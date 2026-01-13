@@ -136,6 +136,14 @@ pub const StorageManager = struct {
 
             fn releaseConst(_: *anyopaque, _: usize) void {}
             fn releaseMut(_: *anyopaque, _: usize) void {}
+
+            fn prefetch(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) void {
+                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
+                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
+                const tile = t.acquireTileConst(ti0, ti1) catch return;
+                // v0: RAM-only prefetch uses intrinsic.
+                @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+            }
         };
 
         return .{
@@ -146,6 +154,7 @@ pub const StorageManager = struct {
                 .acquireTileMut = Vt.acquireTileMut,
                 .releaseConst = Vt.releaseConst,
                 .releaseMut = Vt.releaseMut,
+                .prefetch = Vt.prefetch,
             },
         };
     }

@@ -71,6 +71,9 @@ pub const TensorStore = struct {
         acquireTileMut: *const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) StoreError!TileRefMut,
         releaseConst: *const fn (ctx: *anyopaque, token: usize) void,
         releaseMut: *const fn (ctx: *anyopaque, token: usize) void,
+
+        /// Prefetch hint. Non-blocking.
+        prefetch: ?*const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void = null,
     };
 
     pub fn meta(self: TensorStore, id: TensorId) StoreError!TensorMeta {
@@ -91,5 +94,9 @@ pub const TensorStore = struct {
 
     pub fn releaseMut(self: TensorStore, token: usize) void {
         return self.vtable.releaseMut(self.ctx, token);
+    }
+
+    pub fn prefetch(self: TensorStore, id: TensorId, ti0: usize, ti1: usize) void {
+        if (self.vtable.prefetch) |p| p(self.ctx, id, ti0, ti1);
     }
 };

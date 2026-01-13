@@ -5,7 +5,7 @@ const std = @import("std");
 /// Design goals:
 /// - No allocations during `parallelForAny`.
 /// - Deterministic work partitioning (static contiguous ranges per tid).
-/// - Low overhead on Windows: threads are created once and reused.
+/// - Low overhead: Uses Atomic + Futex for synchronization.
 ///
 /// Terminology:
 /// - `thread_count_total` includes the calling thread (tid=0) plus worker threads (tid=1..).
@@ -24,20 +24,16 @@ pub const ThreadPool = struct {
     };
 
     const Shared = struct {
-        mutex: std.Thread.Mutex = .{},
-        start_cond: std.Thread.Condition = .{},
-        done_cond: std.Thread.Condition = .{},
+        // Synchronization primitives
+        job_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        pending_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        ready_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-        stop: bool = false,
-
-        // Job state
-        gen: u64 = 0,
-        // No separate `active` flag: `gen` change indicates a new job.
-        pending_workers: usize = 0,
-
+        // Job payload
+        ctx: *anyopaque = undefined,
         n: usize = 0,
         grain: usize = 0,
-        ctx: *anyopaque = undefined,
         func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void = undefined,
 
         thread_count_total: usize = 1,
@@ -75,35 +71,42 @@ pub const ThreadPool = struct {
 
         var i: usize = 0;
         while (i < worker_count) : (i += 1) {
-            // tid 1..thread_count_total-1 for workers
             const args: WorkerArgs = .{ .shared = shared, .tid = i + 1 };
             pool.worker_threads[i] = try std.Thread.spawn(.{}, workerMain, .{args});
+        }
+
+        // Barrier: ensure all workers have entered workerMain and are ready to observe the
+        // first job. Without this, a job launched immediately after init could be missed by
+        // workers that haven't started waiting yet, causing a hang.
+        var ready: u32 = shared.ready_workers.load(.acquire);
+        while (ready < @as(u32, @intCast(worker_count))) {
+            std.Thread.Futex.wait(&shared.ready_workers, ready);
+            ready = shared.ready_workers.load(.acquire);
         }
 
         return pool;
     }
 
     pub fn deinit(self: *ThreadPool) void {
-        if (self.thread_count_total <= 1) return;
-
-        const shared: *Shared = self.shared orelse {
-            // Should not happen, but keep deinit robust.
-            self.allocator.free(self.worker_threads);
-            self.worker_threads = &[_]std.Thread{};
+        const shared = self.shared orelse {
+            if (self.worker_threads.len > 0) self.allocator.free(self.worker_threads);
             self.thread_count_total = 1;
             return;
         };
 
-        shared.mutex.lock();
-        shared.stop = true;
-        shared.start_cond.broadcast();
-        shared.mutex.unlock();
+        // Signal stop
+        shared.stop.store(true, .seq_cst);
+        const seq = shared.job_seq.load(.monotonic);
+        shared.job_seq.store(seq + 1, .release);
+        std.Thread.Futex.wake(&shared.job_seq, @intCast(self.worker_threads.len));
 
         for (self.worker_threads) |t| {
             t.join();
         }
 
-        self.allocator.free(self.worker_threads);
+        if (self.worker_threads.len > 0) {
+            self.allocator.free(self.worker_threads);
+        }
         self.worker_threads = &[_]std.Thread{};
         self.thread_count_total = 1;
         self.shared = null;
@@ -132,91 +135,91 @@ pub const ThreadPool = struct {
             return;
         }
 
-        const shared: *Shared = self.shared orelse {
-            // Should not happen if thread_count_total > 1.
+        const shared = self.shared orelse {
             func(ctx, 0, n, 0);
             return;
         };
 
-        // Count how many worker threads will actually have non-empty ranges.
-        // This avoids waiting for workers whose static partition is empty.
-        // Note: we still use a single broadcast wake; workers without work will
-        // go back to sleep quickly, but completion accounting won't stall.
-        var workers_with_work: usize = 0;
-        {
-            var tid: usize = 1;
-            while (tid < self.thread_count_total) : (tid += 1) {
-                const start0: usize = (n * tid) / self.thread_count_total;
-                const end0: usize = (n * (tid + 1)) / self.thread_count_total;
-                if (start0 < end0) workers_with_work += 1;
-            }
-        }
+        const workers_total = self.thread_count_total - 1;
 
-        // If no worker can contribute, avoid the synchronization entirely.
-        if (workers_with_work == 0) {
-            func(ctx, 0, n, 0);
-            return;
-        }
-
-        shared.mutex.lock();
-        // Publish job
+        // Prepare job
         shared.ctx = ctx;
         shared.n = n;
         shared.grain = if (grain == 0) n else grain;
         shared.func = func;
-        shared.pending_workers = workers_with_work;
-        shared.gen +%= 1;
-        const my_gen: u64 = shared.gen;
+
+        // Reset pending count to all workers
+        shared.pending_workers.store(@intCast(workers_total), .monotonic);
+
+        // Publish job by incrementing sequence
+        const seq = shared.job_seq.load(.monotonic);
+        shared.job_seq.store(seq + 1, .release);
 
         // Wake workers
-        shared.start_cond.broadcast();
-        shared.mutex.unlock();
+        std.Thread.Futex.wake(&shared.job_seq, @intCast(workers_total));
 
-        // Run tid=0 on the calling thread
-        _ = runForTid(ctx, n, shared.grain, func, 0, self.thread_count_total);
+        // Run main thread work (tid=0)
+        runForTid(ctx, n, shared.grain, func, 0, self.thread_count_total);
 
-        // Wait for workers
-        shared.mutex.lock();
-        while (shared.gen == my_gen and shared.pending_workers != 0) {
-            shared.done_cond.wait(&shared.mutex);
+        // Wait for workers to finish
+        var spin_wait: usize = 0;
+        while (true) {
+            const pending = shared.pending_workers.load(.acquire);
+            if (pending == 0) break;
+
+            if (spin_wait < 1000) {
+                std.atomic.spinLoopHint();
+                spin_wait += 1;
+                continue;
+            }
+
+            std.Thread.Futex.wait(&shared.pending_workers, pending);
         }
-        shared.mutex.unlock();
     }
 
     fn workerMain(args: WorkerArgs) void {
-        const shared: *Shared = args.shared;
-        const tid: usize = args.tid;
-        var seen_gen: u64 = 0;
+        const shared = args.shared;
+        const tid = args.tid;
+
+        // Signal that this worker is ready.
+        _ = shared.ready_workers.fetchAdd(1, .release);
+        std.Thread.Futex.wake(&shared.ready_workers, 1);
+
+        var last_seq = shared.job_seq.load(.monotonic);
 
         while (true) {
-            shared.mutex.lock();
-            while (!shared.stop and shared.gen == seen_gen) {
-                shared.start_cond.wait(&shared.mutex);
+            // Wait for new job
+            var spin_wait: usize = 0;
+            var seq = shared.job_seq.load(.acquire);
+
+            while (seq == last_seq) {
+                if (spin_wait < 5000) {
+                    std.atomic.spinLoopHint();
+                    spin_wait += 1;
+                    seq = shared.job_seq.load(.monotonic);
+                    continue;
+                }
+                std.Thread.Futex.wait(&shared.job_seq, last_seq);
+                seq = shared.job_seq.load(.monotonic);
             }
 
-            if (shared.stop) {
-                shared.mutex.unlock();
-                return;
-            }
+            // Check stop signal
+            if (shared.stop.load(.monotonic)) return;
 
-            // Snapshot job
-            const ctx: *anyopaque = shared.ctx;
-            const n: usize = shared.n;
-            const grain: usize = shared.grain;
-            const func = shared.func;
-            const job_gen: u64 = shared.gen;
-            const tcount: usize = shared.thread_count_total;
-            seen_gen = job_gen;
-            shared.mutex.unlock();
+            // Ensure acquire fence for payload if needed, job_seq load(.acquire) above covers it
+            _ = shared.job_seq.load(.acquire);
 
-            const did_work: bool = runForTid(ctx, n, grain, func, tid, tcount);
+            last_seq = seq;
 
-            shared.mutex.lock();
-            if (did_work and shared.gen == job_gen and shared.pending_workers > 0) {
-                shared.pending_workers -= 1;
-                if (shared.pending_workers == 0) shared.done_cond.signal();
-            }
-            shared.mutex.unlock();
+            // Execute
+            runForTid(shared.ctx, shared.n, shared.grain, shared.func, tid, shared.thread_count_total);
+
+            // Notify completion
+            const prev = shared.pending_workers.fetchSub(1, .release);
+            _ = prev;
+            // Wake waiters unconditionally.
+            // Futex waiters are not guaranteed to wake on value change unless a wake is issued.
+            std.Thread.Futex.wake(&shared.pending_workers, 1);
         }
     }
 
@@ -227,12 +230,10 @@ pub const ThreadPool = struct {
         func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
         tid: usize,
         thread_count_total: usize,
-    ) bool {
-        // Static contiguous partition:
-        // start = floor(n*tid/tcount), end = floor(n*(tid+1)/tcount)
+    ) void {
         const start0: usize = (n * tid) / thread_count_total;
         const end0: usize = (n * (tid + 1)) / thread_count_total;
-        if (start0 >= end0) return false;
+        if (start0 >= end0) return;
 
         var start: usize = start0;
         const g: usize = if (grain == 0) (end0 - start0) else grain;
@@ -241,8 +242,6 @@ pub const ThreadPool = struct {
             func(ctx, start, end, tid);
             start = end;
         }
-
-        return true;
     }
 };
 

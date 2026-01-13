@@ -201,8 +201,12 @@ pub const CpuBackend = struct {
                 };
 
                 var task: Task = .{ .store = store, .a_id = a_id, .a_meta = a_meta, .dtype = a_meta.dtype, .partials = self.reduce_scratch_f32[0..self.thread_count] };
-                // Grain: 1 tile per chunk; tile counts are usually moderate. This keeps load balanced.
-                p.parallelForAny(@ptrCast(&task), tile_total, 1, Task.runTiles);
+                // Grain size: aim for at least 256KiB of work per task to amortize overhead.
+                const bytes_per_tile = tileByteSize(a_meta);
+                var grain: usize = if (bytes_per_tile == 0) 32 else @max(@as(usize, 1), (256 * 1024) / bytes_per_tile);
+                if (grain > tile_total) grain = tile_total;
+
+                p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
 
                 var i: usize = 0;
                 while (i < self.thread_count) : (i += 1) {
@@ -501,7 +505,8 @@ pub const CpuBackend = struct {
 
                                     if (t.stop.load(.acquire)) return;
 
-                                    const tc1: usize = t.c_meta.tile_counts[1];
+                                    //const tc1: usize = t.c_meta.tile_counts[1];
+                                    const tc0: usize = t.c_meta.tile_counts[0];
                                     const split_factor = t.split;
 
                                     var i: usize = start;
@@ -511,8 +516,10 @@ pub const CpuBackend = struct {
                                         const tile_idx = i / split_factor;
                                         const split_idx = i % split_factor;
 
-                                        const ti_m: usize = tile_idx / tc1;
-                                        const ti_n: usize = tile_idx - ti_m * tc1;
+                                        // Column-major iteration: ti_m is inner, ti_n is outer.
+                                        // This helps keep B tiles in L3 cache across M-steps.
+                                        const ti_n: usize = tile_idx / tc0;
+                                        const ti_m: usize = tile_idx - ti_n * tc0;
 
                                         var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
                                             t.fail(e);
@@ -529,8 +536,25 @@ pub const CpuBackend = struct {
                                         if (r_start >= r_end) continue;
                                         const m_sub = r_end - r_start;
 
+                                        const a_dtype = (t.store.meta(t.s.a) catch |e| {
+                                            t.fail(e);
+                                            return;
+                                        }).dtype;
+                                        const b_dtype = (t.store.meta(t.s.b) catch |e| {
+                                            t.fail(e);
+                                            return;
+                                        }).dtype;
+                                        const c_dtype = t.c_meta.dtype;
+                                        const a_info = a_dtype.info();
+                                        const c_info = c_dtype.info();
+
                                         var ti_k: usize = 0;
                                         while (ti_k < t.a_meta.tile_counts[1]) : (ti_k += 1) {
+                                            if (ti_k + 1 < t.a_meta.tile_counts[1]) {
+                                                t.store.prefetch(t.s.a, ti_m, ti_k + 1);
+                                                t.store.prefetch(t.s.b, ti_k + 1, ti_n);
+                                            }
+
                                             const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
                                                 t.fail(e);
                                                 return;
@@ -544,27 +568,19 @@ pub const CpuBackend = struct {
 
                                             const a_view = a_tile.bufferView();
                                             const b_view = b_tile.bufferView();
-                                            const c_view = c_tile.bufferView();
-
-                                            const a_dtype: DType = a_view.dtype;
-                                            const b_dtype: DType = b_view.dtype;
-                                            const c_dtype: DType = c_view.dtype;
 
                                             const k_tile: usize = a_view.layout.shape[1];
                                             const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
                                             const params: MatMulParams = .{ .m = m_sub, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
 
-                                            const a_info = a_dtype.info();
-                                            const c_info = c_dtype.info();
                                             const a_row_bytes = k_tile * a_info.block_bytes;
                                             const c_row_bytes = n_tile * c_info.block_bytes;
                                             const a_off = r_start * a_row_bytes;
                                             const c_off = r_start * c_row_bytes;
                                             const a_sub_bytes = a_view.bytes[a_off..];
-                                            const c_sub_bytes = c_view.bytes[c_off..];
+                                            const c_sub_bytes = c_view0.bytes[c_off..];
 
                                             // Single-threaded kernels (outer tiling provides parallelism).
-                                            // Keep dtype rules consistent with CpuBackend.matmulImpl.
                                             switch (b_dtype) {
                                                 .f32 => {
                                                     if (a_dtype != .f32 or c_dtype != .f32) {
@@ -735,6 +751,13 @@ pub const CpuBackend = struct {
                                         if (t.stop.load(.acquire)) return;
                                         const ti0: usize = i / tc1;
                                         const ti1: usize = i - ti0 * tc1;
+
+                                        if (i + 1 < end) {
+                                            const nti0 = (i + 1) / tc1;
+                                            const nti1 = (i + 1) - nti0 * tc1;
+                                            t.store.prefetch(t.a, nti0, nti1);
+                                            t.store.prefetch(t.b, nti0, nti1);
+                                        }
 
                                         var out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
                                             t.fail(e);

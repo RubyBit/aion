@@ -3,12 +3,12 @@ const std = @import("std");
 const backend_mod = @import("../backend/backend.zig");
 const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
 const types = @import("../backend/types.zig");
-const backend_utils = @import("../backend/utils.zig");
-const storage = @import("../storage/storage.zig");
+const manager_mod = @import("../storage/manager.zig");
+const graph_mod = @import("graph.zig");
+const plan_mod = @import("plan.zig");
 const program = @import("program.zig");
 
 const Backend = backend_mod.Backend;
-const DType = types.DType;
 
 const PackedLayout2 = struct {
     shape_mem: [2]usize,
@@ -30,200 +30,205 @@ const PackedLayout2 = struct {
     }
 };
 
-const PackedLayout2Quant = struct {
-    shape_mem: [2]usize,
-    strides_mem: [2]isize,
-
-    pub fn init(shape0: usize, shape1: usize) PackedLayout2Quant {
-        return .{
-            .shape_mem = .{ shape0, shape1 },
-            .strides_mem = .{ 0, 0 },
-        };
-    }
-
-    pub fn layout(self: *const PackedLayout2Quant) types.Layout {
-        return .{
-            .rank = 2,
-            .shape = self.shape_mem[0..2],
-            .strides_bytes = self.strides_mem[0..2],
-        };
-    }
-};
-
-test "program: tiled matmul matches packed (f32 x f32 -> f32)" {
+test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    const m: usize = 7;
-    const k: usize = 13;
-    const n: usize = 9;
-
-    // Choose tile sizes that create boundary tiles.
-    const tm: usize = 3;
-    const tk: usize = 5;
-    const tn: usize = 4;
+    const m: usize = 2;
+    const k: usize = 3;
+    const n: usize = 4;
 
     // Packed inputs.
-    const a_elems: usize = m * k;
-    const b_elems: usize = k * n;
-    const c_elems: usize = m * n;
-
-    const a_bytes_len: usize = a_elems * 4;
-    const b_bytes_len: usize = b_elems * 4;
-    const c_bytes_len: usize = c_elems * 4;
+    const a_bytes_len: usize = m * k * 4;
+    const b_bytes_len: usize = k * n * 4;
+    const bias_bytes_len: usize = n * 4;
 
     const a_buf: []u8 = try allocator.alloc(u8, a_bytes_len);
     defer allocator.free(a_buf);
     const b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
     defer allocator.free(b_buf);
-    const c_ref_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(c_ref_buf);
+    const bias_buf: []u8 = try allocator.alloc(u8, bias_bytes_len);
+    defer allocator.free(bias_buf);
 
-    // Fill A,B deterministically with small values.
     const a_vals: []align(1) f32 = @ptrCast(a_buf);
     const b_vals: []align(1) f32 = @ptrCast(b_buf);
-    for (0..a_elems) |i| a_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.25;
-    for (0..b_elems) |i| b_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.2;
-    @memset(c_ref_buf, 0);
+    const bias_vals: []align(1) f32 = @ptrCast(bias_buf);
+
+    for (0..m * k) |i| a_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 2)) * 0.5;
+    for (0..k * n) |i| b_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i % 7))) - 3)) * 0.25;
+    for (0..n) |i| bias_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 1)) * 0.1;
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
     const backend: Backend = cpu.backend();
 
-    // Reference: one packed matmul.
+    // Reference (all packed).
+    const c_bytes_len: usize = m * n * 4;
+    const d_bytes_len: usize = c_bytes_len;
+    const e_bytes_len: usize = c_bytes_len;
+    const f_bytes_len: usize = c_bytes_len;
+    const g_bytes_len: usize = c_bytes_len;
+    const out_bytes_len: usize = 4;
+
+    const c_ref_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
+    defer allocator.free(c_ref_buf);
+    const d_ref_buf: []u8 = try allocator.alloc(u8, d_bytes_len);
+    defer allocator.free(d_ref_buf);
+    const e_ref_buf: []u8 = try allocator.alloc(u8, e_bytes_len);
+    defer allocator.free(e_ref_buf);
+    const f_ref_buf: []u8 = try allocator.alloc(u8, f_bytes_len);
+    defer allocator.free(f_ref_buf);
+    const g_ref_buf: []u8 = try allocator.alloc(u8, g_bytes_len);
+    defer allocator.free(g_ref_buf);
+    const out_ref_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_ref_buf);
+
+    @memset(c_ref_buf, 0);
+    @memset(d_ref_buf, 0);
+    @memset(e_ref_buf, 0);
+    @memset(f_ref_buf, 0);
+    @memset(g_ref_buf, 0);
+    @memset(out_ref_buf, 0);
+
     var a_l = PackedLayout2.init(m, k, 4);
     var b_l = PackedLayout2.init(k, n, 4);
     var c_l = PackedLayout2.init(m, n, 4);
 
     const a_view: types.BufferViewConst = .{ .bytes = a_buf, .dtype = .f32, .layout = a_l.layout() };
     const b_view: types.BufferViewConst = .{ .bytes = b_buf, .dtype = .f32, .layout = b_l.layout() };
-    const c_ref_view: types.BufferViewMut = .{ .bytes = c_ref_buf, .dtype = .f32, .layout = c_l.layout() };
+    const c_view: types.BufferViewMut = .{ .bytes = c_ref_buf, .dtype = .f32, .layout = c_l.layout() };
+    const d_view: types.BufferViewMut = .{ .bytes = d_ref_buf, .dtype = .f32, .layout = c_l.layout() };
+    const e_view: types.BufferViewMut = .{ .bytes = e_ref_buf, .dtype = .f32, .layout = c_l.layout() };
+    const f_view: types.BufferViewMut = .{ .bytes = f_ref_buf, .dtype = .f32, .layout = c_l.layout() };
+    const g_view: types.BufferViewMut = .{ .bytes = g_ref_buf, .dtype = .f32, .layout = c_l.layout() };
 
-    try backend.matmul(.{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 }, c_ref_view, a_view, b_view);
+    // bias layout rank1
+    var bias_shape_mem: [1]usize = .{n};
+    var bias_strides_mem: [1]isize = .{4};
+    const bias_layout: types.Layout = .{ .rank = 1, .shape = bias_shape_mem[0..1], .strides_bytes = bias_strides_mem[0..1] };
+    const bias_view: types.BufferViewConst = .{ .bytes = bias_buf, .dtype = .f32, .layout = bias_layout };
 
-    // Tiled tensors.
-    var a_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .f32, &[_]usize{ m, k }, &[_]usize{ tm, tk }, .{ .tile_alignment = 64 });
-    defer a_t.deinit();
-    var b_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .f32, &[_]usize{ k, n }, &[_]usize{ tk, tn }, .{ .tile_alignment = 64 });
-    defer b_t.deinit();
-    var c_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .f32, &[_]usize{ m, n }, &[_]usize{ tm, tn }, .{ .tile_alignment = 64 });
-    defer c_t.deinit();
+    // out scalar layout
+    var out_shape_mem: [1]usize = .{1};
+    var out_strides_mem: [1]isize = .{4};
+    const out_layout: types.Layout = .{ .rank = 1, .shape = out_shape_mem[0..1], .strides_bytes = out_strides_mem[0..1] };
+    const out_view: types.BufferViewMut = .{ .bytes = out_ref_buf, .dtype = .f32, .layout = out_layout };
 
-    try a_t.writeFromPackedScalar(a_buf);
-    try b_t.writeFromPackedScalar(b_buf);
+    try backend.matmul(.{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 }, c_view, a_view, b_view);
+    try backend.broadcastLastDimBinary(.add, d_view, .{ .bytes = c_ref_buf, .dtype = .f32, .layout = c_l.layout() }, bias_view);
+    try backend.relu(e_view, .{ .bytes = d_ref_buf, .dtype = .f32, .layout = c_l.layout() });
+    try backend.copy(f_view, .{ .bytes = e_ref_buf, .dtype = .f32, .layout = c_l.layout() });
+    try backend.elemwiseBinary(.mul, g_view, .{ .bytes = f_ref_buf, .dtype = .f32, .layout = c_l.layout() }, .{ .bytes = f_ref_buf, .dtype = .f32, .layout = c_l.layout() });
+    try backend.reduce(.mean, out_view, .{ .bytes = g_ref_buf, .dtype = .f32, .layout = c_l.layout() });
 
-    // Compute tiled.
-    try program.matmulTiled(backend, &c_t, &a_t, &b_t, 1.0, 0.0);
+    // Build tiled inputs and graph.
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
 
-    // Compare.
-    const c_out_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(c_out_buf);
-    @memset(c_out_buf, 0);
-    try c_t.readToPackedScalar(c_out_buf);
+    // Intentionally use non-matmul-friendly tiling to exercise ReTileCopyScalar.
+    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 3 }, .{ .tile_alignment = 64 });
+    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{3}, .{ .tile_alignment = 64 });
 
-    const c_ref: []align(1) const f32 = @ptrCast(c_ref_buf);
-    const c_out: []align(1) const f32 = @ptrCast(c_out_buf);
+    try sm.writeFromPackedScalar(a_tid, a_buf);
+    try sm.writeFromPackedScalar(b_tid, b_buf);
+    try sm.writeFromPackedScalar(bias_tid, bias_buf);
 
-    // Exact equality is expected for deterministic f32 math in same loop order? Not guaranteed.
-    // Use a tight tolerance.
-    for (0..c_elems) |i| {
-        const diff: f32 = @abs(c_ref[i] - c_out[i]);
-        try std.testing.expect(diff <= 1e-5);
-    }
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const a_in = try g.addInput(.f32, &[_]usize{ m, k });
+    const b_in = try g.addInput(.f32, &[_]usize{ k, n });
+    const bias_in = try g.addInput(.f32, &[_]usize{n});
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    try g.bindExternal(bias_in, @intCast(bias_tid));
+
+    const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+    const d = try g.addBroadcastLastDimBinary(.add, c, bias_in);
+    const e = try g.addRelu(d);
+    const f = try g.addCopy(e);
+    const gg = try g.addElemwiseBinary(.mul, f, f);
+    const out = try g.addReduce(.mean, gg);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    // Read output.
+    var out_buf: [4]u8 = .{ 0, 0, 0, 0 };
+    try sm.readToPackedScalar(prog.outputs[0], out_buf[0..4]);
+    const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
+    const ref_val: f32 = @as(*align(1) const f32, @ptrCast(out_ref_buf.ptr)).*;
+    try std.testing.expect(@abs(out_val - ref_val) <= 1e-5);
 }
 
-test "program: tiled matmul matches packed (f32 x q8_0 -> f32)" {
+test "graph: view ops lower to materialization (transpose/slice/reshape)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    const m: usize = 4;
-    const k: usize = 96; // multiple of 32
-    const n: usize = 7;
+    const rows: usize = 3;
+    const cols: usize = 4;
 
-    const tm: usize = 2;
-    const tk: usize = 64; // multiple of 32, and leaves boundary k tile (32)
-    const tn: usize = 3;
+    // Packed input.
+    const x_bytes_len: usize = rows * cols * 4;
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
 
-    // Packed A (f32).
-    const a_elems: usize = m * k;
-    const a_bytes_len: usize = a_elems * 4;
-    const a_buf: []u8 = try allocator.alloc(u8, a_bytes_len);
-    defer allocator.free(a_buf);
-    const a_vals: []align(1) f32 = @ptrCast(a_buf);
-    for (0..a_elems) |i| a_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.1;
-
-    // Packed B (q8_0) per kernel convention: [k_blocks, n] blocks.
-    const di = DType.q8_0.info();
-    const k_blocks: usize = k / di.block_elems;
-    const b_bytes_len: usize = k_blocks * n * di.block_bytes;
-    var b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
-    defer allocator.free(b_buf);
-
-    // Fill each block: scale=f16(1.0), then 32 int8 values.
-    const scale_f16: f16 = 1.0;
-    const scale_bytes: [2]u8 = @bitCast(scale_f16);
-    var kb: usize = 0;
-    while (kb < k_blocks) : (kb += 1) {
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            const off: usize = (kb * n + j) * di.block_bytes;
-            b_buf[off + 0] = scale_bytes[0];
-            b_buf[off + 1] = scale_bytes[1];
-
-            // Deterministic small int8 pattern.
-            var qi: usize = 0;
-            while (qi < 32) : (qi += 1) {
-                const v: i8 = @intCast(@as(i32, @intCast((kb + j + qi) % 13)) - 6);
-                b_buf[off + 2 + qi] = @bitCast(v);
-            }
-        }
-    }
-
-    const c_bytes_len: usize = (m * n) * 4;
-    const c_ref_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(c_ref_buf);
-    @memset(c_ref_buf, 0);
+    const x_vals: []align(1) f32 = @ptrCast(x_buf);
+    for (0..rows * cols) |i| x_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 6)) * 0.25;
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
     const backend: Backend = cpu.backend();
 
-    var a_l = PackedLayout2.init(m, k, 4);
-    var b_l = PackedLayout2Quant.init(k, n);
-    var c_l = PackedLayout2.init(m, n, 4);
-
-    const a_view: types.BufferViewConst = .{ .bytes = a_buf, .dtype = .f32, .layout = a_l.layout() };
-    const b_view: types.BufferViewConst = .{ .bytes = b_buf, .dtype = .q8_0, .layout = b_l.layout() };
-    const c_ref_view: types.BufferViewMut = .{ .bytes = c_ref_buf, .dtype = .f32, .layout = c_l.layout() };
-
-    // Reference packed.
-    try backend.matmul(.{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 }, c_ref_view, a_view, b_view);
-
-    // Tiled.
-    var a_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .f32, &[_]usize{ m, k }, &[_]usize{ tm, tk }, .{ .tile_alignment = 64 });
-    defer a_t.deinit();
-    var b_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .q8_0, &[_]usize{ k, n }, &[_]usize{ tk, tn }, .{ .tile_alignment = 64 });
-    defer b_t.deinit();
-    var c_t: storage.TiledTensor = try storage.TiledTensor.init(allocator, .f32, &[_]usize{ m, n }, &[_]usize{ tm, tn }, .{ .tile_alignment = 64 });
-    defer c_t.deinit();
-
-    try a_t.writeFromPackedScalar(a_buf);
-    try b_t.writeFromPackedQuant(b_buf);
-
-    try program.matmulTiled(backend, &c_t, &a_t, &b_t, 1.0, 0.0);
-
-    const c_out_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(c_out_buf);
-    @memset(c_out_buf, 0);
-    try c_t.readToPackedScalar(c_out_buf);
-
-    const c_ref: []align(1) const f32 = @ptrCast(c_ref_buf);
-    const c_out: []align(1) const f32 = @ptrCast(c_out_buf);
-
-    for (0..m * n) |i| {
-        const diff: f32 = @abs(c_ref[i] - c_out[i]);
-        try std.testing.expect(diff <= 1e-5);
+    // Expected: transpose -> slice -> reshape -> relu -> sum.
+    // Slice is on the transposed tensor: take rows [1..3) and cols [0..3).
+    var expected_sum: f32 = 0.0;
+    // This corresponds to x[row=cc, col=1+rr] for rr in 0..2, cc in 0..3? see derivation.
+    // Here slice shape is [2,3] (len0=2,len1=3).
+    {
+        // Elements in reshape order: s[0,0..2], s[1,0..2]
+        const coords = [_][2]usize{
+            .{ 0, 1 }, .{ 1, 1 }, .{ 2, 1 },
+            .{ 0, 2 }, .{ 1, 2 }, .{ 2, 2 },
+        };
+        for (coords) |rc| {
+            const r: usize = rc[0];
+            const c: usize = rc[1];
+            const v: f32 = x_vals[r * cols + c];
+            expected_sum += if (v > 0) v else 0;
+        }
     }
 
-    // Spot-check: tiled B tiles should be valid packed quant views.
-    const tv = try b_t.acquireTileConst(0, 0);
-    try backend_utils.requirePacked(tv.bufferView());
+    // Storage + graph.
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, cols }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ rows, cols });
+    try g.bindExternal(x_in, @intCast(x_tid));
+
+    const t = try g.addViewTranspose2D(x_in);
+    const s = try g.addViewSlice2D(t, 1, 2, 0, 3);
+    const r = try g.addViewReshape(s, &[_]usize{6});
+    const u = try g.addRelu(r);
+    const out = try g.addReduce(.sum, u);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    var out_buf: [4]u8 = .{ 0, 0, 0, 0 };
+    try sm.readToPackedScalar(prog.outputs[0], out_buf[0..4]);
+    const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
+    try std.testing.expect(@abs(out_val - expected_sum) <= 1e-5);
 }

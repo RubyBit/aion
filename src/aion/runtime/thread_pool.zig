@@ -32,7 +32,7 @@ pub const ThreadPool = struct {
 
         // Job state
         gen: u64 = 0,
-        active: bool = false,
+        // No separate `active` flag: `gen` change indicates a new job.
         pending_workers: usize = 0,
 
         n: usize = 0,
@@ -138,15 +138,34 @@ pub const ThreadPool = struct {
             return;
         };
 
+        // Count how many worker threads will actually have non-empty ranges.
+        // This avoids waiting for workers whose static partition is empty.
+        // Note: we still use a single broadcast wake; workers without work will
+        // go back to sleep quickly, but completion accounting won't stall.
+        var workers_with_work: usize = 0;
+        {
+            var tid: usize = 1;
+            while (tid < self.thread_count_total) : (tid += 1) {
+                const start0: usize = (n * tid) / self.thread_count_total;
+                const end0: usize = (n * (tid + 1)) / self.thread_count_total;
+                if (start0 < end0) workers_with_work += 1;
+            }
+        }
+
+        // If no worker can contribute, avoid the synchronization entirely.
+        if (workers_with_work == 0) {
+            func(ctx, 0, n, 0);
+            return;
+        }
+
         shared.mutex.lock();
         // Publish job
         shared.ctx = ctx;
         shared.n = n;
         shared.grain = if (grain == 0) n else grain;
         shared.func = func;
-        shared.pending_workers = self.worker_threads.len;
+        shared.pending_workers = workers_with_work;
         shared.gen +%= 1;
-        shared.active = true;
         const my_gen: u64 = shared.gen;
 
         // Wake workers
@@ -154,16 +173,12 @@ pub const ThreadPool = struct {
         shared.mutex.unlock();
 
         // Run tid=0 on the calling thread
-        runForTid(ctx, n, shared.grain, func, 0, self.thread_count_total);
+        _ = runForTid(ctx, n, shared.grain, func, 0, self.thread_count_total);
 
         // Wait for workers
         shared.mutex.lock();
-        while (shared.active and shared.gen == my_gen and shared.pending_workers != 0) {
+        while (shared.gen == my_gen and shared.pending_workers != 0) {
             shared.done_cond.wait(&shared.mutex);
-        }
-        // Clear active flag once all workers are done.
-        if (shared.gen == my_gen) {
-            shared.active = false;
         }
         shared.mutex.unlock();
     }
@@ -175,7 +190,7 @@ pub const ThreadPool = struct {
 
         while (true) {
             shared.mutex.lock();
-            while (!shared.stop and (!shared.active or shared.gen == seen_gen)) {
+            while (!shared.stop and shared.gen == seen_gen) {
                 shared.start_cond.wait(&shared.mutex);
             }
 
@@ -194,14 +209,12 @@ pub const ThreadPool = struct {
             seen_gen = job_gen;
             shared.mutex.unlock();
 
-            runForTid(ctx, n, grain, func, tid, tcount);
+            const did_work: bool = runForTid(ctx, n, grain, func, tid, tcount);
 
             shared.mutex.lock();
-            if (shared.gen == job_gen and shared.pending_workers > 0) {
+            if (did_work and shared.gen == job_gen and shared.pending_workers > 0) {
                 shared.pending_workers -= 1;
-                if (shared.pending_workers == 0) {
-                    shared.done_cond.signal();
-                }
+                if (shared.pending_workers == 0) shared.done_cond.signal();
             }
             shared.mutex.unlock();
         }
@@ -214,12 +227,12 @@ pub const ThreadPool = struct {
         func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
         tid: usize,
         thread_count_total: usize,
-    ) void {
+    ) bool {
         // Static contiguous partition:
         // start = floor(n*tid/tcount), end = floor(n*(tid+1)/tcount)
         const start0: usize = (n * tid) / thread_count_total;
         const end0: usize = (n * (tid + 1)) / thread_count_total;
-        if (start0 >= end0) return;
+        if (start0 >= end0) return false;
 
         var start: usize = start0;
         const g: usize = if (grain == 0) (end0 - start0) else grain;
@@ -228,6 +241,8 @@ pub const ThreadPool = struct {
             func(ctx, start, end, tid);
             start = end;
         }
+
+        return true;
     }
 };
 

@@ -12,6 +12,37 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+
+    // target.query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avxvnni));
+    // // add also avxvnniint8
+    // target.query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avxvnniint8));
+    // // also add avxvnniint16
+    // target.query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avxvnniint16));
+
+    // // Print default features
+    // {
+    //     // Re-resolve target to see updated features in result if query was modified
+    //     const resolved_target = std.Build.resolveTargetQuery(b, target.query);
+    //     const cpu = resolved_target.result.cpu;
+    //     std.debug.print("Target: {s}-{s}-{s}\n", .{ @tagName(cpu.arch), @tagName(resolved_target.result.os.tag), cpu.model.name });
+    //     std.debug.print("Features: ", .{});
+    //     var first = true;
+        
+    //     switch (cpu.arch) {
+    //         .x86_64 => {
+    //             for (std.Target.x86.all_features, 0..) |feature, i| {
+    //                 if (cpu.features.isEnabled(@intCast(i))) {
+    //                     if (!first) std.debug.print(", ", .{});
+    //                     std.debug.print("{s}", .{feature.name});
+    //                     first = false;
+    //                 }
+    //             }
+    //         },
+    //         else => std.debug.print("(unsupported architecture for feature listing)", .{}),
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
+
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
@@ -66,6 +97,30 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    // ---------------------------------------------------------------------
+    // Benchmarks.
+    // Run with: zig build bench -Doptimize=ReleaseFast -- [bench args]
+    // ---------------------------------------------------------------------
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aion", .module = aion_mod },
+        },
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "aion-bench",
+        .root_module = bench_mod,
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+
+    const bench_step = b.step("bench", "Run microbenchmarks");
+    bench_step.dependOn(&run_bench.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

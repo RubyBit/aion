@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const utils = @import("utils.zig");
+const executable = @import("../runtime/executable.zig");
+const tensor_store = @import("../runtime/tensor_store.zig");
 
 // Local aliases (NOT re-exports). Use `types.zig` / `utils.zig` directly from other files.
 const BackendKind = types.BackendKind;
@@ -12,6 +14,8 @@ const BufferViewMut = types.BufferViewMut;
 const ElemwiseBinaryOp = types.ElemwiseBinaryOp;
 const ReduceOp = types.ReduceOp;
 const MatMulParams = types.MatMulParams;
+
+pub const ExecuteProgramError = BackendError || tensor_store.StoreError;
 
 pub const Backend = struct {
     ctx: *anyopaque,
@@ -52,6 +56,13 @@ pub const Backend = struct {
         /// - Allow packed<->packed always
         /// - Optionally allow strided<->packed if implemented (else return Unsupported)
         copy: *const fn (ctx: *anyopaque, dst: BufferViewMut, src: BufferViewConst) BackendError!void,
+
+        /// Execute a validated tiled program.
+        ///
+        /// Contract:
+        /// - `prog` has been validated end-to-end by the compiler (Graph -> ExecutableProgram).
+        /// - Implementation must not perform per-op argument checking; only backend/storage errors can occur.
+        executeProgram: *const fn (ctx: *anyopaque, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore) ExecuteProgramError!void,
     };
 
     pub fn kind(self: Backend) BackendKind {
@@ -165,5 +176,13 @@ pub const Backend = struct {
         try utils.requirePacked(dst);
         try utils.requirePacked(src);
         return self.vtable.copy(self.ctx, dst, src);
+    }
+
+    pub fn executeProgram(
+        self: Backend,
+        prog: *const executable.ExecutableProgram,
+        store: tensor_store.TensorStore,
+    ) ExecuteProgramError!void {
+        return self.vtable.executeProgram(self.ctx, prog, store);
     }
 };

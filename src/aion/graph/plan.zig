@@ -54,7 +54,17 @@ pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
 
 pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dtype: DType) struct { tm: usize, tn: usize, tk: usize } {
     // Macro tiles: square-ish C tiles.
-    const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(m, n)));
+    //
+    // Important trade-off:
+    // - Larger tiles improve per-tile kernel efficiency and amortize packing.
+    // - But too-large tiles reduce the number of output tiles, which limits parallelism
+    //   for tiled program execution (we intentionally avoid intra-tile parallel writes).
+    //
+    // Heuristic (v1): for matrices >= 512, cap the tile side to 128 to ensure enough
+    // tile-level parallelism on many-core CPUs.
+    const min_mn: usize = @min(m, n);
+    var side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, min_mn));
+    if (side > 128 and min_mn >= 512) side = 128;
     const tm: usize = @min(side, m);
     const tn: usize = @min(side, n);
     const tk: usize = chooseMatMulTk(policy, k, b_dtype);

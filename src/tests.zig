@@ -9,11 +9,15 @@
 const std = @import("std");
 
 comptime {
-    // Force semantic analysis of these files so their `test` blocks are discovered.
     _ = @import("aion/backend/backend.zig");
-    _ = @import("aion/backend/cpu/test_cpu_backend.zig");
-    _ = @import("aion/storage/test_storage.zig");
+    _ = @import("aion/storage/storage.zig");
+    _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
+
     _ = @import("aion/graph/test_program.zig");
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
 
 test "sanity: tests are running" {

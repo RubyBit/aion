@@ -53,7 +53,7 @@ pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
 }
 
 pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dtype: DType) struct { tm: usize, tn: usize, tk: usize } {
-    // Macro tiles: square-ish C tiles.
+    // Macro tiles: choose C tiles.
     //
     // Important trade-off:
     // - Larger tiles improve per-tile kernel efficiency and amortize packing.
@@ -62,6 +62,39 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     //
     // Heuristic (v1): for matrices >= 512, cap the tile side to 128 to ensure enough
     // tile-level parallelism on many-core CPUs.
+    // Special-case very skinny matrices (e.g. matvec with m==1): a square tile would
+    // degenerate to tn==1, which is disastrous for kernel efficiency and tile overhead.
+    //
+    // Heuristic: when one dimension is tiny, tile fully along that dim and use a wide
+    // tile along the other dim (rounded to SIMD-friendly multiples of 16).
+    if (m <= 4 and n >= 64) {
+        const tm: usize = @max(@as(usize, 1), m);
+
+        // Keep N tiles reasonably large to amortize per-tile overhead, but not so large
+        // that we destroy parallelism. 256 matches CPU kernel NC.
+        var tn_target: usize = @min(@as(usize, 256), n);
+        if (tn_target >= 16) {
+            tn_target = roundDownToMultiple(tn_target, 16);
+            if (tn_target == 0) tn_target = 16;
+        }
+        const tn: usize = @max(@as(usize, 1), @min(tn_target, n));
+
+        const tk: usize = chooseMatMulTk(policy, k, b_dtype);
+        return .{ .tm = tm, .tn = tn, .tk = tk };
+    }
+    if (n <= 4 and m >= 64) {
+        const tn: usize = @max(@as(usize, 1), n);
+        var tm_target: usize = @min(@as(usize, 256), m);
+        if (tm_target >= 16) {
+            tm_target = roundDownToMultiple(tm_target, 16);
+            if (tm_target == 0) tm_target = 16;
+        }
+        const tm: usize = @max(@as(usize, 1), @min(tm_target, m));
+        const tk: usize = chooseMatMulTk(policy, k, b_dtype);
+        return .{ .tm = tm, .tn = tn, .tk = tk };
+    }
+
+    // Default: square-ish tiles.
     const min_mn: usize = @min(m, n);
     var side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, min_mn));
     if (side > 128 and min_mn >= 512) side = 128;

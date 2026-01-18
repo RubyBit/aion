@@ -13,10 +13,7 @@ const program_mod = aion.program;
 
 const types = aion.types;
 
-const BufferViewConst = types.BufferViewConst;
-const BufferViewMut = types.BufferViewMut;
 const Layout = types.Layout;
-const MatMulParams = types.MatMulParams;
 
 const Q4_0_BLOCK_ELEMS: usize = types.DType.q4_0.info().block_elems;
 const Q4_0_BLOCK_BYTES: usize = types.DType.q4_0.info().block_bytes;
@@ -40,6 +37,9 @@ const BenchOptions = struct {
 
     // Additionally run the same benchmarks through Graph -> Program (tiled execution).
     program: bool = false,
+
+    // Print cpu cache detection / tuning selection.
+    print_cpuid: bool = false,
 };
 
 fn printUsage() void {
@@ -56,6 +56,7 @@ fn printUsage() void {
             "  --k N            MatMul K (default: 512)\n" ++
             "  --no-quant       Skip quantized matmul benches\n" ++
             "  --program        Also run tiled Graph->Program versions\n" ++
+            "  --print-cpuid    Print detected CPU caches\n" ++
             "  -h, --help       Show help\n",
         .{},
     );
@@ -81,6 +82,8 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
             opts.quant = false;
         } else if (std.mem.eql(u8, a, "--program")) {
             opts.program = true;
+        } else if (std.mem.eql(u8, a, "--print-cpuid")) {
+            opts.print_cpuid = true;
         } else if (std.mem.eql(u8, a, "--iters")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
@@ -597,10 +600,17 @@ fn mainImpl() !void {
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    const arena: std.mem.Allocator = arena_state.allocator();
 
     var prng = std.Random.DefaultPrng.init(0x1234_5678_9abc_def0);
     const rnd = prng.random();
+
+    if (opts.print_cpuid) {
+        const info = aion.cpu.x86_cpuid.detect();
+        std.debug.print(
+            "cpu cpuid caches: l1d={} l2={} l3={}\n",
+            .{ info.caches.l1d_bytes, info.caches.l2_bytes, info.caches.l3_bytes },
+        );
+    }
 
     var cpu: CpuBackend = try makeCpuBackend(allocator, opts.threads);
     defer cpu.deinit();
@@ -624,20 +634,38 @@ fn mainImpl() !void {
         fillRandomF32(rnd, b);
         @memset(out, 0.0);
 
-        const layout: Layout = try packed1D(n_elem, @sizeOf(f32), arena);
-        const a_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(a), .dtype = .f32, .layout = layout };
-        const b_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(b), .dtype = .f32, .layout = layout };
-        const out_view: BufferViewMut = .{ .bytes = std.mem.sliceAsBytes(out), .dtype = .f32, .layout = layout };
+        var sm = StorageManager.init(allocator);
+        defer sm.deinit();
+
+        const policy: plan_mod.TilePolicy = defaultTilePolicy();
+        const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
+
+        const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+        const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+        try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+        try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const a_in = try g.addInput(.f32, &[_]usize{n_elem});
+        const b_in = try g.addInput(.f32, &[_]usize{n_elem});
+        try g.bindExternal(a_in, @intCast(a_tid));
+        try g.bindExternal(b_in, @intCast(b_tid));
+        const out_v = try g.addElemwiseBinary(.add, a_in, b_in);
+        try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+        var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
 
         const ns: u64 = try benchLoop(opts.iters, struct {
             be: Backend,
-            out_view: BufferViewMut,
-            a_view: BufferViewConst,
-            b_view: BufferViewConst,
+            sm: *StorageManager,
+            prog: *const program_mod.Program,
             fn run(self: @This()) !void {
-                try self.be.elemwiseBinary(.add, self.out_view, self.a_view, self.b_view);
+                try self.be.executeProgram(self.prog, self.sm.tensorStore());
             }
-        }{ .be = be, .out_view = out_view, .a_view = a_view, .b_view = b_view });
+        }{ .be = be, .sm = &sm, .prog = &prog });
 
         // Traffic model: read A + read B + write OUT.
         const bytes: u64 = @as(u64, @intCast(3 * n_elem * @sizeOf(f32))) * @as(u64, @intCast(opts.iters));
@@ -661,18 +689,34 @@ fn mainImpl() !void {
         fillRandomF32(rnd, a);
         @memset(out, 0.0);
 
-        const layout: Layout = try packed1D(n_elem, @sizeOf(f32), arena);
-        const a_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(a), .dtype = .f32, .layout = layout };
-        const out_view: BufferViewMut = .{ .bytes = std.mem.sliceAsBytes(out), .dtype = .f32, .layout = layout };
+        var sm = StorageManager.init(allocator);
+        defer sm.deinit();
+
+        const policy: plan_mod.TilePolicy = defaultTilePolicy();
+        const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
+
+        const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+        try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const a_in = try g.addInput(.f32, &[_]usize{n_elem});
+        try g.bindExternal(a_in, @intCast(a_tid));
+        const out_v = try g.addRelu(a_in);
+        try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+        var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
 
         const ns: u64 = try benchLoop(opts.iters, struct {
             be: Backend,
-            out_view: BufferViewMut,
-            a_view: BufferViewConst,
+            sm: *StorageManager,
+            prog: *const program_mod.Program,
             fn run(self: @This()) !void {
-                try self.be.relu(self.out_view, self.a_view);
+                try self.be.executeProgram(self.prog, self.sm.tensorStore());
             }
-        }{ .be = be, .out_view = out_view, .a_view = a_view });
+        }{ .be = be, .sm = &sm, .prog = &prog });
 
         // Traffic: read A + write OUT.
         const bytes: u64 = @as(u64, @intCast(2 * n_elem * @sizeOf(f32))) * @as(u64, @intCast(opts.iters));
@@ -692,20 +736,34 @@ fn mainImpl() !void {
 
         var out: [1]f32 = .{0.0};
 
-        const a_layout: Layout = try packed1D(n_elem, @sizeOf(f32), arena);
-        const out_layout: Layout = emptyLayout0D();
+        var sm = StorageManager.init(allocator);
+        defer sm.deinit();
 
-        const a_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(a), .dtype = .f32, .layout = a_layout };
-        const out_view: BufferViewMut = .{ .bytes = std.mem.sliceAsBytes(out[0..]), .dtype = .f32, .layout = out_layout };
+        const policy: plan_mod.TilePolicy = defaultTilePolicy();
+        const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
+
+        const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+        try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const a_in = try g.addInput(.f32, &[_]usize{n_elem});
+        try g.bindExternal(a_in, @intCast(a_tid));
+        const out_v = try g.addReduce(.sum, a_in);
+        try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+        var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
 
         const ns: u64 = try benchLoop(opts.iters, struct {
             be: Backend,
-            out_view: BufferViewMut,
-            a_view: BufferViewConst,
+            sm: *StorageManager,
+            prog: *const program_mod.Program,
             fn run(self: @This()) !void {
-                try self.be.reduce(.sum, self.out_view, self.a_view);
+                try self.be.executeProgram(self.prog, self.sm.tensorStore());
             }
-        }{ .be = be, .out_view = out_view, .a_view = a_view });
+        }{ .be = be, .sm = &sm, .prog = &prog });
 
         const bytes: u64 = @as(u64, @intCast(n_elem * @sizeOf(f32))) * @as(u64, @intCast(opts.iters));
         const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
@@ -731,26 +789,38 @@ fn mainImpl() !void {
         fillRandomF32(rnd, b);
         @memset(c, 0.0);
 
-        const a_layout: Layout = try packed2D(m, k, @sizeOf(f32), arena);
-        const b_layout: Layout = try packed2D(k, n, @sizeOf(f32), arena);
-        const c_layout: Layout = try packed2D(m, n, @sizeOf(f32), arena);
+        var sm = StorageManager.init(allocator);
+        defer sm.deinit();
 
-        const a_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(a), .dtype = .f32, .layout = a_layout };
-        const b_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(b), .dtype = .f32, .layout = b_layout };
-        const c_view: BufferViewMut = .{ .bytes = std.mem.sliceAsBytes(c), .dtype = .f32, .layout = c_layout };
+        const policy: plan_mod.TilePolicy = defaultTilePolicy();
+        const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
-        const params: MatMulParams = .{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
+        const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+        const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+        try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+        try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const a_in = try g.addInput(.f32, &[_]usize{ m, k });
+        const b_in = try g.addInput(.f32, &[_]usize{ k, n });
+        try g.bindExternal(a_in, @intCast(a_tid));
+        try g.bindExternal(b_in, @intCast(b_tid));
+        const out_v = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+        try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+        var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
 
         const ns: u64 = try benchLoop(opts.iters, struct {
             be: Backend,
-            params: MatMulParams,
-            c_view: BufferViewMut,
-            a_view: BufferViewConst,
-            b_view: BufferViewConst,
+            sm: *StorageManager,
+            prog: *const program_mod.Program,
             fn run(self: @This()) !void {
-                try self.be.matmul(self.params, self.c_view, self.a_view, self.b_view);
+                try self.be.executeProgram(self.prog, self.sm.tensorStore());
             }
-        }{ .be = be, .params = params, .c_view = c_view, .a_view = a_view, .b_view = b_view });
+        }{ .be = be, .sm = &sm, .prog = &prog });
 
         const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
         const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(opts.iters)), ns);
@@ -776,41 +846,44 @@ fn mainImpl() !void {
             const c: []f32 = try allocator.alloc(f32, m * n);
             defer allocator.free(c);
 
-            const a_layout: Layout = try packed2D(m, k, @sizeOf(f32), arena);
-            const c_layout: Layout = try packed2D(m, n, @sizeOf(f32), arena);
-
-            const a_view: BufferViewConst = .{ .bytes = std.mem.sliceAsBytes(a), .dtype = .f32, .layout = a_layout };
-            const c_view: BufferViewMut = .{ .bytes = std.mem.sliceAsBytes(c), .dtype = .f32, .layout = c_layout };
-
-            const params: MatMulParams = .{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
-
             // q8_0
             {
                 const b_bytes: []u8 = try buildQuantB_Q8_0(allocator, rnd, k, n);
                 defer allocator.free(b_bytes);
                 @memset(c, 0.0);
 
-                // For quant tensors, packedness ignores strides; still supply a valid rank-2 layout.
-                const b_shape = try arena.alloc(usize, 2);
-                const b_strides = try arena.alloc(isize, 2);
-                b_shape[0] = k;
-                b_shape[1] = n;
-                b_strides[0] = 1;
-                b_strides[1] = 1;
-                const b_layout: Layout = .{ .rank = 2, .shape = b_shape, .strides_bytes = b_strides };
+                var sm = StorageManager.init(allocator);
+                defer sm.deinit();
 
-                const b_view: BufferViewConst = .{ .bytes = b_bytes, .dtype = .q8_0, .layout = b_layout };
+                const policy: plan_mod.TilePolicy = defaultTilePolicy();
+                const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .q8_0);
+
+                const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+                const b_tid: TensorId = try sm.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+                try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+                try sm.writeFromPackedQuant(b_tid, b_bytes);
+
+                var g = graph_mod.Graph.init(allocator);
+                defer g.deinit();
+
+                const a_in = try g.addInput(.f32, &[_]usize{ m, k });
+                const b_in = try g.addInput(.q8_0, &[_]usize{ k, n });
+                try g.bindExternal(a_in, @intCast(a_tid));
+                try g.bindExternal(b_in, @intCast(b_tid));
+                const out_v = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+                try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+                var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+                defer prog.deinit();
 
                 const ns: u64 = try benchLoop(opts.iters, struct {
                     be: Backend,
-                    params: MatMulParams,
-                    c_view: BufferViewMut,
-                    a_view: BufferViewConst,
-                    b_view: BufferViewConst,
+                    sm: *StorageManager,
+                    prog: *const program_mod.Program,
                     fn run(self: @This()) !void {
-                        try self.be.matmul(self.params, self.c_view, self.a_view, self.b_view);
+                        try self.be.executeProgram(self.prog, self.sm.tensorStore());
                     }
-                }{ .be = be, .params = params, .c_view = c_view, .a_view = a_view, .b_view = b_view });
+                }{ .be = be, .sm = &sm, .prog = &prog });
 
                 const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
                 const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(opts.iters)), ns);
@@ -824,26 +897,38 @@ fn mainImpl() !void {
                 defer allocator.free(b_bytes);
                 @memset(c, 0.0);
 
-                const b_shape = try arena.alloc(usize, 2);
-                const b_strides = try arena.alloc(isize, 2);
-                b_shape[0] = k;
-                b_shape[1] = n;
-                b_strides[0] = 1;
-                b_strides[1] = 1;
-                const b_layout: Layout = .{ .rank = 2, .shape = b_shape, .strides_bytes = b_strides };
+                var sm = StorageManager.init(allocator);
+                defer sm.deinit();
 
-                const b_view: BufferViewConst = .{ .bytes = b_bytes, .dtype = .q4_0, .layout = b_layout };
+                const policy: plan_mod.TilePolicy = defaultTilePolicy();
+                const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .q4_0);
+
+                const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+                const b_tid: TensorId = try sm.createTiledTensor(.q4_0, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+                try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+                try sm.writeFromPackedQuant(b_tid, b_bytes);
+
+                var g = graph_mod.Graph.init(allocator);
+                defer g.deinit();
+
+                const a_in = try g.addInput(.f32, &[_]usize{ m, k });
+                const b_in = try g.addInput(.q4_0, &[_]usize{ k, n });
+                try g.bindExternal(a_in, @intCast(a_tid));
+                try g.bindExternal(b_in, @intCast(b_tid));
+                const out_v = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+                try g.setOutputs(&[_]graph_mod.ValueId{out_v});
+
+                var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+                defer prog.deinit();
 
                 const ns: u64 = try benchLoop(opts.iters, struct {
                     be: Backend,
-                    params: MatMulParams,
-                    c_view: BufferViewMut,
-                    a_view: BufferViewConst,
-                    b_view: BufferViewConst,
+                    sm: *StorageManager,
+                    prog: *const program_mod.Program,
                     fn run(self: @This()) !void {
-                        try self.be.matmul(self.params, self.c_view, self.a_view, self.b_view);
+                        try self.be.executeProgram(self.prog, self.sm.tensorStore());
                     }
-                }{ .be = be, .params = params, .c_view = c_view, .a_view = a_view, .b_view = b_view });
+                }{ .be = be, .sm = &sm, .prog = &prog });
 
                 const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
                 const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(opts.iters)), ns);

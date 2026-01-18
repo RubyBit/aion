@@ -4,10 +4,13 @@ const types = @import("../types.zig");
 const utils = @import("../utils.zig");
 const elemwise = @import("kernels/elemwise.zig");
 const matmul_k = @import("kernels/matmul.zig");
+const matmul_registry = @import("kernels/matmul_registry.zig");
+const matvec_k = @import("kernels/matvecmul.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const simd = @import("kernels/simd.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
+const x86_cpuid = @import("tuning/x86_cpuid.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 
 const Backend = backend_mod.Backend;
@@ -33,9 +36,11 @@ pub const CpuBackend = struct {
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
 
+    matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
+
     // Per-thread scratch for f32 matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
-    matmul_scratch_f32: []matmul_k.MatMulScratchF32 = &[_]matmul_k.MatMulScratchF32{},
+    matmul_scratch_f32: [][]align(32) u8 = &[_][]align(32) u8{},
 
     // Future: thread pool handle, SIMD feature flags, scratch buffers
 
@@ -48,13 +53,13 @@ pub const CpuBackend = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_]matmul_k.MatMulScratchF32{} };
+        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {
         if (opts.thread_count == 0) return error.InvalidArgument;
 
-        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_]matmul_k.MatMulScratchF32{} };
+        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
         if (opts.thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = opts.thread_count });
             self.pool = p;
@@ -64,15 +69,20 @@ pub const CpuBackend = struct {
             self.reduce_scratch_f32 = try allocator.alloc(f32, opts.thread_count);
 
             // Allocate matmul scratch once. No allocations during op execution.
-            var mm: []matmul_k.MatMulScratchF32 = try allocator.alloc(matmul_k.MatMulScratchF32, opts.thread_count);
+            // Select a variant based on CPU cache sizes (when available).
+            const cpu_info = x86_cpuid.detect();
+            const mm_choice = matmul_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            self.matmul_f32 = mm_choice.kernels;
+
+            var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);
             errdefer allocator.free(mm);
             var i: usize = 0;
             errdefer {
                 var j: usize = 0;
-                while (j < i) : (j += 1) mm[j].deinit(allocator);
+                while (j < i) : (j += 1) allocator.free(mm[j]);
             }
             while (i < opts.thread_count) : (i += 1) {
-                mm[i] = try matmul_k.MatMulScratchF32.init(allocator);
+                mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), self.matmul_f32.scratch_bytes);
             }
             self.matmul_scratch_f32 = mm;
         }
@@ -86,11 +96,11 @@ pub const CpuBackend = struct {
         }
 
         if (self.matmul_scratch_f32.len != 0) {
-            for (self.matmul_scratch_f32) |*s| {
-                s.deinit(self.allocator);
+            for (self.matmul_scratch_f32) |buf| {
+                self.allocator.free(buf);
             }
             self.allocator.free(self.matmul_scratch_f32);
-            self.matmul_scratch_f32 = &[_]matmul_k.MatMulScratchF32{};
+            self.matmul_scratch_f32 = &[_][]align(32) u8{};
         }
 
         if (self.reduce_scratch_f32.len != 0) {
@@ -112,12 +122,6 @@ pub const CpuBackend = struct {
         .name = nameImpl,
         .caps = capsImpl,
         .deinit = deinitImpl,
-        .elemwiseBinary = elemwiseBinaryImpl,
-        .broadcastLastDimBinary = broadcastLastDimBinaryImpl,
-        .relu = reluImpl,
-        .reduce = reduceImpl,
-        .matmul = matmulImpl,
-        .copy = copyImpl,
         .executeProgram = executeProgramImpl,
     };
 
@@ -516,7 +520,8 @@ pub const CpuBackend = struct {
                                 c_info: types.DTypeInfo,
                                 s: @TypeOf(s),
 
-                                scratch: []matmul_k.MatMulScratchF32,
+                                scratch: [][]align(32) u8,
+                                matmul_f32: matmul_registry.F32Kernels,
 
                                 stop: std.atomic.Value(bool) = .init(false),
                                 err_mutex: std.Thread.Mutex = .{},
@@ -538,6 +543,7 @@ pub const CpuBackend = struct {
                                     if (t.stop.load(.acquire)) return;
 
                                     const tc0: usize = t.c_meta.tile_counts[0];
+                                    const is_matvec: bool = (t.c_meta.shape[0] == 1);
 
                                     // Process tiles in column-major order. Within this range, tiles
                                     // with the same `ti_n` are contiguous, so we can amortize B packing:
@@ -567,11 +573,146 @@ pub const CpuBackend = struct {
                                             defer t.store.releaseConst(b_tile.token);
                                             const b_view = b_tile.bufferView();
 
+                                            // Fast path for matvec-shaped problems in tiled execution:
+                                            // when there is exactly one M-tile, packing B for reuse is pointless.
+                                            if (is_matvec and t.a_dtype == .f32 and t.c_dtype == .f32) {
+                                                const k_tile: usize = b_view.layout.shape[0];
+                                                const n_tile: usize = b_view.layout.shape[1];
+
+                                                // Only one ti_m exists.
+                                                const ti_m: usize = 0;
+                                                var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
+                                                    t.fail(e);
+                                                    return;
+                                                };
+                                                defer t.store.releaseMut(c_tile.token);
+                                                const c_view0 = c_tile.bufferView();
+
+                                                const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
+                                                    t.fail(e);
+                                                    return;
+                                                };
+                                                defer t.store.releaseConst(a_tile.token);
+                                                const a_view = a_tile.bufferView();
+
+                                                const beta_eff: f32 = if (ti_k == 0) t.s.beta else 1.0;
+                                                const params: MatMulParams = .{ .m = 1, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_eff };
+
+                                                switch (t.b_dtype) {
+                                                    .f32 => matvec_k.matvecF32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    },
+                                                    .q4_0 => matvec_k.matvecQ4_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    },
+                                                    .q8_0 => matvec_k.matvecQ8_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    },
+                                                    else => {
+                                                        t.fail(BackendError.Unsupported);
+                                                        return;
+                                                    },
+                                                }
+
+                                                // Done for this (ti_k, ti_n) group.
+                                                continue;
+                                            }
+
                                             if (t.b_dtype == .f32 and t.a_dtype == .f32 and t.c_dtype == .f32) {
                                                 const k_tile: usize = b_view.layout.shape[0];
                                                 const n_tile: usize = b_view.layout.shape[1];
 
-                                                matmul_k.packBTileF32WithScratch(&t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                                // If the planned tiles exceed the selected packing kernel's limits,
+                                                // fall back to the un-packed kernel for correctness.
+                                                if (k_tile > t.matmul_f32.tuning.kc or n_tile > t.matmul_f32.tuning.nc) {
+                                                    var ti_m: usize = ti_m0;
+                                                    while (ti_m < ti_m_end) : (ti_m += 1) {
+                                                        if (t.stop.load(.acquire)) return;
+
+                                                        var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
+                                                            t.fail(e);
+                                                            return;
+                                                        };
+                                                        defer t.store.releaseMut(c_tile.token);
+
+                                                        const c_view0 = c_tile.bufferView();
+                                                        const m_total: usize = c_view0.layout.shape[0];
+
+                                                        const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
+                                                            t.fail(e);
+                                                            return;
+                                                        };
+                                                        defer t.store.releaseConst(a_tile.token);
+                                                        const a_view = a_tile.bufferView();
+
+                                                        // If the scheduled tile exceeds the tuned kernel limits, compute it
+                                                        // in smaller tiles using the tuned kernel.
+                                                        const kk_total: usize = k_tile;
+                                                        const jj_total: usize = n_tile;
+
+                                                        const pb_f32_len: usize = t.matmul_f32.tuning.kc * t.matmul_f32.tuning.nc;
+                                                        const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
+                                                        const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
+
+                                                        var jj: usize = 0;
+                                                        while (jj < jj_total) : (jj += t.matmul_f32.tuning.nc) {
+                                                            const n_sub: usize = @min(t.matmul_f32.tuning.nc, jj_total - jj);
+
+                                                            var kk: usize = 0;
+                                                            while (kk < kk_total) : (kk += t.matmul_f32.tuning.kc) {
+                                                                const k_sub: usize = @min(t.matmul_f32.tuning.kc, kk_total - kk);
+                                                                const beta_eff: f32 = if (kk == 0) beta_tile else 1.0;
+
+                                                                const b_off: usize = (kk * jj_total + jj) * @sizeOf(f32);
+                                                                const b_need: usize = k_sub * n_sub * @sizeOf(f32);
+                                                                if (b_off + b_need > b_view.bytes.len) {
+                                                                    t.fail(BackendError.InvalidArgument);
+                                                                    return;
+                                                                }
+                                                                const b_sub_bytes: []const u8 = b_view.bytes[b_off .. b_off + b_need];
+                                                                t.matmul_f32.pack_b_tile(t.scratch[tid], k_sub, n_sub, b_sub_bytes) catch |e| {
+                                                                    t.fail(e);
+                                                                    return;
+                                                                };
+
+                                                                // Compute C tile for this sub-panel.
+                                                                // C and A are packed tiles already (row-major), so we can slice per-subtile.
+
+                                                                // A tile is [m_tile, kk_total] contiguous.
+                                                                const a_row_bytes: usize = kk_total * @sizeOf(f32);
+                                                                const a_k_off: usize = kk * @sizeOf(f32);
+
+                                                                // C tile is [m_tile, jj_total] contiguous.
+                                                                const c_row_bytes: usize = jj_total * @sizeOf(f32);
+                                                                const c_n_off: usize = jj * @sizeOf(f32);
+
+                                                                var row: usize = 0;
+                                                                while (row < m_total) : (row += 1) {
+                                                                    const a_row: []const u8 = a_view.bytes[row * a_row_bytes .. (row + 1) * a_row_bytes];
+                                                                    const c_row: []u8 = c_view0.bytes[row * c_row_bytes .. (row + 1) * c_row_bytes];
+
+                                                                    const a_sub: []const u8 = a_row[a_k_off .. a_k_off + k_sub * @sizeOf(f32)];
+                                                                    const c_sub: []u8 = c_row[c_n_off .. c_n_off + n_sub * @sizeOf(f32)];
+
+                                                                    const pp: MatMulParams = .{ .m = 1, .n = n_sub, .k = k_sub, .alpha = t.s.alpha, .beta = beta_eff };
+                                                                    t.matmul_f32.matmul_packed_b(t.scratch[tid], packed_b_view, pp, c_sub, a_sub) catch |e| {
+                                                                        t.fail(e);
+                                                                        return;
+                                                                    };
+                                                                }
+                                                            }
+                                                        }
+
+                                                        continue;
+                                                    }
+
+                                                    continue;
+                                                }
+
+                                                t.matmul_f32.pack_b_tile(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
                                                     t.fail(e);
                                                     return;
                                                 };
@@ -597,7 +738,10 @@ pub const CpuBackend = struct {
 
                                                     const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
 
-                                                    matmul_k.matmulF32WithScratchPackedB(&t.scratch[tid], params, c_view0.bytes, a_view.bytes) catch |e| {
+                                                    const pb_f32_len: usize = t.matmul_f32.tuning.kc * t.matmul_f32.tuning.nc;
+                                                    const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
+                                                    const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
+                                                    t.matmul_f32.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
                                                         t.fail(e);
                                                         return;
                                                     };
@@ -694,6 +838,7 @@ pub const CpuBackend = struct {
                                 .c_info = c_info,
                                 .s = s,
                                 .scratch = self.matmul_scratch_f32,
+                                .matmul_f32 = self.matmul_f32,
                             };
 
                             // Reduce callback overhead while also enabling B-pack amortization.
@@ -751,7 +896,28 @@ pub const CpuBackend = struct {
                                 switch (b_dt) {
                                     .f32 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
-                                        try matmul_k.matmulF32(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        if (m_tile == 1) {
+                                            try matvec_k.matvecF32(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        } else {
+                                            // Use tuned packed-B kernel with B packing per tile.
+                                            // This keeps Program execution working without the generic f32 kernel.
+                                            if (k_tile > self.matmul_f32.tuning.kc or n_tile > self.matmul_f32.tuning.nc) return BackendError.InvalidArgument;
+
+                                            const tid: usize = 0;
+                                            var scratch_buf: []align(32) u8 = if (self.matmul_scratch_f32.len != 0) self.matmul_scratch_f32[0] else blk: {
+                                                const tmp = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), self.matmul_f32.scratch_bytes) catch return BackendError.ExecutionFailed;
+                                                break :blk tmp;
+                                            };
+                                            defer if (self.matmul_scratch_f32.len == 0) self.allocator.free(scratch_buf);
+
+                                            try self.matmul_f32.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
+                                            const pb_f32_len: usize = self.matmul_f32.tuning.kc * self.matmul_f32.tuning.nc;
+                                            const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
+                                            const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
+                                            try self.matmul_f32.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
+
+                                            _ = tid;
+                                        }
                                     },
                                     .f16 => {
                                         if (a_dt != .f16) return BackendError.InvalidArgument;
@@ -765,11 +931,19 @@ pub const CpuBackend = struct {
                                     },
                                     .q4_0 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
-                                        try matmul_k.matmulQ4_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        if (m_tile == 1) {
+                                            try matvec_k.matvecQ4_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        } else {
+                                            try matmul_k.matmulQ4_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        }
                                     },
                                     .q8_0 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
-                                        try matmul_k.matmulQ8_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        if (m_tile == 1) {
+                                            try matvec_k.matvecQ8_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        } else {
+                                            try matmul_k.matmulQ8_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                        }
                                     },
                                     else => return BackendError.Unsupported,
                                 }
@@ -1280,552 +1454,5 @@ pub const CpuBackend = struct {
     fn deinitImpl(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deinit();
-    }
-
-    fn elemwiseBinaryImpl(
-        ctx: *anyopaque,
-        op: ElemwiseBinaryOp,
-        out: BufferViewMut,
-        a: BufferViewConst,
-        b: BufferViewConst,
-    ) BackendError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        // Validation already done by Backend wrapper; types are scalar & packed.
-        const elem_count: usize = utils.elemCount(out.layout.shape) catch return BackendError.InvalidArgument;
-
-        const ElemwiseTask = struct {
-            op: ElemwiseBinaryOp,
-            dtype: DType,
-            out_bytes: []u8,
-            a_bytes: []const u8,
-            b_bytes: []const u8,
-            elem_count_total: usize,
-
-            fn runChunk(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                _ = tid;
-                const task: *@This() = @ptrCast(@alignCast(ctx_any));
-                if (start >= end) return;
-
-                const count: usize = end - start;
-                const elem_size: usize = switch (task.dtype) {
-                    .f32 => 4,
-                    .f16 => 2,
-                    else => 0,
-                };
-                if (elem_size == 0) return;
-
-                const off: usize = start * elem_size;
-                // Best-effort safety: if the view is too small, do nothing.
-                if (off > task.out_bytes.len or off > task.a_bytes.len or off > task.b_bytes.len) return;
-
-                const out_s: []u8 = task.out_bytes[off..];
-                const a_s: []const u8 = task.a_bytes[off..];
-                const b_s: []const u8 = task.b_bytes[off..];
-
-                // Ignore errors here: Backend wrapper already validated, and we do bounds checks above.
-                // Any remaining mismatch should be extremely unlikely; worst-case a no-op chunk.
-                switch (task.dtype) {
-                    .f32 => elemwise.elemwiseBinaryF32(task.op, out_s, a_s, b_s, count) catch {},
-                    .f16 => elemwise.elemwiseBinaryF16(task.op, out_s, a_s, b_s, count) catch {},
-                    else => {},
-                }
-            }
-        };
-
-        switch (out.dtype) {
-            .f32, .f16 => {
-                if (self.pool) |*p| {
-                    const elem_bytes: usize = switch (out.dtype) {
-                        .f32 => @as(usize, 4),
-                        .f16 => @as(usize, 2),
-                        else => @as(usize, 0),
-                    };
-                    if (elem_bytes == 0) return BackendError.InvalidArgument;
-
-                    // Heuristic: aim for ~64KiB contiguous chunks per thread.
-                    // This is cache-friendly and amortizes thread pool overhead.
-                    const target_chunk_bytes: usize = 64 * 1024;
-                    var grain_elems: usize = target_chunk_bytes / elem_bytes;
-                    if (grain_elems < 4096) grain_elems = 4096;
-
-                    // Only parallelize if each thread gets at least one "chunk" worth of work.
-                    const min_total_elems: usize = std.math.mul(usize, self.thread_count, grain_elems) catch elem_count;
-
-                    if (elem_count >= min_total_elems) {
-                        var task: ElemwiseTask = .{ .op = op, .dtype = out.dtype, .out_bytes = out.bytes, .a_bytes = a.bytes, .b_bytes = b.bytes, .elem_count_total = elem_count };
-                        p.parallelForAny(@ptrCast(&task), elem_count, grain_elems, ElemwiseTask.runChunk);
-                        return;
-                    }
-                }
-
-                // Fallback single-thread.
-                switch (out.dtype) {
-                    .f32 => try elemwise.elemwiseBinaryF32(op, out.bytes, a.bytes, b.bytes, elem_count),
-                    .f16 => try elemwise.elemwiseBinaryF16(op, out.bytes, a.bytes, b.bytes, elem_count),
-                    else => unreachable,
-                }
-            },
-            .i8 => return BackendError.Unsupported, // integer elemwise not implemented yet
-            .q4_0, .q8_0 => return BackendError.Unsupported, // quant elemwise makes no sense
-        }
-    }
-
-    fn matmulImpl(
-        ctx: *anyopaque,
-        params: MatMulParams,
-        c: BufferViewMut,
-        a: BufferViewConst,
-        b: BufferViewConst,
-    ) BackendError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        // C is always scalar, A is always scalar, B can be quant.
-        const c_dtype = c.dtype;
-        const a_dtype = a.dtype;
-        const b_dtype = b.dtype;
-
-        // Simple, deterministic parallelization over output rows (M).
-        // This is contention-free: each chunk writes disjoint C row ranges.
-        const do_parallel: bool = (self.thread_count > 1) and (params.m >= 2 * self.thread_count);
-        if (do_parallel and self.pool != null) {
-            const MatmulTask = struct {
-                params: MatMulParams,
-                c_dtype: DType,
-                a_dtype: DType,
-                b_dtype: DType,
-                c_bytes: []u8,
-                a_bytes: []const u8,
-                b_bytes: []const u8,
-
-                fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const task: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-
-                    const m_chunk: usize = end - start;
-                    var p: MatMulParams = task.params;
-                    p.m = m_chunk;
-
-                    const n: usize = task.params.n;
-                    const k: usize = task.params.k;
-
-                    // Byte offsets for row-major packed matrices.
-                    const a_elem_bytes: usize = switch (task.a_dtype) {
-                        .f32 => @as(usize, 4),
-                        .f16 => @as(usize, 2),
-                        else => @as(usize, 0),
-                    };
-                    const c_elem_bytes: usize = switch (task.c_dtype) {
-                        .f32 => @as(usize, 4),
-                        .f16 => @as(usize, 2),
-                        else => @as(usize, 0),
-                    };
-                    const a_row_bytes: usize = k * a_elem_bytes;
-                    const c_row_bytes: usize = n * c_elem_bytes;
-                    if (a_row_bytes == 0 or c_row_bytes == 0) return;
-
-                    const a_off: usize = start * a_row_bytes;
-                    const c_off: usize = start * c_row_bytes;
-                    if (a_off > task.a_bytes.len or c_off > task.c_bytes.len) return;
-
-                    const a_s: []const u8 = task.a_bytes[a_off..];
-                    const c_s: []u8 = task.c_bytes[c_off..];
-
-                    // Dispatch mirrors CpuBackend.matmulImpl, but operating on row-slices.
-                    switch (task.b_dtype) {
-                        .f32 => matmul_k.matmulF32(p, c_s, a_s, task.b_bytes) catch {},
-                        .f16 => {
-                            if (task.c_dtype == .f32) {
-                                matmul_k.matmulF16ToF32(p, c_s, a_s, task.b_bytes) catch {};
-                            } else if (task.c_dtype == .f16) {
-                                matmul_k.matmulF16(p, c_s, a_s, task.b_bytes) catch {};
-                            }
-                        },
-                        .q4_0 => matmul_k.matmulQ4_0(p, c_s, a_s, task.b_bytes) catch {},
-                        .q8_0 => matmul_k.matmulQ8_0(p, c_s, a_s, task.b_bytes) catch {},
-                        else => {},
-                    }
-                }
-            };
-
-            var task: MatmulTask = .{
-                .params = params,
-                .c_dtype = c_dtype,
-                .a_dtype = a_dtype,
-                .b_dtype = b_dtype,
-                .c_bytes = c.bytes,
-                .a_bytes = a.bytes,
-                .b_bytes = b.bytes,
-            };
-
-            // We already validated dtype combinations below, but do it early so we can return errors.
-            switch (b_dtype) {
-                .f32 => {
-                    if (a_dtype != .f32 or c_dtype != .f32) return BackendError.InvalidArgument;
-                },
-                .f16 => {
-                    if (a_dtype != .f16) return BackendError.InvalidArgument;
-                    if (!(c_dtype == .f32 or c_dtype == .f16)) return BackendError.InvalidArgument;
-                },
-                .q4_0, .q8_0 => {
-                    if (a_dtype != .f32 or c_dtype != .f32) return BackendError.InvalidArgument;
-                },
-                else => {},
-            }
-
-            // Don't sub-chunk within each thread: we want each thread to call into the
-            // matmul kernel once for its contiguous row range (reduces call overhead).
-            self.pool.?.parallelForAny(@ptrCast(&task), params.m, 0, MatmulTask.runRows);
-            return;
-        }
-
-        switch (b_dtype) {
-            .f32 => {
-                if (a_dtype != .f32 or c_dtype != .f32) return BackendError.InvalidArgument;
-                try matmul_k.matmulF32(params, c.bytes, a.bytes, b.bytes);
-            },
-            .f16 => {
-                // Supported:
-                // - A=f16, B=f16, C=f16
-                // - A=f16, B=f16, C=f32  (accumulate in f32)
-                if (a_dtype != .f16) return BackendError.InvalidArgument;
-                if (c_dtype == .f32) {
-                    try matmul_k.matmulF16ToF32(params, c.bytes, a.bytes, b.bytes);
-                } else if (c_dtype == .f16) {
-                    try matmul_k.matmulF16(params, c.bytes, a.bytes, b.bytes);
-                } else {
-                    return BackendError.InvalidArgument;
-                }
-            },
-            .q4_0 => {
-                // A must be f32, C must be f32 (dequant on the fly)
-                if (a_dtype != .f32 or c_dtype != .f32) return BackendError.InvalidArgument;
-                try matmul_k.matmulQ4_0(params, c.bytes, a.bytes, b.bytes);
-            },
-            .q8_0 => {
-                if (a_dtype != .f32 or c_dtype != .f32) return BackendError.InvalidArgument;
-                try matmul_k.matmulQ8_0(params, c.bytes, a.bytes, b.bytes);
-            },
-            .i8 => return BackendError.Unsupported,
-        }
-    }
-
-    fn broadcastLastDimBinaryImpl(
-        ctx: *anyopaque,
-        op: ElemwiseBinaryOp,
-        out: BufferViewMut,
-        a: BufferViewConst,
-        b: BufferViewConst,
-    ) BackendError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-
-        // Backend wrapper validated packedness and dtype matches.
-        const rank: usize = @as(usize, out.layout.rank);
-        if (rank == 0 or out.layout.shape.len == 0) return BackendError.InvalidArgument;
-
-        const col_count: usize = out.layout.shape[out.layout.shape.len - 1];
-        if (col_count == 0) return;
-
-        const elem_count: usize = utils.elemCount(out.layout.shape) catch return BackendError.InvalidArgument;
-        if (elem_count == 0) return;
-        if (elem_count % col_count != 0) return BackendError.InvalidArgument;
-        const row_count: usize = elem_count / col_count;
-
-        switch (out.dtype) {
-            .f32, .f16 => {
-                if (self.pool) |*p| {
-                    const elem_bytes: usize = switch (out.dtype) {
-                        .f32 => @as(usize, 4),
-                        .f16 => @as(usize, 2),
-                        else => @as(usize, 0),
-                    };
-                    if (elem_bytes == 0) return BackendError.InvalidArgument;
-
-                    const row_bytes: usize = col_count * elem_bytes;
-                    // Aim for ~128KiB contiguous work per chunk.
-                    const target_bytes: usize = 128 * 1024;
-                    var grain_rows: usize = if (row_bytes == 0) 0 else (target_bytes / row_bytes);
-                    if (grain_rows < 1) grain_rows = 1;
-
-                    // Only parallelize if there is enough outer work.
-                    const min_rows: usize = std.math.mul(usize, self.thread_count, 2) catch row_count;
-                    if (row_count >= min_rows and self.thread_count > 1) {
-                        const Task = struct {
-                            op: ElemwiseBinaryOp,
-                            dtype: DType,
-                            out_bytes: []u8,
-                            a_bytes: []const u8,
-                            b_bytes: []const u8,
-                            col_count: usize,
-
-                            fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                                _ = tid;
-                                const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                                if (start >= end) return;
-
-                                // Slice the row range into a contiguous element range.
-                                const row_count_local: usize = end - start;
-                                const col: usize = t.col_count;
-                                const elem_size: usize = switch (t.dtype) {
-                                    .f32 => 4,
-                                    .f16 => 2,
-                                    else => 0,
-                                };
-                                if (elem_size == 0) return;
-
-                                const off: usize = start * col * elem_size;
-                                if (off > t.out_bytes.len or off > t.a_bytes.len) return;
-                                const out_s: []u8 = t.out_bytes[off..];
-                                const a_s: []const u8 = t.a_bytes[off..];
-
-                                // b always starts at offset 0.
-                                switch (t.dtype) {
-                                    .f32 => switch (t.op) {
-                                        .add => elemwise.broadcastLastDimBinaryF32(.add, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .sub => elemwise.broadcastLastDimBinaryF32(.sub, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .mul => elemwise.broadcastLastDimBinaryF32(.mul, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .div => elemwise.broadcastLastDimBinaryF32(.div, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                    },
-                                    .f16 => switch (t.op) {
-                                        .add => elemwise.broadcastLastDimBinaryF16(.add, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .sub => elemwise.broadcastLastDimBinaryF16(.sub, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .mul => elemwise.broadcastLastDimBinaryF16(.mul, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                        .div => elemwise.broadcastLastDimBinaryF16(.div, out_s, a_s, t.b_bytes, row_count_local, col) catch {},
-                                    },
-                                    else => {},
-                                }
-                            }
-                        };
-
-                        var task: Task = .{ .op = op, .dtype = out.dtype, .out_bytes = out.bytes, .a_bytes = a.bytes, .b_bytes = b.bytes, .col_count = col_count };
-                        p.parallelForAny(@ptrCast(&task), row_count, grain_rows, Task.runRows);
-                        return;
-                    }
-                }
-
-                // Fallback single-thread.
-                switch (out.dtype) {
-                    .f32 => switch (op) {
-                        .add => try elemwise.broadcastLastDimBinaryF32(.add, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .sub => try elemwise.broadcastLastDimBinaryF32(.sub, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .mul => try elemwise.broadcastLastDimBinaryF32(.mul, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .div => try elemwise.broadcastLastDimBinaryF32(.div, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                    },
-                    .f16 => switch (op) {
-                        .add => try elemwise.broadcastLastDimBinaryF16(.add, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .sub => try elemwise.broadcastLastDimBinaryF16(.sub, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .mul => try elemwise.broadcastLastDimBinaryF16(.mul, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                        .div => try elemwise.broadcastLastDimBinaryF16(.div, out.bytes, a.bytes, b.bytes, row_count, col_count),
-                    },
-                    else => unreachable,
-                }
-            },
-            else => return BackendError.Unsupported,
-        }
-    }
-
-    fn reluImpl(
-        ctx: *anyopaque,
-        out: BufferViewMut,
-        a: BufferViewConst,
-    ) BackendError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        const elem_count: usize = utils.elemCount(out.layout.shape) catch return BackendError.InvalidArgument;
-
-        switch (out.dtype) {
-            .f32, .f16 => {
-                if (self.pool) |*p| {
-                    const elem_bytes: usize = switch (out.dtype) {
-                        .f32 => @as(usize, 4),
-                        .f16 => @as(usize, 2),
-                        else => @as(usize, 0),
-                    };
-                    if (elem_bytes == 0) return BackendError.InvalidArgument;
-
-                    // Similar heuristic to elemwiseBinary.
-                    const target_chunk_bytes: usize = 64 * 1024;
-                    var grain_elems: usize = target_chunk_bytes / elem_bytes;
-                    if (grain_elems < 4096) grain_elems = 4096;
-
-                    const min_total_elems: usize = std.math.mul(usize, self.thread_count, grain_elems) catch elem_count;
-                    if (elem_count >= min_total_elems) {
-                        const Task = struct {
-                            dtype: DType,
-                            out_bytes: []u8,
-                            a_bytes: []const u8,
-
-                            fn runChunk(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                                _ = tid;
-                                const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                                if (start >= end) return;
-
-                                const count: usize = end - start;
-                                const elem_size: usize = switch (t.dtype) {
-                                    .f32 => 4,
-                                    .f16 => 2,
-                                    else => 0,
-                                };
-                                if (elem_size == 0) return;
-
-                                const off: usize = start * elem_size;
-                                if (off > t.out_bytes.len or off > t.a_bytes.len) return;
-
-                                const out_s: []u8 = t.out_bytes[off..];
-                                const a_s: []const u8 = t.a_bytes[off..];
-
-                                switch (t.dtype) {
-                                    .f32 => elemwise.reluF32(out_s, a_s, count) catch {},
-                                    .f16 => elemwise.reluF16(out_s, a_s, count) catch {},
-                                    else => {},
-                                }
-                            }
-                        };
-
-                        var task: Task = .{ .dtype = out.dtype, .out_bytes = out.bytes, .a_bytes = a.bytes };
-                        p.parallelForAny(@ptrCast(&task), elem_count, grain_elems, Task.runChunk);
-                        return;
-                    }
-                }
-
-                switch (out.dtype) {
-                    .f32 => try elemwise.reluF32(out.bytes, a.bytes, elem_count),
-                    .f16 => try elemwise.reluF16(out.bytes, a.bytes, elem_count),
-                    else => unreachable,
-                }
-            },
-            else => return BackendError.Unsupported,
-        }
-    }
-
-    fn reduceImpl(
-        ctx: *anyopaque,
-        op: types.ReduceOp,
-        out: BufferViewMut,
-        a: BufferViewConst,
-    ) BackendError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        const elem_count: usize = utils.elemCount(a.layout.shape) catch return BackendError.InvalidArgument;
-
-        if (op == .mean and elem_count == 0) return BackendError.InvalidArgument;
-
-        // v0: only scalar dtypes, output must be f32 or f16.
-        if (!(out.dtype == .f32 or out.dtype == .f16)) return BackendError.InvalidArgument;
-        if (!(a.dtype == .f32 or a.dtype == .f16)) return BackendError.InvalidArgument;
-
-        // Empty sum is defined as 0.
-        if (elem_count == 0) {
-            switch (out.dtype) {
-                .f32 => {
-                    const o: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, out.bytes);
-                    if (o.len < 1) return BackendError.InvalidArgument;
-                    o[0] = 0.0;
-                },
-                .f16 => {
-                    const o: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, out.bytes);
-                    if (o.len < 1) return BackendError.InvalidArgument;
-                    o[0] = 0.0;
-                },
-                else => unreachable,
-            }
-            return;
-        }
-
-        var sum: f32 = 0.0;
-
-        const elem_bytes: usize = switch (a.dtype) {
-            .f32 => @as(usize, 4),
-            .f16 => @as(usize, 2),
-            else => @as(usize, 0),
-        };
-        if (elem_bytes == 0) return BackendError.InvalidArgument;
-
-        const do_parallel_initial: bool = (self.thread_count > 1) and (self.pool != null) and (self.reduce_scratch_f32.len >= self.thread_count);
-        if (do_parallel_initial) {
-            // Heuristic: ~256KiB of input per thread-chunk.
-            // IMPORTANT: reduce() is also used by the tiled Program execution path.
-            // If we parallelize reductions on tiny tiles, thread scheduling overhead dominates
-            // and performance collapses (especially at higher thread counts).
-            const target_chunk_bytes: usize = 256 * 1024;
-            var grain_elems: usize = target_chunk_bytes / elem_bytes;
-            if (grain_elems < 8192) grain_elems = 8192;
-
-            const min_total_elems: usize = std.math.mul(usize, self.thread_count, grain_elems) catch elem_count;
-            if (elem_count < min_total_elems) {
-                // Not enough work to amortize parallel overhead.
-                sum = switch (a.dtype) {
-                    .f32 => try reduce_k.sumF32Range(a.bytes, 0, elem_count),
-                    .f16 => try reduce_k.sumF16RangeToF32(a.bytes, 0, elem_count),
-                    else => return BackendError.InvalidArgument,
-                };
-            } else {
-                // Initialize per-thread partials.
-                @memset(self.reduce_scratch_f32[0..self.thread_count], 0.0);
-
-                const Task = struct {
-                    dtype: DType,
-                    a_bytes: []const u8,
-                    partials: []f32,
-
-                    fn runChunk(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                        const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                        if (start >= end) return;
-                        if (tid >= t.partials.len) return;
-
-                        const part: f32 = switch (t.dtype) {
-                            .f32 => reduce_k.sumF32Range(t.a_bytes, start, end) catch 0.0,
-                            .f16 => reduce_k.sumF16RangeToF32(t.a_bytes, start, end) catch 0.0,
-                            else => 0.0,
-                        };
-                        t.partials[tid] += part;
-                    }
-                };
-
-                var task: Task = .{ .dtype = a.dtype, .a_bytes = a.bytes, .partials = self.reduce_scratch_f32[0..self.thread_count] };
-
-                self.pool.?.parallelForAny(@ptrCast(&task), elem_count, grain_elems, Task.runChunk);
-
-                var i: usize = 0;
-                while (i < self.thread_count) : (i += 1) {
-                    sum += self.reduce_scratch_f32[i];
-                }
-            }
-        } else {
-            sum = switch (a.dtype) {
-                .f32 => try reduce_k.sumF32Range(a.bytes, 0, elem_count),
-                .f16 => try reduce_k.sumF16RangeToF32(a.bytes, 0, elem_count),
-                else => return BackendError.InvalidArgument,
-            };
-        }
-
-        if (op == .mean) {
-            sum *= 1.0 / @as(f32, @floatFromInt(elem_count));
-        }
-
-        // Store.
-        switch (out.dtype) {
-            .f32 => {
-                const o: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, out.bytes);
-                if (o.len < 1) return BackendError.InvalidArgument;
-                o[0] = sum;
-            },
-            .f16 => {
-                const o: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, out.bytes);
-                if (o.len < 1) return BackendError.InvalidArgument;
-                o[0] = @floatCast(sum);
-            },
-            else => unreachable,
-        }
-    }
-
-    fn copyImpl(
-        _: *anyopaque,
-        dst: BufferViewMut,
-        src: BufferViewConst,
-    ) BackendError!void {
-
-        // Caller is expected to validate dtype/shape/packedness via Backend.copy(),
-        // but keep this implementation robust if invoked directly.
-        const need: usize = utils.requiredByteLen(dst.dtype, dst.layout) catch return BackendError.InvalidArgument;
-        if (dst.bytes.len < need or src.bytes.len < need) return BackendError.InvalidArgument;
-        @memcpy(dst.bytes[0..need], src.bytes[0..need]);
     }
 };

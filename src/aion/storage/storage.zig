@@ -201,7 +201,7 @@ pub const TiledTensor = struct {
         const tile_total: usize = std.math.mul(usize, tile_counts0, tile_counts1) catch return StorageError.InvalidArgument;
 
         // Quant constraints: for now, enforce that every tile's innermost dimension is compatible.
-        // This is required so `Backend.matmul` can be called on tiles with k % 32 == 0.
+        // This is required so matmul kernels can be called on tiles with k % 32 == 0.
         const di = dtype.info();
         if (di.is_quantized) {
             // Require innermost dimension (shape[0] for rank1, shape[1] for rank2) to be multiple of block_elems.

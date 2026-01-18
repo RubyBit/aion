@@ -21,13 +21,13 @@ pub const Q8_0_BLOCK_BYTES: usize = 34;
 // This keeps the math identical to the reference path:
 //   dot = sum_t (A[t] * (scale * q[t]))
 // i.e. A stays f32; only B is dequantized on the fly.
-const MR: usize = 6;
-const NR: usize = 16;
+pub const MR: usize = 6;
+pub const NR: usize = 16;
 
 // L1/L2 blocking params (must be multiples of Q*_0_BLOCK_ELEMS == 32)
-const KC: usize = 256;
-const MC: usize = 144; // 24 * MR. (144*256*4 = 144KB)
-const NC: usize = 256; // 16 * NR.
+pub const KC: usize = 256;
+pub const MC: usize = 144; // 24 * MR. (144*256*4 = 144KB)
+pub const NC: usize = 256; // 16 * NR.
 
 comptime {
     if (KC % Q8_0_BLOCK_ELEMS != 0) @compileError("KC must be a multiple of 32");
@@ -39,9 +39,9 @@ comptime {
 //   - scales: [NR]f32
 //   - q:      [32][NR]i8  (transposed; contiguous NR for each t)
 // Layout is identical for q8_0 and q4_0 (q4 is decoded during packing).
-const PB_KBLOCK_BYTES: usize = NR * @sizeOf(f32) + Q8_0_BLOCK_ELEMS * NR * @sizeOf(i8);
-const PB_PANEL_BYTES: usize = (KC / Q8_0_BLOCK_ELEMS) * PB_KBLOCK_BYTES;
-const PB_TOTAL_BYTES: usize = (NC / NR) * PB_PANEL_BYTES;
+pub const PB_KBLOCK_BYTES: usize = NR * @sizeOf(f32) + Q8_0_BLOCK_ELEMS * NR * @sizeOf(i8);
+pub const PB_PANEL_BYTES: usize = (KC / Q8_0_BLOCK_ELEMS) * PB_KBLOCK_BYTES;
+pub const PB_TOTAL_BYTES: usize = (NC / NR) * PB_PANEL_BYTES;
 
 inline fn scaleF16BitsToF32(scale_bits: u16) f32 {
     return @as(f32, @as(f16, @bitCast(scale_bits)));
@@ -74,7 +74,7 @@ fn zeroTailCols(nr: usize, scales: []f32, q: [*]i8) void {
     }
 }
 
-fn packPanelB_Q8_0(kc: usize, nr: usize, b_bytes: []const u8, n_total: usize, kb_start: usize, j_start: usize, packed_out: *[PB_PANEL_BYTES]u8) void {
+pub fn packPanelB_Q8_0(kc: usize, nr: usize, b_bytes: []const u8, n_total: usize, kb_start: usize, j_start: usize, packed_out: *[PB_PANEL_BYTES]u8) void {
     // kc is in f32 elements; quant B is in blocks of 32.
     const k_blocks: usize = kc / Q8_0_BLOCK_ELEMS;
 
@@ -103,7 +103,7 @@ fn packPanelB_Q8_0(kc: usize, nr: usize, b_bytes: []const u8, n_total: usize, kb
     }
 }
 
-fn packPanelB_Q4_0(kc: usize, nr: usize, b_bytes: []const u8, n_total: usize, kb_start: usize, j_start: usize, packed_out: *[PB_PANEL_BYTES]u8) void {
+pub fn packPanelB_Q4_0(kc: usize, nr: usize, b_bytes: []const u8, n_total: usize, kb_start: usize, j_start: usize, packed_out: *[PB_PANEL_BYTES]u8) void {
     const k_blocks: usize = kc / Q4_0_BLOCK_ELEMS;
 
     var kb: usize = 0;

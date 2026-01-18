@@ -3,7 +3,7 @@ const types = @import("../../types.zig");
 const matmul_tuned = @import("matmul_tuned.zig");
 
 pub const Tuning = struct {
-    // Micro-kernel tiles (kept fixed for now).
+    // Micro-kernel tiles
     mr: usize,
     nr: usize,
 
@@ -31,7 +31,7 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning) F32Kernels {
-    const K = matmul_tuned.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc });
+    const K = matmul_tuned.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr });
     return .{
         .tuning = t,
         .scratch_bytes = K.scratchBytes(),

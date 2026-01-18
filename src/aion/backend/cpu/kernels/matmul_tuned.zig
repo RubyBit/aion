@@ -1,16 +1,11 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
+const matmul_registry = @import("matmul_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
-
-pub const Tuning = struct {
-    // Keep micro-kernel fixed for now.
-    kc: usize,
-    mc: usize,
-    nc: usize,
-};
+const Tuning = matmul_registry.Tuning;
 
 pub fn Kernel(comptime t: Tuning) type {
     return struct {
@@ -18,8 +13,8 @@ pub fn Kernel(comptime t: Tuning) type {
         pub const MC = t.mc;
         pub const NC = t.nc;
 
-        pub const MR = 6;
-        pub const NR = 16;
+        pub const MR = t.mr;
+        pub const NR = t.nr;
         pub const ScratchAlignment: usize = 32;
 
         pub fn scratchBytes() usize {

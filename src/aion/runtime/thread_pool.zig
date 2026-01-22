@@ -25,7 +25,9 @@ pub const ThreadPool = struct {
 
     const Shared = struct {
         // Synchronization primitives
-        job_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        // Per-worker job sequence (futex address). Only workers that will execute
+        // work for the current job are woken.
+        worker_job_seq: []std.atomic.Value(u32) = &[_]std.atomic.Value(u32){},
         pending_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         ready_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -36,7 +38,8 @@ pub const ThreadPool = struct {
         grain: usize = 0,
         func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void = undefined,
 
-        thread_count_total: usize = 1,
+        // Threads used for the current job (includes main thread tid=0).
+        job_thread_count_total: usize = 1,
     };
 
     const WorkerArgs = struct {
@@ -62,12 +65,16 @@ pub const ThreadPool = struct {
         const shared: *Shared = try allocator.create(Shared);
         errdefer allocator.destroy(shared);
         shared.* = .{};
-        shared.thread_count_total = pool.thread_count_total;
         pool.shared = shared;
 
         const worker_count: usize = opts.thread_count - 1;
         pool.worker_threads = try allocator.alloc(std.Thread, worker_count);
         errdefer allocator.free(pool.worker_threads);
+
+        // Allocate per-worker job sequence counters.
+        shared.worker_job_seq = try allocator.alloc(std.atomic.Value(u32), worker_count);
+        errdefer allocator.free(shared.worker_job_seq);
+        for (shared.worker_job_seq) |*v| v.* = std.atomic.Value(u32).init(0);
 
         var i: usize = 0;
         while (i < worker_count) : (i += 1) {
@@ -96,9 +103,13 @@ pub const ThreadPool = struct {
 
         // Signal stop
         shared.stop.store(true, .seq_cst);
-        const seq = shared.job_seq.load(.monotonic);
-        shared.job_seq.store(seq + 1, .release);
-        std.Thread.Futex.wake(&shared.job_seq, @intCast(self.worker_threads.len));
+        // Wake all workers (each waits on its own futex word).
+        for (shared.worker_job_seq, 0..) |*seq, idx| {
+            _ = idx;
+            const v = seq.load(.monotonic);
+            seq.store(v + 1, .release);
+            std.Thread.Futex.wake(seq, 1);
+        }
 
         for (self.worker_threads) |t| {
             t.join();
@@ -106,6 +117,10 @@ pub const ThreadPool = struct {
 
         if (self.worker_threads.len > 0) {
             self.allocator.free(self.worker_threads);
+        }
+        if (shared.worker_job_seq.len > 0) {
+            self.allocator.free(shared.worker_job_seq);
+            shared.worker_job_seq = &[_]std.atomic.Value(u32){};
         }
         self.worker_threads = &[_]std.Thread{};
         self.thread_count_total = 1;
@@ -140,7 +155,10 @@ pub const ThreadPool = struct {
             return;
         };
 
-        const workers_total = self.thread_count_total - 1;
+        // Only use as many threads as there are work items.
+        // This avoids waking many workers that would get empty ranges.
+        const threads_job_total: usize = @min(self.thread_count_total, n);
+        const workers_job: usize = if (threads_job_total > 0) (threads_job_total - 1) else 0;
 
         // Prepare job
         shared.ctx = ctx;
@@ -148,18 +166,21 @@ pub const ThreadPool = struct {
         shared.grain = if (grain == 0) n else grain;
         shared.func = func;
 
-        // Reset pending count to all workers
-        shared.pending_workers.store(@intCast(workers_total), .monotonic);
+        shared.job_thread_count_total = threads_job_total;
 
-        // Publish job by incrementing sequence
-        const seq = shared.job_seq.load(.monotonic);
-        shared.job_seq.store(seq + 1, .release);
+        // Reset pending count to the number of workers we will actually wake.
+        shared.pending_workers.store(@intCast(workers_job), .monotonic);
 
-        // Wake workers
-        std.Thread.Futex.wake(&shared.job_seq, @intCast(workers_total));
+        // Publish job to selected workers by incrementing their per-worker sequence.
+        var w: usize = 0;
+        while (w < workers_job) : (w += 1) {
+            const seq = shared.worker_job_seq[w].load(.monotonic);
+            shared.worker_job_seq[w].store(seq + 1, .release);
+            std.Thread.Futex.wake(&shared.worker_job_seq[w], 1);
+        }
 
         // Run main thread work (tid=0)
-        runForTid(ctx, n, shared.grain, func, 0, self.thread_count_total);
+        runForTid(ctx, n, shared.grain, func, 0, threads_job_total);
 
         // Wait for workers to finish
         var spin_wait: usize = 0;
@@ -185,34 +206,33 @@ pub const ThreadPool = struct {
         _ = shared.ready_workers.fetchAdd(1, .release);
         std.Thread.Futex.wake(&shared.ready_workers, 1);
 
-        var last_seq = shared.job_seq.load(.monotonic);
+        const idx: usize = tid - 1;
+        var last_seq = shared.worker_job_seq[idx].load(.monotonic);
 
         while (true) {
-            // Wait for new job
+            // Wait for new job (per-worker futex word).
             var spin_wait: usize = 0;
-            var seq = shared.job_seq.load(.acquire);
+            var seq = shared.worker_job_seq[idx].load(.acquire);
 
             while (seq == last_seq) {
                 if (spin_wait < 5000) {
                     std.atomic.spinLoopHint();
                     spin_wait += 1;
-                    seq = shared.job_seq.load(.monotonic);
+                    seq = shared.worker_job_seq[idx].load(.monotonic);
                     continue;
                 }
-                std.Thread.Futex.wait(&shared.job_seq, last_seq);
-                seq = shared.job_seq.load(.monotonic);
+                std.Thread.Futex.wait(&shared.worker_job_seq[idx], last_seq);
+                seq = shared.worker_job_seq[idx].load(.monotonic);
             }
 
             // Check stop signal
             if (shared.stop.load(.monotonic)) return;
 
-            // Ensure acquire fence for payload if needed, job_seq load(.acquire) above covers it
-            _ = shared.job_seq.load(.acquire);
-
             last_seq = seq;
 
             // Execute
-            runForTid(shared.ctx, shared.n, shared.grain, shared.func, tid, shared.thread_count_total);
+            const tc: usize = shared.job_thread_count_total;
+            runForTid(shared.ctx, shared.n, shared.grain, shared.func, tid, tc);
 
             // Notify completion
             const prev = shared.pending_workers.fetchSub(1, .release);

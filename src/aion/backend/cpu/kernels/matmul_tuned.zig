@@ -9,6 +9,7 @@ const Tuning = matmul_registry.Tuning;
 
 pub fn Kernel(comptime t: Tuning) type {
     return struct {
+        pub const LANES: usize = simd.lanesF32();
         pub const KC = t.kc;
         pub const MC = t.mc;
         pub const NC = t.nc;
@@ -124,7 +125,7 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = 8;
+            const lanes = LANES; // 8 
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;
@@ -222,7 +223,7 @@ pub fn Kernel(comptime t: Tuning) type {
             nr: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = 8;
+            const lanes = LANES; // 8
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;

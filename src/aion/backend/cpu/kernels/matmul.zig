@@ -1,7 +1,6 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const quant = @import("quant.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -61,12 +60,4 @@ pub fn matmulF16ToF32(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, 
             c[c_idx] = alpha * acc + beta * c[c_idx];
         }
     }
-}
-
-pub fn matmulQ4_0(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
-    return quant.matmulQ4_0(params, c_bytes, a_bytes, b_bytes);
-}
-
-pub fn matmulQ8_0(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
-    return quant.matmulQ8_0(params, c_bytes, a_bytes, b_bytes);
 }

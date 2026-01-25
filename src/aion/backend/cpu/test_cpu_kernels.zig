@@ -4,7 +4,8 @@ const types = @import("../types.zig");
 const elemwise = @import("kernels/elemwise.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("kernels/matmul_registry.zig");
-const matvec = @import("kernels/matvecmul.zig");
+const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
+const matvec_registry = @import("kernels/matvec_registry.zig");
 const quant = @import("kernels/quant.zig");
 
 const BackendError = types.BackendError;
@@ -132,11 +133,12 @@ test "cpu kernels: matvec f32" {
         c_ref[j] = acc;
     }
 
-    try matvec.matvecF32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvec_registry.candidates[0].kernels.matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
 }
 
 const Q8_BYTES: usize = types.DType.q8_0.info().block_bytes;
+const Q4_BYTES: usize = types.DType.q4_0.info().block_bytes;
 
 fn quantizeQ8_0FromF32Block32(vals: *const [32]f32, out: *[Q8_BYTES]u8) void {
     var max_abs: f32 = 0.0;
@@ -156,6 +158,135 @@ fn quantizeQ8_0FromF32Block32(vals: *const [32]f32, out: *[Q8_BYTES]u8) void {
         const qi8: i8 = @intCast(std.math.clamp(qi32, -128, 127));
         out[2 + i] = @bitCast(qi8);
     }
+}
+
+fn quantizeQ4_0FromF32Block32(vals: *const [32]f32, out: *[Q4_BYTES]u8) void {
+    var max_abs: f32 = 0.0;
+    for (vals.*) |v| {
+        const a: f32 = @abs(v);
+        if (a > max_abs) max_abs = a;
+    }
+
+    // q4_0 represents values in [-8, 7] with a per-block scale.
+    const scale: f32 = if (max_abs == 0.0) 1.0 else (max_abs / 7.0);
+    const scale_f16: f16 = @floatCast(scale);
+    const scale_bits: [2]u8 = @bitCast(scale_f16);
+    out[0] = scale_bits[0];
+    out[1] = scale_bits[1];
+
+    // 16 bytes of packed nibbles.
+    var i: usize = 0;
+    while (i < 16) : (i += 1) out[2 + i] = 0;
+
+    var t: usize = 0;
+    while (t < 32) : (t += 1) {
+        const qf: f32 = vals[t] / scale;
+        const qi32: i32 = @intFromFloat(std.math.round(qf));
+        const qi: i32 = std.math.clamp(qi32, -8, 7);
+        const nib: u8 = @intCast(qi + 8); // store bias +8
+
+        const byte_idx: usize = t >> 1;
+        const is_lo: bool = ((t & 1) == 0);
+        if (is_lo) {
+            out[2 + byte_idx] = (out[2 + byte_idx] & 0xF0) | (nib & 0x0F);
+        } else {
+            out[2 + byte_idx] = (out[2 + byte_idx] & 0x0F) | (nib << 4);
+        }
+    }
+}
+
+test "cpu kernels: tuned q8_0 matmul via registry" {
+    const m: usize = 8;
+    const n: usize = 32;
+    const k: usize = 64;
+    const params: MatMulParams = .{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
+
+    var prng = std.Random.DefaultPrng.init(0x8888);
+    const rnd = prng.random();
+
+    var a: [m * k]f32 = undefined;
+    var b_f32: [k * n]f32 = undefined;
+    for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (b_f32[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    // Quantize B into block layout [k_blocks, n].
+    const k_blocks: usize = k / 32;
+    var bq: [k_blocks * n * Q8_BYTES]u8 = undefined;
+    var kb: usize = 0;
+    while (kb < k_blocks) : (kb += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var block: [32]f32 = undefined;
+            var t: usize = 0;
+            while (t < 32) : (t += 1) {
+                block[t] = b_f32[(kb * 32 + t) * n + j];
+            }
+            const off: usize = (kb * n + j) * Q8_BYTES;
+            const dst: *[Q8_BYTES]u8 = @ptrCast(bq[off..][0..Q8_BYTES]);
+            quantizeQ8_0FromF32Block32(&block, dst);
+        }
+    }
+
+    var c_ref: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
+
+    const kernels = quant_matmul_registry.candidates[1].kernels;
+    var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
+    defer std.testing.allocator.free(scratch);
+
+    try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
+    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
+
+    try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
+}
+
+test "cpu kernels: tuned q4_0 matmul via registry" {
+    const m: usize = 8;
+    const n: usize = 32;
+    const k: usize = 64;
+    const params: MatMulParams = .{ .m = m, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
+
+    var prng = std.Random.DefaultPrng.init(0x9999);
+    const rnd = prng.random();
+
+    var a: [m * k]f32 = undefined;
+    var b_f32: [k * n]f32 = undefined;
+    for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (b_f32[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const k_blocks: usize = k / 32;
+    var bq: [k_blocks * n * Q4_BYTES]u8 = undefined;
+    var kb: usize = 0;
+    while (kb < k_blocks) : (kb += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var block: [32]f32 = undefined;
+            var t: usize = 0;
+            while (t < 32) : (t += 1) {
+                block[t] = b_f32[(kb * 32 + t) * n + j];
+            }
+            const off: usize = (kb * n + j) * Q4_BYTES;
+            const dst: *[Q4_BYTES]u8 = @ptrCast(bq[off..][0..Q4_BYTES]);
+            quantizeQ4_0FromF32Block32(&block, dst);
+        }
+    }
+
+    var c_ref: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
+
+    const kernels = quant_matmul_registry.candidates[1].kernels;
+    var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
+    defer std.testing.allocator.free(scratch);
+
+    try kernels.pack_b_tile_q4_0(scratch, k, n, bq[0..]);
+    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
+
+    // q4 is much noisier.
+    try expectSliceApproxEqAbs(c_ref[0..], c[0..], 8e-1);
 }
 
 test "cpu kernels: matvec q8_0" {
@@ -197,11 +328,18 @@ test "cpu kernels: matvec q8_0" {
     }
 
     var c: [n]f32 = [_]f32{0.0} ** n;
-    try matvec.matvecQ8_0(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
+    const kernels = quant_matmul_registry.candidates[1].kernels;
+    var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
+    defer std.testing.allocator.free(scratch);
+
+    try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
+    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
 
 comptime {
     _ = BackendError;
     _ = quant;
+    _ = quant_matmul_registry;
 }

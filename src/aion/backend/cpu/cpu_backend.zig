@@ -5,7 +5,8 @@ const utils = @import("../utils.zig");
 const elemwise = @import("kernels/elemwise.zig");
 const matmul_k = @import("kernels/matmul.zig");
 const matmul_registry = @import("kernels/matmul_registry.zig");
-const matvec_k = @import("kernels/matvecmul.zig");
+const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
+const matvec_registry = @import("kernels/matvec_registry.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const simd = @import("kernels/simd.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
@@ -38,7 +39,11 @@ pub const CpuBackend = struct {
 
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
-    // Per-thread scratch for f32 matmul packing (A/B panels).
+    matmul_qx0: quant_matmul_registry.QuantKernels = quant_matmul_registry.candidates[1].kernels,
+
+    matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
+
+    // Per-thread scratch for matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
     matmul_scratch_f32: [][]align(32) u8 = &[_][]align(32) u8{},
 
@@ -74,6 +79,12 @@ pub const CpuBackend = struct {
             const mm_choice = matmul_registry.selectHeuristic(cpu_info.caches.l2_bytes);
             self.matmul_f32 = mm_choice.kernels;
 
+            const qm_choice = quant_matmul_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            self.matmul_qx0 = qm_choice.kernels;
+
+            const mv_choice = matvec_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            self.matvec = mv_choice.kernels;
+
             var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);
             errdefer allocator.free(mm);
             var i: usize = 0;
@@ -81,8 +92,9 @@ pub const CpuBackend = struct {
                 var j: usize = 0;
                 while (j < i) : (j += 1) allocator.free(mm[j]);
             }
+            const scratch_bytes: usize = @max(self.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
             while (i < opts.thread_count) : (i += 1) {
-                mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), self.matmul_f32.scratch_bytes);
+                mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_bytes);
             }
             self.matmul_scratch_f32 = mm;
         }
@@ -522,6 +534,8 @@ pub const CpuBackend = struct {
 
                                 scratch: [][]align(32) u8,
                                 matmul_f32: matmul_registry.F32Kernels,
+                                matmul_qx0: quant_matmul_registry.QuantKernels,
+                                matvec: matvec_registry.Kernels,
 
                                 stop: std.atomic.Value(bool) = .init(false),
                                 err_mutex: std.Thread.Mutex = .{},
@@ -599,17 +613,42 @@ pub const CpuBackend = struct {
                                                 const params: MatMulParams = .{ .m = 1, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_eff };
 
                                                 switch (t.b_dtype) {
-                                                    .f32 => matvec_k.matvecF32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                                    .f32 => t.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                                         t.fail(e);
                                                         return;
                                                     },
-                                                    .q4_0 => matvec_k.matvecQ4_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                                        t.fail(e);
-                                                        return;
-                                                    },
-                                                    .q8_0 => matvec_k.matvecQ8_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                                        t.fail(e);
-                                                        return;
+                                                    // TODO: optimized quantized matvec paths?
+                                                    .q4_0, .q8_0 => {
+                                                        if (t.a_dtype != .f32 or t.c_dtype != .f32) {
+                                                            t.fail(BackendError.InvalidArgument);
+                                                            return;
+                                                        }
+
+                                                        const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
+                                                            t.matmul_qx0
+                                                        else
+                                                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                                                t.fail(BackendError.InvalidArgument);
+                                                                return;
+                                                            });
+
+                                                        if (t.b_dtype == .q4_0) {
+                                                            qk.pack_b_tile_q4_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                                                t.fail(e);
+                                                                return;
+                                                            };
+                                                        } else {
+                                                            qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                                                t.fail(e);
+                                                                return;
+                                                            };
+                                                        }
+
+                                                        const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(t.scratch[tid][0..qk.packed_b_bytes]);
+                                                        qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
+                                                            t.fail(e);
+                                                            return;
+                                                        };
                                                     },
                                                     else => {
                                                         t.fail(BackendError.Unsupported);
@@ -621,7 +660,60 @@ pub const CpuBackend = struct {
                                                 continue;
                                             }
 
-                                            if (t.b_dtype == .f32 and t.a_dtype == .f32 and t.c_dtype == .f32) {
+                                            if ((t.b_dtype == .q4_0 or t.b_dtype == .q8_0) and t.a_dtype == .f32 and t.c_dtype == .f32) {
+                                                const k_tile: usize = b_view.layout.shape[0];
+                                                const n_tile: usize = b_view.layout.shape[1];
+
+                                                const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
+                                                    t.matmul_qx0
+                                                else
+                                                    (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                                        t.fail(BackendError.InvalidArgument);
+                                                        return;
+                                                    });
+
+                                                // Pack B once and apply across all ti_m in this ti_n group.
+                                                if (t.b_dtype == .q4_0) {
+                                                    qk.pack_b_tile_q4_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    };
+                                                } else {
+                                                    qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    };
+                                                }
+
+                                                const pb_bytes_len: usize = qk.packed_b_bytes;
+                                                const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(t.scratch[tid][0..pb_bytes_len]);
+
+                                                var ti_m: usize = ti_m0;
+                                                while (ti_m < ti_m_end) : (ti_m += 1) {
+                                                    if (t.stop.load(.acquire)) return;
+
+                                                    var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    };
+                                                    defer t.store.releaseMut(c_tile.token);
+                                                    const c_view0 = c_tile.bufferView();
+                                                    const m_tile: usize = c_view0.layout.shape[0];
+
+                                                    const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    };
+                                                    defer t.store.releaseConst(a_tile.token);
+                                                    const a_view = a_tile.bufferView();
+
+                                                    const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
+                                                    qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
+                                                        t.fail(e);
+                                                        return;
+                                                    };
+                                                }
+                                            } else if (t.b_dtype == .f32 and t.a_dtype == .f32 and t.c_dtype == .f32) {
                                                 const k_tile: usize = b_view.layout.shape[0];
                                                 const n_tile: usize = b_view.layout.shape[1];
 
@@ -792,26 +884,6 @@ pub const CpuBackend = struct {
                                                                 return;
                                                             }
                                                         },
-                                                        .q4_0 => {
-                                                            if (t.a_dtype != .f32 or t.c_dtype != .f32) {
-                                                                t.fail(BackendError.InvalidArgument);
-                                                                return;
-                                                            }
-                                                            matmul_k.matmulQ4_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                                                t.fail(e);
-                                                                return;
-                                                            };
-                                                        },
-                                                        .q8_0 => {
-                                                            if (t.a_dtype != .f32 or t.c_dtype != .f32) {
-                                                                t.fail(BackendError.InvalidArgument);
-                                                                return;
-                                                            }
-                                                            matmul_k.matmulQ8_0(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                                                t.fail(e);
-                                                                return;
-                                                            };
-                                                        },
                                                         else => {
                                                             t.fail(BackendError.Unsupported);
                                                             return;
@@ -839,6 +911,8 @@ pub const CpuBackend = struct {
                                 .s = s,
                                 .scratch = self.matmul_scratch_f32,
                                 .matmul_f32 = self.matmul_f32,
+                                .matmul_qx0 = self.matmul_qx0,
+                                .matvec = self.matvec,
                             };
 
                             // Reduce callback overhead while also enabling B-pack amortization.
@@ -897,7 +971,7 @@ pub const CpuBackend = struct {
                                     .f32 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
                                         if (m_tile == 1) {
-                                            try matvec_k.matvecF32(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                                            try self.matvec.matvec_f32(params, c_view.bytes, a_view.bytes, b_view.bytes);
                                         } else {
                                             // Use tuned packed-B kernel with B packing per tile.
                                             // This keeps Program execution working without the generic f32 kernel.
@@ -931,19 +1005,39 @@ pub const CpuBackend = struct {
                                     },
                                     .q4_0 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
-                                        if (m_tile == 1) {
-                                            try matvec_k.matvecQ4_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                                        } else {
-                                            try matmul_k.matmulQ4_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                                        }
+                                        const qk: quant_matmul_registry.QuantKernels = if (k_tile <= self.matmul_qx0.tuning.kc and n_tile <= self.matmul_qx0.tuning.nc)
+                                            self.matmul_qx0
+                                        else
+                                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+
+                                        var scratch_buf: []align(32) u8 = if (self.matmul_scratch_f32.len != 0) self.matmul_scratch_f32[0] else blk: {
+                                            const scratch_need: usize = @max(self.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                                            const tmp = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
+                                            break :blk tmp;
+                                        };
+                                        defer if (self.matmul_scratch_f32.len == 0) self.allocator.free(scratch_buf);
+
+                                        try qk.pack_b_tile_q4_0(scratch_buf, k_tile, n_tile, b_view.bytes);
+                                        const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
+                                        try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
                                     },
                                     .q8_0 => {
                                         if (a_dt != .f32 or c_dt != .f32) return BackendError.InvalidArgument;
-                                        if (m_tile == 1) {
-                                            try matvec_k.matvecQ8_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                                        } else {
-                                            try matmul_k.matmulQ8_0(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                                        }
+                                        const qk: quant_matmul_registry.QuantKernels = if (k_tile <= self.matmul_qx0.tuning.kc and n_tile <= self.matmul_qx0.tuning.nc)
+                                            self.matmul_qx0
+                                        else
+                                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+
+                                        var scratch_buf: []align(32) u8 = if (self.matmul_scratch_f32.len != 0) self.matmul_scratch_f32[0] else blk: {
+                                            const scratch_need: usize = @max(self.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                                            const tmp = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
+                                            break :blk tmp;
+                                        };
+                                        defer if (self.matmul_scratch_f32.len == 0) self.allocator.free(scratch_buf);
+
+                                        try qk.pack_b_tile_q8_0(scratch_buf, k_tile, n_tile, b_view.bytes);
+                                        const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
+                                        try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
                                     },
                                     else => return BackendError.Unsupported,
                                 }

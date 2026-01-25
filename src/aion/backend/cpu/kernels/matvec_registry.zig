@@ -1,5 +1,6 @@
 const types = @import("../../types.zig");
 const matvec_tuned = @import("matvec.zig");
+const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {
     /// Micro-tile along N.
@@ -55,8 +56,8 @@ pub const candidates = [_]Candidate{
     .{ .id = .tuned, .kernels = kernelsFor(.{ .nr = 16, .nc = 256, .prefetch_k_dist = 4 }) },
 };
 
-pub fn selectHeuristic(l2_bytes: usize) Candidate {
-    _ = l2_bytes;
+pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
+    _ = info;
     // Default to tuned; fall back to baseline by switching this if needed.
     return candidates[0];
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const quant_matmul_tuned = @import("quant_matmul_tuned.zig");
+const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -85,9 +86,10 @@ pub fn selectForTile(k: usize, n: usize) ?QuantKernels {
     return best;
 }
 
-pub fn selectHeuristic(l2_bytes: usize) Candidate {
+pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // Similar heuristic to f32: pick largest candidate whose packed-B footprint
     // fits in ~75% of L2.
+    const l2_bytes = info.caches.l2_bytes;
     if (l2_bytes == 0) return candidates[1];
 
     const budget: usize = (l2_bytes * 3) / 4;

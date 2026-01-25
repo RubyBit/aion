@@ -1,30 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cpuid_root = @import("cpuid.zig");
 
-pub const CpuFeatures = struct {
-    avx2: bool = false,
-    avx_vnni: bool = false,
-    avx512_vnni: bool = false,
-    amx_int8: bool = false,
-};
-
-pub const Caches = struct {
-    l1d_bytes: usize = 0,
-    l2_bytes: usize = 0,
-    l3_bytes: usize = 0,
-};
-
-pub const CpuInfo = struct {
-    features: CpuFeatures = .{},
-    caches: Caches = .{},
-};
-
-pub fn detect() CpuInfo {
-    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) {
-        return CpuInfo{};
-    }
-
-    var info: CpuInfo = CpuInfo{};
+pub fn detect() cpuid_root.CpuInfo {
+    var info: cpuid_root.CpuInfo = .{ .arch = .x86_64 };
 
     const max_leaf: u32 = cpuid(0, 0).eax;
     if (max_leaf >= 7) {
@@ -46,9 +25,6 @@ pub fn detect() CpuInfo {
 const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
 
 fn cpuid(leaf: u32, subleaf: u32) CpuidRegs {
-    // For x86_64 under the SysV and Win64 ABIs, RBX is a callee-saved register.
-    // Use an early-clobber output for RBX to make the register allocator happy
-    // and avoid the "couldn't allocate output register" failures.
     var eax: u32 = leaf;
     var ebx: u32 = 0;
     var ecx: u32 = subleaf;
@@ -62,8 +38,7 @@ fn cpuid(leaf: u32, subleaf: u32) CpuidRegs {
               [ecx] "+{ecx}" (ecx),
               [edx] "={edx}" (edx),
             :
-            : .{ .cc = true, .memory = true }
-        );
+            : .{ .cc = true, .memory = true });
     } else {
         asm volatile (
             \\cpuid
@@ -72,18 +47,17 @@ fn cpuid(leaf: u32, subleaf: u32) CpuidRegs {
               [ecx] "+{ecx}" (ecx),
               [edx] "={edx}" (edx),
             :
-            : .{ .cc = true, .memory = true }
-        );
+            : .{ .cc = true, .memory = true });
     }
 
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-fn detectCaches() Caches {
+fn detectCaches() cpuid_root.Caches {
     const max_leaf: u32 = cpuid(0, 0).eax;
-    if (max_leaf < 4) return Caches{};
+    if (max_leaf < 4) return .{};
 
-    var caches: Caches = Caches{};
+    var caches: cpuid_root.Caches = .{};
 
     var i: u32 = 0;
     while (true) : (i += 1) {
@@ -101,7 +75,6 @@ fn detectCaches() Caches {
 
         switch (level) {
             1 => {
-                // Type 1 = data cache, 3 = unified.
                 if (cache_type == 1 or cache_type == 3) caches.l1d_bytes = @max(caches.l1d_bytes, size_bytes);
             },
             2 => caches.l2_bytes = @max(caches.l2_bytes, size_bytes),

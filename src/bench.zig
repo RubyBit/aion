@@ -574,7 +574,7 @@ fn mainImpl() !void {
     const rnd = prng.random();
 
     if (opts.print_cpuid) {
-        const info = aion.cpu.x86_cpuid.detect();
+        const info = aion.cpu.cpuid.detect();
         std.debug.print(
             "cpu cpuid caches: l1d={} l2={} l3={}\n",
             .{ info.caches.l1d_bytes, info.caches.l2_bytes, info.caches.l3_bytes },

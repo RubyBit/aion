@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const matmul_tuned = @import("matmul_tuned.zig");
+const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -47,7 +48,7 @@ pub const candidates = [_]Candidate{
     .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 256, .mc = 240, .nc = 512 }) },
 };
 
-pub fn selectHeuristic(l2_bytes: usize) Candidate {
+pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // Heuristic goal: pick the largest variant that still keeps the packed-B tile
     // in L2 (or as much of it as possible).
     //
@@ -61,6 +62,7 @@ pub fn selectHeuristic(l2_bytes: usize) Candidate {
     // - but never return `small` when L2 is reasonably sized (>= 1MiB), because
     //   the current tiler commonly uses tk=256.
 
+    const l2_bytes = info.caches.l2_bytes;
     if (l2_bytes == 0) return candidates[1];
 
     const budget: usize = (l2_bytes * 3) / 4;

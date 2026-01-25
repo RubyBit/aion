@@ -6,7 +6,7 @@
 pub const backend = @import("aion/backend/backend.zig");
 pub const cpu = struct {
     pub const CpuBackend = @import("aion/backend/cpu/cpu_backend.zig").CpuBackend;
-    pub const x86_cpuid = @import("aion/backend/cpu/tuning/x86_cpuid.zig");
+    pub const cpuid = @import("aion/backend/cpu/tuning/cpuid.zig");
 };
 pub const storage = @import("aion/storage/storage.zig");
 pub const storage_manager = @import("aion/storage/manager.zig");

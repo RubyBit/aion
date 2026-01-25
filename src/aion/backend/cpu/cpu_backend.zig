@@ -11,7 +11,7 @@ const reduce_k = @import("kernels/reduce.zig");
 const simd = @import("kernels/simd.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
-const x86_cpuid = @import("tuning/x86_cpuid.zig");
+const cpuid = @import("tuning/cpuid.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 
 const Backend = backend_mod.Backend;
@@ -75,14 +75,14 @@ pub const CpuBackend = struct {
 
             // Allocate matmul scratch once. No allocations during op execution.
             // Select a variant based on CPU cache sizes (when available).
-            const cpu_info = x86_cpuid.detect();
-            const mm_choice = matmul_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            const cpu_info = cpuid.detect();
+            const mm_choice = matmul_registry.selectHeuristic(cpu_info);
             self.matmul_f32 = mm_choice.kernels;
 
-            const qm_choice = quant_matmul_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            const qm_choice = quant_matmul_registry.selectHeuristic(cpu_info);
             self.matmul_qx0 = qm_choice.kernels;
 
-            const mv_choice = matvec_registry.selectHeuristic(cpu_info.caches.l2_bytes);
+            const mv_choice = matvec_registry.selectHeuristic(cpu_info);
             self.matvec = mv_choice.kernels;
 
             var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);

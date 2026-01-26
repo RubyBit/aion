@@ -1,12 +1,19 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const quant = @import("quant.zig");
 const quant_matmul_registry = @import("quant_matmul_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
 const Tuning = quant_matmul_registry.Tuning;
+
+/// q4_0 block: 32 elements stored as 2-byte f16 scale + 16 bytes (32 nibbles)
+pub const Q4_0_BLOCK_ELEMS: usize = 32;
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// q8_0 block: 32 elements stored as 2-byte f16 scale + 32 bytes (int8s)
+pub const Q8_0_BLOCK_ELEMS: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 34;
 
 pub fn Kernel(comptime t: Tuning) type {
     return struct {
@@ -23,13 +30,13 @@ pub fn Kernel(comptime t: Tuning) type {
 
         comptime {
             if (NR % LANES != 0) @compileError("NR must be a multiple of SIMD lanes");
-            if ((KC % quant.Q8_0_BLOCK_ELEMS) != 0) @compileError("KC must be a multiple of 32");
+            if ((KC % Q8_0_BLOCK_ELEMS) != 0) @compileError("KC must be a multiple of 32");
             if ((NC % NR) != 0) @compileError("NC must be a multiple of NR");
         }
 
         // Packed-B layout matches `kernels/quant.zig`, but is parameterized by KC/NC.
-        pub const PB_KBLOCK_BYTES: usize = NR * @sizeOf(f32) + quant.Q8_0_BLOCK_ELEMS * NR * @sizeOf(i8);
-        pub const PB_PANEL_BYTES: usize = (KC / quant.Q8_0_BLOCK_ELEMS) * PB_KBLOCK_BYTES;
+        pub const PB_KBLOCK_BYTES: usize = NR * @sizeOf(f32) + Q8_0_BLOCK_ELEMS * NR * @sizeOf(i8);
+        pub const PB_PANEL_BYTES: usize = (KC / Q8_0_BLOCK_ELEMS) * PB_KBLOCK_BYTES;
         pub const PB_TOTAL_BYTES: usize = (NC / NR) * PB_PANEL_BYTES;
 
         fn pbBytesPadded() usize {
@@ -81,7 +88,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
             @memset(scales[nr..NR], 0.0);
             var t_el: usize = 0;
-            while (t_el < quant.Q8_0_BLOCK_ELEMS) : (t_el += 1) {
+            while (t_el < Q8_0_BLOCK_ELEMS) : (t_el += 1) {
                 const row_off: usize = t_el * NR;
                 @memset(q[row_off + nr .. row_off + NR], 0);
             }
@@ -115,7 +122,7 @@ pub fn Kernel(comptime t: Tuning) type {
             j_start: usize,
             packed_out: *[PB_PANEL_BYTES]u8,
         ) void {
-            const k_blocks: usize = kc / quant.Q8_0_BLOCK_ELEMS;
+            const k_blocks: usize = kc / Q8_0_BLOCK_ELEMS;
 
             var kb: usize = 0;
             while (kb < k_blocks) : (kb += 1) {
@@ -125,13 +132,13 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var j: usize = 0;
                 while (j < nr) : (j += 1) {
-                    const block_off: usize = ((kb_start + kb) * n_total + (j_start + j)) * quant.Q8_0_BLOCK_BYTES;
+                    const block_off: usize = ((kb_start + kb) * n_total + (j_start + j)) * Q8_0_BLOCK_BYTES;
                     const block_ptr: [*]align(1) const u8 = b_bytes.ptr + block_off;
                     scales_ptr[j] = loadScaleF32FromBlockBytes(block_ptr);
 
                     const src_q: [*]align(1) const i8 = @ptrCast(block_ptr + 2);
                     var t_el: usize = 0;
-                    while (t_el < quant.Q8_0_BLOCK_ELEMS) : (t_el += 1) {
+                    while (t_el < Q8_0_BLOCK_ELEMS) : (t_el += 1) {
                         q_ptr[t_el * NR + j] = src_q[t_el];
                     }
                 }
@@ -149,7 +156,7 @@ pub fn Kernel(comptime t: Tuning) type {
             j_start: usize,
             packed_out: *[PB_PANEL_BYTES]u8,
         ) void {
-            const k_blocks: usize = kc / quant.Q4_0_BLOCK_ELEMS;
+            const k_blocks: usize = kc / Q4_0_BLOCK_ELEMS;
 
             var kb: usize = 0;
             while (kb < k_blocks) : (kb += 1) {
@@ -159,13 +166,13 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var j: usize = 0;
                 while (j < nr) : (j += 1) {
-                    const block_off: usize = ((kb_start + kb) * n_total + (j_start + j)) * quant.Q4_0_BLOCK_BYTES;
+                    const block_off: usize = ((kb_start + kb) * n_total + (j_start + j)) * Q4_0_BLOCK_BYTES;
                     const block_ptr: [*]align(1) const u8 = b_bytes.ptr + block_off;
                     scales_ptr[j] = loadScaleF32FromBlockBytes(block_ptr);
 
                     const nib_ptr: [*]align(1) const u8 = @ptrCast(block_ptr + 2);
                     var t_el: usize = 0;
-                    while (t_el < quant.Q4_0_BLOCK_ELEMS) : (t_el += 1) {
+                    while (t_el < Q4_0_BLOCK_ELEMS) : (t_el += 1) {
                         const byte: u8 = nib_ptr[t_el >> 1];
                         const nib_u: u8 = if ((t_el & 1) == 0) (byte & 0x0F) else (byte >> 4);
                         q_ptr[t_el * NR + j] = @as(i8, @intCast(nib_u)) - @as(i8, 8);
@@ -178,10 +185,10 @@ pub fn Kernel(comptime t: Tuning) type {
 
         pub fn packBTileQ8_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
-            if ((k % quant.Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+            if ((k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
 
-            const k_blocks: usize = k / quant.Q8_0_BLOCK_ELEMS;
-            if (b_bytes.len < k_blocks * n * quant.Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+            const k_blocks: usize = k / Q8_0_BLOCK_ELEMS;
+            if (b_bytes.len < k_blocks * n * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
 
             const s = try splitScratch(scratch_bytes);
             const packed_b: []align(32) u8 = s.pb;
@@ -198,10 +205,10 @@ pub fn Kernel(comptime t: Tuning) type {
 
         pub fn packBTileQ4_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
-            if ((k % quant.Q4_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+            if ((k % Q4_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
 
-            const k_blocks: usize = k / quant.Q4_0_BLOCK_ELEMS;
-            if (b_bytes.len < k_blocks * n * quant.Q4_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+            const k_blocks: usize = k / Q4_0_BLOCK_ELEMS;
+            if (b_bytes.len < k_blocks * n * Q4_0_BLOCK_BYTES) return BackendError.InvalidArgument;
 
             const s = try splitScratch(scratch_bytes);
             const packed_b: []align(32) u8 = s.pb;
@@ -242,7 +249,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
             const a_ptr_base: [*]const f32 = @ptrCast(&packed_a[0]);
             const b_ptr_base: [*]const u8 = packed_b.ptr;
-            const kb_count: usize = kc / quant.Q8_0_BLOCK_ELEMS;
+            const kb_count: usize = kc / Q8_0_BLOCK_ELEMS;
 
             var kb: usize = 0;
             while (kb < kb_count) : (kb += 1) {
@@ -256,7 +263,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 }
 
                 var t_el: usize = 0;
-                while (t_el < quant.Q8_0_BLOCK_ELEMS) : (t_el += 1) {
+                while (t_el < Q8_0_BLOCK_ELEMS) : (t_el += 1) {
                     const q_row: [*]align(1) const i8 = q_ptr + t_el * NR;
 
                     var qs: [num_vecs]VecF = undefined;
@@ -267,7 +274,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     }
 
                     inline for (0..MR) |r| {
-                        const a_val: f32 = a_ptr_base[r * KC + kb * quant.Q8_0_BLOCK_ELEMS + t_el];
+                        const a_val: f32 = a_ptr_base[r * KC + kb * Q8_0_BLOCK_ELEMS + t_el];
                         const a_v: VecF = @splat(a_val);
                         inline for (0..num_vecs) |v| {
                             acc[r][v] = @mulAdd(VecF, a_v, qs[v], acc[r][v]);
@@ -320,7 +327,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
             const a_ptr_base: [*]const f32 = @ptrCast(&packed_a[0]);
             const b_ptr_base: [*]const u8 = packed_b.ptr;
-            const kb_count: usize = kc / quant.Q8_0_BLOCK_ELEMS;
+            const kb_count: usize = kc / Q8_0_BLOCK_ELEMS;
 
             var kb: usize = 0;
             while (kb < kb_count) : (kb += 1) {
@@ -334,7 +341,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 }
 
                 var t_el: usize = 0;
-                while (t_el < quant.Q8_0_BLOCK_ELEMS) : (t_el += 1) {
+                while (t_el < Q8_0_BLOCK_ELEMS) : (t_el += 1) {
                     const q_row: [*]align(1) const i8 = q_ptr + t_el * NR;
 
                     var qs: [num_vecs]VecF = undefined;
@@ -346,7 +353,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                     inline for (0..MR) |r| {
                         if (r < mr) {
-                            const a_val: f32 = a_ptr_base[r * KC + kb * quant.Q8_0_BLOCK_ELEMS + t_el];
+                            const a_val: f32 = a_ptr_base[r * KC + kb * Q8_0_BLOCK_ELEMS + t_el];
                             const a_v: VecF = @splat(a_val);
                             inline for (0..num_vecs) |v| {
                                 acc[r][v] = @mulAdd(VecF, a_v, qs[v], acc[r][v]);
@@ -399,7 +406,7 @@ pub fn Kernel(comptime t: Tuning) type {
             const beta: f32 = params.beta;
 
             if (k > KC or n > NC) return BackendError.InvalidArgument;
-            if ((k % quant.Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+            if ((k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
 
             if (packed_b_view.len < PB_TOTAL_BYTES) return BackendError.InvalidArgument;
 

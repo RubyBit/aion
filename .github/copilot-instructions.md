@@ -21,4 +21,4 @@ Deterministic error handling: expose meaningful Zig error unions when I/O stalls
 
 Configurable prefetch scheduler: exploit predictable execution graphs (e.g., transformer layers) to hide disk I/O behind compute.
 
-Utilizing `zig build bench` we can benchmark the libraries performance ensuring that it meets hpc standards.q
+Utilizing `zig build bench` we can benchmark the libraries performance ensuring that it meets hpc standards. Also `zig build test` is used to test the library's correctness.

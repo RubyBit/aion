@@ -7,11 +7,7 @@ When generating zig code, always ensure that:
 4. Use `defer` statements for resource management to ensure proper cleanup.
 
 
-For this current project you are designing and implementing a tensor library in Zig. This library should be able to be used for high-performance numerical computing for end users who need efficient tensor operations (running on consumer hardware). The library should support multi-dimensional arrays (tensors) and provide a variety of operations such as addition, multiplication, reshaping, slicing and all the other common tensor operations. 
-
-Example reference: https://github.com/ggml-org/ggml
-
-This project will be better than the ggml library in at least usability and feature set.
+For this current project you are designing and implementing a tensor library in Zig. This library should be able to be used for high-performance numerical computing for end users who need efficient tensor operations (running on consumer hardware). The library should support multi-dimensional arrays (tensors) and provide a variety of operations such as addition, multiplication, reshaping, slicing and all the other common tensor operations. It shall utilize custom kernels optimized for performance on CPU architectures (with appropriate parameters based on the CPU features detected at runtime, e.g., AVX2, AVX512, etc.).
 
 Also, a critical feature: out-of-core tensors. The library must operate correctly when model/tensor data is larger than available RAM or GPU VRAM. To achieve this, design:
 
@@ -24,3 +20,5 @@ Tiled operators: rewrite core kernels (GEMM, convolution, attention, elementwise
 Deterministic error handling: expose meaningful Zig error unions when I/O stalls, disk bandwidth is insufficient, or cache limits are exceeded.
 
 Configurable prefetch scheduler: exploit predictable execution graphs (e.g., transformer layers) to hide disk I/O behind compute.
+
+Utilizing `zig build bench` we can benchmark the libraries performance ensuring that it meets hpc standards.q

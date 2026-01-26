@@ -49,6 +49,24 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(isScalarSupported(a.dtype));
             try compileRequire(isScalarSupported(c.dtype));
 
+            // DType contract (v0):
+            // - Quantized B: A and C must be f32.
+            // - Non-quantized B: A and B must match.
+            //   * f32: C must be f32
+            //   * f16: C may be f16 or f32 (promotion)
+            if (b.dtype.info().is_quantized) {
+                try compileRequire(a.dtype == .f32);
+                try compileRequire(c.dtype == .f32);
+            } else {
+                try compileRequire(isScalarSupported(b.dtype));
+                try compileRequire(b.dtype == a.dtype);
+                switch (b.dtype) {
+                    .f32 => try compileRequire(c.dtype == .f32),
+                    .f16 => try compileRequire(c.dtype == .f16 or c.dtype == .f32),
+                    else => return CompileError.InvalidArgument,
+                }
+            }
+
             // Shapes.
             try compileRequire(a.shape[1] == b.shape[0]);
             try compileRequire(c.shape[0] == a.shape[0]);

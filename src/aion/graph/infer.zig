@@ -105,7 +105,9 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             // DType routing (v0 strict):
             // - If B is quant, A must be f32 and output is f32.
             // - If B is f32, A must be f32 and output is f32.
-            // - If B is f16, A must be f16 and output is f16.
+            // - If B is f16, A must be f16 and output is f16 by default.
+            //   If the output dtype is pre-constrained to f32, allow f16->f32 promotion.
+            const out_v = try getValue(graph, node.output);
             if (b_dt.info().is_quantized) {
                 if (a_dt != .f32) return InferError.DTypeMismatch;
                 try setInferred(graph, node.output, .f32, &[_]usize{ m, n });
@@ -114,7 +116,9 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
                 try setInferred(graph, node.output, .f32, &[_]usize{ m, n });
             } else if (b_dt == .f16) {
                 if (a_dt != .f16) return InferError.DTypeMismatch;
-                try setInferred(graph, node.output, .f16, &[_]usize{ m, n });
+                const out_dt: DType = out_v.dtype orelse .f16;
+                if (out_dt != .f16 and out_dt != .f32) return InferError.DTypeMismatch;
+                try setInferred(graph, node.output, out_dt, &[_]usize{ m, n });
             } else {
                 return InferError.Unsupported;
             }

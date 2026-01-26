@@ -3,21 +3,34 @@ const types = @import("../backend/types.zig");
 
 pub const TensorId = u32;
 
+pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
+pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
+pub const StepBroadcastLastDimBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
+pub const StepReluTiled = struct { out: TensorId, a: TensorId };
+pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
+pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
+
+/// Pack/unpack/re-tiling materialization (scalar only, same shape).
+pub const StepReTileCopyScalar = struct { dst: TensorId, src: TensorId };
+
+/// View materializations (scalar only in v0).
+pub const StepReshapeScalar = struct { dst: TensorId, src: TensorId };
+pub const StepTranspose2DScalar = struct { dst: TensorId, src: TensorId };
+pub const StepSlice2DScalar = struct { dst: TensorId, src: TensorId, start0: usize, start1: usize };
+
 pub const Step = union(enum) {
-    MatMulTiled: struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 },
-    ElemwiseBinaryTiled: struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId },
-    BroadcastLastDimBinaryTiled: struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId },
-    ReluTiled: struct { out: TensorId, a: TensorId },
-    ReduceAll: struct { op: types.ReduceOp, out: TensorId, a: TensorId },
-    CopyTiled: struct { dst: TensorId, src: TensorId },
+    MatMulTiled: StepMatMulTiled,
+    ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
+    BroadcastLastDimBinaryTiled: StepBroadcastLastDimBinaryTiled,
+    ReluTiled: StepReluTiled,
+    ReduceAll: StepReduceAll,
+    CopyTiled: StepCopyTiled,
 
-    /// Pack/unpack/re-tiling materialization (scalar only, same shape).
-    ReTileCopyScalar: struct { dst: TensorId, src: TensorId },
+    ReTileCopyScalar: StepReTileCopyScalar,
 
-    /// View materializations (scalar only in v0).
-    ReshapeScalar: struct { dst: TensorId, src: TensorId },
-    Transpose2DScalar: struct { dst: TensorId, src: TensorId },
-    Slice2DScalar: struct { dst: TensorId, src: TensorId, start0: usize, start1: usize },
+    ReshapeScalar: StepReshapeScalar,
+    Transpose2DScalar: StepTranspose2DScalar,
+    Slice2DScalar: StepSlice2DScalar,
 };
 
 /// Validated executable schedule.

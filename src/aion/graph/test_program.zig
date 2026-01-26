@@ -5,6 +5,7 @@ const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
 const types = @import("../backend/types.zig");
 const manager_mod = @import("../storage/manager.zig");
 const graph_mod = @import("graph.zig");
+const infer_mod = @import("infer.zig");
 const plan_mod = @import("plan.zig");
 const program = @import("program.zig");
 
@@ -127,6 +128,104 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
     // No scalar reference computed anymore; smoke-test that we produced a finite value.
     try std.testing.expect(std.math.isFinite(out_val));
+}
+
+test "graph: matmul f16 allows promoted f32 output" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 2;
+    const k: usize = 4;
+    const n: usize = 3;
+
+    const a_bytes_len: usize = m * k * 2;
+    const b_bytes_len: usize = k * n * 2;
+
+    const a_buf: []u8 = try allocator.alloc(u8, a_bytes_len);
+    defer allocator.free(a_buf);
+    const b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
+    defer allocator.free(b_buf);
+
+    const a_vals: []align(1) f16 = @ptrCast(a_buf);
+    const b_vals: []align(1) f16 = @ptrCast(b_buf);
+
+    for (0..m * k) |i| a_vals[i] = @as(f16, @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i)) - 3)) * 0.25));
+    for (0..k * n) |i| b_vals[i] = @as(f16, @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i % 5))) - 2)) * 0.5));
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally choose non-matmul-friendly tiling to ensure retile logic is exercised.
+    const a_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    const b_tid = try sm.createTiledTensor(.f16, &[_]usize{ k, n }, &[_]usize{ 2, 1 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(a_tid, a_buf);
+    try sm.writeFromPackedScalar(b_tid, b_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const a_in = try g.addInput(.f16, &[_]usize{ m, k });
+    const b_in = try g.addInput(.f16, &[_]usize{ k, n });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+
+    const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+    // Request f16->f32 promotion by constraining the matmul output dtype.
+    g.values.items[@intCast(c)].dtype = .f32;
+
+    const out = try g.addReduce(.sum, c);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    var out_buf: [4]u8 = .{ 0, 0, 0, 0 };
+    try sm.readToPackedScalar(prog.outputs[0], out_buf[0..4]);
+    const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
+    try std.testing.expect(std.math.isFinite(out_val));
+}
+
+test "graph: matmul rejects mismatched non-quant dtypes" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 2;
+    const k: usize = 3;
+    const n: usize = 4;
+
+    const a_bytes_len: usize = m * k * 2;
+    const b_bytes_len: usize = k * n * 4;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const a_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+
+    // Contents are irrelevant; compilation should fail before execution.
+    var a_zero: [a_bytes_len]u8 = [_]u8{0} ** a_bytes_len;
+    var b_zero: [b_bytes_len]u8 = [_]u8{0} ** b_bytes_len;
+    try sm.writeFromPackedScalar(a_tid, a_zero[0..]);
+    try sm.writeFromPackedScalar(b_tid, b_zero[0..]);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const a_in = try g.addInput(.f16, &[_]usize{ m, k });
+    const b_in = try g.addInput(.f32, &[_]usize{ k, n });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+
+    const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{c});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, policy));
 }
 
 test "graph: view ops lower to materialization (transpose/slice/reshape)" {

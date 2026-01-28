@@ -6,7 +6,6 @@ const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("kernels/matmul_registry.zig");
 const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
 const matvec_registry = @import("kernels/matvec_registry.zig");
-const quant = @import("kernels/quant.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -340,6 +339,5 @@ test "cpu kernels: matvec q8_0" {
 
 comptime {
     _ = BackendError;
-    _ = quant;
     _ = quant_matmul_registry;
 }

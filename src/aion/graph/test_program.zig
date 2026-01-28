@@ -11,6 +11,18 @@ const program = @import("program.zig");
 
 const Backend = backend_mod.Backend;
 
+fn asF32Slice(buf: []u8) []align(1) f32 {
+    std.debug.assert((buf.len % @sizeOf(f32)) == 0);
+    const ptr: [*]align(1) f32 = @ptrCast(buf.ptr);
+    return ptr[0 .. buf.len / @sizeOf(f32)];
+}
+
+fn asF16Slice(buf: []u8) []align(1) f16 {
+    std.debug.assert((buf.len % @sizeOf(f16)) == 0);
+    const ptr: [*]align(1) f16 = @ptrCast(buf.ptr);
+    return ptr[0 .. buf.len / @sizeOf(f16)];
+}
+
 const PackedLayout2 = struct {
     shape_mem: [2]usize,
     strides_mem: [2]isize,
@@ -50,9 +62,9 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     const bias_buf: []u8 = try allocator.alloc(u8, bias_bytes_len);
     defer allocator.free(bias_buf);
 
-    const a_vals: []align(1) f32 = @ptrCast(a_buf);
-    const b_vals: []align(1) f32 = @ptrCast(b_buf);
-    const bias_vals: []align(1) f32 = @ptrCast(bias_buf);
+    const a_vals: []align(1) f32 = asF32Slice(a_buf);
+    const b_vals: []align(1) f32 = asF32Slice(b_buf);
+    const bias_vals: []align(1) f32 = asF32Slice(bias_buf);
 
     for (0..m * k) |i| a_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 2)) * 0.5;
     for (0..k * n) |i| b_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i % 7))) - 3)) * 0.25;
@@ -83,7 +95,46 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     const out_ref_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
     defer allocator.free(out_ref_buf);
 
-    // Reference computation removed: backend no longer supports direct (non-program) ops.
+    // Naive reference on packed inputs (computed in plain Zig).
+    const c_ref: []align(1) f32 = asF32Slice(c_ref_buf);
+    const d_ref: []align(1) f32 = asF32Slice(d_ref_buf);
+    const e_ref: []align(1) f32 = asF32Slice(e_ref_buf);
+    const f_ref: []align(1) f32 = asF32Slice(f_ref_buf);
+    const g_ref: []align(1) f32 = asF32Slice(g_ref_buf);
+    const out_ref: []align(1) f32 = asF32Slice(out_ref_buf);
+
+    // c = a @ b
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var acc: f32 = 0.0;
+            for (0..k) |kk| {
+                acc += a_vals[i * k + kk] * b_vals[kk * n + j];
+            }
+            c_ref[i * n + j] = acc;
+        }
+    }
+    // d = c + bias (broadcast over last dim)
+    for (0..m) |i| {
+        for (0..n) |j| {
+            d_ref[i * n + j] = c_ref[i * n + j] + bias_vals[j];
+        }
+    }
+    // e = relu(d)
+    for (0..m * n) |idx| {
+        const v: f32 = d_ref[idx];
+        e_ref[idx] = if (v > 0) v else 0;
+    }
+    // f = copy(e)
+    @memcpy(f_ref[0 .. m * n], e_ref[0 .. m * n]);
+    // g = f * f
+    for (0..m * n) |idx| {
+        const v: f32 = f_ref[idx];
+        g_ref[idx] = v * v;
+    }
+    // out = mean(g)
+    var sum: f32 = 0.0;
+    for (0..m * n) |idx| sum += g_ref[idx];
+    out_ref[0] = sum / @as(f32, @floatFromInt(m * n));
 
     // Build tiled inputs and graph.
     var sm = manager_mod.StorageManager.init(allocator);
@@ -126,8 +177,9 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     var out_buf: [4]u8 = .{ 0, 0, 0, 0 };
     try sm.readToPackedScalar(prog.outputs[0], out_buf[0..4]);
     const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
-    // No scalar reference computed anymore; smoke-test that we produced a finite value.
     try std.testing.expect(std.math.isFinite(out_val));
+    // Keep this reasonably tight, but allow minor FP differences due to kernel accumulation order.
+    try std.testing.expectApproxEqAbs(out_ref[0], out_val, 1e-5);
 }
 
 test "graph: matmul f16 allows promoted f32 output" {
@@ -145,8 +197,8 @@ test "graph: matmul f16 allows promoted f32 output" {
     const b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
     defer allocator.free(b_buf);
 
-    const a_vals: []align(1) f16 = @ptrCast(a_buf);
-    const b_vals: []align(1) f16 = @ptrCast(b_buf);
+    const a_vals: []align(1) f16 = asF16Slice(a_buf);
+    const b_vals: []align(1) f16 = asF16Slice(b_buf);
 
     for (0..m * k) |i| a_vals[i] = @as(f16, @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i)) - 3)) * 0.25));
     for (0..k * n) |i| b_vals[i] = @as(f16, @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i % 5))) - 2)) * 0.5));
@@ -179,6 +231,20 @@ test "graph: matmul f16 allows promoted f32 output" {
     const out = try g.addReduce(.sum, c);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
+    // Naive reference: matmul in f32 then sum.
+    var expected_sum: f32 = 0.0;
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var acc: f32 = 0.0;
+            for (0..k) |kk| {
+                const av: f32 = @floatCast(a_vals[i * k + kk]);
+                const bv: f32 = @floatCast(b_vals[kk * n + j]);
+                acc += av * bv;
+            }
+            expected_sum += acc;
+        }
+    }
+
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
     var prog = try program.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
@@ -189,6 +255,8 @@ test "graph: matmul f16 allows promoted f32 output" {
     try sm.readToPackedScalar(prog.outputs[0], out_buf[0..4]);
     const out_val: f32 = @as(*align(1) const f32, @ptrCast(out_buf[0..4].ptr)).*;
     try std.testing.expect(std.math.isFinite(out_val));
+    // f16 inputs may accumulate slightly differently depending on kernel, but should be very close.
+    try std.testing.expectApproxEqAbs(expected_sum, out_val, 5e-3);
 }
 
 test "graph: matmul rejects mismatched non-quant dtypes" {

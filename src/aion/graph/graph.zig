@@ -4,6 +4,7 @@ const types = @import("../backend/types.zig");
 
 pub const DType = types.DType;
 pub const ElemwiseBinaryOp = types.ElemwiseBinaryOp;
+pub const UnaryOp = types.UnaryOp;
 pub const ReduceOp = types.ReduceOp;
 
 pub const ValueId = u32;
@@ -33,7 +34,7 @@ pub const Op = union(enum) {
 
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
-    Relu: void,
+    Unary: struct { op: UnaryOp },
     Reduce: struct { op: ReduceOp },
     Copy: void,
 
@@ -129,8 +130,12 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .BroadcastLastDimBinary = .{ .op = op } }, &[_]ValueId{ a, b });
     }
 
+    pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
+    }
+
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.Relu, &[_]ValueId{a});
+        return self.addUnary(.relu, a);
     }
 
     pub fn addReduce(self: *Self, op: ReduceOp, a: ValueId) GraphError!ValueId {

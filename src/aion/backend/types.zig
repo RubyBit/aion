@@ -88,6 +88,14 @@ pub const ElemwiseBinaryOp = enum(u8) {
     div,
 };
 
+pub const UnaryOp = enum(u8) {
+    relu,
+    gelu,
+    silu,
+    sigmoid,
+    tanh,
+};
+
 pub const ReduceOp = enum(u8) {
     sum,
     mean,

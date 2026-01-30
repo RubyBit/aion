@@ -2,6 +2,11 @@ const std = @import("std");
 const types = @import("../types.zig");
 
 const elemwise = @import("kernels/elemwise.zig");
+const relu_k = @import("kernels/relu.zig");
+const gelu_k = @import("kernels/gelu.zig");
+const silu_k = @import("kernels/silu.zig");
+const sigmoid_k = @import("kernels/sigmoid.zig");
+const tanh_k = @import("kernels/tanh.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("kernels/matmul_registry.zig");
 const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
@@ -17,6 +22,50 @@ fn expectSliceApproxEqAbs(expected: []const f32, got: []const f32, tol: f32) !vo
     }
 }
 
+fn expectAllFinite(vals: []const f32) !void {
+    for (vals) |v| try std.testing.expect(std.math.isFinite(v));
+}
+
+fn expectMonotonicNonDecreasing(vals: []const f32, eps: f32) !void {
+    if (vals.len < 2) return;
+    var i: usize = 0;
+    while (i + 1 < vals.len) : (i += 1) {
+        try std.testing.expect(vals[i] <= vals[i + 1] + eps);
+    }
+}
+
+fn maxAbsDiffF32(a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == b.len);
+    var m: f32 = 0.0;
+    for (a, b) |x, y| m = @max(m, @abs(x - y));
+    return m;
+}
+
+fn sigmoidRefF32(x: f32) f32 {
+    const xf: f64 = @floatCast(x);
+    // Stable enough for our small test domain.
+    const y: f64 = 1.0 / (1.0 + std.math.exp(-xf));
+    return @floatCast(y);
+}
+
+fn tanhRefF32(x: f32) f32 {
+    const xf: f64 = @floatCast(x);
+    return @floatCast(std.math.tanh(xf));
+}
+
+fn siluRefF32(x: f32) f32 {
+    return x * sigmoidRefF32(x);
+}
+
+fn geluTanhApproxRefF32(x: f32) f32 {
+    // Standard tanh-based GELU approximation.
+    const xf: f64 = @floatCast(x);
+    const k0: f64 = std.math.sqrt(2.0 / std.math.pi);
+    const inner: f64 = k0 * (xf + 0.044715 * xf * xf * xf);
+    const y: f64 = 0.5 * xf * (1.0 + std.math.tanh(inner));
+    return @floatCast(y);
+}
+
 test "cpu kernels: elemwise add f32" {
     var a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     var b = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
@@ -24,6 +73,119 @@ test "cpu kernels: elemwise add f32" {
 
     try elemwise.elemwiseBinaryF32(.add, std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]), out.len);
     try expectSliceApproxEqAbs(&[_]f32{ 6.0, 8.0, 10.0, 12.0 }, out[0..], 1e-6);
+}
+
+test "cpu kernels: unary relu f32" {
+    var a = [_]f32{ -2.0, -0.5, 0.0, 0.5, 3.0 };
+    var out = [_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0 };
+    try relu_k.reluF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(a[0..]), a.len);
+    try expectSliceApproxEqAbs(&[_]f32{ 0.0, 0.0, 0.0, 0.5, 3.0 }, out[0..], 1e-6);
+}
+
+test "cpu kernels: unary sigmoid f32 properties and accuracy" {
+    // Symmetric, ascending domain with a center point at 0.
+    var x = [_]f32{ -6.0, -3.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 3.0, 6.0 };
+    var out: [x.len]f32 = undefined;
+
+    try sigmoid_k.sigmoidF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
+    try expectAllFinite(out[0..]);
+    for (out) |v| try std.testing.expect(v >= 0.0 and v <= 1.0);
+
+    // Known point.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[5], 2e-2);
+
+    // Monotone increasing.
+    try expectMonotonicNonDecreasing(out[0..], 1e-3);
+
+    // Symmetry: s(-x) ~= 1 - s(x).
+    var i: usize = 0;
+    while (i < x.len / 2) : (i += 1) {
+        const j: usize = x.len - 1 - i;
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0) - out[j], out[i], 3e-2);
+    }
+
+    // Accuracy vs exp-based sigmoid.
+    var ref: [x.len]f32 = undefined;
+    for (x, 0..) |v, idx| ref[idx] = sigmoidRefF32(v);
+    const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
+    try std.testing.expect(max_abs <= 3e-2);
+}
+
+test "cpu kernels: unary tanh f32 properties and accuracy" {
+    var x = [_]f32{ -6.0, -3.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 3.0, 6.0 };
+    var out: [x.len]f32 = undefined;
+
+    try tanh_k.tanhF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
+    try expectAllFinite(out[0..]);
+    for (out) |v| try std.testing.expect(v >= -1.0 and v <= 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+
+    try expectMonotonicNonDecreasing(out[0..], 1e-3);
+
+    // Odd symmetry: tanh(-x) ~= -tanh(x).
+    var i: usize = 0;
+    while (i < x.len / 2) : (i += 1) {
+        const j: usize = x.len - 1 - i;
+        try std.testing.expectApproxEqAbs(-out[j], out[i], 3e-2);
+    }
+
+    var ref: [x.len]f32 = undefined;
+    for (x, 0..) |v, idx| ref[idx] = tanhRefF32(v);
+    const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
+    try std.testing.expect(max_abs <= 3e-2);
+}
+
+test "cpu kernels: unary silu f32 properties and accuracy" {
+    var x = [_]f32{ -6.0, -3.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 3.0, 6.0 };
+    var out: [x.len]f32 = undefined;
+
+    try silu_k.siluF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
+    try expectAllFinite(out[0..]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+
+    // Note: SiLU/Swish is not strictly monotone on the negative side.
+    // Avoid monotonicity assertions here; rely on identities + reference checks.
+
+    // Identity from definition silu(x) = x*sigmoid(x): silu(x) - silu(-x) = x.
+    var i: usize = 0;
+    while (i < x.len / 2) : (i += 1) {
+        const j: usize = x.len - 1 - i;
+        // x[j] is the positive counterpart.
+        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 5e-2);
+    }
+
+    // Accuracy vs exp-based reference.
+    var ref: [x.len]f32 = undefined;
+    for (x, 0..) |v, idx| ref[idx] = siluRefF32(v);
+    const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
+    try std.testing.expect(max_abs <= 5e-2);
+}
+
+test "cpu kernels: unary gelu f32 properties and accuracy" {
+    var x = [_]f32{ -6.0, -3.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 3.0, 6.0 };
+    var out: [x.len]f32 = undefined;
+
+    try gelu_k.geluF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
+    try expectAllFinite(out[0..]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+
+    // Gelu should approach 0 for large negative and ~x for large positive.
+    try std.testing.expect(out[0] <= 0.0);
+    try std.testing.expectApproxEqAbs(x[x.len - 1], out[out.len - 1], 2e-1);
+
+    // The widely-used tanh GELU approximation is "approximately" odd in the sense:
+    // gelu(x) - gelu(-x) ~= x (exact for the true CDF-based GELU).
+    var i: usize = 0;
+    while (i < x.len / 2) : (i += 1) {
+        const j: usize = x.len - 1 - i;
+        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 8e-2);
+    }
+
+    // Accuracy vs tanh-based GELU formula (but with accurate tanh).
+    var ref: [x.len]f32 = undefined;
+    for (x, 0..) |v, idx| ref[idx] = geluTanhApproxRefF32(v);
+    const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
+    try std.testing.expect(max_abs <= 6e-2);
 }
 
 test "cpu kernels: reduce sum/mean f32" {

@@ -131,7 +131,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             _ = s.op;
         },
 
-        .ReluTiled => |s| {
+        .UnaryTiled => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
             try compileRequire(isScalarSupported(out.dtype));
@@ -144,6 +144,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             }
             try compileRequire(out.tile_shape[0] == a.tile_shape[0] and out.tile_shape[1] == a.tile_shape[1]);
             try compileRequire(out.tile_counts[0] == a.tile_counts[0] and out.tile_counts[1] == a.tile_counts[1]);
+            _ = s.op;
         },
 
         .CopyTiled => |s| {
@@ -359,13 +360,13 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .BroadcastLastDimBinaryTiled = .{ .op = bb.op, .out = out_tid, .a = a_tid, .b = b_tid } });
             },
 
-            .Relu => {
+            .Unary => |u| {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
                 const tile: [2]usize = tileShapeForValue(policy, out_dt, out_shape);
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
-                try appendStepChecked(allocator, mgr, &steps, .{ .ReluTiled = .{ .out = out_tid, .a = a_tid } });
+                try appendStepChecked(allocator, mgr, &steps, .{ .UnaryTiled = .{ .op = u.op, .out = out_tid, .a = a_tid } });
             },
 
             .Reduce => |rr| {

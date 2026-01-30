@@ -10,6 +10,7 @@ pub const Op = graph_mod.Op;
 pub const ValueId = graph_mod.ValueId;
 
 pub const DType = types.DType;
+pub const UnaryOp = types.UnaryOp;
 
 pub const InferError = error{
     InvalidGraph,
@@ -159,12 +160,14 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, a.dtype.?, a.shape);
         },
 
-        .Relu => {
+        .Unary => |u| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
             try setInferred(graph, node.output, a.dtype.?, a.shape);
+
+            _ = u.op;
         },
 
         .Reduce => |_| {

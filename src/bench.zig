@@ -188,6 +188,18 @@ fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters:
 }
 
 fn benchProgramRelu(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
+    return benchProgramUnary(allocator, rnd, iters, n_elem, .relu, "relu", be);
+}
+
+fn benchProgramUnary(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    n_elem: usize,
+    op: types.UnaryOp,
+    label: []const u8,
+    be: Backend,
+) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
@@ -206,7 +218,7 @@ fn benchProgramRelu(allocator: std.mem.Allocator, rnd: std.Random, iters: usize,
 
     const a_in = try g.addInput(.f32, &[_]usize{n_elem});
     try g.bindExternal(a_in, @intCast(a_tid));
-    const out = try g.addRelu(a_in);
+    const out = try g.addUnary(op, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -221,6 +233,7 @@ fn benchProgramRelu(allocator: std.mem.Allocator, rnd: std.Random, iters: usize,
         }
     }{ .be = be, .sm = &sm, .prog = &prog });
 
+    // One input read + one output write.
     const bytes: u64 = @as(u64, @intCast(2 * n_elem * @sizeOf(f32))) * @as(u64, @intCast(iters));
     const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
 
@@ -228,7 +241,7 @@ fn benchProgramRelu(allocator: std.mem.Allocator, rnd: std.Random, iters: usize,
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem / 2, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem - 1, 0);
-    std.debug.print("program relu f32:         {d:.3} GiB/s  (chk={d:.4})\n", .{ gib_s, chk });
+    std.debug.print("program unary {s} f32:    {d:.3} GiB/s  (chk={d:.4})\n", .{ label, gib_s, chk });
 }
 
 fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
@@ -589,6 +602,10 @@ fn mainImpl() !void {
 
     try benchProgramElemwiseAdd(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramRelu(allocator, rnd, opts.iters, opts.n_elem, be);
+    try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .gelu, "gelu", be);
+    try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .silu, "silu", be);
+    try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .sigmoid, "sigmoid", be);
+    try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .tanh, "tanh", be);
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     if (opts.quant) {

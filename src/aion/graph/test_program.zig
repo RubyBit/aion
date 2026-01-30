@@ -182,6 +182,100 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     try std.testing.expectApproxEqAbs(out_ref[0], out_val, 1e-5);
 }
 
+test "graph: unary ops match reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // Moderate-sized 1D input to exercise vector loops + tails.
+    const n: usize = 257;
+    const x_bytes_len: usize = n * 4;
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+
+    // Deterministic mix of values within a safe domain for exp/tanh comparisons.
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 128));
+        x_vals[i] = (t / 32.0); // ~[-4,4]
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{16}, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 16, .tile_alignment = 64 };
+
+    inline for (.{
+        .{ .op = types.UnaryOp.relu, .name = "relu" },
+        .{ .op = types.UnaryOp.sigmoid, .name = "sigmoid" },
+        .{ .op = types.UnaryOp.tanh, .name = "tanh" },
+        .{ .op = types.UnaryOp.silu, .name = "silu" },
+        .{ .op = types.UnaryOp.gelu, .name = "gelu" },
+    }) |case| {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const x_in = try g.addInput(.f32, &[_]usize{n});
+        try g.bindExternal(x_in, @intCast(x_tid));
+        const y = try g.addUnary(case.op, x_in);
+        try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
+        try backend.executeProgram(&prog, sm.tensorStore());
+
+        // Read output (packed).
+        var out_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+        defer allocator.free(out_buf);
+        try sm.readToPackedScalar(prog.outputs[0], out_buf[0..x_bytes_len]);
+        const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+        // Reference and comparisons.
+        i = 0;
+        while (i < n) : (i += 1) {
+            const x: f32 = x_vals[i];
+            const got: f32 = out_vals[i];
+            try std.testing.expect(std.math.isFinite(got));
+
+            const xf: f64 = @floatCast(x);
+            const ref64: f64 = switch (case.op) {
+                .relu => if (x > 0.0) @as(f64, xf) else 0.0,
+                .sigmoid => 1.0 / (1.0 + std.math.exp(-xf)),
+                .tanh => std.math.tanh(xf),
+                .silu => xf * (1.0 / (1.0 + std.math.exp(-xf))),
+                // Compare to the common tanh-based GELU approximation.
+                .gelu => blk: {
+                    const k0: f64 = std.math.sqrt(2.0 / std.math.pi);
+                    const inner: f64 = k0 * (xf + 0.044715 * xf * xf * xf);
+                    break :blk 0.5 * xf * (1.0 + std.math.tanh(inner));
+                },
+            };
+            const ref: f32 = @as(f32, @floatCast(ref64));
+
+            const abs_err: f32 = @abs(got - ref);
+            const tol: f32 = switch (case.op) {
+                .relu => 0.0,
+                .sigmoid => 3e-2,
+                .tanh => 3e-2,
+                .silu => 5e-2,
+                .gelu => 6e-2,
+            };
+
+            // If this fails, include op name for quick debugging.
+            if (!(abs_err <= tol)) {
+                std.debug.print("unary {s} mismatch at i={} x={} got={} ref={} abs_err={} tol={}\n", .{ case.name, i, x, got, ref, abs_err, tol });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
 test "graph: matmul f16 allows promoted f32 output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

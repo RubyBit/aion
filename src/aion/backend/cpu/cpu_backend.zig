@@ -6,6 +6,7 @@ const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
 const matvec_registry = @import("kernels/matvec_registry.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
+const exec_unary = @import("exec/unary.zig");
 const exec_matmul = @import("exec/matmul.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
@@ -161,9 +162,9 @@ pub const CpuBackend = struct {
                     try ElemwiseExec.execBroadcastLastDimBinaryTiled(pool_ptr, self.thread_count, s, store);
                 },
 
-                .ReluTiled => |s| {
+                .UnaryTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                    try ElemwiseExec.execReluTiled(pool_ptr, self.thread_count, s, store);
+                    try exec_unary.execUnaryTiled(pool_ptr, self.thread_count, s, store);
                 },
 
                 .CopyTiled => |s| {

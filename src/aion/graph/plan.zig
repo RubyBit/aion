@@ -42,6 +42,15 @@ pub fn chooseSoftmaxTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: u
     return .{ .tm = tm, .tn = tn };
 }
 
+pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
+    // LayerNorm/RMSNorm are row-wise and need per-row scratch. Keep tm small.
+    const tm_cap: usize = 256;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+    // Favor decent width along last dim; cap to base_square_2d like softmax.
+    const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+    return .{ .tm = tm, .tn = tn };
+}
+
 pub fn roundDownToMultiple(x: usize, m: usize) usize {
     if (m == 0) return x;
     return x - (x % m);

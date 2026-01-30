@@ -166,6 +166,64 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(out.tile_shape[0] <= 256);
         },
 
+        .LayerNormTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const gamma: *const TiledTensor = mgr.getConst(s.gamma) catch return CompileError.InvalidArgument;
+            const beta: *const TiledTensor = mgr.getConst(s.beta) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.rank == 2 and x.rank == 2);
+            try compileRequire(gamma.rank == 1 and beta.rank == 1);
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == x.dtype and out.dtype == gamma.dtype and out.dtype == beta.dtype);
+
+            try compileRequire(out.shape[0] == x.shape[0] and out.shape[1] == x.shape[1]);
+            try compileRequire(gamma.shape[0] == out.shape[1]);
+            try compileRequire(beta.shape[0] == out.shape[1]);
+
+            try compileRequire(out.tile_shape[0] == x.tile_shape[0] and out.tile_shape[1] == x.tile_shape[1]);
+            try compileRequire(out.tile_counts[0] == x.tile_counts[0] and out.tile_counts[1] == x.tile_counts[1]);
+
+            // gamma/beta tiled along last dim.
+            try compileRequire(gamma.tile_shape[0] == out.tile_shape[1]);
+            try compileRequire(beta.tile_shape[0] == out.tile_shape[1]);
+            try compileRequire(gamma.tile_counts[0] == out.tile_counts[1]);
+            try compileRequire(beta.tile_counts[0] == out.tile_counts[1]);
+
+            // Per-row scratch arrays in exec.
+            try compileRequire(out.tile_shape[0] <= 256);
+
+            try compileRequire(s.eps > 0.0);
+        },
+
+        .RMSNormTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const gamma: *const TiledTensor = mgr.getConst(s.gamma) catch return CompileError.InvalidArgument;
+            const beta: *const TiledTensor = mgr.getConst(s.beta) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.rank == 2 and x.rank == 2);
+            try compileRequire(gamma.rank == 1 and beta.rank == 1);
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == x.dtype and out.dtype == gamma.dtype and out.dtype == beta.dtype);
+
+            try compileRequire(out.shape[0] == x.shape[0] and out.shape[1] == x.shape[1]);
+            try compileRequire(gamma.shape[0] == out.shape[1]);
+            try compileRequire(beta.shape[0] == out.shape[1]);
+
+            try compileRequire(out.tile_shape[0] == x.tile_shape[0] and out.tile_shape[1] == x.tile_shape[1]);
+            try compileRequire(out.tile_counts[0] == x.tile_counts[0] and out.tile_counts[1] == x.tile_counts[1]);
+
+            // gamma/beta tiled along last dim.
+            try compileRequire(gamma.tile_shape[0] == out.tile_shape[1]);
+            try compileRequire(beta.tile_shape[0] == out.tile_shape[1]);
+            try compileRequire(gamma.tile_counts[0] == out.tile_counts[1]);
+            try compileRequire(beta.tile_counts[0] == out.tile_counts[1]);
+
+            try compileRequire(out.tile_shape[0] <= 256);
+            try compileRequire(s.eps > 0.0);
+        },
+
         .CopyTiled => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
@@ -410,6 +468,59 @@ pub fn compileGraph(
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
                 try appendStepChecked(allocator, mgr, &steps, .{ .SoftmaxTiled = .{ .out = out_tid, .a = a_tid } });
+            },
+
+            .LayerNorm => |ln| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const g_id: usize = @intCast(node.inputs[1]);
+                const b_id: usize = @intCast(node.inputs[2]);
+                const x_v = graph.values.items[x_id];
+                const g_v = graph.values.items[g_id];
+                const b_v = graph.values.items[b_id];
+
+                if (out_dt != .f32 and out_dt != .f16) return CompileError.InvalidArgument;
+                if (out_shape.len != 2) return CompileError.InvalidArgument;
+
+                const m: usize = out_shape[0];
+                const n: usize = out_shape[1];
+                const st = plan_mod.chooseNormTiles(policy, m, n);
+                const tile: [2]usize = .{ st.tm, st.tn };
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                const x_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, x_id, x_v.dtype.?, x_v.shape, tile);
+
+                // gamma/beta must be rank-1 tiled to match tn.
+                const bcast_tile: [2]usize = .{ tile[1], 1 };
+                const gamma_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, g_id, g_v.dtype.?, g_v.shape, bcast_tile);
+                const beta_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, b_id, b_v.dtype.?, b_v.shape, bcast_tile);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .LayerNormTiled = .{ .out = out_tid, .x = x_tid, .gamma = gamma_tid, .beta = beta_tid, .eps = ln.eps } });
+            },
+
+            .RMSNorm => |rn| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const g_id: usize = @intCast(node.inputs[1]);
+                const b_id: usize = @intCast(node.inputs[2]);
+                const x_v = graph.values.items[x_id];
+                const g_v = graph.values.items[g_id];
+                const b_v = graph.values.items[b_id];
+
+                if (out_dt != .f32 and out_dt != .f16) return CompileError.InvalidArgument;
+                if (out_shape.len != 2) return CompileError.InvalidArgument;
+
+                const m: usize = out_shape[0];
+                const n: usize = out_shape[1];
+                const st = plan_mod.chooseNormTiles(policy, m, n);
+                const tile: [2]usize = .{ st.tm, st.tn };
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                const x_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, x_id, x_v.dtype.?, x_v.shape, tile);
+
+                const bcast_tile: [2]usize = .{ tile[1], 1 };
+                const gamma_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, g_id, g_v.dtype.?, g_v.shape, bcast_tile);
+                const beta_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, b_id, b_v.dtype.?, b_v.shape, bcast_tile);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .RMSNormTiled = .{ .out = out_tid, .x = x_tid, .gamma = gamma_tid, .beta = beta_tid, .eps = rn.eps } });
             },
 
             .Reduce => |rr| {

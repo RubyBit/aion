@@ -8,6 +8,8 @@ pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: Te
 pub const StepBroadcastLastDimBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
 pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
 pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId };
+pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
@@ -25,6 +27,8 @@ pub const Step = union(enum) {
     BroadcastLastDimBinaryTiled: StepBroadcastLastDimBinaryTiled,
     UnaryTiled: StepUnaryTiled,
     SoftmaxTiled: StepSoftmaxTiled,
+    LayerNormTiled: StepLayerNormTiled,
+    RMSNormTiled: StepRMSNormTiled,
     ReduceAll: StepReduceAll,
     CopyTiled: StepCopyTiled,
 

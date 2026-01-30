@@ -290,6 +290,48 @@ fn softmaxRefRowF32(out: []f32, x: []align(1) const f32) void {
     for (out) |*v| v.* = @floatCast(@as(f64, @floatCast(v.*)) * inv);
 }
 
+fn layernormRefRowF32(out: []f32, x: []align(1) const f32, gamma: []align(1) const f32, beta: []align(1) const f32, eps: f32) void {
+    std.debug.assert(out.len == x.len);
+    std.debug.assert(gamma.len == x.len);
+    std.debug.assert(beta.len == x.len);
+    var sum: f64 = 0.0;
+    var sumsq: f64 = 0.0;
+    for (x) |v| {
+        const vf: f64 = @floatCast(v);
+        sum += vf;
+        sumsq += vf * vf;
+    }
+    const n: f64 = @floatFromInt(x.len);
+    const mean: f64 = sum / n;
+    const msq: f64 = sumsq / n;
+    const var0: f64 = @max(0.0, msq - mean * mean);
+    const inv: f64 = 1.0 / std.math.sqrt(var0 + @as(f64, @floatCast(eps)));
+    for (x, 0..) |v, i| {
+        const xf: f64 = @floatCast(v);
+        const y: f64 = ((xf - mean) * inv) * @as(f64, @floatCast(gamma[i])) + @as(f64, @floatCast(beta[i]));
+        out[i] = @floatCast(y);
+    }
+}
+
+fn rmsnormRefRowF32(out: []f32, x: []align(1) const f32, gamma: []align(1) const f32, beta: []align(1) const f32, eps: f32) void {
+    std.debug.assert(out.len == x.len);
+    std.debug.assert(gamma.len == x.len);
+    std.debug.assert(beta.len == x.len);
+    var sumsq: f64 = 0.0;
+    for (x) |v| {
+        const vf: f64 = @floatCast(v);
+        sumsq += vf * vf;
+    }
+    const n: f64 = @floatFromInt(x.len);
+    const msq: f64 = sumsq / n;
+    const inv: f64 = 1.0 / std.math.sqrt(msq + @as(f64, @floatCast(eps)));
+    for (x, 0..) |v, i| {
+        const xf: f64 = @floatCast(v);
+        const y: f64 = (xf * inv) * @as(f64, @floatCast(gamma[i])) + @as(f64, @floatCast(beta[i]));
+        out[i] = @floatCast(y);
+    }
+}
+
 test "graph: softmax rank-1 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -431,6 +473,108 @@ test "graph: softmax rank-2 matches reference (f32)" {
         // Fast exp approx: keep sum fairly tight, value-wise compare loosely.
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 3e-3);
         try std.testing.expect(max_abs <= 3e-2);
+    }
+}
+
+test "graph: layernorm and rmsnorm rank-2 match reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 6;
+    const n: usize = 17;
+    const eps: f32 = 1e-5;
+
+    const x_bytes_len: usize = m * n * 4;
+    const v_bytes_len: usize = n * 4;
+
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
+    const g_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
+    defer allocator.free(g_buf);
+    const b_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
+    defer allocator.free(b_buf);
+
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+    const g_vals: []align(1) f32 = asF32Slice(g_buf);
+    const b_vals: []align(1) f32 = asF32Slice(b_buf);
+
+    // Deterministic values; keep magnitudes modest.
+    for (0..m * n) |i| {
+        const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i % 71))) - 35));
+        const r: usize = i / n;
+        x_vals[i] = (t / 16.0) + (@as(f32, @floatFromInt(@as(i32, @intCast(r)) - 3)) * 0.05);
+    }
+    for (0..n) |i| {
+        const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 8));
+        g_vals[i] = 1.0 + (t * 0.01);
+        b_vals[i] = (t * 0.02);
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally awkward tiling to exercise retile + edge tiles.
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ 2, 5 }, .{ .tile_alignment = 64 });
+    const g_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{6}, .{ .tile_alignment = 64 });
+    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{7}, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(g_tid, g_buf);
+    try sm.writeFromPackedScalar(b_tid, b_buf);
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 8, .tile_alignment = 64 };
+
+    // Run both ops.
+    inline for (.{
+        .{ .is_rms = false, .name = "layernorm" },
+        .{ .is_rms = true, .name = "rmsnorm" },
+    }) |case| {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const x_in = try g.addInput(.f32, &[_]usize{ m, n });
+        const gamma_in = try g.addInput(.f32, &[_]usize{n});
+        const beta_in = try g.addInput(.f32, &[_]usize{n});
+        try g.bindExternal(x_in, @intCast(x_tid));
+        try g.bindExternal(gamma_in, @intCast(g_tid));
+        try g.bindExternal(beta_in, @intCast(b_tid));
+
+        const y = if (case.is_rms) try g.addRMSNorm(x_in, gamma_in, beta_in, eps) else try g.addLayerNorm(x_in, gamma_in, beta_in, eps);
+        try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
+        try backend.executeProgram(&prog, sm.tensorStore());
+
+        const out_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+        defer allocator.free(out_buf);
+        try sm.readToPackedScalar(prog.outputs[0], out_buf);
+        const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+        const ref_row: []f32 = try allocator.alloc(f32, n);
+        defer allocator.free(ref_row);
+
+        for (0..m) |r| {
+            const x_row: []align(1) const f32 = x_vals[(r * n)..(r * n + n)];
+            if (case.is_rms) {
+                rmsnormRefRowF32(ref_row, x_row, g_vals, b_vals, eps);
+            } else {
+                layernormRefRowF32(ref_row, x_row, g_vals, b_vals, eps);
+            }
+            var max_abs: f32 = 0.0;
+            for (0..n) |c| {
+                const got: f32 = out_vals[r * n + c];
+                const ref: f32 = ref_row[c];
+                try std.testing.expect(std.math.isFinite(got));
+                max_abs = @max(max_abs, @abs(got - ref));
+            }
+            if (!(max_abs <= 2e-4)) {
+                std.debug.print("{s} mismatch row={} max_abs={}\n", .{ case.name, r, max_abs });
+                return error.TestExpectedEqual;
+            }
+        }
     }
 }
 

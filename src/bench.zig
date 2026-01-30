@@ -331,6 +331,123 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     std.debug.print("program softmax f32:     {d:.3} GiB/s  (chk={d:.4})\n", .{ gib_s, chk });
 }
 
+fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const st = plan_mod.chooseNormTiles(policy, m, n);
+
+    const x: []f32 = try allocator.alloc(f32, m * n);
+    defer allocator.free(x);
+    const gamma: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(gamma);
+    const beta: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(beta);
+    fillRandomF32(rnd, x);
+    fillRandomF32(rnd, gamma);
+    fillRandomF32(rnd, beta);
+
+    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const g_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
+    try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
+    try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ m, n });
+    const gamma_in = try g.addInput(.f32, &[_]usize{n});
+    const beta_in = try g.addInput(.f32, &[_]usize{n});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(gamma_in, @intCast(g_tid));
+    try g.bindExternal(beta_in, @intCast(b_tid));
+    const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    // Our implementation reads X twice (stats + apply), reads gamma/beta once, writes Y once.
+    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f32))) * @as(u64, @intCast(iters));
+    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
+        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
+        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    std.debug.print("program layernorm f32:   {d:.3} GiB/s  (chk={d:.4})\n", .{ gib_s, chk });
+}
+
+fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const st = plan_mod.chooseNormTiles(policy, m, n);
+
+    const x: []f32 = try allocator.alloc(f32, m * n);
+    defer allocator.free(x);
+    const gamma: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(gamma);
+    const beta: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(beta);
+    fillRandomF32(rnd, x);
+    fillRandomF32(rnd, gamma);
+    fillRandomF32(rnd, beta);
+
+    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const g_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
+    try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
+    try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ m, n });
+    const gamma_in = try g.addInput(.f32, &[_]usize{n});
+    const beta_in = try g.addInput(.f32, &[_]usize{n});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(gamma_in, @intCast(g_tid));
+    try g.bindExternal(beta_in, @intCast(b_tid));
+    const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f32))) * @as(u64, @intCast(iters));
+    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
+        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
+        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    std.debug.print("program rmsnorm f32:     {d:.3} GiB/s  (chk={d:.4})\n", .{ gib_s, chk });
+}
+
 fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
@@ -652,6 +769,8 @@ fn mainImpl() !void {
     try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .sigmoid, "sigmoid", be);
     try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .tanh, "tanh", be);
     try benchProgramSoftmaxF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
+    try benchProgramLayerNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
+    try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     if (opts.quant) {

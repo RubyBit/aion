@@ -9,6 +9,7 @@ const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
 const exec_matmul = @import("exec/matmul.zig");
 const exec_softmax = @import("exec/softmax.zig");
+const exec_layernorm = @import("exec/layernorm.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -182,6 +183,16 @@ pub const CpuBackend = struct {
                 .SoftmaxTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_softmax.execSoftmaxTiled(pool_ptr, self.thread_count, self.softmax_scratch_f32, s, store);
+                },
+
+                .LayerNormTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_layernorm.execLayerNormTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .RMSNormTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_layernorm.execRMSNormTiled(pool_ptr, self.thread_count, s, store);
                 },
 
                 .CopyTiled => |s| {

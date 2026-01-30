@@ -179,6 +179,44 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, a.dtype.?, a.shape);
         },
 
+        .LayerNorm => |_| {
+            try require(node.inputs.len == 3);
+            const x = try getValue(graph, node.inputs[0]);
+            const gamma = try getValue(graph, node.inputs[1]);
+            const beta = try getValue(graph, node.inputs[2]);
+
+            try require(x.dtype != null and gamma.dtype != null and beta.dtype != null);
+            try require(x.shape.len == 2);
+            try require(gamma.shape.len == 1 and beta.shape.len == 1);
+
+            if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
+            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+
+            const n: usize = x.shape[1];
+            if (gamma.shape[0] != n or beta.shape[0] != n) return InferError.ShapeMismatch;
+
+            try setInferred(graph, node.output, x.dtype.?, x.shape);
+        },
+
+        .RMSNorm => |_| {
+            try require(node.inputs.len == 3);
+            const x = try getValue(graph, node.inputs[0]);
+            const gamma = try getValue(graph, node.inputs[1]);
+            const beta = try getValue(graph, node.inputs[2]);
+
+            try require(x.dtype != null and gamma.dtype != null and beta.dtype != null);
+            try require(x.shape.len == 2);
+            try require(gamma.shape.len == 1 and beta.shape.len == 1);
+
+            if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
+            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+
+            const n: usize = x.shape[1];
+            if (gamma.shape[0] != n or beta.shape[0] != n) return InferError.ShapeMismatch;
+
+            try setInferred(graph, node.output, x.dtype.?, x.shape);
+        },
+
         .Reduce => |_| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);

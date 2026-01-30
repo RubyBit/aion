@@ -36,6 +36,14 @@ pub const Op = union(enum) {
     BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
     Softmax: void,
+
+    /// Normalize over the last dimension (rank-2 only in v0).
+    /// out = ((x - mean) / sqrt(var + eps)) * gamma + beta
+    LayerNorm: struct { eps: f32 },
+
+    /// Normalize over the last dimension (rank-2 only in v0).
+    /// out = (x / sqrt(mean(x^2) + eps)) * gamma + beta
+    RMSNorm: struct { eps: f32 },
     Reduce: struct { op: ReduceOp },
     Copy: void,
 
@@ -140,6 +148,14 @@ pub const Graph = struct {
     /// - rank-2: per row (axis=1)
     pub fn addSoftmax(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.Softmax, &[_]ValueId{a});
+    }
+
+    pub fn addLayerNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .LayerNorm = .{ .eps = eps } }, &[_]ValueId{ x, gamma, beta });
+    }
+
+    pub fn addRMSNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .RMSNorm = .{ .eps = eps } }, &[_]ValueId{ x, gamma, beta });
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {

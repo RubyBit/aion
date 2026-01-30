@@ -35,6 +35,7 @@ pub const Op = union(enum) {
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
+    Softmax: void,
     Reduce: struct { op: ReduceOp },
     Copy: void,
 
@@ -132,6 +133,13 @@ pub const Graph = struct {
 
     pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
+    }
+
+    /// Softmax over the last dimension.
+    /// - rank-1: over the vector axis
+    /// - rank-2: per row (axis=1)
+    pub fn addSoftmax(self: *Self, a: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.Softmax, &[_]ValueId{a});
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {

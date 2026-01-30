@@ -276,6 +276,164 @@ test "graph: unary ops match reference (f32)" {
     }
 }
 
+fn softmaxRefRowF32(out: []f32, x: []align(1) const f32) void {
+    std.debug.assert(out.len == x.len);
+    var maxv: f64 = -std.math.inf(f64);
+    for (x) |v| maxv = @max(maxv, @as(f64, @floatCast(v)));
+    var sum: f64 = 0.0;
+    for (x, 0..) |v, i| {
+        const e: f64 = std.math.exp(@as(f64, @floatCast(v)) - maxv);
+        out[i] = @floatCast(e);
+        sum += e;
+    }
+    const inv: f64 = 1.0 / sum;
+    for (out) |*v| v.* = @floatCast(@as(f64, @floatCast(v.*)) * inv);
+}
+
+test "graph: softmax rank-1 matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const n: usize = 257;
+    const x_bytes_len: usize = n * 4;
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+
+    // Deterministic values in a safe range.
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 128));
+        x_vals[i] = (t / 32.0); // ~[-4,4]
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally awkward tiling to exercise tile loops.
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{17}, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{n});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    const y = try g.addSoftmax(x_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    // Read output and compare.
+    const out_tid = prog.outputs[0];
+    const out_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const ref: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(ref);
+    softmaxRefRowF32(ref, x_vals);
+
+    var sum: f32 = 0.0;
+    for (out_vals) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        try std.testing.expect(v >= 0.0 and v <= 1.0);
+        sum += v;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 2e-3);
+
+    // Compare loosely since the kernel uses fast exp.
+    var max_abs: f32 = 0.0;
+    for (out_vals, ref) |g0, r0| max_abs = @max(max_abs, @abs(g0 - r0));
+    try std.testing.expect(max_abs <= 3e-2);
+}
+
+test "graph: softmax rank-2 matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 5;
+    const n: usize = 9;
+    const x_bytes_len: usize = m * n * 4;
+
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+
+    // Deterministic values in a safe range.
+    for (0..m) |r| {
+        for (0..n) |c| {
+            const idx: usize = r * n + c;
+            const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(idx)) - @as(i32, @intCast((m * n) / 2))));
+            // Add a small row-dependent offset so row maxima differ.
+            x_vals[idx] = (t / 32.0) + (@as(f32, @floatFromInt(@as(i32, @intCast(r)) - 2)) * 0.05);
+        }
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally awkward tiling to exercise tile loops + possible retile.
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ 2, 5 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ m, n });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    const y = try g.addSoftmax(x_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    // Force softmax tiling to span multiple tiles in both dims.
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    // Read output.
+    const out_tid = prog.outputs[0];
+    const out_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    // Reference and comparisons per row.
+    const ref_row: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(ref_row);
+
+    for (0..m) |r| {
+        const x_row: []align(1) const f32 = x_vals[(r * n)..(r * n + n)];
+        softmaxRefRowF32(ref_row, x_row);
+
+        var sum: f32 = 0.0;
+        var max_abs: f32 = 0.0;
+        for (0..n) |c| {
+            const idx: usize = r * n + c;
+            const got: f32 = out_vals[idx];
+            const ref: f32 = ref_row[c];
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expect(got >= 0.0 and got <= 1.0);
+            sum += got;
+            max_abs = @max(max_abs, @abs(got - ref));
+        }
+
+        // Fast exp approx: keep sum fairly tight, value-wise compare loosely.
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 3e-3);
+        try std.testing.expect(max_abs <= 3e-2);
+    }
+}
+
 test "graph: matmul f16 allows promoted f32 output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

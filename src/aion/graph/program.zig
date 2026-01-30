@@ -147,6 +147,25 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             _ = s.op;
         },
 
+        .SoftmaxTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
+            // v0: f32 only (fast + stable).
+            try compileRequire(out.dtype == .f32 and a.dtype == .f32);
+            try compileRequire(out.rank == a.rank);
+            try compileRequire(out.rank == 1 or out.rank == 2);
+            if (out.rank == 1) {
+                try compileRequire(out.shape[0] == a.shape[0]);
+            } else {
+                try compileRequire(out.shape[0] == a.shape[0] and out.shape[1] == a.shape[1]);
+            }
+            try compileRequire(out.tile_shape[0] == a.tile_shape[0] and out.tile_shape[1] == a.tile_shape[1]);
+            try compileRequire(out.tile_counts[0] == a.tile_counts[0] and out.tile_counts[1] == a.tile_counts[1]);
+
+            // Per-row scratch in exec uses stack arrays sized by tile_shape[0].
+            try compileRequire(out.tile_shape[0] <= 256);
+        },
+
         .CopyTiled => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
@@ -367,6 +386,30 @@ pub fn compileGraph(
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
                 try appendStepChecked(allocator, mgr, &steps, .{ .UnaryTiled = .{ .op = u.op, .out = out_tid, .a = a_tid } });
+            },
+
+            .Softmax => {
+                const a_id: usize = @intCast(node.inputs[0]);
+                const a_v = graph.values.items[a_id];
+
+                // v0: softmax only for f32.
+                if (a_v.dtype.? != .f32) return CompileError.InvalidArgument;
+
+                const tile: [2]usize = blk: {
+                    if (out_shape.len == 1) {
+                        const t1: [1]usize = plan_mod.chooseTileShape1D(policy, out_shape[0]);
+                        // Keep tm <= 256 for per-row scratch.
+                        break :blk .{ @min(@as(usize, 256), t1[0]), 1 };
+                    }
+                    const m: usize = out_shape[0];
+                    const n: usize = out_shape[1];
+                    const st = plan_mod.chooseSoftmaxTiles(policy, m, n);
+                    break :blk .{ st.tm, st.tn };
+                };
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
+                try appendStepChecked(allocator, mgr, &steps, .{ .SoftmaxTiled = .{ .out = out_tid, .a = a_tid } });
             },
 
             .Reduce => |rr| {

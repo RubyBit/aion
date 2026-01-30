@@ -170,6 +170,15 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             _ = u.op;
         },
 
+        .Softmax => {
+            try require(node.inputs.len == 1);
+            const a = try getValue(graph, node.inputs[0]);
+            try require(a.dtype != null and a.shape.len != 0);
+            if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
+            // v0: softmax over last dimension; preserve shape/dtype.
+            try setInferred(graph, node.output, a.dtype.?, a.shape);
+        },
+
         .Reduce => |_| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);

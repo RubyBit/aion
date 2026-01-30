@@ -8,6 +8,7 @@ const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
 const exec_matmul = @import("exec/matmul.zig");
+const exec_softmax = @import("exec/softmax.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -31,6 +32,9 @@ pub const CpuBackend = struct {
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
 
+    // Per-thread scratch for softmax reductions (max + sum). Size == 2*thread_count.
+    softmax_scratch_f32: []f32 = &[_]f32{},
+
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
     matmul_qx0: quant_matmul_registry.QuantKernels = quant_matmul_registry.candidates[1].kernels,
@@ -52,13 +56,13 @@ pub const CpuBackend = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {
         if (opts.thread_count == 0) return error.InvalidArgument;
 
-        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
         if (opts.thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = opts.thread_count });
             self.pool = p;
@@ -66,6 +70,9 @@ pub const CpuBackend = struct {
 
             // Allocate reduction scratch once. No allocations during op execution.
             self.reduce_scratch_f32 = try allocator.alloc(f32, opts.thread_count);
+
+            // Allocate softmax reduction scratch once. No allocations during op execution.
+            self.softmax_scratch_f32 = try allocator.alloc(f32, opts.thread_count * 2);
 
             // Allocate matmul scratch once. No allocations during op execution.
             // Select a variant based on CPU cache sizes (when available).
@@ -112,6 +119,11 @@ pub const CpuBackend = struct {
         if (self.reduce_scratch_f32.len != 0) {
             self.allocator.free(self.reduce_scratch_f32);
             self.reduce_scratch_f32 = &[_]f32{};
+        }
+
+        if (self.softmax_scratch_f32.len != 0) {
+            self.allocator.free(self.softmax_scratch_f32);
+            self.softmax_scratch_f32 = &[_]f32{};
         }
         self.thread_count = 1;
     }
@@ -165,6 +177,11 @@ pub const CpuBackend = struct {
                 .UnaryTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_unary.execUnaryTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .SoftmaxTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_softmax.execSoftmaxTiled(pool_ptr, self.thread_count, self.softmax_scratch_f32, s, store);
                 },
 
                 .CopyTiled => |s| {

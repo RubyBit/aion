@@ -30,6 +30,18 @@ pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize 
     return .{ side, side };
 }
 
+pub fn chooseSoftmaxTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
+    // Softmax is row-wise and needs per-row scratch. Prefer modest row tiles.
+    // Keep tm small to allow stack scratch in exec and increase parallelism.
+    const tm_cap: usize = 256;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+
+    // Favor wide tiles along the reduction axis to reduce tile overhead.
+    // Cap tn to base_square_2d to avoid giant tiles.
+    const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+    return .{ .tm = tm, .tn = tn };
+}
+
 pub fn roundDownToMultiple(x: usize, m: usize) usize {
     if (m == 0) return x;
     return x - (x % m);

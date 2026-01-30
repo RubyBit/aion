@@ -7,6 +7,7 @@ const gelu_k = @import("kernels/gelu.zig");
 const silu_k = @import("kernels/silu.zig");
 const sigmoid_k = @import("kernels/sigmoid.zig");
 const tanh_k = @import("kernels/tanh.zig");
+const exec_softmax = @import("exec/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("kernels/matmul_registry.zig");
 const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
@@ -186,6 +187,51 @@ test "cpu kernels: unary gelu f32 properties and accuracy" {
     for (x, 0..) |v, idx| ref[idx] = geluTanhApproxRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
     try std.testing.expect(max_abs <= 6e-2);
+}
+
+fn softmaxRefRowF32(out: []f32, x: []const f32) void {
+    std.debug.assert(out.len == x.len);
+    var maxv: f64 = -std.math.inf(f64);
+    for (x) |v| maxv = @max(maxv, @as(f64, @floatCast(v)));
+    var sum: f64 = 0.0;
+    for (x, 0..) |v, i| {
+        const e: f64 = std.math.exp(@as(f64, @floatCast(v)) - maxv);
+        out[i] = @floatCast(e);
+        sum += e;
+    }
+    const inv: f64 = 1.0 / sum;
+    for (out) |*v| v.* = @floatCast(@as(f64, @floatCast(v.*)) * inv);
+}
+
+test "cpu kernels: softmax f32 matches reference (rank-1)" {
+    // This tests the core softmax math used by the tiled exec.
+    var x = [_]f32{ -4.0, -1.0, 0.0, 0.5, 1.0, 2.0, 4.0 };
+    var out = [_]f32{0} ** x.len;
+    var ref = [_]f32{0} ** x.len;
+    softmaxRefRowF32(ref[0..], x[0..]);
+
+    // Use the exec helpers by building fake BufferViews around packed memory.
+    const out_bytes = std.mem.sliceAsBytes(out[0..]);
+    const in_bytes = std.mem.sliceAsBytes(x[0..]);
+
+    const layout = types.Layout{ .rank = 1, .shape = &[_]usize{x.len}, .strides_bytes = &[_]isize{@intCast(@sizeOf(f32))} };
+    const in_view = types.BufferViewConst{ .bytes = in_bytes, .dtype = .f32, .layout = layout };
+    const out_view = types.BufferViewMut{ .bytes = out_bytes, .dtype = .f32, .layout = layout };
+
+    var max_buf: [1]f32 = .{-std.math.inf(f32)};
+    var sum_buf: [1]f32 = .{0.0};
+    exec_softmax.updateMaxF32(max_buf[0..], in_view, 1);
+    exec_softmax.expSumStoreF32(sum_buf[0..], out_view, in_view, max_buf[0..], 1);
+    exec_softmax.normalizeF32(out_view, sum_buf[0..], 1);
+
+    try expectAllFinite(out[0..]);
+    var s: f32 = 0.0;
+    for (out) |v| {
+        try std.testing.expect(v >= 0.0 and v <= 1.0);
+        s += v;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s, 2e-3);
+    try expectSliceApproxEqAbs(ref[0..], out[0..], 3e-2);
 }
 
 test "cpu kernels: reduce sum/mean f32" {

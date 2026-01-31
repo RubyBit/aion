@@ -157,7 +157,7 @@ pub const Graph = struct {
 
     /// Softmax over the last dimension.
     /// - rank-1: over the vector axis
-    /// - rank-2: per row (axis=1)
+    /// - rank-2: per row
     pub fn addSoftmax(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.Softmax, &[_]ValueId{a});
     }

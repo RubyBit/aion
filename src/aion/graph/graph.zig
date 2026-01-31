@@ -44,6 +44,18 @@ pub const Op = union(enum) {
     /// Normalize over the last dimension (rank-2 only in v0).
     /// out = (x / sqrt(mean(x^2) + eps)) * gamma + beta
     RMSNorm: struct { eps: f32 },
+
+    /// Fused attention (rank-2 only in v0).
+    ///
+    /// Shapes:
+    /// - q: [m, dk]
+    /// - k: [n, dk]
+    /// - v: [n, dv]
+    /// - out: [m, dv]
+    ///
+    /// Computes softmax(scale * q @ k^T) @ v.
+    /// If causal, masks keys where key_index > query_index.
+    Attention: struct { scale: f32, causal: bool },
     Reduce: struct { op: ReduceOp },
     Copy: void,
 
@@ -156,6 +168,10 @@ pub const Graph = struct {
 
     pub fn addRMSNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32) GraphError!ValueId {
         return self.addNodeInternal(.{ .RMSNorm = .{ .eps = eps } }, &[_]ValueId{ x, gamma, beta });
+    }
+
+    pub fn addAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Attention = .{ .scale = scale, .causal = causal } }, &[_]ValueId{ q, k, v });
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {

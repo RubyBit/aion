@@ -332,6 +332,68 @@ fn rmsnormRefRowF32(out: []f32, x: []align(1) const f32, gamma: []align(1) const
     }
 }
 
+fn attentionRefF32(
+    allocator: std.mem.Allocator,
+    out: []f32,
+    q: []align(1) const f32,
+    k: []align(1) const f32,
+    v: []align(1) const f32,
+    m: usize,
+    n: usize,
+    dk: usize,
+    dv: usize,
+    scale: f32,
+    causal: bool,
+) void {
+    std.debug.assert(out.len == m * dv);
+    std.debug.assert(q.len == m * dk);
+    std.debug.assert(k.len == n * dk);
+    std.debug.assert(v.len == n * dv);
+
+    var scores: []f64 = allocator.alloc(f64, n) catch unreachable;
+    defer allocator.free(scores);
+    var probs: []f64 = allocator.alloc(f64, n) catch unreachable;
+    defer allocator.free(probs);
+
+    for (0..m) |r| {
+        // scores[c] = scale * dot(q[r], k[c]) with optional causal masking.
+        var maxv: f64 = -std.math.inf(f64);
+        for (0..n) |c| {
+            var s: f64 = 0.0;
+            if (causal and c > r) {
+                s = -std.math.inf(f64);
+            } else {
+                const q_off: usize = r * dk;
+                const k_off: usize = c * dk;
+                for (0..dk) |kk| {
+                    s += @as(f64, @floatCast(q[q_off + kk])) * @as(f64, @floatCast(k[k_off + kk]));
+                }
+                s *= @as(f64, @floatCast(scale));
+            }
+            scores[c] = s;
+            maxv = @max(maxv, s);
+        }
+
+        var sum: f64 = 0.0;
+        for (0..n) |c| {
+            const s: f64 = scores[c];
+            const e: f64 = if (std.math.isFinite(s)) std.math.exp(s - maxv) else 0.0;
+            probs[c] = e;
+            sum += e;
+        }
+        const inv: f64 = 1.0 / sum;
+        for (0..n) |c| probs[c] *= inv;
+
+        for (0..dv) |j| {
+            var acc: f64 = 0.0;
+            for (0..n) |c| {
+                acc += probs[c] * @as(f64, @floatCast(v[c * dv + j]));
+            }
+            out[r * dv + j] = @floatCast(acc);
+        }
+    }
+}
+
 test "graph: softmax rank-1 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -574,6 +636,96 @@ test "graph: layernorm and rmsnorm rank-2 match reference (f32)" {
                 std.debug.print("{s} mismatch row={} max_abs={}\n", .{ case.name, r, max_abs });
                 return error.TestExpectedEqual;
             }
+        }
+    }
+}
+
+test "graph: attention rank-2 matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 7;
+    const n: usize = 11;
+    const dk: usize = 9;
+    const dv: usize = 13;
+
+    const q_bytes_len: usize = m * dk * 4;
+    const k_bytes_len: usize = n * dk * 4;
+    const v_bytes_len: usize = n * dv * 4;
+    const out_bytes_len: usize = m * dv * 4;
+
+    const q_buf: []u8 = try allocator.alloc(u8, q_bytes_len);
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, k_bytes_len);
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
+    defer allocator.free(v_buf);
+
+    const q_vals: []align(1) f32 = asF32Slice(q_buf);
+    const k_vals: []align(1) f32 = asF32Slice(k_buf);
+    const v_vals: []align(1) f32 = asF32Slice(v_buf);
+
+    // Keep magnitudes modest so expApprox and reference stay close.
+    for (0..m * dk) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 31))) - 15))) * 0.03;
+    for (0..n * dk) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 29))) - 14))) * 0.03;
+    for (0..n * dv) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 37))) - 18))) * 0.02;
+
+    const scale: f32 = 0.25;
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally awkward tiling to exercise retile.
+    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, dk }, &[_]usize{ 3, 4 }, .{ .tile_alignment = 64 });
+    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ n, dk }, &[_]usize{ 4, 5 }, .{ .tile_alignment = 64 });
+    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ n, dv }, &[_]usize{ 5, 3 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(q_tid, q_buf);
+    try sm.writeFromPackedScalar(k_tid, k_buf);
+    try sm.writeFromPackedScalar(v_tid, v_buf);
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
+
+    inline for (.{
+        .{ .causal = false, .name = "noncausal" },
+        .{ .causal = true, .name = "causal" },
+    }) |case| {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const q_in = try g.addInput(.f32, &[_]usize{ m, dk });
+        const k_in = try g.addInput(.f32, &[_]usize{ n, dk });
+        const v_in = try g.addInput(.f32, &[_]usize{ n, dv });
+        try g.bindExternal(q_in, @intCast(q_tid));
+        try g.bindExternal(k_in, @intCast(k_tid));
+        try g.bindExternal(v_in, @intCast(v_tid));
+
+        const y = try g.addAttention(q_in, k_in, v_in, scale, case.causal);
+        try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
+        try backend.executeProgram(&prog, sm.tensorStore());
+
+        const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+        defer allocator.free(out_buf);
+        try sm.readToPackedScalar(prog.outputs[0], out_buf);
+        const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+        const ref: []f32 = try allocator.alloc(f32, m * dv);
+        defer allocator.free(ref);
+        attentionRefF32(allocator, ref, q_vals, k_vals, v_vals, m, n, dk, dv, scale, case.causal);
+
+        var max_abs: f32 = 0.0;
+        for (out_vals, ref) |got, r0| {
+            try std.testing.expect(std.math.isFinite(got));
+            max_abs = @max(max_abs, @abs(got - r0));
+        }
+        if (!(max_abs <= 6e-2)) {
+            std.debug.print("attention {s} mismatch max_abs={}\n", .{ case.name, max_abs });
+            return error.TestExpectedEqual;
         }
     }
 }

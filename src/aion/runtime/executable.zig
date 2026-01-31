@@ -10,6 +10,7 @@ pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorI
 pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId };
 pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+pub const StepAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
@@ -29,6 +30,7 @@ pub const Step = union(enum) {
     SoftmaxTiled: StepSoftmaxTiled,
     LayerNormTiled: StepLayerNormTiled,
     RMSNormTiled: StepRMSNormTiled,
+    AttentionTiled: StepAttentionTiled,
     ReduceAll: StepReduceAll,
     CopyTiled: StepCopyTiled,
 

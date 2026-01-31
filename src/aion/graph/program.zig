@@ -224,6 +224,49 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(s.eps > 0.0);
         },
 
+        .AttentionTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const q: *const TiledTensor = mgr.getConst(s.q) catch return CompileError.InvalidArgument;
+            const k: *const TiledTensor = mgr.getConst(s.k) catch return CompileError.InvalidArgument;
+            const v: *const TiledTensor = mgr.getConst(s.v) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.rank == 2 and q.rank == 2 and k.rank == 2 and v.rank == 2);
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == q.dtype and out.dtype == k.dtype and out.dtype == v.dtype);
+
+            // Shapes: q:[m,dk], k:[n,dk], v:[n,dv], out:[m,dv]
+            try compileRequire(q.shape[1] == k.shape[1]);
+            try compileRequire(k.shape[0] == v.shape[0]);
+            try compileRequire(out.shape[0] == q.shape[0]);
+            try compileRequire(out.shape[1] == v.shape[1]);
+
+            // Tiling contract:
+            // - out tile rows match q tile rows.
+            // - v tile cols match out tile cols.
+            // - k/v tile rows match (key blocks).
+            // - q/k tile cols match (dk blocks).
+            try compileRequire(out.tile_shape[0] == q.tile_shape[0]);
+            try compileRequire(out.tile_counts[0] == q.tile_counts[0]);
+
+            try compileRequire(out.tile_shape[1] == v.tile_shape[1]);
+            try compileRequire(out.tile_counts[1] == v.tile_counts[1]);
+
+            try compileRequire(k.tile_shape[0] == v.tile_shape[0]);
+            try compileRequire(k.tile_counts[0] == v.tile_counts[0]);
+
+            try compileRequire(q.tile_shape[1] == k.tile_shape[1]);
+            try compileRequire(q.tile_counts[1] == k.tile_counts[1]);
+
+            // Scratch limits (v0): keep per-tile row scratch bounded.
+            try compileRequire(out.tile_shape[0] <= 256);
+            try compileRequire(k.tile_shape[0] <= 128);
+            try compileRequire(out.tile_shape[1] <= 64);
+
+            try compileRequire(s.scale > 0.0);
+            try compileRequire(std.math.isFinite(s.scale));
+            _ = s.causal;
+        },
+
         .CopyTiled => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
@@ -521,6 +564,41 @@ pub fn compileGraph(
                 const beta_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, b_id, b_v.dtype.?, b_v.shape, bcast_tile);
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .RMSNormTiled = .{ .out = out_tid, .x = x_tid, .gamma = gamma_tid, .beta = beta_tid, .eps = rn.eps } });
+            },
+
+            .Attention => |attn| {
+                const q_id: usize = @intCast(node.inputs[0]);
+                const k_id: usize = @intCast(node.inputs[1]);
+                const v_id: usize = @intCast(node.inputs[2]);
+
+                const q_v = graph.values.items[q_id];
+                const k_v = graph.values.items[k_id];
+                const v_v = graph.values.items[v_id];
+
+                if (out_shape.len != 2) return CompileError.InvalidArgument;
+                if (!isScalarSupported(out_dt)) return CompileError.InvalidArgument;
+
+                const m: usize = q_v.shape[0];
+                const n: usize = k_v.shape[0];
+                const dk: usize = q_v.shape[1];
+                const dv: usize = v_v.shape[1];
+
+                const st = plan_mod.chooseAttentionTiles(policy, m, n, dk, dv);
+
+                // Output tile uses [tm, tv].
+                const out_tile: [2]usize = .{ st.tm, st.tv };
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                // Ensure tiling for inputs.
+                const q_needed: [2]usize = .{ st.tm, st.tk };
+                const k_needed: [2]usize = .{ st.tn, st.tk };
+                const v_needed: [2]usize = .{ st.tn, st.tv };
+
+                const q_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, q_id, q_v.dtype.?, q_v.shape, q_needed);
+                const k_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, k_id, k_v.dtype.?, k_v.shape, k_needed);
+                const v_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, v_id, v_v.dtype.?, v_v.shape, v_needed);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .AttentionTiled = .{ .out = out_tid, .q = q_tid, .k = k_tid, .v = v_tid, .scale = attn.scale, .causal = attn.causal } });
             },
 
             .Reduce => |rr| {

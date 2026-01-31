@@ -448,6 +448,84 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     std.debug.print("program rmsnorm f32:     {d:.3} GiB/s  (chk={d:.4})\n", .{ gib_s, chk });
 }
 
+fn benchProgramAttentionF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    m: usize,
+    n: usize,
+    dk: usize,
+    dv: usize,
+    causal: bool,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const st = plan_mod.chooseAttentionTiles(policy, m, n, dk, dv);
+
+    const q: []f32 = try allocator.alloc(f32, m * dk);
+    defer allocator.free(q);
+    const k: []f32 = try allocator.alloc(f32, n * dk);
+    defer allocator.free(k);
+    const v: []f32 = try allocator.alloc(f32, n * dv);
+    defer allocator.free(v);
+    fillRandomF32(rnd, q);
+    fillRandomF32(rnd, k);
+    fillRandomF32(rnd, v);
+
+    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, dk }, &[_]usize{ st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n, dk }, &[_]usize{ st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n, dv }, &[_]usize{ st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
+    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k));
+    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in = try g.addInput(.f32, &[_]usize{ m, dk });
+    const k_in = try g.addInput(.f32, &[_]usize{ n, dk });
+    const v_in = try g.addInput(.f32, &[_]usize{ n, dv });
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
+    const y = try g.addAttention(q_in, k_in, v_in, scale, causal);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    // FLOPs (ignoring softmax exp overhead):
+    // - QK^T: 2*m*n*dk
+    // - P@V:  2*m*n*dv
+    const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
+    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
+        try readF32AtTiled(&sm, out_tid, m / 2, dv / 2) +
+        try readF32AtTiled(&sm, out_tid, m - 1, dv - 1);
+
+    const mode: []const u8 = if (causal) "causal" else "noncausal";
+    std.debug.print(
+        "program attention f32 {s}: {d:.2} GFLOP/s (m={} n={} dk={} dv={}, chk={d:.4})\n",
+        .{ mode, gflops, m, n, dk, dv, chk },
+    );
+}
+
 fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
@@ -771,6 +849,8 @@ fn mainImpl() !void {
     try benchProgramSoftmaxF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramLayerNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, false, be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     if (opts.quant) {

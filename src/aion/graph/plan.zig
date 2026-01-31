@@ -51,6 +51,37 @@ pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usiz
     return .{ .tm = tm, .tn = tn };
 }
 
+pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, dv: usize) struct { tm: usize, tn: usize, tk: usize, tv: usize } {
+    // Attention is row-wise over queries, and needs per-query scratch.
+    // IMPORTANT: we parallelize attention primarily across query tiles.
+    // Keep tm modest so we have enough tile-level parallelism on many-core CPUs.
+    const tm_cap: usize = 32;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+
+    // Block keys modestly so per-row score scratch stays small.
+    const tn_cap: usize = 128;
+    const tn: usize = @max(@as(usize, 1), @min(n, @min(tn_cap, policy.base_square_2d)));
+
+    // Block value/output columns to bound the accumulator scratch.
+    const tv_cap: usize = 64;
+    var tv_target: usize = @min(dv, @min(tv_cap, policy.base_square_2d));
+    if (tv_target >= 16) {
+        tv_target = roundDownToMultiple(tv_target, 16);
+        if (tv_target == 0) tv_target = @min(@as(usize, 16), dv);
+    }
+    const tv: usize = @max(@as(usize, 1), @min(tv_target, dv));
+
+    // Block head dim reasonably; keep it SIMD-friendly.
+    var tk_target: usize = @min(@as(usize, 128), dk);
+    if (tk_target >= 16) {
+        tk_target = roundDownToMultiple(tk_target, 16);
+        if (tk_target == 0) tk_target = @min(@as(usize, 16), dk);
+    }
+    const tk: usize = @max(@as(usize, 1), @min(tk_target, dk));
+
+    return .{ .tm = tm, .tn = tn, .tk = tk, .tv = tv };
+}
+
 pub fn roundDownToMultiple(x: usize, m: usize) usize {
     if (m == 0) return x;
     return x - (x % m);

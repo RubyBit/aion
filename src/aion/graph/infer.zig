@@ -217,6 +217,28 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, x.dtype.?, x.shape);
         },
 
+        .Attention => |attn| {
+            try require(node.inputs.len == 3);
+            const q = try getValue(graph, node.inputs[0]);
+            const k = try getValue(graph, node.inputs[1]);
+            const v = try getValue(graph, node.inputs[2]);
+
+            try require(q.dtype != null and k.dtype != null and v.dtype != null);
+            try require(q.shape.len == 2 and k.shape.len == 2 and v.shape.len == 2);
+
+            if (q.dtype.? != k.dtype.? or q.dtype.? != v.dtype.?) return InferError.DTypeMismatch;
+            if (q.dtype.?.info().is_quantized) return InferError.Unsupported;
+
+            // q:[m,dk], k:[n,dk], v:[n,dv] -> out:[m,dv]
+            if (q.shape[1] != k.shape[1]) return InferError.ShapeMismatch;
+            if (k.shape[0] != v.shape[0]) return InferError.ShapeMismatch;
+
+            if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
+            _ = attn.causal;
+
+            try setInferred(graph, node.output, q.dtype.?, &[_]usize{ q.shape[0], v.shape[1] });
+        },
+
         .Reduce => |_| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);

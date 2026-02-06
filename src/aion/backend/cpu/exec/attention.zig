@@ -9,30 +9,16 @@ const executable = @import("../../../runtime/executable.zig");
 const exec_utils = @import("utils.zig");
 const fast_math = @import("../kernels/fast_math.zig");
 const simd = @import("../kernels/simd.zig");
+const attn_kernels = @import("../kernels/attention.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
-const simd_lanes = 8;
-const Vec = @Vector(simd_lanes, f32);
-
-inline fn vecLoad(ptr: [*]align(1) const f32) Vec {
-    return @as(*align(1) const [simd_lanes]f32, @ptrCast(ptr)).*;
-}
-
-inline fn vecStore(ptr: [*]align(1) f32, v: Vec) void {
-    @as(*align(1) [simd_lanes]f32, @ptrCast(ptr)).* = v;
-}
-
-fn expSoftmax(x: f32) f32 {
-    // For masked values we feed -inf; exp(-inf) must be 0.
-    if (!std.math.isFinite(x)) {
-        if (x < 0.0) return 0.0;
-        return std.math.inf(f32);
-    }
-    // Clamp to keep exp approx stable.
-    return fast_math.expApproxF32(fast_math.clampF32(x, -20.0, 0.0));
-}
+const simd_lanes: usize = attn_kernels.simd_lanes;
+const Vec = attn_kernels.Vec;
+const vecLoad = attn_kernels.vecLoad;
+const vecStore = attn_kernels.vecStore;
+const expSoftmax = attn_kernels.expSoftmax;
 
 pub fn execAttentionTiled(
     pool: ?*thread_pool.ThreadPool,
@@ -229,8 +215,8 @@ fn attentionTileAllV_Stream_F32(
             const qs: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, qv.bytes);
             const ks: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, kv.bytes);
 
-            packKBlock(n_k, k_q, ks, k_k, &kt_scratch);
-            calcScoresF32(m_q, n_k, k_q, qs, k_q, &kt_scratch, &qt_scratch, scores[0..scores_len], tn);
+            attn_kernels.packKBlock(n_k, k_q, ks, k_k, &kt_scratch);
+            attn_kernels.calcScoresF32(m_q, n_k, k_q, qs, k_q, &kt_scratch, &qt_scratch, scores[0..scores_len], tn);
         }
 
         // Apply scale and causal mask; also clamp unused cols to -inf.
@@ -346,7 +332,7 @@ fn attentionTileAllV_Stream_F32(
             const out_stride: usize = out_strides[ti_v];
             if (dv_v != out_stride) return BackendError.InvalidArgument;
 
-            accumulateValuesF32(m_tile, n_v, dv_v, scores[0..scores_len], tn, vs, dv_v, out_s, out_stride);
+            attn_kernels.accumulateValuesF32(m_tile, n_v, dv_v, scores[0..scores_len], tn, vs, dv_v, out_s, out_stride);
         }
     }
 
@@ -371,173 +357,6 @@ fn attentionTileAllV_Stream_F32(
                 vecStore(ptr, vecLoad(ptr) * v_inv);
             }
             while (j < out_stride) : (j += 1) out_s[off + j] *= inv;
-        }
-    }
-}
-
-fn packQBlock(
-    rows: usize,
-    cols: usize,
-    src: []align(1) const f32,
-    src_stride: usize,
-    dst: []f32,
-) void {
-    const MR = 6;
-    var c0: usize = 0;
-    while (c0 < rows) : (c0 += MR) {
-        if (c0 + MR > rows) break;
-        const dst_ptr = dst[(c0 / MR) * (cols * MR) ..].ptr;
-        for (0..cols) |k| {
-            const ptr = dst_ptr + k * MR;
-            for (0..MR) |i| ptr[i] = src[(c0 + i) * src_stride + k];
-        }
-    }
-}
-
-fn packKBlock(
-    rows: usize,
-    cols: usize,
-    src: []align(1) const f32,
-    src_stride: usize,
-    dst: []f32,
-) void {
-    const NR = 16;
-    var c0: usize = 0;
-    while (c0 < rows) : (c0 += NR) {
-        if (c0 + NR > rows) break;
-        const dst_ptr = dst[(c0 / NR) * (cols * NR) ..].ptr;
-        for (0..cols) |k| {
-            const ptr = dst_ptr + k * NR;
-            for (0..NR) |i| ptr[i] = src[(c0 + i) * src_stride + k];
-        }
-    }
-}
-
-fn calcScoresF32(
-    m_q: usize,
-    n_k: usize,
-    k_dim: usize,
-    qs: []align(1) const f32,
-    q_stride: usize,
-    kt: []f32, // Packed K (NR=16)
-    qt: []f32, // Packed Q (MR=6)
-    scores: []f32,
-    score_stride: usize,
-) void {
-    const MR = 6;
-    const NR = 16;
-
-    packQBlock(m_q, k_dim, qs, q_stride, qt);
-
-    var r0: usize = 0;
-    while (r0 < m_q) : (r0 += MR) {
-        const r_end = @min(r0 + MR, m_q);
-        var c0: usize = 0;
-        while (c0 < n_k) : (c0 += NR) {
-            if (c0 + NR > n_k or r0 + MR > m_q) {
-                // Naive fallback
-                for (r0..r_end) |r| {
-                    const q_p = qs[r * q_stride ..];
-                    const s_p = scores[r * score_stride ..];
-                    // We don't have K in easy access here except packed or fallback to old approach
-                    // Since bench uses aligned sizes (256, 128), we skip fallback logic for perf
-                    // But for correctness we need K. We don't have KS here!
-                    // We can unpack kt or just use q_p against kt?
-                    // kt is packed [n_k/NR, k, NR].
-                    // Accessing kt randomly is painful.
-                    // Assume aligned for now.
-                    _ = q_p;
-                    _ = s_p;
-                }
-                continue;
-            }
-
-            // MR=6, NR=16 (2 vectors)
-            var vScores0: [MR]Vec = undefined;
-            var vScores1: [MR]Vec = undefined;
-            for (0..MR) |i| {
-                vScores0[i] = @splat(0.0);
-                vScores1[i] = @splat(0.0);
-            }
-
-            const q_ptr_base = qt[(r0 / MR) * (k_dim * MR) ..].ptr;
-            const k_ptr_base = kt[(c0 / NR) * (k_dim * NR) ..].ptr;
-
-            for (0..k_dim) |k| {
-                const vk_ptr = k_ptr_base + k * NR;
-                const vK0 = vecLoad(vk_ptr);
-                const vK1 = vecLoad(vk_ptr + 8);
-
-                const q_k_ptr = q_ptr_base + k * MR;
-
-                inline for (0..MR) |i| {
-                    const vQ = @as(Vec, @splat(q_k_ptr[i]));
-                    vScores0[i] += vQ * vK0;
-                    vScores1[i] += vQ * vK1;
-                }
-            }
-
-            for (r0..r_end) |r| {
-                const ri = r - r0;
-                const ptr = scores[r * score_stride + c0 ..].ptr;
-                vecStore(ptr, vecLoad(ptr) + vScores0[ri]);
-                vecStore(ptr + 8, vecLoad(ptr + 8) + vScores1[ri]);
-            }
-        }
-    }
-}
-
-fn accumulateValuesF32(
-    m_tile: usize,
-    n_v: usize,
-    dv: usize,
-    scores: []f32,
-    score_stride: usize,
-    vs: []align(1) const f32,
-    v_stride: usize,
-    acc: []f32,
-    acc_stride: usize,
-) void {
-    const MR = 8;
-    var j: usize = 0;
-    while (j < dv) : (j += simd_lanes) {
-        if (j + simd_lanes > dv) {
-            // Scalar fallback
-            for (j..dv) |jj| {
-                for (0..m_tile) |r| {
-                    const p_row = scores[r * score_stride ..];
-                    var s: f32 = acc[r * acc_stride + jj];
-                    for (0..n_v) |k| {
-                        s += p_row[k] * vs[k * v_stride + jj];
-                    }
-                    acc[r * acc_stride + jj] = s;
-                }
-            }
-            break;
-        }
-
-        var r0: usize = 0;
-        while (r0 < m_tile) : (r0 += MR) {
-            const r1 = @min(r0 + MR, m_tile);
-
-            var vAcc: [MR]Vec = undefined;
-            for (r0..r1) |r| {
-                const ri = r - r0;
-                vAcc[ri] = vecLoad(acc[r * acc_stride + j ..].ptr);
-            }
-
-            for (0..n_v) |k| {
-                const vV = vecLoad(vs[k * v_stride + j ..].ptr);
-                for (r0..r1) |r| {
-                    const ri = r - r0;
-                    vAcc[ri] += @as(Vec, @splat(scores[r * score_stride + k])) * vV;
-                }
-            }
-
-            for (r0..r1) |r| {
-                const ri = r - r0;
-                vecStore(acc[r * acc_stride + j ..].ptr, vAcc[ri]);
-            }
         }
     }
 }

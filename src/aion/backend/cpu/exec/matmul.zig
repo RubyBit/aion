@@ -7,9 +7,9 @@ const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 
 const matmul_k = @import("../kernels/matmul.zig");
-const matmul_registry = @import("../kernels/matmul_registry.zig");
-const quant_matmul_registry = @import("../kernels/quant_matmul_registry.zig");
-const matvec_registry = @import("../kernels/matvec_registry.zig");
+const matmul_registry = @import("../registry/matmul_registry.zig");
+const quant_matmul_registry = @import("../registry/quant_matmul_registry.zig");
+const matvec_registry = @import("../registry/matvec_registry.zig");
 
 const BackendError = types.BackendError;
 const DType = types.DType;

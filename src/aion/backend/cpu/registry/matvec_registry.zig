@@ -1,5 +1,5 @@
 const types = @import("../../types.zig");
-const matvec_tuned = @import("matvec.zig");
+const matvec_tuned = @import("../kernels/matvec.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {

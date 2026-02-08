@@ -9,9 +9,9 @@ const sigmoid_k = @import("kernels/sigmoid.zig");
 const tanh_k = @import("kernels/tanh.zig");
 const exec_softmax = @import("exec/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
-const matmul_registry = @import("kernels/matmul_registry.zig");
-const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
-const matvec_registry = @import("kernels/matvec_registry.zig");
+const matmul_registry = @import("registry/matmul_registry.zig");
+const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const matvec_registry = @import("registry/matvec_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -40,6 +40,27 @@ fn maxAbsDiffF32(a: []const f32, b: []const f32) f32 {
     var m: f32 = 0.0;
     for (a, b) |x, y| m = @max(m, @abs(x - y));
     return m;
+}
+
+fn matmulKernelsById(id: matmul_registry.VariantId) matmul_registry.F32Kernels {
+    inline for (matmul_registry.candidates) |c| {
+        if (c.id == id) return c.kernels;
+    }
+    @panic("missing matmul kernel variant");
+}
+
+fn quantMatmulKernelsById(id: quant_matmul_registry.VariantId) quant_matmul_registry.QuantKernels {
+    inline for (quant_matmul_registry.candidates) |c| {
+        if (c.id == id) return c.kernels;
+    }
+    @panic("missing quant matmul kernel variant");
+}
+
+fn matvecKernelsById(id: matvec_registry.VariantId) matvec_registry.Kernels {
+    inline for (matvec_registry.candidates) |c| {
+        if (c.id == id) return c.kernels;
+    }
+    @panic("missing matvec kernel variant");
 }
 
 fn sigmoidRefF32(x: f32) f32 {
@@ -287,7 +308,7 @@ test "cpu kernels: tuned f32 matmul via registry" {
 
     naiveMatmulF32(params, c_ref[0..], a[0..], b[0..]);
 
-    const kernels = matmul_registry.candidates[1].kernels;
+    const kernels: matmul_registry.F32Kernels = matmulKernelsById(.medium);
     try std.testing.expect(k > 0 and n > 0);
 
     const pb_f32_len: usize = kernels.tuning.kc * kernels.tuning.nc;
@@ -340,7 +361,7 @@ test "cpu kernels: matvec f32" {
         c_ref[j] = acc;
     }
 
-    try matvec_registry.candidates[0].kernels.matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvecKernelsById(.tuned).matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
 }
 
@@ -438,7 +459,7 @@ test "cpu kernels: tuned q8_0 matmul via registry" {
     var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels = quant_matmul_registry.candidates[1].kernels;
+    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
@@ -484,7 +505,7 @@ test "cpu kernels: tuned q4_0 matmul via registry" {
     var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels = quant_matmul_registry.candidates[1].kernels;
+    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
@@ -535,7 +556,7 @@ test "cpu kernels: matvec q8_0" {
     }
 
     var c: [n]f32 = [_]f32{0.0} ** n;
-    const kernels = quant_matmul_registry.candidates[1].kernels;
+    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 

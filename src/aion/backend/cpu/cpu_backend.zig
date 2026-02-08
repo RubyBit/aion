@@ -1,9 +1,9 @@
 const std = @import("std");
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
-const matmul_registry = @import("kernels/matmul_registry.zig");
-const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
-const matvec_registry = @import("kernels/matvec_registry.zig");
+const matmul_registry = @import("registry/matmul_registry.zig");
+const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const matvec_registry = @import("registry/matvec_registry.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
@@ -58,7 +58,22 @@ pub const CpuBackend = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        const cpu_info = cpuid.detect();
+        const mm_choice: matmul_registry.Candidate = matmul_registry.selectHeuristic(cpu_info);
+        const qm_choice: quant_matmul_registry.Candidate = quant_matmul_registry.selectHeuristic(cpu_info);
+        const mv_choice: matvec_registry.Candidate = matvec_registry.selectHeuristic(cpu_info);
+
+        return .{
+            .allocator = allocator,
+            .pool = null,
+            .thread_count = 1,
+            .reduce_scratch_f32 = &[_]f32{},
+            .softmax_scratch_f32 = &[_]f32{},
+            .matmul_f32 = mm_choice.kernels,
+            .matmul_qx0 = qm_choice.kernels,
+            .matvec = mv_choice.kernels,
+            .matmul_scratch_f32 = &[_][]align(32) u8{},
+        };
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {

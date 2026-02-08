@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const matmul_registry = @import("matmul_registry.zig");
+const matmul_registry = @import("../registry/matmul_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -125,7 +125,7 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = LANES; // 8 
+            const lanes = LANES; // 8
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;

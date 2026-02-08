@@ -1,6 +1,6 @@
 const std = @import("std");
 const types = @import("../../types.zig");
-const matmul_tuned = @import("matmul_tuned.zig");
+const matmul_tuned = @import("../kernels/matmul_tuned.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {
@@ -62,14 +62,14 @@ pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // - but never return `small` when L2 is reasonably sized (>= 1MiB), because
     //   the current tiler commonly uses tk=256.
 
-    const l2_bytes = info.caches.l2_bytes;
+    const l2_bytes: usize = info.caches.l2_bytes;
     if (l2_bytes == 0) return candidates[1];
 
     const budget: usize = (l2_bytes * 3) / 4;
 
     var best: Candidate = candidates[0];
     inline for (candidates) |c| {
-        const footprint = c.kernels.tuning.kc * c.kernels.tuning.nc * @sizeOf(f32);
+        const footprint: usize = c.kernels.tuning.kc * c.kernels.tuning.nc * @sizeOf(f32);
         if (footprint <= budget) best = c;
     }
 

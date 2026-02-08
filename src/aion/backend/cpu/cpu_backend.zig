@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
+const attention_registry = @import("registry/attention_registry.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
@@ -43,6 +44,8 @@ pub const CpuBackend = struct {
 
     matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
 
+    attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
+
     // Per-thread scratch for matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
     matmul_scratch_f32: [][]align(32) u8 = &[_][]align(32) u8{},
@@ -62,6 +65,7 @@ pub const CpuBackend = struct {
         const mm_choice: matmul_registry.Candidate = matmul_registry.selectHeuristic(cpu_info);
         const qm_choice: quant_matmul_registry.Candidate = quant_matmul_registry.selectHeuristic(cpu_info);
         const mv_choice: matvec_registry.Candidate = matvec_registry.selectHeuristic(cpu_info);
+        const attn_choice: attention_registry.Candidate = attention_registry.selectHeuristic(cpu_info);
 
         return .{
             .allocator = allocator,
@@ -72,6 +76,7 @@ pub const CpuBackend = struct {
             .matmul_f32 = mm_choice.kernels,
             .matmul_qx0 = qm_choice.kernels,
             .matvec = mv_choice.kernels,
+            .attention_kernels = attn_choice.kernels,
             .matmul_scratch_f32 = &[_][]align(32) u8{},
         };
     }
@@ -102,6 +107,9 @@ pub const CpuBackend = struct {
 
             const mv_choice = matvec_registry.selectHeuristic(cpu_info);
             self.matvec = mv_choice.kernels;
+
+            const attn_choice = attention_registry.selectHeuristic(cpu_info);
+            self.attention_kernels = attn_choice.kernels;
 
             var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);
             errdefer allocator.free(mm);
@@ -213,7 +221,7 @@ pub const CpuBackend = struct {
 
                 .AttentionTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                    try exec_attention.execAttentionTiled(pool_ptr, self.thread_count, s, store);
+                    try exec_attention.execAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
                 },
 
                 .CopyTiled => |s| {

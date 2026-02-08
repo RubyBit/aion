@@ -7,11 +7,12 @@ const gelu_k = @import("kernels/gelu.zig");
 const silu_k = @import("kernels/silu.zig");
 const sigmoid_k = @import("kernels/sigmoid.zig");
 const tanh_k = @import("kernels/tanh.zig");
-const exec_softmax = @import("exec/softmax.zig");
+const softmax_k = @import("kernels/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
+const attention_registry = @import("registry/attention_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -61,6 +62,13 @@ fn matvecKernelsById(id: matvec_registry.VariantId) matvec_registry.Kernels {
         if (c.id == id) return c.kernels;
     }
     @panic("missing matvec kernel variant");
+}
+
+fn attentionKernelsById(id: attention_registry.VariantId) attention_registry.Kernels {
+    inline for (attention_registry.candidates) |c| {
+        if (c.id == id) return c.kernels;
+    }
+    @panic("missing attention kernel variant");
 }
 
 fn sigmoidRefF32(x: f32) f32 {
@@ -241,9 +249,9 @@ test "cpu kernels: softmax f32 matches reference (rank-1)" {
 
     var max_buf: [1]f32 = .{-std.math.inf(f32)};
     var sum_buf: [1]f32 = .{0.0};
-    exec_softmax.updateMaxF32(max_buf[0..], in_view, 1);
-    exec_softmax.expSumStoreF32(sum_buf[0..], out_view, in_view, max_buf[0..], 1);
-    exec_softmax.normalizeF32(out_view, sum_buf[0..], 1);
+    softmax_k.updateMaxF32(max_buf[0..], in_view, 1);
+    softmax_k.expSumStoreF32(sum_buf[0..], out_view, in_view, max_buf[0..], 1);
+    softmax_k.normalizeF32(out_view, sum_buf[0..], 1);
 
     try expectAllFinite(out[0..]);
     var s: f32 = 0.0;
@@ -332,6 +340,46 @@ test "cpu kernels: tuned f32 matmul via registry" {
     }
 
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
+}
+
+test "cpu kernels: attention calcScores handles partial tiles" {
+    const kernels: attention_registry.Kernels = attentionKernelsById(.baseline);
+
+    const M: usize = 7;
+    const N: usize = 19;
+    const K: usize = 13;
+
+    var prng = std.Random.DefaultPrng.init(0x4242);
+    const rnd = prng.random();
+
+    var q: [M * K]f32 = undefined;
+    var k: [N * K]f32 = undefined;
+    for (q[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (k[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    var scores: [M * N]f32 = [_]f32{0.0} ** (M * N);
+    var qt: [M * K]f32 = [_]f32{0.0} ** (M * K);
+    var kt: [N * K]f32 = [_]f32{0.0} ** (N * K);
+
+    kernels.pack_q_block(M, K, q[0..], K, qt[0..]);
+    kernels.pack_k_block(N, K, k[0..], K, kt[0..]);
+    kernels.calc_scores_f32(M, N, K, q[0..], K, k[0..], K, kt[0..], qt[0..], scores[0..], N);
+
+    var ref: [M * N]f32 = undefined;
+    var r: usize = 0;
+    while (r < M) : (r += 1) {
+        var c: usize = 0;
+        while (c < N) : (c += 1) {
+            var acc: f32 = 0.0;
+            var kk: usize = 0;
+            while (kk < K) : (kk += 1) {
+                acc += q[r * K + kk] * k[c * K + kk];
+            }
+            ref[r * N + c] = acc;
+        }
+    }
+
+    try expectSliceApproxEqAbs(ref[0..], scores[0..], 1e-3);
 }
 
 test "cpu kernels: matvec f32" {

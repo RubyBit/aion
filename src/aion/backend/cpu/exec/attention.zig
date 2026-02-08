@@ -10,6 +10,7 @@ const exec_utils = @import("utils.zig");
 const fast_math = @import("../kernels/fast_math.zig");
 const simd = @import("../kernels/simd.zig");
 const attn_kernels = @import("../kernels/attention.zig");
+const attention_registry = @import("../registry/attention_registry.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -18,11 +19,11 @@ const simd_lanes: usize = attn_kernels.simd_lanes;
 const Vec = attn_kernels.Vec;
 const vecLoad = attn_kernels.vecLoad;
 const vecStore = attn_kernels.vecStore;
-const expSoftmax = attn_kernels.expSoftmax;
 
 pub fn execAttentionTiled(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
+    kernels: attention_registry.Kernels,
     s: executable.StepAttentionTiled,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
@@ -72,6 +73,7 @@ pub fn execAttentionTiled(
                 q_meta: tensor_store.TensorMeta,
                 k_meta: tensor_store.TensorMeta,
                 s: executable.StepAttentionTiled,
+                kernels: attention_registry.Kernels,
 
                 stop: std.atomic.Value(bool) = .init(false),
                 err_mutex: std.Thread.Mutex = .{},
@@ -92,7 +94,7 @@ pub fn execAttentionTiled(
                     var ti_q: usize = start;
                     while (ti_q < end) : (ti_q += 1) {
                         if (t.stop.load(.acquire)) return;
-                        attentionTileAllV_Stream_F32(t.store, t.out_meta, t.q_meta, t.k_meta, t.s, ti_q) catch |e| {
+                        attentionTileAllV_Stream_F32(t.store, t.out_meta, t.q_meta, t.k_meta, t.s, t.kernels, ti_q) catch |e| {
                             t.fail(e);
                             return;
                         };
@@ -100,7 +102,7 @@ pub fn execAttentionTiled(
                 }
             };
 
-            var task: Task = .{ .store = store, .out_meta = out_meta, .q_meta = q_meta, .k_meta = k_meta, .s = s };
+            var task: Task = .{ .store = store, .out_meta = out_meta, .q_meta = q_meta, .k_meta = k_meta, .s = s, .kernels = kernels };
             p.parallelForAny(@ptrCast(&task), ti_q_total, 1, Task.runTiQ);
             if (task.err_any) |e| return @errorCast(e);
             return;
@@ -110,7 +112,7 @@ pub fn execAttentionTiled(
     // Sequential fallback.
     var ti_q: usize = 0;
     while (ti_q < ti_q_total) : (ti_q += 1) {
-        try attentionTileAllV_Stream_F32(store, out_meta, q_meta, k_meta, s, ti_q);
+        try attentionTileAllV_Stream_F32(store, out_meta, q_meta, k_meta, s, kernels, ti_q);
     }
 }
 
@@ -120,6 +122,7 @@ fn attentionTileAllV_Stream_F32(
     q_meta: tensor_store.TensorMeta,
     k_meta: tensor_store.TensorMeta,
     s: executable.StepAttentionTiled,
+    kernels: attention_registry.Kernels,
     ti_q: usize,
 ) ExecuteProgramError!void {
     std.debug.assert(out_meta.dtype == .f32);
@@ -215,8 +218,8 @@ fn attentionTileAllV_Stream_F32(
             const qs: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, qv.bytes);
             const ks: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, kv.bytes);
 
-            attn_kernels.packKBlock(n_k, k_q, ks, k_k, &kt_scratch);
-            attn_kernels.calcScoresF32(m_q, n_k, k_q, qs, k_q, &kt_scratch, &qt_scratch, scores[0..scores_len], tn);
+            kernels.pack_k_block(n_k, k_q, ks, k_k, &kt_scratch);
+            kernels.calc_scores_f32(m_q, n_k, k_q, qs, k_q, ks, k_k, &kt_scratch, &qt_scratch, scores[0..scores_len], tn);
         }
 
         // Apply scale and causal mask; also clamp unused cols to -inf.
@@ -258,7 +261,7 @@ fn attentionTileAllV_Stream_F32(
         for (0..m_tile) |r| {
             const mn: f32 = @max(m_state[r], row_max[r]);
             m_new[r] = mn;
-            rescale[r] = if (m_state[r] == -std.math.inf(f32)) 0.0 else expSoftmax(m_state[r] - mn);
+            rescale[r] = if (m_state[r] == -std.math.inf(f32)) 0.0 else kernels.exp_softmax(m_state[r] - mn);
         }
 
         // Rescale previous accumulators (output tiles) and l_state.
@@ -303,7 +306,7 @@ fn attentionTileAllV_Stream_F32(
             }
             ssum += @reduce(.Add, v_ssum);
             while (c < tn) : (c += 1) {
-                const p: f32 = expSoftmax(scores[r * tn + c] - mn);
+                const p: f32 = kernels.exp_softmax(scores[r * tn + c] - mn);
                 scores[r * tn + c] = p;
                 ssum += p;
             }
@@ -332,7 +335,7 @@ fn attentionTileAllV_Stream_F32(
             const out_stride: usize = out_strides[ti_v];
             if (dv_v != out_stride) return BackendError.InvalidArgument;
 
-            attn_kernels.accumulateValuesF32(m_tile, n_v, dv_v, scores[0..scores_len], tn, vs, dv_v, out_s, out_stride);
+            kernels.accumulate_values_f32(m_tile, n_v, dv_v, scores[0..scores_len], tn, vs, dv_v, out_s, out_stride);
         }
     }
 

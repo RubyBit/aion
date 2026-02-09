@@ -224,6 +224,11 @@ pub const CpuBackend = struct {
                     try exec_attention.execAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
                 },
 
+                .MultiHeadAttentionTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_attention.execMultiHeadAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
+                },
+
                 .CopyTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try ElemwiseExec.execCopyTiled(pool_ptr, self.thread_count, s, store);

@@ -24,6 +24,9 @@ const BenchOptions = struct {
     iters: usize = 50,
     threads: usize = 1,
 
+    // Multi-head attention heads (packed head-major layout).
+    heads: usize = 4,
+
     // Elementwise length (logical elements).
     n_elem: usize = 8 * 1024 * 1024,
 
@@ -47,6 +50,7 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
+            "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
             "  --m N            MatMul M (default: 512)\n" ++
             "  --n N            MatMul N (default: 512)\n" ++
@@ -86,6 +90,10 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
             opts.threads = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--heads")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.heads = try parseUsize(args[i]);
         } else if (std.mem.eql(u8, a, "--n-elem")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
@@ -109,6 +117,7 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
 
     if (opts.iters == 0) return error.InvalidArgument;
     if (opts.threads == 0) return error.InvalidArgument;
+    if (opts.heads == 0) return error.InvalidArgument;
     if (opts.n_elem == 0) return error.InvalidArgument;
     if (opts.m == 0 or opts.n == 0 or opts.k == 0) return error.InvalidArgument;
 
@@ -526,6 +535,87 @@ fn benchProgramAttentionF32(
     );
 }
 
+fn benchProgramMultiHeadAttentionF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    heads: usize,
+    m_head: usize,
+    n_head: usize,
+    dk: usize,
+    dv: usize,
+    causal: bool,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const st = plan_mod.chooseAttentionTiles(policy, m_head, n_head, dk, dv);
+
+    const m_total: usize = heads * m_head;
+    const n_total: usize = heads * n_head;
+
+    const q: []f32 = try allocator.alloc(f32, m_total * dk);
+    defer allocator.free(q);
+    const k: []f32 = try allocator.alloc(f32, n_total * dk);
+    defer allocator.free(k);
+    const v: []f32 = try allocator.alloc(f32, n_total * dv);
+    defer allocator.free(v);
+    fillRandomF32(rnd, q);
+    fillRandomF32(rnd, k);
+    fillRandomF32(rnd, v);
+
+    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m_total, dk }, &[_]usize{ st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dk }, &[_]usize{ st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dv }, &[_]usize{ st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
+    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k));
+    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in = try g.addInput(.f32, &[_]usize{ m_total, dk });
+    const k_in = try g.addInput(.f32, &[_]usize{ n_total, dk });
+    const v_in = try g.addInput(.f32, &[_]usize{ n_total, dv });
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
+    const y = try g.addMultiHeadAttention(q_in, k_in, v_in, scale, causal, heads);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    // FLOPs (ignoring softmax exp overhead): per head * heads
+    const flops_per: u64 = 2 * @as(u64, @intCast(m_head)) * @as(u64, @intCast(n_head)) *
+        (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv))) * @as(u64, @intCast(heads));
+    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
+        try readF32AtTiled(&sm, out_tid, m_head / 2, dv / 2) +
+        try readF32AtTiled(&sm, out_tid, m_total - 1, dv - 1);
+
+    const mode: []const u8 = if (causal) "causal" else "noncausal";
+    std.debug.print(
+        "program mha f32 {s}: {d:.2} GFLOP/s (h={} m={} n={} dk={} dv={}, chk={d:.4})\n",
+        .{ mode, gflops, heads, m_head, n_head, dk, dv, chk },
+    );
+}
+
 fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
@@ -851,6 +941,8 @@ fn mainImpl() !void {
     try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
+    try benchProgramMultiHeadAttentionF32(allocator, rnd, opts.iters, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
+    try benchProgramMultiHeadAttentionF32(allocator, rnd, opts.iters, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     if (opts.quant) {

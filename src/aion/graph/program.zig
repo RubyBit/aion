@@ -267,6 +267,58 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             _ = s.causal;
         },
 
+        .MultiHeadAttentionTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const q: *const TiledTensor = mgr.getConst(s.q) catch return CompileError.InvalidArgument;
+            const k: *const TiledTensor = mgr.getConst(s.k) catch return CompileError.InvalidArgument;
+            const v: *const TiledTensor = mgr.getConst(s.v) catch return CompileError.InvalidArgument;
+
+            try compileRequire(s.heads > 0);
+
+            try compileRequire(out.rank == 2 and q.rank == 2 and k.rank == 2 and v.rank == 2);
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == q.dtype and out.dtype == k.dtype and out.dtype == v.dtype);
+
+            // Packed layout: q:[h*m,dk], k:[h*n,dk], v:[h*n,dv], out:[h*m,dv]
+            try compileRequire(q.shape[1] == k.shape[1]);
+            try compileRequire(k.shape[0] == v.shape[0]);
+            try compileRequire(out.shape[0] == q.shape[0]);
+            try compileRequire(out.shape[1] == v.shape[1]);
+
+            try compileRequire(q.shape[0] % s.heads == 0);
+            try compileRequire(k.shape[0] % s.heads == 0);
+            try compileRequire(v.shape[0] % s.heads == 0);
+            const m_head: usize = q.shape[0] / s.heads;
+            const n_head: usize = k.shape[0] / s.heads;
+            try compileRequire(m_head > 0 and n_head > 0);
+
+            // Tiling contract (same as attention).
+            try compileRequire(out.tile_shape[0] == q.tile_shape[0]);
+            try compileRequire(out.tile_counts[0] == q.tile_counts[0]);
+
+            try compileRequire(out.tile_shape[1] == v.tile_shape[1]);
+            try compileRequire(out.tile_counts[1] == v.tile_counts[1]);
+
+            try compileRequire(k.tile_shape[0] == v.tile_shape[0]);
+            try compileRequire(k.tile_counts[0] == v.tile_counts[0]);
+
+            try compileRequire(q.tile_shape[1] == k.tile_shape[1]);
+            try compileRequire(q.tile_counts[1] == k.tile_counts[1]);
+
+            // Head alignment: per-head rows must align to tile rows.
+            try compileRequire((m_head % out.tile_shape[0]) == 0);
+            try compileRequire((n_head % k.tile_shape[0]) == 0);
+
+            // Scratch limits (v0): keep per-tile row scratch bounded.
+            try compileRequire(out.tile_shape[0] <= 256);
+            try compileRequire(k.tile_shape[0] <= 128);
+            try compileRequire(out.tile_shape[1] <= 64);
+
+            try compileRequire(s.scale > 0.0);
+            try compileRequire(std.math.isFinite(s.scale));
+            _ = s.causal;
+        },
+
         .CopyTiled => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
@@ -599,6 +651,49 @@ pub fn compileGraph(
                 const v_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, v_id, v_v.dtype.?, v_v.shape, v_needed);
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .AttentionTiled = .{ .out = out_tid, .q = q_tid, .k = k_tid, .v = v_tid, .scale = attn.scale, .causal = attn.causal } });
+            },
+
+            .MultiHeadAttention => |attn| {
+                const q_id: usize = @intCast(node.inputs[0]);
+                const k_id: usize = @intCast(node.inputs[1]);
+                const v_id: usize = @intCast(node.inputs[2]);
+
+                const q_v = graph.values.items[q_id];
+                const k_v = graph.values.items[k_id];
+                const v_v = graph.values.items[v_id];
+
+                if (out_shape.len != 2) return CompileError.InvalidArgument;
+                if (!isScalarSupported(out_dt)) return CompileError.InvalidArgument;
+                if (attn.heads == 0) return CompileError.InvalidArgument;
+
+                if ((q_v.shape[0] % attn.heads) != 0) return CompileError.InvalidArgument;
+                if ((k_v.shape[0] % attn.heads) != 0) return CompileError.InvalidArgument;
+                if ((v_v.shape[0] % attn.heads) != 0) return CompileError.InvalidArgument;
+
+                const m_head: usize = q_v.shape[0] / attn.heads;
+                const n_head: usize = k_v.shape[0] / attn.heads;
+                const dk: usize = q_v.shape[1];
+                const dv: usize = v_v.shape[1];
+
+                const st = plan_mod.chooseAttentionTiles(policy, m_head, n_head, dk, dv);
+
+                if ((m_head % st.tm) != 0) return CompileError.InvalidArgument;
+                if ((n_head % st.tn) != 0) return CompileError.InvalidArgument;
+
+                // Output tile uses [tm, tv].
+                const out_tile: [2]usize = .{ st.tm, st.tv };
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                // Ensure tiling for inputs.
+                const q_needed: [2]usize = .{ st.tm, st.tk };
+                const k_needed: [2]usize = .{ st.tn, st.tk };
+                const v_needed: [2]usize = .{ st.tn, st.tv };
+
+                const q_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, q_id, q_v.dtype.?, q_v.shape, q_needed);
+                const k_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, k_id, k_v.dtype.?, k_v.shape, k_needed);
+                const v_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, v_id, v_v.dtype.?, v_v.shape, v_needed);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .MultiHeadAttentionTiled = .{ .out = out_tid, .q = q_tid, .k = k_tid, .v = v_tid, .scale = attn.scale, .causal = attn.causal, .heads = attn.heads } });
             },
 
             .Reduce => |rr| {

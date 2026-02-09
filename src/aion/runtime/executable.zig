@@ -11,6 +11,7 @@ pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId };
 pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool };
+pub const StepMultiHeadAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool, heads: usize };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
@@ -31,6 +32,7 @@ pub const Step = union(enum) {
     LayerNormTiled: StepLayerNormTiled,
     RMSNormTiled: StepRMSNormTiled,
     AttentionTiled: StepAttentionTiled,
+    MultiHeadAttentionTiled: StepMultiHeadAttentionTiled,
     ReduceAll: StepReduceAll,
     CopyTiled: StepCopyTiled,
 

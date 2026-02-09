@@ -56,6 +56,19 @@ pub const Op = union(enum) {
     /// Computes softmax(scale * q @ k^T) @ v.
     /// If causal, masks keys where key_index > query_index.
     Attention: struct { scale: f32, causal: bool },
+
+    /// Fused multi-head attention (packed, rank-2 only in v0).
+    ///
+    /// Packed layout (B=1, head-major):
+    /// - q: [h*m, dk]
+    /// - k: [h*n, dk]
+    /// - v: [h*n, dv]
+    /// - out: [h*m, dv]
+    ///
+    /// Each head operates on its own contiguous slice in the leading dimension.
+    /// Computes softmax(scale * q @ k^T) @ v per head.
+    /// If causal, masks keys where key_index > query_index (within head).
+    MultiHeadAttention: struct { scale: f32, causal: bool, heads: usize },
     Reduce: struct { op: ReduceOp },
     Copy: void,
 
@@ -172,6 +185,10 @@ pub const Graph = struct {
 
     pub fn addAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool) GraphError!ValueId {
         return self.addNodeInternal(.{ .Attention = .{ .scale = scale, .causal = causal } }, &[_]ValueId{ q, k, v });
+    }
+
+    pub fn addMultiHeadAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool, heads: usize) GraphError!ValueId {
+        return self.addNodeInternal(.{ .MultiHeadAttention = .{ .scale = scale, .causal = causal, .heads = heads } }, &[_]ValueId{ q, k, v });
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {

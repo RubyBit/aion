@@ -394,6 +394,48 @@ fn attentionRefF32(
     }
 }
 
+fn attentionRefMultiHeadF32(
+    allocator: std.mem.Allocator,
+    out: []f32,
+    q: []align(1) const f32,
+    k: []align(1) const f32,
+    v: []align(1) const f32,
+    heads: usize,
+    m_head: usize,
+    n_head: usize,
+    dk: usize,
+    dv: usize,
+    scale: f32,
+    causal: bool,
+) void {
+    std.debug.assert(heads > 0);
+    std.debug.assert(out.len == heads * m_head * dv);
+    std.debug.assert(q.len == heads * m_head * dk);
+    std.debug.assert(k.len == heads * n_head * dk);
+    std.debug.assert(v.len == heads * n_head * dv);
+
+    var h: usize = 0;
+    while (h < heads) : (h += 1) {
+        const q_off: usize = h * m_head * dk;
+        const k_off: usize = h * n_head * dk;
+        const v_off: usize = h * n_head * dv;
+        const out_off: usize = h * m_head * dv;
+        attentionRefF32(
+            allocator,
+            out[out_off .. out_off + (m_head * dv)],
+            q[q_off .. q_off + (m_head * dk)],
+            k[k_off .. k_off + (n_head * dk)],
+            v[v_off .. v_off + (n_head * dv)],
+            m_head,
+            n_head,
+            dk,
+            dv,
+            scale,
+            causal,
+        );
+    }
+}
+
 test "graph: softmax rank-1 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -725,6 +767,100 @@ test "graph: attention rank-2 matches reference (f32)" {
         }
         if (!(max_abs <= 6e-2)) {
             std.debug.print("attention {s} mismatch max_abs={}\n", .{ case.name, max_abs });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "graph: multi-head attention packed matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const heads: usize = 2;
+    const m_head: usize = 4;
+    const n_head: usize = 8;
+    const dk: usize = 8;
+    const dv: usize = 8;
+
+    const m_total: usize = heads * m_head;
+    const n_total: usize = heads * n_head;
+
+    const q_bytes_len: usize = m_total * dk * 4;
+    const k_bytes_len: usize = n_total * dk * 4;
+    const v_bytes_len: usize = n_total * dv * 4;
+    const out_bytes_len: usize = m_total * dv * 4;
+
+    const q_buf: []u8 = try allocator.alloc(u8, q_bytes_len);
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, k_bytes_len);
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
+    defer allocator.free(v_buf);
+
+    const q_vals: []align(1) f32 = asF32Slice(q_buf);
+    const k_vals: []align(1) f32 = asF32Slice(k_buf);
+    const v_vals: []align(1) f32 = asF32Slice(v_buf);
+
+    // Keep magnitudes modest so expApprox and reference stay close.
+    for (0..m_total * dk) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 31))) - 15))) * 0.03;
+    for (0..n_total * dk) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 29))) - 14))) * 0.03;
+    for (0..n_total * dv) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 37))) - 18))) * 0.02;
+
+    const scale: f32 = 0.25;
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Intentionally awkward tiling to exercise retile into head-aligned tiles.
+    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ m_total, dk }, &[_]usize{ 3, 4 }, .{ .tile_alignment = 64 });
+    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dk }, &[_]usize{ 5, 4 }, .{ .tile_alignment = 64 });
+    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dv }, &[_]usize{ 6, 3 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(q_tid, q_buf);
+    try sm.writeFromPackedScalar(k_tid, k_buf);
+    try sm.writeFromPackedScalar(v_tid, v_buf);
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 4, .tile_alignment = 64 };
+
+    inline for (.{
+        .{ .causal = false, .name = "noncausal" },
+        .{ .causal = true, .name = "causal" },
+    }) |case| {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const q_in = try g.addInput(.f32, &[_]usize{ m_total, dk });
+        const k_in = try g.addInput(.f32, &[_]usize{ n_total, dk });
+        const v_in = try g.addInput(.f32, &[_]usize{ n_total, dv });
+        try g.bindExternal(q_in, @intCast(q_tid));
+        try g.bindExternal(k_in, @intCast(k_tid));
+        try g.bindExternal(v_in, @intCast(v_tid));
+
+        const y = try g.addMultiHeadAttention(q_in, k_in, v_in, scale, case.causal, heads);
+        try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        defer prog.deinit();
+        try backend.executeProgram(&prog, sm.tensorStore());
+
+        const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+        defer allocator.free(out_buf);
+        try sm.readToPackedScalar(prog.outputs[0], out_buf);
+        const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+        const ref: []f32 = try allocator.alloc(f32, m_total * dv);
+        defer allocator.free(ref);
+        attentionRefMultiHeadF32(allocator, ref, q_vals, k_vals, v_vals, heads, m_head, n_head, dk, dv, scale, case.causal);
+
+        var max_abs: f32 = 0.0;
+        for (out_vals, ref) |got, r0| {
+            try std.testing.expect(std.math.isFinite(got));
+            max_abs = @max(max_abs, @abs(got - r0));
+        }
+        if (!(max_abs <= 6e-2)) {
+            std.debug.print("multi-head attention {s} mismatch max_abs={}\n", .{ case.name, max_abs });
             return error.TestExpectedEqual;
         }
     }

@@ -35,38 +35,37 @@ pub const Op = union(enum) {
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
-    Softmax: void,
+    Softmax: struct { axis: i32 },
 
-    /// Normalize over the last dimension (rank-2 only in v0).
+    /// Normalize over the last dimensions (rank>=1; normalized_shape is required).
     /// out = ((x - mean) / sqrt(var + eps)) * gamma + beta
-    LayerNorm: struct { eps: f32 },
+    LayerNorm: struct { eps: f32, normalized_shape: []const usize },
 
-    /// Normalize over the last dimension (rank-2 only in v0).
+    /// Normalize over the last dimensions (rank>=1; normalized_shape is required).
     /// out = (x / sqrt(mean(x^2) + eps)) * gamma + beta
-    RMSNorm: struct { eps: f32 },
+    RMSNorm: struct { eps: f32, normalized_shape: []const usize },
 
-    /// Fused attention (rank-2 only in v0).
+    /// Fused attention (batched over leading dims).
     ///
     /// Shapes:
-    /// - q: [m, dk]
-    /// - k: [n, dk]
-    /// - v: [n, dv]
-    /// - out: [m, dv]
+    /// - q: [..., m, dk]
+    /// - k: [..., n, dk]
+    /// - v: [..., n, dv]
+    /// - out: [..., m, dv]
     ///
-    /// Computes softmax(scale * q @ k^T) @ v.
+    /// Computes softmax(scale * q @ k^T) @ v per leading-dim slice.
     /// If causal, masks keys where key_index > query_index.
     Attention: struct { scale: f32, causal: bool },
 
-    /// Fused multi-head attention (packed, rank-2 only in v0).
+    /// Fused multi-head attention (separate head dim).
     ///
-    /// Packed layout (B=1, head-major):
-    /// - q: [h*m, dk]
-    /// - k: [h*n, dk]
-    /// - v: [h*n, dv]
-    /// - out: [h*m, dv]
+    /// Separate head dim (batched):
+    /// - q: [..., h, m, dk]
+    /// - k: [..., h, n, dk]
+    /// - v: [..., h, n, dv]
+    /// - out: [..., h, m, dv]
     ///
-    /// Each head operates on its own contiguous slice in the leading dimension.
-    /// Computes softmax(scale * q @ k^T) @ v per head.
+    /// Computes softmax(scale * q @ k^T) @ v per head/slice.
     /// If causal, masks keys where key_index > query_index (within head).
     MultiHeadAttention: struct { scale: f32, causal: bool, heads: usize },
     Reduce: struct { op: ReduceOp },
@@ -96,6 +95,8 @@ pub const Graph = struct {
 
     const Self = @This();
 
+    const MAX_RANK: usize = 8;
+
     pub fn init(allocator: std.mem.Allocator) Self {
         const arena = std.heap.ArenaAllocator.init(allocator);
         return .{ .arena = arena, .allocator = allocator };
@@ -114,7 +115,7 @@ pub const Graph = struct {
     }
 
     pub fn dupeShape(self: *Self, shape: []const usize) GraphError![]const usize {
-        if (shape.len == 0 or shape.len > 2) return GraphError.InvalidArgument;
+        if (shape.len == 0 or shape.len > MAX_RANK) return GraphError.InvalidArgument;
         const out: []usize = self.arenaAlloc().alloc(usize, shape.len) catch return GraphError.OutOfMemory;
         @memcpy(out, shape);
         return out;
@@ -168,19 +169,20 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
     }
 
-    /// Softmax over the last dimension.
-    /// - rank-1: over the vector axis
-    /// - rank-2: per row
-    pub fn addSoftmax(self: *Self, a: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.Softmax, &[_]ValueId{a});
+    /// Softmax over the specified axis (negative axes are allowed).
+    /// - axis == -1 => last dimension
+    pub fn addSoftmax(self: *Self, a: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Softmax = .{ .axis = axis } }, &[_]ValueId{a});
     }
 
-    pub fn addLayerNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32) GraphError!ValueId {
-        return self.addNodeInternal(.{ .LayerNorm = .{ .eps = eps } }, &[_]ValueId{ x, gamma, beta });
+    pub fn addLayerNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32, normalized_shape: []const usize) GraphError!ValueId {
+        const ns: []const usize = try self.dupeShape(normalized_shape);
+        return self.addNodeInternal(.{ .LayerNorm = .{ .eps = eps, .normalized_shape = ns } }, &[_]ValueId{ x, gamma, beta });
     }
 
-    pub fn addRMSNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32) GraphError!ValueId {
-        return self.addNodeInternal(.{ .RMSNorm = .{ .eps = eps } }, &[_]ValueId{ x, gamma, beta });
+    pub fn addRMSNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32, normalized_shape: []const usize) GraphError!ValueId {
+        const ns: []const usize = try self.dupeShape(normalized_shape);
+        return self.addNodeInternal(.{ .RMSNorm = .{ .eps = eps, .normalized_shape = ns } }, &[_]ValueId{ x, gamma, beta });
     }
 
     pub fn addAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool) GraphError!ValueId {

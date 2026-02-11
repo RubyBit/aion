@@ -307,3 +307,93 @@ pub fn accumulateValuesF32(
 ) void {
     DefaultKernel.accumulateValuesF32(m_tile, n_v, dv, scores, score_stride, vs, v_stride, acc, acc_stride);
 }
+
+pub fn applyScaleMaskF32(
+    scores: []f32,
+    m_tile: usize,
+    tn: usize,
+    head_n: usize,
+    local_key_row0: usize,
+    local_q_row0: usize,
+    scale: f32,
+    causal: bool,
+) void {
+    var r: usize = 0;
+    while (r < m_tile) : (r += 1) {
+        const q_idx: usize = local_q_row0 + r;
+        if (local_key_row0 >= head_n) continue;
+        const valid_cols: usize = @min(tn, head_n - local_key_row0);
+        var c: usize = 0;
+        while (c < valid_cols) : (c += 1) {
+            const k_idx: usize = local_key_row0 + c;
+            const idx: usize = r * tn + c;
+            var v0: f32 = scores[idx] * scale;
+            if (causal and k_idx > q_idx) v0 = -std.math.inf(f32);
+            scores[idx] = v0;
+        }
+        if (valid_cols < tn) {
+            @memset(scores[r * tn + valid_cols .. r * tn + tn], -std.math.inf(f32));
+        }
+    }
+}
+
+pub fn rowMaxF32(scores: []const f32, m_tile: usize, tn: usize, row_max: []f32) void {
+    const lanes: usize = comptime simd.lanesF32();
+    const VecT = @Vector(lanes, f32);
+
+    var r: usize = 0;
+    while (r < m_tile) : (r += 1) {
+        var mx: f32 = -std.math.inf(f32);
+        var c: usize = 0;
+        if (tn >= lanes) {
+            var vmx: VecT = @splat(-std.math.inf(f32));
+            while (c + lanes <= tn) : (c += lanes) {
+                const v: VecT = @as(*align(1) const VecT, @ptrCast(scores.ptr + r * tn + c)).*;
+                vmx = @max(vmx, v);
+            }
+            mx = @reduce(.Max, vmx);
+        }
+        while (c < tn) : (c += 1) {
+            mx = @max(mx, scores[r * tn + c]);
+        }
+        row_max[r] = mx;
+    }
+}
+
+pub fn expNormalizeScoresF32(
+    scores: []f32,
+    m_tile: usize,
+    tn: usize,
+    m_new: []const f32,
+    l_state: []f32,
+) void {
+    const lanes: usize = comptime simd.lanesF32();
+    const VecT = @Vector(lanes, f32);
+
+    var r: usize = 0;
+    while (r < m_tile) : (r += 1) {
+        const mn: f32 = m_new[r];
+        var ssum: f32 = 0.0;
+
+        var c: usize = 0;
+        const v_mn: VecT = @splat(mn);
+        var v_ssum: VecT = @splat(0.0);
+        while (c + lanes <= tn) : (c += lanes) {
+            const ptr: [*]f32 = scores.ptr + r * tn + c;
+            const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+            const v_diff: VecT = fast_math.clampVecF32(lanes, v_s - v_mn, -80.0, 0.0);
+            const v_p: VecT = fast_math.expApproxVecF32(lanes, v_diff);
+            @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
+            v_ssum += v_p;
+        }
+        ssum += @reduce(.Add, v_ssum);
+        while (c < tn) : (c += 1) {
+            const idx: usize = r * tn + c;
+            const p: f32 = fast_math.expApproxF32(fast_math.clampF32(scores[idx] - mn, -80.0, 0.0));
+            scores[idx] = p;
+            ssum += p;
+        }
+
+        l_state[r] += ssum;
+    }
+}

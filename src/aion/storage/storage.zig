@@ -2,6 +2,10 @@ const std = @import("std");
 
 const types = @import("../backend/types.zig");
 const utils = @import("../backend/utils.zig");
+const small_vec = @import("../small_vec.zig");
+
+const SmallVec = small_vec.SmallVec;
+const INLINE_RANK: usize = 8;
 
 pub const DType = types.DType;
 pub const Layout = types.Layout;
@@ -33,36 +37,35 @@ pub const TileViewConst = struct {
     bytes: []const u8,
     dtype: DType,
     rank: u8,
-    shape_mem: [2]usize,
-    strides_mem: [2]isize,
+    shape_mem: [INLINE_RANK]usize,
+    strides_mem: [INLINE_RANK]isize,
 
-    pub fn init(bytes: []const u8, dtype: DType, rank: u8, dims: [2]usize, elem_bytes: usize) TileViewConst {
+    pub fn init(bytes: []const u8, dtype: DType, rank: u8, dims: []const usize, elem_bytes: usize) StorageError!TileViewConst {
+        if (dims.len != @as(usize, rank)) return StorageError.InvalidArgument;
+        if (dims.len > INLINE_RANK) return StorageError.InvalidArgument;
+
         var self: TileViewConst = undefined;
         self.bytes = bytes;
         self.dtype = dtype;
         self.rank = rank;
-        self.shape_mem = dims;
+        @memset(self.shape_mem[0..INLINE_RANK], 0);
+        @memset(self.strides_mem[0..INLINE_RANK], 0);
+
+        var i: usize = 0;
+        while (i < dims.len) : (i += 1) {
+            self.shape_mem[i] = dims[i];
+        }
 
         // For quant dtypes, strides are ignored in v0 packedness checks.
-        if (dtype.info().is_quantized) {
-            self.strides_mem = .{ 0, 0 };
-        } else {
-            // Packed row-major scalar.
-            // rank=1: stride[0] = elem_bytes
-            // rank=2: stride[1] = elem_bytes, stride[0] = dims[1] * elem_bytes
-            var s0: isize = 0;
-            var s1: isize = 0;
-            if (rank == 0) {
-                s0 = 0;
-                s1 = 0;
-            } else if (rank == 1) {
-                s0 = @intCast(elem_bytes);
-                s1 = 0;
-            } else {
-                s1 = @intCast(elem_bytes);
-                s0 = @intCast(dims[1] * elem_bytes);
+        if (!dtype.info().is_quantized) {
+            // Packed row-major scalar: stride[d] = elem_bytes * product(dims[d+1..]).
+            var stride: usize = elem_bytes;
+            var d: usize = dims.len;
+            while (d > 0) : (d -= 1) {
+                const idx: usize = d - 1;
+                self.strides_mem[idx] = @intCast(stride);
+                stride = std.math.mul(usize, stride, dims[idx]) catch return StorageError.InvalidArgument;
             }
-            self.strides_mem = .{ s0, s1 };
         }
 
         return self;
@@ -86,32 +89,33 @@ pub const TileViewMut = struct {
     bytes: []u8,
     dtype: DType,
     rank: u8,
-    shape_mem: [2]usize,
-    strides_mem: [2]isize,
+    shape_mem: [INLINE_RANK]usize,
+    strides_mem: [INLINE_RANK]isize,
 
-    pub fn init(bytes: []u8, dtype: DType, rank: u8, dims: [2]usize, elem_bytes: usize) TileViewMut {
+    pub fn init(bytes: []u8, dtype: DType, rank: u8, dims: []const usize, elem_bytes: usize) StorageError!TileViewMut {
+        if (dims.len != @as(usize, rank)) return StorageError.InvalidArgument;
+        if (dims.len > INLINE_RANK) return StorageError.InvalidArgument;
+
         var self: TileViewMut = undefined;
         self.bytes = bytes;
         self.dtype = dtype;
         self.rank = rank;
-        self.shape_mem = dims;
+        @memset(self.shape_mem[0..INLINE_RANK], 0);
+        @memset(self.strides_mem[0..INLINE_RANK], 0);
 
-        if (dtype.info().is_quantized) {
-            self.strides_mem = .{ 0, 0 };
-        } else {
-            var s0: isize = 0;
-            var s1: isize = 0;
-            if (rank == 0) {
-                s0 = 0;
-                s1 = 0;
-            } else if (rank == 1) {
-                s0 = @intCast(elem_bytes);
-                s1 = 0;
-            } else {
-                s1 = @intCast(elem_bytes);
-                s0 = @intCast(dims[1] * elem_bytes);
+        var i: usize = 0;
+        while (i < dims.len) : (i += 1) {
+            self.shape_mem[i] = dims[i];
+        }
+
+        if (!dtype.info().is_quantized) {
+            var stride: usize = elem_bytes;
+            var d: usize = dims.len;
+            while (d > 0) : (d -= 1) {
+                const idx: usize = d - 1;
+                self.strides_mem[idx] = @intCast(stride);
+                stride = std.math.mul(usize, stride, dims[idx]) catch return StorageError.InvalidArgument;
             }
-            self.strides_mem = .{ s0, s1 };
         }
 
         return self;
@@ -138,17 +142,23 @@ pub const TileViewMut = struct {
 /// out-of-core semantics later (tiles become the cache unit).
 ///
 /// v0 scope:
-/// - rank 1 or 2 only
+/// - scalar tensors support arbitrary rank (packed row-major)
 /// - tiles are always packed
-/// - quant types are supported as opaque bytes with strict K-tile constraints for matmul compatibility
+/// - quant types are supported for rank 1/2 with strict K-axis alignment (axis 0)
 pub const TiledTensor = struct {
     allocator: std.mem.Allocator,
 
     dtype: DType,
     rank: u8,
-    shape: [2]usize,
-    tile_shape: [2]usize,
-    tile_counts: [2]usize,
+    shape: []const usize,
+    tile_shape: []const usize,
+    tile_counts: []const usize,
+    tile_strides: []const usize,
+
+    shape_storage: SmallVec(usize, INLINE_RANK),
+    tile_shape_storage: SmallVec(usize, INLINE_RANK),
+    tile_counts_storage: SmallVec(usize, INLINE_RANK),
+    tile_strides_storage: SmallVec(usize, INLINE_RANK),
 
     // Metadata: one allocation, split into offsets and lens.
     meta: []usize,
@@ -169,58 +179,104 @@ pub const TiledTensor = struct {
     };
 
     pub fn init(
+        self: *Self,
         allocator: std.mem.Allocator,
         dtype: DType,
         shape_in: []const usize,
         tile_shape_in: []const usize,
         opts: InitOptions,
-    ) StorageError!Self {
-        if (shape_in.len == 0 or shape_in.len > 2) return StorageError.InvalidArgument;
+    ) StorageError!void {
+        if (shape_in.len == 0) return StorageError.InvalidArgument;
         if (tile_shape_in.len != shape_in.len) return StorageError.InvalidArgument;
 
         const rank: u8 = @intCast(shape_in.len);
-        var shape: [2]usize = .{ 1, 1 };
-        var tile_shape: [2]usize = .{ 1, 1 };
 
-        shape[0] = shape_in[0];
-        tile_shape[0] = tile_shape_in[0];
-        if (rank == 2) {
-            shape[1] = shape_in[1];
-            tile_shape[1] = tile_shape_in[1];
+        var shape_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initFromSlice(allocator, shape_in) catch return StorageError.OutOfMemory;
+        var tile_shape_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initFromSlice(allocator, tile_shape_in) catch {
+            shape_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+
+        var tile_counts_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, shape_in.len) catch {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+
+        var tile_strides_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, shape_in.len) catch {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            tile_counts_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+        var moved: bool = false;
+        errdefer if (!moved) {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            tile_counts_storage.deinit();
+            tile_strides_storage.deinit();
+        };
+
+        self.* = .{
+            .allocator = allocator,
+            .dtype = dtype,
+            .rank = rank,
+            .shape = &[_]usize{},
+            .tile_shape = &[_]usize{},
+            .tile_counts = &[_]usize{},
+            .tile_strides = &[_]usize{},
+            .shape_storage = shape_storage,
+            .tile_shape_storage = tile_shape_storage,
+            .tile_counts_storage = tile_counts_storage,
+            .tile_strides_storage = tile_strides_storage,
+            .meta = &[_]usize{},
+            .tile_offsets = &[_]usize{},
+            .tile_lens = &[_]usize{},
+            .data = &[_]u8{},
+            .tile_alignment = opts.tile_alignment,
+        };
+        moved = true;
+        errdefer self.deinit();
+
+        self.shape = self.shape_storage.constSlice();
+        self.tile_shape = self.tile_shape_storage.constSlice();
+
+        var tile_counts_mut: []usize = self.tile_counts_storage.slice();
+        var tile_strides_mut: []usize = self.tile_strides_storage.slice();
+
+        var d: usize = 0;
+        while (d < self.shape.len) : (d += 1) {
+            if (self.shape[d] == 0) return StorageError.InvalidArgument;
+            if (self.tile_shape[d] == 0) return StorageError.InvalidArgument;
+            const count: usize = (self.shape[d] + self.tile_shape[d] - 1) / self.tile_shape[d];
+            if (count == 0) return StorageError.InvalidArgument;
+            tile_counts_mut[d] = count;
         }
 
-        if (shape[0] == 0) return StorageError.InvalidArgument;
-        if (rank == 2 and shape[1] == 0) return StorageError.InvalidArgument;
-        if (tile_shape[0] == 0) return StorageError.InvalidArgument;
-        if (rank == 2 and tile_shape[1] == 0) return StorageError.InvalidArgument;
+        var tile_total: usize = 1;
+        var rev: usize = self.shape.len;
+        while (rev > 0) : (rev -= 1) {
+            const idx: usize = rev - 1;
+            tile_strides_mut[idx] = tile_total;
+            tile_total = std.math.mul(usize, tile_total, tile_counts_mut[idx]) catch return StorageError.InvalidArgument;
+        }
 
-        const tile_counts0: usize = (shape[0] + tile_shape[0] - 1) / tile_shape[0];
-        const tile_counts1: usize = if (rank == 2) ((shape[1] + tile_shape[1] - 1) / tile_shape[1]) else 1;
-        if (tile_counts0 == 0 or tile_counts1 == 0) return StorageError.InvalidArgument;
-
-        const tile_total: usize = std.math.mul(usize, tile_counts0, tile_counts1) catch return StorageError.InvalidArgument;
+        self.tile_counts = self.tile_counts_storage.constSlice();
+        self.tile_strides = self.tile_strides_storage.constSlice();
 
         // Quant constraints: for now, enforce that every tile's innermost dimension is compatible.
         // This is required so matmul kernels can be called on tiles with k % 32 == 0.
         const di = dtype.info();
         if (di.is_quantized) {
-            // Require innermost dimension (shape[0] for rank1, shape[1] for rank2) to be multiple of block_elems.
-            const inner_dim: usize = if (rank == 1) shape[0] else shape[0];
-            _ = inner_dim;
-            // NOTE: For rank2 quant, the kernel contract is about K (% block_elems). This storage is generic
-            // and does not know which axis is K; we enforce that the *first axis* is block-aligned, which
-            // matches the matmul contract for B tiles when stored as [K,N].
-            if (shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
-            if (tile_shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
-            // Also ensure boundary K-tiles remain block-aligned.
-            // (This allows last tile smaller than tile_shape[0], as long as it is a multiple of block_elems.)
-            const rem: usize = shape[0] % tile_shape[0];
+            // v0 rule: enforce block alignment on the first axis.
+            if (self.shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
+            if (self.tile_shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
+            const rem: usize = self.shape[0] % self.tile_shape[0];
             if (rem != 0 and (rem % di.block_elems != 0)) return StorageError.InvalidArgument;
         }
 
         // Allocate metadata (offsets + lens) in one block.
         const meta: []usize = allocator.alloc(usize, tile_total * 2) catch return StorageError.OutOfMemory;
-        errdefer allocator.free(meta);
         const tile_offsets: []usize = meta[0..tile_total];
         const tile_lens: []usize = meta[tile_total..];
 
@@ -230,53 +286,49 @@ pub const TiledTensor = struct {
 
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
 
-        var ti0: usize = 0;
-        while (ti0 < tile_counts0) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < tile_counts1) : (ti1 += 1) {
-                const dims: [2]usize = computeTileDims(rank, shape, tile_shape, ti0, ti1);
-                const tile_elems: usize = std.math.mul(usize, dims[0], dims[1]) catch {
-                    allocator.free(meta);
-                    return StorageError.InvalidArgument;
-                };
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, self.shape.len) catch {
+            allocator.free(meta);
+            return StorageError.OutOfMemory;
+        };
+        defer tile_coords.deinit();
 
-                const tile_bytes: usize = utils.requiredBytesForElems(dtype, tile_elems) catch {
-                    allocator.free(meta);
-                    return StorageError.InvalidArgument;
-                };
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, self.shape.len) catch {
+            allocator.free(meta);
+            return StorageError.OutOfMemory;
+        };
+        defer tile_dims.deinit();
 
-                off = alignForward(off, opts.tile_alignment);
-                tile_offsets[idx] = off;
-                tile_lens[idx] = tile_bytes;
-                off = std.math.add(usize, off, tile_bytes) catch {
-                    allocator.free(meta);
-                    return StorageError.InvalidArgument;
-                };
-                idx += 1;
-            }
+        while (idx < tile_total) : (idx += 1) {
+            try decodeTileCoords(idx, self.tile_counts, self.tile_strides, tile_coords.slice());
+            try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+
+            const tile_elems: usize = try mulAll(tile_dims.constSlice());
+            const tile_bytes: usize = utils.requiredBytesForElems(dtype, tile_elems) catch {
+                allocator.free(meta);
+                return StorageError.InvalidArgument;
+            };
+
+            off = alignForward(off, opts.tile_alignment);
+            tile_offsets[idx] = off;
+            tile_lens[idx] = tile_bytes;
+            off = std.math.add(usize, off, tile_bytes) catch {
+                allocator.free(meta);
+                return StorageError.InvalidArgument;
+            };
         }
 
         // Allocate backing buffer aligned for SIMD-friendly accesses.
         const data: []align(64) u8 = allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), off) catch return StorageError.OutOfMemory;
-        errdefer allocator.free(data);
         @memset(data, 0);
 
         // Keep compiler from complaining about elem_bytes in unused branches.
         _ = elem_bytes;
 
-        return .{
-            .allocator = allocator,
-            .dtype = dtype,
-            .rank = rank,
-            .shape = shape,
-            .tile_shape = tile_shape,
-            .tile_counts = .{ tile_counts0, tile_counts1 },
-            .meta = meta,
-            .tile_offsets = tile_offsets,
-            .tile_lens = tile_lens,
-            .data = data,
-            .tile_alignment = opts.tile_alignment,
-        };
+        self.meta = meta;
+        self.tile_offsets = tile_offsets;
+        self.tile_lens = tile_lens;
+        self.data = data;
+        return;
     }
 
     pub fn deinit(self: *Self) void {
@@ -290,10 +342,15 @@ pub const TiledTensor = struct {
             self.allocator.free(self.data);
             self.data = &[_]u8{};
         }
+        self.shape_storage.deinit();
+        self.tile_shape_storage.deinit();
+        self.tile_counts_storage.deinit();
+        self.tile_strides_storage.deinit();
+        self.shape = &[_]usize{};
+        self.tile_shape = &[_]usize{};
+        self.tile_counts = &[_]usize{};
+        self.tile_strides = &[_]usize{};
         self.rank = 0;
-        self.shape = .{ 0, 0 };
-        self.tile_shape = .{ 0, 0 };
-        self.tile_counts = .{ 0, 0 };
     }
 
     pub fn tileCountTotal(self: Self) usize {
@@ -301,18 +358,39 @@ pub const TiledTensor = struct {
     }
 
     pub fn tileIndex(self: Self, ti0: usize, ti1: usize) StorageError!usize {
-        if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
-        if (ti1 >= self.tile_counts[1]) return StorageError.InvalidArgument;
-        return ti0 * self.tile_counts[1] + ti1;
+        if (self.rank == 1) {
+            if (ti1 != 0) return StorageError.InvalidArgument;
+            if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
+            return tileIndexFromCoords(self.tile_strides, self.tile_counts, &[_]usize{ti0});
+        }
+        if (self.rank == 2) {
+            if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
+            if (ti1 >= self.tile_counts[1]) return StorageError.InvalidArgument;
+            return tileIndexFromCoords(self.tile_strides, self.tile_counts, &[_]usize{ ti0, ti1 });
+        }
+        return StorageError.InvalidArgument;
     }
 
     pub fn tileDims(self: Self, ti0: usize, ti1: usize) StorageError![2]usize {
-        if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
-        if (ti1 >= self.tile_counts[1]) return StorageError.InvalidArgument;
-        return computeTileDims(self.rank, self.shape, self.tile_shape, ti0, ti1);
+        if (self.rank == 1) {
+            if (ti1 != 0) return StorageError.InvalidArgument;
+            if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
+            var dims: [2]usize = .{ 0, 1 };
+            try computeTileDimsND(self.shape, self.tile_shape, &[_]usize{ti0}, dims[0..1]);
+            return dims;
+        }
+        if (self.rank == 2) {
+            if (ti0 >= self.tile_counts[0]) return StorageError.InvalidArgument;
+            if (ti1 >= self.tile_counts[1]) return StorageError.InvalidArgument;
+            var dims: [2]usize = .{ 0, 0 };
+            try computeTileDimsND(self.shape, self.tile_shape, &[_]usize{ ti0, ti1 }, dims[0..2]);
+            return dims;
+        }
+        return StorageError.InvalidArgument;
     }
 
     pub fn acquireTileConst(self: *const Self, ti0: usize, ti1: usize) StorageError!TileViewConst {
+        if (self.rank > 2) return StorageError.InvalidArgument;
         const idx: usize = try self.tileIndex(ti0, ti1);
         const off: usize = self.tile_offsets[idx];
         const len: usize = self.tile_lens[idx];
@@ -321,10 +399,32 @@ pub const TiledTensor = struct {
         const dims: [2]usize = try self.tileDims(ti0, ti1);
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, dims, elem_bytes);
+        return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
+    }
+
+    pub fn acquireTileConstLinear(self: *const Self, tile_index: usize) StorageError!TileViewConst {
+        if (tile_index >= self.tile_offsets.len) return StorageError.InvalidArgument;
+        if (@as(usize, self.rank) > INLINE_RANK) return StorageError.InvalidArgument;
+
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+
+        try decodeTileCoords(tile_index, self.tile_counts, self.tile_strides, tile_coords.slice());
+        try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+
+        const off: usize = self.tile_offsets[tile_index];
+        const len: usize = self.tile_lens[tile_index];
+        if (off + len > self.data.len) return StorageError.InvalidArgument;
+
+        const di = self.dtype.info();
+        const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
+        return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, tile_dims.constSlice(), elem_bytes);
     }
 
     pub fn acquireTileMut(self: *Self, ti0: usize, ti1: usize) StorageError!TileViewMut {
+        if (self.rank > 2) return StorageError.InvalidArgument;
         const idx: usize = try self.tileIndex(ti0, ti1);
         const off: usize = self.tile_offsets[idx];
         const len: usize = self.tile_lens[idx];
@@ -333,7 +433,28 @@ pub const TiledTensor = struct {
         const dims: [2]usize = try self.tileDims(ti0, ti1);
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewMut.init(self.data[off .. off + len], self.dtype, self.rank, dims, elem_bytes);
+        return TileViewMut.init(self.data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
+    }
+
+    pub fn acquireTileMutLinear(self: *Self, tile_index: usize) StorageError!TileViewMut {
+        if (tile_index >= self.tile_offsets.len) return StorageError.InvalidArgument;
+        if (@as(usize, self.rank) > INLINE_RANK) return StorageError.InvalidArgument;
+
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+
+        try decodeTileCoords(tile_index, self.tile_counts, self.tile_strides, tile_coords.slice());
+        try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+
+        const off: usize = self.tile_offsets[tile_index];
+        const len: usize = self.tile_lens[tile_index];
+        if (off + len > self.data.len) return StorageError.InvalidArgument;
+
+        const di = self.dtype.info();
+        const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
+        return TileViewMut.init(self.data[off .. off + len], self.dtype, self.rank, tile_dims.constSlice(), elem_bytes);
     }
 
     /// Writes a packed row-major scalar tensor into this tiled storage.
@@ -347,67 +468,52 @@ pub const TiledTensor = struct {
         if (packed_bytes.len < need_total) return StorageError.InvalidArgument;
 
         const elem_bytes: usize = self.dtype.info().block_bytes;
+        const shape: []const usize = self.shape;
+        const tile_shape: []const usize = self.tile_shape;
+        const tile_counts: []const usize = self.tile_counts;
+        const tile_strides: []const usize = self.tile_strides;
+        const rank: usize = @as(usize, self.rank);
 
-        if (self.rank == 1) {
-            const n: usize = self.shape[0];
-            const t: usize = self.tile_shape[0];
-            const tile_count: usize = self.tile_counts[0];
+        var packed_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_strides.deinit();
+        try computePackedStridesElems(shape, packed_strides.slice());
 
-            var ti: usize = 0;
-            while (ti < tile_count) : (ti += 1) {
-                const start: usize = ti * t;
-                const len_elems: usize = @min(t, n - start);
-                const idx: usize = try self.tileIndex(ti, 0);
-                const off: usize = self.tile_offsets[idx];
-                const out_len: usize = self.tile_lens[idx];
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+        var tile_local_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_local_strides.deinit();
+        var local_idx: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer local_idx.deinit();
 
-                const want_bytes: usize = len_elems * elem_bytes;
-                if (want_bytes != out_len) return StorageError.InvalidArgument;
+        var tile_index: usize = 0;
+        while (tile_index < self.tile_offsets.len) : (tile_index += 1) {
+            try decodeTileCoords(tile_index, tile_counts, tile_strides, tile_coords.slice());
+            try computeTileDimsND(shape, tile_shape, tile_coords.constSlice(), tile_dims.slice());
+            try computePackedStridesElems(tile_dims.constSlice(), tile_local_strides.slice());
 
-                const src_off: usize = start * elem_bytes;
-                @memcpy(self.data[off .. off + want_bytes], packed_bytes[src_off .. src_off + want_bytes]);
-            }
-            return;
-        }
+            const tile_elems: usize = try mulAll(tile_dims.constSlice());
+            const tile_bytes: usize = tile_elems * elem_bytes;
+            const off: usize = self.tile_offsets[tile_index];
+            const out_len: usize = self.tile_lens[tile_index];
+            if (tile_bytes != out_len) return StorageError.InvalidArgument;
 
-        // rank == 2
-        const rows: usize = self.shape[0];
-        const cols: usize = self.shape[1];
-        const tm: usize = self.tile_shape[0];
-        const tn: usize = self.tile_shape[1];
+            var t_lin: usize = 0;
+            while (t_lin < tile_elems) : (t_lin += 1) {
+                try decodeLinearIndex(t_lin, tile_local_strides.constSlice(), tile_dims.constSlice(), local_idx.slice());
 
-        var ti0: usize = 0;
-        while (ti0 < self.tile_counts[0]) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < self.tile_counts[1]) : (ti1 += 1) {
-                const dims: [2]usize = computeTileDims(2, self.shape, self.tile_shape, ti0, ti1);
-                const m_tile: usize = dims[0];
-                const n_tile: usize = dims[1];
-
-                const idx: usize = try self.tileIndex(ti0, ti1);
-                const off: usize = self.tile_offsets[idx];
-                const out_len: usize = self.tile_lens[idx];
-
-                const tile_bytes: usize = m_tile * n_tile * elem_bytes;
-                if (tile_bytes != out_len) return StorageError.InvalidArgument;
-
-                const row0: usize = ti0 * tm;
-                const col0: usize = ti1 * tn;
-
-                var r: usize = 0;
-                while (r < m_tile) : (r += 1) {
-                    const src_row: usize = row0 + r;
-                    if (src_row >= rows) return StorageError.InvalidArgument;
-
-                    const src_off: usize = (src_row * cols + col0) * elem_bytes;
-                    const dst_off: usize = (r * n_tile) * elem_bytes;
-                    const row_bytes: usize = n_tile * elem_bytes;
-
-                    @memcpy(
-                        self.data[(off + dst_off)..(off + dst_off + row_bytes)],
-                        packed_bytes[src_off .. src_off + row_bytes],
-                    );
+                var packed_lin: usize = 0;
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    const g: usize = tile_coords.constSlice()[d] * tile_shape[d] + local_idx.constSlice()[d];
+                    if (g >= shape[d]) return StorageError.InvalidArgument;
+                    packed_lin = std.math.add(usize, packed_lin, g * packed_strides.constSlice()[d]) catch return StorageError.InvalidArgument;
                 }
+
+                const src_off: usize = packed_lin * elem_bytes;
+                const dst_off: usize = t_lin * elem_bytes;
+                @memcpy(self.data[(off + dst_off)..(off + dst_off + elem_bytes)], packed_bytes[src_off .. src_off + elem_bytes]);
             }
         }
     }
@@ -420,159 +526,129 @@ pub const TiledTensor = struct {
         if (out.len < need_total) return StorageError.InvalidArgument;
 
         const elem_bytes: usize = self.dtype.info().block_bytes;
+        const shape: []const usize = self.shape;
+        const tile_shape: []const usize = self.tile_shape;
+        const tile_counts: []const usize = self.tile_counts;
+        const tile_strides: []const usize = self.tile_strides;
+        const rank: usize = @as(usize, self.rank);
 
-        if (self.rank == 1) {
-            const n: usize = self.shape[0];
-            const t: usize = self.tile_shape[0];
-            const tile_count: usize = self.tile_counts[0];
+        var packed_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_strides.deinit();
+        try computePackedStridesElems(shape, packed_strides.slice());
 
-            var ti: usize = 0;
-            while (ti < tile_count) : (ti += 1) {
-                const start: usize = ti * t;
-                const len_elems: usize = @min(t, n - start);
-                const idx: usize = try self.tileIndex(ti, 0);
-                const off: usize = self.tile_offsets[idx];
-                const in_len: usize = self.tile_lens[idx];
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+        var tile_local_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_local_strides.deinit();
+        var local_idx: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer local_idx.deinit();
 
-                const want_bytes: usize = len_elems * elem_bytes;
-                if (want_bytes != in_len) return StorageError.InvalidArgument;
+        var tile_index: usize = 0;
+        while (tile_index < self.tile_offsets.len) : (tile_index += 1) {
+            try decodeTileCoords(tile_index, tile_counts, tile_strides, tile_coords.slice());
+            try computeTileDimsND(shape, tile_shape, tile_coords.constSlice(), tile_dims.slice());
+            try computePackedStridesElems(tile_dims.constSlice(), tile_local_strides.slice());
 
-                const dst_off: usize = start * elem_bytes;
-                @memcpy(out[dst_off .. dst_off + want_bytes], self.data[off .. off + want_bytes]);
-            }
-            return;
-        }
+            const tile_elems: usize = try mulAll(tile_dims.constSlice());
+            const tile_bytes: usize = tile_elems * elem_bytes;
+            const off: usize = self.tile_offsets[tile_index];
+            const in_len: usize = self.tile_lens[tile_index];
+            if (tile_bytes != in_len) return StorageError.InvalidArgument;
 
-        // rank == 2
-        const rows: usize = self.shape[0];
-        const cols: usize = self.shape[1];
-        const tm: usize = self.tile_shape[0];
-        const tn: usize = self.tile_shape[1];
+            var t_lin: usize = 0;
+            while (t_lin < tile_elems) : (t_lin += 1) {
+                try decodeLinearIndex(t_lin, tile_local_strides.constSlice(), tile_dims.constSlice(), local_idx.slice());
 
-        var ti0: usize = 0;
-        while (ti0 < self.tile_counts[0]) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < self.tile_counts[1]) : (ti1 += 1) {
-                const dims: [2]usize = computeTileDims(2, self.shape, self.tile_shape, ti0, ti1);
-                const m_tile: usize = dims[0];
-                const n_tile: usize = dims[1];
-
-                const idx: usize = try self.tileIndex(ti0, ti1);
-                const off: usize = self.tile_offsets[idx];
-                const in_len: usize = self.tile_lens[idx];
-
-                const tile_bytes: usize = m_tile * n_tile * elem_bytes;
-                if (tile_bytes != in_len) return StorageError.InvalidArgument;
-
-                const row0: usize = ti0 * tm;
-                const col0: usize = ti1 * tn;
-
-                var r: usize = 0;
-                while (r < m_tile) : (r += 1) {
-                    const dst_row: usize = row0 + r;
-                    if (dst_row >= rows) return StorageError.InvalidArgument;
-
-                    const dst_off: usize = (dst_row * cols + col0) * elem_bytes;
-                    const src_off: usize = (r * n_tile) * elem_bytes;
-                    const row_bytes: usize = n_tile * elem_bytes;
-
-                    @memcpy(
-                        out[dst_off .. dst_off + row_bytes],
-                        self.data[(off + src_off)..(off + src_off + row_bytes)],
-                    );
+                var packed_lin: usize = 0;
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    const g: usize = tile_coords.constSlice()[d] * tile_shape[d] + local_idx.constSlice()[d];
+                    if (g >= shape[d]) return StorageError.InvalidArgument;
+                    packed_lin = std.math.add(usize, packed_lin, g * packed_strides.constSlice()[d]) catch return StorageError.InvalidArgument;
                 }
+
+                const dst_off: usize = packed_lin * elem_bytes;
+                const src_off: usize = t_lin * elem_bytes;
+                @memcpy(out[dst_off .. dst_off + elem_bytes], self.data[(off + src_off)..(off + src_off + elem_bytes)]);
             }
         }
     }
 
     /// Writes a packed quant tensor into this tiled storage.
     ///
-    /// v0 packed quant convention:
-    /// - rank-1: a flat array of blocks.
-    /// - rank-2: a row-major array of blocks with shape [k_blocks, n], where k_blocks = k / block_elems.
+    /// v0 packed quant convention (arbitrary rank):
+    /// - treat axis-0 as blockized: shape_blocks[0] = shape[0] / block_elems
+    /// - remaining axes are unchanged
+    /// - packed bytes are row-major over shape_blocks with element size = block_bytes
     pub fn writeFromPackedQuant(self: *Self, packed_bytes: []const u8) StorageError!void {
         const di = self.dtype.info();
         if (!di.is_quantized) return StorageError.InvalidArgument;
-        if (self.rank == 0 or self.rank > 2) return StorageError.InvalidArgument;
+        if (self.rank == 0) return StorageError.InvalidArgument;
 
-        const total_elems: usize = if (self.rank == 1) self.shape[0] else (std.math.mul(usize, self.shape[0], self.shape[1]) catch return StorageError.InvalidArgument);
+        const total_elems: usize = try mulAll(self.shape);
         const need_total: usize = utils.requiredBytesForElems(self.dtype, total_elems) catch return StorageError.InvalidArgument;
         if (packed_bytes.len < need_total) return StorageError.InvalidArgument;
 
-        if (self.rank == 1) {
-            // Each tile is a packed array of blocks; copy blocks with no reinterpretation.
-            const n: usize = self.shape[0];
-            const t: usize = self.tile_shape[0];
-            const tile_count: usize = self.tile_counts[0];
+        const rank: usize = @as(usize, self.rank);
 
-            var ti: usize = 0;
-            while (ti < tile_count) : (ti += 1) {
-                const start: usize = ti * t;
-                const len_elems: usize = @min(t, n - start);
-                if (len_elems % di.block_elems != 0) return StorageError.InvalidArgument;
+        var packed_block_shape: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_block_shape.deinit();
+        var packed_block_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_block_strides.deinit();
+        try computeBlockShape(self.shape, di.block_elems, packed_block_shape.slice());
+        try computePackedStridesElems(packed_block_shape.constSlice(), packed_block_strides.slice());
 
-                const tile_bytes: usize = utils.requiredBytesForElems(self.dtype, len_elems) catch return StorageError.InvalidArgument;
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+        var tile_block_shape: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_block_shape.deinit();
+        var tile_block_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_block_strides.deinit();
+        var local_block_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer local_block_coords.deinit();
 
-                const idx: usize = try self.tileIndex(ti, 0);
-                const off: usize = self.tile_offsets[idx];
-                const out_len: usize = self.tile_lens[idx];
-                if (tile_bytes != out_len) return StorageError.InvalidArgument;
+        var tile_index: usize = 0;
+        while (tile_index < self.tile_offsets.len) : (tile_index += 1) {
+            try decodeTileCoords(tile_index, self.tile_counts, self.tile_strides, tile_coords.slice());
+            try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+            try computeBlockShape(tile_dims.constSlice(), di.block_elems, tile_block_shape.slice());
+            try computePackedStridesElems(tile_block_shape.constSlice(), tile_block_strides.slice());
 
-                const src_bytes_off: usize = utils.requiredBytesForElems(self.dtype, start) catch return StorageError.InvalidArgument;
-                @memcpy(self.data[off .. off + tile_bytes], packed_bytes[src_bytes_off .. src_bytes_off + tile_bytes]);
-            }
-            return;
-        }
+            const tile_blocks: usize = try mulAll(tile_block_shape.constSlice());
+            const tile_bytes: usize = tile_blocks * di.block_bytes;
+            const off: usize = self.tile_offsets[tile_index];
+            const out_len: usize = self.tile_lens[tile_index];
+            if (tile_bytes != out_len) return StorageError.InvalidArgument;
 
-        // rank == 2, block-matrix copy with strides in the source.
-        const k: usize = self.shape[0];
-        const n: usize = self.shape[1];
-        if (k % di.block_elems != 0) return StorageError.InvalidArgument;
-        const k_blocks_total: usize = k / di.block_elems;
+            var b_lin: usize = 0;
+            while (b_lin < tile_blocks) : (b_lin += 1) {
+                try decodeLinearIndex(b_lin, tile_block_strides.constSlice(), tile_block_shape.constSlice(), local_block_coords.slice());
 
-        const tk: usize = self.tile_shape[0];
-        const tn: usize = self.tile_shape[1];
-
-        var ti0: usize = 0;
-        while (ti0 < self.tile_counts[0]) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < self.tile_counts[1]) : (ti1 += 1) {
-                const dims: [2]usize = computeTileDims(2, self.shape, self.tile_shape, ti0, ti1);
-                const k_tile: usize = dims[0];
-                const n_tile: usize = dims[1];
-                if (k_tile % di.block_elems != 0) return StorageError.InvalidArgument;
-
-                const kb_start: usize = (ti0 * tk) / di.block_elems;
-                const kb_count: usize = k_tile / di.block_elems;
-
-                const idx: usize = try self.tileIndex(ti0, ti1);
-                const off: usize = self.tile_offsets[idx];
-                const out_len: usize = self.tile_lens[idx];
-
-                const tile_bytes: usize = kb_count * n_tile * di.block_bytes;
-                if (tile_bytes != out_len) return StorageError.InvalidArgument;
-
-                const col0: usize = ti1 * tn;
-
-                var jj: usize = 0;
-                while (jj < n_tile) : (jj += 1) {
-                    const j: usize = col0 + jj;
-                    if (j >= n) return StorageError.InvalidArgument;
-
-                    var kb: usize = 0;
-                    while (kb < kb_count) : (kb += 1) {
-                        const src_kb: usize = kb_start + kb;
-                        if (src_kb >= k_blocks_total) return StorageError.InvalidArgument;
-
-                        const src_off: usize = (src_kb * n + j) * di.block_bytes;
-                        const dst_off: usize = (kb * n_tile + jj) * di.block_bytes;
-
-                        @memcpy(
-                            self.data[(off + dst_off)..(off + dst_off + di.block_bytes)],
-                            packed_bytes[src_off .. src_off + di.block_bytes],
-                        );
-                    }
+                var packed_block_lin: usize = 0;
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    const base: usize = if (d == 0) blk: {
+                        const tile_start: usize = tile_coords.constSlice()[0] * self.tile_shape[0];
+                        if (tile_start % di.block_elems != 0) return StorageError.InvalidArgument;
+                        break :blk (tile_start / di.block_elems) + local_block_coords.constSlice()[0];
+                    } else blk: {
+                        break :blk tile_coords.constSlice()[d] * self.tile_shape[d] + local_block_coords.constSlice()[d];
+                    };
+                    if (base >= packed_block_shape.constSlice()[d]) return StorageError.InvalidArgument;
+                    packed_block_lin = std.math.add(usize, packed_block_lin, base * packed_block_strides.constSlice()[d]) catch return StorageError.InvalidArgument;
                 }
+
+                const src_off: usize = packed_block_lin * di.block_bytes;
+                const dst_off: usize = b_lin * di.block_bytes;
+
+                @memcpy(
+                    self.data[(off + dst_off)..(off + dst_off + di.block_bytes)],
+                    packed_bytes[src_off .. src_off + di.block_bytes],
+                );
             }
         }
     }
@@ -581,84 +657,70 @@ pub const TiledTensor = struct {
     pub fn readToPackedQuant(self: *const Self, out: []u8) StorageError!void {
         const di = self.dtype.info();
         if (!di.is_quantized) return StorageError.InvalidArgument;
-        if (self.rank == 0 or self.rank > 2) return StorageError.InvalidArgument;
+        if (self.rank == 0) return StorageError.InvalidArgument;
 
-        const total_elems: usize = if (self.rank == 1) self.shape[0] else (std.math.mul(usize, self.shape[0], self.shape[1]) catch return StorageError.InvalidArgument);
+        const total_elems: usize = try mulAll(self.shape);
         const need_total: usize = utils.requiredBytesForElems(self.dtype, total_elems) catch return StorageError.InvalidArgument;
         if (out.len < need_total) return StorageError.InvalidArgument;
 
-        if (self.rank == 1) {
-            const n: usize = self.shape[0];
-            const t: usize = self.tile_shape[0];
-            const tile_count: usize = self.tile_counts[0];
+        const rank: usize = @as(usize, self.rank);
 
-            var ti: usize = 0;
-            while (ti < tile_count) : (ti += 1) {
-                const start: usize = ti * t;
-                const len_elems: usize = @min(t, n - start);
-                if (len_elems % di.block_elems != 0) return StorageError.InvalidArgument;
+        var packed_block_shape: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_block_shape.deinit();
+        var packed_block_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer packed_block_strides.deinit();
+        try computeBlockShape(self.shape, di.block_elems, packed_block_shape.slice());
+        try computePackedStridesElems(packed_block_shape.constSlice(), packed_block_strides.slice());
 
-                const tile_bytes: usize = utils.requiredBytesForElems(self.dtype, len_elems) catch return StorageError.InvalidArgument;
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+        var tile_block_shape: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_block_shape.deinit();
+        var tile_block_strides: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer tile_block_strides.deinit();
+        var local_block_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, rank) catch return StorageError.OutOfMemory;
+        defer local_block_coords.deinit();
 
-                const idx: usize = try self.tileIndex(ti, 0);
-                const off: usize = self.tile_offsets[idx];
-                const in_len: usize = self.tile_lens[idx];
-                if (tile_bytes != in_len) return StorageError.InvalidArgument;
+        var tile_index: usize = 0;
+        while (tile_index < self.tile_offsets.len) : (tile_index += 1) {
+            try decodeTileCoords(tile_index, self.tile_counts, self.tile_strides, tile_coords.slice());
+            try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+            try computeBlockShape(tile_dims.constSlice(), di.block_elems, tile_block_shape.slice());
+            try computePackedStridesElems(tile_block_shape.constSlice(), tile_block_strides.slice());
 
-                const dst_bytes_off: usize = utils.requiredBytesForElems(self.dtype, start) catch return StorageError.InvalidArgument;
-                @memcpy(out[dst_bytes_off .. dst_bytes_off + tile_bytes], self.data[off .. off + tile_bytes]);
-            }
-            return;
-        }
+            const tile_blocks: usize = try mulAll(tile_block_shape.constSlice());
+            const tile_bytes: usize = tile_blocks * di.block_bytes;
+            const off: usize = self.tile_offsets[tile_index];
+            const in_len: usize = self.tile_lens[tile_index];
+            if (tile_bytes != in_len) return StorageError.InvalidArgument;
 
-        const k: usize = self.shape[0];
-        const n: usize = self.shape[1];
-        if (k % di.block_elems != 0) return StorageError.InvalidArgument;
-        const k_blocks_total: usize = k / di.block_elems;
+            var b_lin: usize = 0;
+            while (b_lin < tile_blocks) : (b_lin += 1) {
+                try decodeLinearIndex(b_lin, tile_block_strides.constSlice(), tile_block_shape.constSlice(), local_block_coords.slice());
 
-        const tk: usize = self.tile_shape[0];
-        const tn: usize = self.tile_shape[1];
-
-        var ti0: usize = 0;
-        while (ti0 < self.tile_counts[0]) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < self.tile_counts[1]) : (ti1 += 1) {
-                const dims: [2]usize = computeTileDims(2, self.shape, self.tile_shape, ti0, ti1);
-                const k_tile: usize = dims[0];
-                const n_tile: usize = dims[1];
-                if (k_tile % di.block_elems != 0) return StorageError.InvalidArgument;
-
-                const kb_start: usize = (ti0 * tk) / di.block_elems;
-                const kb_count: usize = k_tile / di.block_elems;
-
-                const idx: usize = try self.tileIndex(ti0, ti1);
-                const off: usize = self.tile_offsets[idx];
-                const in_len: usize = self.tile_lens[idx];
-
-                const tile_bytes: usize = kb_count * n_tile * di.block_bytes;
-                if (tile_bytes != in_len) return StorageError.InvalidArgument;
-
-                const col0: usize = ti1 * tn;
-
-                var jj: usize = 0;
-                while (jj < n_tile) : (jj += 1) {
-                    const j: usize = col0 + jj;
-                    if (j >= n) return StorageError.InvalidArgument;
-
-                    var kb: usize = 0;
-                    while (kb < kb_count) : (kb += 1) {
-                        const dst_kb: usize = kb_start + kb;
-                        if (dst_kb >= k_blocks_total) return StorageError.InvalidArgument;
-
-                        const dst_off: usize = (dst_kb * n + j) * di.block_bytes;
-                        const src_off: usize = (kb * n_tile + jj) * di.block_bytes;
-
-                        @memcpy(
-                            out[dst_off .. dst_off + di.block_bytes],
-                            self.data[(off + src_off)..(off + src_off + di.block_bytes)],
-                        );
-                    }
+                var packed_block_lin: usize = 0;
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    const base: usize = if (d == 0) blk: {
+                        const tile_start: usize = tile_coords.constSlice()[0] * self.tile_shape[0];
+                        if (tile_start % di.block_elems != 0) return StorageError.InvalidArgument;
+                        break :blk (tile_start / di.block_elems) + local_block_coords.constSlice()[0];
+                    } else blk: {
+                        break :blk tile_coords.constSlice()[d] * self.tile_shape[d] + local_block_coords.constSlice()[d];
+                    };
+                    if (base >= packed_block_shape.constSlice()[d]) return StorageError.InvalidArgument;
+                    packed_block_lin = std.math.add(usize, packed_block_lin, base * packed_block_strides.constSlice()[d]) catch return StorageError.InvalidArgument;
                 }
+
+                const dst_off: usize = packed_block_lin * di.block_bytes;
+                const src_off: usize = b_lin * di.block_bytes;
+
+                @memcpy(
+                    out[dst_off .. dst_off + di.block_bytes],
+                    self.data[(off + src_off)..(off + src_off + di.block_bytes)],
+                );
             }
         }
     }
@@ -666,20 +728,98 @@ pub const TiledTensor = struct {
     fn requiredBytesPackedScalar(self: Self) usize {
         const di = self.dtype.info();
         const elem_bytes: usize = di.block_bytes;
-        if (self.rank == 1) return self.shape[0] * elem_bytes;
-        return self.shape[0] * self.shape[1] * elem_bytes;
+        const elems: usize = mulAll(self.shape) catch return 0;
+        return elems * elem_bytes;
     }
 };
 
-fn computeTileDims(rank: u8, shape: [2]usize, tile_shape: [2]usize, ti0: usize, ti1: usize) [2]usize {
-    const d0_start: usize = ti0 * tile_shape[0];
-    const d0_len: usize = if (d0_start >= shape[0]) 0 else @min(tile_shape[0], shape[0] - d0_start);
-
-    if (rank == 1) {
-        return .{ d0_len, 1 };
+fn mulAll(vals: []const usize) StorageError!usize {
+    if (vals.len == 0) return StorageError.InvalidArgument;
+    var acc: usize = 1;
+    for (vals) |v| {
+        acc = std.math.mul(usize, acc, v) catch return StorageError.InvalidArgument;
     }
+    return acc;
+}
 
-    const d1_start: usize = ti1 * tile_shape[1];
-    const d1_len: usize = if (d1_start >= shape[1]) 0 else @min(tile_shape[1], shape[1] - d1_start);
-    return .{ d0_len, d1_len };
+fn computePackedStridesElems(shape: []const usize, out: []usize) StorageError!void {
+    if (out.len != shape.len) return StorageError.InvalidArgument;
+    if (shape.len == 0) return StorageError.InvalidArgument;
+
+    var stride: usize = 1;
+    var d: usize = shape.len;
+    while (d > 0) : (d -= 1) {
+        const idx: usize = d - 1;
+        out[idx] = stride;
+        stride = std.math.mul(usize, stride, shape[idx]) catch return StorageError.InvalidArgument;
+    }
+}
+
+fn computeBlockShape(shape: []const usize, block_elems: usize, out: []usize) StorageError!void {
+    if (out.len != shape.len) return StorageError.InvalidArgument;
+    if (shape.len == 0) return StorageError.InvalidArgument;
+    if (block_elems == 0) return StorageError.InvalidArgument;
+
+    if (shape[0] % block_elems != 0) return StorageError.InvalidArgument;
+    out[0] = shape[0] / block_elems;
+
+    var d: usize = 1;
+    while (d < shape.len) : (d += 1) {
+        out[d] = shape[d];
+    }
+}
+
+fn computeTileDimsND(shape: []const usize, tile_shape: []const usize, tile_coords: []const usize, out: []usize) StorageError!void {
+    if (shape.len != tile_shape.len) return StorageError.InvalidArgument;
+    if (tile_coords.len != shape.len) return StorageError.InvalidArgument;
+    if (out.len != shape.len) return StorageError.InvalidArgument;
+
+    var d: usize = 0;
+    while (d < shape.len) : (d += 1) {
+        const start: usize = tile_coords[d] * tile_shape[d];
+        if (start >= shape[d]) return StorageError.InvalidArgument;
+        out[d] = @min(tile_shape[d], shape[d] - start);
+    }
+}
+
+fn decodeTileCoords(tile_index: usize, tile_counts: []const usize, tile_strides: []const usize, out: []usize) StorageError!void {
+    if (tile_counts.len != tile_strides.len) return StorageError.InvalidArgument;
+    if (out.len != tile_counts.len) return StorageError.InvalidArgument;
+
+    var d: usize = 0;
+    while (d < tile_counts.len) : (d += 1) {
+        const stride: usize = tile_strides[d];
+        if (stride == 0) return StorageError.InvalidArgument;
+        const v: usize = tile_index / stride;
+        out[d] = v % tile_counts[d];
+    }
+}
+
+fn tileIndexFromCoords(tile_strides: []const usize, tile_counts: []const usize, coords: []const usize) StorageError!usize {
+    if (coords.len != tile_counts.len) return StorageError.InvalidArgument;
+    if (tile_strides.len != tile_counts.len) return StorageError.InvalidArgument;
+
+    var idx: usize = 0;
+    var d: usize = 0;
+    while (d < coords.len) : (d += 1) {
+        if (coords[d] >= tile_counts[d]) return StorageError.InvalidArgument;
+        idx = std.math.add(usize, idx, coords[d] * tile_strides[d]) catch return StorageError.InvalidArgument;
+    }
+    return idx;
+}
+
+fn decodeLinearIndex(linear: usize, strides: []const usize, dims: []const usize, out: []usize) StorageError!void {
+    if (strides.len != dims.len) return StorageError.InvalidArgument;
+    if (out.len != dims.len) return StorageError.InvalidArgument;
+
+    var rem: usize = linear;
+    var d: usize = 0;
+    while (d < dims.len) : (d += 1) {
+        const stride: usize = strides[d];
+        if (stride == 0) return StorageError.InvalidArgument;
+        const v: usize = rem / stride;
+        if (v >= dims[d]) return StorageError.InvalidArgument;
+        out[d] = v;
+        rem -= out[d] * stride;
+    }
 }

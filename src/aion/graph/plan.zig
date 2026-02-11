@@ -18,6 +18,10 @@ pub const TilePolicy = struct {
 
     /// Tile alignment in bytes for `TiledTensor` backing.
     tile_alignment: usize = 64,
+
+    /// Max number of batch tiles to allow when retiling rank>2 scalar tensors.
+    /// Keeps retile cost bounded to preserve perf for large batch grids.
+    batch_retile_max_tiles: usize = 64,
 };
 
 pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {

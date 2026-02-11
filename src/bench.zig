@@ -24,7 +24,10 @@ const BenchOptions = struct {
     iters: usize = 50,
     threads: usize = 1,
 
-    // Multi-head attention heads (packed head-major layout).
+    // Batch size for batched matmul benchmarks.
+    batch: usize = 4,
+
+    // Multi-head attention heads (separate head dimension).
     heads: usize = 4,
 
     // Elementwise length (logical elements).
@@ -50,6 +53,7 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
+            "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
             "  --m N            MatMul M (default: 512)\n" ++
@@ -90,6 +94,10 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
             opts.threads = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--batch")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.batch = try parseUsize(args[i]);
         } else if (std.mem.eql(u8, a, "--heads")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
@@ -118,6 +126,7 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
     if (opts.iters == 0) return error.InvalidArgument;
     if (opts.threads == 0) return error.InvalidArgument;
     if (opts.heads == 0) return error.InvalidArgument;
+    if (opts.batch == 0) return error.InvalidArgument;
     if (opts.n_elem == 0) return error.InvalidArgument;
     if (opts.m == 0 or opts.n == 0 or opts.k == 0) return error.InvalidArgument;
 
@@ -137,6 +146,12 @@ fn readF32AtTiled(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: us
     const n_tile: usize = tile.shape_mem[1];
     const off: usize = (in0 * n_tile + in1) * @sizeOf(f32);
     return @as(*align(1) const f32, @ptrCast(tile.bytes[off..][0..4].ptr)).*;
+}
+
+fn asF32Slice(buf: []u8) []align(1) f32 {
+    std.debug.assert((buf.len % @sizeOf(f32)) == 0);
+    const ptr: [*]align(1) f32 = @ptrCast(buf.ptr);
+    return ptr[0 .. buf.len / @sizeOf(f32)];
 }
 
 fn defaultTilePolicy() plan_mod.TilePolicy {
@@ -314,7 +329,7 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
 
     const x_in = try g.addInput(.f32, &[_]usize{ m, n });
     try g.bindExternal(x_in, @intCast(x_tid));
-    const y = try g.addSoftmax(x_in);
+    const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -373,7 +388,8 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     try g.bindExternal(x_in, @intCast(x_tid));
     try g.bindExternal(gamma_in, @intCast(g_tid));
     try g.bindExternal(beta_in, @intCast(b_tid));
-    const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5);
+    const norm_shape: [1]usize = .{n};
+    const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -432,7 +448,8 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     try g.bindExternal(x_in, @intCast(x_tid));
     try g.bindExternal(gamma_in, @intCast(g_tid));
     try g.bindExternal(beta_in, @intCast(b_tid));
-    const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5);
+    const norm_shape: [1]usize = .{n};
+    const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -535,10 +552,11 @@ fn benchProgramAttentionF32(
     );
 }
 
-fn benchProgramMultiHeadAttentionF32(
+fn benchProgramMultiHeadAttentionSeparateF32(
     allocator: std.mem.Allocator,
     rnd: std.Random,
     iters: usize,
+    batch: usize,
     heads: usize,
     m_head: usize,
     n_head: usize,
@@ -553,22 +571,19 @@ fn benchProgramMultiHeadAttentionF32(
     const policy: plan_mod.TilePolicy = defaultTilePolicy();
     const st = plan_mod.chooseAttentionTiles(policy, m_head, n_head, dk, dv);
 
-    const m_total: usize = heads * m_head;
-    const n_total: usize = heads * n_head;
-
-    const q: []f32 = try allocator.alloc(f32, m_total * dk);
+    const q: []f32 = try allocator.alloc(f32, batch * heads * m_head * dk);
     defer allocator.free(q);
-    const k: []f32 = try allocator.alloc(f32, n_total * dk);
+    const k: []f32 = try allocator.alloc(f32, batch * heads * n_head * dk);
     defer allocator.free(k);
-    const v: []f32 = try allocator.alloc(f32, n_total * dv);
+    const v: []f32 = try allocator.alloc(f32, batch * heads * n_head * dv);
     defer allocator.free(v);
     fillRandomF32(rnd, q);
     fillRandomF32(rnd, k);
     fillRandomF32(rnd, v);
 
-    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m_total, dk }, &[_]usize{ st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dk }, &[_]usize{ st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n_total, dv }, &[_]usize{ st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
+    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, m_head, dk }, &[_]usize{ 1, 1, st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dk }, &[_]usize{ 1, 1, st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dv }, &[_]usize{ 1, 1, st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
     try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
     try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k));
     try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v));
@@ -576,9 +591,9 @@ fn benchProgramMultiHeadAttentionF32(
     var g = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
-    const q_in = try g.addInput(.f32, &[_]usize{ m_total, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ n_total, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ n_total, dv });
+    const q_in = try g.addInput(.f32, &[_]usize{ batch, heads, m_head, dk });
+    const k_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dk });
+    const v_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dv });
     try g.bindExternal(q_in, @intCast(q_tid));
     try g.bindExternal(k_in, @intCast(k_tid));
     try g.bindExternal(v_in, @intCast(v_tid));
@@ -599,20 +614,26 @@ fn benchProgramMultiHeadAttentionF32(
         }
     }{ .be = be, .sm = &sm, .prog = &prog });
 
-    // FLOPs (ignoring softmax exp overhead): per head * heads
-    const flops_per: u64 = 2 * @as(u64, @intCast(m_head)) * @as(u64, @intCast(n_head)) *
-        (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv))) * @as(u64, @intCast(heads));
+    const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(heads)) * @as(u64, @intCast(m_head)) * @as(u64, @intCast(n_head)) *
+        (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
     const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m_head / 2, dv / 2) +
-        try readF32AtTiled(&sm, out_tid, m_total - 1, dv - 1);
+    const out_bytes_len: usize = batch * heads * m_head * dv * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const idx0: usize = 0;
+    const idx1: usize = (((batch / 2) * heads + (heads / 2)) * m_head + (m_head / 2)) * dv + (dv / 2);
+    const idx2: usize = (((batch - 1) * heads + (heads - 1)) * m_head + (m_head - 1)) * dv + (dv - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
     const mode: []const u8 = if (causal) "causal" else "noncausal";
     std.debug.print(
-        "program mha f32 {s}: {d:.2} GFLOP/s (h={} m={} n={} dk={} dv={}, chk={d:.4})\n",
-        .{ mode, gflops, heads, m_head, n_head, dk, dv, chk },
+        "program mha separate f32 {s}: {d:.2} GFLOP/s (b={} h={} m={} n={} dk={} dv={}, chk={d:.4})\n",
+        .{ mode, gflops, batch, heads, m_head, n_head, dk, dv, chk },
     );
 }
 
@@ -665,6 +686,65 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
     std.debug.print("program matmul f32:       {d:.2} GFLOP/s (m={} n={} k={}, chk={d:.4})\n", .{ gflops, m, n, k, chk });
+}
+
+fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, batch: usize, m: usize, n: usize, k: usize, be: Backend) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
+
+    const a: []f32 = try allocator.alloc(f32, batch * m * k);
+    defer allocator.free(a);
+    const b: []f32 = try allocator.alloc(f32, batch * k * n);
+    defer allocator.free(b);
+    fillRandomF32(rnd, a);
+    fillRandomF32(rnd, b);
+
+    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+    try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const a_in = try g.addInput(.f32, &[_]usize{ batch, m, k });
+    const b_in = try g.addInput(.f32, &[_]usize{ batch, k, n });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
+    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const out_bytes_len: usize = batch * m * n * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const idx0: usize = 0;
+    const idx1: usize = (batch / 2) * m * n + (m / 2) * n + (n / 2);
+    const idx2: usize = (batch - 1) * m * n + (m - 1) * n + (n - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    std.debug.print("program matmul batched f32: {d:.2} GFLOP/s (b={} m={} n={} k={}, chk={d:.4})\n", .{ gflops, batch, m, n, k, chk });
 }
 
 fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, b_dtype: types.DType, be: Backend) !void {
@@ -941,10 +1021,11 @@ fn mainImpl() !void {
     try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
-    try benchProgramMultiHeadAttentionF32(allocator, rnd, opts.iters, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
-    try benchProgramMultiHeadAttentionF32(allocator, rnd, opts.iters, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
+    try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
+    try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
+    try benchProgramMatmulBatchedF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);
     if (opts.quant) {
         if (opts.k % 32 != 0) {
             std.debug.print("(skipping quant matmul: k={} not divisible by 32)\n", .{opts.k});

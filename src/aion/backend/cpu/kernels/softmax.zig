@@ -2,6 +2,8 @@ const fast_math = @import("fast_math.zig");
 const simd = @import("simd.zig");
 const types = @import("../../types.zig");
 
+const BackendError = types.BackendError;
+
 fn expFastVec(comptime lanes: usize, x: @Vector(lanes, f32)) @Vector(lanes, f32) {
     return fast_math.expApproxVecF32(lanes, fast_math.clampVecF32(lanes, x, -20.0, 0.0));
 }
@@ -120,5 +122,84 @@ pub fn normalizeF32(out_view: types.BufferViewMut, sum_buf: []const f32, rank: u
             @as(*align(1) Vec, @ptrCast(out.ptr + off + c)).* = v * inv_v;
         }
         while (c < n_tile) : (c += 1) out[off + c] *= inv;
+    }
+}
+
+pub fn updateMaxStridedRowsF32(
+    max_buf: []f32,
+    in_bytes: []const u8,
+    axis_len: usize,
+    axis_stride: usize,
+    row_offsets: []const usize,
+) BackendError!void {
+    if (axis_len == 0) return BackendError.InvalidArgument;
+    if (row_offsets.len < max_buf.len) return BackendError.InvalidArgument;
+
+    var r: usize = 0;
+    while (r < max_buf.len) : (r += 1) {
+        const base_off: usize = row_offsets[r];
+        var m: f32 = max_buf[r];
+        var c: usize = 0;
+        while (c < axis_len) : (c += 1) {
+            const off: usize = base_off + c * axis_stride;
+            const v: f32 = @as(*align(1) const f32, @ptrCast(in_bytes.ptr + off)).*;
+            m = @max(m, v);
+        }
+        max_buf[r] = m;
+    }
+}
+
+pub fn expSumStoreStridedRowsF32(
+    sum_buf: []f32,
+    out_bytes: []u8,
+    in_bytes: []const u8,
+    axis_len: usize,
+    axis_stride_in: usize,
+    axis_stride_out: usize,
+    row_offsets_in: []const usize,
+    row_offsets_out: []const usize,
+    max_buf: []const f32,
+) BackendError!void {
+    if (axis_len == 0) return BackendError.InvalidArgument;
+    if (sum_buf.len != max_buf.len) return BackendError.InvalidArgument;
+    if (row_offsets_in.len < max_buf.len or row_offsets_out.len < max_buf.len) return BackendError.InvalidArgument;
+
+    var r: usize = 0;
+    while (r < max_buf.len) : (r += 1) {
+        const base_in: usize = row_offsets_in[r];
+        const base_out: usize = row_offsets_out[r];
+        const m: f32 = max_buf[r];
+        var c: usize = 0;
+        while (c < axis_len) : (c += 1) {
+            const off_in: usize = base_in + c * axis_stride_in;
+            const off_out: usize = base_out + c * axis_stride_out;
+            const x0: f32 = @as(*align(1) const f32, @ptrCast(in_bytes.ptr + off_in)).*;
+            const e: f32 = expFast(x0 - m);
+            @as(*align(1) f32, @ptrCast(out_bytes.ptr + off_out)).* = e;
+            sum_buf[r] += e;
+        }
+    }
+}
+
+pub fn normalizeStridedRowsF32(
+    out_bytes: []u8,
+    axis_len: usize,
+    axis_stride_out: usize,
+    row_offsets_out: []const usize,
+    sum_buf: []const f32,
+) BackendError!void {
+    if (axis_len == 0) return BackendError.InvalidArgument;
+    if (row_offsets_out.len < sum_buf.len) return BackendError.InvalidArgument;
+
+    var r: usize = 0;
+    while (r < sum_buf.len) : (r += 1) {
+        const base_out: usize = row_offsets_out[r];
+        const inv: f32 = 1.0 / sum_buf[r];
+        var c: usize = 0;
+        while (c < axis_len) : (c += 1) {
+            const off_out: usize = base_out + c * axis_stride_out;
+            const v: f32 = @as(*align(1) const f32, @ptrCast(out_bytes.ptr + off_out)).*;
+            @as(*align(1) f32, @ptrCast(out_bytes.ptr + off_out)).* = v * inv;
+        }
     }
 }

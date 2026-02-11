@@ -62,11 +62,20 @@ fn elemCount(shape: []const usize) InferError!usize {
     return backend_utils.elemCount(shape) catch return InferError.InvalidGraph;
 }
 
+fn normalizeAxis(axis: i32, rank: usize) InferError!usize {
+    if (rank == 0) return InferError.InvalidGraph;
+    const r_i32: i32 = @intCast(rank);
+    var ax: i32 = axis;
+    if (ax < 0) ax += r_i32;
+    if (ax < 0 or ax >= r_i32) return InferError.InvalidGraph;
+    return @intCast(ax);
+}
+
 pub fn infer(graph: *Graph) InferError!void {
     // Ensure declared inputs are valid.
     for (graph.values.items) |v| {
         if (v.shape.len != 0) {
-            if (v.shape.len == 0 or v.shape.len > 2) return InferError.Unsupported;
+            if (v.shape.len == 0) return InferError.Unsupported;
             for (v.shape) |d| if (d == 0) return InferError.InvalidGraph;
         }
     }
@@ -91,16 +100,30 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
             try require(a.dtype != null and b.dtype != null);
-            try require(a.shape.len == 2 and b.shape.len == 2);
+            try require(a.shape.len >= 2 and b.shape.len >= 2);
+            if (a.shape.len != b.shape.len) return InferError.RankMismatch;
 
             const a_dt: DType = a.dtype.?;
             const b_dt: DType = b.dtype.?;
 
-            // Shape.
-            const m: usize = a.shape[0];
-            const k: usize = a.shape[1];
-            const k_b: usize = b.shape[0];
-            const n: usize = b.shape[1];
+            const rank: usize = a.shape.len;
+
+            // Shape (batched with broadcast):
+            // - batch dims can be equal or one side can be 1
+            // - output batch dims follow the max of (a,b)
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
+            var d: usize = 0;
+            while (d + 2 < rank) : (d += 1) {
+                const ad: usize = a.shape[d];
+                const bd: usize = b.shape[d];
+                if (ad != bd and ad != 1 and bd != 1) return InferError.ShapeMismatch;
+                out_shape[d] = if (ad >= bd) ad else bd;
+            }
+
+            const m: usize = a.shape[rank - 2];
+            const k: usize = a.shape[rank - 1];
+            const k_b: usize = b.shape[rank - 2];
+            const n: usize = b.shape[rank - 1];
             if (k != k_b) return InferError.ShapeMismatch;
 
             // DType routing (v0 strict):
@@ -111,15 +134,21 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             const out_v = try getValue(graph, node.output);
             if (b_dt.info().is_quantized) {
                 if (a_dt != .f32) return InferError.DTypeMismatch;
-                try setInferred(graph, node.output, .f32, &[_]usize{ m, n });
+                out_shape[rank - 2] = m;
+                out_shape[rank - 1] = n;
+                try setInferred(graph, node.output, .f32, out_shape);
             } else if (b_dt == .f32) {
                 if (a_dt != .f32) return InferError.DTypeMismatch;
-                try setInferred(graph, node.output, .f32, &[_]usize{ m, n });
+                out_shape[rank - 2] = m;
+                out_shape[rank - 1] = n;
+                try setInferred(graph, node.output, .f32, out_shape);
             } else if (b_dt == .f16) {
                 if (a_dt != .f16) return InferError.DTypeMismatch;
                 const out_dt: DType = out_v.dtype orelse .f16;
                 if (out_dt != .f16 and out_dt != .f32) return InferError.DTypeMismatch;
-                try setInferred(graph, node.output, out_dt, &[_]usize{ m, n });
+                out_shape[rank - 2] = m;
+                out_shape[rank - 1] = n;
+                try setInferred(graph, node.output, out_dt, out_shape);
             } else {
                 return InferError.Unsupported;
             }
@@ -170,50 +199,67 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             _ = u.op;
         },
 
-        .Softmax => {
+        .Softmax => |sm| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
-            // v0: softmax over last dimension; preserve shape/dtype.
+            _ = try normalizeAxis(sm.axis, a.shape.len);
             try setInferred(graph, node.output, a.dtype.?, a.shape);
         },
 
-        .LayerNorm => |_| {
+        .LayerNorm => |ln| {
             try require(node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const gamma = try getValue(graph, node.inputs[1]);
             const beta = try getValue(graph, node.inputs[2]);
 
             try require(x.dtype != null and gamma.dtype != null and beta.dtype != null);
-            try require(x.shape.len == 2);
-            try require(gamma.shape.len == 1 and beta.shape.len == 1);
+            try require(x.shape.len != 0);
+            try require(gamma.shape.len != 0 and beta.shape.len != 0);
 
             if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
             if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
 
-            const n: usize = x.shape[1];
-            if (gamma.shape[0] != n or beta.shape[0] != n) return InferError.ShapeMismatch;
+            if (ln.normalized_shape.len == 0) return InferError.InvalidGraph;
+            if (gamma.shape.len != ln.normalized_shape.len or beta.shape.len != ln.normalized_shape.len) return InferError.ShapeMismatch;
+            if (x.shape.len < ln.normalized_shape.len) return InferError.RankMismatch;
 
+            // normalized_shape must match trailing dims of x and gamma/beta shapes.
+            const norm_len: usize = ln.normalized_shape.len;
+            var d: usize = 0;
+            while (d < norm_len) : (d += 1) {
+                const x_dim: usize = x.shape[x.shape.len - norm_len + d];
+                if (x_dim != ln.normalized_shape[d]) return InferError.ShapeMismatch;
+                if (gamma.shape[d] != ln.normalized_shape[d] or beta.shape[d] != ln.normalized_shape[d]) return InferError.ShapeMismatch;
+            }
             try setInferred(graph, node.output, x.dtype.?, x.shape);
         },
 
-        .RMSNorm => |_| {
+        .RMSNorm => |rn| {
             try require(node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const gamma = try getValue(graph, node.inputs[1]);
             const beta = try getValue(graph, node.inputs[2]);
 
             try require(x.dtype != null and gamma.dtype != null and beta.dtype != null);
-            try require(x.shape.len == 2);
-            try require(gamma.shape.len == 1 and beta.shape.len == 1);
+            try require(x.shape.len != 0);
+            try require(gamma.shape.len != 0 and beta.shape.len != 0);
 
             if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
             if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
 
-            const n: usize = x.shape[1];
-            if (gamma.shape[0] != n or beta.shape[0] != n) return InferError.ShapeMismatch;
+            if (rn.normalized_shape.len == 0) return InferError.InvalidGraph;
+            if (gamma.shape.len != rn.normalized_shape.len or beta.shape.len != rn.normalized_shape.len) return InferError.ShapeMismatch;
+            if (x.shape.len < rn.normalized_shape.len) return InferError.RankMismatch;
 
+            const norm_len: usize = rn.normalized_shape.len;
+            var d: usize = 0;
+            while (d < norm_len) : (d += 1) {
+                const x_dim: usize = x.shape[x.shape.len - norm_len + d];
+                if (x_dim != rn.normalized_shape[d]) return InferError.ShapeMismatch;
+                if (gamma.shape[d] != rn.normalized_shape[d] or beta.shape[d] != rn.normalized_shape[d]) return InferError.ShapeMismatch;
+            }
             try setInferred(graph, node.output, x.dtype.?, x.shape);
         },
 
@@ -224,19 +270,34 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             const v = try getValue(graph, node.inputs[2]);
 
             try require(q.dtype != null and k.dtype != null and v.dtype != null);
-            try require(q.shape.len == 2 and k.shape.len == 2 and v.shape.len == 2);
+            try require(q.shape.len >= 2 and k.shape.len >= 2 and v.shape.len >= 2);
+            if (q.shape.len != k.shape.len or q.shape.len != v.shape.len) return InferError.RankMismatch;
 
             if (q.dtype.? != k.dtype.? or q.dtype.? != v.dtype.?) return InferError.DTypeMismatch;
             if (q.dtype.?.info().is_quantized) return InferError.Unsupported;
 
-            // q:[m,dk], k:[n,dk], v:[n,dv] -> out:[m,dv]
-            if (q.shape[1] != k.shape[1]) return InferError.ShapeMismatch;
-            if (k.shape[0] != v.shape[0]) return InferError.ShapeMismatch;
+            const rank: usize = q.shape.len;
+            const lead_dims: usize = rank - 2;
+            var d: usize = 0;
+            while (d < lead_dims) : (d += 1) {
+                if (q.shape[d] != k.shape[d] or q.shape[d] != v.shape[d]) return InferError.ShapeMismatch;
+            }
+
+            // q:[..., m, dk], k:[..., n, dk], v:[..., n, dv] -> out:[..., m, dv]
+            if (q.shape[rank - 1] != k.shape[rank - 1]) return InferError.ShapeMismatch;
+            if (k.shape[rank - 2] != v.shape[rank - 2]) return InferError.ShapeMismatch;
 
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
             _ = attn.causal;
 
-            try setInferred(graph, node.output, q.dtype.?, &[_]usize{ q.shape[0], v.shape[1] });
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
+            d = 0;
+            while (d < lead_dims) : (d += 1) {
+                out_shape[d] = q.shape[d];
+            }
+            out_shape[rank - 2] = q.shape[rank - 2];
+            out_shape[rank - 1] = v.shape[rank - 1];
+            try setInferred(graph, node.output, q.dtype.?, out_shape);
         },
 
         .MultiHeadAttention => |attn| {
@@ -246,24 +307,40 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             const v = try getValue(graph, node.inputs[2]);
 
             try require(q.dtype != null and k.dtype != null and v.dtype != null);
-            try require(q.shape.len == 2 and k.shape.len == 2 and v.shape.len == 2);
+            try require(q.shape.len >= 3 and k.shape.len >= 3 and v.shape.len >= 3);
+            if (q.shape.len != k.shape.len or q.shape.len != v.shape.len) return InferError.RankMismatch;
 
             if (q.dtype.? != k.dtype.? or q.dtype.? != v.dtype.?) return InferError.DTypeMismatch;
             if (q.dtype.?.info().is_quantized) return InferError.Unsupported;
 
             if (attn.heads == 0) return InferError.InvalidGraph;
 
-            // Packed layout: q:[h*m,dk], k:[h*n,dk], v:[h*n,dv] -> out:[h*m,dv]
-            if (q.shape[1] != k.shape[1]) return InferError.ShapeMismatch;
-            if (k.shape[0] != v.shape[0]) return InferError.ShapeMismatch;
-            if ((q.shape[0] % attn.heads) != 0) return InferError.ShapeMismatch;
-            if ((k.shape[0] % attn.heads) != 0) return InferError.ShapeMismatch;
-            if ((v.shape[0] % attn.heads) != 0) return InferError.ShapeMismatch;
+            // Separate head dim: q:[..., h, m, dk], k:[..., h, n, dk], v:[..., h, n, dv]
+            const rank: usize = q.shape.len;
+            const lead_dims: usize = rank - 3;
+            var d: usize = 0;
+            while (d < lead_dims) : (d += 1) {
+                if (q.shape[d] != k.shape[d] or q.shape[d] != v.shape[d]) return InferError.ShapeMismatch;
+            }
+            const head_dim: usize = rank - 3;
+            if (q.shape[head_dim] != attn.heads) return InferError.ShapeMismatch;
+            if (k.shape[head_dim] != attn.heads or v.shape[head_dim] != attn.heads) return InferError.ShapeMismatch;
+
+            if (q.shape[rank - 1] != k.shape[rank - 1]) return InferError.ShapeMismatch;
+            if (k.shape[rank - 2] != v.shape[rank - 2]) return InferError.ShapeMismatch;
 
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
             _ = attn.causal;
 
-            try setInferred(graph, node.output, q.dtype.?, &[_]usize{ q.shape[0], v.shape[1] });
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
+            d = 0;
+            while (d < lead_dims) : (d += 1) {
+                out_shape[d] = q.shape[d];
+            }
+            out_shape[head_dim] = attn.heads;
+            out_shape[rank - 2] = q.shape[rank - 2];
+            out_shape[rank - 1] = v.shape[rank - 1];
+            try setInferred(graph, node.output, q.dtype.?, out_shape);
         },
 
         .Reduce => |_| {

@@ -47,7 +47,7 @@ pub const StorageManager = struct {
         var t: *TiledTensor = self.allocator.create(TiledTensor) catch return StorageError.OutOfMemory;
         errdefer self.allocator.destroy(t);
 
-        t.* = try TiledTensor.init(self.allocator, dtype, shape, tile_shape, opts);
+        try t.init(self.allocator, dtype, shape, tile_shape, opts);
         errdefer t.deinit();
 
         const idx_usize: usize = self.tensors.items.len;
@@ -103,6 +103,7 @@ pub const StorageManager = struct {
                     .shape = t.shape,
                     .tile_shape = t.tile_shape,
                     .tile_counts = t.tile_counts,
+                    .tile_strides = t.tile_strides,
                 };
             }
 
@@ -134,6 +135,34 @@ pub const StorageManager = struct {
                 };
             }
 
+            fn acquireTileConstLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefConst {
+                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
+                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+                const tile = t.acquireTileConstLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
+                return .{
+                    .bytes = tile.bytes,
+                    .dtype = tile.dtype,
+                    .rank = tile.rank,
+                    .shape_mem = tile.shape_mem,
+                    .strides_mem = tile.strides_mem,
+                    .token = 0,
+                };
+            }
+
+            fn acquireTileMutLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefMut {
+                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
+                const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+                var tile = t.acquireTileMutLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
+                return .{
+                    .bytes = tile.bytes,
+                    .dtype = tile.dtype,
+                    .rank = tile.rank,
+                    .shape_mem = tile.shape_mem,
+                    .strides_mem = tile.strides_mem,
+                    .token = 0,
+                };
+            }
+
             fn releaseConst(_: *anyopaque, _: usize) void {}
             fn releaseMut(_: *anyopaque, _: usize) void {}
 
@@ -144,6 +173,13 @@ pub const StorageManager = struct {
                 // v0: RAM-only prefetch uses intrinsic.
                 @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
             }
+
+            fn prefetchLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) void {
+                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
+                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
+                const tile = t.acquireTileConstLinear(tile_index) catch return;
+                @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+            }
         };
 
         return .{
@@ -152,9 +188,12 @@ pub const StorageManager = struct {
                 .meta = Vt.meta,
                 .acquireTileConst = Vt.acquireTileConst,
                 .acquireTileMut = Vt.acquireTileMut,
+                .acquireTileConstLinear = Vt.acquireTileConstLinear,
+                .acquireTileMutLinear = Vt.acquireTileMutLinear,
                 .releaseConst = Vt.releaseConst,
                 .releaseMut = Vt.releaseMut,
                 .prefetch = Vt.prefetch,
+                .prefetchLinear = Vt.prefetchLinear,
             },
         };
     }

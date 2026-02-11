@@ -14,7 +14,8 @@ test "storage: scalar f32 roundtrip pack<->tiles" {
     const rows: usize = 5;
     const cols: usize = 7;
 
-    var tt: storage.TiledTensor = try storage.TiledTensor.init(
+    var tt: storage.TiledTensor = undefined;
+    try tt.init(
         allocator,
         .f32,
         &[_]usize{ rows, cols },
@@ -24,7 +25,7 @@ test "storage: scalar f32 roundtrip pack<->tiles" {
     defer tt.deinit();
 
     const total_elems: usize = rows * cols;
-    var packed_vals: []f32 = try allocator.alloc(f32, total_elems);
+    const packed_vals: []f32 = try allocator.alloc(f32, total_elems);
     defer allocator.free(packed_vals);
 
     // Fill with a deterministic pattern.
@@ -81,7 +82,8 @@ test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
     const k: usize = 96;
     const n: usize = 5;
 
-    var tt: storage.TiledTensor = try storage.TiledTensor.init(
+    var tt: storage.TiledTensor = undefined;
+    try tt.init(
         allocator,
         .q8_0,
         &[_]usize{ k, n },
@@ -107,4 +109,38 @@ test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
 
     try tt.readToPackedQuant(out);
     try std.testing.expectEqualSlices(u8, packed_bytes_q, out);
+}
+
+test "storage: scalar f32 roundtrip rank-3 pack<->tiles" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const d0: usize = 3;
+    const d1: usize = 4;
+    const d2: usize = 5;
+
+    var tt: storage.TiledTensor = undefined;
+    try tt.init(
+        allocator,
+        .f32,
+        &[_]usize{ d0, d1, d2 },
+        &[_]usize{ 2, 3, 2 },
+        .{ .tile_alignment = 64 },
+    );
+    defer tt.deinit();
+
+    const total_elems: usize = d0 * d1 * d2;
+    const packed_vals: []f32 = try allocator.alloc(f32, total_elems);
+    defer allocator.free(packed_vals);
+
+    // Deterministic pattern: linear index + offset.
+    for (packed_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 7)) * 0.25;
+
+    try tt.writeFromPackedScalar(std.mem.sliceAsBytes(packed_vals));
+
+    const out: []f32 = try allocator.alloc(f32, total_elems);
+    defer allocator.free(out);
+    @memset(out, 0);
+
+    try tt.readToPackedScalar(std.mem.sliceAsBytes(out));
+    try std.testing.expectEqualSlices(f32, packed_vals, out);
 }

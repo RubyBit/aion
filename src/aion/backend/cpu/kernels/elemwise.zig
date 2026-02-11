@@ -60,6 +60,21 @@ pub fn broadcastLastDimBinaryF32(
     }
 }
 
+/// Broadcast over last dim for packed N-D (row_count derived from elem_count / col_count).
+pub fn broadcastLastDimBinaryF32Packed(
+    comptime op: ElemwiseBinaryOp,
+    out_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+    elem_count: usize,
+    col_count: usize,
+) BackendError!void {
+    if (col_count == 0) return BackendError.InvalidArgument;
+    if ((elem_count % col_count) != 0) return BackendError.InvalidArgument;
+    const row_count: usize = elem_count / col_count;
+    return broadcastLastDimBinaryF32(op, out_bytes, a_bytes, b_bytes, row_count, col_count);
+}
+
 /// f16 variant: arithmetic is done in f32 and narrowed back to f16.
 pub fn broadcastLastDimBinaryF16(
     comptime op: ElemwiseBinaryOp,
@@ -113,6 +128,21 @@ pub fn broadcastLastDimBinaryF16(
             out[base + c] = @floatCast(rv);
         }
     }
+}
+
+/// Broadcast over last dim for packed N-D (row_count derived from elem_count / col_count).
+pub fn broadcastLastDimBinaryF16Packed(
+    comptime op: ElemwiseBinaryOp,
+    out_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+    elem_count: usize,
+    col_count: usize,
+) BackendError!void {
+    if (col_count == 0) return BackendError.InvalidArgument;
+    if ((elem_count % col_count) != 0) return BackendError.InvalidArgument;
+    const row_count: usize = elem_count / col_count;
+    return broadcastLastDimBinaryF16(op, out_bytes, a_bytes, b_bytes, row_count, col_count);
 }
 
 pub fn elemwiseBinaryF32(

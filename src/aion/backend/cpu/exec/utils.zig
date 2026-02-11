@@ -10,11 +10,13 @@ const DType = types.DType;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
 pub fn tileElemCount(meta: tensor_store.TensorMeta) usize {
-    return switch (meta.rank) {
-        0 => 1,
-        1 => meta.tile_shape[0],
-        else => meta.tile_shape[0] * meta.tile_shape[1],
-    };
+    if (meta.rank == 0) return 1;
+    var acc: usize = 1;
+    var d: usize = 0;
+    while (d < @as(usize, meta.rank)) : (d += 1) {
+        acc *= meta.tile_shape[d];
+    }
+    return acc;
 }
 
 pub fn tileByteSize(meta: tensor_store.TensorMeta) usize {
@@ -44,8 +46,13 @@ pub fn shouldParallelTiles(thread_count: usize, tile_total: usize, tile_bytes: u
 
 pub fn elemCountFromTileView(view: anytype) usize {
     // view.layout.rank is u8; shape slice length matches rank.
-    if (view.layout.rank == 1) return view.layout.shape[0];
-    return view.layout.shape[0] * view.layout.shape[1];
+    if (view.layout.rank == 0) return 1;
+    var acc: usize = 1;
+    var d: usize = 0;
+    while (d < @as(usize, view.layout.rank)) : (d += 1) {
+        acc *= view.layout.shape[d];
+    }
+    return acc;
 }
 
 fn scalarElemBytes(dtype: DType) ExecuteProgramError!usize {
@@ -98,6 +105,7 @@ fn readScalarBytesAt(
     cache: *ScalarTileCacheConst,
     out: []u8,
 ) ExecuteProgramError!void {
+    if (meta.rank > 2) return BackendError.InvalidArgument;
     if (meta.rank == 1) {
         const ti: usize = idx0 / meta.tile_shape[0];
         const in_i: usize = idx0 - ti * meta.tile_shape[0];
@@ -128,6 +136,7 @@ fn writeScalarBytesAt(
     cache: *ScalarTileCacheMut,
     bytes: []const u8,
 ) ExecuteProgramError!void {
+    if (meta.rank > 2) return BackendError.InvalidArgument;
     if (meta.rank == 1) {
         const ti: usize = idx0 / meta.tile_shape[0];
         const in_i: usize = idx0 - ti * meta.tile_shape[0];
@@ -151,7 +160,12 @@ fn writeScalarBytesAt(
 pub fn retileCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
+    if (dst_meta.rank != src_meta.rank) return BackendError.InvalidArgument;
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
+
+    if (dst_meta.rank > 2) {
+        return retileCopyScalarND(store, dst_meta, src_meta, dst_id, src_id, elem_bytes);
+    }
 
     var src_cache: ScalarTileCacheConst = .{};
     defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
@@ -180,9 +194,149 @@ pub fn retileCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.Te
     }
 }
 
+const MAX_RANK: usize = 8;
+
+fn computePackedStrides(shape: []const usize, out: []usize) ExecuteProgramError!void {
+    if (out.len != shape.len) return BackendError.InvalidArgument;
+    if (shape.len == 0) return BackendError.InvalidArgument;
+
+    var stride: usize = 1;
+    var d: usize = shape.len;
+    while (d > 0) : (d -= 1) {
+        const idx: usize = d - 1;
+        out[idx] = stride;
+        stride = std.math.mul(usize, stride, shape[idx]) catch return BackendError.InvalidArgument;
+    }
+}
+
+fn decodeLinearToCoords(linear: usize, strides: []const usize, shape: []const usize, out: []usize) ExecuteProgramError!void {
+    if (out.len != shape.len or strides.len != shape.len) return BackendError.InvalidArgument;
+    var rem: usize = linear;
+    var d: usize = 0;
+    while (d < shape.len) : (d += 1) {
+        const stride: usize = strides[d];
+        if (stride == 0) return BackendError.InvalidArgument;
+        const v: usize = rem / stride;
+        if (v >= shape[d]) return BackendError.InvalidArgument;
+        out[d] = v;
+        rem -= v * stride;
+    }
+}
+
+const TileCacheConstND = struct {
+    valid: bool = false,
+    tile_index: usize = 0,
+    tile: tensor_store.TileRefConst = undefined,
+    strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+};
+
+const TileCacheMutND = struct {
+    valid: bool = false,
+    tile_index: usize = 0,
+    tile: tensor_store.TileRefMut = undefined,
+    strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+};
+
+fn ensureConstTileLinear(cache: *TileCacheConstND, store: tensor_store.TensorStore, id: tensor_store.TensorId, tile_index: usize, rank: usize) ExecuteProgramError!void {
+    if (cache.valid and cache.tile_index == tile_index) return;
+    if (cache.valid) store.releaseConst(cache.tile.token);
+    cache.tile = try store.acquireTileConstLinear(id, tile_index);
+    cache.tile_index = tile_index;
+    cache.valid = true;
+    const shape: []const usize = cache.tile.bufferView().layout.shape;
+    try computePackedStrides(shape, cache.strides[0..rank]);
+}
+
+fn ensureMutTileLinear(cache: *TileCacheMutND, store: tensor_store.TensorStore, id: tensor_store.TensorId, tile_index: usize, rank: usize) ExecuteProgramError!void {
+    if (cache.valid and cache.tile_index == tile_index) return;
+    if (cache.valid) store.releaseMut(cache.tile.token);
+    cache.tile = try store.acquireTileMutLinear(id, tile_index);
+    cache.tile_index = tile_index;
+    cache.valid = true;
+    const shape: []const usize = cache.tile.bufferView().layout.shape;
+    try computePackedStrides(shape, cache.strides[0..rank]);
+}
+
+fn retileCopyScalarND(
+    store: tensor_store.TensorStore,
+    dst_meta: tensor_store.TensorMeta,
+    src_meta: tensor_store.TensorMeta,
+    dst_id: tensor_store.TensorId,
+    src_id: tensor_store.TensorId,
+    elem_bytes: usize,
+) ExecuteProgramError!void {
+    const rank: usize = @as(usize, dst_meta.rank);
+    if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
+
+    var strides: [MAX_RANK]usize = undefined;
+    try computePackedStrides(dst_meta.shape, strides[0..rank]);
+
+    var coords: [MAX_RANK]usize = undefined;
+    var src_tile_coords: [MAX_RANK]usize = undefined;
+    var dst_tile_coords: [MAX_RANK]usize = undefined;
+    var src_local_coords: [MAX_RANK]usize = undefined;
+    var dst_local_coords: [MAX_RANK]usize = undefined;
+
+    var src_cache: TileCacheConstND = .{};
+    defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
+    var dst_cache: TileCacheMutND = .{};
+    defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
+
+    var tmp: [4]u8 = .{ 0, 0, 0, 0 };
+    const buf: []u8 = tmp[0..elem_bytes];
+
+    const total_elems: usize = elemCountFromShape(dst_meta.shape) catch return BackendError.InvalidArgument;
+    var lin: usize = 0;
+    while (lin < total_elems) : (lin += 1) {
+        try decodeLinearToCoords(lin, strides[0..rank], dst_meta.shape, coords[0..rank]);
+
+        var d: usize = 0;
+        while (d < rank) : (d += 1) {
+            dst_tile_coords[d] = coords[d] / dst_meta.tile_shape[d];
+            dst_local_coords[d] = coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
+
+            src_tile_coords[d] = coords[d] / src_meta.tile_shape[d];
+            src_local_coords[d] = coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
+        }
+
+        const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..rank]);
+        const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..rank]);
+
+        try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, rank);
+        try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, rank);
+
+        const src_strides: []const usize = src_cache.strides[0..rank];
+        const dst_strides: []const usize = dst_cache.strides[0..rank];
+
+        var src_lin: usize = 0;
+        var dst_lin: usize = 0;
+        d = 0;
+        while (d < rank) : (d += 1) {
+            src_lin = std.math.add(usize, src_lin, src_local_coords[d] * src_strides[d]) catch return BackendError.InvalidArgument;
+            dst_lin = std.math.add(usize, dst_lin, dst_local_coords[d] * dst_strides[d]) catch return BackendError.InvalidArgument;
+        }
+
+        const src_off: usize = src_lin * elem_bytes;
+        const dst_off: usize = dst_lin * elem_bytes;
+
+        @memcpy(buf, src_cache.tile.bytes[src_off .. src_off + elem_bytes]);
+        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + elem_bytes], buf);
+    }
+}
+
+fn elemCountFromShape(shape: []const usize) ExecuteProgramError!usize {
+    if (shape.len == 0) return BackendError.InvalidArgument;
+    var acc: usize = 1;
+    for (shape) |d| {
+        acc = std.math.mul(usize, acc, d) catch return BackendError.InvalidArgument;
+    }
+    return acc;
+}
+
 pub fn reshapeCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
+    if (dst_meta.rank > 2 or src_meta.rank > 2) return BackendError.InvalidArgument;
 
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
     const dst_elems: usize = if (dst_meta.rank == 1) dst_meta.shape[0] else (dst_meta.shape[0] * dst_meta.shape[1]);
@@ -211,6 +365,7 @@ pub fn reshapeCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
 pub fn transpose2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
+    if (dst_meta.rank > 2 or src_meta.rank > 2) return BackendError.InvalidArgument;
 
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
     var src_cache: ScalarTileCacheConst = .{};
@@ -234,6 +389,7 @@ pub fn transpose2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_sto
 pub fn slice2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId, start0: usize, start1: usize) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
+    if (dst_meta.rank > 2 or src_meta.rank > 2) return BackendError.InvalidArgument;
 
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
     var src_cache: ScalarTileCacheConst = .{};
@@ -278,7 +434,11 @@ pub fn reduceAllScalar(
     var did_parallel: bool = false;
 
     if (pool) |p| {
-        const tile_total: usize = a_meta.tile_counts[0] * a_meta.tile_counts[1];
+        var tile_total: usize = 1;
+        var d: usize = 0;
+        while (d < @as(usize, a_meta.rank)) : (d += 1) {
+            tile_total *= a_meta.tile_counts[d];
+        }
 
         if (thread_count > 1 and scratch_f32.len >= thread_count and tile_total >= 2) {
             @memset(scratch_f32[0..thread_count], 0.0);
@@ -295,13 +455,10 @@ pub fn reduceAllScalar(
                     if (start >= end) return;
                     if (tid >= t.partials.len) return;
 
-                    const tc1: usize = t.a_meta.tile_counts[1];
                     var acc: f32 = 0.0;
                     var i: usize = start;
                     while (i < end) : (i += 1) {
-                        const ti0: usize = i / tc1;
-                        const ti1: usize = i - ti0 * tc1;
-                        const tile = t.store.acquireTileConst(t.a_id, ti0, ti1) catch continue;
+                        const tile = t.store.acquireTileConstLinear(t.a_id, i) catch continue;
                         defer t.store.releaseConst(tile.token);
                         const v = tile.bufferView();
                         const n: usize = if (v.layout.rank == 1) v.layout.shape[0] else (v.layout.shape[0] * v.layout.shape[1]);
@@ -331,21 +488,24 @@ pub fn reduceAllScalar(
     }
 
     if (!did_parallel) {
-        var ti0: usize = 0;
-        while (ti0 < a_meta.tile_counts[0]) : (ti0 += 1) {
-            var ti1: usize = 0;
-            while (ti1 < a_meta.tile_counts[1]) : (ti1 += 1) {
-                const tile = try store.acquireTileConst(a_id, ti0, ti1);
-                defer store.releaseConst(tile.token);
-                const v = tile.bufferView();
-                const n: usize = elemCountFromTileView(v);
-                const part: f32 = switch (a_meta.dtype) {
-                    .f32 => try reduce_k.sumF32Range(v.bytes, 0, n),
-                    .f16 => try reduce_k.sumF16RangeToF32(v.bytes, 0, n),
-                    else => return BackendError.InvalidArgument,
-                };
-                sum_f64 += @as(f64, part);
-            }
+        var tile_total_seq: usize = 1;
+        var d2: usize = 0;
+        while (d2 < @as(usize, a_meta.rank)) : (d2 += 1) {
+            tile_total_seq *= a_meta.tile_counts[d2];
+        }
+
+        var tile_index: usize = 0;
+        while (tile_index < tile_total_seq) : (tile_index += 1) {
+            const tile = try store.acquireTileConstLinear(a_id, tile_index);
+            defer store.releaseConst(tile.token);
+            const v = tile.bufferView();
+            const n: usize = elemCountFromTileView(v);
+            const part: f32 = switch (a_meta.dtype) {
+                .f32 => try reduce_k.sumF32Range(v.bytes, 0, n),
+                .f16 => try reduce_k.sumF16RangeToF32(v.bytes, 0, n),
+                else => return BackendError.InvalidArgument,
+            };
+            sum_f64 += @as(f64, part);
         }
     }
 

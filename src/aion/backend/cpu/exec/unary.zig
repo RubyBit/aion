@@ -24,7 +24,11 @@ pub fn execUnaryTiled(
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const out_meta = try store.meta(s.out);
-    const tile_total: usize = out_meta.tile_counts[0] * out_meta.tile_counts[1];
+    var tile_total: usize = 1;
+    var d: usize = 0;
+    while (d < @as(usize, out_meta.rank)) : (d += 1) {
+        tile_total *= out_meta.tile_counts[d];
+    }
     const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
     const min_total_bytes: usize = 256 * 1024;
 
@@ -53,26 +57,19 @@ pub fn execUnaryTiled(
                     const t: *@This() = @ptrCast(@alignCast(ctx_any));
                     if (start >= end) return;
                     if (t.stop.load(.acquire)) return;
-
-                    const tc1: usize = t.out_meta.tile_counts[1];
                     var i: usize = start;
                     while (i < end) : (i += 1) {
                         if (t.stop.load(.acquire)) return;
-                        const ti0: usize = i / tc1;
-                        const ti1: usize = i - ti0 * tc1;
-
                         if (i + 1 < end) {
-                            const nti0: usize = (i + 1) / tc1;
-                            const nti1: usize = (i + 1) - nti0 * tc1;
-                            t.store.prefetch(t.a, nti0, nti1);
+                            t.store.prefetchLinear(t.a, i + 1);
                         }
 
-                        var out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
+                        var out_tile = t.store.acquireTileMutLinear(t.out, i) catch |e| {
                             t.fail(e);
                             return;
                         };
                         defer t.store.releaseMut(out_tile.token);
-                        const a_tile = t.store.acquireTileConst(t.a, ti0, ti1) catch |e| {
+                        const a_tile = t.store.acquireTileConstLinear(t.a, i) catch |e| {
                             t.fail(e);
                             return;
                         };
@@ -110,24 +107,21 @@ pub fn execUnaryTiled(
     }
 
     // Sequential fallback.
-    var ti0: usize = 0;
-    while (ti0 < out_meta.tile_counts[0]) : (ti0 += 1) {
-        var ti1: usize = 0;
-        while (ti1 < out_meta.tile_counts[1]) : (ti1 += 1) {
-            var out_tile = try store.acquireTileMut(s.out, ti0, ti1);
-            defer store.releaseMut(out_tile.token);
-            const a_tile = try store.acquireTileConst(s.a, ti0, ti1);
-            defer store.releaseConst(a_tile.token);
+    var tile_index: usize = 0;
+    while (tile_index < tile_total) : (tile_index += 1) {
+        var out_tile = try store.acquireTileMutLinear(s.out, tile_index);
+        defer store.releaseMut(out_tile.token);
+        const a_tile = try store.acquireTileConstLinear(s.a, tile_index);
+        defer store.releaseConst(a_tile.token);
 
-            const out_view = out_tile.bufferView();
-            const a_view = a_tile.bufferView();
-            const n: usize = exec_utils.elemCountFromTileView(out_view);
+        const out_view = out_tile.bufferView();
+        const a_view = a_tile.bufferView();
+        const n: usize = exec_utils.elemCountFromTileView(out_view);
 
-            switch (out_view.dtype) {
-                .f32 => try dispatchF32(s.op, out_view.bytes, a_view.bytes, n),
-                .f16 => try dispatchF16(s.op, out_view.bytes, a_view.bytes, n),
-                else => return BackendError.InvalidArgument,
-            }
+        switch (out_view.dtype) {
+            .f32 => try dispatchF32(s.op, out_view.bytes, a_view.bytes, n),
+            .f16 => try dispatchF16(s.op, out_view.bytes, a_view.bytes, n),
+            else => return BackendError.InvalidArgument,
         }
     }
 }

@@ -14,6 +14,24 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
 const Mode = layernorm_kernels.Mode;
 
+const MAX_RANK: usize = 8;
+
+fn productUsize(vals: []const usize) ExecuteProgramError!usize {
+    if (vals.len == 0) return BackendError.InvalidArgument;
+    var acc: usize = 1;
+    for (vals) |v| {
+        acc = std.math.mul(usize, acc, v) catch return BackendError.InvalidArgument;
+    }
+    return acc;
+}
+
+fn tileDim(shape: []const usize, tile_shape: []const usize, tile_index: usize, dim: usize) ExecuteProgramError!usize {
+    if (dim >= shape.len or dim >= tile_shape.len) return BackendError.InvalidArgument;
+    const start: usize = tile_index * tile_shape[dim];
+    if (start >= shape[dim]) return BackendError.InvalidArgument;
+    return @min(tile_shape[dim], shape[dim] - start);
+}
+
 pub fn execLayerNormTiled(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
@@ -45,29 +63,190 @@ fn execNormTiled(
 ) ExecuteProgramError!void {
     if (!(eps > 0.0) or !std.math.isFinite(eps)) return BackendError.InvalidArgument;
     const out_meta = try store.meta(out);
-    if (out_meta.rank != 2) return BackendError.InvalidArgument;
+    const x_meta = try store.meta(x);
+    const g_meta = try store.meta(gamma);
+    const b_meta = try store.meta(beta);
+
+    const rank: usize = @as(usize, out_meta.rank);
+    if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
+    if (out_meta.rank != x_meta.rank) return BackendError.InvalidArgument;
     if (!(out_meta.dtype == .f32 or out_meta.dtype == .f16)) return BackendError.InvalidArgument;
+    if (out_meta.dtype != x_meta.dtype or out_meta.dtype != g_meta.dtype or out_meta.dtype != b_meta.dtype) return BackendError.InvalidArgument;
 
-    // v0 contract: keep tm small so we can allocate per-row stats on stack.
-    const tm: usize = out_meta.tile_shape[0];
-    if (tm == 0 or tm > 256) return BackendError.InvalidArgument;
+    const norm_rank: usize = @as(usize, g_meta.rank);
+    if (norm_rank == 0 or norm_rank > rank) return BackendError.InvalidArgument;
+    if (g_meta.rank != b_meta.rank) return BackendError.InvalidArgument;
 
-    const ti0_total: usize = out_meta.tile_counts[0];
+    // Shapes must match trailing normalized dims.
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (out_meta.shape[d] != x_meta.shape[d]) return BackendError.InvalidArgument;
+    }
+    d = 0;
+    while (d < norm_rank) : (d += 1) {
+        const od: usize = out_meta.shape[rank - norm_rank + d];
+        if (g_meta.shape[d] != od or b_meta.shape[d] != od) return BackendError.InvalidArgument;
+    }
+
+    // Fast path: rank-2, normalized over last dim.
+    if (rank == 2 and norm_rank == 1) {
+        // v0 contract: keep tm small so we can allocate per-row stats on stack.
+        const tm: usize = out_meta.tile_shape[0];
+        if (tm == 0 or tm > 256) return BackendError.InvalidArgument;
+
+        const ti0_total: usize = out_meta.tile_counts[0];
+        const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
+        const min_total_bytes: usize = 256 * 1024;
+        const tile_total: usize = out_meta.tile_counts[0] * out_meta.tile_counts[1];
+
+        if (pool) |p| {
+            if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes) and ti0_total >= 2) {
+                const Task = struct {
+                    store: tensor_store.TensorStore,
+                    out_meta: tensor_store.TensorMeta,
+                    mode: Mode,
+                    out: tensor_store.TensorId,
+                    x: tensor_store.TensorId,
+                    gamma: tensor_store.TensorId,
+                    beta: tensor_store.TensorId,
+                    eps: f32,
+
+                    stop: std.atomic.Value(bool) = .init(false),
+                    err_mutex: std.Thread.Mutex = .{},
+                    err_any: ?anyerror = null,
+
+                    fn fail(t: *@This(), err: anyerror) void {
+                        if (t.stop.swap(true, .acq_rel)) return;
+                        t.err_mutex.lock();
+                        defer t.err_mutex.unlock();
+                        if (t.err_any == null) t.err_any = err;
+                    }
+
+                    fn runTi0(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+                        _ = tid;
+                        const t: *@This() = @ptrCast(@alignCast(ctx_any));
+                        if (start >= end) return;
+                        if (t.stop.load(.acquire)) return;
+                        var ti0: usize = start;
+                        while (ti0 < end) : (ti0 += 1) {
+                            if (t.stop.load(.acquire)) return;
+                            normTi0(t.store, t.out_meta, t.mode, t.out, t.x, t.gamma, t.beta, t.eps, ti0) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                        }
+                    }
+                };
+
+                var task: Task = .{ .store = store, .out_meta = out_meta, .mode = mode, .out = out, .x = x, .gamma = gamma, .beta = beta, .eps = eps };
+                p.parallelForAny(@ptrCast(&task), ti0_total, 1, Task.runTi0);
+                if (task.err_any) |e| return @errorCast(e);
+                return;
+            }
+        }
+
+        // Sequential fallback.
+        var ti0: usize = 0;
+        while (ti0 < ti0_total) : (ti0 += 1) {
+            try normTi0(store, out_meta, mode, out, x, gamma, beta, eps, ti0);
+        }
+        return;
+    }
+
+    return execNormTiledND(pool, thread_count, mode, out, x, gamma, beta, eps, store, out_meta, g_meta, b_meta, norm_rank);
+}
+
+fn execNormTiledND(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    mode: Mode,
+    out: tensor_store.TensorId,
+    x: tensor_store.TensorId,
+    gamma: tensor_store.TensorId,
+    beta: tensor_store.TensorId,
+    eps: f32,
+    store: tensor_store.TensorStore,
+    out_meta: tensor_store.TensorMeta,
+    g_meta: tensor_store.TensorMeta,
+    b_meta: tensor_store.TensorMeta,
+    norm_rank: usize,
+) ExecuteProgramError!void {
+    const rank: usize = @as(usize, out_meta.rank);
+    const row_dim_count: usize = rank - norm_rank;
+
+    // Total normalized elements (per row).
+    const norm_elems: usize = try productUsize(g_meta.shape);
+    if (norm_elems == 0) return BackendError.InvalidArgument;
+    const denom: f32 = @as(f32, @floatFromInt(norm_elems));
+    const inv_denom: f32 = 1.0 / denom;
+
+    var row_dims: [MAX_RANK]usize = undefined;
+    var row_counts: [MAX_RANK]usize = undefined;
+    var row_strides: [MAX_RANK]usize = undefined;
+    var row_dim_idx: usize = 0;
+    while (row_dim_idx < row_dim_count) : (row_dim_idx += 1) {
+        row_dims[row_dim_idx] = row_dim_idx;
+        row_counts[row_dim_idx] = out_meta.tile_counts[row_dim_idx];
+    }
+
+    var row_stride: usize = 1;
+    var i: usize = row_dim_count;
+    while (i > 0) : (i -= 1) {
+        const idx: usize = i - 1;
+        row_strides[idx] = row_stride;
+        row_stride = std.math.mul(usize, row_stride, row_counts[idx]) catch return BackendError.InvalidArgument;
+    }
+    const row_tile_total: usize = row_stride;
+
+    var norm_dims: [MAX_RANK]usize = undefined;
+    var norm_counts: [MAX_RANK]usize = undefined;
+    var norm_strides: [MAX_RANK]usize = undefined;
+    var nd: usize = 0;
+    while (nd < norm_rank) : (nd += 1) {
+        norm_dims[nd] = row_dim_count + nd;
+        norm_counts[nd] = out_meta.tile_counts[row_dim_count + nd];
+    }
+
+    var norm_stride: usize = 1;
+    i = norm_rank;
+    while (i > 0) : (i -= 1) {
+        const idx: usize = i - 1;
+        norm_strides[idx] = norm_stride;
+        norm_stride = std.math.mul(usize, norm_stride, norm_counts[idx]) catch return BackendError.InvalidArgument;
+    }
+    const norm_tile_total: usize = norm_stride;
+
     const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
     const min_total_bytes: usize = 256 * 1024;
-    const tile_total: usize = out_meta.tile_counts[0] * out_meta.tile_counts[1];
+    var tile_total: usize = 1;
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        tile_total *= out_meta.tile_counts[d];
+    }
 
     if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes) and ti0_total >= 2) {
+        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes) and row_tile_total >= 2) {
             const Task = struct {
                 store: tensor_store.TensorStore,
                 out_meta: tensor_store.TensorMeta,
+                g_meta: tensor_store.TensorMeta,
+                b_meta: tensor_store.TensorMeta,
                 mode: Mode,
                 out: tensor_store.TensorId,
                 x: tensor_store.TensorId,
                 gamma: tensor_store.TensorId,
                 beta: tensor_store.TensorId,
                 eps: f32,
+                norm_rank: usize,
+                row_dim_count: usize,
+                row_dims: [MAX_RANK]usize,
+                row_counts: [MAX_RANK]usize,
+                row_strides: [MAX_RANK]usize,
+                norm_dims: [MAX_RANK]usize,
+                norm_counts: [MAX_RANK]usize,
+                norm_strides: [MAX_RANK]usize,
+                norm_tile_total: usize,
+                inv_denom: f32,
 
                 stop: std.atomic.Value(bool) = .init(false),
                 err_mutex: std.Thread.Mutex = .{},
@@ -80,33 +259,377 @@ fn execNormTiled(
                     if (t.err_any == null) t.err_any = err;
                 }
 
-                fn runTi0(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+                fn runRowTile(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
                     _ = tid;
                     const t: *@This() = @ptrCast(@alignCast(ctx_any));
                     if (start >= end) return;
                     if (t.stop.load(.acquire)) return;
-                    var ti0: usize = start;
-                    while (ti0 < end) : (ti0 += 1) {
+
+                    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                    var norm_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+                    var row_idx: usize = start;
+                    while (row_idx < end) : (row_idx += 1) {
                         if (t.stop.load(.acquire)) return;
-                        normTi0(t.store, t.out_meta, t.mode, t.out, t.x, t.gamma, t.beta, t.eps, ti0) catch |e| {
-                            t.fail(e);
+                        var rem: usize = row_idx;
+                        var rdi: usize = 0;
+                        while (rdi < t.row_dim_count) : (rdi += 1) {
+                            const stride0: usize = t.row_strides[rdi];
+                            const v: usize = rem / stride0;
+                            coords[t.row_dims[rdi]] = v;
+                            rem -= v * stride0;
+                        }
+
+                        var rows: usize = 1;
+                        rdi = 0;
+                        while (rdi < t.row_dim_count) : (rdi += 1) {
+                            const dim: usize = t.row_dims[rdi];
+                            const dim_len: usize = tileDim(t.out_meta.shape, t.out_meta.tile_shape, coords[dim], dim) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            rows = std.math.mul(usize, rows, dim_len) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                        }
+                        if (rows == 0 or rows > 256) {
+                            t.fail(BackendError.InvalidArgument);
                             return;
-                        };
+                        }
+
+                        var sum: [256]f32 = undefined;
+                        var sumsq: [256]f32 = undefined;
+                        @memset(sum[0..rows], 0.0);
+                        @memset(sumsq[0..rows], 0.0);
+
+                        var nt: usize = 0;
+                        while (nt < t.norm_tile_total) : (nt += 1) {
+                            if (t.stop.load(.acquire)) return;
+                            var remn: usize = nt;
+                            var ndi: usize = 0;
+                            while (ndi < t.norm_rank) : (ndi += 1) {
+                                const stride_n: usize = t.norm_strides[ndi];
+                                const v: usize = remn / stride_n;
+                                norm_coords[ndi] = v;
+                                remn -= v * stride_n;
+                            }
+
+                            ndi = 0;
+                            while (ndi < t.norm_rank) : (ndi += 1) {
+                                coords[t.norm_dims[ndi]] = norm_coords[ndi];
+                            }
+
+                            const tile_index: usize = tensor_store.encodeTileIndex(t.out_meta, coords[0..t.out_meta.tile_counts.len]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            const x_tile = t.store.acquireTileConstLinear(t.x, tile_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseConst(x_tile.token);
+
+                            var cols: usize = 1;
+                            ndi = 0;
+                            while (ndi < t.norm_rank) : (ndi += 1) {
+                                const dim: usize = t.norm_dims[ndi];
+                                const dim_len: usize = tileDim(t.out_meta.shape, t.out_meta.tile_shape, coords[dim], dim) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                cols = std.math.mul(usize, cols, dim_len) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+
+                            const elem_bytes: usize = switch (t.out_meta.dtype) {
+                                .f32 => 4,
+                                .f16 => 2,
+                                else => 0,
+                            };
+                            if (elem_bytes == 0) {
+                                t.fail(BackendError.InvalidArgument);
+                                return;
+                            }
+
+                            var shape_mem: [2]usize = .{ rows, cols };
+                            var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
+                            const x_view: types.BufferViewConst = .{ .bytes = x_tile.bytes, .dtype = t.out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                            layernorm_kernels.accumulateStats(sum[0..rows], sumsq[0..rows], x_view);
+                        }
+
+                        var mean: [256]f32 = undefined;
+                        var inv: [256]f32 = undefined;
+                        var r0: usize = 0;
+                        while (r0 < rows) : (r0 += 1) {
+                            const mu: f32 = sum[r0] * t.inv_denom;
+                            mean[r0] = mu;
+                            const msq: f32 = sumsq[r0] * t.inv_denom;
+                            const v: f32 = if (t.mode == .layernorm) @max(@as(f32, 0.0), msq - (mu * mu)) else msq;
+                            const d0: f32 = v + t.eps;
+                            if (!(d0 > 0.0) or !std.math.isFinite(d0)) {
+                                t.fail(BackendError.InvalidArgument);
+                                return;
+                            }
+                            inv[r0] = 1.0 / std.math.sqrt(d0);
+                        }
+
+                        nt = 0;
+                        while (nt < t.norm_tile_total) : (nt += 1) {
+                            if (t.stop.load(.acquire)) return;
+                            var remn2: usize = nt;
+                            var ndi2: usize = 0;
+                            while (ndi2 < t.norm_rank) : (ndi2 += 1) {
+                                const stride_n: usize = t.norm_strides[ndi2];
+                                const v2: usize = remn2 / stride_n;
+                                norm_coords[ndi2] = v2;
+                                remn2 -= v2 * stride_n;
+                            }
+
+                            ndi2 = 0;
+                            while (ndi2 < t.norm_rank) : (ndi2 += 1) {
+                                coords[t.norm_dims[ndi2]] = norm_coords[ndi2];
+                            }
+
+                            const tile_index: usize = tensor_store.encodeTileIndex(t.out_meta, coords[0..t.out_meta.tile_counts.len]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseMut(out_tile.token);
+                            const x_tile = t.store.acquireTileConstLinear(t.x, tile_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseConst(x_tile.token);
+
+                            const g_index: usize = tensor_store.encodeTileIndex(t.g_meta, norm_coords[0..t.norm_rank]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            const g_tile = t.store.acquireTileConstLinear(t.gamma, g_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseConst(g_tile.token);
+
+                            const b_index: usize = tensor_store.encodeTileIndex(t.b_meta, norm_coords[0..t.norm_rank]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            const b_tile = t.store.acquireTileConstLinear(t.beta, b_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseConst(b_tile.token);
+
+                            var cols2: usize = 1;
+                            ndi2 = 0;
+                            while (ndi2 < t.norm_rank) : (ndi2 += 1) {
+                                const dim: usize = t.norm_dims[ndi2];
+                                const dim_len: usize = tileDim(t.out_meta.shape, t.out_meta.tile_shape, coords[dim], dim) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                cols2 = std.math.mul(usize, cols2, dim_len) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+
+                            const elem_bytes: usize = switch (t.out_meta.dtype) {
+                                .f32 => 4,
+                                .f16 => 2,
+                                else => 0,
+                            };
+                            if (elem_bytes == 0) {
+                                t.fail(BackendError.InvalidArgument);
+                                return;
+                            }
+
+                            var shape_mem: [2]usize = .{ rows, cols2 };
+                            var strides_mem: [2]isize = .{ @intCast(cols2 * elem_bytes), @intCast(elem_bytes) };
+                            var shape_vec: [1]usize = .{cols2};
+                            var strides_vec: [1]isize = .{@intCast(elem_bytes)};
+
+                            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = t.out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                            const x_view: types.BufferViewConst = .{ .bytes = x_tile.bytes, .dtype = t.out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                            const g_view: types.BufferViewConst = .{ .bytes = g_tile.bytes, .dtype = t.out_meta.dtype, .layout = .{ .rank = 1, .shape = shape_vec[0..1], .strides_bytes = strides_vec[0..1] } };
+                            const b_view: types.BufferViewConst = .{ .bytes = b_tile.bytes, .dtype = t.out_meta.dtype, .layout = .{ .rank = 1, .shape = shape_vec[0..1], .strides_bytes = strides_vec[0..1] } };
+                            layernorm_kernels.applyNorm(t.mode, mean[0..rows], inv[0..rows], out_view, x_view, g_view, b_view);
+                        }
                     }
                 }
             };
 
-            var task: Task = .{ .store = store, .out_meta = out_meta, .mode = mode, .out = out, .x = x, .gamma = gamma, .beta = beta, .eps = eps };
-            p.parallelForAny(@ptrCast(&task), ti0_total, 1, Task.runTi0);
+            var task: Task = .{
+                .store = store,
+                .out_meta = out_meta,
+                .g_meta = g_meta,
+                .b_meta = b_meta,
+                .mode = mode,
+                .out = out,
+                .x = x,
+                .gamma = gamma,
+                .beta = beta,
+                .eps = eps,
+                .norm_rank = norm_rank,
+                .row_dim_count = row_dim_count,
+                .row_dims = row_dims,
+                .row_counts = row_counts,
+                .row_strides = row_strides,
+                .norm_dims = norm_dims,
+                .norm_counts = norm_counts,
+                .norm_strides = norm_strides,
+                .norm_tile_total = norm_tile_total,
+                .inv_denom = inv_denom,
+            };
+            p.parallelForAny(@ptrCast(&task), row_tile_total, 1, Task.runRowTile);
             if (task.err_any) |e| return @errorCast(e);
             return;
         }
     }
 
     // Sequential fallback.
-    var ti0: usize = 0;
-    while (ti0 < ti0_total) : (ti0 += 1) {
-        try normTi0(store, out_meta, mode, out, x, gamma, beta, eps, ti0);
+    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var norm_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var row_idx: usize = 0;
+    while (row_idx < row_tile_total) : (row_idx += 1) {
+        var rem: usize = row_idx;
+        var rdi: usize = 0;
+        while (rdi < row_dim_count) : (rdi += 1) {
+            const stride0: usize = row_strides[rdi];
+            const v: usize = rem / stride0;
+            coords[row_dims[rdi]] = v;
+            rem -= v * stride0;
+        }
+
+        var rows: usize = 1;
+        rdi = 0;
+        while (rdi < row_dim_count) : (rdi += 1) {
+            const dim: usize = row_dims[rdi];
+            const dim_len: usize = try tileDim(out_meta.shape, out_meta.tile_shape, coords[dim], dim);
+            rows = std.math.mul(usize, rows, dim_len) catch return BackendError.InvalidArgument;
+        }
+        if (rows == 0 or rows > 256) return BackendError.InvalidArgument;
+
+        var sum: [256]f32 = undefined;
+        var sumsq: [256]f32 = undefined;
+        @memset(sum[0..rows], 0.0);
+        @memset(sumsq[0..rows], 0.0);
+
+        var nt: usize = 0;
+        while (nt < norm_tile_total) : (nt += 1) {
+            var remn: usize = nt;
+            var ndi: usize = 0;
+            while (ndi < norm_rank) : (ndi += 1) {
+                const stride_n: usize = norm_strides[ndi];
+                const v: usize = remn / stride_n;
+                norm_coords[ndi] = v;
+                remn -= v * stride_n;
+            }
+
+            ndi = 0;
+            while (ndi < norm_rank) : (ndi += 1) {
+                coords[norm_dims[ndi]] = norm_coords[ndi];
+            }
+
+            const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords[0..out_meta.tile_counts.len]);
+            const x_tile = try store.acquireTileConstLinear(x, tile_index);
+            defer store.releaseConst(x_tile.token);
+
+            var cols: usize = 1;
+            ndi = 0;
+            while (ndi < norm_rank) : (ndi += 1) {
+                const dim: usize = norm_dims[ndi];
+                const dim_len: usize = try tileDim(out_meta.shape, out_meta.tile_shape, coords[dim], dim);
+                cols = std.math.mul(usize, cols, dim_len) catch return BackendError.InvalidArgument;
+            }
+
+            const elem_bytes: usize = switch (out_meta.dtype) {
+                .f32 => 4,
+                .f16 => 2,
+                else => return BackendError.InvalidArgument,
+            };
+            var shape_mem: [2]usize = .{ rows, cols };
+            var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
+            const x_view: types.BufferViewConst = .{ .bytes = x_tile.bytes, .dtype = out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+            layernorm_kernels.accumulateStats(sum[0..rows], sumsq[0..rows], x_view);
+        }
+
+        var mean: [256]f32 = undefined;
+        var inv: [256]f32 = undefined;
+        var r0: usize = 0;
+        while (r0 < rows) : (r0 += 1) {
+            const mu: f32 = sum[r0] * inv_denom;
+            mean[r0] = mu;
+            const msq: f32 = sumsq[r0] * inv_denom;
+            const v: f32 = if (mode == .layernorm) @max(@as(f32, 0.0), msq - (mu * mu)) else msq;
+            const d0: f32 = v + eps;
+            if (!(d0 > 0.0) or !std.math.isFinite(d0)) return BackendError.InvalidArgument;
+            inv[r0] = 1.0 / std.math.sqrt(d0);
+        }
+
+        nt = 0;
+        while (nt < norm_tile_total) : (nt += 1) {
+            var remn2: usize = nt;
+            var ndi2: usize = 0;
+            while (ndi2 < norm_rank) : (ndi2 += 1) {
+                const stride_n: usize = norm_strides[ndi2];
+                const v2: usize = remn2 / stride_n;
+                norm_coords[ndi2] = v2;
+                remn2 -= v2 * stride_n;
+            }
+
+            ndi2 = 0;
+            while (ndi2 < norm_rank) : (ndi2 += 1) {
+                coords[norm_dims[ndi2]] = norm_coords[ndi2];
+            }
+
+            const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords[0..out_meta.tile_counts.len]);
+            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            defer store.releaseMut(out_tile.token);
+            const x_tile = try store.acquireTileConstLinear(x, tile_index);
+            defer store.releaseConst(x_tile.token);
+
+            const g_index: usize = try tensor_store.encodeTileIndex(g_meta, norm_coords[0..norm_rank]);
+            const b_index: usize = try tensor_store.encodeTileIndex(b_meta, norm_coords[0..norm_rank]);
+            const g_tile = try store.acquireTileConstLinear(gamma, g_index);
+            defer store.releaseConst(g_tile.token);
+            const b_tile = try store.acquireTileConstLinear(beta, b_index);
+            defer store.releaseConst(b_tile.token);
+
+            var cols2: usize = 1;
+            ndi2 = 0;
+            while (ndi2 < norm_rank) : (ndi2 += 1) {
+                const dim: usize = norm_dims[ndi2];
+                const dim_len: usize = try tileDim(out_meta.shape, out_meta.tile_shape, coords[dim], dim);
+                cols2 = std.math.mul(usize, cols2, dim_len) catch return BackendError.InvalidArgument;
+            }
+
+            const elem_bytes: usize = switch (out_meta.dtype) {
+                .f32 => 4,
+                .f16 => 2,
+                else => return BackendError.InvalidArgument,
+            };
+
+            var shape_mem: [2]usize = .{ rows, cols2 };
+            var strides_mem: [2]isize = .{ @intCast(cols2 * elem_bytes), @intCast(elem_bytes) };
+            var shape_vec: [1]usize = .{cols2};
+            var strides_vec: [1]isize = .{@intCast(elem_bytes)};
+
+            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+            const x_view: types.BufferViewConst = .{ .bytes = x_tile.bytes, .dtype = out_meta.dtype, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+            const g_view: types.BufferViewConst = .{ .bytes = g_tile.bytes, .dtype = out_meta.dtype, .layout = .{ .rank = 1, .shape = shape_vec[0..1], .strides_bytes = strides_vec[0..1] } };
+            const b_view: types.BufferViewConst = .{ .bytes = b_tile.bytes, .dtype = out_meta.dtype, .layout = .{ .rank = 1, .shape = shape_vec[0..1], .strides_bytes = strides_vec[0..1] } };
+            layernorm_kernels.applyNorm(mode, mean[0..rows], inv[0..rows], out_view, x_view, g_view, b_view);
+        }
     }
 }
 

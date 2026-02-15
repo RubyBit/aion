@@ -86,6 +86,36 @@ pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, d
     return .{ .tm = tm, .tn = tn, .tk = tk, .tv = tv };
 }
 
+pub fn chooseConv1DTiles(policy: TilePolicy, l: usize, c_out: usize) struct { tl: usize, tc: usize } {
+    // Conv1D is typically memory-friendly along the length axis (NLC) and many hot
+    // cases (e.g. pointwise) benefit from larger M to amortize matmul overhead.
+    // Allow Conv1D to use a larger length tile than the generic base_1d.
+    const tl_cap: usize = std.math.mul(usize, policy.base_1d, 2) catch policy.base_1d;
+    const tl: usize = @max(@as(usize, 1), @min(l, tl_cap));
+
+    var tc_target: usize = @max(@as(usize, 1), @min(c_out, policy.base_square_2d));
+    if (tc_target >= 16) {
+        tc_target = roundDownToMultiple(tc_target, 16);
+        if (tc_target == 0) tc_target = @min(@as(usize, 16), c_out);
+    }
+    const tc: usize = @max(@as(usize, 1), @min(c_out, tc_target));
+    return .{ .tl = tl, .tc = tc };
+}
+
+pub fn chooseConv2DTiles(policy: TilePolicy, h: usize, w: usize, c_out: usize) struct { th: usize, tw: usize, tc: usize } {
+    const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(h, w)));
+    const th: usize = @max(@as(usize, 1), @min(h, side));
+    const tw: usize = @max(@as(usize, 1), @min(w, side));
+
+    var tc_target: usize = @max(@as(usize, 1), @min(c_out, policy.base_square_2d));
+    if (tc_target >= 16) {
+        tc_target = roundDownToMultiple(tc_target, 16);
+        if (tc_target == 0) tc_target = @min(@as(usize, 16), c_out);
+    }
+    const tc: usize = @max(@as(usize, 1), @min(c_out, tc_target));
+    return .{ .th = th, .tw = tw, .tc = tc };
+}
+
 pub fn roundDownToMultiple(x: usize, m: usize) usize {
     if (m == 0) return x;
     return x - (x % m);

@@ -73,6 +73,16 @@ fn elemCount(shape: []const usize) CompileError!usize {
     return backend_utils.elemCount(shape) catch return CompileError.InvalidArgument;
 }
 
+fn convOutDim(in_len: usize, kernel: usize, stride: usize, dilation: usize, pad_before: usize, pad_after: usize) CompileError!usize {
+    if (kernel == 0 or stride == 0 or dilation == 0) return CompileError.InvalidArgument;
+    const eff_kernel_sub1: usize = std.math.mul(usize, dilation, kernel - 1) catch return CompileError.InvalidArgument;
+    const eff_kernel: usize = std.math.add(usize, eff_kernel_sub1, 1) catch return CompileError.InvalidArgument;
+    const padded: usize = std.math.add(usize, std.math.add(usize, in_len, pad_before) catch return CompileError.InvalidArgument, pad_after) catch return CompileError.InvalidArgument;
+    if (padded < eff_kernel) return CompileError.InvalidArgument;
+    const numer: usize = padded - eff_kernel;
+    return (numer / stride) + 1;
+}
+
 fn isScalarSupported(dtype: types.DType) bool {
     return switch (dtype) {
         .f32, .f16 => true,
@@ -238,6 +248,94 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                     row_elems = std.math.mul(usize, row_elems, out.tile_shape[d]) catch return CompileError.InvalidArgument;
                 }
                 try compileRequire(row_elems <= 256);
+            }
+        },
+
+        .Conv1DTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const w: *const TiledTensor = mgr.getConst(s.w) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.dtype == .f32 and x.dtype == .f32 and w.dtype == .f32);
+            try compileRequire(out.rank == x.rank and out.rank >= 2);
+            try compileRequire(w.rank == 3);
+            try compileRequire(s.groups > 0);
+            try compileRequire(s.stride > 0 and s.dilation > 0);
+
+            const rank: usize = @as(usize, out.rank);
+            const l_in: usize = x.shape[rank - 2];
+            const c_in: usize = x.shape[rank - 1];
+            const k: usize = w.shape[0];
+            const c_in_g: usize = w.shape[1];
+            const c_out: usize = w.shape[2];
+
+            try compileRequire(c_in % s.groups == 0);
+            try compileRequire(c_out % s.groups == 0);
+            try compileRequire(c_in_g * s.groups == c_in);
+
+            const l_out: usize = try convOutDim(l_in, k, s.stride, s.dilation, s.pad_left, s.pad_right);
+            try compileRequire(out.shape[rank - 2] == l_out);
+            try compileRequire(out.shape[rank - 1] == c_out);
+
+            var d: usize = 0;
+            while (d + 2 < rank) : (d += 1) {
+                try compileRequire(out.shape[d] == x.shape[d]);
+                try compileRequire(out.tile_shape[d] == x.tile_shape[d]);
+                try compileRequire(out.tile_counts[d] == x.tile_counts[d]);
+            }
+            try compileRequire(out.tile_shape[rank - 2] == x.tile_shape[rank - 2]);
+
+            if (s.bias) |bias_id| {
+                const b: *const TiledTensor = mgr.getConst(bias_id) catch return CompileError.InvalidArgument;
+                try compileRequire(b.dtype == .f32);
+                try compileRequire(b.rank == 1 and b.shape[0] == c_out);
+            }
+        },
+
+        .Conv2DTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const w: *const TiledTensor = mgr.getConst(s.w) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.dtype == .f32 and x.dtype == .f32 and w.dtype == .f32);
+            try compileRequire(out.rank == x.rank and out.rank >= 3);
+            try compileRequire(w.rank == 4);
+            try compileRequire(s.groups > 0);
+            try compileRequire(s.stride_h > 0 and s.stride_w > 0 and s.dilation_h > 0 and s.dilation_w > 0);
+
+            const rank: usize = @as(usize, out.rank);
+            const h_in: usize = x.shape[rank - 3];
+            const w_in: usize = x.shape[rank - 2];
+            const c_in: usize = x.shape[rank - 1];
+
+            const k_h: usize = w.shape[0];
+            const k_w: usize = w.shape[1];
+            const c_in_g: usize = w.shape[2];
+            const c_out: usize = w.shape[3];
+
+            try compileRequire(c_in % s.groups == 0);
+            try compileRequire(c_out % s.groups == 0);
+            try compileRequire(c_in_g * s.groups == c_in);
+
+            const h_out: usize = try convOutDim(h_in, k_h, s.stride_h, s.dilation_h, s.pad_top, s.pad_bottom);
+            const w_out: usize = try convOutDim(w_in, k_w, s.stride_w, s.dilation_w, s.pad_left, s.pad_right);
+            try compileRequire(out.shape[rank - 3] == h_out);
+            try compileRequire(out.shape[rank - 2] == w_out);
+            try compileRequire(out.shape[rank - 1] == c_out);
+
+            var d: usize = 0;
+            while (d + 3 < rank) : (d += 1) {
+                try compileRequire(out.shape[d] == x.shape[d]);
+                try compileRequire(out.tile_shape[d] == x.tile_shape[d]);
+                try compileRequire(out.tile_counts[d] == x.tile_counts[d]);
+            }
+            try compileRequire(out.tile_shape[rank - 3] == x.tile_shape[rank - 3]);
+            try compileRequire(out.tile_shape[rank - 2] == x.tile_shape[rank - 2]);
+
+            if (s.bias) |bias_id| {
+                const b: *const TiledTensor = mgr.getConst(bias_id) catch return CompileError.InvalidArgument;
+                try compileRequire(b.dtype == .f32);
+                try compileRequire(b.rank == 1 and b.shape[0] == c_out);
             }
         },
 
@@ -752,6 +850,112 @@ pub fn compileGraph(
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
                 try appendStepChecked(allocator, mgr, &steps, .{ .SoftmaxTiled = .{ .out = out_tid, .a = a_tid, .axis = sm.axis } });
+            },
+
+            .Conv1D => |cv| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const w_id: usize = @intCast(node.inputs[1]);
+
+                const x_v = graph.values.items[x_id];
+                const rank: usize = out_shape.len;
+                if (rank < 2) return CompileError.InvalidArgument;
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..rank];
+                @memset(out_tile, 1);
+
+                // Keep leading + length tiling aligned with X when available.
+                if (ctx.value_has_tensor[x_id]) {
+                    const x_tid_existing: TensorId = ctx.value_tensor[x_id];
+                    const x_t_existing: *const TiledTensor = try mgr.getConst(x_tid_existing);
+                    var d: usize = 0;
+                    while (d < rank - 1) : (d += 1) {
+                        out_tile[d] = x_t_existing.tile_shape[d];
+                    }
+                } else {
+                    const ct = plan_mod.chooseConv1DTiles(policy, out_shape[rank - 2], out_shape[rank - 1]);
+                    if (rank > 2) @memset(out_tile[0 .. rank - 2], 1);
+                    out_tile[rank - 2] = ct.tl;
+                }
+                const ct = plan_mod.chooseConv1DTiles(policy, out_shape[rank - 2], out_shape[rank - 1]);
+                out_tile[rank - 1] = ct.tc;
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+                const x_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
+                const w_tid: TensorId = try ensureAnyTensor(&ctx, w_id);
+
+                var bias_tid: ?TensorId = null;
+                if (node.inputs.len == 3) {
+                    const b_id: usize = @intCast(node.inputs[2]);
+                    _ = x_v;
+                    bias_tid = try ensureAnyTensor(&ctx, b_id);
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .Conv1DTiled = .{
+                    .out = out_tid,
+                    .x = x_tid,
+                    .w = w_tid,
+                    .bias = bias_tid,
+                    .stride = cv.stride,
+                    .dilation = cv.dilation,
+                    .pad_left = cv.pad_left,
+                    .pad_right = cv.pad_right,
+                    .groups = cv.groups,
+                } });
+            },
+
+            .Conv2D => |cv| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const w_id: usize = @intCast(node.inputs[1]);
+                const rank: usize = out_shape.len;
+                if (rank < 3) return CompileError.InvalidArgument;
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..rank];
+                @memset(out_tile, 1);
+
+                // Keep leading + spatial tiling aligned with X when available.
+                if (ctx.value_has_tensor[x_id]) {
+                    const x_tid_existing: TensorId = ctx.value_tensor[x_id];
+                    const x_t_existing: *const TiledTensor = try mgr.getConst(x_tid_existing);
+                    var d: usize = 0;
+                    while (d < rank - 1) : (d += 1) {
+                        out_tile[d] = x_t_existing.tile_shape[d];
+                    }
+                } else {
+                    const ct = plan_mod.chooseConv2DTiles(policy, out_shape[rank - 3], out_shape[rank - 2], out_shape[rank - 1]);
+                    if (rank > 3) @memset(out_tile[0 .. rank - 3], 1);
+                    out_tile[rank - 3] = ct.th;
+                    out_tile[rank - 2] = ct.tw;
+                }
+                const ct = plan_mod.chooseConv2DTiles(policy, out_shape[rank - 3], out_shape[rank - 2], out_shape[rank - 1]);
+                out_tile[rank - 1] = ct.tc;
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+                const x_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
+                const w_tid: TensorId = try ensureAnyTensor(&ctx, w_id);
+
+                var bias_tid: ?TensorId = null;
+                if (node.inputs.len == 3) {
+                    const b_id: usize = @intCast(node.inputs[2]);
+                    bias_tid = try ensureAnyTensor(&ctx, b_id);
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .Conv2DTiled = .{
+                    .out = out_tid,
+                    .x = x_tid,
+                    .w = w_tid,
+                    .bias = bias_tid,
+                    .stride_h = cv.stride_h,
+                    .stride_w = cv.stride_w,
+                    .dilation_h = cv.dilation_h,
+                    .dilation_w = cv.dilation_w,
+                    .pad_top = cv.pad_top,
+                    .pad_bottom = cv.pad_bottom,
+                    .pad_left = cv.pad_left,
+                    .pad_right = cv.pad_right,
+                    .groups = cv.groups,
+                } });
             },
 
             .LayerNorm => |ln| {

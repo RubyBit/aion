@@ -107,6 +107,9 @@ pub const MatMulParams = struct {
     n: usize,
     k: usize,
 
+    /// Leading dimension (row stride) of C. If 0, defaults to n.
+    ldc: usize = 0,
+
     alpha: f32 = 1.0,
     beta: f32 = 0.0,
 };

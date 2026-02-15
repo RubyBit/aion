@@ -37,6 +37,40 @@ pub const Op = union(enum) {
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
 
+    /// 1D convolution (NLC-style channel-last).
+    ///
+    /// Shapes:
+    /// - x: [..., l_in, c_in]
+    /// - w: [k, c_in/groups, c_out]
+    /// - bias (optional): [c_out]
+    /// - out: [..., l_out, c_out]
+    Conv1D: struct {
+        stride: usize = 1,
+        dilation: usize = 1,
+        pad_left: usize = 0,
+        pad_right: usize = 0,
+        groups: usize = 1,
+    },
+
+    /// 2D convolution (NHWC-style channel-last).
+    ///
+    /// Shapes:
+    /// - x: [..., h_in, w_in, c_in]
+    /// - w: [k_h, k_w, c_in/groups, c_out]
+    /// - bias (optional): [c_out]
+    /// - out: [..., h_out, w_out, c_out]
+    Conv2D: struct {
+        stride_h: usize = 1,
+        stride_w: usize = 1,
+        dilation_h: usize = 1,
+        dilation_w: usize = 1,
+        pad_top: usize = 0,
+        pad_bottom: usize = 0,
+        pad_left: usize = 0,
+        pad_right: usize = 0,
+        groups: usize = 1,
+    },
+
     /// Normalize over the last dimensions (rank>=1; normalized_shape is required).
     /// out = ((x - mean) / sqrt(var + eps)) * gamma + beta
     LayerNorm: struct { eps: f32, normalized_shape: []const usize },
@@ -173,6 +207,62 @@ pub const Graph = struct {
     /// - axis == -1 => last dimension
     pub fn addSoftmax(self: *Self, a: ValueId, axis: i32) GraphError!ValueId {
         return self.addNodeInternal(.{ .Softmax = .{ .axis = axis } }, &[_]ValueId{a});
+    }
+
+    pub fn addConv1D(
+        self: *Self,
+        x: ValueId,
+        w: ValueId,
+        bias: ?ValueId,
+        stride: usize,
+        dilation: usize,
+        pad_left: usize,
+        pad_right: usize,
+        groups: usize,
+    ) GraphError!ValueId {
+        const op: Op = .{ .Conv1D = .{
+            .stride = stride,
+            .dilation = dilation,
+            .pad_left = pad_left,
+            .pad_right = pad_right,
+            .groups = groups,
+        } };
+        if (bias) |b| {
+            return self.addNodeInternal(op, &[_]ValueId{ x, w, b });
+        }
+        return self.addNodeInternal(op, &[_]ValueId{ x, w });
+    }
+
+    pub fn addConv2D(
+        self: *Self,
+        x: ValueId,
+        w: ValueId,
+        bias: ?ValueId,
+        stride_h: usize,
+        stride_w: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        pad_top: usize,
+        pad_bottom: usize,
+        pad_left: usize,
+        pad_right: usize,
+        groups: usize,
+    ) GraphError!ValueId {
+        const op: Op = .{ .Conv2D = .{
+            .stride_h = stride_h,
+            .stride_w = stride_w,
+            .dilation_h = dilation_h,
+            .dilation_w = dilation_w,
+            .pad_top = pad_top,
+            .pad_bottom = pad_bottom,
+            .pad_left = pad_left,
+            .pad_right = pad_right,
+            .groups = groups,
+        } };
+        if (bias) |b| {
+            return self.addNodeInternal(op, &[_]ValueId{ x, w, b });
+        }
+        return self.addNodeInternal(op, &[_]ValueId{ x, w });
     }
 
     pub fn addLayerNorm(self: *Self, x: ValueId, gamma: ValueId, beta: ValueId, eps: f32, normalized_shape: []const usize) GraphError!ValueId {

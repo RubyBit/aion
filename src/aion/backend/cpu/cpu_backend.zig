@@ -10,6 +10,7 @@ const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
 const exec_matmul = @import("exec/matmul.zig");
 const exec_softmax = @import("exec/softmax.zig");
+const exec_conv = @import("exec/conv.zig");
 const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
@@ -207,6 +208,30 @@ pub const CpuBackend = struct {
                 .SoftmaxTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_softmax.execSoftmaxTiled(pool_ptr, self.thread_count, self.softmax_scratch_f32, s, store);
+                },
+
+                .Conv1DTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    var conv_ctx: exec_conv.ConvExecCtx = .{
+                        .allocator = self.allocator,
+                        .pool = pool_ptr,
+                        .thread_count = self.thread_count,
+                        .matmul_f32 = self.matmul_f32,
+                        .matmul_scratch = self.matmul_scratch_f32,
+                    };
+                    try exec_conv.execConv1DTiled(&conv_ctx, s, store);
+                },
+
+                .Conv2DTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    var conv_ctx: exec_conv.ConvExecCtx = .{
+                        .allocator = self.allocator,
+                        .pool = pool_ptr,
+                        .thread_count = self.thread_count,
+                        .matmul_f32 = self.matmul_f32,
+                        .matmul_scratch = self.matmul_scratch_f32,
+                    };
+                    try exec_conv.execConv2DTiled(&conv_ctx, s, store);
                 },
 
                 .LayerNormTiled => |s| {

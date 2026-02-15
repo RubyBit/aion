@@ -196,7 +196,7 @@ pub fn retileCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.Te
 
 const MAX_RANK: usize = 8;
 
-fn computePackedStrides(shape: []const usize, out: []usize) ExecuteProgramError!void {
+pub fn computePackedStrides(shape: []const usize, out: []usize) ExecuteProgramError!void {
     if (out.len != shape.len) return BackendError.InvalidArgument;
     if (shape.len == 0) return BackendError.InvalidArgument;
 
@@ -209,7 +209,7 @@ fn computePackedStrides(shape: []const usize, out: []usize) ExecuteProgramError!
     }
 }
 
-fn decodeLinearToCoords(linear: usize, strides: []const usize, shape: []const usize, out: []usize) ExecuteProgramError!void {
+pub fn decodeLinearToCoords(linear: usize, strides: []const usize, shape: []const usize, out: []usize) ExecuteProgramError!void {
     if (out.len != shape.len or strides.len != shape.len) return BackendError.InvalidArgument;
     var rem: usize = linear;
     var d: usize = 0;
@@ -324,7 +324,7 @@ fn retileCopyScalarND(
     }
 }
 
-fn elemCountFromShape(shape: []const usize) ExecuteProgramError!usize {
+pub fn elemCountFromShape(shape: []const usize) ExecuteProgramError!usize {
     if (shape.len == 0) return BackendError.InvalidArgument;
     var acc: usize = 1;
     for (shape) |d| {

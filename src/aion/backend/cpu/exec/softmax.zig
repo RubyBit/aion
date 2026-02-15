@@ -122,19 +122,6 @@ pub fn execSoftmaxTiled(
     }
 }
 
-fn computePackedStrides(shape: []const usize, out: []usize) ExecuteProgramError!void {
-    if (out.len != shape.len) return BackendError.InvalidArgument;
-    if (shape.len == 0) return BackendError.InvalidArgument;
-
-    var stride: usize = 1;
-    var d: usize = shape.len;
-    while (d > 0) : (d -= 1) {
-        const idx: usize = d - 1;
-        out[idx] = stride;
-        stride = std.math.mul(usize, stride, shape[idx]) catch return BackendError.InvalidArgument;
-    }
-}
-
 fn computeRowOffsets(
     row_offsets: []usize,
     row_coords: []usize,
@@ -280,7 +267,7 @@ fn softmaxAxisStridedND(
                             return;
                         }
 
-                        computePackedStrides(row_sizes[0..t.row_dim_count], row_local_strides[0..t.row_dim_count]) catch |e| {
+                        exec_utils.computePackedStrides(row_sizes[0..t.row_dim_count], row_local_strides[0..t.row_dim_count]) catch |e| {
                             t.fail(e);
                             return;
                         };
@@ -532,7 +519,7 @@ fn softmaxAxisStridedND(
         }
         if (rows == 0 or rows > 256) return BackendError.InvalidArgument;
 
-        try computePackedStrides(row_sizes_seq[0..row_dim_count], row_strides_seq[0..row_dim_count]);
+        try exec_utils.computePackedStrides(row_sizes_seq[0..row_dim_count], row_strides_seq[0..row_dim_count]);
 
         var max_buf: [256]f32 = undefined;
         var sum_buf: [256]f32 = undefined;

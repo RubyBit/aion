@@ -43,6 +43,15 @@ const BenchOptions = struct {
 
     // Print cpu cache detection / tuning selection.
     print_cpuid: bool = false,
+
+    // Conv benchmark sizes.
+    conv_batch: usize = 2,
+    conv_l: usize = 512,
+    conv_h: usize = 64,
+    conv_w: usize = 64,
+    conv_cin: usize = 64,
+    conv_cout: usize = 64,
+    conv_k: usize = 3,
 };
 
 fn printUsage() void {
@@ -61,6 +70,13 @@ fn printUsage() void {
             "  --k N            MatMul K (default: 512)\n" ++
             "  --no-quant       Skip quantized matmul benches\n" ++
             "  --print-cpuid    Print detected CPU caches\n" ++
+            "  --conv-batch N   Conv batch size (default: 2)\n" ++
+            "  --conv-l N       Conv1D input length (default: 512)\n" ++
+            "  --conv-h N       Conv2D input height (default: 64)\n" ++
+            "  --conv-w N       Conv2D input width (default: 64)\n" ++
+            "  --conv-cin N     Conv input channels (default: 64)\n" ++
+            "  --conv-cout N    Conv output channels (default: 64)\n" ++
+            "  --conv-k N       Conv kernel size (default: 3)\n" ++
             "  -h, --help       Show help\n",
         .{},
     );
@@ -118,6 +134,34 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
             opts.k = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-batch")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_batch = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-l")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_l = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-h")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_h = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-w")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_w = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-cin")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_cin = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-cout")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_cout = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--conv-k")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            opts.conv_k = try parseUsize(args[i]);
         } else {
             return error.InvalidArgument;
         }
@@ -129,8 +173,220 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
     if (opts.batch == 0) return error.InvalidArgument;
     if (opts.n_elem == 0) return error.InvalidArgument;
     if (opts.m == 0 or opts.n == 0 or opts.k == 0) return error.InvalidArgument;
+    if (opts.conv_batch == 0) return error.InvalidArgument;
+    if (opts.conv_l == 0 or opts.conv_h == 0 or opts.conv_w == 0) return error.InvalidArgument;
+    if (opts.conv_cin == 0 or opts.conv_cout == 0) return error.InvalidArgument;
+    if (opts.conv_k == 0) return error.InvalidArgument;
 
     return opts;
+}
+
+fn benchProgramConv1D(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    batch: usize,
+    l_in: usize,
+    c_in: usize,
+    c_out: usize,
+    kernel: usize,
+    groups: usize,
+    label: []const u8,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    if (groups == 0) return error.InvalidArgument;
+    if (c_in % groups != 0 or c_out % groups != 0) return error.InvalidArgument;
+
+    const stride: usize = 1;
+    const dilation: usize = 1;
+    const pad_left: usize = kernel / 2;
+    const pad_right: usize = kernel / 2;
+    const c_in_g: usize = c_in / groups;
+
+    const l_out: usize = ((l_in + pad_left + pad_right - ((kernel - 1) * dilation + 1)) / stride) + 1;
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const ct = plan_mod.chooseConv1DTiles(policy, l_out, c_out);
+
+    const x: []f32 = try allocator.alloc(f32, batch * l_in * c_in);
+    defer allocator.free(x);
+    const w: []f32 = try allocator.alloc(f32, kernel * c_in_g * c_out);
+    defer allocator.free(w);
+    const b: []f32 = try allocator.alloc(f32, c_out);
+    defer allocator.free(b);
+    fillRandomF32(rnd, x);
+    fillRandomF32(rnd, w);
+    fillRandomF32(rnd, b);
+
+    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, l_in, c_in }, &[_]usize{ 1, ct.tl, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
+    const w_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ kernel, c_in_g, c_out }, &[_]usize{ kernel, c_in_g, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{ct.tc}, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
+    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w));
+    try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ batch, l_in, c_in });
+    const w_in = try g.addInput(.f32, &[_]usize{ kernel, c_in_g, c_out });
+    const b_in = try g.addInput(.f32, &[_]usize{c_out});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(w_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const y = try g.addConv1D(x_in, w_in, b_in, stride, dilation, pad_left, pad_right, groups);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(l_out)) * @as(u64, @intCast(c_out)) *
+        @as(u64, @intCast(kernel * c_in_g));
+    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const out_bytes_len: usize = batch * l_out * c_out * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+    const idx0: usize = 0;
+    const idx1: usize = (batch / 2) * l_out * c_out + (l_out / 2) * c_out + (c_out / 2);
+    const idx2: usize = (batch - 1) * l_out * c_out + (l_out - 1) * c_out + (c_out - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    std.debug.print("program conv1d {s}:      {d:.2} GFLOP/s (b={} l={} cin={} cout={} k={} g={}, chk={d:.4})\n", .{
+        label,
+        gflops,
+        batch,
+        l_in,
+        c_in,
+        c_out,
+        kernel,
+        groups,
+        chk,
+    });
+}
+
+fn benchProgramConv2D(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    batch: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    kernel: usize,
+    groups: usize,
+    label: []const u8,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    if (groups == 0) return error.InvalidArgument;
+    if (c_in % groups != 0 or c_out % groups != 0) return error.InvalidArgument;
+
+    const stride_h: usize = 1;
+    const stride_w: usize = 1;
+    const dilation_h: usize = 1;
+    const dilation_w: usize = 1;
+    const pad_top: usize = kernel / 2;
+    const pad_bottom: usize = kernel / 2;
+    const pad_left: usize = kernel / 2;
+    const pad_right: usize = kernel / 2;
+
+    const k_h: usize = kernel;
+    const k_w: usize = kernel;
+    const c_in_g: usize = c_in / groups;
+
+    const h_out: usize = ((h_in + pad_top + pad_bottom - ((k_h - 1) * dilation_h + 1)) / stride_h) + 1;
+    const w_out: usize = ((w_in + pad_left + pad_right - ((k_w - 1) * dilation_w + 1)) / stride_w) + 1;
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const ct = plan_mod.chooseConv2DTiles(policy, h_out, w_out, c_out);
+
+    const x: []f32 = try allocator.alloc(f32, batch * h_in * w_in * c_in);
+    defer allocator.free(x);
+    const w: []f32 = try allocator.alloc(f32, k_h * k_w * c_in_g * c_out);
+    defer allocator.free(w);
+    const b: []f32 = try allocator.alloc(f32, c_out);
+    defer allocator.free(b);
+    fillRandomF32(rnd, x);
+    fillRandomF32(rnd, w);
+    fillRandomF32(rnd, b);
+
+    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, h_in, w_in, c_in }, &[_]usize{ 1, ct.th, ct.tw, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
+    const w_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c_out }, &[_]usize{ k_h, k_w, c_in_g, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{ct.tc}, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
+    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w));
+    try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ batch, h_in, w_in, c_in });
+    const w_val = try g.addInput(.f32, &[_]usize{ k_h, k_w, c_in_g, c_out });
+    const b_in = try g.addInput(.f32, &[_]usize{c_out});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_val, @intCast(w_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const y = try g.addConv2D(x_in, w_val, b_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, groups);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(h_out)) * @as(u64, @intCast(w_out)) *
+        @as(u64, @intCast(c_out)) * @as(u64, @intCast(k_h * k_w * c_in_g));
+    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const out_bytes_len: usize = batch * h_out * w_out * c_out * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+    const idx0: usize = 0;
+    const idx1: usize = ((batch / 2) * h_out * w_out * c_out) + ((h_out / 2) * w_out * c_out) + ((w_out / 2) * c_out) + (c_out / 2);
+    const idx2: usize = ((batch - 1) * h_out * w_out * c_out) + ((h_out - 1) * w_out * c_out) + ((w_out - 1) * c_out) + (c_out - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    std.debug.print("program conv2d {s}:      {d:.2} GFLOP/s (b={} h={} w={} cin={} cout={} k={} g={}, chk={d:.4})\n", .{
+        label,
+        gflops,
+        batch,
+        h_in,
+        w_in,
+        c_in,
+        c_out,
+        kernel,
+        groups,
+        chk,
+    });
 }
 
 fn readF32AtTiled(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f32 {
@@ -1023,6 +1279,23 @@ fn mainImpl() !void {
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
+    // Convolution program benches (NHWC/NLC, grouped by `groups`).
+    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, "regular", be);
+    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, 1, 1, "pointwise", be);
+    if (opts.conv_cout == opts.conv_cin) {
+        try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, "depthwise", be);
+    } else {
+        std.debug.print("(skipping conv1d depthwise: conv-cout={} must equal conv-cin={})\n", .{ opts.conv_cout, opts.conv_cin });
+    }
+
+    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, "regular", be);
+    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, 1, 1, "pointwise", be);
+    if (opts.conv_cout == opts.conv_cin) {
+        try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, "depthwise", be);
+    } else {
+        std.debug.print("(skipping conv2d depthwise: conv-cout={} must equal conv-cin={})\n", .{ opts.conv_cout, opts.conv_cin });
+    }
+
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     try benchProgramMatmulBatchedF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);

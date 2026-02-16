@@ -36,6 +36,10 @@ pub const VariantId = enum { small, medium, large };
 /// heuristic assumes larger variants also have larger packed-B footprints.
 pub const f32_kc512_nc128: F32Kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 512, .mc = 144, .nc = 128 });
 
+/// Special-purpose variant for conv-like workloads where N is small (e.g. cout<=128)
+/// and the default matmul uses KC=256.
+pub const f32_kc256_nc128: F32Kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 256, .mc = 144, .nc = 128 });
+
 pub const Candidate = struct {
     id: VariantId,
     kernels: F32Kernels,
@@ -61,6 +65,74 @@ pub const candidates = [_]Candidate{
     // packed-B footprint reasonable (KC*NC*4 = 1MiB).
     .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 512, .mc = 288, .nc = 512 }) },
 };
+
+pub fn maxScratchBytes() usize {
+    var best: usize = 0;
+    inline for (candidates) |c| {
+        best = @max(best, c.kernels.scratch_bytes);
+    }
+    // Include non-default/special-purpose variants.
+    best = @max(best, f32_kc512_nc128.scratch_bytes);
+    best = @max(best, f32_kc256_nc128.scratch_bytes);
+    return best;
+}
+
+pub fn selectForTile(k: usize, n: usize) ?F32Kernels {
+    // Choose the smallest kernel variant that can cover the requested tile.
+    // Smaller KC/NC reduces packed-B footprint and scratch bandwidth.
+    var best: ?F32Kernels = null;
+
+    inline for (candidates) |c| {
+        if (k <= c.kernels.tuning.kc and n <= c.kernels.tuning.nc) {
+            if (best == null) {
+                best = c.kernels;
+            } else {
+                const cur: F32Kernels = best.?;
+                const cur_area: usize = cur.tuning.kc * cur.tuning.nc;
+                const cand_area: usize = c.kernels.tuning.kc * c.kernels.tuning.nc;
+                if (cand_area < cur_area) best = c.kernels;
+            }
+        }
+    }
+
+    // Consider special-purpose narrow-N variants too.
+    if (k <= f32_kc512_nc128.tuning.kc and n <= f32_kc512_nc128.tuning.nc) {
+        if (best == null) {
+            best = f32_kc512_nc128;
+        } else {
+            const cur: F32Kernels = best.?;
+            const cur_area: usize = cur.tuning.kc * cur.tuning.nc;
+            const cand_area: usize = f32_kc512_nc128.tuning.kc * f32_kc512_nc128.tuning.nc;
+            if (cand_area < cur_area) best = f32_kc512_nc128;
+        }
+    }
+    if (k <= f32_kc256_nc128.tuning.kc and n <= f32_kc256_nc128.tuning.nc) {
+        if (best == null) {
+            best = f32_kc256_nc128;
+        } else {
+            const cur: F32Kernels = best.?;
+            const cur_area: usize = cur.tuning.kc * cur.tuning.nc;
+            const cand_area: usize = f32_kc256_nc128.tuning.kc * f32_kc256_nc128.tuning.nc;
+            if (cand_area < cur_area) best = f32_kc256_nc128;
+        }
+    }
+
+    return best;
+}
+
+pub fn selectForConvOcTile(default_kernels: F32Kernels, oc_count: usize) F32Kernels {
+    // Conv implicit-GEMM packs weights by OC tiles (N dimension). For small N,
+    // reducing NC can shrink packed-B panels and scratch footprint significantly.
+    if (oc_count == 0) return default_kernels;
+
+    if (default_kernels.tuning.kc == 512 and default_kernels.tuning.nc > 128 and oc_count <= 128) {
+        return f32_kc512_nc128;
+    }
+    if (default_kernels.tuning.kc == 256 and default_kernels.tuning.nc > 128 and oc_count <= 128) {
+        return f32_kc256_nc128;
+    }
+    return default_kernels;
+}
 
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // Heuristic goal: pick the largest variant that still keeps the packed-B tile

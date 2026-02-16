@@ -2,6 +2,8 @@ const std = @import("std");
 const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
+const conv1d_registry = @import("../registry/conv1d_registry.zig");
+const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const exec_utils = @import("utils.zig");
@@ -21,6 +23,11 @@ pub const ConvExecCtx = struct {
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
     matmul_f32: matmul_registry.F32Kernels,
+
+    // Depthwise direct conv kernels (selected by CPU registry).
+    depthwise_conv1d: conv1d_registry.Kernels,
+    depthwise_conv2d: conv2d_registry.Kernels,
+
     // Per-thread scratch for matmul packing. May be empty in single-thread mode.
     matmul_scratch: [][]align(32) u8,
 };
@@ -107,7 +114,8 @@ pub fn getOrCreatePackedWeights(
 pub fn scratchForTid(ctx: *const ConvExecCtx, tid: usize) ExecuteProgramError![]align(32) u8 {
     if (ctx.matmul_scratch.len != 0 and tid < ctx.matmul_scratch.len) return ctx.matmul_scratch[tid];
     if (ctx.matmul_scratch.len != 0) return ctx.matmul_scratch[0];
-    return ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), ctx.matmul_f32.scratch_bytes) catch return BackendError.ExecutionFailed;
+    const scratch_need: usize = matmul_registry.maxScratchBytes();
+    return ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
 }
 
 pub fn fillWeightBlock(

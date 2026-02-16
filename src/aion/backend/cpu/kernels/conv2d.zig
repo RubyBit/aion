@@ -38,6 +38,30 @@ inline fn outHWIndex(b: usize, ohti: usize, owti: usize, out_htc: usize, out_wtc
     return (b * out_htc + ohti) * out_wtc + owti;
 }
 
+/// Depthwise Conv2D kernel tuning knobs (compile-time).
+pub const DepthwiseConv2DTuning = struct {
+    /// If true, unroll the 3x3 inner loops in the fast stride=1,dilation=1 path.
+    ///
+    /// This is only used when `t.fast_stride1_dil1` and `t.k_h == 3` and `t.k_w == 3`.
+    unroll_3x3: bool = false,
+    lanes: usize = simd.lanesF32(),
+};
+
+/// Generates a depthwise Conv2D kernel implementation specialized by `tuning`.
+pub fn Kernel(comptime tuning: DepthwiseConv2DTuning) type {
+    return struct {
+        pub fn runItemRange(t: *const DepthwiseConv2DTask, start: usize, end: usize) void {
+            DepthwiseConv2DTask.runItemRangeImpl(tuning, t, start, end);
+        }
+
+        pub fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+            _ = tid;
+            const t: *const DepthwiseConv2DTask = @ptrCast(@alignCast(ctx_any));
+            runItemRange(t, start, end);
+        }
+    };
+}
+
 /// Inner depthwise Conv2D kernel.
 ///
 /// Setup-free: assumes the caller has already validated shapes/tiling and has
@@ -93,11 +117,11 @@ pub const DepthwiseConv2DTask = struct {
     // Fast-path enable.
     fast_stride1_dil1: bool,
 
-    const lanes: usize = simd.lanesF32();
-    const Vec = @Vector(lanes, f32);
-
-    pub fn runItemRange(t: *const @This(), start: usize, end: usize) void {
+    fn runItemRangeImpl(comptime tuning: DepthwiseConv2DTuning, t: *const @This(), start: usize, end: usize) void {
         @setRuntimeSafety(false);
+
+        const lanes: usize = tuning.lanes;
+        const Vec = @Vector(lanes, f32);
 
         const bias_present_local: bool = (t.bias_slices.len != 0);
 
@@ -159,20 +183,79 @@ pub const DepthwiseConv2DTask = struct {
                                 const ih0u: usize = @intCast(ih0);
                                 const iw0u: usize = @intCast(iw0);
 
-                                var kh: usize = 0;
-                                while (kh < t.k_h) : (kh += 1) {
-                                    const ih: usize = ih0u + kh;
-                                    const x_row_base: usize = ih * xt.row_stride;
-                                    const w_row_base: usize = kh * wt.kh_stride;
+                                if (tuning.unroll_3x3 and t.k_h == 3 and t.k_w == 3) {
+                                    const x_row0: usize = (ih0u + 0) * xt.row_stride;
+                                    const x_row1: usize = (ih0u + 1) * xt.row_stride;
+                                    const x_row2: usize = (ih0u + 2) * xt.row_stride;
+                                    const w_row0: usize = 0 * wt.kh_stride;
+                                    const w_row1: usize = 1 * wt.kh_stride;
+                                    const w_row2: usize = 2 * wt.kh_stride;
 
-                                    var kw: usize = 0;
-                                    while (kw < t.k_w) : (kw += 1) {
-                                        const iw: usize = iw0u + kw;
-                                        const xp: [*]align(1) const f32 = xt.vals.ptr + (x_row_base + iw * xt.c_mem + c);
-                                        const wp: [*]align(1) const f32 = wt.vals.ptr + (w_row_base + kw * wt.c_mem + c);
-                                        const xv: Vec = @as(*align(1) const Vec, @ptrCast(xp)).*;
-                                        const wv: Vec = @as(*align(1) const Vec, @ptrCast(wp)).*;
-                                        acc += xv * wv;
+                                    const xp00: [*]align(1) const f32 = xt.vals.ptr + (x_row0 + (iw0u + 0) * xt.c_mem + c);
+                                    const xp01: [*]align(1) const f32 = xt.vals.ptr + (x_row0 + (iw0u + 1) * xt.c_mem + c);
+                                    const xp02: [*]align(1) const f32 = xt.vals.ptr + (x_row0 + (iw0u + 2) * xt.c_mem + c);
+                                    const xp10: [*]align(1) const f32 = xt.vals.ptr + (x_row1 + (iw0u + 0) * xt.c_mem + c);
+                                    const xp11: [*]align(1) const f32 = xt.vals.ptr + (x_row1 + (iw0u + 1) * xt.c_mem + c);
+                                    const xp12: [*]align(1) const f32 = xt.vals.ptr + (x_row1 + (iw0u + 2) * xt.c_mem + c);
+                                    const xp20: [*]align(1) const f32 = xt.vals.ptr + (x_row2 + (iw0u + 0) * xt.c_mem + c);
+                                    const xp21: [*]align(1) const f32 = xt.vals.ptr + (x_row2 + (iw0u + 1) * xt.c_mem + c);
+                                    const xp22: [*]align(1) const f32 = xt.vals.ptr + (x_row2 + (iw0u + 2) * xt.c_mem + c);
+
+                                    const wp00: [*]align(1) const f32 = wt.vals.ptr + (w_row0 + 0 * wt.c_mem + c);
+                                    const wp01: [*]align(1) const f32 = wt.vals.ptr + (w_row0 + 1 * wt.c_mem + c);
+                                    const wp02: [*]align(1) const f32 = wt.vals.ptr + (w_row0 + 2 * wt.c_mem + c);
+                                    const wp10: [*]align(1) const f32 = wt.vals.ptr + (w_row1 + 0 * wt.c_mem + c);
+                                    const wp11: [*]align(1) const f32 = wt.vals.ptr + (w_row1 + 1 * wt.c_mem + c);
+                                    const wp12: [*]align(1) const f32 = wt.vals.ptr + (w_row1 + 2 * wt.c_mem + c);
+                                    const wp20: [*]align(1) const f32 = wt.vals.ptr + (w_row2 + 0 * wt.c_mem + c);
+                                    const wp21: [*]align(1) const f32 = wt.vals.ptr + (w_row2 + 1 * wt.c_mem + c);
+                                    const wp22: [*]align(1) const f32 = wt.vals.ptr + (w_row2 + 2 * wt.c_mem + c);
+
+                                    const xv00: Vec = @as(*align(1) const Vec, @ptrCast(xp00)).*;
+                                    const xv01: Vec = @as(*align(1) const Vec, @ptrCast(xp01)).*;
+                                    const xv02: Vec = @as(*align(1) const Vec, @ptrCast(xp02)).*;
+                                    const xv10: Vec = @as(*align(1) const Vec, @ptrCast(xp10)).*;
+                                    const xv11: Vec = @as(*align(1) const Vec, @ptrCast(xp11)).*;
+                                    const xv12: Vec = @as(*align(1) const Vec, @ptrCast(xp12)).*;
+                                    const xv20: Vec = @as(*align(1) const Vec, @ptrCast(xp20)).*;
+                                    const xv21: Vec = @as(*align(1) const Vec, @ptrCast(xp21)).*;
+                                    const xv22: Vec = @as(*align(1) const Vec, @ptrCast(xp22)).*;
+
+                                    const wv00: Vec = @as(*align(1) const Vec, @ptrCast(wp00)).*;
+                                    const wv01: Vec = @as(*align(1) const Vec, @ptrCast(wp01)).*;
+                                    const wv02: Vec = @as(*align(1) const Vec, @ptrCast(wp02)).*;
+                                    const wv10: Vec = @as(*align(1) const Vec, @ptrCast(wp10)).*;
+                                    const wv11: Vec = @as(*align(1) const Vec, @ptrCast(wp11)).*;
+                                    const wv12: Vec = @as(*align(1) const Vec, @ptrCast(wp12)).*;
+                                    const wv20: Vec = @as(*align(1) const Vec, @ptrCast(wp20)).*;
+                                    const wv21: Vec = @as(*align(1) const Vec, @ptrCast(wp21)).*;
+                                    const wv22: Vec = @as(*align(1) const Vec, @ptrCast(wp22)).*;
+
+                                    acc += xv00 * wv00;
+                                    acc += xv01 * wv01;
+                                    acc += xv02 * wv02;
+                                    acc += xv10 * wv10;
+                                    acc += xv11 * wv11;
+                                    acc += xv12 * wv12;
+                                    acc += xv20 * wv20;
+                                    acc += xv21 * wv21;
+                                    acc += xv22 * wv22;
+                                } else {
+                                    var kh: usize = 0;
+                                    while (kh < t.k_h) : (kh += 1) {
+                                        const ih: usize = ih0u + kh;
+                                        const x_row_base: usize = ih * xt.row_stride;
+                                        const w_row_base: usize = kh * wt.kh_stride;
+
+                                        var kw: usize = 0;
+                                        while (kw < t.k_w) : (kw += 1) {
+                                            const iw: usize = iw0u + kw;
+                                            const xp: [*]align(1) const f32 = xt.vals.ptr + (x_row_base + iw * xt.c_mem + c);
+                                            const wp: [*]align(1) const f32 = wt.vals.ptr + (w_row_base + kw * wt.c_mem + c);
+                                            const xv: Vec = @as(*align(1) const Vec, @ptrCast(xp)).*;
+                                            const wv: Vec = @as(*align(1) const Vec, @ptrCast(wp)).*;
+                                            acc += xv * wv;
+                                        }
                                     }
                                 }
                             } else {
@@ -214,23 +297,50 @@ pub const DepthwiseConv2DTask = struct {
                         while (c < c_mem) : (c += 1) {
                             var accs: f32 = 0.0;
 
-                            var kh: usize = 0;
-                            while (kh < t.k_h) : (kh += 1) {
-                                const ih: isize = ih0 + @as(isize, @intCast(kh));
-                                if (ih < 0 or ih >= @as(isize, @intCast(t.h_in))) continue;
-                                const ih_u: usize = @intCast(ih);
-                                if (ih_u >= xt.h_mem) continue;
-                                const x_row_base: usize = ih_u * xt.row_stride;
-                                const w_row_base: usize = kh * wt.kh_stride;
+                            if (interior and tuning.unroll_3x3 and t.k_h == 3 and t.k_w == 3) {
+                                const ih0u: usize = @intCast(ih0);
+                                const iw0u: usize = @intCast(iw0);
 
-                                var kw: usize = 0;
-                                while (kw < t.k_w) : (kw += 1) {
-                                    const iw: isize = iw0 + @as(isize, @intCast(kw));
-                                    if (iw < 0 or iw >= @as(isize, @intCast(t.w_in))) continue;
-                                    const iw_u: usize = @intCast(iw);
-                                    if (iw_u >= xt.w_mem) continue;
+                                const x00: f32 = xt.vals[((ih0u + 0) * xt.row_stride) + ((iw0u + 0) * xt.c_mem) + c];
+                                const x01: f32 = xt.vals[((ih0u + 0) * xt.row_stride) + ((iw0u + 1) * xt.c_mem) + c];
+                                const x02: f32 = xt.vals[((ih0u + 0) * xt.row_stride) + ((iw0u + 2) * xt.c_mem) + c];
+                                const x10: f32 = xt.vals[((ih0u + 1) * xt.row_stride) + ((iw0u + 0) * xt.c_mem) + c];
+                                const x11: f32 = xt.vals[((ih0u + 1) * xt.row_stride) + ((iw0u + 1) * xt.c_mem) + c];
+                                const x12: f32 = xt.vals[((ih0u + 1) * xt.row_stride) + ((iw0u + 2) * xt.c_mem) + c];
+                                const x20: f32 = xt.vals[((ih0u + 2) * xt.row_stride) + ((iw0u + 0) * xt.c_mem) + c];
+                                const x21: f32 = xt.vals[((ih0u + 2) * xt.row_stride) + ((iw0u + 1) * xt.c_mem) + c];
+                                const x22: f32 = xt.vals[((ih0u + 2) * xt.row_stride) + ((iw0u + 2) * xt.c_mem) + c];
 
-                                    accs += xt.vals[x_row_base + iw_u * xt.c_mem + c] * wt.vals[w_row_base + kw * wt.c_mem + c];
+                                const w00: f32 = wt.vals[(0 * wt.kh_stride) + (0 * wt.c_mem) + c];
+                                const w01: f32 = wt.vals[(0 * wt.kh_stride) + (1 * wt.c_mem) + c];
+                                const w02: f32 = wt.vals[(0 * wt.kh_stride) + (2 * wt.c_mem) + c];
+                                const w10: f32 = wt.vals[(1 * wt.kh_stride) + (0 * wt.c_mem) + c];
+                                const w11: f32 = wt.vals[(1 * wt.kh_stride) + (1 * wt.c_mem) + c];
+                                const w12: f32 = wt.vals[(1 * wt.kh_stride) + (2 * wt.c_mem) + c];
+                                const w20: f32 = wt.vals[(2 * wt.kh_stride) + (0 * wt.c_mem) + c];
+                                const w21: f32 = wt.vals[(2 * wt.kh_stride) + (1 * wt.c_mem) + c];
+                                const w22: f32 = wt.vals[(2 * wt.kh_stride) + (2 * wt.c_mem) + c];
+
+                                accs = x00 * w00 + x01 * w01 + x02 * w02 + x10 * w10 + x11 * w11 + x12 * w12 + x20 * w20 + x21 * w21 + x22 * w22;
+                            } else {
+                                var kh: usize = 0;
+                                while (kh < t.k_h) : (kh += 1) {
+                                    const ih: isize = ih0 + @as(isize, @intCast(kh));
+                                    if (ih < 0 or ih >= @as(isize, @intCast(t.h_in))) continue;
+                                    const ih_u: usize = @intCast(ih);
+                                    if (ih_u >= xt.h_mem) continue;
+                                    const x_row_base: usize = ih_u * xt.row_stride;
+                                    const w_row_base: usize = kh * wt.kh_stride;
+
+                                    var kw: usize = 0;
+                                    while (kw < t.k_w) : (kw += 1) {
+                                        const iw: isize = iw0 + @as(isize, @intCast(kw));
+                                        if (iw < 0 or iw >= @as(isize, @intCast(t.w_in))) continue;
+                                        const iw_u: usize = @intCast(iw);
+                                        if (iw_u >= xt.w_mem) continue;
+
+                                        accs += xt.vals[x_row_base + iw_u * xt.c_mem + c] * wt.vals[w_row_base + kw * wt.c_mem + c];
+                                    }
                                 }
                             }
 
@@ -560,6 +670,10 @@ pub const DepthwiseConv2DTask = struct {
                 }
             }
         }
+    }
+
+    pub fn runItemRange(t: *const @This(), start: usize, end: usize) void {
+        runItemRangeImpl(.{}, t, start, end);
     }
 
     pub fn runItems(ctx_any: *anyopaque, start: usize, end: usize, _: usize) void {

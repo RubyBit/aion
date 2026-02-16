@@ -452,19 +452,23 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         if (m_tile == 1) {
                             try ctx.matvec.matvec_f32(params, c_view.bytes, a_view.bytes, b_view.bytes);
                         } else {
-                            if (k_tile > ctx.matmul_f32.tuning.kc or n_tile > ctx.matmul_f32.tuning.nc) return BackendError.InvalidArgument;
+                            const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
+                                ctx.matmul_f32
+                            else
+                                (matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                             var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                                const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), ctx.matmul_f32.scratch_bytes) catch return BackendError.ExecutionFailed;
+                                const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
+                                const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                                 break :blk tmp;
                             };
                             defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                            try ctx.matmul_f32.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
-                            const pb_f32_len: usize = ctx.matmul_f32.tuning.kc * ctx.matmul_f32.tuning.nc;
+                            try mk.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
+                            const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
                             const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
                             const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
-                            try ctx.matmul_f32.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
+                            try mk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
                         }
                     },
                     .f16 => {
@@ -481,7 +485,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                             (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(ctx.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                             const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                             break :blk tmp;
                         };
@@ -498,7 +502,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                             (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(ctx.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                             const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                             break :blk tmp;
                         };
@@ -650,18 +654,22 @@ fn execMatMulTiledBatched(
                                             return;
                                         };
                                     } else {
-                                        if (k_tile > t.matmul_f32.tuning.kc or n_tile > t.matmul_f32.tuning.nc) {
-                                            t.fail(BackendError.InvalidArgument);
-                                            return;
-                                        }
-                                        t.matmul_f32.pack_b_tile(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
+                                        const mk: matmul_registry.F32Kernels = if (k_tile <= t.matmul_f32.tuning.kc and n_tile <= t.matmul_f32.tuning.nc)
+                                            t.matmul_f32
+                                        else
+                                            (matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                                t.fail(BackendError.InvalidArgument);
+                                                return;
+                                            });
+
+                                        mk.pack_b_tile(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
                                             t.fail(e);
                                             return;
                                         };
-                                        const pb_f32_len: usize = t.matmul_f32.tuning.kc * t.matmul_f32.tuning.nc;
+                                        const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
                                         const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
                                         const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-                                        t.matmul_f32.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
+                                        mk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
                                             t.fail(e);
                                             return;
                                         };
@@ -795,19 +803,23 @@ fn execMatMulTiledBatched(
                     if (m_tile == 1) {
                         try ctx.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes);
                     } else {
-                        if (k_tile > ctx.matmul_f32.tuning.kc or n_tile > ctx.matmul_f32.tuning.nc) return BackendError.InvalidArgument;
+                        const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
+                            ctx.matmul_f32
+                        else
+                            (matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), ctx.matmul_f32.scratch_bytes) catch return BackendError.ExecutionFailed;
+                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
+                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                             break :blk tmp;
                         };
                         defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                        try ctx.matmul_f32.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
-                        const pb_f32_len: usize = ctx.matmul_f32.tuning.kc * ctx.matmul_f32.tuning.nc;
+                        try mk.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
+                        const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
                         const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
                         const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
-                        try ctx.matmul_f32.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
+                        try mk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
                     }
                 },
                 .f16 => {
@@ -824,7 +836,7 @@ fn execMatMulTiledBatched(
                         (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                     var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                        const scratch_need: usize = @max(ctx.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                        const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                         const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                         break :blk tmp;
                     };
@@ -841,7 +853,7 @@ fn execMatMulTiledBatched(
                         (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                     var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                        const scratch_need: usize = @max(ctx.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+                        const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                         const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
                         break :blk tmp;
                     };

@@ -5,6 +5,8 @@ const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
+const conv1d_registry = @import("registry/conv1d_registry.zig");
+const conv2d_registry = @import("registry/conv2d_registry.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
@@ -47,6 +49,9 @@ pub const CpuBackend = struct {
 
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
 
+    depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
+    depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
+
     // Per-thread scratch for matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
     matmul_scratch_f32: [][]align(32) u8 = &[_][]align(32) u8{},
@@ -67,6 +72,8 @@ pub const CpuBackend = struct {
         const qm_choice: quant_matmul_registry.Candidate = quant_matmul_registry.selectHeuristic(cpu_info);
         const mv_choice: matvec_registry.Candidate = matvec_registry.selectHeuristic(cpu_info);
         const attn_choice: attention_registry.Candidate = attention_registry.selectHeuristic(cpu_info);
+        const conv1d_choice: conv1d_registry.Candidate = conv1d_registry.selectHeuristic(cpu_info);
+        const conv2d_choice: conv2d_registry.Candidate = conv2d_registry.selectHeuristic(cpu_info);
 
         return .{
             .allocator = allocator,
@@ -78,6 +85,8 @@ pub const CpuBackend = struct {
             .matmul_qx0 = qm_choice.kernels,
             .matvec = mv_choice.kernels,
             .attention_kernels = attn_choice.kernels,
+            .depthwise_conv1d = conv1d_choice.kernels,
+            .depthwise_conv2d = conv2d_choice.kernels,
             .matmul_scratch_f32 = &[_][]align(32) u8{},
         };
     }
@@ -112,6 +121,12 @@ pub const CpuBackend = struct {
             const attn_choice = attention_registry.selectHeuristic(cpu_info);
             self.attention_kernels = attn_choice.kernels;
 
+            const conv1d_choice = conv1d_registry.selectHeuristic(cpu_info);
+            self.depthwise_conv1d = conv1d_choice.kernels;
+
+            const conv2d_choice = conv2d_registry.selectHeuristic(cpu_info);
+            self.depthwise_conv2d = conv2d_choice.kernels;
+
             var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);
             errdefer allocator.free(mm);
             var i: usize = 0;
@@ -119,7 +134,7 @@ pub const CpuBackend = struct {
                 var j: usize = 0;
                 while (j < i) : (j += 1) allocator.free(mm[j]);
             }
-            const scratch_bytes: usize = @max(self.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+            const scratch_bytes: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
             while (i < opts.thread_count) : (i += 1) {
                 mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_bytes);
             }
@@ -217,6 +232,8 @@ pub const CpuBackend = struct {
                         .pool = pool_ptr,
                         .thread_count = self.thread_count,
                         .matmul_f32 = self.matmul_f32,
+                        .depthwise_conv1d = self.depthwise_conv1d,
+                        .depthwise_conv2d = self.depthwise_conv2d,
                         .matmul_scratch = self.matmul_scratch_f32,
                     };
                     try exec_conv.execConv1DTiled(&conv_ctx, s, store);
@@ -229,6 +246,8 @@ pub const CpuBackend = struct {
                         .pool = pool_ptr,
                         .thread_count = self.thread_count,
                         .matmul_f32 = self.matmul_f32,
+                        .depthwise_conv1d = self.depthwise_conv1d,
+                        .depthwise_conv2d = self.depthwise_conv2d,
                         .matmul_scratch = self.matmul_scratch_f32,
                     };
                     try exec_conv.execConv2DTiled(&conv_ctx, s, store);

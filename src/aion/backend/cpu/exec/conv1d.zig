@@ -301,12 +301,12 @@ fn tryExecConv1DDepthwiseTileNative(
     const work_items: usize = batch * out_ltc * out_ctc;
     if (ctx.pool) |p| {
         if (ctx.thread_count > 1 and work_items >= 2) {
-            p.parallelForAny(@ptrCast(&task), work_items, 1, conv1d_kernels.DepthwiseConv1DTask.runItems);
+            p.parallelForAny(@ptrCast(&task), work_items, 1, ctx.depthwise_conv1d.run_items);
             return true;
         }
     }
 
-    task.runItemRange(0, work_items);
+    ctx.depthwise_conv1d.run_item_range(&task, 0, work_items);
     return true;
 }
 
@@ -351,9 +351,9 @@ fn tryExecConv1DImplicitGemmTileNative(
 
     const k_dim_g: usize = k * c_in_g;
 
-    const matmul: matmul_registry.F32Kernels = ctx.matmul_f32;
-    const kc: usize = matmul.tuning.kc;
-    const m_cap: usize = matmul.tuning.mc;
+    const matmul_default: matmul_registry.F32Kernels = ctx.matmul_f32;
+    const kc: usize = matmul_default.tuning.kc;
+    const m_cap: usize = matmul_default.tuning.mc;
     if (kc == 0 or m_cap == 0) return BackendError.InvalidArgument;
 
     // Bias is tiled along C_out.
@@ -418,6 +418,12 @@ fn tryExecConv1DImplicitGemmTileNative(
     const oc_tiles: usize = out_meta.tile_counts[2];
     if (oc_tiles == 0) return BackendError.InvalidArgument;
 
+    // Allow per-OC-tile matmul selection (primarily narrow-N variants) while keeping
+    // KC constant, because KC drives the K-blocking loop structure below.
+    const oc_matmuls: []matmul_registry.F32Kernels = try alloc.alloc(matmul_registry.F32Kernels, oc_tiles);
+    defer alloc.free(oc_matmuls);
+    var max_nc: usize = matmul_default.tuning.nc;
+
     const packed_ws: []PackedWeightEntry = try alloc.alloc(PackedWeightEntry, oc_tiles);
     defer alloc.free(packed_ws);
     const oc_counts: []usize = try alloc.alloc(usize, oc_tiles);
@@ -441,6 +447,15 @@ fn tryExecConv1DImplicitGemmTileNative(
         if (w_vals_all.len < k_dim_g * oc_count) return BackendError.InvalidArgument;
         const w_vals: []align(1) const f32 = w_vals_all[0 .. k_dim_g * oc_count];
 
+        // Select a matmul variant for this OC tile. We only accept variants that
+        // preserve KC (and MR/NR) to keep the surrounding packing/loop structure stable.
+        var matmul_oc: matmul_registry.F32Kernels = matmul_registry.selectForConvOcTile(matmul_default, oc_count);
+        if (matmul_oc.tuning.kc != kc or matmul_oc.tuning.mr != matmul_default.tuning.mr or matmul_oc.tuning.nr != matmul_default.tuning.nr) {
+            matmul_oc = matmul_default;
+        }
+        oc_matmuls[oc_ti] = matmul_oc;
+        max_nc = @max(max_nc, matmul_oc.tuning.nc);
+
         const oc_start: usize = oc_ti * out_meta.tile_shape[2];
         const key: PackedWeightKey = .{
             .w_id = s.w,
@@ -449,9 +464,9 @@ fn tryExecConv1DImplicitGemmTileNative(
             .c_out = oc_count,
             .groups = 1,
             .kc = kc,
-            .nc = matmul.tuning.nc,
+            .nc = matmul_oc.tuning.nc,
         };
-        packed_ws[oc_ti] = try getOrCreatePackedWeights(matmul, key, w_vals);
+        packed_ws[oc_ti] = try getOrCreatePackedWeights(matmul_oc, key, w_vals);
 
         if (bias_present) {
             const b_id: tensor_store.TensorId = s.bias.?;
@@ -521,7 +536,10 @@ fn tryExecConv1DImplicitGemmTileNative(
     const Task = struct {
         ctx: *ConvExecCtx,
         s: StepConv1DTiled,
-        matmul: matmul_registry.F32Kernels,
+        // Matmul kernel selection per OC tile. All entries share KC/MR/NR.
+        oc_matmuls: []const matmul_registry.F32Kernels,
+        mr: usize,
+        max_nc: usize,
 
         // Shapes.
         l_in: usize,
@@ -554,7 +572,7 @@ fn tryExecConv1DImplicitGemmTileNative(
         fn runItemRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
             @setRuntimeSafety(false);
 
-            const pb_elems: usize = t.kc * t.matmul.tuning.nc;
+            const pb_elems: usize = t.kc * t.max_nc;
             const pa_elems: usize = t.m_cap * t.kc;
             const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch));
             std.debug.assert(scratch_f32.len >= pb_elems + pa_elems);
@@ -566,7 +584,7 @@ fn tryExecConv1DImplicitGemmTileNative(
             const dilation_u: usize = t.s.dilation;
 
             const bias_present_local: bool = (t.bias_slices.len != 0);
-            const MR: usize = t.matmul.tuning.mr;
+            const MR: usize = t.mr;
             const KC: usize = t.kc;
 
             var item0: usize = start;
@@ -699,7 +717,8 @@ fn tryExecConv1DImplicitGemmTileNative(
                             const pb0: usize = bi_full * block_elems;
                             const packed_b_view: []align(32) const f32 = @alignCast(pw.blocks[pb0 .. pb0 + block_elems]);
                             const pp: MatMulParams = .{ .m = m_rows, .n = oc_count, .k = k_sub, .ldc = oc_count, .alpha = 1.0, .beta = beta_eff };
-                            try t.matmul.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
+                            const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
+                            try mk.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
                         }
                     }
                 }
@@ -807,7 +826,8 @@ fn tryExecConv1DImplicitGemmTileNative(
                         const pb0: usize = t.full_blocks * block_elems;
                         const packed_b_view: []align(32) const f32 = @alignCast(pw.blocks[pb0 .. pb0 + block_elems]);
                         const pp: MatMulParams = .{ .m = m_rows, .n = oc_count, .k = k_sub, .ldc = oc_count, .alpha = 1.0, .beta = beta_eff };
-                        try t.matmul.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
+                        const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
+                        try mk.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
                     }
                 }
 
@@ -853,7 +873,9 @@ fn tryExecConv1DImplicitGemmTileNative(
     var task: Task = .{
         .ctx = ctx,
         .s = s,
-        .matmul = matmul,
+        .oc_matmuls = oc_matmuls,
+        .mr = matmul_default.tuning.mr,
+        .max_nc = max_nc,
         .l_in = l_in,
         .c_in = c_in,
         .k = k,
@@ -883,7 +905,8 @@ fn tryExecConv1DImplicitGemmTileNative(
     }
 
     // Fallback single-thread.
-    const scratch0: []align(32) u8 = ctx.matmul_scratch[0];
+    const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
+    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
     try task.runItemRange(scratch0, 0, work_items);
 
     return true;

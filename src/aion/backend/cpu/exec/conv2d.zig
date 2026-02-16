@@ -394,12 +394,12 @@ fn tryExecConv2DDepthwiseTileNative(
     const work_items: usize = batch * out_htc * out_wtc * out_ctc;
     if (ctx.pool) |p| {
         if (ctx.thread_count > 1 and work_items >= 2) {
-            p.parallelForAny(@ptrCast(&task), work_items, 1, conv2d_kernels.DepthwiseConv2DTask.runItems);
+            p.parallelForAny(@ptrCast(&task), work_items, 1, ctx.depthwise_conv2d.run_items);
             return true;
         }
     }
 
-    task.runItemRange(0, work_items);
+    ctx.depthwise_conv2d.run_item_range(&task, 0, work_items);
     return true;
 }
 
@@ -536,13 +536,9 @@ fn tryExecConv2DImplicitGemmTileNative(
         if (w_vals_all.len < k_dim_g * oc_count) return BackendError.InvalidArgument;
         const w_vals: []align(1) const f32 = w_vals_all[0 .. k_dim_g * oc_count];
 
-        // Pick a narrower NC for small-N cases *without* reducing KC. Using the default
-        // KC=512 variant with NC=512 for N=128 inflates packed-B and scratch footprint,
-        // which becomes visible when N is small.
-        var matmul: matmul_registry.F32Kernels = matmul_default;
-        if (matmul_default.tuning.kc == 512 and matmul_default.tuning.nc > 128 and oc_count <= 128) {
-            matmul = matmul_registry.f32_kc512_nc128;
-        }
+        // Pick a narrower NC for small-N cases *without* reducing KC.
+        // This keeps K blocking (KC) large while shrinking packed-B and scratch footprint.
+        const matmul: matmul_registry.F32Kernels = matmul_registry.selectForConvOcTile(matmul_default, oc_count);
         const kc: usize = matmul.tuning.kc;
         if (kc == 0) return BackendError.InvalidArgument;
 
@@ -978,11 +974,13 @@ fn tryExecConv2DImplicitGemmTileNative(
                             const grain: usize = @max(m_cap_eff, @max(@as(usize, 1), tile_rows / (ctx.thread_count * 4)));
                             p.parallelForAny(@ptrCast(&task), tile_rows, grain, Task.runRows);
                         } else {
-                            const scratch0: []align(32) u8 = ctx.matmul_scratch[0];
+                            const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
+                            defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
                             try task.runRowsRange(scratch0, 0, tile_rows);
                         }
                     } else {
-                        const scratch0: []align(32) u8 = ctx.matmul_scratch[0];
+                        const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
+                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
                         try task.runRowsRange(scratch0, 0, tile_rows);
                     }
                 }

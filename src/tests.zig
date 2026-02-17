@@ -14,6 +14,8 @@ comptime {
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
 
     _ = @import("aion/graph/test_program.zig");
+
+    _ = @import("aion/api/test_api.zig");
 }
 
 test {

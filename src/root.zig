@@ -15,6 +15,9 @@ pub const infer = @import("aion/graph/infer.zig");
 pub const plan = @import("aion/graph/plan.zig");
 pub const program = @import("aion/graph/program.zig");
 
+/// High-level, user-friendly API (graph-first under the hood, but graph-hidden).
+pub const api = @import("aion/api/api.zig");
+
 pub const runtime = @import("aion/runtime/executable.zig");
 pub const tensor_store = @import("aion/runtime/tensor_store.zig");
 

@@ -336,29 +336,84 @@ pub fn elemCountFromShape(shape: []const usize) ExecuteProgramError!usize {
 pub fn reshapeCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
-    if (dst_meta.rank > 2 or src_meta.rank > 2) return BackendError.InvalidArgument;
+    if (dst_meta.dtype != src_meta.dtype) return BackendError.InvalidArgument;
 
+    // Scalar dtypes only (v0).
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
-    const dst_elems: usize = if (dst_meta.rank == 1) dst_meta.shape[0] else (dst_meta.shape[0] * dst_meta.shape[1]);
 
-    var src_cache: ScalarTileCacheConst = .{};
-    defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
-    var dst_cache: ScalarTileCacheMut = .{};
-    defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
+    const src_total: usize = try elemCountFromShape(src_meta.shape);
+    const dst_total: usize = try elemCountFromShape(dst_meta.shape);
+    if (src_total != dst_total) return BackendError.InvalidArgument;
 
-    var tmp: [4]u8 = .{ 0, 0, 0, 0 };
-    const buf: []u8 = tmp[0..elem_bytes];
+    // Stream scalar elements in linear order across tiles.
+    var src_tile_total: usize = 1;
+    var d0: usize = 0;
+    while (d0 < @as(usize, src_meta.rank)) : (d0 += 1) {
+        src_tile_total = std.math.mul(usize, src_tile_total, src_meta.tile_counts[d0]) catch return BackendError.InvalidArgument;
+    }
+    var dst_tile_total: usize = 1;
+    var d1: usize = 0;
+    while (d1 < @as(usize, dst_meta.rank)) : (d1 += 1) {
+        dst_tile_total = std.math.mul(usize, dst_tile_total, dst_meta.tile_counts[d1]) catch return BackendError.InvalidArgument;
+    }
+    if (src_tile_total == 0 or dst_tile_total == 0) return BackendError.InvalidArgument;
 
-    var lin: usize = 0;
-    while (lin < dst_elems) : (lin += 1) {
-        const src_i0: usize = if (src_meta.rank == 1) lin else (lin / src_meta.shape[1]);
-        const src_i1: usize = if (src_meta.rank == 1) 0 else (lin - src_i0 * src_meta.shape[1]);
+    var src_tile_index: usize = 0;
+    var dst_tile_index: usize = 0;
 
-        const dst_i0: usize = if (dst_meta.rank == 1) lin else (lin / dst_meta.shape[1]);
-        const dst_i1: usize = if (dst_meta.rank == 1) 0 else (lin - dst_i0 * dst_meta.shape[1]);
+    var src_tile = try store.acquireTileConstLinear(src_id, src_tile_index);
+    defer store.releaseConst(src_tile.token);
+    var dst_tile = try store.acquireTileMutLinear(dst_id, dst_tile_index);
+    defer store.releaseMut(dst_tile.token);
 
-        try readScalarBytesAt(store, src_meta, src_id, elem_bytes, src_i0, src_i1, &src_cache, buf);
-        try writeScalarBytesAt(store, dst_meta, dst_id, elem_bytes, dst_i0, dst_i1, &dst_cache, buf);
+    var src_view = src_tile.bufferView();
+    var dst_view = dst_tile.bufferView();
+    var src_n: usize = elemCountFromTileView(src_view);
+    var dst_n: usize = elemCountFromTileView(dst_view);
+    if (src_n * elem_bytes > src_view.bytes.len) return BackendError.InvalidArgument;
+    if (dst_n * elem_bytes > dst_view.bytes.len) return BackendError.InvalidArgument;
+
+    var src_pos: usize = 0;
+    var dst_pos: usize = 0;
+    var remaining: usize = dst_total;
+
+    while (remaining > 0) {
+        if (src_pos == src_n) {
+            store.releaseConst(src_tile.token);
+            src_tile_index += 1;
+            if (src_tile_index >= src_tile_total) return BackendError.InvalidArgument;
+            src_tile = try store.acquireTileConstLinear(src_id, src_tile_index);
+            src_view = src_tile.bufferView();
+            src_n = elemCountFromTileView(src_view);
+            if (src_n * elem_bytes > src_view.bytes.len) return BackendError.InvalidArgument;
+            src_pos = 0;
+        }
+
+        if (dst_pos == dst_n) {
+            store.releaseMut(dst_tile.token);
+            dst_tile_index += 1;
+            if (dst_tile_index >= dst_tile_total) return BackendError.InvalidArgument;
+            dst_tile = try store.acquireTileMutLinear(dst_id, dst_tile_index);
+            dst_view = dst_tile.bufferView();
+            dst_n = elemCountFromTileView(dst_view);
+            if (dst_n * elem_bytes > dst_view.bytes.len) return BackendError.InvalidArgument;
+            dst_pos = 0;
+        }
+
+        const src_avail: usize = src_n - src_pos;
+        const dst_avail: usize = dst_n - dst_pos;
+        var chunk: usize = if (src_avail < dst_avail) src_avail else dst_avail;
+        if (chunk > remaining) chunk = remaining;
+
+        const src_off: usize = src_pos * elem_bytes;
+        const dst_off: usize = dst_pos * elem_bytes;
+        const bytes: usize = chunk * elem_bytes;
+
+        @memcpy(dst_view.bytes[dst_off .. dst_off + bytes], src_view.bytes[src_off .. src_off + bytes]);
+
+        src_pos += chunk;
+        dst_pos += chunk;
+        remaining -= chunk;
     }
 }
 
@@ -424,11 +479,11 @@ pub fn reduceAllScalar(
 
     if (out_meta.dtype != a_meta.dtype) return BackendError.InvalidArgument;
 
-    const total_elems_u64: u64 = switch (a_meta.rank) {
-        1 => @as(u64, @intCast(a_meta.shape[0])),
-        2 => @as(u64, @intCast(a_meta.shape[0])) * @as(u64, @intCast(a_meta.shape[1])),
-        else => return BackendError.InvalidArgument,
-    };
+    var total_elems_u64: u64 = 1;
+    var d_total: usize = 0;
+    while (d_total < @as(usize, a_meta.rank)) : (d_total += 1) {
+        total_elems_u64 = std.math.mul(u64, total_elems_u64, @as(u64, @intCast(a_meta.shape[d_total]))) catch return BackendError.InvalidArgument;
+    }
 
     var sum_f64: f64 = 0.0;
     var did_parallel: bool = false;

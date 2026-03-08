@@ -16,5 +16,6 @@ pub const nn = @import("nn.zig");
 
 pub const ApiError = @import("errors.zig").ApiError;
 pub const InitError = @import("errors.zig").InitError;
+pub const LoadError = @import("errors.zig").LoadError;
 pub const CompileError = @import("errors.zig").CompileError;
 pub const ExecuteError = @import("errors.zig").ExecuteError;

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const api = @import("api.zig");
+const aion_file = @import("../storage/aion_file.zig");
 const manager_mod = @import("../storage/manager.zig");
 const types = @import("../backend/types.zig");
 
@@ -398,4 +399,63 @@ test "api.nn: mini resnet (conv/residual/linear/softmax)" {
         try std.testing.expectApproxEqAbs(probs_ref[i], p, 2e-3);
     }
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 2e-3);
+}
+
+test "api: importAionFile + tensorByName + readonly param execution" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer src_ctx.deinit();
+
+    const w_t: api.Tensor = try src_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
+
+    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("weights.aion", .{ .read = true, .truncate = true });
+    defer file.close();
+
+    const metadata = [_]aion_file.MetadataSource{aion_file.MetadataSource.string("arch", "import-test")};
+    const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = w_src }};
+    try aion_file.writeFile(file, metadata[0..], tensors[0..], .{});
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    try ctx.importAionFile(file);
+
+    const w_loaded: api.Tensor = try ctx.tensorByName("w");
+    try std.testing.expectEqual(types.DType.f32, w_loaded.getDType());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, w_loaded.getShape());
+
+    const w_vals: []f32 = try w_loaded.readAlloc(allocator, f32);
+    defer allocator.free(w_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 0.5, 3.0, 4.0, -1.5 }, w_vals);
+
+    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, w_loaded.writeF32(&[_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }));
+
+    const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+    const W: api.TensorRef = try bld.param(w_loaded);
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const y_t: api.Tensor = try model.runOutputTensor(0);
+    var y_vals: [3]f32 = undefined;
+    try y_t.read(&y_vals);
+
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -8.0), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[2], 1e-6);
 }

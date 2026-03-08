@@ -168,6 +168,8 @@ pub const TiledTensor = struct {
     // Tile backing buffer.
     data: []align(64) u8,
 
+    owns_data: bool = true,
+
     // Alignment between tiles in the backing buffer.
     tile_alignment: usize = 64,
 
@@ -233,6 +235,7 @@ pub const TiledTensor = struct {
             .tile_offsets = &[_]usize{},
             .tile_lens = &[_]usize{},
             .data = &[_]u8{},
+            .owns_data = true,
             .tile_alignment = opts.tile_alignment,
         };
         moved = true;
@@ -328,7 +331,127 @@ pub const TiledTensor = struct {
         self.tile_offsets = tile_offsets;
         self.tile_lens = tile_lens;
         self.data = data;
+        self.owns_data = true;
         return;
+    }
+
+    pub fn initBorrowed(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        dtype: DType,
+        shape_in: []const usize,
+        tile_shape_in: []const usize,
+        tile_offsets_in: []const usize,
+        tile_lens_in: []const usize,
+        data_in: []align(64) u8,
+        opts: InitOptions,
+    ) StorageError!void {
+        if (shape_in.len == 0) return StorageError.InvalidArgument;
+        if (tile_shape_in.len != shape_in.len) return StorageError.InvalidArgument;
+        if (tile_offsets_in.len != tile_lens_in.len) return StorageError.InvalidArgument;
+
+        const rank: u8 = @intCast(shape_in.len);
+
+        var shape_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initFromSlice(allocator, shape_in) catch return StorageError.OutOfMemory;
+        var tile_shape_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initFromSlice(allocator, tile_shape_in) catch {
+            shape_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+
+        var tile_counts_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, shape_in.len) catch {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+
+        var tile_strides_storage: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(allocator, shape_in.len) catch {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            tile_counts_storage.deinit();
+            return StorageError.OutOfMemory;
+        };
+        var moved: bool = false;
+        errdefer if (!moved) {
+            shape_storage.deinit();
+            tile_shape_storage.deinit();
+            tile_counts_storage.deinit();
+            tile_strides_storage.deinit();
+        };
+
+        self.* = .{
+            .allocator = allocator,
+            .dtype = dtype,
+            .rank = rank,
+            .shape = &[_]usize{},
+            .tile_shape = &[_]usize{},
+            .tile_counts = &[_]usize{},
+            .tile_strides = &[_]usize{},
+            .shape_storage = shape_storage,
+            .tile_shape_storage = tile_shape_storage,
+            .tile_counts_storage = tile_counts_storage,
+            .tile_strides_storage = tile_strides_storage,
+            .meta = &[_]usize{},
+            .tile_offsets = &[_]usize{},
+            .tile_lens = &[_]usize{},
+            .data = data_in,
+            .owns_data = false,
+            .tile_alignment = opts.tile_alignment,
+        };
+        moved = true;
+        errdefer self.deinit();
+
+        self.shape = self.shape_storage.constSlice();
+        self.tile_shape = self.tile_shape_storage.constSlice();
+
+        var tile_counts_mut: []usize = self.tile_counts_storage.slice();
+        var tile_strides_mut: []usize = self.tile_strides_storage.slice();
+
+        var d: usize = 0;
+        while (d < self.shape.len) : (d += 1) {
+            if (self.shape[d] == 0) return StorageError.InvalidArgument;
+            if (self.tile_shape[d] == 0) return StorageError.InvalidArgument;
+            const count: usize = (self.shape[d] + self.tile_shape[d] - 1) / self.tile_shape[d];
+            if (count == 0) return StorageError.InvalidArgument;
+            tile_counts_mut[d] = count;
+        }
+
+        var tile_total: usize = 1;
+        var rev: usize = self.shape.len;
+        while (rev > 0) : (rev -= 1) {
+            const idx: usize = rev - 1;
+            tile_strides_mut[idx] = tile_total;
+            tile_total = std.math.mul(usize, tile_total, tile_counts_mut[idx]) catch return StorageError.InvalidArgument;
+        }
+
+        if (tile_total != tile_offsets_in.len) return StorageError.InvalidArgument;
+
+        self.tile_counts = self.tile_counts_storage.constSlice();
+        self.tile_strides = self.tile_strides_storage.constSlice();
+
+        const di = dtype.info();
+        if (di.is_quantized) {
+            if (self.shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
+            if (self.tile_shape[0] % di.block_elems != 0) return StorageError.InvalidArgument;
+            const rem: usize = self.shape[0] % self.tile_shape[0];
+            if (rem != 0 and (rem % di.block_elems != 0)) return StorageError.InvalidArgument;
+        }
+
+        const meta: []usize = allocator.alloc(usize, tile_total * 2) catch return StorageError.OutOfMemory;
+        const tile_offsets: []usize = meta[0..tile_total];
+        const tile_lens: []usize = meta[tile_total..];
+        errdefer allocator.free(meta);
+
+        @memcpy(tile_offsets, tile_offsets_in);
+        @memcpy(tile_lens, tile_lens_in);
+
+        for (tile_offsets, tile_lens) |off, len| {
+            if (off % opts.tile_alignment != 0) return StorageError.InvalidArgument;
+            if (off > data_in.len or len > data_in.len - off) return StorageError.InvalidArgument;
+        }
+
+        self.meta = meta;
+        self.tile_offsets = tile_offsets;
+        self.tile_lens = tile_lens;
     }
 
     pub fn deinit(self: *Self) void {
@@ -338,10 +461,11 @@ pub const TiledTensor = struct {
             self.tile_offsets = &[_]usize{};
             self.tile_lens = &[_]usize{};
         }
-        if (self.data.len != 0) {
+        if (self.data.len != 0 and self.owns_data) {
             self.allocator.free(self.data);
-            self.data = &[_]u8{};
         }
+        self.data = &[_]u8{};
+        self.owns_data = true;
         self.shape_storage.deinit();
         self.tile_shape_storage.deinit();
         self.tile_counts_storage.deinit();

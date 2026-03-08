@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const aion_file = @import("../storage/aion_file.zig");
 const backend_mod = @import("../backend/backend.zig");
 const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
 const types = @import("../backend/types.zig");
@@ -78,6 +79,16 @@ pub const Context = struct {
     /// if a `Context` value is moved.
     pub fn backend(self: *Self) backend_mod.Backend {
         return self.cpu.backend();
+    }
+
+    pub fn importAionFile(self: *Self, file: std.fs.File) api_errors.LoadError!void {
+        return self.store.importAionFile(file);
+    }
+
+    pub fn tensorByName(self: *Self, name: []const u8) api_errors.ApiError!api_tensor.Tensor {
+        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
+        const t = try self.store.getConst(tid);
+        return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
 
     pub fn builder(self: *const Self) api_builder.Builder {

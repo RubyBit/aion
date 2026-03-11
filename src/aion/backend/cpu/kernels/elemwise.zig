@@ -60,6 +60,21 @@ pub fn broadcastLastDimBinaryF32(
     }
 }
 
+/// Broadcast over last dim for packed N-D (row_count derived from elem_count / col_count).
+pub fn broadcastLastDimBinaryF32Packed(
+    comptime op: ElemwiseBinaryOp,
+    out_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+    elem_count: usize,
+    col_count: usize,
+) BackendError!void {
+    if (col_count == 0) return BackendError.InvalidArgument;
+    if ((elem_count % col_count) != 0) return BackendError.InvalidArgument;
+    const row_count: usize = elem_count / col_count;
+    return broadcastLastDimBinaryF32(op, out_bytes, a_bytes, b_bytes, row_count, col_count);
+}
+
 /// f16 variant: arithmetic is done in f32 and narrowed back to f16.
 pub fn broadcastLastDimBinaryF16(
     comptime op: ElemwiseBinaryOp,
@@ -113,6 +128,21 @@ pub fn broadcastLastDimBinaryF16(
             out[base + c] = @floatCast(rv);
         }
     }
+}
+
+/// Broadcast over last dim for packed N-D (row_count derived from elem_count / col_count).
+pub fn broadcastLastDimBinaryF16Packed(
+    comptime op: ElemwiseBinaryOp,
+    out_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+    elem_count: usize,
+    col_count: usize,
+) BackendError!void {
+    if (col_count == 0) return BackendError.InvalidArgument;
+    if ((elem_count % col_count) != 0) return BackendError.InvalidArgument;
+    const row_count: usize = elem_count / col_count;
+    return broadcastLastDimBinaryF16(op, out_bytes, a_bytes, b_bytes, row_count, col_count);
 }
 
 pub fn elemwiseBinaryF32(
@@ -225,68 +255,5 @@ pub fn elemwiseBinaryF16(
                 out[i] = @floatCast(@as(f32, a[i]) / @as(f32, b[i]));
             }
         },
-    }
-}
-
-pub fn reluF32(
-    out_bytes: []u8,
-    a_bytes: []const u8,
-    elem_count: usize,
-) BackendError!void {
-    const out: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, out_bytes);
-    const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
-
-    if (out.len < elem_count or a.len < elem_count) {
-        return BackendError.InvalidArgument;
-    }
-
-    const lanes: usize = comptime simd.lanesF32();
-    const Vec = @Vector(lanes, f32);
-    const zero: Vec = @splat(@as(f32, 0.0));
-
-    var i: usize = 0;
-    const vec_end: usize = elem_count - (elem_count % lanes);
-    while (i < vec_end) : (i += lanes) {
-        const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
-        const rv: Vec = @max(av, zero);
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
-    }
-
-    while (i < elem_count) : (i += 1) {
-        const x: f32 = a[i];
-        out[i] = if (x > 0.0) x else 0.0;
-    }
-}
-
-pub fn reluF16(
-    out_bytes: []u8,
-    a_bytes: []const u8,
-    elem_count: usize,
-) BackendError!void {
-    const out: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, out_bytes);
-    const a: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, a_bytes);
-
-    if (out.len < elem_count or a.len < elem_count) {
-        return BackendError.InvalidArgument;
-    }
-
-    const lanes: usize = comptime simd.lanesF32();
-    const VecH = @Vector(lanes, f16);
-    const VecF = @Vector(lanes, f32);
-    const zero: VecF = @splat(@as(f32, 0.0));
-
-    var i: usize = 0;
-    const vec_end: usize = elem_count - (elem_count % lanes);
-    while (i < vec_end) : (i += lanes) {
-        const ah: VecH = @as(*align(1) const VecH, @ptrCast(a.ptr + i)).*;
-        const af: VecF = @floatCast(ah);
-        const rf: VecF = @max(af, zero);
-        const rh: VecH = @floatCast(rf);
-        @as(*align(1) VecH, @ptrCast(out.ptr + i)).* = rh;
-    }
-
-    while (i < elem_count) : (i += 1) {
-        const x: f32 = @as(f32, a[i]);
-        out[i] = @floatCast(if (x > 0.0) x else 0.0);
     }
 }

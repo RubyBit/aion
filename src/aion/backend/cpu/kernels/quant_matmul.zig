@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const quant_matmul_registry = @import("quant_matmul_registry.zig");
+const quant_matmul_registry = @import("../registry/quant_matmul_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;

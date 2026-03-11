@@ -88,6 +88,14 @@ pub const ElemwiseBinaryOp = enum(u8) {
     div,
 };
 
+pub const UnaryOp = enum(u8) {
+    relu,
+    gelu,
+    silu,
+    sigmoid,
+    tanh,
+};
+
 pub const ReduceOp = enum(u8) {
     sum,
     mean,
@@ -98,6 +106,9 @@ pub const MatMulParams = struct {
     m: usize,
     n: usize,
     k: usize,
+
+    /// Leading dimension (row stride) of C. If 0, defaults to n.
+    ldc: usize = 0,
 
     alpha: f32 = 1.0,
     beta: f32 = 0.0,

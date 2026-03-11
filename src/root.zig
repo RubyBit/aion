@@ -9,11 +9,15 @@ pub const cpu = struct {
     pub const cpuid = @import("aion/backend/cpu/tuning/cpuid.zig");
 };
 pub const storage = @import("aion/storage/storage.zig");
+pub const storage_file = @import("aion/storage/aion_file.zig");
 pub const storage_manager = @import("aion/storage/manager.zig");
 pub const graph = @import("aion/graph/graph.zig");
 pub const infer = @import("aion/graph/infer.zig");
 pub const plan = @import("aion/graph/plan.zig");
 pub const program = @import("aion/graph/program.zig");
+
+/// High-level, user-friendly API (graph-first under the hood, but graph-hidden).
+pub const api = @import("aion/api/api.zig");
 
 pub const runtime = @import("aion/runtime/executable.zig");
 pub const tensor_store = @import("aion/runtime/tensor_store.zig");

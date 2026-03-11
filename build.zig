@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     //     std.debug.print("Target: {s}-{s}-{s}\n", .{ @tagName(cpu.arch), @tagName(resolved_target.result.os.tag), cpu.model.name });
     //     std.debug.print("Features: ", .{});
     //     var first = true;
-        
+
     //     switch (cpu.arch) {
     //         .x86_64 => {
     //             for (std.Target.x86.all_features, 0..) |feature, i| {

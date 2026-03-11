@@ -1,6 +1,6 @@
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const matvec_registry = @import("matvec_registry.zig");
+const matvec_registry = @import("../registry/matvec_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;

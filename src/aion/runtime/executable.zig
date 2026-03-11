@@ -6,7 +6,38 @@ pub const TensorId = u32;
 pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
 pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
 pub const StepBroadcastLastDimBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
-pub const StepReluTiled = struct { out: TensorId, a: TensorId };
+pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
+pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId, axis: i32 };
+pub const StepConv1DTiled = struct {
+    out: TensorId,
+    x: TensorId,
+    w: TensorId,
+    bias: ?TensorId,
+    stride: usize,
+    dilation: usize,
+    pad_left: usize,
+    pad_right: usize,
+    groups: usize,
+};
+pub const StepConv2DTiled = struct {
+    out: TensorId,
+    x: TensorId,
+    w: TensorId,
+    bias: ?TensorId,
+    stride_h: usize,
+    stride_w: usize,
+    dilation_h: usize,
+    dilation_w: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_left: usize,
+    pad_right: usize,
+    groups: usize,
+};
+pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+pub const StepAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool };
+pub const StepMultiHeadAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool, heads: usize };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
@@ -22,7 +53,14 @@ pub const Step = union(enum) {
     MatMulTiled: StepMatMulTiled,
     ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
     BroadcastLastDimBinaryTiled: StepBroadcastLastDimBinaryTiled,
-    ReluTiled: StepReluTiled,
+    UnaryTiled: StepUnaryTiled,
+    SoftmaxTiled: StepSoftmaxTiled,
+    Conv1DTiled: StepConv1DTiled,
+    Conv2DTiled: StepConv2DTiled,
+    LayerNormTiled: StepLayerNormTiled,
+    RMSNormTiled: StepRMSNormTiled,
+    AttentionTiled: StepAttentionTiled,
+    MultiHeadAttentionTiled: StepMultiHeadAttentionTiled,
     ReduceAll: StepReduceAll,
     CopyTiled: StepCopyTiled,
 

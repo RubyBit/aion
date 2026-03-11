@@ -18,6 +18,10 @@ pub const TilePolicy = struct {
 
     /// Tile alignment in bytes for `TiledTensor` backing.
     tile_alignment: usize = 64,
+
+    /// Max number of batch tiles to allow when retiling rank>2 scalar tensors.
+    /// Keeps retile cost bounded to preserve perf for large batch grids.
+    batch_retile_max_tiles: usize = 64,
 };
 
 pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
@@ -28,6 +32,88 @@ pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
 pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize {
     const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(m, n)));
     return .{ side, side };
+}
+
+pub fn chooseSoftmaxTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
+    // Softmax is row-wise and needs per-row scratch. Prefer modest row tiles.
+    // Keep tm small to allow stack scratch in exec and increase parallelism.
+    const tm_cap: usize = 256;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+
+    // Favor wide tiles along the reduction axis to reduce tile overhead.
+    // Cap tn to base_square_2d to avoid giant tiles.
+    const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+    return .{ .tm = tm, .tn = tn };
+}
+
+pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
+    // LayerNorm/RMSNorm are row-wise and need per-row scratch. Keep tm small.
+    const tm_cap: usize = 256;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+    // Favor decent width along last dim; cap to base_square_2d like softmax.
+    const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+    return .{ .tm = tm, .tn = tn };
+}
+
+pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, dv: usize) struct { tm: usize, tn: usize, tk: usize, tv: usize } {
+    // Attention is row-wise over queries, and needs per-query scratch.
+    // IMPORTANT: we parallelize attention primarily across query tiles.
+    // Keep tm modest so we have enough tile-level parallelism on many-core CPUs.
+    const tm_cap: usize = 32;
+    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
+
+    // Block keys modestly so per-row score scratch stays small.
+    const tn_cap: usize = 128;
+    const tn: usize = @max(@as(usize, 1), @min(n, @min(tn_cap, policy.base_square_2d)));
+
+    // Block value/output columns to bound the accumulator scratch.
+    const tv_cap: usize = 64;
+    var tv_target: usize = @min(dv, @min(tv_cap, policy.base_square_2d));
+    if (tv_target >= 16) {
+        tv_target = roundDownToMultiple(tv_target, 16);
+        if (tv_target == 0) tv_target = @min(@as(usize, 16), dv);
+    }
+    const tv: usize = @max(@as(usize, 1), @min(tv_target, dv));
+
+    // Block head dim reasonably; keep it SIMD-friendly.
+    var tk_target: usize = @min(@as(usize, 128), dk);
+    if (tk_target >= 16) {
+        tk_target = roundDownToMultiple(tk_target, 16);
+        if (tk_target == 0) tk_target = @min(@as(usize, 16), dk);
+    }
+    const tk: usize = @max(@as(usize, 1), @min(tk_target, dk));
+
+    return .{ .tm = tm, .tn = tn, .tk = tk, .tv = tv };
+}
+
+pub fn chooseConv1DTiles(policy: TilePolicy, l: usize, c_out: usize) struct { tl: usize, tc: usize } {
+    // Conv1D is typically memory-friendly along the length axis (NLC) and many hot
+    // cases (e.g. pointwise) benefit from larger M to amortize matmul overhead.
+    // Allow Conv1D to use a larger length tile than the generic base_1d.
+    const tl_cap: usize = std.math.mul(usize, policy.base_1d, 2) catch policy.base_1d;
+    const tl: usize = @max(@as(usize, 1), @min(l, tl_cap));
+
+    var tc_target: usize = @max(@as(usize, 1), @min(c_out, policy.base_square_2d));
+    if (tc_target >= 16) {
+        tc_target = roundDownToMultiple(tc_target, 16);
+        if (tc_target == 0) tc_target = @min(@as(usize, 16), c_out);
+    }
+    const tc: usize = @max(@as(usize, 1), @min(c_out, tc_target));
+    return .{ .tl = tl, .tc = tc };
+}
+
+pub fn chooseConv2DTiles(policy: TilePolicy, h: usize, w: usize, c_out: usize) struct { th: usize, tw: usize, tc: usize } {
+    const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(h, w)));
+    const th: usize = @max(@as(usize, 1), @min(h, side));
+    const tw: usize = @max(@as(usize, 1), @min(w, side));
+
+    var tc_target: usize = @max(@as(usize, 1), @min(c_out, policy.base_square_2d));
+    if (tc_target >= 16) {
+        tc_target = roundDownToMultiple(tc_target, 16);
+        if (tc_target == 0) tc_target = @min(@as(usize, 16), c_out);
+    }
+    const tc: usize = @max(@as(usize, 1), @min(c_out, tc_target));
+    return .{ .th = th, .tw = tw, .tc = tc };
 }
 
 pub fn roundDownToMultiple(x: usize, m: usize) usize {

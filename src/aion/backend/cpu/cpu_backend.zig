@@ -1,12 +1,20 @@
 const std = @import("std");
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
-const matmul_registry = @import("kernels/matmul_registry.zig");
-const quant_matmul_registry = @import("kernels/quant_matmul_registry.zig");
-const matvec_registry = @import("kernels/matvec_registry.zig");
+const matmul_registry = @import("registry/matmul_registry.zig");
+const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const matvec_registry = @import("registry/matvec_registry.zig");
+const attention_registry = @import("registry/attention_registry.zig");
+const conv1d_registry = @import("registry/conv1d_registry.zig");
+const conv2d_registry = @import("registry/conv2d_registry.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
+const exec_unary = @import("exec/unary.zig");
 const exec_matmul = @import("exec/matmul.zig");
+const exec_softmax = @import("exec/softmax.zig");
+const exec_conv = @import("exec/conv.zig");
+const exec_layernorm = @import("exec/layernorm.zig");
+const exec_attention = @import("exec/attention.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -30,11 +38,19 @@ pub const CpuBackend = struct {
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
 
+    // Per-thread scratch for softmax reductions (max + sum). Size == 2*thread_count.
+    softmax_scratch_f32: []f32 = &[_]f32{},
+
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
     matmul_qx0: quant_matmul_registry.QuantKernels = quant_matmul_registry.candidates[1].kernels,
 
     matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
+
+    attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
+
+    depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
+    depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
 
     // Per-thread scratch for matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
@@ -51,13 +67,34 @@ pub const CpuBackend = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        const cpu_info = cpuid.detect();
+        const mm_choice: matmul_registry.Candidate = matmul_registry.selectHeuristic(cpu_info);
+        const qm_choice: quant_matmul_registry.Candidate = quant_matmul_registry.selectHeuristic(cpu_info);
+        const mv_choice: matvec_registry.Candidate = matvec_registry.selectHeuristic(cpu_info);
+        const attn_choice: attention_registry.Candidate = attention_registry.selectHeuristic(cpu_info);
+        const conv1d_choice: conv1d_registry.Candidate = conv1d_registry.selectHeuristic(cpu_info);
+        const conv2d_choice: conv2d_registry.Candidate = conv2d_registry.selectHeuristic(cpu_info);
+
+        return .{
+            .allocator = allocator,
+            .pool = null,
+            .thread_count = 1,
+            .reduce_scratch_f32 = &[_]f32{},
+            .softmax_scratch_f32 = &[_]f32{},
+            .matmul_f32 = mm_choice.kernels,
+            .matmul_qx0 = qm_choice.kernels,
+            .matvec = mv_choice.kernels,
+            .attention_kernels = attn_choice.kernels,
+            .depthwise_conv1d = conv1d_choice.kernels,
+            .depthwise_conv2d = conv2d_choice.kernels,
+            .matmul_scratch_f32 = &[_][]align(32) u8{},
+        };
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {
         if (opts.thread_count == 0) return error.InvalidArgument;
 
-        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
         if (opts.thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = opts.thread_count });
             self.pool = p;
@@ -65,6 +102,9 @@ pub const CpuBackend = struct {
 
             // Allocate reduction scratch once. No allocations during op execution.
             self.reduce_scratch_f32 = try allocator.alloc(f32, opts.thread_count);
+
+            // Allocate softmax reduction scratch once. No allocations during op execution.
+            self.softmax_scratch_f32 = try allocator.alloc(f32, opts.thread_count * 2);
 
             // Allocate matmul scratch once. No allocations during op execution.
             // Select a variant based on CPU cache sizes (when available).
@@ -78,6 +118,15 @@ pub const CpuBackend = struct {
             const mv_choice = matvec_registry.selectHeuristic(cpu_info);
             self.matvec = mv_choice.kernels;
 
+            const attn_choice = attention_registry.selectHeuristic(cpu_info);
+            self.attention_kernels = attn_choice.kernels;
+
+            const conv1d_choice = conv1d_registry.selectHeuristic(cpu_info);
+            self.depthwise_conv1d = conv1d_choice.kernels;
+
+            const conv2d_choice = conv2d_registry.selectHeuristic(cpu_info);
+            self.depthwise_conv2d = conv2d_choice.kernels;
+
             var mm: [][]align(32) u8 = try allocator.alloc([]align(32) u8, opts.thread_count);
             errdefer allocator.free(mm);
             var i: usize = 0;
@@ -85,7 +134,7 @@ pub const CpuBackend = struct {
                 var j: usize = 0;
                 while (j < i) : (j += 1) allocator.free(mm[j]);
             }
-            const scratch_bytes: usize = @max(self.matmul_f32.scratch_bytes, quant_matmul_registry.maxScratchBytes());
+            const scratch_bytes: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
             while (i < opts.thread_count) : (i += 1) {
                 mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_bytes);
             }
@@ -111,6 +160,11 @@ pub const CpuBackend = struct {
         if (self.reduce_scratch_f32.len != 0) {
             self.allocator.free(self.reduce_scratch_f32);
             self.reduce_scratch_f32 = &[_]f32{};
+        }
+
+        if (self.softmax_scratch_f32.len != 0) {
+            self.allocator.free(self.softmax_scratch_f32);
+            self.softmax_scratch_f32 = &[_]f32{};
         }
         self.thread_count = 1;
     }
@@ -161,9 +215,62 @@ pub const CpuBackend = struct {
                     try ElemwiseExec.execBroadcastLastDimBinaryTiled(pool_ptr, self.thread_count, s, store);
                 },
 
-                .ReluTiled => |s| {
+                .UnaryTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                    try ElemwiseExec.execReluTiled(pool_ptr, self.thread_count, s, store);
+                    try exec_unary.execUnaryTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .SoftmaxTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_softmax.execSoftmaxTiled(pool_ptr, self.thread_count, self.softmax_scratch_f32, s, store);
+                },
+
+                .Conv1DTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    var conv_ctx: exec_conv.ConvExecCtx = .{
+                        .allocator = self.allocator,
+                        .pool = pool_ptr,
+                        .thread_count = self.thread_count,
+                        .matmul_f32 = self.matmul_f32,
+                        .depthwise_conv1d = self.depthwise_conv1d,
+                        .depthwise_conv2d = self.depthwise_conv2d,
+                        .matmul_scratch = self.matmul_scratch_f32,
+                    };
+                    try exec_conv.execConv1DTiled(&conv_ctx, s, store);
+                },
+
+                .Conv2DTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    var conv_ctx: exec_conv.ConvExecCtx = .{
+                        .allocator = self.allocator,
+                        .pool = pool_ptr,
+                        .thread_count = self.thread_count,
+                        .matmul_f32 = self.matmul_f32,
+                        .depthwise_conv1d = self.depthwise_conv1d,
+                        .depthwise_conv2d = self.depthwise_conv2d,
+                        .matmul_scratch = self.matmul_scratch_f32,
+                    };
+                    try exec_conv.execConv2DTiled(&conv_ctx, s, store);
+                },
+
+                .LayerNormTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_layernorm.execLayerNormTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .RMSNormTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_layernorm.execRMSNormTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .AttentionTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_attention.execAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
+                },
+
+                .MultiHeadAttentionTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_attention.execMultiHeadAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
                 },
 
                 .CopyTiled => |s| {

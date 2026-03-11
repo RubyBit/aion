@@ -11,9 +11,12 @@ const std = @import("std");
 comptime {
     _ = @import("aion/backend/backend.zig");
     _ = @import("aion/storage/storage.zig");
+    _ = @import("aion/storage/test_storage.zig");
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
 
     _ = @import("aion/graph/test_program.zig");
+
+    _ = @import("aion/api/test_api.zig");
 }
 
 test {

@@ -1,6 +1,6 @@
 const std = @import("std");
 const types = @import("../../types.zig");
-const quant_matmul_tuned = @import("quant_matmul_tuned.zig");
+const quant_matmul = @import("../kernels/quant_matmul.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 
 pub const Tuning = struct {
@@ -41,7 +41,7 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning) QuantKernels {
-    const K = quant_matmul_tuned.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr });
+    const K = quant_matmul.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr });
     return .{
         .tuning = t,
         .scratch_bytes = K.scratchBytes(),
@@ -89,7 +89,7 @@ pub fn selectForTile(k: usize, n: usize) ?QuantKernels {
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // Similar heuristic to f32: pick largest candidate whose packed-B footprint
     // fits in ~75% of L2.
-    const l2_bytes = info.caches.l2_bytes;
+    const l2_bytes: usize = info.caches.l2_bytes;
     if (l2_bytes == 0) return candidates[1];
 
     const budget: usize = (l2_bytes * 3) / 4;

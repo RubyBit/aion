@@ -8,17 +8,20 @@ pub const StoreError = error{ InvalidArgument, OutOfMemory };
 pub const TensorMeta = struct {
     dtype: types.DType,
     rank: u8,
-    shape: [2]usize,
-    tile_shape: [2]usize,
-    tile_counts: [2]usize,
+    shape: []const usize,
+    tile_shape: []const usize,
+    tile_counts: []const usize,
+    tile_strides: []const usize,
 };
+
+const INLINE_RANK: usize = 8;
 
 pub const TileRefConst = struct {
     bytes: []const u8,
     dtype: types.DType,
     rank: u8,
-    shape_mem: [2]usize,
-    strides_mem: [2]isize,
+    shape_mem: [INLINE_RANK]usize,
+    strides_mem: [INLINE_RANK]isize,
     token: usize = 0,
 
     pub fn bufferView(self: *const TileRefConst) types.BufferViewConst {
@@ -39,8 +42,8 @@ pub const TileRefMut = struct {
     bytes: []u8,
     dtype: types.DType,
     rank: u8,
-    shape_mem: [2]usize,
-    strides_mem: [2]isize,
+    shape_mem: [INLINE_RANK]usize,
+    strides_mem: [INLINE_RANK]isize,
     token: usize = 0,
 
     pub fn bufferView(self: *TileRefMut) types.BufferViewMut {
@@ -59,8 +62,16 @@ pub const TileRefMut = struct {
 
 /// Backend-facing storage interface.
 ///
-/// v0 implementation is RAM-only and tokens are always 0.
-/// Future out-of-core can use tokens for pin/unpin and deterministic I/O errors.
+/// Conceptually, acquiring a tile returns a temporary lease on storage and the
+/// returned token must be released when the caller is done with the tile.
+///
+/// v0 keeps this lightweight:
+/// - tokens are always `0`
+/// - release hooks are no-ops
+/// - tile lifetime is guaranteed by the owning `StorageManager`
+///
+/// Future out-of-core storage can turn tokens into real pin/lease handles for
+/// cache residency, staging buffers, and deterministic I/O failure boundaries.
 pub const TensorStore = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -69,11 +80,19 @@ pub const TensorStore = struct {
         meta: *const fn (ctx: *anyopaque, id: TensorId) StoreError!TensorMeta,
         acquireTileConst: *const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) StoreError!TileRefConst,
         acquireTileMut: *const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) StoreError!TileRefMut,
+        acquireTileConstLinear: *const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) StoreError!TileRefConst,
+        acquireTileMutLinear: *const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) StoreError!TileRefMut,
+        /// Release a previously acquired read-only tile lease.
         releaseConst: *const fn (ctx: *anyopaque, token: usize) void,
+        /// Release a previously acquired mutable tile lease.
         releaseMut: *const fn (ctx: *anyopaque, token: usize) void,
 
         /// Prefetch hint. Non-blocking.
+        ///
+        /// In v0 this is only a CPU cache hint. Future implementations may use
+        /// it to initiate staged tile loads or cache warming.
         prefetch: ?*const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void = null,
+        prefetchLinear: ?*const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) void = null,
     };
 
     pub fn meta(self: TensorStore, id: TensorId) StoreError!TensorMeta {
@@ -88,6 +107,14 @@ pub const TensorStore = struct {
         return self.vtable.acquireTileMut(self.ctx, id, ti0, ti1);
     }
 
+    pub fn acquireTileConstLinear(self: TensorStore, id: TensorId, tile_index: usize) StoreError!TileRefConst {
+        return self.vtable.acquireTileConstLinear(self.ctx, id, tile_index);
+    }
+
+    pub fn acquireTileMutLinear(self: TensorStore, id: TensorId, tile_index: usize) StoreError!TileRefMut {
+        return self.vtable.acquireTileMutLinear(self.ctx, id, tile_index);
+    }
+
     pub fn releaseConst(self: TensorStore, token: usize) void {
         return self.vtable.releaseConst(self.ctx, token);
     }
@@ -99,4 +126,36 @@ pub const TensorStore = struct {
     pub fn prefetch(self: TensorStore, id: TensorId, ti0: usize, ti1: usize) void {
         if (self.vtable.prefetch) |p| p(self.ctx, id, ti0, ti1);
     }
+
+    pub fn prefetchLinear(self: TensorStore, id: TensorId, tile_index: usize) void {
+        if (self.vtable.prefetchLinear) |p| p(self.ctx, id, tile_index);
+    }
 };
+
+pub fn decodeTileCoords(meta: TensorMeta, tile_index: usize, out: []usize) StoreError!void {
+    if (out.len != meta.tile_counts.len) return StoreError.InvalidArgument;
+    if (meta.tile_counts.len != meta.tile_strides.len) return StoreError.InvalidArgument;
+    if (meta.tile_counts.len == 0) return StoreError.InvalidArgument;
+
+    var d: usize = 0;
+    while (d < meta.tile_counts.len) : (d += 1) {
+        const stride: usize = meta.tile_strides[d];
+        if (stride == 0) return StoreError.InvalidArgument;
+        const v: usize = tile_index / stride;
+        out[d] = v % meta.tile_counts[d];
+    }
+}
+
+pub fn encodeTileIndex(meta: TensorMeta, coords: []const usize) StoreError!usize {
+    if (coords.len != meta.tile_counts.len) return StoreError.InvalidArgument;
+    if (meta.tile_counts.len != meta.tile_strides.len) return StoreError.InvalidArgument;
+    if (meta.tile_counts.len == 0) return StoreError.InvalidArgument;
+
+    var idx: usize = 0;
+    var d: usize = 0;
+    while (d < coords.len) : (d += 1) {
+        if (coords[d] >= meta.tile_counts[d]) return StoreError.InvalidArgument;
+        idx = std.math.add(usize, idx, coords[d] * meta.tile_strides[d]) catch return StoreError.InvalidArgument;
+    }
+    return idx;
+}

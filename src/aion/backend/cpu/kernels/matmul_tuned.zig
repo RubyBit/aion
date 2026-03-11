@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
-const matmul_registry = @import("matmul_registry.zig");
+const matmul_registry = @import("../registry/matmul_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -54,19 +54,40 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
 
+        pub fn packATileF32(k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) BackendError!void {
+            if (k > KC) return BackendError.InvalidArgument;
+            const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
+            if (a.len < m * k) return BackendError.InvalidArgument;
+
+            const panel_count: usize = (m + MR - 1) / MR;
+            const need: usize = panel_count * MR * KC;
+            if (packed_a_out.len < need) return BackendError.InvalidArgument;
+
+            var ir: usize = 0;
+            while (ir < m) : (ir += MR) {
+                const mr = @min(MR, m - ir);
+                const panel_idx: usize = ir / MR;
+                const offset: usize = panel_idx * (MR * KC);
+                const dest: *[MR * KC]f32 = @ptrCast(packed_a_out[offset..][0 .. MR * KC]);
+                packPanelA(k, mr, a, k, ir, 0, dest);
+            }
+        }
+
         pub fn matmulF32PackedB(scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8) BackendError!void {
             const m: usize = params.m;
             const n: usize = params.n;
             const k: usize = params.k;
             const alpha: f32 = params.alpha;
             const beta: f32 = params.beta;
+            const c_stride: usize = if (params.ldc != 0) params.ldc else n;
 
             if (k > KC or n > NC) return BackendError.InvalidArgument;
             if (packed_b_view.len < KC * NC) return BackendError.InvalidArgument;
 
             const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
             const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
-            if (c.len < m * n or a.len < m * k) return BackendError.InvalidArgument;
+            if (m == 0 or n == 0) return BackendError.InvalidArgument;
+            if (c.len < (m - 1) * c_stride + n or a.len < m * k) return BackendError.InvalidArgument;
 
             const s = try splitScratch(scratch_bytes);
             const packed_a: []align(32) f32 = s.pa;
@@ -99,15 +120,63 @@ pub fn Kernel(comptime t: Tuning) type {
 
                         if (mr == MR and nr == NR) {
                             if (alpha == 1.0 and beta == 0.0) {
-                                microKernel6x16_Fast_A1B0(k, a_panel, b_panel, c, n, ic + ir_ex, jr_ex);
+                                microKernel6x16_Fast_A1B0(k, a_panel, b_panel, c, c_stride, ic + ir_ex, jr_ex);
                             } else if (alpha == 1.0 and beta == 1.0) {
-                                microKernel6x16_Fast_A1B1(k, a_panel, b_panel, c, n, ic + ir_ex, jr_ex);
+                                microKernel6x16_Fast_A1B1(k, a_panel, b_panel, c, c_stride, ic + ir_ex, jr_ex);
                             } else {
-                                microKernel6x16_Fast(k, alpha, beta, a_panel, b_panel, c, n, ic + ir_ex, jr_ex);
+                                microKernel6x16_Fast(k, alpha, beta, a_panel, b_panel, c, c_stride, ic + ir_ex, jr_ex);
                             }
                         } else {
-                            microKernel6x16(k, alpha, beta, a_panel, b_panel, c, n, ic + ir_ex, jr_ex, mr, nr);
+                            microKernel6x16(k, alpha, beta, a_panel, b_panel, c, c_stride, ic + ir_ex, jr_ex, mr, nr);
                         }
+                    }
+                }
+            }
+        }
+
+        pub fn matmulF32PackedAB(packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: MatMulParams, c_bytes: []u8) BackendError!void {
+            const m: usize = params.m;
+            const n: usize = params.n;
+            const k: usize = params.k;
+            const alpha: f32 = params.alpha;
+            const beta: f32 = params.beta;
+            const c_stride: usize = if (params.ldc != 0) params.ldc else n;
+
+            if (k > KC or n > NC) return BackendError.InvalidArgument;
+            if (packed_b_view.len < KC * NC) return BackendError.InvalidArgument;
+
+            const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
+            if (m == 0 or n == 0) return BackendError.InvalidArgument;
+            if (c.len < (m - 1) * c_stride + n) return BackendError.InvalidArgument;
+
+            const panel_count: usize = (m + MR - 1) / MR;
+            const need_a: usize = panel_count * MR * KC;
+            if (packed_a.len < need_a) return BackendError.InvalidArgument;
+
+            const packed_b: []align(32) const f32 = packed_b_view;
+
+            var jr_ex: usize = 0;
+            while (jr_ex < n) : (jr_ex += NR) {
+                const nr = @min(NR, n - jr_ex);
+                const b_offset: usize = (jr_ex / NR) * (KC * NR);
+                const b_panel: *const [KC * NR]f32 = @ptrCast(@alignCast(packed_b.ptr + b_offset));
+
+                var ir_ex: usize = 0;
+                while (ir_ex < m) : (ir_ex += MR) {
+                    const mr = @min(MR, m - ir_ex);
+                    const a_offset: usize = (ir_ex / MR) * (MR * KC);
+                    const a_panel: *const [MR * KC]f32 = @ptrCast(@alignCast(packed_a.ptr + a_offset));
+
+                    if (mr == MR and nr == NR) {
+                        if (alpha == 1.0 and beta == 0.0) {
+                            microKernel6x16_Fast_A1B0(k, a_panel, b_panel, c, c_stride, ir_ex, jr_ex);
+                        } else if (alpha == 1.0 and beta == 1.0) {
+                            microKernel6x16_Fast_A1B1(k, a_panel, b_panel, c, c_stride, ir_ex, jr_ex);
+                        } else {
+                            microKernel6x16_Fast(k, alpha, beta, a_panel, b_panel, c, c_stride, ir_ex, jr_ex);
+                        }
+                    } else {
+                        microKernel6x16(k, alpha, beta, a_panel, b_panel, c, c_stride, ir_ex, jr_ex, mr, nr);
                     }
                 }
             }
@@ -125,7 +194,7 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = LANES; // 8 
+            const lanes = LANES; // 8
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;

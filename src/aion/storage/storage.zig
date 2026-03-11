@@ -477,6 +477,22 @@ pub const TiledTensor = struct {
         self.rank = 0;
     }
 
+    pub fn isOwned(self: *const Self) bool {
+        return self.owns_data;
+    }
+
+    pub fn promoteToOwned(self: *Self) StorageError!bool {
+        if (self.owns_data) return false;
+
+        const owned_copy: []align(64) u8 = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), self.data.len) catch return StorageError.OutOfMemory;
+        errdefer self.allocator.free(owned_copy);
+
+        @memcpy(owned_copy, self.data);
+        self.data = owned_copy;
+        self.owns_data = true;
+        return true;
+    }
+
     pub fn tileCountTotal(self: Self) usize {
         return self.tile_offsets.len;
     }

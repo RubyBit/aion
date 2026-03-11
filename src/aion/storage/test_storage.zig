@@ -1,12 +1,19 @@
 const std = @import("std");
 
 const aion_file = @import("aion_file.zig");
+const manager_mod = @import("manager.zig");
 const storage = @import("storage.zig");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
 const simd = @import("../backend/cpu/kernels/simd.zig");
 
 const DType = types.DType;
+
+fn createTestFile(dir: std.fs.Dir, sub_path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.ioBasic();
+    return .adaptFromNewApi(try std.Io.Dir.createFile(dir.adaptToNewApi(), io, sub_path, flags));
+}
 
 test "storage: scalar f32 roundtrip pack<->tiles" {
     const allocator: std.mem.Allocator = std.testing.allocator;
@@ -184,7 +191,7 @@ test "storage file: write/parse tiled tensors roundtrip" {
     defer tmp.cleanup();
 
     {
-        const file = try tmp.dir.createFile("weights.aion", .{ .read = true, .truncate = true });
+        const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
         defer file.close();
 
         const metadata = [_]aion_file.MetadataSource{
@@ -259,7 +266,7 @@ test "storage file: mapReadOnly parses without heap copy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("mapped.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "mapped.aion", .{ .read = true, .truncate = true });
     defer file.close();
 
     const tensors = [_]aion_file.TensorSource{.{ .name = "mapped.weight", .tensor = &tt }};
@@ -275,4 +282,67 @@ test "storage file: mapReadOnly parses without heap copy" {
     try view.validateTensorCrc32(desc);
     const data = try view.tensorDataBytes(desc);
     try std.testing.expectEqualSlices(u8, tt.data, data);
+}
+
+test "storage manager: mapped and copied imports expose residency and promotion" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var src: storage.TiledTensor = undefined;
+    try src.init(
+        allocator,
+        .f32,
+        &[_]usize{ 2, 2 },
+        &[_]usize{ 2, 2 },
+        .{ .tile_alignment = 64 },
+    );
+    defer src.deinit();
+
+    const src_vals: [4]f32 = .{ 1.0, 2.0, 3.0, 4.0 };
+    try src.writeFromPackedScalar(std.mem.sliceAsBytes(src_vals[0..]));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "residency.aion", .{ .read = true, .truncate = true });
+    defer file.close();
+
+    const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = &src }};
+    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+
+    var mapped_sm = manager_mod.StorageManager.init(allocator);
+    defer mapped_sm.deinit();
+    try mapped_sm.importAionFile(file, .{ .residency = .mapped });
+
+    const mapped_id = mapped_sm.tensorIdByName("w").?;
+    try std.testing.expect(try mapped_sm.isMappedTensor(mapped_id));
+    try std.testing.expectEqual(manager_mod.TensorResidency.imported_mapped, try mapped_sm.tensorResidency(mapped_id));
+    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, mapped_sm.getMut(mapped_id));
+
+    try mapped_sm.promoteToOwnedRam(mapped_id);
+    try std.testing.expectEqual(manager_mod.TensorResidency.owned, try mapped_sm.tensorResidency(mapped_id));
+    _ = try mapped_sm.getMut(mapped_id);
+
+    var mapped_after: [4]f32 = undefined;
+    try mapped_sm.readToPackedScalar(mapped_id, std.mem.sliceAsBytes(mapped_after[0..]));
+    try std.testing.expectEqualSlices(f32, src_vals[0..], mapped_after[0..]);
+
+    var copied_sm = manager_mod.StorageManager.init(allocator);
+    defer copied_sm.deinit();
+    try copied_sm.importAionFile(file, .{ .residency = .copied });
+
+    const copied_id = copied_sm.tensorIdByName("w").?;
+    try std.testing.expect(!(try copied_sm.isMappedTensor(copied_id)));
+    try std.testing.expectEqual(manager_mod.TensorResidency.imported_copied, try copied_sm.tensorResidency(copied_id));
+    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, copied_sm.getMut(copied_id));
+
+    try copied_sm.promoteToOwnedRam(copied_id);
+    try std.testing.expectEqual(manager_mod.TensorResidency.owned, try copied_sm.tensorResidency(copied_id));
+    _ = try copied_sm.getMut(copied_id);
+
+    const updated_vals: [4]f32 = .{ 10.0, 20.0, 30.0, 40.0 };
+    try copied_sm.writeFromPackedScalar(copied_id, std.mem.sliceAsBytes(updated_vals[0..]));
+
+    var copied_after: [4]f32 = undefined;
+    try copied_sm.readToPackedScalar(copied_id, std.mem.sliceAsBytes(copied_after[0..]));
+    try std.testing.expectEqualSlices(f32, updated_vals[0..], copied_after[0..]);
 }

@@ -7,6 +7,12 @@ const types = @import("../backend/types.zig");
 
 const nn = api.nn;
 
+fn createTestFile(dir: std.fs.Dir, sub_path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.ioBasic();
+    return .adaptFromNewApi(try std.Io.Dir.createFile(dir.adaptToNewApi(), io, sub_path, flags));
+}
+
 test "api: build+compile+run (matmul/broadcast/relu/copy/reduce)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -417,7 +423,7 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("weights.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
     defer file.close();
 
     const metadata = [_]aion_file.MetadataSource{aion_file.MetadataSource.string("arch", "import-test")};
@@ -427,7 +433,7 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    try ctx.importAionFile(file);
+    try ctx.importAionFile(file, .{});
 
     const w_loaded: api.Tensor = try ctx.tensorByName("w");
     try std.testing.expectEqual(types.DType.f32, w_loaded.getDType());
@@ -458,4 +464,103 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), y_vals[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -8.0), y_vals[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[2], 1e-6);
+}
+
+test "api: importAionPath and importAionPathAbsolute convenience apis" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer src_ctx.deinit();
+
+    const w_t: api.Tensor = try src_ctx.fromArray([2][2]f32{
+        .{ 1.0, 2.0 },
+        .{ 3.0, 4.0 },
+    });
+    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "path_import.aion", .{ .read = true, .truncate = true });
+    defer file.close();
+
+    const tensors = [_]aion_file.TensorSource{.{ .name = "w_path", .tensor = w_src }};
+    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+
+    const relative_path: []const u8 = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "path_import.aion" });
+    defer allocator.free(relative_path);
+
+    const absolute_path: []u8 = try tmp.parent_dir.realpathAlloc(allocator, &tmp.sub_path);
+    defer allocator.free(absolute_path);
+    const absolute_file_path: []const u8 = try std.fs.path.join(allocator, &.{ absolute_path, "path_import.aion" });
+    defer allocator.free(absolute_file_path);
+
+    var rel_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer rel_ctx.deinit();
+    try rel_ctx.importAionPath(relative_path, .{});
+    const rel_w = try rel_ctx.tensorByName("w_path");
+    const rel_vals = try rel_w.readAlloc(allocator, f32);
+    defer allocator.free(rel_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0 }, rel_vals);
+
+    var abs_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer abs_ctx.deinit();
+    try abs_ctx.importAionPathAbsolute(absolute_file_path, .{});
+    const abs_w = try abs_ctx.tensorByName("w_path");
+    const abs_vals = try abs_w.readAlloc(allocator, f32);
+    defer allocator.free(abs_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0 }, abs_vals);
+}
+
+test "api: import options expose mapped state and promotion to owned ram" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer src_ctx.deinit();
+
+    const w_t: api.Tensor = try src_ctx.fromArray([2][2]f32{
+        .{ 1.0, 2.0 },
+        .{ 3.0, 4.0 },
+    });
+    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "import_options.aion", .{ .read = true, .truncate = true });
+    defer file.close();
+
+    const tensors = [_]aion_file.TensorSource{.{ .name = "w_opts", .tensor = w_src }};
+    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+
+    var mapped_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer mapped_ctx.deinit();
+    try mapped_ctx.importAionFile(file, .{ .residency = .mapped });
+    try std.testing.expect(try mapped_ctx.isMappedTensor("w_opts"));
+
+    const mapped_tensor = try mapped_ctx.tensorByName("w_opts");
+    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, mapped_tensor.writeF32(&[_]f32{ 9.0, 8.0, 7.0, 6.0 }));
+
+    try mapped_ctx.promoteTensorToOwnedRam("w_opts");
+    try std.testing.expect(!(try mapped_ctx.isMappedTensor("w_opts")));
+    try mapped_tensor.writeF32(&[_]f32{ 9.0, 8.0, 7.0, 6.0 });
+
+    const mapped_vals = try mapped_tensor.readAlloc(allocator, f32);
+    defer allocator.free(mapped_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 9.0, 8.0, 7.0, 6.0 }, mapped_vals);
+
+    var copied_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer copied_ctx.deinit();
+    try copied_ctx.importAionFile(file, .{ .residency = .copied });
+    try std.testing.expect(!(try copied_ctx.isMappedTensor("w_opts")));
+
+    const copied_tensor = try copied_ctx.tensorByName("w_opts");
+    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, copied_tensor.writeF32(&[_]f32{ 5.0, 6.0, 7.0, 8.0 }));
+
+    try copied_ctx.promoteTensorToOwnedRam("w_opts");
+    try copied_tensor.writeF32(&[_]f32{ 5.0, 6.0, 7.0, 8.0 });
+
+    const copied_vals = try copied_tensor.readAlloc(allocator, f32);
+    defer allocator.free(copied_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5.0, 6.0, 7.0, 8.0 }, copied_vals);
 }

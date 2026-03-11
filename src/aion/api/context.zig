@@ -17,6 +17,8 @@ const api_errors = @import("errors.zig");
 
 pub const DType = types.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
+pub const ImportResidency = manager_mod.ImportResidency;
+pub const ImportOptions = manager_mod.ImportAionOptions;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -81,8 +83,30 @@ pub const Context = struct {
         return self.cpu.backend();
     }
 
-    pub fn importAionFile(self: *Self, file: std.fs.File) api_errors.LoadError!void {
-        return self.store.importAionFile(file);
+    pub fn importAionFile(self: *Self, file: std.fs.File, opts: ImportOptions) api_errors.LoadError!void {
+        return self.store.importAionFile(file, opts);
+    }
+
+    pub fn importAionPath(self: *Self, path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
+        const file = std.fs.cwd().openFile(path, .{}) catch return aion_file.FileError.IoFailure;
+        defer file.close();
+        return self.importAionFile(file, opts);
+    }
+
+    pub fn importAionPathAbsolute(self: *Self, absolute_path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
+        const file = std.fs.openFileAbsolute(absolute_path, .{}) catch return aion_file.FileError.IoFailure;
+        defer file.close();
+        return self.importAionFile(file, opts);
+    }
+
+    pub fn isMappedTensor(self: *Self, name: []const u8) api_errors.ApiError!bool {
+        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.store.isMappedTensor(tid);
+    }
+
+    pub fn promoteTensorToOwnedRam(self: *Self, name: []const u8) api_errors.ApiError!void {
+        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.store.promoteToOwnedRam(tid);
     }
 
     pub fn tensorByName(self: *Self, name: []const u8) api_errors.ApiError!api_tensor.Tensor {

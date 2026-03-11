@@ -62,8 +62,16 @@ pub const TileRefMut = struct {
 
 /// Backend-facing storage interface.
 ///
-/// v0 implementation is RAM-only and tokens are always 0.
-/// Future out-of-core can use tokens for pin/unpin and deterministic I/O errors.
+/// Conceptually, acquiring a tile returns a temporary lease on storage and the
+/// returned token must be released when the caller is done with the tile.
+///
+/// v0 keeps this lightweight:
+/// - tokens are always `0`
+/// - release hooks are no-ops
+/// - tile lifetime is guaranteed by the owning `StorageManager`
+///
+/// Future out-of-core storage can turn tokens into real pin/lease handles for
+/// cache residency, staging buffers, and deterministic I/O failure boundaries.
 pub const TensorStore = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -74,10 +82,15 @@ pub const TensorStore = struct {
         acquireTileMut: *const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) StoreError!TileRefMut,
         acquireTileConstLinear: *const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) StoreError!TileRefConst,
         acquireTileMutLinear: *const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) StoreError!TileRefMut,
+        /// Release a previously acquired read-only tile lease.
         releaseConst: *const fn (ctx: *anyopaque, token: usize) void,
+        /// Release a previously acquired mutable tile lease.
         releaseMut: *const fn (ctx: *anyopaque, token: usize) void,
 
         /// Prefetch hint. Non-blocking.
+        ///
+        /// In v0 this is only a CPU cache hint. Future implementations may use
+        /// it to initiate staged tile loads or cache warming.
         prefetch: ?*const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void = null,
         prefetchLinear: ?*const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) void = null,
     };

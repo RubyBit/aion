@@ -52,6 +52,9 @@ const BenchOptions = struct {
     conv_cin: usize = 64,
     conv_cout: usize = 64,
     conv_k: usize = 3,
+
+    // Reflect convolution benchmarks.
+    reflect_conv: bool = true,
 };
 
 fn printUsage() void {
@@ -77,6 +80,7 @@ fn printUsage() void {
             "  --conv-cin N     Conv input channels (default: 64)\n" ++
             "  --conv-cout N    Conv output channels (default: 64)\n" ++
             "  --conv-k N       Conv kernel size (default: 3)\n" ++
+            "  --no-reflect-conv  Disable reflect-padding conv benches\n" ++
             "  -h, --help       Show help\n",
         .{},
     );
@@ -162,6 +166,8 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
             i += 1;
             if (i >= args.len) return error.InvalidArgument;
             opts.conv_k = try parseUsize(args[i]);
+        } else if (std.mem.eql(u8, a, "--no-reflect-conv")) {
+            opts.reflect_conv = false;
         } else {
             return error.InvalidArgument;
         }
@@ -191,6 +197,7 @@ fn benchProgramConv1D(
     c_out: usize,
     kernel: usize,
     groups: usize,
+    pad_mode: types.PadMode,
     label: []const u8,
     be: Backend,
 ) !void {
@@ -237,7 +244,7 @@ fn benchProgramConv1D(
     try g.bindExternal(x_in, @intCast(x_tid));
     try g.bindExternal(w_in, @intCast(w_tid));
     try g.bindExternal(b_in, @intCast(b_tid));
-    const y = try g.addConv1D(x_in, w_in, b_in, stride, dilation, pad_left, pad_right, groups);
+    const y = try g.addConv1DWithPadMode(x_in, w_in, b_in, stride, dilation, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -291,6 +298,7 @@ fn benchProgramConv2D(
     c_out: usize,
     kernel: usize,
     groups: usize,
+    pad_mode: types.PadMode,
     label: []const u8,
     be: Backend,
 ) !void {
@@ -345,7 +353,7 @@ fn benchProgramConv2D(
     try g.bindExternal(x_in, @intCast(x_tid));
     try g.bindExternal(w_val, @intCast(w_tid));
     try g.bindExternal(b_in, @intCast(b_tid));
-    const y = try g.addConv2D(x_in, w_val, b_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, groups);
+    const y = try g.addConv2DWithPadMode(x_in, w_val, b_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -564,6 +572,83 @@ fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out_tid: TensorId = prog.outputs[0];
     const sum: f32 = try readF32AtTiled(&sm, out_tid, 0, 0);
     std.debug.print("program reduce sum f32:   {d:.3} GiB/s  (sum={d:.4})\n", .{ gib_s, sum });
+}
+
+fn benchProgramReduceAxisF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    m: usize,
+    n: usize,
+    axis: i32,
+    label: []const u8,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const t2: [2]usize = plan_mod.chooseTileShape2DSquare(policy, m, n);
+
+    const a: []f32 = try allocator.alloc(f32, m * n);
+    defer allocator.free(a);
+    fillRandomF32(rnd, a);
+
+    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ t2[0], t2[1] }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const a_in = try g.addInput(.f32, &[_]usize{ m, n });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    const out = try g.addReduceAxis(.mean, a_in, axis);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const out_tid: TensorId = prog.outputs[0];
+    const out_t = try sm.getConst(out_tid);
+    var out_elems: usize = 1;
+    for (out_t.shape) |dim| {
+        out_elems *= dim;
+    }
+
+    // Approx memory traffic: one full input read + one output write.
+    const bytes_per_iter: usize = (m * n + out_elems) * @sizeOf(f32);
+    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
+    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+
+    const out_bytes_len: usize = out_elems * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const idx0: usize = 0;
+    const idx1: usize = out_elems / 2;
+    const idx2: usize = out_elems - 1;
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    std.debug.print("program reduce axis mean f32 {s}: {d:.3} GiB/s  (m={} n={} axis={}, out={}, chk={d:.4})\n", .{
+        label,
+        gib_s,
+        m,
+        n,
+        axis,
+        out_elems,
+        chk,
+    });
 }
 
 fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -1280,23 +1365,47 @@ fn mainImpl() !void {
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
     // Convolution program benches (NHWC/NLC, grouped by `groups`).
-    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, "regular", be);
-    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, 1, 1, "pointwise", be);
+    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .zero, "regular", be);
+    try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, 1, 1, .zero, "pointwise", be);
     if (opts.conv_cout == opts.conv_cin) {
-        try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, "depthwise", be);
+        try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, .zero, "depthwise", be);
     } else {
         std.debug.print("(skipping conv1d depthwise: conv-cout={} must equal conv-cin={})\n", .{ opts.conv_cout, opts.conv_cin });
     }
 
-    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, "regular", be);
-    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, 1, 1, "pointwise", be);
+    if (opts.reflect_conv) {
+        const conv1d_pad: usize = opts.conv_k / 2;
+        if (opts.conv_l > 1 and conv1d_pad < opts.conv_l) {
+            benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .reflect, "regular-reflect", be) catch |e| {
+                std.debug.print("(conv1d reflect bench failed: {s})\n", .{@errorName(e)});
+            };
+        } else {
+            std.debug.print("(skipping conv1d reflect: requires conv-l>1 and conv-k/2 < conv-l; got conv-l={} conv-k={})\n", .{ opts.conv_l, opts.conv_k });
+        }
+    }
+
+    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .zero, "regular", be);
+    try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, 1, 1, .zero, "pointwise", be);
     if (opts.conv_cout == opts.conv_cin) {
-        try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, "depthwise", be);
+        try benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, opts.conv_cin, .zero, "depthwise", be);
     } else {
         std.debug.print("(skipping conv2d depthwise: conv-cout={} must equal conv-cin={})\n", .{ opts.conv_cout, opts.conv_cin });
     }
 
+    if (opts.reflect_conv) {
+        const conv2d_pad: usize = opts.conv_k / 2;
+        if (opts.conv_h > 1 and opts.conv_w > 1 and conv2d_pad < opts.conv_h and conv2d_pad < opts.conv_w) {
+            benchProgramConv2D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_h, opts.conv_w, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .reflect, "regular-reflect", be) catch |e| {
+                std.debug.print("(conv2d reflect bench failed: {s})\n", .{@errorName(e)});
+            };
+        } else {
+            std.debug.print("(skipping conv2d reflect: requires conv-h>1, conv-w>1, conv-k/2<conv-h, conv-k/2<conv-w; got h={} w={} k={})\n", .{ opts.conv_h, opts.conv_w, opts.conv_k });
+        }
+    }
+
     try benchProgramReduceSum(allocator, rnd, opts.iters, opts.n_elem, be);
+    try benchProgramReduceAxisF32(allocator, rnd, opts.iters, opts.m, opts.n, -1, "last", be);
+    try benchProgramReduceAxisF32(allocator, rnd, opts.iters, opts.m, opts.n, 0, "axis0", be);
     try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
     try benchProgramMatmulBatchedF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);
     if (opts.quant) {

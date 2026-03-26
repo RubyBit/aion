@@ -243,6 +243,11 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             const l_out: usize = try convOutDim(l_in, k, cv.stride, cv.dilation, cv.pad_left, cv.pad_right);
 
+            if (cv.pad_mode == .reflect) {
+                if (l_in <= 1) return InferError.InvalidGraph;
+                if (cv.pad_left >= l_in or cv.pad_right >= l_in) return InferError.InvalidGraph;
+            }
+
             if (node.inputs.len == 3) {
                 const b = try getValue(graph, node.inputs[2]);
                 try require(b.dtype != null);
@@ -285,6 +290,12 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             const h_out: usize = try convOutDim(h_in, k_h, cv.stride_h, cv.dilation_h, cv.pad_top, cv.pad_bottom);
             const w_out: usize = try convOutDim(w_in, k_w, cv.stride_w, cv.dilation_w, cv.pad_left, cv.pad_right);
+
+            if (cv.pad_mode == .reflect) {
+                if (h_in <= 1 or w_in <= 1) return InferError.InvalidGraph;
+                if (cv.pad_top >= h_in or cv.pad_bottom >= h_in) return InferError.InvalidGraph;
+                if (cv.pad_left >= w_in or cv.pad_right >= w_in) return InferError.InvalidGraph;
+            }
 
             if (node.inputs.len == 3) {
                 const b = try getValue(graph, node.inputs[2]);
@@ -437,15 +448,70 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, q.dtype.?, out_shape);
         },
 
-        .Reduce => |_| {
+        .Reduce => |rr| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
 
-            // Reduce over all elements. Output is a 1-element rank-1 tensor for now.
-            _ = try elemCount(a.shape);
-            try setInferred(graph, node.output, a.dtype.?, &[_]usize{1});
+            if (rr.axis) |axis_raw| {
+                const rank: usize = a.shape.len;
+                const axis: usize = try normalizeAxis(axis_raw, rank);
+
+                if (rank == 1) {
+                    // v0 keeps rank>=1 tensors; reducing the only axis yields [1].
+                    try setInferred(graph, node.output, a.dtype.?, &[_]usize{1});
+                } else {
+                    var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank - 1) catch return InferError.InvalidGraph;
+                    var src_d: usize = 0;
+                    var dst_d: usize = 0;
+                    while (src_d < rank) : (src_d += 1) {
+                        if (src_d == axis) continue;
+                        out_shape[dst_d] = a.shape[src_d];
+                        dst_d += 1;
+                    }
+                    try setInferred(graph, node.output, a.dtype.?, out_shape);
+                }
+            } else {
+                // Reduce over all elements. Output is a 1-element rank-1 tensor for now.
+                _ = try elemCount(a.shape);
+                try setInferred(graph, node.output, a.dtype.?, &[_]usize{1});
+            }
+        },
+
+        .Concat => |cc| {
+            try require(node.inputs.len >= 1);
+            const first = try getValue(graph, node.inputs[0]);
+            try require(first.dtype != null and first.shape.len != 0);
+            if (first.dtype.?.info().is_quantized) return InferError.Unsupported;
+
+            const rank: usize = first.shape.len;
+            const axis: usize = try normalizeAxis(cc.axis, rank);
+
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
+            @memcpy(out_shape, first.shape);
+
+            var axis_sum: usize = first.shape[axis];
+
+            var i: usize = 1;
+            while (i < node.inputs.len) : (i += 1) {
+                const v = try getValue(graph, node.inputs[i]);
+                try require(v.dtype != null and v.shape.len != 0);
+                if (v.dtype.? != first.dtype.?) return InferError.DTypeMismatch;
+                if (v.dtype.?.info().is_quantized) return InferError.Unsupported;
+                if (v.shape.len != rank) return InferError.RankMismatch;
+
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    if (d == axis) continue;
+                    if (v.shape[d] != first.shape[d]) return InferError.ShapeMismatch;
+                }
+
+                axis_sum = std.math.add(usize, axis_sum, v.shape[axis]) catch return InferError.InvalidGraph;
+            }
+
+            out_shape[axis] = axis_sum;
+            try setInferred(graph, node.output, first.dtype.?, out_shape);
         },
 
         .Copy => {
@@ -460,13 +526,83 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
 
-            if (vr.new_shape.len == 0 or vr.new_shape.len > 2) return InferError.Unsupported;
+            if (vr.new_shape.len == 0) return InferError.Unsupported;
 
             const a_elems: usize = try elemCount(a.shape);
             const b_elems: usize = try elemCount(vr.new_shape);
             if (a_elems != b_elems) return InferError.ShapeMismatch;
 
             try setInferred(graph, node.output, a.dtype.?, vr.new_shape);
+        },
+
+        .ViewSqueeze => |vs| {
+            try require(node.inputs.len == 1);
+            const a = try getValue(graph, node.inputs[0]);
+            try require(a.dtype != null and a.shape.len != 0);
+
+            const rank: usize = a.shape.len;
+            if (vs.axis) |axis_raw| {
+                const axis: usize = try normalizeAxis(axis_raw, rank);
+                if (a.shape[axis] != 1) return InferError.ShapeMismatch;
+
+                if (rank == 1) {
+                    try setInferred(graph, node.output, a.dtype.?, &[_]usize{1});
+                } else {
+                    var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank - 1) catch return InferError.InvalidGraph;
+                    var src_d: usize = 0;
+                    var dst_d: usize = 0;
+                    while (src_d < rank) : (src_d += 1) {
+                        if (src_d == axis) continue;
+                        out_shape[dst_d] = a.shape[src_d];
+                        dst_d += 1;
+                    }
+                    try setInferred(graph, node.output, a.dtype.?, out_shape);
+                }
+            } else {
+                var out_shape_buf: [8]usize = undefined;
+                var out_rank: usize = 0;
+                for (a.shape) |d| {
+                    if (d != 1) {
+                        out_shape_buf[out_rank] = d;
+                        out_rank += 1;
+                    }
+                }
+
+                if (out_rank == 0) {
+                    try setInferred(graph, node.output, a.dtype.?, &[_]usize{1});
+                } else {
+                    try setInferred(graph, node.output, a.dtype.?, out_shape_buf[0..out_rank]);
+                }
+            }
+        },
+
+        .ViewUnsqueeze => |vu| {
+            try require(node.inputs.len == 1);
+            const a = try getValue(graph, node.inputs[0]);
+            try require(a.dtype != null and a.shape.len != 0);
+
+            const out_rank: usize = a.shape.len + 1;
+            if (out_rank > 8) return InferError.Unsupported;
+
+            const out_rank_i32: i32 = @intCast(out_rank);
+            var ax: i32 = vu.axis;
+            if (ax < 0) ax += out_rank_i32;
+            if (ax < 0 or ax >= out_rank_i32) return InferError.InvalidGraph;
+            const axis: usize = @intCast(ax);
+
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, out_rank) catch return InferError.InvalidGraph;
+            var src_d: usize = 0;
+            var dst_d: usize = 0;
+            while (dst_d < out_rank) : (dst_d += 1) {
+                if (dst_d == axis) {
+                    out_shape[dst_d] = 1;
+                } else {
+                    out_shape[dst_d] = a.shape[src_d];
+                    src_d += 1;
+                }
+            }
+
+            try setInferred(graph, node.output, a.dtype.?, out_shape);
         },
 
         .ViewTranspose2D => {
@@ -476,15 +612,19 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, a.dtype.?, &[_]usize{ a.shape[1], a.shape[0] });
         },
 
-        .ViewSlice2D => |sl| {
+        .ViewSliceND => |sl| {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
-            try require(a.dtype != null and a.shape.len == 2);
+            try require(a.dtype != null and a.shape.len != 0);
 
-            if (sl.start0 + sl.len0 > a.shape[0]) return InferError.ShapeMismatch;
-            if (sl.start1 + sl.len1 > a.shape[1]) return InferError.ShapeMismatch;
+            if (sl.starts.len != a.shape.len or sl.lens.len != a.shape.len) return InferError.ShapeMismatch;
+            var d: usize = 0;
+            while (d < a.shape.len) : (d += 1) {
+                if (sl.starts[d] + sl.lens[d] > a.shape[d]) return InferError.ShapeMismatch;
+                if (sl.lens[d] == 0) return InferError.ShapeMismatch;
+            }
 
-            try setInferred(graph, node.output, a.dtype.?, &[_]usize{ sl.len0, sl.len1 });
+            try setInferred(graph, node.output, a.dtype.?, sl.lens);
         },
     }
 }

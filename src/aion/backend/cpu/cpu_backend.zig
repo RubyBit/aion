@@ -283,6 +283,15 @@ pub const CpuBackend = struct {
                     try exec_utils.reduceAllScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, store);
                 },
 
+                .ReduceAxis => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_utils.reduceAxisScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, s.axis, store);
+                },
+
+                .ConcatScalar => |s| {
+                    try exec_utils.concatScalar(s, store);
+                },
+
                 .ReTileCopyScalar => |s| {
                     try exec_utils.retileCopyScalar(store, s.dst, s.src);
                 },
@@ -292,8 +301,9 @@ pub const CpuBackend = struct {
                 .Transpose2DScalar => |s| {
                     try exec_utils.transpose2DCopyScalar(store, s.dst, s.src);
                 },
-                .Slice2DScalar => |s| {
-                    try exec_utils.slice2DCopyScalar(store, s.dst, s.src, s.start0, s.start1);
+                .SliceNDScalar => |s| {
+                    const rank: usize = @as(usize, s.rank);
+                    try exec_utils.sliceNDCopyScalar(store, s.dst, s.src, s.starts[0..rank]);
                 },
             }
         }

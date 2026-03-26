@@ -94,11 +94,17 @@ pub const UnaryOp = enum(u8) {
     silu,
     sigmoid,
     tanh,
+    sqrt,
 };
 
 pub const ReduceOp = enum(u8) {
     sum,
     mean,
+};
+
+pub const PadMode = enum(u8) {
+    zero,
+    reflect,
 };
 
 pub const MatMulParams = struct {

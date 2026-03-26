@@ -101,6 +101,11 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    pub fn sqrt(self: *Self, a: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addUnary(.sqrt, a.value);
+        return .{ .value = out };
+    }
+
     pub fn unary(self: *Self, op: types.UnaryOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addUnary(op, a.value);
         return .{ .value = out };
@@ -142,7 +147,22 @@ pub const Builder = struct {
         pad_right: usize,
         groups: usize,
     ) Error!TensorRef {
-        const out: ValueId = try self.graph.addConv1D(
+        return self.conv1dPadMode(x, w, bias, stride, dilation, pad_left, pad_right, .zero, groups);
+    }
+
+    pub fn conv1dPadMode(
+        self: *Self,
+        x: TensorRef,
+        w: TensorRef,
+        bias: ?TensorRef,
+        stride: usize,
+        dilation: usize,
+        pad_left: usize,
+        pad_right: usize,
+        pad_mode: types.PadMode,
+        groups: usize,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addConv1DWithPadMode(
             x.value,
             w.value,
             if (bias) |b0| b0.value else null,
@@ -150,6 +170,7 @@ pub const Builder = struct {
             dilation,
             pad_left,
             pad_right,
+            pad_mode,
             groups,
         );
         return .{ .value = out };
@@ -170,7 +191,26 @@ pub const Builder = struct {
         pad_right: usize,
         groups: usize,
     ) Error!TensorRef {
-        const out: ValueId = try self.graph.addConv2D(
+        return self.conv2dPadMode(x, w, bias, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, .zero, groups);
+    }
+
+    pub fn conv2dPadMode(
+        self: *Self,
+        x: TensorRef,
+        w: TensorRef,
+        bias: ?TensorRef,
+        stride_h: usize,
+        stride_w: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        pad_top: usize,
+        pad_bottom: usize,
+        pad_left: usize,
+        pad_right: usize,
+        pad_mode: types.PadMode,
+        groups: usize,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addConv2DWithPadMode(
             x.value,
             w.value,
             if (bias) |b0| b0.value else null,
@@ -182,6 +222,7 @@ pub const Builder = struct {
             pad_bottom,
             pad_left,
             pad_right,
+            pad_mode,
             groups,
         );
         return .{ .value = out };
@@ -197,8 +238,47 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    pub fn reduceAxis(self: *Self, op: types.ReduceOp, a: TensorRef, axis: i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addReduceAxis(op, a.value, axis);
+        return .{ .value = out };
+    }
+
+    pub fn concat(self: *Self, tensors: []const TensorRef, axis: i32) Error!TensorRef {
+        if (tensors.len == 0) return Error.InvalidArgument;
+        var ids: [16]ValueId = .{0} ** 16;
+        if (tensors.len > ids.len) return Error.InvalidArgument;
+        var i: usize = 0;
+        while (i < tensors.len) : (i += 1) {
+            ids[i] = tensors[i].value;
+        }
+        const out: ValueId = try self.graph.addConcat(ids[0..tensors.len], axis);
+        return .{ .value = out };
+    }
+
+    pub fn stack(self: *Self, tensors: []const TensorRef, axis: i32) Error!TensorRef {
+        if (tensors.len == 0) return Error.InvalidArgument;
+        var unsq: [16]TensorRef = undefined;
+        if (tensors.len > unsq.len) return Error.InvalidArgument;
+
+        var i: usize = 0;
+        while (i < tensors.len) : (i += 1) {
+            unsq[i] = try self.unsqueeze(tensors[i], axis);
+        }
+        return self.concat(unsq[0..tensors.len], axis);
+    }
+
     pub fn reshape(self: *Self, a: TensorRef, new_shape: []const usize) Error!TensorRef {
         const out: ValueId = try self.graph.addViewReshape(a.value, new_shape);
+        return .{ .value = out };
+    }
+
+    pub fn squeeze(self: *Self, a: TensorRef, axis: ?i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addViewSqueeze(a.value, axis);
+        return .{ .value = out };
+    }
+
+    pub fn unsqueeze(self: *Self, a: TensorRef, axis: i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addViewUnsqueeze(a.value, axis);
         return .{ .value = out };
     }
 
@@ -207,8 +287,12 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    pub fn slice2d(self: *Self, a: TensorRef, start0: usize, len0: usize, start1: usize, len1: usize) Error!TensorRef {
-        const out: ValueId = try self.graph.addViewSlice2D(a.value, start0, len0, start1, len1);
+    pub fn slice(self: *Self, a: TensorRef, starts: []const usize, lens: []const usize) Error!TensorRef {
+        const out: ValueId = try self.graph.addViewSliceND(a.value, starts, lens);
         return .{ .value = out };
+    }
+
+    pub fn slice2d(self: *Self, a: TensorRef, start0: usize, len0: usize, start1: usize, len1: usize) Error!TensorRef {
+        return self.slice(a, &[_]usize{ start0, start1 }, &[_]usize{ len0, len1 });
     }
 };

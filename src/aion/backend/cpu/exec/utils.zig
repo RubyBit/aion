@@ -4,6 +4,7 @@ const types = @import("../../types.zig");
 const reduce_k = @import("../kernels/reduce.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
+const executable = @import("../../../runtime/executable.zig");
 
 const BackendError = types.BackendError;
 const DType = types.DType;
@@ -225,6 +226,7 @@ pub fn decodeLinearToCoords(linear: usize, strides: []const usize, shape: []cons
 
 const TileCacheConstND = struct {
     valid: bool = false,
+    tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefConst = undefined,
     strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
@@ -232,15 +234,17 @@ const TileCacheConstND = struct {
 
 const TileCacheMutND = struct {
     valid: bool = false,
+    tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefMut = undefined,
     strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
 };
 
 fn ensureConstTileLinear(cache: *TileCacheConstND, store: tensor_store.TensorStore, id: tensor_store.TensorId, tile_index: usize, rank: usize) ExecuteProgramError!void {
-    if (cache.valid and cache.tile_index == tile_index) return;
+    if (cache.valid and cache.tensor_id == id and cache.tile_index == tile_index) return;
     if (cache.valid) store.releaseConst(cache.tile.token);
     cache.tile = try store.acquireTileConstLinear(id, tile_index);
+    cache.tensor_id = id;
     cache.tile_index = tile_index;
     cache.valid = true;
     const shape: []const usize = cache.tile.bufferView().layout.shape;
@@ -248,9 +252,10 @@ fn ensureConstTileLinear(cache: *TileCacheConstND, store: tensor_store.TensorSto
 }
 
 fn ensureMutTileLinear(cache: *TileCacheMutND, store: tensor_store.TensorStore, id: tensor_store.TensorId, tile_index: usize, rank: usize) ExecuteProgramError!void {
-    if (cache.valid and cache.tile_index == tile_index) return;
+    if (cache.valid and cache.tensor_id == id and cache.tile_index == tile_index) return;
     if (cache.valid) store.releaseMut(cache.tile.token);
     cache.tile = try store.acquireTileMutLinear(id, tile_index);
+    cache.tensor_id = id;
     cache.tile_index = tile_index;
     cache.valid = true;
     const shape: []const usize = cache.tile.bufferView().layout.shape;
@@ -441,26 +446,219 @@ pub fn transpose2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_sto
     }
 }
 
-pub fn slice2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId, start0: usize, start1: usize) ExecuteProgramError!void {
+pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId, starts: []const usize) ExecuteProgramError!void {
     const dst_meta = try store.meta(dst_id);
     const src_meta = try store.meta(src_id);
-    if (dst_meta.rank > 2 or src_meta.rank > 2) return BackendError.InvalidArgument;
+
+    if (dst_meta.dtype != src_meta.dtype) return BackendError.InvalidArgument;
+    const rank: usize = @as(usize, dst_meta.rank);
+    if (rank == 0 or rank != @as(usize, src_meta.rank) or rank > MAX_RANK) return BackendError.InvalidArgument;
+    if (starts.len != rank) return BackendError.InvalidArgument;
 
     const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
-    var src_cache: ScalarTileCacheConst = .{};
+
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (starts[d] + dst_meta.shape[d] > src_meta.shape[d]) return BackendError.InvalidArgument;
+        if (dst_meta.shape[d] == 0) return BackendError.InvalidArgument;
+    }
+
+    var dst_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    try computePackedStrides(dst_meta.shape, dst_strides[0..rank]);
+
+    var dst_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var src_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var dst_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var dst_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var src_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var src_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var src_cache: TileCacheConstND = .{};
     defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
-    var dst_cache: ScalarTileCacheMut = .{};
+    var dst_cache: TileCacheMutND = .{};
     defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
 
-    var tmp: [4]u8 = .{ 0, 0, 0, 0 };
-    const buf: []u8 = tmp[0..elem_bytes];
+    const total_out: usize = try elemCountFromShape(dst_meta.shape);
+    var lin: usize = 0;
+    while (lin < total_out) : (lin += 1) {
+        try decodeLinearToCoords(lin, dst_strides[0..rank], dst_meta.shape, dst_coords[0..rank]);
 
-    var r0: usize = 0;
-    while (r0 < dst_meta.shape[0]) : (r0 += 1) {
-        var c0: usize = 0;
-        while (c0 < dst_meta.shape[1]) : (c0 += 1) {
-            try readScalarBytesAt(store, src_meta, src_id, elem_bytes, start0 + r0, start1 + c0, &src_cache, buf);
-            try writeScalarBytesAt(store, dst_meta, dst_id, elem_bytes, r0, c0, &dst_cache, buf);
+        d = 0;
+        while (d < rank) : (d += 1) {
+            src_coords[d] = starts[d] + dst_coords[d];
+
+            dst_tile_coords[d] = dst_coords[d] / dst_meta.tile_shape[d];
+            dst_local_coords[d] = dst_coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
+
+            src_tile_coords[d] = src_coords[d] / src_meta.tile_shape[d];
+            src_local_coords[d] = src_coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
+        }
+
+        const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..rank]);
+        const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..rank]);
+
+        try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, rank);
+        try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, rank);
+
+        var dst_local_lin: usize = 0;
+        var src_local_lin: usize = 0;
+        d = 0;
+        while (d < rank) : (d += 1) {
+            dst_local_lin = std.math.add(usize, dst_local_lin, dst_local_coords[d] * dst_cache.strides[d]) catch return BackendError.InvalidArgument;
+            src_local_lin = std.math.add(usize, src_local_lin, src_local_coords[d] * src_cache.strides[d]) catch return BackendError.InvalidArgument;
+        }
+
+        const dst_off: usize = dst_local_lin * elem_bytes;
+        const src_off: usize = src_local_lin * elem_bytes;
+        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + elem_bytes], src_cache.tile.bytes[src_off .. src_off + elem_bytes]);
+    }
+}
+
+pub fn concatScalar(step: executable.StepConcatScalar, store: tensor_store.TensorStore) ExecuteProgramError!void {
+    const out_meta = try store.meta(step.out);
+    const rank: usize = @as(usize, out_meta.rank);
+    if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
+    if (step.axis >= rank) return BackendError.InvalidArgument;
+
+    const count: usize = @as(usize, step.input_count);
+    if (count == 0) return BackendError.InvalidArgument;
+
+    const elem_bytes: usize = try scalarElemBytes(out_meta.dtype);
+
+    var out_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var in_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var out_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var out_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var in_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var in_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var in_axis_offsets: [16]usize = .{0} ** 16;
+    var in_metas: [16]tensor_store.TensorMeta = undefined;
+    var non_axis_dims: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var non_axis_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var non_axis_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var non_axis_count: usize = 0;
+
+    var axis_sum: usize = 0;
+    var prefix_total: usize = 1;
+    var d_init: usize = 0;
+    while (d_init < rank) : (d_init += 1) {
+        if (d_init == step.axis) continue;
+        non_axis_dims[non_axis_count] = d_init;
+        non_axis_shape[non_axis_count] = out_meta.shape[d_init];
+        non_axis_count += 1;
+        prefix_total = std.math.mul(usize, prefix_total, out_meta.shape[d_init]) catch return BackendError.InvalidArgument;
+    }
+    if (non_axis_count > 1) {
+        try computePackedStrides(non_axis_shape[0..non_axis_count], non_axis_strides[0..non_axis_count]);
+    }
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const in_id: tensor_store.TensorId = step.inputs[i];
+        const m = try store.meta(in_id);
+        in_metas[i] = m;
+
+        if (m.dtype != out_meta.dtype) return BackendError.InvalidArgument;
+        if (@as(usize, m.rank) != rank) return BackendError.InvalidArgument;
+
+        var d: usize = 0;
+        while (d < rank) : (d += 1) {
+            if (d == step.axis) continue;
+            if (m.shape[d] != out_meta.shape[d]) return BackendError.InvalidArgument;
+        }
+
+        in_axis_offsets[i] = axis_sum;
+        axis_sum = std.math.add(usize, axis_sum, m.shape[step.axis]) catch return BackendError.InvalidArgument;
+    }
+    if (axis_sum != out_meta.shape[step.axis]) return BackendError.InvalidArgument;
+
+    var out_cache: TileCacheMutND = .{};
+    defer if (out_cache.valid) store.releaseMut(out_cache.tile.token);
+    var in_cache: TileCacheConstND = .{};
+    defer if (in_cache.valid) store.releaseConst(in_cache.tile.token);
+
+    var p: usize = 0;
+    while (p < prefix_total) : (p += 1) {
+        var rem: usize = p;
+        if (non_axis_count > 0) {
+            var nd: usize = 0;
+            while (nd < non_axis_count) : (nd += 1) {
+                const dim: usize = non_axis_dims[nd];
+                const coord: usize = if (non_axis_count == 1) rem else rem / non_axis_strides[nd];
+                if (coord >= out_meta.shape[dim]) return BackendError.InvalidArgument;
+                out_coords[dim] = coord;
+                in_coords[dim] = coord;
+                if (non_axis_count != 1) rem -= coord * non_axis_strides[nd];
+            }
+        }
+
+        var src_idx: usize = 0;
+        while (src_idx < count) : (src_idx += 1) {
+            const src_meta: tensor_store.TensorMeta = in_metas[src_idx];
+            const src_axis_len: usize = src_meta.shape[step.axis];
+            const dst_axis_base: usize = in_axis_offsets[src_idx];
+
+            var dst_axis_pos: usize = dst_axis_base;
+            var src_axis_pos: usize = 0;
+            var left: usize = src_axis_len;
+            while (left > 0) {
+                out_coords[step.axis] = dst_axis_pos;
+                in_coords[step.axis] = src_axis_pos;
+
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    out_tile_coords[d] = out_coords[d] / out_meta.tile_shape[d];
+                    out_local_coords[d] = out_coords[d] - out_tile_coords[d] * out_meta.tile_shape[d];
+
+                    in_tile_coords[d] = in_coords[d] / src_meta.tile_shape[d];
+                    in_local_coords[d] = in_coords[d] - in_tile_coords[d] * src_meta.tile_shape[d];
+                }
+
+                const out_tile_index: usize = try tensor_store.encodeTileIndex(out_meta, out_tile_coords[0..rank]);
+                const in_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, in_tile_coords[0..rank]);
+
+                try ensureMutTileLinear(&out_cache, store, step.out, out_tile_index, rank);
+                try ensureConstTileLinear(&in_cache, store, step.inputs[src_idx], in_tile_index, rank);
+
+                const out_view = out_cache.tile.bufferView();
+                const in_view = in_cache.tile.bufferView();
+
+                const out_run_max: usize = out_view.layout.shape[step.axis] - out_local_coords[step.axis];
+                const in_run_max: usize = in_view.layout.shape[step.axis] - in_local_coords[step.axis];
+                var run_len: usize = left;
+                if (run_len > out_run_max) run_len = out_run_max;
+                if (run_len > in_run_max) run_len = in_run_max;
+                if (run_len == 0) return BackendError.InvalidArgument;
+
+                var out_local_lin: usize = 0;
+                var in_local_lin: usize = 0;
+                d = 0;
+                while (d < rank) : (d += 1) {
+                    out_local_lin = std.math.add(usize, out_local_lin, out_local_coords[d] * out_cache.strides[d]) catch return BackendError.InvalidArgument;
+                    in_local_lin = std.math.add(usize, in_local_lin, in_local_coords[d] * in_cache.strides[d]) catch return BackendError.InvalidArgument;
+                }
+
+                if (out_cache.strides[step.axis] == 1 and in_cache.strides[step.axis] == 1) {
+                    const out_off: usize = out_local_lin * elem_bytes;
+                    const in_off: usize = in_local_lin * elem_bytes;
+                    const bytes: usize = run_len * elem_bytes;
+                    @memcpy(out_cache.tile.bytes[out_off .. out_off + bytes], in_cache.tile.bytes[in_off .. in_off + bytes]);
+                } else {
+                    var r: usize = 0;
+                    while (r < run_len) : (r += 1) {
+                        const out_elem_lin: usize = out_local_lin + r * out_cache.strides[step.axis];
+                        const in_elem_lin: usize = in_local_lin + r * in_cache.strides[step.axis];
+                        const out_off: usize = out_elem_lin * elem_bytes;
+                        const in_off: usize = in_elem_lin * elem_bytes;
+                        @memcpy(out_cache.tile.bytes[out_off .. out_off + elem_bytes], in_cache.tile.bytes[in_off .. in_off + elem_bytes]);
+                    }
+                }
+
+                dst_axis_pos += run_len;
+                src_axis_pos += run_len;
+                left -= run_len;
+            }
         }
     }
 }
@@ -579,4 +777,287 @@ pub fn reduceAllScalar(
         .f16 => @as(*align(1) f16, @ptrCast(out_view.bytes.ptr)).* = @floatCast(@as(f32, @floatCast(result_f64))),
         else => return BackendError.InvalidArgument,
     }
+}
+
+pub fn reduceAxisScalar(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    scratch_f32: []f32,
+    op: types.ReduceOp,
+    out_id: tensor_store.TensorId,
+    a_id: tensor_store.TensorId,
+    axis: usize,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    const out_meta = try store.meta(out_id);
+    const a_meta = try store.meta(a_id);
+
+    if (out_meta.dtype != a_meta.dtype) return BackendError.InvalidArgument;
+    if (a_meta.rank == 0 or a_meta.rank > MAX_RANK) return BackendError.InvalidArgument;
+    const in_rank: usize = @as(usize, a_meta.rank);
+    if (axis >= in_rank) return BackendError.InvalidArgument;
+
+    const out_rank_expected: usize = if (in_rank == 1) 1 else in_rank - 1;
+    if (@as(usize, out_meta.rank) != out_rank_expected) return BackendError.InvalidArgument;
+
+    const axis_len: usize = a_meta.shape[axis];
+    if (axis_len == 0) return BackendError.InvalidArgument;
+
+    const elem_bytes: usize = try scalarElemBytes(a_meta.dtype);
+
+    var out_tile_total: usize = 1;
+    var d_tot: usize = 0;
+    while (d_tot < out_rank_expected) : (d_tot += 1) {
+        out_tile_total = std.math.mul(usize, out_tile_total, out_meta.tile_counts[d_tot]) catch return BackendError.InvalidArgument;
+    }
+
+    var out_tile_count_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    try computePackedStrides(out_meta.tile_counts[0..out_rank_expected], out_tile_count_strides[0..out_rank_expected]);
+
+    const maybe_parallel: bool = pool != null and thread_count > 1 and scratch_f32.len >= thread_count and out_tile_total >= 2 and shouldParallelTiles(thread_count, out_tile_total, tileByteSize(out_meta), 256 * 1024);
+
+    const Task = struct {
+        store: tensor_store.TensorStore,
+        op: types.ReduceOp,
+        axis: usize,
+        axis_len: usize,
+        out_id: tensor_store.TensorId,
+        a_id: tensor_store.TensorId,
+        out_meta: tensor_store.TensorMeta,
+        a_meta: tensor_store.TensorMeta,
+        in_rank: usize,
+        out_rank: usize,
+        elem_bytes: usize,
+        out_tile_count_strides: [MAX_RANK]usize,
+
+        stop: std.atomic.Value(bool) = .init(false),
+        err_mutex: std.Thread.Mutex = .{},
+        err_any: ?anyerror = null,
+
+        fn fail(t: *@This(), err: anyerror) void {
+            if (t.stop.swap(true, .acq_rel)) return;
+            t.err_mutex.lock();
+            defer t.err_mutex.unlock();
+            if (t.err_any == null) t.err_any = err;
+        }
+
+        fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+            _ = tid;
+            const t: *@This() = @ptrCast(@alignCast(ctx_any));
+            if (start >= end) return;
+            if (t.stop.load(.acquire)) return;
+
+            var out_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var out_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var out_global_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var in_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var in_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var in_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+            var in_cache: TileCacheConstND = .{};
+            defer if (in_cache.valid) t.store.releaseConst(in_cache.tile.token);
+
+            var tile_index: usize = start;
+            while (tile_index < end) : (tile_index += 1) {
+                if (t.stop.load(.acquire)) return;
+
+                decodeLinearToCoords(tile_index, t.out_tile_count_strides[0..t.out_rank], t.out_meta.tile_counts[0..t.out_rank], out_tile_coords[0..t.out_rank]) catch |e| {
+                    t.fail(e);
+                    return;
+                };
+
+                var out_tile = t.store.acquireTileMutLinear(t.out_id, tile_index) catch |e| {
+                    t.fail(e);
+                    return;
+                };
+                defer t.store.releaseMut(out_tile.token);
+
+                const out_view = out_tile.bufferView();
+                const tile_shape: []const usize = out_view.layout.shape;
+
+                var out_local_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                computePackedStrides(tile_shape, out_local_strides[0..t.out_rank]) catch |e| {
+                    t.fail(e);
+                    return;
+                };
+
+                const tile_elems: usize = elemCountFromTileView(out_view);
+                var local_lin: usize = 0;
+                while (local_lin < tile_elems) : (local_lin += 1) {
+                    decodeLinearToCoords(local_lin, out_local_strides[0..t.out_rank], tile_shape, out_local_coords[0..t.out_rank]) catch |e| {
+                        t.fail(e);
+                        return;
+                    };
+
+                    var od: usize = 0;
+                    while (od < t.out_rank) : (od += 1) {
+                        out_global_coords[od] = out_tile_coords[od] * t.out_meta.tile_shape[od] + out_local_coords[od];
+                    }
+
+                    if (t.in_rank == 1) {
+                        in_coords[0] = 0;
+                    } else {
+                        var src_d: usize = 0;
+                        var dst_d: usize = 0;
+                        while (src_d < t.in_rank) : (src_d += 1) {
+                            if (src_d == t.axis) continue;
+                            in_coords[src_d] = out_global_coords[dst_d];
+                            dst_d += 1;
+                        }
+                    }
+
+                    var acc: f64 = 0.0;
+                    var a_i: usize = 0;
+
+                    // Fast path: if reducing over innermost axis, values within a tile segment
+                    // are contiguous and can use SIMD range-reduction kernels.
+                    if (t.axis + 1 == t.in_rank) {
+                        while (a_i < t.axis_len) {
+                            in_coords[t.axis] = a_i;
+
+                            var d_in: usize = 0;
+                            while (d_in < t.in_rank) : (d_in += 1) {
+                                in_tile_coords[d_in] = in_coords[d_in] / t.a_meta.tile_shape[d_in];
+                                in_local_coords[d_in] = in_coords[d_in] - in_tile_coords[d_in] * t.a_meta.tile_shape[d_in];
+                            }
+
+                            const in_tile_index: usize = tensor_store.encodeTileIndex(t.a_meta, in_tile_coords[0..t.in_rank]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+
+                            ensureConstTileLinear(&in_cache, t.store, t.a_id, in_tile_index, t.in_rank) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+
+                            var in_local_lin: usize = 0;
+                            var d_lin: usize = 0;
+                            while (d_lin < t.in_rank) : (d_lin += 1) {
+                                in_local_lin = std.math.add(usize, in_local_lin, in_local_coords[d_lin] * in_cache.strides[d_lin]) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+
+                            const run_max: usize = t.a_meta.tile_shape[t.axis] - in_local_coords[t.axis];
+                            const remain: usize = t.axis_len - a_i;
+                            const run_len: usize = if (run_max < remain) run_max else remain;
+
+                            const seg_start: usize = in_local_lin;
+                            const seg_end: usize = in_local_lin + run_len;
+                            const part: f32 = switch (t.a_meta.dtype) {
+                                .f32 => reduce_k.sumF32Range(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                },
+                                .f16 => reduce_k.sumF16RangeToF32(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                },
+                                else => {
+                                    t.fail(BackendError.InvalidArgument);
+                                    return;
+                                },
+                            };
+
+                            acc += @as(f64, part);
+                            a_i += run_len;
+                        }
+                    } else {
+                        // Generic fallback for arbitrary axis: scalar gather.
+                        while (a_i < t.axis_len) : (a_i += 1) {
+                            in_coords[t.axis] = a_i;
+
+                            var d_in: usize = 0;
+                            while (d_in < t.in_rank) : (d_in += 1) {
+                                in_tile_coords[d_in] = in_coords[d_in] / t.a_meta.tile_shape[d_in];
+                                in_local_coords[d_in] = in_coords[d_in] - in_tile_coords[d_in] * t.a_meta.tile_shape[d_in];
+                            }
+
+                            const in_tile_index: usize = tensor_store.encodeTileIndex(t.a_meta, in_tile_coords[0..t.in_rank]) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+
+                            ensureConstTileLinear(&in_cache, t.store, t.a_id, in_tile_index, t.in_rank) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+
+                            var in_local_lin: usize = 0;
+                            var d_lin: usize = 0;
+                            while (d_lin < t.in_rank) : (d_lin += 1) {
+                                in_local_lin = std.math.add(usize, in_local_lin, in_local_coords[d_lin] * in_cache.strides[d_lin]) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+
+                            const in_off: usize = in_local_lin * t.elem_bytes;
+                            switch (t.a_meta.dtype) {
+                                .f32 => {
+                                    const v: f32 = @as(*align(1) const f32, @ptrCast(in_cache.tile.bytes[in_off .. in_off + 4].ptr)).*;
+                                    acc += @as(f64, v);
+                                },
+                                .f16 => {
+                                    const v: f16 = @as(*align(1) const f16, @ptrCast(in_cache.tile.bytes[in_off .. in_off + 2].ptr)).*;
+                                    acc += @as(f64, @floatCast(v));
+                                },
+                                else => {
+                                    t.fail(BackendError.InvalidArgument);
+                                    return;
+                                },
+                            }
+                        }
+                    }
+
+                    if (t.op == .mean) {
+                        acc /= @as(f64, @floatFromInt(t.axis_len));
+                    }
+
+                    const out_off: usize = local_lin * t.elem_bytes;
+                    switch (t.out_meta.dtype) {
+                        .f32 => {
+                            @as(*align(1) f32, @ptrCast(out_view.bytes[out_off .. out_off + 4].ptr)).* = @floatCast(acc);
+                        },
+                        .f16 => {
+                            @as(*align(1) f16, @ptrCast(out_view.bytes[out_off .. out_off + 2].ptr)).* = @floatCast(@as(f32, @floatCast(acc)));
+                        },
+                        else => {
+                            t.fail(BackendError.InvalidArgument);
+                            return;
+                        },
+                    }
+                }
+            }
+        }
+    };
+
+    var task: Task = .{
+        .store = store,
+        .op = op,
+        .axis = axis,
+        .axis_len = axis_len,
+        .out_id = out_id,
+        .a_id = a_id,
+        .out_meta = out_meta,
+        .a_meta = a_meta,
+        .in_rank = in_rank,
+        .out_rank = out_rank_expected,
+        .elem_bytes = elem_bytes,
+        .out_tile_count_strides = out_tile_count_strides,
+    };
+
+    if (maybe_parallel) {
+        const p: *thread_pool.ThreadPool = pool.?;
+        var grain: usize = @max(@as(usize, 1), out_tile_total / (thread_count * 4));
+        if (grain > out_tile_total) grain = out_tile_total;
+        p.parallelForAny(@ptrCast(&task), out_tile_total, grain, Task.runTiles);
+        if (task.err_any) |e| return @errorCast(e);
+        return;
+    }
+
+    Task.runTiles(@ptrCast(&task), 0, out_tile_total, 0);
+    if (task.err_any) |e| return @errorCast(e);
 }

@@ -7,6 +7,7 @@ const gelu_k = @import("kernels/gelu.zig");
 const silu_k = @import("kernels/silu.zig");
 const sigmoid_k = @import("kernels/sigmoid.zig");
 const tanh_k = @import("kernels/tanh.zig");
+const sqrt_k = @import("kernels/sqrt.zig");
 const softmax_k = @import("kernels/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
@@ -216,6 +217,29 @@ test "cpu kernels: unary gelu f32 properties and accuracy" {
     for (x, 0..) |v, idx| ref[idx] = geluTanhApproxRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
     try std.testing.expect(max_abs <= 6e-2);
+}
+
+test "cpu kernels: unary sqrt f32 and f16" {
+    var x = [_]f32{ 0.0, 0.25, 1.0, 2.25, 16.0, 81.0 };
+    var out = [_]f32{0.0} ** x.len;
+    try sqrt_k.sqrtF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
+
+    for (x, out) |v, got| {
+        const ref: f32 = @sqrt(v);
+        try std.testing.expectApproxEqAbs(ref, got, 1e-6);
+    }
+
+    var xh: [x.len]f16 = undefined;
+    var outh: [x.len]f16 = undefined;
+    for (x, 0..) |v, i| xh[i] = @floatCast(v);
+
+    try sqrt_k.sqrtF16(std.mem.sliceAsBytes(outh[0..]), std.mem.sliceAsBytes(xh[0..]), xh.len);
+
+    for (x, outh) |v, got_h| {
+        const ref: f32 = @sqrt(v);
+        const got: f32 = @floatCast(got_h);
+        try std.testing.expectApproxEqAbs(ref, got, 2e-3);
+    }
 }
 
 fn softmaxRefRowF32(out: []f32, x: []const f32) void {

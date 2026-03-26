@@ -7,6 +7,7 @@ const gelu_k = @import("../kernels/gelu.zig");
 const silu_k = @import("../kernels/silu.zig");
 const sigmoid_k = @import("../kernels/sigmoid.zig");
 const tanh_k = @import("../kernels/tanh.zig");
+const sqrt_k = @import("../kernels/sqrt.zig");
 
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
@@ -133,6 +134,7 @@ fn dispatchF32(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) Back
         .silu => silu_k.siluF32(out_bytes, a_bytes, n),
         .sigmoid => sigmoid_k.sigmoidF32(out_bytes, a_bytes, n),
         .tanh => tanh_k.tanhF32(out_bytes, a_bytes, n),
+        .sqrt => sqrt_k.sqrtF32(out_bytes, a_bytes, n),
     };
 }
 
@@ -143,5 +145,6 @@ fn dispatchF16(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) Back
         .silu => silu_k.siluF16(out_bytes, a_bytes, n),
         .sigmoid => sigmoid_k.sigmoidF16(out_bytes, a_bytes, n),
         .tanh => tanh_k.tanhF16(out_bytes, a_bytes, n),
+        .sqrt => sqrt_k.sqrtF16(out_bytes, a_bytes, n),
     };
 }

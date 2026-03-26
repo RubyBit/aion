@@ -159,6 +159,161 @@ test "api: context constructors + tensor typed IO" {
     try std.testing.expectError(manager_mod.StorageError.InvalidArgument, tf16.write(bad[0..]));
 }
 
+test "api: reduceAxis mean over last dim" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x_t: api.Tensor = try ctx.fromArray([2][3]f32{
+        .{ 1.0, 2.0, 3.0 },
+        .{ 4.0, 5.0, 6.0 },
+    });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+    const Y: api.TensorRef = try bld.reduceAxis(.mean, X, -1);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{2}, out_t.getShape());
+
+    var out_vals: [2]f32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out_vals[1], 1e-6);
+}
+
+test "api: squeeze and unsqueeze roundtrip" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x_t: api.Tensor = try ctx.fromArray([1][2][1][3]f32{
+        .{
+            .{
+                .{ 1.0, 2.0, 3.0 },
+            },
+            .{
+                .{ 4.0, 5.0, 6.0 },
+            },
+        },
+    });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+
+    const S: api.TensorRef = try bld.squeeze(X, null);
+    const U0: api.TensorRef = try bld.unsqueeze(S, 0);
+    const U1: api.TensorRef = try bld.unsqueeze(U0, 2);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ U1, S });
+    defer model.deinit();
+
+    const out_u: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 1, 3 }, out_u.getShape());
+
+    var out_u_vals: [1 * 2 * 1 * 3]f32 = undefined;
+    try out_u.read(&out_u_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 }, out_u_vals[0..]);
+
+    const out_s: api.Tensor = model.outputTensor(1);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, out_s.getShape());
+
+    // Invalid squeeze axis (dimension != 1) is validated during infer/compile.
+    var bld_bad = api.Builder.init(allocator);
+    defer bld_bad.deinit();
+    const X_bad: api.TensorRef = try bld_bad.param(x_t);
+    const S_bad: api.TensorRef = try bld_bad.squeeze(X_bad, null);
+    const Bad: api.TensorRef = try bld_bad.squeeze(S_bad, 1);
+    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld_bad, &[_]api.TensorRef{Bad}));
+}
+
+test "api: generic nd slice" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x_t: api.Tensor = try ctx.fromArray([2][3][4]f32{
+        .{
+            .{ 1.0, 2.0, 3.0, 4.0 },
+            .{ 5.0, 6.0, 7.0, 8.0 },
+            .{ 9.0, 10.0, 11.0, 12.0 },
+        },
+        .{
+            .{ 13.0, 14.0, 15.0, 16.0 },
+            .{ 17.0, 18.0, 19.0, 20.0 },
+            .{ 21.0, 22.0, 23.0, 24.0 },
+        },
+    });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+    const S: api.TensorRef = try bld.slice(X, &[_]usize{ 1, 1, 0 }, &[_]usize{ 1, 2, 3 });
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{S});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 3 }, out_t.getShape());
+
+    var out_vals: [1 * 2 * 3]f32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 17.0, 18.0, 19.0, 21.0, 22.0, 23.0 }, out_vals[0..]);
+}
+
+test "api: concat and stack" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const a_t: api.Tensor = try ctx.fromArray([2][2]f32{ .{ 1.0, 2.0 }, .{ 3.0, 4.0 } });
+    const b_t: api.Tensor = try ctx.fromArray([2][1]f32{ .{10.0}, .{20.0} });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const A: api.TensorRef = try bld.param(a_t);
+    const B: api.TensorRef = try bld.param(b_t);
+
+    const C: api.TensorRef = try bld.concat(&[_]api.TensorRef{ A, B }, 1);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{C});
+    defer model.deinit();
+
+    const out_c: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, out_c.getShape());
+    var c_vals: [6]f32 = undefined;
+    try out_c.read(&c_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 10.0, 3.0, 4.0, 20.0 }, c_vals[0..]);
+
+    var bld2 = api.Builder.init(allocator);
+    defer bld2.deinit();
+    const A2: api.TensorRef = try bld2.param(a_t);
+    const B2: api.TensorRef = try bld2.param(a_t);
+    const S: api.TensorRef = try bld2.stack(&[_]api.TensorRef{ A2, B2 }, 0);
+
+    var model2 = try ctx.compile(&bld2, &[_]api.TensorRef{S});
+    defer model2.deinit();
+
+    const out_s: api.Tensor = try model2.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 2, 2 }, out_s.getShape());
+    var s_vals: [8]f32 = undefined;
+    try out_s.read(&s_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 }, s_vals[0..]);
+}
+
 test "api: model outputCount/outputTensor + builder.name" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

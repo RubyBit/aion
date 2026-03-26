@@ -2,6 +2,7 @@ const std = @import("std");
 
 const api_builder = @import("builder.zig");
 const api_tensor = @import("tensor.zig");
+const types = @import("../backend/types.zig");
 
 pub const Builder = api_builder.Builder;
 pub const TensorRef = api_builder.TensorRef;
@@ -52,6 +53,7 @@ pub const Conv2D = struct {
         pad_bottom: usize = 0,
         pad_left: usize = 0,
         pad_right: usize = 0,
+        pad_mode: types.PadMode = .zero,
         groups: usize = 1,
     };
 
@@ -63,7 +65,7 @@ pub const Conv2D = struct {
 
     /// NHWC conv2d (channel-last) with weight layout [k_h, k_w, c_in/groups, c_out].
     pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-        return bld.conv2d(
+        return bld.conv2dPadMode(
             x,
             self.w,
             self.b,
@@ -75,6 +77,7 @@ pub const Conv2D = struct {
             self.opts.pad_bottom,
             self.opts.pad_left,
             self.opts.pad_right,
+            self.opts.pad_mode,
             self.opts.groups,
         );
     }

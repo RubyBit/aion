@@ -35,6 +35,19 @@ fn bytesAsF32Mut(bytes: []u8) []align(1) f32 {
     return ptr[0 .. bytes.len / @sizeOf(f32)];
 }
 
+inline fn reflectIndex1D(idx_nom: isize, len: usize) usize {
+    const l: isize = @intCast(len);
+    var x: isize = idx_nom;
+    while (x < 0 or x >= l) {
+        if (x < 0) {
+            x = -x;
+        } else {
+            x = (2 * l - 2) - x;
+        }
+    }
+    return @intCast(x);
+}
+
 fn tryExecConv1DDepthwiseTileNative(
     ctx: *ConvExecCtx,
     s: StepConv1DTiled,
@@ -272,10 +285,10 @@ fn tryExecConv1DDepthwiseTileNative(
     const x_tl: usize = x_meta.tile_shape[1];
     const w_tk: usize = w_meta.tile_shape[0];
 
-    const fast_stride1_dil1: bool = (s.stride == 1 and s.dilation == 1 and x_ltc == 1 and w_ktc == 1);
+    const fast_stride1_dil1: bool = (s.pad_mode != .reflect and s.stride == 1 and s.dilation == 1 and x_ltc == 1 and w_ktc == 1);
 
     var task: conv1d_kernels.DepthwiseConv1DTask = .{
-        .p = .{ .stride = s.stride, .dilation = s.dilation, .pad_left = s.pad_left },
+        .p = .{ .stride = s.stride, .dilation = s.dilation, .pad_left = s.pad_left, .reflect = s.pad_mode == .reflect },
         .batch = batch,
         .l_in = l_in,
         .l_out = l_out,
@@ -318,6 +331,7 @@ fn tryExecConv1DImplicitGemmTileNative(
     w_meta: tensor_store.TensorMeta,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!bool {
+    // Support reflect padding inside the same tile-native packing loop.
     // Tile-native fast path (Conv1D NLC-style channel-last).
     // Goals:
     // - avoid packed-scalar read/write of X/out
@@ -569,6 +583,17 @@ fn tryExecConv1DImplicitGemmTileNative(
         full_blocks: usize,
         k_tail: usize,
 
+        inline fn reflectIndex(idx_nom: isize, len: isize) isize {
+            // len must be > 1 (validated in infer/program for reflect)
+            var x: isize = idx_nom;
+            while (x < 0 or x >= len) {
+                // Reflect padding semantics used by our reference tests.
+                // Note: this mapping reflects around the edge including index 0.
+                if (x < 0) x = -x else x = (2 * len - 2) - x;
+            }
+            return x;
+        }
+
         fn runItemRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
             @setRuntimeSafety(false);
 
@@ -579,6 +604,7 @@ fn tryExecConv1DImplicitGemmTileNative(
             const packed_a_buf: []align(32) f32 = @alignCast(scratch_f32[pb_elems .. pb_elems + pa_elems]);
 
             const l_in_i: isize = @as(isize, @intCast(t.l_in));
+            const use_reflect: bool = (t.s.pad_mode == .reflect);
             const max_l: isize = @as(isize, @intCast((t.k - 1) * t.s.dilation));
             const max_l_u: usize = @intCast(max_l);
             const dilation_u: usize = t.s.dilation;
@@ -674,24 +700,36 @@ fn tryExecConv1DImplicitGemmTileNative(
                                             @memcpy(dst, xt.vals[src0 .. src0 + take]);
                                         }
                                     } else {
-                                        const li: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
-                                        if (li >= 0 and li < l_in_i) {
+                                        // Edge / padding.
+                                        const li_nom: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
+                                        if (use_reflect) {
+                                            // Reflect always maps into range (given validated constraints).
+                                            const li: isize = reflectIndex(li_nom, l_in_i);
                                             const li_u: usize = @intCast(li);
                                             const xlti: usize = li_u / t.x_tl;
-                                            if (xlti < t.x_ltc) {
-                                                const li_l: usize = li_u - xlti * t.x_tl;
-                                                const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                                if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
-                                                    const src0: usize = li_l * xt.row_stride + ic0;
-                                                    @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                            const li_l: usize = li_u - xlti * t.x_tl;
+                                            const xt: XTile = t.x_tiles[b_x_off + xlti];
+                                            const src0: usize = li_l * xt.row_stride + ic0;
+                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                        } else {
+                                            if (li_nom >= 0 and li_nom < l_in_i) {
+                                                const li_u: usize = @intCast(li_nom);
+                                                const xlti: usize = li_u / t.x_tl;
+                                                if (xlti < t.x_ltc) {
+                                                    const li_l: usize = li_u - xlti * t.x_tl;
+                                                    const xt: XTile = t.x_tiles[b_x_off + xlti];
+                                                    if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
+                                                        const src0: usize = li_l * xt.row_stride + ic0;
+                                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                                    } else {
+                                                        @memset(dst, 0.0);
+                                                    }
                                                 } else {
                                                     @memset(dst, 0.0);
                                                 }
                                             } else {
                                                 @memset(dst, 0.0);
                                             }
-                                        } else {
-                                            @memset(dst, 0.0);
                                         }
                                     }
 
@@ -784,24 +822,34 @@ fn tryExecConv1DImplicitGemmTileNative(
                                         @memcpy(dst, xt.vals[src0 .. src0 + take]);
                                     }
                                 } else {
-                                    const li: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
-                                    if (li >= 0 and li < l_in_i) {
+                                    const li_nom: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
+                                    if (use_reflect) {
+                                        const li: isize = reflectIndex(li_nom, l_in_i);
                                         const li_u: usize = @intCast(li);
                                         const xlti: usize = li_u / t.x_tl;
-                                        if (xlti < t.x_ltc) {
-                                            const li_l: usize = li_u - xlti * t.x_tl;
-                                            const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                            if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
-                                                const src0: usize = li_l * xt.row_stride + ic0;
-                                                @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                        const li_l: usize = li_u - xlti * t.x_tl;
+                                        const xt: XTile = t.x_tiles[b_x_off + xlti];
+                                        const src0: usize = li_l * xt.row_stride + ic0;
+                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                    } else {
+                                        if (li_nom >= 0 and li_nom < l_in_i) {
+                                            const li_u: usize = @intCast(li_nom);
+                                            const xlti: usize = li_u / t.x_tl;
+                                            if (xlti < t.x_ltc) {
+                                                const li_l: usize = li_u - xlti * t.x_tl;
+                                                const xt: XTile = t.x_tiles[b_x_off + xlti];
+                                                if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
+                                                    const src0: usize = li_l * xt.row_stride + ic0;
+                                                    @memcpy(dst, xt.vals[src0 .. src0 + take]);
+                                                } else {
+                                                    @memset(dst, 0.0);
+                                                }
                                             } else {
                                                 @memset(dst, 0.0);
                                             }
                                         } else {
                                             @memset(dst, 0.0);
                                         }
-                                    } else {
-                                        @memset(dst, 0.0);
                                     }
                                 }
 
@@ -1121,6 +1169,8 @@ fn execConv1DImplicitGemm(
             defer t.alloc.free(lo_idx);
             const tile_stride: usize = m_cap_local * t.oc_tile_max;
             const bias_present: bool = (t.bias.len != 0);
+            const use_reflect: bool = (t.s.pad_mode == .reflect);
+            const l_in_i: isize = @as(isize, @intCast(t.params.l_in));
 
             var row0: usize = start;
             while (row0 < end) {
@@ -1185,12 +1235,15 @@ fn execConv1DImplicitGemm(
 
                                         const pos0: usize = lo * t.s.stride + kw * t.s.dilation;
                                         var xv: f32 = 0.0;
-                                        if (pos0 >= t.s.pad_left) {
-                                            const li: usize = pos0 - t.s.pad_left;
-                                            if (li < t.params.l_in) {
-                                                const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
-                                                xv = t.x[x_idx];
-                                            }
+                                        const li_nom: isize = @as(isize, @intCast(pos0)) - @as(isize, @intCast(t.s.pad_left));
+                                        if (use_reflect) {
+                                            const li: usize = reflectIndex1D(li_nom, t.params.l_in);
+                                            const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                            xv = t.x[x_idx];
+                                        } else if (li_nom >= 0 and li_nom < l_in_i) {
+                                            const li: usize = @intCast(li_nom);
+                                            const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                            xv = t.x[x_idx];
                                         }
                                         a_panel[mr * k_sub + kl] = xv;
                                     }
@@ -1237,12 +1290,15 @@ fn execConv1DImplicitGemm(
 
                                             const pos0: usize = lo + kw;
                                             var xv: f32 = 0.0;
-                                            if (pos0 >= t.s.pad_left) {
-                                                const li: usize = pos0 - t.s.pad_left;
-                                                if (li < t.params.l_in) {
-                                                    const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
-                                                    xv = t.x[x_idx];
-                                                }
+                                            const li_nom: isize = @as(isize, @intCast(pos0)) - @as(isize, @intCast(t.s.pad_left));
+                                            if (use_reflect) {
+                                                const li: usize = reflectIndex1D(li_nom, t.params.l_in);
+                                                const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                                xv = t.x[x_idx];
+                                            } else if (li_nom >= 0 and li_nom < l_in_i) {
+                                                const li: usize = @intCast(li_nom);
+                                                const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                                xv = t.x[x_idx];
                                             }
                                             a_panel[mr * k_sub + kl] = xv;
                                         }
@@ -1263,12 +1319,15 @@ fn execConv1DImplicitGemm(
 
                                     const pos0: usize = lo * t.s.stride + kw * t.s.dilation;
                                     var xv: f32 = 0.0;
-                                    if (pos0 >= t.s.pad_left) {
-                                        const li: usize = pos0 - t.s.pad_left;
-                                        if (li < t.params.l_in) {
-                                            const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
-                                            xv = t.x[x_idx];
-                                        }
+                                    const li_nom: isize = @as(isize, @intCast(pos0)) - @as(isize, @intCast(t.s.pad_left));
+                                    if (use_reflect) {
+                                        const li: usize = reflectIndex1D(li_nom, t.params.l_in);
+                                        const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                        xv = t.x[x_idx];
+                                    } else if (li_nom >= 0 and li_nom < l_in_i) {
+                                        const li: usize = @intCast(li_nom);
+                                        const x_idx: usize = ((b * t.params.l_in + li) * t.params.c_in) + ic_base + ic;
+                                        xv = t.x[x_idx];
                                     }
                                     a_panel[mr * k_sub + kl] = xv;
                                 }

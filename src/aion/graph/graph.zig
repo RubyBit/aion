@@ -6,6 +6,8 @@ pub const DType = types.DType;
 pub const ElemwiseBinaryOp = types.ElemwiseBinaryOp;
 pub const UnaryOp = types.UnaryOp;
 pub const ReduceOp = types.ReduceOp;
+pub const PadMode = types.PadMode;
+const MAX_CONCAT_INPUTS: usize = 16;
 
 pub const ValueId = u32;
 pub const NodeId = u32;
@@ -49,6 +51,7 @@ pub const Op = union(enum) {
         dilation: usize = 1,
         pad_left: usize = 0,
         pad_right: usize = 0,
+        pad_mode: PadMode = .zero,
         groups: usize = 1,
     },
 
@@ -68,6 +71,7 @@ pub const Op = union(enum) {
         pad_bottom: usize = 0,
         pad_left: usize = 0,
         pad_right: usize = 0,
+        pad_mode: PadMode = .zero,
         groups: usize = 1,
     },
 
@@ -102,13 +106,16 @@ pub const Op = union(enum) {
     /// Computes softmax(scale * q @ k^T) @ v per head/slice.
     /// If causal, masks keys where key_index > query_index (within head).
     MultiHeadAttention: struct { scale: f32, causal: bool, heads: usize },
-    Reduce: struct { op: ReduceOp },
+    Reduce: struct { op: ReduceOp, axis: ?i32 = null },
+    Concat: struct { axis: i32 },
     Copy: void,
 
     /// View ops (lowered into materialization steps in v0).
     ViewReshape: struct { new_shape: []const usize },
+    ViewSqueeze: struct { axis: ?i32 = null },
+    ViewUnsqueeze: struct { axis: i32 },
     ViewTranspose2D: void,
-    ViewSlice2D: struct { start0: usize, len0: usize, start1: usize, len1: usize },
+    ViewSliceND: struct { starts: []const usize, lens: []const usize },
 };
 
 pub const Node = struct {
@@ -220,11 +227,27 @@ pub const Graph = struct {
         pad_right: usize,
         groups: usize,
     ) GraphError!ValueId {
+        return self.addConv1DWithPadMode(x, w, bias, stride, dilation, pad_left, pad_right, .zero, groups);
+    }
+
+    pub fn addConv1DWithPadMode(
+        self: *Self,
+        x: ValueId,
+        w: ValueId,
+        bias: ?ValueId,
+        stride: usize,
+        dilation: usize,
+        pad_left: usize,
+        pad_right: usize,
+        pad_mode: PadMode,
+        groups: usize,
+    ) GraphError!ValueId {
         const op: Op = .{ .Conv1D = .{
             .stride = stride,
             .dilation = dilation,
             .pad_left = pad_left,
             .pad_right = pad_right,
+            .pad_mode = pad_mode,
             .groups = groups,
         } };
         if (bias) |b| {
@@ -248,6 +271,25 @@ pub const Graph = struct {
         pad_right: usize,
         groups: usize,
     ) GraphError!ValueId {
+        return self.addConv2DWithPadMode(x, w, bias, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, .zero, groups);
+    }
+
+    pub fn addConv2DWithPadMode(
+        self: *Self,
+        x: ValueId,
+        w: ValueId,
+        bias: ?ValueId,
+        stride_h: usize,
+        stride_w: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        pad_top: usize,
+        pad_bottom: usize,
+        pad_left: usize,
+        pad_right: usize,
+        pad_mode: PadMode,
+        groups: usize,
+    ) GraphError!ValueId {
         const op: Op = .{ .Conv2D = .{
             .stride_h = stride_h,
             .stride_w = stride_w,
@@ -257,6 +299,7 @@ pub const Graph = struct {
             .pad_bottom = pad_bottom,
             .pad_left = pad_left,
             .pad_right = pad_right,
+            .pad_mode = pad_mode,
             .groups = groups,
         } };
         if (bias) |b| {
@@ -288,7 +331,16 @@ pub const Graph = struct {
     }
 
     pub fn addReduce(self: *Self, op: ReduceOp, a: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.{ .Reduce = .{ .op = op } }, &[_]ValueId{a});
+        return self.addNodeInternal(.{ .Reduce = .{ .op = op, .axis = null } }, &[_]ValueId{a});
+    }
+
+    pub fn addReduceAxis(self: *Self, op: ReduceOp, a: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Reduce = .{ .op = op, .axis = axis } }, &[_]ValueId{a});
+    }
+
+    pub fn addConcat(self: *Self, inputs: []const ValueId, axis: i32) GraphError!ValueId {
+        if (inputs.len == 0 or inputs.len > MAX_CONCAT_INPUTS) return GraphError.InvalidArgument;
+        return self.addNodeInternal(.{ .Concat = .{ .axis = axis } }, inputs);
     }
 
     pub fn addCopy(self: *Self, a: ValueId) GraphError!ValueId {
@@ -300,12 +352,27 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .ViewReshape = .{ .new_shape = sh } }, &[_]ValueId{a});
     }
 
+    pub fn addViewSqueeze(self: *Self, a: ValueId, axis: ?i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .ViewSqueeze = .{ .axis = axis } }, &[_]ValueId{a});
+    }
+
+    pub fn addViewUnsqueeze(self: *Self, a: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .ViewUnsqueeze = .{ .axis = axis } }, &[_]ValueId{a});
+    }
+
     pub fn addViewTranspose2D(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.ViewTranspose2D, &[_]ValueId{a});
     }
 
+    pub fn addViewSliceND(self: *Self, a: ValueId, starts: []const usize, lens: []const usize) GraphError!ValueId {
+        if (starts.len == 0 or starts.len != lens.len or starts.len > MAX_RANK) return GraphError.InvalidArgument;
+        const starts_copy: []const usize = try self.dupeShape(starts);
+        const lens_copy: []const usize = try self.dupeShape(lens);
+        return self.addNodeInternal(.{ .ViewSliceND = .{ .starts = starts_copy, .lens = lens_copy } }, &[_]ValueId{a});
+    }
+
     pub fn addViewSlice2D(self: *Self, a: ValueId, start0: usize, len0: usize, start1: usize, len1: usize) GraphError!ValueId {
-        return self.addNodeInternal(.{ .ViewSlice2D = .{ .start0 = start0, .len0 = len0, .start1 = start1, .len1 = len1 } }, &[_]ValueId{a});
+        return self.addViewSliceND(a, &[_]usize{ start0, start1 }, &[_]usize{ len0, len1 });
     }
 
     pub fn setOutputs(self: *Self, outs: []const ValueId) GraphError!void {

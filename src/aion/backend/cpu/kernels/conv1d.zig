@@ -5,7 +5,16 @@ pub const DepthwiseConv1DParams = struct {
     stride: usize,
     dilation: usize,
     pad_left: usize,
+    reflect: bool = false,
 };
+
+inline fn reflectIndex(idx_nom: isize, len: isize) isize {
+    var x: isize = idx_nom;
+    while (x < 0 or x >= len) {
+        if (x < 0) x = -x else x = (2 * len - 2) - x;
+    }
+    return x;
+}
 
 pub const XTile = struct {
     vals: []align(1) const f32,
@@ -48,6 +57,8 @@ pub fn Kernel(comptime tuning: DepthwiseConv1DTuning) type {
             @setRuntimeSafety(false);
 
             const bias_present_local: bool = (t.bias_slices.len != 0);
+            const use_reflect: bool = t.p.reflect;
+            const l_in_i: isize = @intCast(t.l_in);
 
             var item: usize = start;
             while (item < end) : (item += 1) {
@@ -201,9 +212,11 @@ pub fn Kernel(comptime tuning: DepthwiseConv1DTuning) type {
                         var kw: usize = 0;
                         while (kw < t.k) : (kw += 1) {
                             const in_nom: usize = lo_abs * t.p.stride + kw * t.p.dilation;
-                            if (in_nom < t.p.pad_left) continue;
-                            const li: usize = in_nom - t.p.pad_left;
-                            if (li >= t.l_in) continue;
+                            const li_nom: isize = @as(isize, @intCast(in_nom)) - @as(isize, @intCast(t.p.pad_left));
+                            const li: usize = if (use_reflect) @intCast(reflectIndex(li_nom, l_in_i)) else blk: {
+                                if (li_nom < 0 or li_nom >= l_in_i) continue;
+                                break :blk @as(usize, @intCast(li_nom));
+                            };
 
                             const xlti: usize = li / t.x_tl;
                             if (xlti >= t.x_ltc) continue;
@@ -243,9 +256,11 @@ pub fn Kernel(comptime tuning: DepthwiseConv1DTuning) type {
                         var kw: usize = 0;
                         while (kw < t.k) : (kw += 1) {
                             const in_nom: usize = lo_abs * t.p.stride + kw * t.p.dilation;
-                            if (in_nom < t.p.pad_left) continue;
-                            const li: usize = in_nom - t.p.pad_left;
-                            if (li >= t.l_in) continue;
+                            const li_nom: isize = @as(isize, @intCast(in_nom)) - @as(isize, @intCast(t.p.pad_left));
+                            const li: usize = if (use_reflect) @intCast(reflectIndex(li_nom, l_in_i)) else blk: {
+                                if (li_nom < 0 or li_nom >= l_in_i) continue;
+                                break :blk @as(usize, @intCast(li_nom));
+                            };
 
                             const xlti: usize = li / t.x_tl;
                             if (xlti >= t.x_ltc) continue;

@@ -277,6 +277,11 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(out.shape[rank - 2] == l_out);
             try compileRequire(out.shape[rank - 1] == c_out);
 
+            if (s.pad_mode == .reflect) {
+                try compileRequire(l_in > 1);
+                try compileRequire(s.pad_left < l_in and s.pad_right < l_in);
+            }
+
             var d: usize = 0;
             while (d + 2 < rank) : (d += 1) {
                 try compileRequire(out.shape[d] == x.shape[d]);
@@ -322,6 +327,12 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(out.shape[rank - 3] == h_out);
             try compileRequire(out.shape[rank - 2] == w_out);
             try compileRequire(out.shape[rank - 1] == c_out);
+
+            if (s.pad_mode == .reflect) {
+                try compileRequire(h_in > 1 and w_in > 1);
+                try compileRequire(s.pad_top < h_in and s.pad_bottom < h_in);
+                try compileRequire(s.pad_left < w_in and s.pad_right < w_in);
+            }
 
             var d: usize = 0;
             while (d + 3 < rank) : (d += 1) {
@@ -582,6 +593,62 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             _ = s.op;
         },
 
+        .ReduceAxis => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == a.dtype);
+            try compileRequire(isScalarSupported(a.dtype));
+            try compileRequire(a.rank >= 1 and a.rank <= MAX_RANK);
+
+            const rank: usize = @as(usize, a.rank);
+            try compileRequire(s.axis < rank);
+
+            if (rank == 1) {
+                try compileRequire(out.rank == 1 and out.shape[0] == 1);
+            } else {
+                try compileRequire(out.rank == rank - 1);
+                var src_d: usize = 0;
+                var dst_d: usize = 0;
+                while (src_d < rank) : (src_d += 1) {
+                    if (src_d == s.axis) continue;
+                    try compileRequire(out.shape[dst_d] == a.shape[src_d]);
+                    dst_d += 1;
+                }
+            }
+
+            _ = s.op;
+        },
+
+        .ConcatScalar => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            try compileRequire(isScalarSupported(out.dtype));
+
+            const count: usize = @as(usize, s.input_count);
+            try compileRequire(count >= 1);
+            const rank: usize = @as(usize, out.rank);
+            try compileRequire(rank >= 1 and rank <= MAX_RANK);
+            try compileRequire(s.axis < rank);
+
+            var axis_sum: usize = 0;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const in_t: *const TiledTensor = mgr.getConst(s.inputs[i]) catch return CompileError.InvalidArgument;
+                try compileRequire(in_t.dtype == out.dtype);
+                try compileRequire(in_t.rank == out.rank);
+
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    if (d == s.axis) continue;
+                    try compileRequire(in_t.shape[d] == out.shape[d]);
+                }
+
+                axis_sum = std.math.add(usize, axis_sum, in_t.shape[s.axis]) catch return CompileError.InvalidArgument;
+            }
+
+            try compileRequire(axis_sum == out.shape[s.axis]);
+        },
+
         .ReTileCopyScalar => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
@@ -610,14 +677,21 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(dst.shape[0] == src.shape[1] and dst.shape[1] == src.shape[0]);
         },
 
-        .Slice2DScalar => |s| {
+        .SliceNDScalar => |s| {
             const dst: *const TiledTensor = mgr.getConst(s.dst) catch return CompileError.InvalidArgument;
             const src: *const TiledTensor = mgr.getConst(s.src) catch return CompileError.InvalidArgument;
             try compileRequire(isScalarSupported(dst.dtype));
             try compileRequire(dst.dtype == src.dtype);
-            try compileRequire(dst.rank == 2 and src.rank == 2);
-            try compileRequire(s.start0 + dst.shape[0] <= src.shape[0]);
-            try compileRequire(s.start1 + dst.shape[1] <= src.shape[1]);
+            try compileRequire(dst.rank == src.rank);
+
+            const rank: usize = @as(usize, s.rank);
+            try compileRequire(rank == @as(usize, dst.rank));
+            try compileRequire(rank >= 1 and rank <= MAX_RANK);
+
+            var d: usize = 0;
+            while (d < rank) : (d += 1) {
+                try compileRequire(s.starts[d] + dst.shape[d] <= src.shape[d]);
+            }
         },
     }
 }
@@ -900,6 +974,7 @@ pub fn compileGraph(
                     .dilation = cv.dilation,
                     .pad_left = cv.pad_left,
                     .pad_right = cv.pad_right,
+                    .pad_mode = cv.pad_mode,
                     .groups = cv.groups,
                 } });
             },
@@ -954,6 +1029,7 @@ pub fn compileGraph(
                     .pad_bottom = cv.pad_bottom,
                     .pad_left = cv.pad_left,
                     .pad_right = cv.pad_right,
+                    .pad_mode = cv.pad_mode,
                     .groups = cv.groups,
                 } });
             },
@@ -1161,13 +1237,53 @@ pub fn compileGraph(
 
             .Reduce => |rr| {
                 const a_id: usize = @intCast(node.inputs[0]);
-                const a_v = graph.values.items[a_id];
-                const out_tile: [1]usize = .{1};
-                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile[0..]);
-                // Reduce supports any tiling; no need to retile.
                 const a_tid: TensorId = try ensureAnyTensor(&ctx, a_id);
-                _ = a_v;
-                try appendStepChecked(allocator, mgr, &steps, .{ .ReduceAll = .{ .op = rr.op, .out = out_tid, .a = a_tid } });
+                const a_v = graph.values.items[a_id];
+
+                if (rr.axis) |axis_raw| {
+                    const rank: usize = a_v.shape.len;
+                    const axis: usize = try normalizeAxis(axis_raw, rank);
+
+                    var out_tile_buf: [MAX_RANK]usize = undefined;
+                    const out_tile: []usize = out_tile_buf[0..out_shape.len];
+
+                    if (out_shape.len == 1) {
+                        const t1: [1]usize = plan_mod.chooseTileShape1D(policy, out_shape[0]);
+                        out_tile[0] = t1[0];
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                    }
+
+                    const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+                    try appendStepChecked(allocator, mgr, &steps, .{ .ReduceAxis = .{ .op = rr.op, .out = out_tid, .a = a_tid, .axis = axis } });
+                } else {
+                    const out_tile: [1]usize = .{1};
+                    const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile[0..]);
+                    try appendStepChecked(allocator, mgr, &steps, .{ .ReduceAll = .{ .op = rr.op, .out = out_tid, .a = a_tid } });
+                }
+            },
+
+            .Concat => |cc| {
+                if (node.inputs.len == 0) return CompileError.InvalidArgument;
+                const axis: usize = try normalizeAxis(cc.axis, out_shape.len);
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                var in_ids: [16]TensorId = .{0} ** 16;
+                if (node.inputs.len > in_ids.len) return CompileError.InvalidArgument;
+
+                var i: usize = 0;
+                while (i < node.inputs.len) : (i += 1) {
+                    const vidx: usize = @intCast(node.inputs[i]);
+                    const in_v = graph.values.items[vidx];
+                    if (in_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
+                    in_ids[i] = try ensureAnyTensor(&ctx, vidx);
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .ConcatScalar = .{ .out = out_tid, .axis = axis, .input_count = @intCast(node.inputs.len), .inputs = in_ids } });
             },
 
             .Copy => {
@@ -1194,6 +1310,30 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
             },
 
+            .ViewSqueeze => |_| {
+                const a_id: usize = @intCast(node.inputs[0]);
+                const a_v = graph.values.items[a_id];
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+                const a_tid: TensorId = try ensureAnyTensor(&ctx, a_id);
+                if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
+                try appendStepChecked(allocator, mgr, &steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
+            },
+
+            .ViewUnsqueeze => |_| {
+                const a_id: usize = @intCast(node.inputs[0]);
+                const a_v = graph.values.items[a_id];
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+                const a_tid: TensorId = try ensureAnyTensor(&ctx, a_id);
+                if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
+                try appendStepChecked(allocator, mgr, &steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
+            },
+
             .ViewTranspose2D => {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
@@ -1206,7 +1346,7 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .Transpose2DScalar = .{ .dst = out_tid, .src = a_tid } });
             },
 
-            .ViewSlice2D => |sl| {
+            .ViewSliceND => |sl| {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
                 var out_tile_buf: [MAX_RANK]usize = undefined;
@@ -1215,7 +1355,16 @@ pub fn compileGraph(
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
                 const a_tid: TensorId = try ensureAnyTensor(&ctx, a_id);
                 if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
-                try appendStepChecked(allocator, mgr, &steps, .{ .Slice2DScalar = .{ .dst = out_tid, .src = a_tid, .start0 = sl.start0, .start1 = sl.start1 } });
+
+                var starts_buf: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                if (sl.starts.len == 0 or sl.starts.len > MAX_RANK) return CompileError.InvalidArgument;
+                const rank: usize = sl.starts.len;
+                var d: usize = 0;
+                while (d < rank) : (d += 1) {
+                    starts_buf[d] = sl.starts[d];
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .SliceNDScalar = .{ .dst = out_tid, .src = a_tid, .rank = @intCast(rank), .starts = starts_buf } });
             },
         }
     }

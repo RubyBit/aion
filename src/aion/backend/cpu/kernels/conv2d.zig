@@ -8,7 +8,16 @@ pub const DepthwiseConv2DParams = struct {
     dilation_w: usize,
     pad_top: usize,
     pad_left: usize,
+    reflect: bool = false,
 };
+
+inline fn reflectIndex(idx_nom: isize, len: isize) isize {
+    var x: isize = idx_nom;
+    while (x < 0 or x >= len) {
+        if (x < 0) x = -x else x = (2 * len - 2) - x;
+    }
+    return x;
+}
 
 pub const XTile = struct {
     vals: []align(1) const f32,
@@ -124,6 +133,9 @@ pub const DepthwiseConv2DTask = struct {
         const Vec = @Vector(lanes, f32);
 
         const bias_present_local: bool = (t.bias_slices.len != 0);
+        const use_reflect: bool = t.p.reflect;
+        const h_in_i: isize = @intCast(t.h_in);
+        const w_in_i: isize = @intCast(t.w_in);
 
         var item: usize = start;
         while (item < end) : (item += 1) {
@@ -573,9 +585,11 @@ pub const DepthwiseConv2DTask = struct {
                         var kh: usize = 0;
                         while (kh < t.k_h) : (kh += 1) {
                             const ih_nom: usize = oh_abs * t.p.stride_h + kh * t.p.dilation_h;
-                            if (ih_nom < t.p.pad_top) continue;
-                            const ih: usize = ih_nom - t.p.pad_top;
-                            if (ih >= t.h_in) continue;
+                            const ih_idx: isize = @as(isize, @intCast(ih_nom)) - @as(isize, @intCast(t.p.pad_top));
+                            const ih: usize = if (use_reflect) @intCast(reflectIndex(ih_idx, h_in_i)) else blk: {
+                                if (ih_idx < 0 or ih_idx >= h_in_i) continue;
+                                break :blk @as(usize, @intCast(ih_idx));
+                            };
 
                             const xhti: usize = ih / t.x_th;
                             if (xhti >= t.x_htc) continue;
@@ -584,9 +598,11 @@ pub const DepthwiseConv2DTask = struct {
                             var kw: usize = 0;
                             while (kw < t.k_w) : (kw += 1) {
                                 const iw_nom: usize = ow_abs * t.p.stride_w + kw * t.p.dilation_w;
-                                if (iw_nom < t.p.pad_left) continue;
-                                const iw: usize = iw_nom - t.p.pad_left;
-                                if (iw >= t.w_in) continue;
+                                const iw_idx: isize = @as(isize, @intCast(iw_nom)) - @as(isize, @intCast(t.p.pad_left));
+                                const iw: usize = if (use_reflect) @intCast(reflectIndex(iw_idx, w_in_i)) else blk: {
+                                    if (iw_idx < 0 or iw_idx >= w_in_i) continue;
+                                    break :blk @as(usize, @intCast(iw_idx));
+                                };
 
                                 const xwti: usize = iw / t.x_tw;
                                 if (xwti >= t.x_wtc) continue;
@@ -631,9 +647,11 @@ pub const DepthwiseConv2DTask = struct {
                         var kh: usize = 0;
                         while (kh < t.k_h) : (kh += 1) {
                             const ih_nom: usize = oh_abs * t.p.stride_h + kh * t.p.dilation_h;
-                            if (ih_nom < t.p.pad_top) continue;
-                            const ih: usize = ih_nom - t.p.pad_top;
-                            if (ih >= t.h_in) continue;
+                            const ih_idx: isize = @as(isize, @intCast(ih_nom)) - @as(isize, @intCast(t.p.pad_top));
+                            const ih: usize = if (use_reflect) @intCast(reflectIndex(ih_idx, h_in_i)) else blk: {
+                                if (ih_idx < 0 or ih_idx >= h_in_i) continue;
+                                break :blk @as(usize, @intCast(ih_idx));
+                            };
                             const xhti: usize = ih / t.x_th;
                             if (xhti >= t.x_htc) continue;
                             const ih_l: usize = ih - xhti * t.x_th;
@@ -641,9 +659,11 @@ pub const DepthwiseConv2DTask = struct {
                             var kw: usize = 0;
                             while (kw < t.k_w) : (kw += 1) {
                                 const iw_nom: usize = ow_abs * t.p.stride_w + kw * t.p.dilation_w;
-                                if (iw_nom < t.p.pad_left) continue;
-                                const iw: usize = iw_nom - t.p.pad_left;
-                                if (iw >= t.w_in) continue;
+                                const iw_idx: isize = @as(isize, @intCast(iw_nom)) - @as(isize, @intCast(t.p.pad_left));
+                                const iw: usize = if (use_reflect) @intCast(reflectIndex(iw_idx, w_in_i)) else blk: {
+                                    if (iw_idx < 0 or iw_idx >= w_in_i) continue;
+                                    break :blk @as(usize, @intCast(iw_idx));
+                                };
                                 const xwti: usize = iw / t.x_tw;
                                 if (xwti >= t.x_wtc) continue;
                                 const iw_l: usize = iw - xwti * t.x_tw;

@@ -130,9 +130,9 @@ pub const Graph = struct {
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
 
-    values: std.ArrayList(Value) = .{},
-    nodes: std.ArrayList(Node) = .{},
-    outputs: std.ArrayList(ValueId) = .{},
+    values: std.ArrayList(Value) = .empty,
+    nodes: std.ArrayList(Node) = .empty,
+    outputs: std.ArrayList(ValueId) = .empty,
 
     const Self = @This();
 

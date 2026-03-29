@@ -123,7 +123,7 @@ test "cpu kernels: unary sigmoid f32 properties and accuracy" {
     for (out) |v| try std.testing.expect(v >= 0.0 and v <= 1.0);
 
     // Known point.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[5], 2e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[5], 1e-4);
 
     // Monotone increasing.
     try expectMonotonicNonDecreasing(out[0..], 1e-3);
@@ -132,14 +132,14 @@ test "cpu kernels: unary sigmoid f32 properties and accuracy" {
     var i: usize = 0;
     while (i < x.len / 2) : (i += 1) {
         const j: usize = x.len - 1 - i;
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0) - out[j], out[i], 3e-2);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0) - out[j], out[i], 1e-4);
     }
 
     // Accuracy vs exp-based sigmoid.
     var ref: [x.len]f32 = undefined;
     for (x, 0..) |v, idx| ref[idx] = sigmoidRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
-    try std.testing.expect(max_abs <= 3e-2);
+    try std.testing.expect(max_abs <= 1e-4);
 }
 
 test "cpu kernels: unary tanh f32 properties and accuracy" {
@@ -149,7 +149,7 @@ test "cpu kernels: unary tanh f32 properties and accuracy" {
     try tanh_k.tanhF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
     try expectAllFinite(out[0..]);
     for (out) |v| try std.testing.expect(v >= -1.0 and v <= 1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 1e-4);
 
     try expectMonotonicNonDecreasing(out[0..], 1e-3);
 
@@ -157,13 +157,13 @@ test "cpu kernels: unary tanh f32 properties and accuracy" {
     var i: usize = 0;
     while (i < x.len / 2) : (i += 1) {
         const j: usize = x.len - 1 - i;
-        try std.testing.expectApproxEqAbs(-out[j], out[i], 3e-2);
+        try std.testing.expectApproxEqAbs(-out[j], out[i], 1e-4);
     }
 
     var ref: [x.len]f32 = undefined;
     for (x, 0..) |v, idx| ref[idx] = tanhRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
-    try std.testing.expect(max_abs <= 3e-2);
+    try std.testing.expect(max_abs <= 1e-4);
 }
 
 test "cpu kernels: unary silu f32 properties and accuracy" {
@@ -172,7 +172,7 @@ test "cpu kernels: unary silu f32 properties and accuracy" {
 
     try silu_k.siluF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
     try expectAllFinite(out[0..]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 1e-4);
 
     // Note: SiLU/Swish is not strictly monotone on the negative side.
     // Avoid monotonicity assertions here; rely on identities + reference checks.
@@ -182,14 +182,14 @@ test "cpu kernels: unary silu f32 properties and accuracy" {
     while (i < x.len / 2) : (i += 1) {
         const j: usize = x.len - 1 - i;
         // x[j] is the positive counterpart.
-        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 5e-2);
+        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 1e-4);
     }
 
     // Accuracy vs exp-based reference.
     var ref: [x.len]f32 = undefined;
     for (x, 0..) |v, idx| ref[idx] = siluRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
-    try std.testing.expect(max_abs <= 5e-2);
+    try std.testing.expect(max_abs <= 1e-4);
 }
 
 test "cpu kernels: unary gelu f32 properties and accuracy" {
@@ -198,25 +198,25 @@ test "cpu kernels: unary gelu f32 properties and accuracy" {
 
     try gelu_k.geluF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
     try expectAllFinite(out[0..]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 2e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 1e-4);
 
     // Gelu should approach 0 for large negative and ~x for large positive.
     try std.testing.expect(out[0] <= 0.0);
-    try std.testing.expectApproxEqAbs(x[x.len - 1], out[out.len - 1], 2e-1);
+    try std.testing.expectApproxEqAbs(x[x.len - 1], out[out.len - 1], 1e-4);
 
     // The widely-used tanh GELU approximation is "approximately" odd in the sense:
     // gelu(x) - gelu(-x) ~= x (exact for the true CDF-based GELU).
     var i: usize = 0;
     while (i < x.len / 2) : (i += 1) {
         const j: usize = x.len - 1 - i;
-        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 8e-2);
+        try std.testing.expectApproxEqAbs(x[j], out[j] - out[i], 1e-4);
     }
 
     // Accuracy vs tanh-based GELU formula (but with accurate tanh).
     var ref: [x.len]f32 = undefined;
     for (x, 0..) |v, idx| ref[idx] = geluTanhApproxRefF32(v);
     const max_abs: f32 = maxAbsDiffF32(out[0..], ref[0..]);
-    try std.testing.expect(max_abs <= 6e-2);
+    try std.testing.expect(max_abs <= 1e-4);
 }
 
 test "cpu kernels: unary sqrt f32 and f16" {

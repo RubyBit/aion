@@ -90,15 +90,14 @@ fn parseUsize(arg: []const u8) !usize {
     return std.fmt.parseInt(usize, arg, 10);
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
+fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions {
     var opts: BenchOptions = .{};
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var it = try args.iterateAllocator(allocator);
+    defer it.deinit();
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
+    _ = it.next(); // skip argv[0] (program name)
+    while (it.next()) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             printUsage();
             std.process.exit(0);
@@ -107,65 +106,50 @@ fn parseArgs(allocator: std.mem.Allocator) !BenchOptions {
         } else if (std.mem.eql(u8, a, "--print-cpuid")) {
             opts.print_cpuid = true;
         } else if (std.mem.eql(u8, a, "--iters")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.iters = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.iters = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--threads")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.threads = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.threads = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--batch")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.batch = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.batch = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--heads")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.heads = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.heads = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--n-elem")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.n_elem = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.n_elem = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--m")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.m = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.m = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--n")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.n = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.n = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--k")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.k = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.k = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-batch")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_batch = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_batch = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-l")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_l = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_l = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-h")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_h = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_h = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-w")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_w = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_w = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-cin")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_cin = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_cin = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-cout")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_cout = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_cout = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--conv-k")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            opts.conv_k = try parseUsize(args[i]);
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.conv_k = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--no-reflect-conv")) {
             opts.reflect_conv = false;
         } else {
@@ -1171,8 +1155,12 @@ fn fmtRateGFLOPs(flops: u64, ns: u64) f64 {
     return gflop / sec;
 }
 
-fn nowNs(timer: *std.time.Timer) u64 {
-    return timer.read();
+fn nowNs() u64 {
+    const ts: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);
+    const ns: i96 = ts.toNanoseconds();
+    if (ns <= 0) return 0;
+    const max_u64_i96: i96 = @as(i96, std.math.maxInt(u64));
+    return @intCast(@min(ns, max_u64_i96));
 }
 
 fn benchLoop(iters: usize, work_in: anytype) !u64 {
@@ -1183,13 +1171,12 @@ fn benchLoop(iters: usize, work_in: anytype) !u64 {
     // Warm-up (helps with cache and first-touch page faults).
     try work.run();
 
-    var t = try std.time.Timer.start();
-    const start: u64 = nowNs(&t);
+    const start: u64 = nowNs();
     var i: usize = 0;
     while (i < iters) : (i += 1) {
         try work.run();
     }
-    const end: u64 = nowNs(&t);
+    const end: u64 = nowNs();
     return end - start;
 }
 
@@ -1264,7 +1251,7 @@ fn buildQuantB_Q8_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
     const k_blocks: usize = k / Q8_0_BLOCK_ELEMS;
 
     // Generate a reference f32 B[K,N] first, then quantize into block layout.
-    var b_f32: []f32 = try allocator.alloc(f32, k * n);
+    const b_f32: []f32 = try allocator.alloc(f32, k * n);
     defer allocator.free(b_f32);
     fillRandomF32(rnd, b_f32);
 
@@ -1292,7 +1279,7 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
     if (k % Q4_0_BLOCK_ELEMS != 0) return error.InvalidArgument;
     const k_blocks: usize = k / Q4_0_BLOCK_ELEMS;
 
-    var b_f32: []f32 = try allocator.alloc(f32, k * n);
+    const b_f32: []f32 = try allocator.alloc(f32, k * n);
     defer allocator.free(b_f32);
     fillRandomF32(rnd, b_f32);
 
@@ -1316,19 +1303,17 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
     return out;
 }
 
-pub fn main() void {
-    mainImpl() catch |e| {
+pub fn main(minimal: std.process.Init.Minimal) void {
+    mainImpl(minimal.args) catch |e| {
         std.debug.print("fatal: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
 }
 
-fn mainImpl() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator: std.mem.Allocator = gpa.allocator();
+fn mainImpl(args: std.process.Args) !void {
+    const allocator: std.mem.Allocator = std.heap.page_allocator;
 
-    const opts: BenchOptions = parseArgs(allocator) catch |e| {
+    const opts: BenchOptions = parseArgs(args, allocator) catch |e| {
         std.debug.print("error: {s}\n\n", .{@errorName(e)});
         printUsage();
         return;

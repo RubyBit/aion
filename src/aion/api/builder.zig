@@ -22,14 +22,14 @@ pub const Builder = struct {
     graph: graph_mod.Graph,
 
     // Optional per-value names for diagnostics/debugging.
-    value_names: std.ArrayListUnmanaged(?[]const u8) = .{},
+    value_names: std.ArrayListUnmanaged(?[]const u8) = .empty,
 
     const Self = @This();
 
     pub const Error = graph_mod.GraphError;
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .graph = graph_mod.Graph.init(allocator), .value_names = .{} };
+        return .{ .allocator = allocator, .graph = graph_mod.Graph.init(allocator), .value_names = .empty };
     }
 
     pub fn deinit(self: *Self) void {
@@ -40,6 +40,23 @@ pub const Builder = struct {
 
     pub fn innerGraph(self: *Self) *graph_mod.Graph {
         return &self.graph;
+    }
+
+    /// Return the known shape for a value, if available.
+    ///
+    /// Note: many intermediate values only become known after inference at
+    /// compile time. Parameters and explicit inputs will have shapes.
+    pub fn knownShape(self: *Self, t: TensorRef) ?[]const usize {
+        const idx: usize = @intCast(t.value);
+        if (idx >= self.graph.values.items.len) return null;
+        const v = self.graph.values.items[idx];
+        if (v.shape.len == 0) return null;
+        return v.shape;
+    }
+
+    /// Like `knownShape`, but returns `error.InvalidArgument` if shape is unknown.
+    pub fn requireKnownShape(self: *Self, t: TensorRef) Error![]const usize {
+        return self.knownShape(t) orelse Error.InvalidArgument;
     }
 
     fn ensureNameSlot(self: *Self, vid: ValueId) Error!void {
@@ -98,6 +115,16 @@ pub const Builder = struct {
 
     pub fn relu(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addRelu(a.value);
+        return .{ .value = out };
+    }
+
+    pub fn sigmoid(self: *Self, a: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addUnary(.sigmoid, a.value);
+        return .{ .value = out };
+    }
+
+    pub fn tanh(self: *Self, a: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addUnary(.tanh, a.value);
         return .{ .value = out };
     }
 

@@ -43,13 +43,13 @@ pub fn execUnaryTiled(
                 a: tensor_store.TensorId,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -65,7 +65,7 @@ pub fn execUnaryTiled(
                             t.store.prefetchLinear(t.a, i + 1);
                         }
 
-                        var out_tile = t.store.acquireTileMutLinear(t.out, i) catch |e| {
+                        const out_tile = t.store.acquireTileMutLinear(t.out, i) catch |e| {
                             t.fail(e);
                             return;
                         };
@@ -110,7 +110,7 @@ pub fn execUnaryTiled(
     // Sequential fallback.
     var tile_index: usize = 0;
     while (tile_index < tile_total) : (tile_index += 1) {
-        var out_tile = try store.acquireTileMutLinear(s.out, tile_index);
+        const out_tile = try store.acquireTileMutLinear(s.out, tile_index);
         defer store.releaseMut(out_tile.token);
         const a_tile = try store.acquireTileConstLinear(s.a, tile_index);
         defer store.releaseConst(a_tile.token);

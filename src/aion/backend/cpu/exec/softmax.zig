@@ -81,13 +81,13 @@ pub fn execSoftmaxTiled(
                 a: tensor_store.TensorId,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -213,13 +213,13 @@ fn softmaxAxisStridedND(
                 axis_tiles: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -336,7 +336,7 @@ fn softmaxAxisStridedND(
                                 t.fail(e);
                                 return;
                             };
-                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -425,7 +425,7 @@ fn softmaxAxisStridedND(
                                 t.fail(e);
                                 return;
                             };
-                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -562,7 +562,7 @@ fn softmaxAxisStridedND(
         while (ti_axis_seq < axis_tiles) : (ti_axis_seq += 1) {
             coords_seq[axis] = ti_axis_seq;
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords_seq[0..out_meta.tile_counts.len]);
-            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
             defer store.releaseMut(out_tile.token);
             const in_tile = try store.acquireTileConstLinear(a, tile_index);
             defer store.releaseConst(in_tile.token);
@@ -620,7 +620,7 @@ fn softmaxAxisStridedND(
         while (ti_axis_seq < axis_tiles) : (ti_axis_seq += 1) {
             coords_seq[axis] = ti_axis_seq;
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords_seq[0..out_meta.tile_counts.len]);
-            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
             defer store.releaseMut(out_tile.token);
 
             const out_view = out_tile.bufferView();
@@ -710,13 +710,13 @@ fn softmaxAxisLastND(
                 axis_tiles: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -797,7 +797,7 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -828,7 +828,7 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -912,7 +912,7 @@ fn softmaxAxisLastND(
         while (ti_axis_seq < axis_tiles) : (ti_axis_seq += 1) {
             coords_seq[axis] = ti_axis_seq;
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords_seq[0..out_meta.tile_counts.len]);
-            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
             defer store.releaseMut(out_tile.token);
             const in_tile = try store.acquireTileConstLinear(a, tile_index);
             defer store.releaseConst(in_tile.token);
@@ -930,7 +930,7 @@ fn softmaxAxisLastND(
         while (ti_axis_seq < axis_tiles) : (ti_axis_seq += 1) {
             coords_seq[axis] = ti_axis_seq;
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords_seq[0..out_meta.tile_counts.len]);
-            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
             defer store.releaseMut(out_tile.token);
 
             const cols: usize = try tileDim(out_meta.shape, out_meta.tile_shape, ti_axis_seq, axis);
@@ -977,13 +977,13 @@ fn softmaxRank1(
                 tc1: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -1034,13 +1034,13 @@ fn softmaxRank1(
                 tc1: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -1062,7 +1062,7 @@ fn softmaxRank1(
                                 t.store.prefetch(t.a, ti0, ti1 + 1);
                                 t.store.prefetch(t.out, ti0, ti1 + 1);
                             }
-                            var out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
+                            const out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -1105,13 +1105,13 @@ fn softmaxRank1(
                 tc1: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -1131,7 +1131,7 @@ fn softmaxRank1(
                         var ti1: usize = 0;
                         while (ti1 < t.tc1) : (ti1 += 1) {
                             if (ti1 + 1 < t.tc1) t.store.prefetch(t.out, ti0, ti1 + 1);
-                            var out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
+                            const out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -1186,7 +1186,7 @@ fn softmaxRank1(
                 store.prefetch(a, ti0, ti1 + 1);
                 store.prefetch(out, ti0, ti1 + 1);
             }
-            var out_tile = try store.acquireTileMut(out, ti0, ti1);
+            const out_tile = try store.acquireTileMut(out, ti0, ti1);
             defer store.releaseMut(out_tile.token);
             const in_tile = try store.acquireTileConst(a, ti0, ti1);
             defer store.releaseConst(in_tile.token);
@@ -1208,7 +1208,7 @@ fn softmaxRank1(
         var ti1: usize = 0;
         while (ti1 < tc1) : (ti1 += 1) {
             if (ti1 + 1 < tc1) store.prefetch(out, ti0, ti1 + 1);
-            var out_tile = try store.acquireTileMut(out, ti0, ti1);
+            const out_tile = try store.acquireTileMut(out, ti0, ti1);
             defer store.releaseMut(out_tile.token);
             const out_view = out_tile.bufferView();
             if (out_view.dtype != .f32) return BackendError.InvalidArgument;
@@ -1264,7 +1264,7 @@ fn softmaxTi0(
             store.prefetch(a, ti0, ti1 + 1);
             store.prefetch(out, ti0, ti1 + 1);
         }
-        var out_tile = try store.acquireTileMut(out, ti0, ti1);
+        const out_tile = try store.acquireTileMut(out, ti0, ti1);
         defer store.releaseMut(out_tile.token);
         const in_tile = try store.acquireTileConst(a, ti0, ti1);
         defer store.releaseConst(in_tile.token);
@@ -1279,7 +1279,7 @@ fn softmaxTi0(
     ti1 = 0;
     while (ti1 < tc1) : (ti1 += 1) {
         if (ti1 + 1 < tc1) store.prefetch(out, ti0, ti1 + 1);
-        var out_tile = try store.acquireTileMut(out, ti0, ti1);
+        const out_tile = try store.acquireTileMut(out, ti0, ti1);
         defer store.releaseMut(out_tile.token);
         const out_view = out_tile.bufferView();
         if (out_view.dtype != .f32) return BackendError.InvalidArgument;

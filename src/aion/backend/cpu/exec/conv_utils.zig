@@ -50,7 +50,7 @@ pub const PackedWeightEntry = struct {
     block_elems: usize,
 };
 
-var g_packed_w_mutex: std.Thread.Mutex = .{};
+var g_packed_w_mutex: std.Io.Mutex = .init;
 var g_packed_w_init: bool = false;
 var g_packed_w_cache: std.AutoHashMap(PackedWeightKey, PackedWeightEntry) = undefined;
 
@@ -65,8 +65,8 @@ pub fn getOrCreatePackedWeights(
     key: PackedWeightKey,
     w_matrix: ?[]align(1) const f32,
 ) ExecuteProgramError!PackedWeightEntry {
-    g_packed_w_mutex.lock();
-    defer g_packed_w_mutex.unlock();
+    std.Io.Threaded.mutexLock(&g_packed_w_mutex);
+    defer std.Io.Threaded.mutexUnlock(&g_packed_w_mutex);
 
     ensurePackedWeightCacheInit();
     if (g_packed_w_cache.get(key)) |entry| return entry;

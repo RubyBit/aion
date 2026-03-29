@@ -78,21 +78,36 @@ fn parseSizeToBytes(s: []const u8) usize {
     return n * mult;
 }
 
-fn readFileTrimAlloc(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u8) ![]u8 {
-    var f = try dir.openFile(path, .{});
-    defer f.close();
-    const data = try f.readToEndAlloc(alloc, 256);
-    return std.mem.trimRight(u8, data, "\r\n\t ");
+fn readFileTrimAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, path: []const u8) ![]u8 {
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+
+    const len_u64 = try f.length(io);
+    const len: usize = std.math.cast(usize, len_u64) orelse return error.FileTooBig;
+    const data = try alloc.alloc(u8, len);
+    errdefer alloc.free(data);
+
+    const read_len = try f.readPositionalAll(io, data, 0);
+    const trimmed = std.mem.trimRight(u8, data[0..read_len], "\r\n\t ");
+    if (trimmed.len == data.len) return data;
+
+    const out = try alloc.dupe(u8, trimmed);
+    alloc.free(data);
+    return out;
 }
 
 fn detectCachesArmLinux(alloc: std.mem.Allocator) cpuid_root.Caches {
     var out: cpuid_root.Caches = .{};
     const base_path = "/sys/devices/system/cpu";
-    var cpu_dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch return out;
-    defer cpu_dir.close();
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+    var cpu_dir = std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true }) catch return out;
+    defer cpu_dir.close(io);
 
     var it = cpu_dir.iterate();
-    while (it.next() catch null) |e| {
+    while (it.next(io) catch null) |e| {
         if (e.kind != .directory) continue;
         if (!std.mem.startsWith(u8, e.name, "cpu")) continue;
         if (e.name.len <= 3) continue;
@@ -100,16 +115,16 @@ fn detectCachesArmLinux(alloc: std.mem.Allocator) cpuid_root.Caches {
 
         const cache_path = std.fmt.allocPrint(alloc, "{s}/cache", .{e.name}) catch continue;
         defer alloc.free(cache_path);
-        var cache_dir = cpu_dir.openDir(cache_path, .{ .iterate = true }) catch continue;
-        defer cache_dir.close();
+        var cache_dir = cpu_dir.openDir(io, cache_path, .{ .iterate = true }) catch continue;
+        defer cache_dir.close(io);
 
         var it2 = cache_dir.iterate();
-        while (it2.next() catch null) |idx| {
+        while (it2.next(io) catch null) |idx| {
             if (idx.kind != .directory) continue;
             if (!std.mem.startsWith(u8, idx.name, "index")) continue;
 
-            var idx_dir = cache_dir.openDir(idx.name, .{}) catch continue;
-            defer idx_dir.close();
+            const idx_dir = cache_dir.openDir(io, idx.name, .{}) catch continue;
+            defer idx_dir.close(io);
 
             const level_s = readFileTrimAlloc(alloc, idx_dir, "level") catch continue;
             defer alloc.free(level_s);

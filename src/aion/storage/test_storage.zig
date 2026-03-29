@@ -9,10 +9,8 @@ const simd = @import("../backend/cpu/kernels/simd.zig");
 
 const DType = types.DType;
 
-fn createTestFile(dir: std.fs.Dir, sub_path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.ioBasic();
-    return .adaptFromNewApi(try std.Io.Dir.createFile(dir.adaptToNewApi(), io, sub_path, flags));
+fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    return try dir.createFile(std.testing.io, sub_path, flags);
 }
 
 test "storage: scalar f32 roundtrip pack<->tiles" {
@@ -192,7 +190,7 @@ test "storage file: write/parse tiled tensors roundtrip" {
 
     {
         const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
-        defer file.close();
+        defer file.close(std.testing.io);
 
         const metadata = [_]aion_file.MetadataSource{
             aion_file.MetadataSource.string("arch", "tiny-test"),
@@ -267,7 +265,7 @@ test "storage file: mapReadOnly parses without heap copy" {
     defer tmp.cleanup();
 
     const file = try createTestFile(tmp.dir, "mapped.aion", .{ .read = true, .truncate = true });
-    defer file.close();
+    defer file.close(std.testing.io);
 
     const tensors = [_]aion_file.TensorSource{.{ .name = "mapped.weight", .tensor = &tt }};
     try aion_file.writeFile(file, &.{}, tensors[0..], .{});
@@ -275,7 +273,7 @@ test "storage file: mapReadOnly parses without heap copy" {
     var mapped = try aion_file.MappedFile.mapReadOnly(file);
     defer mapped.deinit();
 
-    const file_size: usize = @intCast(try file.getEndPos());
+    const file_size: usize = @intCast(try file.length(std.testing.io));
     const bytes = try mapped.logicalBytes(file_size);
     const view = try aion_file.parse(bytes);
     const desc = (try view.findTensor("mapped.weight")).?;
@@ -304,7 +302,7 @@ test "storage manager: mapped and copied imports expose residency and promotion"
     defer tmp.cleanup();
 
     const file = try createTestFile(tmp.dir, "residency.aion", .{ .read = true, .truncate = true });
-    defer file.close();
+    defer file.close(std.testing.io);
 
     const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = &src }};
     try aion_file.writeFile(file, &.{}, tensors[0..], .{});

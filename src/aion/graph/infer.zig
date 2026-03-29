@@ -166,7 +166,7 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             _ = mm; // alpha/beta handled in lowering.
         },
 
-        .ElemwiseBinary => |_| {
+        .ElemwiseBinary => {
             try require(node.inputs.len == 2);
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
@@ -182,7 +182,7 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, a.dtype.?, a.shape);
         },
 
-        .BroadcastLastDimBinary => |_| {
+        .BroadcastLastDimBinary => {
             try require(node.inputs.len == 2);
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);

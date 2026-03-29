@@ -35,13 +35,13 @@ pub const TensorId = u32;
 /// For now it owns `TiledTensor` allocations and provides tile acquisition.
 pub const StorageManager = struct {
     allocator: std.mem.Allocator,
-    tensors: std.ArrayList(*TiledTensor) = .{},
-    tensor_readonly: std.ArrayList(bool) = .{},
-    tensor_residency: std.ArrayList(TensorResidency) = .{},
-    tensor_import_mapping_indices: std.ArrayList(?u32) = .{},
-    imported_aion_mappings: std.ArrayList(ImportedAionMapping) = .{},
+    tensors: std.ArrayList(*TiledTensor) = .empty,
+    tensor_readonly: std.ArrayList(bool) = .empty,
+    tensor_residency: std.ArrayList(TensorResidency) = .empty,
+    tensor_import_mapping_indices: std.ArrayList(?u32) = .empty,
+    imported_aion_mappings: std.ArrayList(ImportedAionMapping) = .empty,
     tensor_names: std.StringHashMapUnmanaged(TensorId) = .{},
-    owned_tensor_names: std.ArrayList([]u8) = .{},
+    owned_tensor_names: std.ArrayList([]u8) = .empty,
 
     const Self = @This();
 
@@ -157,10 +157,12 @@ pub const StorageManager = struct {
         return self.tensor_names.get(name);
     }
 
-    pub fn importAionFile(self: *Self, file: std.fs.File, opts: ImportAionOptions) LoadAionError!void {
+    pub fn importAionFile(self: *Self, file: std.Io.File, opts: ImportAionOptions) LoadAionError!void {
         switch (opts.residency) {
             .mapped => {
-                const end_pos: u64 = file.getEndPos() catch return aion_file.FileError.IoFailure;
+                var io_backend: std.Io.Threaded = .init_single_threaded;
+                const io = io_backend.io();
+                const end_pos: u64 = file.length(io) catch return aion_file.FileError.IoFailure;
                 const file_size: usize = std.math.cast(usize, end_pos) orelse return aion_file.FileError.InvalidFormat;
                 var mapped: aion_file.MappedFile = try aion_file.MappedFile.mapReadOnly(file);
                 errdefer mapped.deinit();
@@ -179,7 +181,7 @@ pub const StorageManager = struct {
         const start_mapping_count: usize = self.imported_aion_mappings.items.len;
         const start_owned_name_count: usize = self.owned_tensor_names.items.len;
 
-        var added_names: std.ArrayList([]const u8) = .{};
+        var added_names: std.ArrayList([]const u8) = .empty;
         defer added_names.deinit(self.allocator);
 
         const owned_bytes = bytes;
@@ -222,7 +224,7 @@ pub const StorageManager = struct {
         const start_mapping_count: usize = self.imported_aion_mappings.items.len;
         const start_owned_name_count: usize = self.owned_tensor_names.items.len;
 
-        var added_names: std.ArrayList([]const u8) = .{};
+        var added_names: std.ArrayList([]const u8) = .empty;
         defer added_names.deinit(self.allocator);
 
         var mapped = mapped_file;
@@ -263,7 +265,7 @@ pub const StorageManager = struct {
     }
 
     fn importAionView(self: *Self, view: aion_file.View) LoadAionError!void {
-        var added_names: std.ArrayList([]const u8) = .{};
+        var added_names: std.ArrayList([]const u8) = .empty;
         defer added_names.deinit(self.allocator);
         try self.importAionViewWithNames(view, &added_names, .owned, null);
     }
@@ -444,7 +446,7 @@ pub const StorageManager = struct {
             fn acquireTileMut(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) tensor_store.StoreError!tensor_store.TileRefMut {
                 const sm: *StorageManager = @ptrCast(@alignCast(ctx));
                 const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                var tile = t.acquireTileMut(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
+                const tile = t.acquireTileMut(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
                 return .{
                     .bytes = tile.bytes,
                     .dtype = tile.dtype,
@@ -472,7 +474,7 @@ pub const StorageManager = struct {
             fn acquireTileMutLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefMut {
                 const sm: *StorageManager = @ptrCast(@alignCast(ctx));
                 const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                var tile = t.acquireTileMutLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
+                const tile = t.acquireTileMutLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
                 return .{
                     .bytes = tile.bytes,
                     .dtype = tile.dtype,

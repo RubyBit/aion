@@ -80,22 +80,26 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // Unit tests.
-    // Note: Zig compilation is lazy; if the library root only re-exports modules
-    // but doesn't actually reference symbols, tests in those imported files may
-    // not be discovered. Use a dedicated test root that forces compilation.
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{},
-    });
-
-    const lib_tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
-
+    // On this Zig snapshot, running the test artifact through Build's special
+    // `--listen=-` test runner mode can stall on Windows. The direct `zig test`
+    // path is the closest stable fallback and still honors the selected
+    // target/optimize settings.
     const test_step = b.step("test", "Run tests");
+    const run_lib_tests = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "test",
+        "src/tests.zig",
+        "--cache-dir",
+        ".zig-cache",
+        optimizeArg(optimize),
+    });
+    run_lib_tests.has_side_effects = true;
+    if (!target.query.isNativeTriple()) {
+        run_lib_tests.addArgs(&.{
+            "-target",
+            target.query.zigTriple(b.allocator) catch @panic("OOM"),
+        });
+    }
     test_step.dependOn(&run_lib_tests.step);
 
     // ---------------------------------------------------------------------
@@ -133,4 +137,13 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn optimizeArg(optimize: std.builtin.OptimizeMode) []const u8 {
+    return switch (optimize) {
+        .Debug => "-ODebug",
+        .ReleaseSafe => "-OReleaseSafe",
+        .ReleaseFast => "-OReleaseFast",
+        .ReleaseSmall => "-OReleaseSmall",
+    };
 }

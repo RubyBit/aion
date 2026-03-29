@@ -112,13 +112,13 @@ fn execNormTiled(
                     eps: f32,
 
                     stop: std.atomic.Value(bool) = .init(false),
-                    err_mutex: std.Thread.Mutex = .{},
+                    err_mutex: std.Io.Mutex = .init,
                     err_any: ?anyerror = null,
 
                     fn fail(t: *@This(), err: anyerror) void {
                         if (t.stop.swap(true, .acq_rel)) return;
-                        t.err_mutex.lock();
-                        defer t.err_mutex.unlock();
+                        std.Io.Threaded.mutexLock(&t.err_mutex);
+                        defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                         if (t.err_any == null) t.err_any = err;
                     }
 
@@ -249,13 +249,13 @@ fn execNormTiledND(
                 inv_denom: f32,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 
@@ -397,7 +397,7 @@ fn execNormTiledND(
                                 t.fail(e);
                                 return;
                             };
-                            var out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -593,7 +593,7 @@ fn execNormTiledND(
             }
 
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords[0..out_meta.tile_counts.len]);
-            var out_tile = try store.acquireTileMutLinear(out, tile_index);
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
             defer store.releaseMut(out_tile.token);
             const x_tile = try store.acquireTileConstLinear(x, tile_index);
             defer store.releaseConst(x_tile.token);

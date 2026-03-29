@@ -46,7 +46,7 @@ pub const TileRefMut = struct {
     strides_mem: [INLINE_RANK]isize,
     token: usize = 0,
 
-    pub fn bufferView(self: *TileRefMut) types.BufferViewMut {
+    pub fn bufferView(self: *const TileRefMut) types.BufferViewMut {
         const r: usize = @as(usize, self.rank);
         return .{
             .bytes = self.bytes,

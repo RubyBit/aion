@@ -766,7 +766,7 @@ pub fn compileGraph(
     }
 
     // Compile into a dynamic step list first.
-    var steps = std.ArrayListUnmanaged(Step){};
+    var steps = std.ArrayListUnmanaged(Step).empty;
     errdefer steps.deinit(allocator);
 
     // Helper: allocate tensor for a value (owned).
@@ -1297,7 +1297,7 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .CopyTiled = .{ .dst = out_tid, .src = a_tid } });
             },
 
-            .ViewReshape => |_| {
+            .ViewReshape => {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
                 var out_tile_buf: [MAX_RANK]usize = undefined;
@@ -1310,7 +1310,7 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
             },
 
-            .ViewSqueeze => |_| {
+            .ViewSqueeze => {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
                 var out_tile_buf: [MAX_RANK]usize = undefined;
@@ -1322,7 +1322,7 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
             },
 
-            .ViewUnsqueeze => |_| {
+            .ViewUnsqueeze => {
                 const a_id: usize = @intCast(node.inputs[0]);
                 const a_v = graph.values.items[a_id];
                 var out_tile_buf: [MAX_RANK]usize = undefined;

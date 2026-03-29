@@ -181,20 +181,29 @@ pub const MappedFile = struct {
     else
         void;
 
-    pub fn mapReadOnly(file: std.fs.File) FileError!MappedFile {
-        const end_pos: u64 = file.getEndPos() catch return FileError.IoFailure;
+    pub fn mapReadOnly(file: std.Io.File) FileError!MappedFile {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const end_pos: u64 = file.length(io) catch return FileError.IoFailure;
         const size: usize = castU64ToUsize(end_pos) orelse return FileError.InvalidFormat;
         if (size < header_size) return FileError.InvalidFormat;
 
         if (builtin.os.tag == .windows) {
+            const section_access: windows.ACCESS_MASK = .{
+                .STANDARD = .{ .RIGHTS = .REQUIRED },
+                .SPECIFIC = .{ .SECTION = .{
+                    .QUERY = true,
+                    .MAP_READ = true,
+                } },
+            };
             var section_handle: windows.HANDLE = undefined;
             const create_section_rc = windows.ntdll.NtCreateSection(
                 &section_handle,
-                windows.STANDARD_RIGHTS_REQUIRED | windows.SECTION_QUERY | windows.SECTION_MAP_READ,
+                section_access,
                 null,
                 null,
-                windows.PAGE_READONLY,
-                windows.SEC_COMMIT,
+                .{ .READONLY = true },
+                .{ .COMMIT = true },
                 file.handle,
             );
             if (create_section_rc != .SUCCESS) return FileError.IoFailure;
@@ -210,9 +219,9 @@ pub const MappedFile = struct {
                 0,
                 null,
                 &view_len,
-                .ViewUnmap,
-                0,
-                windows.PAGE_READONLY,
+                .Unmap,
+                .{},
+                .{ .READONLY = true },
             );
             if (map_section_rc != .SUCCESS) return FileError.IoFailure;
             errdefer _ = windows.ntdll.NtUnmapViewOfSection(windows.GetCurrentProcess(), @constCast(view_ptr.?));
@@ -306,23 +315,24 @@ pub fn parse(bytes: []const u8) FileError!View {
     return .{ .bytes = bytes, .header = header };
 }
 
-pub fn readAlloc(allocator: std.mem.Allocator, file: std.fs.File) FileError![]align(64) u8 {
-    const end_pos: u64 = file.getEndPos() catch return FileError.IoFailure;
+pub fn readAlloc(allocator: std.mem.Allocator, file: std.Io.File) FileError![]align(64) u8 {
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+    const end_pos: u64 = file.length(io) catch return FileError.IoFailure;
     const size: usize = castU64ToUsize(end_pos) orelse return FileError.InvalidFormat;
     const buf: []align(64) u8 = allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), size) catch return FileError.OutOfMemory;
     errdefer allocator.free(buf);
 
-    file.seekTo(0) catch return FileError.IoFailure;
-    var io_backend: std.Io.Threaded = .init_single_threaded;
-    const io: std.Io = io_backend.io();
-    var read_buffer: [4096]u8 = undefined;
-    var reader = file.reader(io, &read_buffer);
-    reader.interface.readSliceAll(buf) catch return FileError.IoFailure;
+    const read_len = file.readPositionalAll(io, buf, 0) catch return FileError.IoFailure;
+    if (read_len != buf.len) return FileError.IoFailure;
     return buf;
 }
 
-pub fn writeFile(file: std.fs.File, metadata: []const MetadataSource, tensors: []const TensorSource, opts: WriteOptions) FileError!void {
+pub fn writeFile(file: std.Io.File, metadata: []const MetadataSource, tensors: []const TensorSource, opts: WriteOptions) FileError!void {
     if (opts.data_alignment == 0 or !std.math.isPowerOfTwo(opts.data_alignment)) return FileError.InvalidArgument;
+
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
 
     var layouts_mem: [32]TensorLayout = undefined;
     if (tensors.len > layouts_mem.len) return FileError.InvalidArgument;
@@ -369,55 +379,54 @@ pub fn writeFile(file: std.fs.File, metadata: []const MetadataSource, tensors: [
         cursor = std.math.add(u64, cursor, @as(u64, @intCast(src.tensor.data.len))) catch return FileError.InvalidArgument;
     }
 
-    file.seekTo(0) catch return FileError.IoFailure;
-    const writer = file;
+    var writer: WriteCursor = .{ .file = file, .io = io };
 
-    writeAll(writer, &magic_bytes) catch return FileError.IoFailure;
-    try writeInt(writer, u32, current_version);
-    try writeInt(writer, u64, HeaderFlags.little_endian | HeaderFlags.crc32_present);
-    try writeInt(writer, u64, @intCast(metadata.len));
-    try writeInt(writer, u64, @intCast(tensors.len));
-    try writeInt(writer, u64, registry_offset);
-    try writeInt(writer, u64, data_offset);
-    try writeZeroes(writer, 16);
+    writeAll(&writer, &magic_bytes) catch return FileError.IoFailure;
+    try writeInt(&writer, u32, current_version);
+    try writeInt(&writer, u64, HeaderFlags.little_endian | HeaderFlags.crc32_present);
+    try writeInt(&writer, u64, @intCast(metadata.len));
+    try writeInt(&writer, u64, @intCast(tensors.len));
+    try writeInt(&writer, u64, registry_offset);
+    try writeInt(&writer, u64, data_offset);
+    try writeZeroes(&writer, 16);
 
     for (metadata) |entry| {
-        try writeMetadataEntry(writer, entry);
+        try writeMetadataEntry(&writer, entry);
     }
 
     for (tensors, layouts) |src, layout| {
-        try writeTensorDescriptor(writer, src, layout);
+        try writeTensorDescriptor(&writer, src, layout);
     }
 
     for (tensors) |src| {
-        writeAll(writer, src.name) catch return FileError.IoFailure;
+        writeAll(&writer, src.name) catch return FileError.IoFailure;
     }
 
     for (tensors) |src| {
         for (src.tensor.tile_offsets) |off| {
-            try writeInt(writer, u64, @intCast(off));
+            try writeInt(&writer, u64, @intCast(off));
         }
     }
 
     for (tensors) |src| {
         for (src.tensor.tile_lens) |len| {
-            try writeInt(writer, u64, @intCast(len));
+            try writeInt(&writer, u64, @intCast(len));
         }
     }
 
     var written: u64 = cursorAfterMetadata(metadata, tensors) catch return FileError.InvalidArgument;
     if (written > data_offset) return FileError.InvalidFormat;
-    try writeZeroes(writer, @intCast(data_offset - written));
+    try writeZeroes(&writer, @intCast(data_offset - written));
     written = data_offset;
 
     for (tensors, layouts) |src, layout| {
         if (written > layout.tensor_data_offset) return FileError.InvalidFormat;
-        try writeZeroes(writer, @intCast(layout.tensor_data_offset - written));
-        writeAll(writer, src.tensor.data) catch return FileError.IoFailure;
+        try writeZeroes(&writer, @intCast(layout.tensor_data_offset - written));
+        writeAll(&writer, src.tensor.data) catch return FileError.IoFailure;
         written = layout.tensor_data_offset + @as(u64, @intCast(src.tensor.data.len));
     }
 
-    file.setEndPos(written) catch return FileError.IoFailure;
+    file.setLength(io, written) catch return FileError.IoFailure;
 }
 
 const TensorLayout = struct {
@@ -428,6 +437,17 @@ const TensorLayout = struct {
     tensor_data_size: u64,
     tile_count: u64,
     crc32: u32,
+};
+
+const WriteCursor = struct {
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64 = 0,
+
+    fn writeAll(self: *WriteCursor, bytes: []const u8) std.Io.File.WritePositionalError!void {
+        try self.file.writePositionalAll(self.io, bytes, self.offset);
+        self.offset += @intCast(bytes.len);
+    }
 };
 
 fn validateMetadataSource(entry: MetadataSource) FileError!void {
@@ -484,7 +504,7 @@ fn parseMetadataEntryAt(bytes: []const u8, cursor: *usize) FileError!MetadataEnt
     const key = try readBytes(bytes, cursor, key_len);
 
     const value_type_raw: u8 = try readIntCursor(bytes, cursor, u8);
-    const value_type: ValueType = std.meta.intToEnum(ValueType, value_type_raw) catch return FileError.InvalidFormat;
+    const value_type: ValueType = std.enums.fromInt(ValueType, value_type_raw) orelse return FileError.InvalidFormat;
 
     const value_len_u32: u32 = try readIntCursor(bytes, cursor, u32);
     const value_len: usize = castU64ToUsize(value_len_u32) orelse return FileError.InvalidFormat;
@@ -509,7 +529,7 @@ fn parseTensorDescriptor(bytes: []const u8, header: Header, entry_off: usize) Fi
     const flags: u16 = try readIntCursor(bytes, &cursor, u16);
 
     if (rank == 0 or rank > 8) return FileError.InvalidFormat;
-    const dtype: DType = std.meta.intToEnum(DType, dtype_raw) catch return FileError.InvalidFormat;
+    const dtype: DType = std.enums.fromInt(DType, dtype_raw) orelse return FileError.InvalidFormat;
 
     var shape_mem: [8]u64 = .{0} ** 8;
     var tile_shape_mem: [8]u64 = .{0} ** 8;

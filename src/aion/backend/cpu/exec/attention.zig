@@ -175,13 +175,13 @@ fn execAttentionTiledND(
                 q_tiles_per_slice: usize,
 
                 stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Thread.Mutex = .{},
+                err_mutex: std.Io.Mutex = .init,
                 err_any: ?anyerror = null,
 
                 fn fail(t: *@This(), err: anyerror) void {
                     if (t.stop.swap(true, .acq_rel)) return;
-                    t.err_mutex.lock();
-                    defer t.err_mutex.unlock();
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
                     if (t.err_any == null) t.err_any = err;
                 }
 

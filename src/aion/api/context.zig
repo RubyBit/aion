@@ -83,19 +83,23 @@ pub const Context = struct {
         return self.cpu.backend();
     }
 
-    pub fn importAionFile(self: *Self, file: std.fs.File, opts: ImportOptions) api_errors.LoadError!void {
+    pub fn importAionFile(self: *Self, file: std.Io.File, opts: ImportOptions) api_errors.LoadError!void {
         return self.store.importAionFile(file, opts);
     }
 
     pub fn importAionPath(self: *Self, path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
-        const file = std.fs.cwd().openFile(path, .{}) catch return aion_file.FileError.IoFailure;
-        defer file.close();
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return aion_file.FileError.IoFailure;
+        defer file.close(io);
         return self.importAionFile(file, opts);
     }
 
     pub fn importAionPathAbsolute(self: *Self, absolute_path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
-        const file = std.fs.openFileAbsolute(absolute_path, .{}) catch return aion_file.FileError.IoFailure;
-        defer file.close();
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.openFileAbsolute(io, absolute_path, .{}) catch return aion_file.FileError.IoFailure;
+        defer file.close(io);
         return self.importAionFile(file, opts);
     }
 

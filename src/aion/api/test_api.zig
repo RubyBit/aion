@@ -4,13 +4,12 @@ const api = @import("api.zig");
 const aion_file = @import("../storage/aion_file.zig");
 const manager_mod = @import("../storage/manager.zig");
 const types = @import("../backend/types.zig");
+const fast = @import("../backend/cpu/kernels/fast_math.zig");
 
 const nn = api.nn;
 
-fn createTestFile(dir: std.fs.Dir, sub_path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.ioBasic();
-    return .adaptFromNewApi(try std.Io.Dir.createFile(dir.adaptToNewApi(), io, sub_path, flags));
+fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    return try dir.createFile(std.testing.io, sub_path, flags);
 }
 
 test "api: build+compile+run (matmul/broadcast/relu/copy/reduce)" {
@@ -562,6 +561,131 @@ test "api.nn: mini resnet (conv/residual/linear/softmax)" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 2e-3);
 }
 
+test "api.nn: lstm cell (single step)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 2;
+    const input_size: usize = 3;
+    const hidden: usize = 4;
+    const gate_dim: usize = 4 * hidden;
+
+    // Deterministic values.
+    var x_vals: [batch * input_size]f32 = undefined;
+    var h0_vals: [batch * hidden]f32 = undefined;
+    var c0_vals: [batch * hidden]f32 = undefined;
+    var w_ih_vals: [input_size * gate_dim]f32 = undefined;
+    var w_hh_vals: [hidden * gate_dim]f32 = undefined;
+    var b_ih_vals: [gate_dim]f32 = undefined;
+    var b_hh_vals: [gate_dim]f32 = undefined;
+
+    for (0..x_vals.len) |i| x_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.1;
+    for (0..h0_vals.len) |i| h0_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.07;
+    for (0..c0_vals.len) |i| c0_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4))) * 0.05;
+    for (0..w_ih_vals.len) |i| w_ih_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5))) * 0.02;
+    for (0..w_hh_vals.len) |i| w_hh_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6))) * 0.015;
+    for (0..b_ih_vals.len) |i| b_ih_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.01;
+    for (0..b_hh_vals.len) |i| b_hh_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.008;
+
+    // Reference implementation.
+    var gates_ref: [batch * gate_dim]f32 = undefined;
+    var i_ref: [batch * hidden]f32 = undefined;
+    var f_ref: [batch * hidden]f32 = undefined;
+    var g_ref: [batch * hidden]f32 = undefined;
+    var o_ref: [batch * hidden]f32 = undefined;
+    var c_ref: [batch * hidden]f32 = undefined;
+    var h_ref: [batch * hidden]f32 = undefined;
+
+    const sigmoid = struct {
+        fn f(x: f32) f32 {
+            return fast.sigmoidApproxF32(x);
+        }
+    }.f;
+
+    // gates = x@w_ih + h0@w_hh + b_ih + b_hh
+    for (0..batch) |b| {
+        for (0..gate_dim) |j| {
+            var acc: f32 = b_ih_vals[j] + b_hh_vals[j];
+            for (0..input_size) |k| {
+                acc += x_vals[b * input_size + k] * w_ih_vals[k * gate_dim + j];
+            }
+            for (0..hidden) |k| {
+                acc += h0_vals[b * hidden + k] * w_hh_vals[k * gate_dim + j];
+            }
+            gates_ref[b * gate_dim + j] = acc;
+        }
+    }
+
+    for (0..batch) |b| {
+        for (0..hidden) |j| {
+            const base: usize = b * gate_dim;
+            i_ref[b * hidden + j] = sigmoid(gates_ref[base + 0 * hidden + j]);
+            f_ref[b * hidden + j] = sigmoid(gates_ref[base + 1 * hidden + j]);
+            g_ref[b * hidden + j] = fast.tanhApproxF32(gates_ref[base + 2 * hidden + j]);
+            o_ref[b * hidden + j] = sigmoid(gates_ref[base + 3 * hidden + j]);
+        }
+    }
+
+    for (0..batch) |b| {
+        for (0..hidden) |j| {
+            const idx: usize = b * hidden + j;
+            const c_t: f32 = f_ref[idx] * c0_vals[idx] + i_ref[idx] * g_ref[idx];
+            c_ref[idx] = c_t;
+            h_ref[idx] = o_ref[idx] * fast.tanhApproxF32(c_t);
+        }
+    }
+
+    // API path.
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x_t: api.Tensor = try ctx.fromF32(&[_]usize{ batch, input_size }, x_vals[0..]);
+    const h0_t: api.Tensor = try ctx.fromF32(&[_]usize{ batch, hidden }, h0_vals[0..]);
+    const c0_t: api.Tensor = try ctx.fromF32(&[_]usize{ batch, hidden }, c0_vals[0..]);
+    const w_ih_t: api.Tensor = try ctx.fromF32(&[_]usize{ input_size, gate_dim }, w_ih_vals[0..]);
+    const w_hh_t: api.Tensor = try ctx.fromF32(&[_]usize{ hidden, gate_dim }, w_hh_vals[0..]);
+    const b_ih_t: api.Tensor = try ctx.fromF32(&[_]usize{gate_dim}, b_ih_vals[0..]);
+    const b_hh_t: api.Tensor = try ctx.fromF32(&[_]usize{gate_dim}, b_hh_vals[0..]);
+
+    // Error path: wrong bias shape.
+    const bad_bias: api.Tensor = try ctx.tensor(.f32, &[_]usize{gate_dim - 1});
+    var tmp: [gate_dim - 1]f32 = .{0.0} ** (gate_dim - 1);
+    try bad_bias.write(tmp[0..]);
+
+    var bld_bad = api.Builder.init(allocator);
+    defer bld_bad.deinit();
+    try std.testing.expectError(error.InvalidArgument, nn.LSTMCell.bind(&bld_bad, w_ih_t, w_hh_t, b_ih_t, bad_bias));
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+    const H0: api.TensorRef = try bld.param(h0_t);
+    const C0: api.TensorRef = try bld.param(c0_t);
+
+    const cell: nn.LSTMCell = try nn.LSTMCell.bind(&bld, w_ih_t, w_hh_t, b_ih_t, b_hh_t);
+    const st: nn.LSTMState = try cell.forward(&bld, X, H0, C0);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ st.h, st.c });
+    defer model.deinit();
+
+    const out_h_t: api.Tensor = try model.runOutputTensor(0);
+    const out_c_t: api.Tensor = try model.runOutputTensor(1);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ batch, hidden }, out_h_t.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ batch, hidden }, out_c_t.getShape());
+
+    var out_h: [batch * hidden]f32 = undefined;
+    var out_c: [batch * hidden]f32 = undefined;
+    try out_h_t.read(&out_h);
+    try out_c_t.read(&out_c);
+
+    for (0..out_h.len) |i| {
+        try std.testing.expect(std.math.isFinite(out_h[i]));
+        try std.testing.expect(std.math.isFinite(out_c[i]));
+        try std.testing.expectApproxEqAbs(h_ref[i], out_h[i], 1e-5);
+        try std.testing.expectApproxEqAbs(c_ref[i], out_c[i], 1e-5);
+    }
+}
+
 test "api: importAionFile + tensorByName + readonly param execution" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -579,7 +703,7 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     defer tmp.cleanup();
 
     const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
-    defer file.close();
+    defer file.close(std.testing.io);
 
     const metadata = [_]aion_file.MetadataSource{aion_file.MetadataSource.string("arch", "import-test")};
     const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = w_src }};
@@ -637,7 +761,7 @@ test "api: importAionPath and importAionPathAbsolute convenience apis" {
     defer tmp.cleanup();
 
     const file = try createTestFile(tmp.dir, "path_import.aion", .{ .read = true, .truncate = true });
-    defer file.close();
+    defer file.close(std.testing.io);
 
     const tensors = [_]aion_file.TensorSource{.{ .name = "w_path", .tensor = w_src }};
     try aion_file.writeFile(file, &.{}, tensors[0..], .{});
@@ -645,7 +769,7 @@ test "api: importAionPath and importAionPathAbsolute convenience apis" {
     const relative_path: []const u8 = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "path_import.aion" });
     defer allocator.free(relative_path);
 
-    const absolute_path: []u8 = try tmp.parent_dir.realpathAlloc(allocator, &tmp.sub_path);
+    const absolute_path: [:0]u8 = try tmp.parent_dir.realPathFileAlloc(std.testing.io, &tmp.sub_path, allocator);
     defer allocator.free(absolute_path);
     const absolute_file_path: []const u8 = try std.fs.path.join(allocator, &.{ absolute_path, "path_import.aion" });
     defer allocator.free(absolute_file_path);
@@ -683,7 +807,7 @@ test "api: import options expose mapped state and promotion to owned ram" {
     defer tmp.cleanup();
 
     const file = try createTestFile(tmp.dir, "import_options.aion", .{ .read = true, .truncate = true });
-    defer file.close();
+    defer file.close(std.testing.io);
 
     const tensors = [_]aion_file.TensorSource{.{ .name = "w_opts", .tensor = w_src }};
     try aion_file.writeFile(file, &.{}, tensors[0..], .{});

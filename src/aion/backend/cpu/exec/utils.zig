@@ -768,7 +768,7 @@ pub fn reduceAllScalar(
         result_f64 /= @as(f64, @floatFromInt(total_elems_u64));
     }
 
-    var out_tile = try store.acquireTileMut(out_id, 0, 0);
+    const out_tile = try store.acquireTileMut(out_id, 0, 0);
     defer store.releaseMut(out_tile.token);
     const out_view = out_tile.bufferView();
 
@@ -831,13 +831,13 @@ pub fn reduceAxisScalar(
         out_tile_count_strides: [MAX_RANK]usize,
 
         stop: std.atomic.Value(bool) = .init(false),
-        err_mutex: std.Thread.Mutex = .{},
+        err_mutex: std.Io.Mutex = .init,
         err_any: ?anyerror = null,
 
         fn fail(t: *@This(), err: anyerror) void {
             if (t.stop.swap(true, .acq_rel)) return;
-            t.err_mutex.lock();
-            defer t.err_mutex.unlock();
+            std.Io.Threaded.mutexLock(&t.err_mutex);
+            defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
             if (t.err_any == null) t.err_any = err;
         }
 
@@ -866,7 +866,7 @@ pub fn reduceAxisScalar(
                     return;
                 };
 
-                var out_tile = t.store.acquireTileMutLinear(t.out_id, tile_index) catch |e| {
+                const out_tile = t.store.acquireTileMutLinear(t.out_id, tile_index) catch |e| {
                     t.fail(e);
                     return;
                 };

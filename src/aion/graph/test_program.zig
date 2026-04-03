@@ -23,6 +23,20 @@ fn asF16Slice(buf: []u8) []align(1) f16 {
     return ptr[0 .. buf.len / @sizeOf(f16)];
 }
 
+test "plan: chooseTileShape2DSquare handles skinny matrices" {
+    const policy: plan_mod.TilePolicy = .{};
+
+    const t0: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 1, 128);
+    try std.testing.expectEqual(@as(usize, 1), t0[0]);
+    try std.testing.expectEqual(@min(@as(usize, 128), policy.base_1d), t0[1]);
+    try std.testing.expect(t0[1] > 1);
+
+    const t1: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 256, 1);
+    try std.testing.expectEqual(@min(@as(usize, 256), policy.base_1d), t1[0]);
+    try std.testing.expectEqual(@as(usize, 1), t1[1]);
+    try std.testing.expect(t1[0] > 1);
+}
+
 const PackedLayout2 = struct {
     shape_mem: [2]usize,
     strides_mem: [2]isize,

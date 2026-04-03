@@ -583,6 +583,85 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try requireSameTileCounts(dst, src);
         },
 
+        .LSTMCellFused => |s| {
+            const out_state: *const TiledTensor = mgr.getConst(s.out_state) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const h_prev: *const TiledTensor = mgr.getConst(s.h_prev) catch return CompileError.InvalidArgument;
+            const c_prev: *const TiledTensor = mgr.getConst(s.c_prev) catch return CompileError.InvalidArgument;
+            const w_ih: *const TiledTensor = mgr.getConst(s.w_ih) catch return CompileError.InvalidArgument;
+            const w_hh: *const TiledTensor = mgr.getConst(s.w_hh) catch return CompileError.InvalidArgument;
+
+            try compileRequire(isScalarSupported(out_state.dtype));
+            try compileRequire(out_state.dtype == x.dtype);
+            try compileRequire(out_state.dtype == h_prev.dtype);
+            try compileRequire(out_state.dtype == c_prev.dtype);
+            try compileRequire(out_state.dtype == w_ih.dtype);
+            try compileRequire(out_state.dtype == w_hh.dtype);
+            try compileRequire(!out_state.dtype.info().is_quantized);
+
+            try compileRequire(out_state.rank == 2);
+            try compileRequire(x.rank == 2);
+            try compileRequire(h_prev.rank == 2);
+            try compileRequire(c_prev.rank == 2);
+            try compileRequire(w_ih.rank == 2);
+            try compileRequire(w_hh.rank == 2);
+
+            const batch: usize = x.shape[0];
+            const input_size: usize = x.shape[1];
+            const hidden: usize = h_prev.shape[1];
+            try compileRequire(batch != 0 and input_size != 0 and hidden != 0);
+
+            try compileRequire(h_prev.shape[0] == batch and c_prev.shape[0] == batch);
+            try compileRequire(c_prev.shape[1] == hidden);
+
+            const gate_dim: usize = std.math.mul(usize, hidden, 4) catch return CompileError.InvalidArgument;
+            try compileRequire(w_ih.shape[0] == input_size and w_ih.shape[1] == gate_dim);
+            try compileRequire(w_hh.shape[0] == hidden and w_hh.shape[1] == gate_dim);
+
+            const out_dim: usize = std.math.mul(usize, hidden, 2) catch return CompileError.InvalidArgument;
+            try compileRequire(out_state.shape[0] == batch and out_state.shape[1] == out_dim);
+
+            if (s.b_ih) |bid| {
+                const b_ih: *const TiledTensor = mgr.getConst(bid) catch return CompileError.InvalidArgument;
+                try compileRequire(b_ih.dtype == out_state.dtype);
+                try compileRequire(b_ih.rank == 1);
+                try compileRequire(b_ih.shape[0] == gate_dim);
+            } else {
+                try compileRequire(s.b_hh == null);
+            }
+
+            if (s.b_hh) |bid| {
+                const b_hh: *const TiledTensor = mgr.getConst(bid) catch return CompileError.InvalidArgument;
+                try compileRequire(b_hh.dtype == out_state.dtype);
+                try compileRequire(b_hh.rank == 1);
+                try compileRequire(b_hh.shape[0] == gate_dim);
+            }
+        },
+
+        .ComplexAbsMean => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const stft: *const TiledTensor = mgr.getConst(s.stft) catch return CompileError.InvalidArgument;
+
+            try compileRequire(isScalarSupported(out.dtype));
+            try compileRequire(out.dtype == stft.dtype);
+            try compileRequire(!out.dtype.info().is_quantized);
+
+            try compileRequire(stft.rank == 3);
+            try compileRequire(out.rank == 2);
+
+            const batch: usize = stft.shape[0];
+            const time: usize = stft.shape[1];
+            const chans2: usize = stft.shape[2];
+            try compileRequire(batch != 0 and time != 0 and chans2 != 0);
+            try compileRequire(chans2 % 2 == 0);
+
+            const cutoff: usize = chans2 / 2;
+            try compileRequire(s.out_channels >= 1 and s.out_channels <= cutoff);
+
+            try compileRequire(out.shape[0] == batch);
+            try compileRequire(out.shape[1] == s.out_channels);
+        },
+
         .ReduceAll => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
@@ -1284,6 +1363,71 @@ pub fn compileGraph(
                 }
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .ConcatScalar = .{ .out = out_tid, .axis = axis, .input_count = @intCast(node.inputs.len), .inputs = in_ids } });
+            },
+
+            .ComplexAbsMean => |cm| {
+                if (node.inputs.len != 1) return CompileError.InvalidArgument;
+
+                const stft_id: usize = @intCast(node.inputs[0]);
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                const stft_tid: TensorId = try ensureAnyTensor(&ctx, stft_id);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .ComplexAbsMean = .{
+                    .out = out_tid,
+                    .stft = stft_tid,
+                    .out_channels = cm.out_channels,
+                } });
+            },
+
+            .LSTMCell => |lc| {
+                // Inputs: x, h_prev, c_prev, w_ih, w_hh (+ optional b_ih, b_hh)
+                if (lc.has_bias) {
+                    if (node.inputs.len != 7) return CompileError.InvalidArgument;
+                } else {
+                    if (node.inputs.len != 5) return CompileError.InvalidArgument;
+                }
+
+                const x_id: usize = @intCast(node.inputs[0]);
+                const h_id: usize = @intCast(node.inputs[1]);
+                const c_id: usize = @intCast(node.inputs[2]);
+                const wih_id: usize = @intCast(node.inputs[3]);
+                const whh_id: usize = @intCast(node.inputs[4]);
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                const x_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
+                const h_tid: TensorId = try ensureAnyTensor(&ctx, h_id);
+                const c_tid: TensorId = try ensureAnyTensor(&ctx, c_id);
+                const wih_tid: TensorId = try ensureAnyTensor(&ctx, wih_id);
+                const whh_tid: TensorId = try ensureAnyTensor(&ctx, whh_id);
+
+                var b_ih_tid: ?TensorId = null;
+                var b_hh_tid: ?TensorId = null;
+                if (lc.has_bias) {
+                    const bih_id: usize = @intCast(node.inputs[5]);
+                    const bhh_id: usize = @intCast(node.inputs[6]);
+                    b_ih_tid = try ensureAnyTensor(&ctx, bih_id);
+                    b_hh_tid = try ensureAnyTensor(&ctx, bhh_id);
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .LSTMCellFused = .{
+                    .out_state = out_tid,
+                    .x = x_tid,
+                    .h_prev = h_tid,
+                    .c_prev = c_tid,
+                    .w_ih = wih_tid,
+                    .w_hh = whh_tid,
+                    .b_ih = b_ih_tid,
+                    .b_hh = b_hh_tid,
+                } });
             },
 
             .Copy => {

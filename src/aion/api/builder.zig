@@ -282,6 +282,46 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Fused single-timestep LSTM cell.
+    ///
+    /// Output is a packed state tensor of shape `[batch, 2*hidden]` where:
+    /// - state[:, 0:hidden]   == h_t
+    /// - state[:, hidden:2*h] == c_t
+    pub fn lstmCell(
+        self: *Self,
+        x: TensorRef,
+        h_prev: TensorRef,
+        c_prev: TensorRef,
+        w_ih: TensorRef,
+        w_hh: TensorRef,
+        b_ih: ?TensorRef,
+        b_hh: ?TensorRef,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addLSTMCell(
+            x.value,
+            h_prev.value,
+            c_prev.value,
+            w_ih.value,
+            w_hh.value,
+            if (b_ih) |t| t.value else null,
+            if (b_hh) |t| t.value else null,
+        );
+        return .{ .value = out };
+    }
+
+    /// Fused complex-abs (magnitude) + mean reduction over time.
+    ///
+    /// Expects split-complex layout: `x[batch, time, 2*cutoff]` where the last
+    /// dimension is `[real(0..cutoff), imag(0..cutoff)]`.
+    ///
+    /// Output: `[batch, out_channels]` where
+    /// $$out[b,c] = \mathrm{mean}_t\, \sqrt{re^2 + im^2}$$
+    /// with `re=x[b,t,c]`, `im=x[b,t,c+cutoff]`.
+    pub fn complexAbsMean(self: *Self, x: TensorRef, out_channels: usize) Error!TensorRef {
+        const out: ValueId = try self.graph.addComplexAbsMean(x.value, out_channels);
+        return .{ .value = out };
+    }
+
     pub fn stack(self: *Self, tensors: []const TensorRef, axis: i32) Error!TensorRef {
         if (tensors.len == 0) return Error.InvalidArgument;
         var unsq: [16]TensorRef = undefined;

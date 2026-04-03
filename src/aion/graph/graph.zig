@@ -108,6 +108,39 @@ pub const Op = union(enum) {
     MultiHeadAttention: struct { scale: f32, causal: bool, heads: usize },
     Reduce: struct { op: ReduceOp, axis: ?i32 = null },
     Concat: struct { axis: i32 },
+
+    /// Fused single-timestep LSTM cell.
+    ///
+    /// Inputs (N=rank-2):
+    /// - x:      [batch, input_size]
+    /// - h_prev: [batch, hidden]
+    /// - c_prev: [batch, hidden]
+    /// - w_ih:   [input_size, 4*hidden]
+    /// - w_hh:   [hidden, 4*hidden]
+    /// - b_ih:   [4*hidden] (optional)
+    /// - b_hh:   [4*hidden] (optional)
+    ///
+    /// Output:
+    /// - state: [batch, 2*hidden] where state[:,0:h]=h_t and state[:,h:2h]=c_t
+    LSTMCell: struct { has_bias: bool },
+
+    /// Fused complex-abs (magnitude) + mean reduction over time.
+    ///
+    /// This is a common pattern in audio/signal front-ends when complex values are
+    /// represented as split real/imag halves.
+    ///
+    /// Input:
+    /// - x: [batch, time, 2*cutoff] interpreted as real/imag halves.
+    ///
+    /// Output:
+    /// - out: [batch, out_channels] where out[b,c] = mean_t sqrt(re^2 + im^2)
+    ///   using re=x[b,t,c], im=x[b,t,c+cutoff].
+    ///
+    /// Contract:
+    /// - x.shape[2] must be even
+    /// - out_channels must be in 1..=cutoff
+    ComplexAbsMean: struct { out_channels: usize },
+
     Copy: void,
 
     /// View ops (lowered into materialization steps in v0).
@@ -345,6 +378,31 @@ pub const Graph = struct {
 
     pub fn addCopy(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.Copy, &[_]ValueId{a});
+    }
+
+    pub fn addLSTMCell(
+        self: *Self,
+        x: ValueId,
+        h_prev: ValueId,
+        c_prev: ValueId,
+        w_ih: ValueId,
+        w_hh: ValueId,
+        b_ih: ?ValueId,
+        b_hh: ?ValueId,
+    ) GraphError!ValueId {
+        // Bias policy: either both provided or both omitted.
+        if ((b_ih != null) != (b_hh != null)) return GraphError.InvalidArgument;
+
+        const op: Op = .{ .LSTMCell = .{ .has_bias = (b_ih != null) } };
+        if (b_ih) |b0| {
+            return self.addNodeInternal(op, &[_]ValueId{ x, h_prev, c_prev, w_ih, w_hh, b0, b_hh.? });
+        }
+        return self.addNodeInternal(op, &[_]ValueId{ x, h_prev, c_prev, w_ih, w_hh });
+    }
+
+    pub fn addComplexAbsMean(self: *Self, x: ValueId, out_channels: usize) GraphError!ValueId {
+        if (out_channels == 0) return GraphError.InvalidArgument;
+        return self.addNodeInternal(.{ .ComplexAbsMean = .{ .out_channels = out_channels } }, &[_]ValueId{x});
     }
 
     pub fn addViewReshape(self: *Self, a: ValueId, new_shape: []const usize) GraphError!ValueId {

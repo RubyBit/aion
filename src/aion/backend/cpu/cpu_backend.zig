@@ -15,6 +15,8 @@ const exec_softmax = @import("exec/softmax.zig");
 const exec_conv = @import("exec/conv.zig");
 const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
+const exec_lstm = @import("exec/lstm.zig");
+const exec_complex_abs_mean = @import("exec/complex_abs_mean.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -34,6 +36,10 @@ pub const CpuBackend = struct {
 
     pool: ?thread_pool.ThreadPool = null,
     thread_count: usize = 1,
+
+    /// When enabled, print per-step execution timing from `executeProgram`.
+    /// Intended for coarse profiling/debugging; adds overhead.
+    profile_steps: bool = false,
 
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
@@ -64,6 +70,9 @@ pub const CpuBackend = struct {
         /// Total threads to use including the calling thread.
         /// Set to 1 to disable parallelism (default).
         thread_count: usize = 1,
+
+        /// Print per-step timing from `executeProgram`.
+        profile_steps: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -79,6 +88,7 @@ pub const CpuBackend = struct {
             .allocator = allocator,
             .pool = null,
             .thread_count = 1,
+            .profile_steps = false,
             .reduce_scratch_f32 = &[_]f32{},
             .softmax_scratch_f32 = &[_]f32{},
             .matmul_f32 = mm_choice.kernels,
@@ -94,7 +104,7 @@ pub const CpuBackend = struct {
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {
         if (opts.thread_count == 0) return error.InvalidArgument;
 
-        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
+        var self: Self = .{ .allocator = allocator, .pool = null, .thread_count = 1, .profile_steps = opts.profile_steps, .reduce_scratch_f32 = &[_]f32{}, .softmax_scratch_f32 = &[_]f32{}, .matmul_scratch_f32 = &[_][]align(32) u8{} };
         if (opts.thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = opts.thread_count });
             self.pool = p;
@@ -189,7 +199,23 @@ pub const CpuBackend = struct {
     fn executeProgramImpl(ctx: *anyopaque, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore) ExecuteProgramError!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
 
-        for (prog.steps) |step| {
+        const do_profile: bool = self.profile_steps;
+        if (do_profile) {
+            std.debug.print("cpu_backend: program steps={}\n", .{prog.steps.len});
+        }
+
+        const nowNs = struct {
+            fn f() u64 {
+                const ts: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);
+                const ns: i96 = ts.toNanoseconds();
+                if (ns <= 0) return 0;
+                const max_u64_i96: i96 = @as(i96, std.math.maxInt(u64));
+                return @intCast(@min(ns, max_u64_i96));
+            }
+        }.f;
+
+        for (prog.steps, 0..) |step, step_i| {
+            const t0: u64 = if (do_profile) nowNs() else 0;
             switch (step) {
                 .MatMulTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
@@ -278,6 +304,16 @@ pub const CpuBackend = struct {
                     try ElemwiseExec.execCopyTiled(pool_ptr, self.thread_count, s, store);
                 },
 
+                .LSTMCellFused => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_lstm.execLSTMCellFused(pool_ptr, self.thread_count, s, store);
+                },
+
+                .ComplexAbsMean => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_complex_abs_mean.execComplexAbsMean(pool_ptr, self.thread_count, s, store);
+                },
+
                 .ReduceAll => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_utils.reduceAllScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, store);
@@ -306,7 +342,16 @@ pub const CpuBackend = struct {
                     try exec_utils.sliceNDCopyScalar(store, s.dst, s.src, s.starts[0..rank]);
                 },
             }
+
+            if (do_profile) {
+                const t1: u64 = nowNs();
+                const dt_us: u64 = (t1 - t0) / 1000;
+                std.debug.print("  step {d:3}: {s}  {d} us\n", .{ step_i, @tagName(step), dt_us });
+            }
         }
+
+        // Avoid spamming during benchmarks: if enabled, profile only the first execution.
+        if (do_profile) self.profile_steps = false;
     }
 
     fn kindImpl(_: *anyopaque) BackendKind {

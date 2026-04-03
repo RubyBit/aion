@@ -83,6 +83,44 @@ pub const Conv2D = struct {
     }
 };
 
+pub const Conv1D = struct {
+    w: TensorRef,
+    b: ?TensorRef = null,
+    opts: Options = .{},
+
+    const Self = @This();
+
+    pub const Options = struct {
+        stride: usize = 1,
+        dilation: usize = 1,
+        pad_left: usize = 0,
+        pad_right: usize = 0,
+        pad_mode: types.PadMode = .zero,
+        groups: usize = 1,
+    };
+
+    pub fn bind(bld: *Builder, w: Tensor, bias: ?Tensor, opts: Options) Builder.Error!Self {
+        const w_ref: TensorRef = try bld.param(w);
+        const b_ref: ?TensorRef = if (bias) |bt| try bld.param(bt) else null;
+        return .{ .w = w_ref, .b = b_ref, .opts = opts };
+    }
+
+    /// NLC (channel-last) conv1d with weight layout [k, c_in/groups, c_out].
+    pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
+        return bld.conv1dPadMode(
+            x,
+            self.w,
+            self.b,
+            self.opts.stride,
+            self.opts.dilation,
+            self.opts.pad_left,
+            self.opts.pad_right,
+            self.opts.pad_mode,
+            self.opts.groups,
+        );
+    }
+};
+
 /// A tiny residual block: conv -> relu -> conv -> add(skip) -> relu.
 pub const ResBlock2D = struct {
     conv1: Conv2D,
@@ -171,48 +209,52 @@ pub const LSTMCell = struct {
     }
 
     pub fn forward(self: Self, bld: *Builder, x: TensorRef, h_prev: TensorRef, c_prev: TensorRef) Builder.Error!LSTMState {
-        const x_shape: []const usize = try bld.requireKnownShape(x);
-        const h_shape: []const usize = try bld.requireKnownShape(h_prev);
-        const c_shape: []const usize = try bld.requireKnownShape(c_prev);
+        const x_shape_opt: ?[]const usize = bld.knownShape(x);
+        const h_shape_opt: ?[]const usize = bld.knownShape(h_prev);
+        const c_shape_opt: ?[]const usize = bld.knownShape(c_prev);
 
-        if (x_shape.len != 2 or h_shape.len != 2 or c_shape.len != 2) return Builder.Error.InvalidArgument;
+        if (x_shape_opt) |x_shape| {
+            if (x_shape.len != 2) return Builder.Error.InvalidArgument;
+            if (x_shape[1] != self.input_size) return Builder.Error.InvalidArgument;
+        }
+        if (h_shape_opt) |h_shape| {
+            if (h_shape.len != 2) return Builder.Error.InvalidArgument;
+            if (h_shape[1] != self.hidden_size) return Builder.Error.InvalidArgument;
+        }
+        if (c_shape_opt) |c_shape| {
+            if (c_shape.len != 2) return Builder.Error.InvalidArgument;
+            if (c_shape[1] != self.hidden_size) return Builder.Error.InvalidArgument;
+        }
 
-        const batch: usize = x_shape[0];
+        var batch_opt: ?usize = null;
+        if (h_shape_opt) |h_shape| {
+            batch_opt = h_shape[0];
+        }
+        if (c_shape_opt) |c_shape| {
+            if (batch_opt) |b0| {
+                if (c_shape[0] != b0) return Builder.Error.InvalidArgument;
+            } else {
+                batch_opt = c_shape[0];
+            }
+        }
+        if (x_shape_opt) |x_shape| {
+            if (batch_opt) |b0| {
+                if (x_shape[0] != b0) return Builder.Error.InvalidArgument;
+            } else {
+                batch_opt = x_shape[0];
+            }
+        }
+
+        const batch: usize = batch_opt orelse return Builder.Error.InvalidArgument;
         if (batch == 0) return Builder.Error.InvalidArgument;
-        if (x_shape[1] != self.input_size) return Builder.Error.InvalidArgument;
-        if (h_shape[0] != batch or c_shape[0] != batch) return Builder.Error.InvalidArgument;
-        if (h_shape[1] != self.hidden_size or c_shape[1] != self.hidden_size) return Builder.Error.InvalidArgument;
 
-        // gates = x @ w_ih + h_prev @ w_hh + b_ih + b_hh
-        const gx: TensorRef = try bld.matmul(x, self.w_ih, 1.0, 0.0);
-        const gh: TensorRef = try bld.matmul(h_prev, self.w_hh, 1.0, 0.0);
-        var gates: TensorRef = try bld.add(gx, gh);
-        if (self.b_ih) |b0| {
-            gates = try bld.broadcastAddLastDim(gates, b0);
-        }
-        if (self.b_hh) |b1| {
-            gates = try bld.broadcastAddLastDim(gates, b1);
-        }
+        // Fused single-step LSTM cell.
+        // Output is a packed [batch, 2h] state: [h_t | c_t].
+        const packed_state: TensorRef = try bld.lstmCell(x, h_prev, c_prev, self.w_ih, self.w_hh, self.b_ih, self.b_hh);
 
-        // Split [batch, 4h] -> 4 x [batch, h]
         const h: usize = self.hidden_size;
-        const i_lin: TensorRef = try bld.slice2d(gates, 0, batch, 0 * h, h);
-        const f_lin: TensorRef = try bld.slice2d(gates, 0, batch, 1 * h, h);
-        const g_lin: TensorRef = try bld.slice2d(gates, 0, batch, 2 * h, h);
-        const o_lin: TensorRef = try bld.slice2d(gates, 0, batch, 3 * h, h);
-
-        const i_gate: TensorRef = try bld.sigmoid(i_lin);
-        const f_gate: TensorRef = try bld.sigmoid(f_lin);
-        const g_gate: TensorRef = try bld.tanh(g_lin);
-        const o_gate: TensorRef = try bld.sigmoid(o_lin);
-
-        const fc: TensorRef = try bld.mul(f_gate, c_prev);
-        const ig: TensorRef = try bld.mul(i_gate, g_gate);
-        const c_t: TensorRef = try bld.add(fc, ig);
-
-        const tanh_c: TensorRef = try bld.tanh(c_t);
-        const h_t: TensorRef = try bld.mul(o_gate, tanh_c);
-
+        const h_t: TensorRef = try bld.slice2d(packed_state, 0, batch, 0, h);
+        const c_t: TensorRef = try bld.slice2d(packed_state, 0, batch, h, h);
         return .{ .h = h_t, .c = c_t };
     }
 };

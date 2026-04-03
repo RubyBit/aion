@@ -235,6 +235,57 @@ test "api: squeeze and unsqueeze roundtrip" {
     try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld_bad, &[_]api.TensorRef{Bad}));
 }
 
+test "api.nn: Conv1D bind+forward" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // NLC input: [batch=1, length=4, channels=1]
+    const x_t: api.Tensor = try ctx.fromArray([1][4][1]f32{
+        .{
+            .{1.0},
+            .{2.0},
+            .{3.0},
+            .{4.0},
+        },
+    });
+
+    // Weight: [k=1, c_in=1, c_out=1] => identity for stride=1, pad=0.
+    const w_t: api.Tensor = try ctx.fromArray([1][1][1]f32{
+        .{.{1.0}},
+    });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+
+    const conv: nn.Conv1D = try nn.Conv1D.bind(&bld, w_t, null, .{
+        .stride = 1,
+        .dilation = 1,
+        .pad_left = 0,
+        .pad_right = 0,
+        .pad_mode = .zero,
+        .groups = 1,
+    });
+
+    const Y: api.TensorRef = try conv.forward(&bld, X);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 4, 1 }, out_t.getShape());
+
+    var out_vals: [4]f32 = undefined;
+    try out_t.read(out_vals[0..]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_vals[0], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out_vals[1], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out_vals[2], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out_vals[3], 0.0);
+}
+
 test "api: generic nd slice" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -683,6 +734,61 @@ test "api.nn: lstm cell (single step)" {
         try std.testing.expect(std.math.isFinite(out_c[i]));
         try std.testing.expectApproxEqAbs(h_ref[i], out_h[i], 1e-5);
         try std.testing.expectApproxEqAbs(c_ref[i], out_c[i], 1e-5);
+    }
+}
+
+test "api: complexAbsMean (split-complex abs mean over time)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 2;
+    const time: usize = 3;
+    const cutoff: usize = 3;
+    const chans2: usize = cutoff * 2;
+    const out_channels: usize = 2;
+
+    var stft_vals: [batch * time * chans2]f32 = undefined;
+    for (0..stft_vals.len) |i| {
+        stft_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5))) * 0.25;
+    }
+
+    // Reference: out[b,c] = mean_t sqrt(re^2 + im^2).
+    var ref: [batch * out_channels]f32 = .{0.0} ** (batch * out_channels);
+    for (0..batch) |b| {
+        for (0..out_channels) |c| {
+            var acc: f32 = 0.0;
+            for (0..time) |t| {
+                const base: usize = (b * time + t) * chans2;
+                const re: f32 = stft_vals[base + c];
+                const im: f32 = stft_vals[base + (c + cutoff)];
+                acc += @sqrt(re * re + im * im);
+            }
+            ref[b * out_channels + c] = acc / @as(f32, @floatFromInt(time));
+        }
+    }
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const stft_t: api.Tensor = try ctx.fromF32(&[_]usize{ batch, time, chans2 }, stft_vals[0..]);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const STFT: api.TensorRef = try bld.param(stft_t);
+    const Out: api.TensorRef = try bld.complexAbsMean(STFT, out_channels);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ batch, out_channels }, out_t.getShape());
+
+    var out_vals: [batch * out_channels]f32 = undefined;
+    try out_t.read(&out_vals);
+
+    for (0..out_vals.len) |i| {
+        try std.testing.expect(std.math.isFinite(out_vals[i]));
+        try std.testing.expectApproxEqAbs(ref[i], out_vals[i], 1e-6);
     }
 }
 

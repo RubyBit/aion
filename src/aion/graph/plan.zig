@@ -30,6 +30,22 @@ pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
 }
 
 pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize {
+    // Default to square tiles for ease of transpose materialization, but avoid
+    // pathological tiling for skinny matrices (e.g. [1, 256]) where a square
+    // heuristic would yield 1x1 tiles and explode tile counts.
+    //
+    // For vector-like shapes, tile along the long axis using base_1d so common
+    // batch==1 workloads don't spend their time in tile-loop overhead.
+    if (m <= 1 and n <= 1) return .{ 1, 1 };
+    if (m <= 1) {
+        const tn: usize = @max(@as(usize, 1), @min(n, policy.base_1d));
+        return .{ 1, tn };
+    }
+    if (n <= 1) {
+        const tm: usize = @max(@as(usize, 1), @min(m, policy.base_1d));
+        return .{ tm, 1 };
+    }
+
     const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(m, n)));
     return .{ side, side };
 }

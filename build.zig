@@ -126,6 +126,62 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run microbenchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    // ---------------------------------------------------------------------
+    // Examples.
+    // Run with:
+    //   zig build examples -- [example args]
+    //   zig build bench-examples -- [example args]
+    // ---------------------------------------------------------------------
+    const examples_step = b.step("examples", "Run all Zig examples under examples/");
+    const bench_examples_step = b.step("bench-examples", "Run all examples in benchmark mode");
+
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+
+    const examples_dir_opt: ?std.Io.Dir = std.Io.Dir.cwd().openDir(io, "examples", .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => @panic("failed to open examples directory"),
+    };
+
+    if (examples_dir_opt) |examples_dir| {
+        var dir = examples_dir;
+        defer dir.close(io);
+
+        var it = dir.iterate();
+        while (true) {
+            const entry_opt = it.next(io) catch @panic("failed iterating examples directory");
+            const entry = entry_opt orelse break;
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+
+            const stem: []const u8 = std.fs.path.stem(entry.name);
+            const rel_path: []const u8 = b.fmt("examples/{s}", .{entry.name});
+
+            const ex_mod = b.createModule(.{
+                .root_source_file = b.path(rel_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "aion", .module = aion_mod },
+                },
+            });
+
+            const ex_exe = b.addExecutable(.{
+                .name = b.fmt("aion-example-{s}", .{stem}),
+                .root_module = ex_mod,
+            });
+
+            const run_ex = b.addRunArtifact(ex_exe);
+            if (b.args) |args| run_ex.addArgs(args);
+            examples_step.dependOn(&run_ex.step);
+
+            const run_ex_bench = b.addRunArtifact(ex_exe);
+            run_ex_bench.addArgs(&.{ "--bench-iters", "10" });
+            if (b.args) |args| run_ex_bench.addArgs(args);
+            bench_examples_step.dependOn(&run_ex_bench.step);
+        }
+    }
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

@@ -47,6 +47,24 @@ pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: Tensor
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
+pub const StepLSTMCellFused = struct {
+    out_state: TensorId,
+    x: TensorId,
+    h_prev: TensorId,
+    c_prev: TensorId,
+    w_ih: TensorId,
+    w_hh: TensorId,
+    b_ih: ?TensorId,
+    b_hh: ?TensorId,
+};
+
+pub const StepComplexAbsMean = struct {
+    out: TensorId,
+    stft: TensorId,
+    /// Number of output channels to produce (must be <= (stft_last_dim/2)).
+    out_channels: usize,
+};
+
 /// Pack/unpack/re-tiling materialization (scalar only, same shape).
 pub const StepReTileCopyScalar = struct { dst: TensorId, src: TensorId };
 
@@ -71,6 +89,10 @@ pub const Step = union(enum) {
     ReduceAxis: StepReduceAxis,
     ConcatScalar: StepConcatScalar,
     CopyTiled: StepCopyTiled,
+
+    LSTMCellFused: StepLSTMCellFused,
+
+    ComplexAbsMean: StepComplexAbsMean,
 
     ReTileCopyScalar: StepReTileCopyScalar,
 

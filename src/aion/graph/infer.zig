@@ -514,6 +514,88 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, first.dtype.?, out_shape);
         },
 
+        .ComplexAbsMean => |cm| {
+            try require(node.inputs.len == 1);
+            const stft = try getValue(graph, node.inputs[0]);
+            try require(stft.dtype != null and stft.shape.len != 0);
+
+            // v0: scalar-only and non-quantized.
+            if (stft.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (stft.dtype.? != .f32 and stft.dtype.? != .f16) return InferError.Unsupported;
+
+            if (stft.shape.len != 3) return InferError.RankMismatch;
+            const batch: usize = stft.shape[0];
+            const time: usize = stft.shape[1];
+            const chans2: usize = stft.shape[2];
+            if (batch == 0 or time == 0 or chans2 == 0) return InferError.InvalidGraph;
+            if (chans2 % 2 != 0) return InferError.ShapeMismatch;
+
+            const cutoff: usize = chans2 / 2;
+            if (cm.out_channels == 0 or cm.out_channels > cutoff) return InferError.ShapeMismatch;
+
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, 2) catch return InferError.InvalidGraph;
+            out_shape[0] = batch;
+            out_shape[1] = cm.out_channels;
+            try setInferred(graph, node.output, stft.dtype.?, out_shape);
+        },
+
+        .LSTMCell => |lc| {
+            // Inputs (required): x, h_prev, c_prev, w_ih, w_hh
+            // Inputs (optional): b_ih, b_hh
+            if (lc.has_bias) {
+                try require(node.inputs.len == 7);
+            } else {
+                try require(node.inputs.len == 5);
+            }
+
+            const x = try getValue(graph, node.inputs[0]);
+            const h_prev = try getValue(graph, node.inputs[1]);
+            const c_prev = try getValue(graph, node.inputs[2]);
+            const w_ih = try getValue(graph, node.inputs[3]);
+            const w_hh = try getValue(graph, node.inputs[4]);
+
+            try require(x.dtype != null and x.shape.len != 0);
+            try require(h_prev.dtype != null and h_prev.shape.len != 0);
+            try require(c_prev.dtype != null and c_prev.shape.len != 0);
+            try require(w_ih.dtype != null and w_ih.shape.len != 0);
+            try require(w_hh.dtype != null and w_hh.shape.len != 0);
+
+            // v0: fused LSTM is scalar-only (f32/f16) and non-quantized.
+            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (x.dtype.? != .f32 and x.dtype.? != .f16) return InferError.Unsupported;
+            if (h_prev.dtype.? != x.dtype.? or c_prev.dtype.? != x.dtype.? or w_ih.dtype.? != x.dtype.? or w_hh.dtype.? != x.dtype.?) return InferError.DTypeMismatch;
+
+            if (x.shape.len != 2 or h_prev.shape.len != 2 or c_prev.shape.len != 2) return InferError.RankMismatch;
+            if (w_ih.shape.len != 2 or w_hh.shape.len != 2) return InferError.RankMismatch;
+
+            const batch: usize = x.shape[0];
+            const input_size: usize = x.shape[1];
+            const hidden: usize = h_prev.shape[1];
+            if (batch == 0 or input_size == 0 or hidden == 0) return InferError.InvalidGraph;
+            if (h_prev.shape[0] != batch or c_prev.shape[0] != batch) return InferError.ShapeMismatch;
+            if (c_prev.shape[1] != hidden) return InferError.ShapeMismatch;
+
+            const gate_dim: usize = std.math.mul(usize, hidden, 4) catch return InferError.InvalidGraph;
+            if (w_ih.shape[0] != input_size or w_ih.shape[1] != gate_dim) return InferError.ShapeMismatch;
+            if (w_hh.shape[0] != hidden or w_hh.shape[1] != gate_dim) return InferError.ShapeMismatch;
+
+            if (lc.has_bias) {
+                const b_ih = try getValue(graph, node.inputs[5]);
+                const b_hh = try getValue(graph, node.inputs[6]);
+                try require(b_ih.dtype != null and b_ih.shape.len != 0);
+                try require(b_hh.dtype != null and b_hh.shape.len != 0);
+                if (b_ih.dtype.? != x.dtype.? or b_hh.dtype.? != x.dtype.?) return InferError.DTypeMismatch;
+                if (b_ih.shape.len != 1 or b_hh.shape.len != 1) return InferError.RankMismatch;
+                if (b_ih.shape[0] != gate_dim or b_hh.shape[0] != gate_dim) return InferError.ShapeMismatch;
+            }
+
+            const out_hidden2: usize = std.math.mul(usize, hidden, 2) catch return InferError.InvalidGraph;
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, 2) catch return InferError.InvalidGraph;
+            out_shape[0] = batch;
+            out_shape[1] = out_hidden2;
+            try setInferred(graph, node.output, x.dtype.?, out_shape);
+        },
+
         .Copy => {
             try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);

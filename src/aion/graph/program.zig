@@ -789,6 +789,17 @@ fn fillTileShapeDefault(policy: plan_mod.TilePolicy, dtype: types.DType, shape: 
     if (out.len != shape.len) return CompileError.InvalidArgument;
     if (shape.len == 0) return CompileError.InvalidArgument;
 
+    // Small tensors: use full dimensions as a single tile.  Avoids per-tile
+    // overhead (acquire/release, multi-tile element-by-element read/write)
+    // that dominates for small workloads.
+    var total: usize = 1;
+    for (shape) |dim| total = std.math.mul(usize, total, dim) catch break;
+    if (total <= policy.small_tensor_threshold) {
+        @memcpy(out, shape);
+        _ = dtype;
+        return;
+    }
+
     if (shape.len == 1) {
         const t1: [1]usize = plan_mod.chooseTileShape1D(policy, shape[0]);
         out[0] = t1[0];
@@ -957,7 +968,21 @@ pub fn compileGraph(
                 const a_v = graph.values.items[a_id];
                 var tile_buf: [MAX_RANK]usize = undefined;
                 const tile: []usize = tile_buf[0..out_shape.len];
-                try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+
+                // Inherit input tiling when available to avoid retile failures
+                // (e.g. Conv1D output uses chooseConv1DTiles, which may differ
+                // from the default chooseTileShape2DSquare).
+                if (ctx.value_has_tensor[a_id]) {
+                    const a_t: *const TiledTensor = try mgr.getConst(ctx.value_tensor[a_id]);
+                    if (a_t.tile_shape.len == out_shape.len) {
+                        @memcpy(tile, a_t.tile_shape);
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                    }
+                } else {
+                    try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                }
+
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
                 try appendStepChecked(allocator, mgr, &steps, .{ .UnaryTiled = .{ .op = u.op, .out = out_tid, .a = a_tid } });
@@ -1033,6 +1058,21 @@ pub fn compileGraph(
                 const ct = plan_mod.chooseConv1DTiles(policy, out_shape[rank - 2], out_shape[rank - 1]);
                 out_tile[rank - 1] = ct.tc;
 
+                // Depthwise conv: keep C tiling aligned with X when possible.
+                // This preserves eligibility for the depthwise tile-native kernel
+                // (including reflect padding), even when the generic Conv1D tile
+                // chooser would collapse small outputs into a single C tile.
+                if (cv.groups == x_v.shape[rank - 1] and cv.groups == out_shape[rank - 1] and ctx.value_has_tensor[x_id]) {
+                    const x_tid_existing: TensorId = ctx.value_tensor[x_id];
+                    const x_t_existing: *const TiledTensor = try mgr.getConst(x_tid_existing);
+                    if (x_t_existing.tile_shape.len == rank) {
+                        const tc_x: usize = x_t_existing.tile_shape[rank - 1];
+                        if (tc_x != 0 and tc_x <= out_shape[rank - 1]) {
+                            out_tile[rank - 1] = tc_x;
+                        }
+                    }
+                }
+
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
                 const x_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
                 const w_tid: TensorId = try ensureAnyTensor(&ctx, w_id);
@@ -1040,7 +1080,6 @@ pub fn compileGraph(
                 var bias_tid: ?TensorId = null;
                 if (node.inputs.len == 3) {
                     const b_id: usize = @intCast(node.inputs[2]);
-                    _ = x_v;
                     bias_tid = try ensureAnyTensor(&ctx, b_id);
                 }
 
@@ -1580,12 +1619,22 @@ fn ensureTilingScalarMaybeRetile(
     if (i == want_tile.len) return cur;
 
     if (shape.len > 2) {
-        // Performance guard: only allow batch retile when M/N/K tiles are unchanged
-        // and batch tile count is small.
+        // Performance guard: for large rank>2 tensors, only allow batch retile
+        // when the last two dims' tiling is unchanged and the batch tile grid is
+        // small. For small tensors, retiling is cheap and we allow changing the
+        // last two dims to avoid compile-time tiling dead-ends.
+        const total_elems: usize = try elemCount(shape);
         const rank: usize = shape.len;
-        if (cur_t.tile_shape[rank - 1] != want_tile[rank - 1]) return CompileError.InvalidArgument;
-        if (cur_t.tile_shape[rank - 2] != want_tile[rank - 2]) return CompileError.InvalidArgument;
 
+        // For large tensors, changing the last two dims can turn a cheap retile into
+        // a massive element-wise shuffle; reject it.
+        if (total_elems > policy.small_tensor_threshold) {
+            if (cur_t.tile_shape[rank - 1] != want_tile[rank - 1]) return CompileError.InvalidArgument;
+            if (cur_t.tile_shape[rank - 2] != want_tile[rank - 2]) return CompileError.InvalidArgument;
+        }
+
+        // Always keep the batch tile grid bounded (even for small tensors), since
+        // a tiny per-tile footprint can still imply thousands of tiles.
         var batch_tiles: usize = 1;
         var d: usize = 0;
         while (d + 2 < rank) : (d += 1) {

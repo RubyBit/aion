@@ -22,6 +22,11 @@ pub const TilePolicy = struct {
     /// Max number of batch tiles to allow when retiling rank>2 scalar tensors.
     /// Keeps retile cost bounded to preserve perf for large batch grids.
     batch_retile_max_tiles: usize = 64,
+
+    /// Tensors with total element count at or below this threshold are stored
+    /// as a single tile, eliminating per-tile acquire/release overhead and
+    /// enabling the memcpy fast-path in readTensorPackedF32/writeTensorPackedF32.
+    small_tensor_threshold: usize = 128 * 1024,
 };
 
 pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
@@ -103,6 +108,9 @@ pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, d
 }
 
 pub fn chooseConv1DTiles(policy: TilePolicy, l: usize, c_out: usize) struct { tl: usize, tc: usize } {
+    // Small outputs: single tile (avoids per-tile overhead).
+    if (l * c_out <= policy.small_tensor_threshold) return .{ .tl = l, .tc = c_out };
+
     // Conv1D is typically memory-friendly along the length axis (NLC) and many hot
     // cases (e.g. pointwise) benefit from larger M to amortize matmul overhead.
     // Allow Conv1D to use a larger length tile than the generic base_1d.

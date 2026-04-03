@@ -10,6 +10,9 @@ const TensorRef = api.TensorRef;
 
 const ExampleOptions = struct {
     weights_path: ?[]u8 = null,
+    raw_weights_path: ?[]u8 = null,
+    export_path: ?[]u8 = null,
+    wav_path: ?[]u8 = null,
     chunks: usize = 8,
     num_samples: usize = 512,
     context_size: usize = 64,
@@ -17,14 +20,15 @@ const ExampleOptions = struct {
     pad_mode: types.PadMode = .reflect,
     profile: bool = false,
     profile_steps: bool = false,
-
-    /// Front-end choice:
-    /// - true: use fused `complexAbsMean` op (single runtime step)
-    /// - false: build the equivalent subgraph from primitive ops
-    use_fused_complex_abs_mean: bool = true,
+    print_probs: bool = false,
+    viz: bool = false,
+    viz_threshold: f32 = 0.5,
 
     pub fn deinit(self: *ExampleOptions, allocator: std.mem.Allocator) void {
         if (self.weights_path) |p| allocator.free(p);
+        if (self.raw_weights_path) |p| allocator.free(p);
+        if (self.export_path) |p| allocator.free(p);
+        if (self.wav_path) |p| allocator.free(p);
         self.* = undefined;
     }
 };
@@ -167,7 +171,7 @@ const TinySileroVAD = struct {
         };
     }
 
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef, state: TinySileroState, use_fused_absmean: bool) Builder.Error!TinySileroForward {
+    pub fn forward(self: Self, bld: *Builder, x: TensorRef, state: TinySileroState) Builder.Error!TinySileroForward {
         // x: [batch, time]
         const x_shape: []const usize = try bld.requireKnownShape(x);
         if (x_shape.len != 2) return Builder.Error.InvalidArgument;
@@ -193,15 +197,22 @@ const TinySileroVAD = struct {
             if (stft_shape[2] != self.cutoff * 2) return Builder.Error.InvalidArgument;
         }
 
-        const y4_2d: TensorRef = if (use_fused_absmean)
-            // Fused front-end: abs_mean = mean_t sqrt(real^2 + imag^2)
-            // and keep the first `hidden` channels for the LSTM input.
-            try bld.complexAbsMean(stft, self.lstm_cell.hidden_size)
-        else
-            // Unfused reference: build the equivalent subgraph from primitive ops.
-            try complexAbsMeanUnfused(bld, stft, batch, t_steps, self.cutoff, self.lstm_cell.hidden_size);
+        // Spectral magnitude: split real/imag halves, compute sqrt(re^2 + im^2).
+        const real: TensorRef = try bld.slice(stft, &[_]usize{ 0, 0, 0 }, &[_]usize{ batch, t_steps, self.cutoff });
+        const imag: TensorRef = try bld.slice(stft, &[_]usize{ 0, 0, self.cutoff }, &[_]usize{ batch, t_steps, self.cutoff });
+        const r2: TensorRef = try bld.mul(real, real);
+        const im2: TensorRef = try bld.mul(imag, imag);
+        const mag2: TensorRef = try bld.add(r2, im2);
+        const mag: TensorRef = try bld.sqrt(mag2); // [batch, t_steps, 129]
 
-        const st: nn.LSTMState = try self.lstm_cell.forward(bld, y4_2d, state.h, state.c);
+        // Conv feature extraction (matches Python TinySileroVAD).
+        const c1: TensorRef = try bld.relu(try self.conv1.forward(bld, mag)); // [batch, t_steps, 128]
+        const c2: TensorRef = try bld.relu(try self.conv2.forward(bld, c1)); // [batch, t_steps/2, 64]
+        const c3: TensorRef = try bld.relu(try self.conv3.forward(bld, c2)); // [batch, t_steps/4, 64]
+        const c4: TensorRef = try bld.relu(try self.conv4.forward(bld, c3)); // [batch, 1, 128]
+        const features: TensorRef = try bld.squeeze(c4, 1); // [batch, 128]
+
+        const st: nn.LSTMState = try self.lstm_cell.forward(bld, features, state.h, state.c);
 
         const h3: TensorRef = try bld.unsqueeze(st.h, 1); // [batch, 1, 128]
         const act: TensorRef = try bld.relu(h3);
@@ -211,7 +222,7 @@ const TinySileroVAD = struct {
         const probs1: TensorRef = try bld.reduceAxis(.mean, probs2, 1); // [batch]
         const probs: TensorRef = try bld.unsqueeze(probs1, 1); // [batch, 1]
 
-        return .{ .features = y4_2d, .prob = probs, .h = st.h, .c = st.c };
+        return .{ .features = features, .prob = probs, .h = st.h, .c = st.c };
     }
 };
 
@@ -248,12 +259,29 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !ExampleOptio
             } else {
                 return error.InvalidArgument;
             }
+        } else if (std.mem.eql(u8, arg, "--raw-weights")) {
+            const p: []const u8 = it.next() orelse return error.InvalidArgument;
+            if (out.raw_weights_path) |old| allocator.free(old);
+            out.raw_weights_path = try allocator.dupe(u8, p);
+        } else if (std.mem.eql(u8, arg, "--export-aion")) {
+            const p: []const u8 = it.next() orelse return error.InvalidArgument;
+            if (out.export_path) |old| allocator.free(old);
+            out.export_path = try allocator.dupe(u8, p);
+        } else if (std.mem.eql(u8, arg, "--wav")) {
+            const p: []const u8 = it.next() orelse return error.InvalidArgument;
+            if (out.wav_path) |old| allocator.free(old);
+            out.wav_path = try allocator.dupe(u8, p);
+        } else if (std.mem.eql(u8, arg, "--print-probs")) {
+            out.print_probs = true;
+        } else if (std.mem.eql(u8, arg, "--viz")) {
+            out.viz = true;
+        } else if (std.mem.eql(u8, arg, "--viz-threshold")) {
+            const v: []const u8 = it.next() orelse return error.InvalidArgument;
+            out.viz_threshold = try std.fmt.parseFloat(f32, v);
         } else if (std.mem.eql(u8, arg, "--profile")) {
             out.profile = true;
         } else if (std.mem.eql(u8, arg, "--profile-steps")) {
             out.profile_steps = true;
-        } else if (std.mem.eql(u8, arg, "--no-fused-absmean")) {
-            out.use_fused_complex_abs_mean = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return error.HelpRequested;
@@ -262,7 +290,9 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !ExampleOptio
         }
     }
 
-    if (out.chunks == 0 or out.num_samples == 0 or out.context_size == 0 or out.bench_iters == 0) return error.InvalidArgument;
+    if (out.num_samples == 0 or out.context_size == 0 or out.bench_iters == 0) return error.InvalidArgument;
+    // If --wav is provided, --chunks 0 means "auto".
+    if (out.wav_path == null and out.chunks == 0) return error.InvalidArgument;
     if (out.context_size != 64) {
         std.debug.print("warning: TinySilero reference context is 64; got {}\n", .{out.context_size});
     }
@@ -272,53 +302,78 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !ExampleOptio
 
 fn printUsage() void {
     std.debug.print(
-        \\TinySileroVAD-style Aion integration example
+        \\TinySileroVAD Aion integration example
         \\
         \\Usage:
         \\  zig build examples -- [options]
         \\  zig build bench-examples -- [options]
         \\
         \\Options:
-        \\  --weights <path>       Optional .aion model package to load directly
+        \\  --weights <path>       Load a pre-exported .aion model package directly
+        \\  --raw-weights <path>   Load raw f32 weights (from convert_silero_vad.py),
+        \\                         build the graph, export to .aion, and run
+        \\  --export-aion <path>   Save the exported .aion to a permanent path
+        \\  --wav <path>           Stream audio from a .wav file instead of synthetic audio
         \\  --chunks <n>           Number of streaming chunks (default: 8)
+        \\                         If --wav is set, --chunks 0 means "auto" (ceil(len/num_samples))
         \\  --num-samples <n>      Samples per chunk (default: 512)
         \\  --context <n>          Context size prepended to chunk (default: 64)
         \\  --bench-iters <n>      Run the streaming loop n times for timing (default: 1)
         \\  --pad-mode <reflect|zero>  STFT pre-conv pad mode (default: reflect)
+        \\  --print-probs          Print per-chunk probabilities (useful with --wav)
+        \\  --viz                  Print a per-second speech/silence visualization
+        \\  --viz-threshold <f>     Threshold for --viz (default: 0.5)
         \\  --profile              Print a rough per-chunk time breakdown (adds overhead)
         \\  --profile-steps        Print per-step timings for the first model.run() (adds overhead)
-        \\  --no-fused-absmean     Build abs-mean front-end from primitive ops (no fused op)
         \\  -h, --help             Show this help
         \\
-        \\If --weights is omitted, the example creates deterministic synthetic weights,
-        \\exports a temporary `.aion` model package, reloads it, and runs streaming
-        \\inference from that package rather than rebuilding the architecture for execution.
+        \\Conversion workflow:
+        \\  1. python scripts/convert_silero_vad.py silero_vad_16k.safetensors weights.bin
+        \\  2. zig build examples -- --raw-weights weights.bin --export-aion silero_vad.aion
+        \\  3. zig build examples -- --weights silero_vad.aion
+        \\
+        \\If neither --weights nor --raw-weights is given, synthetic weights are used.
         \\
     , .{});
 }
 
-fn complexAbsMeanUnfused(
-    bld: *Builder,
-    stft: TensorRef,
-    batch: usize,
-    time: usize,
-    cutoff: usize,
-    out_channels: usize,
-) Builder.Error!TensorRef {
-    if (batch == 0 or time == 0 or cutoff == 0) return Builder.Error.InvalidArgument;
-    if (out_channels == 0 or out_channels > cutoff) return Builder.Error.InvalidArgument;
+fn printVizPerSecond(allocator: std.mem.Allocator, probs: []const f32, num_samples: usize, threshold: f32) !void {
+    const sample_rate: usize = 16_000;
+    if (num_samples == 0) return error.InvalidArgument;
+    if (probs.len == 0) return;
 
-    // stft is [batch, time, 2*cutoff]. Real is first half, Imag is second half.
-    const real: TensorRef = try bld.slice(stft, &[_]usize{ 0, 0, 0 }, &[_]usize{ batch, time, out_channels });
-    const imag: TensorRef = try bld.slice(stft, &[_]usize{ 0, 0, cutoff }, &[_]usize{ batch, time, out_channels });
+    const total_samples: usize = std.math.mul(usize, probs.len, num_samples) catch return error.InvalidArgument;
+    const seconds: usize = std.math.divCeil(usize, total_samples, sample_rate) catch return error.InvalidArgument;
 
-    const r2: TensorRef = try bld.mul(real, real);
-    const im2: TensorRef = try bld.mul(imag, imag);
-    const mag2: TensorRef = try bld.add(r2, im2);
-    const mag: TensorRef = try bld.sqrt(mag2);
+    const sums: []f32 = try allocator.alloc(f32, seconds);
+    defer allocator.free(sums);
+    const counts: []u32 = try allocator.alloc(u32, seconds);
+    defer allocator.free(counts);
+    @memset(sums, 0.0);
+    @memset(counts, 0);
 
-    // Mean over time axis => [batch, out_channels]
-    return bld.reduceAxis(.mean, mag, 1);
+    for (probs, 0..) |p, chunk_idx| {
+        const start_sample: usize = std.math.mul(usize, chunk_idx, num_samples) catch continue;
+        const sec: usize = start_sample / sample_rate;
+        if (sec >= seconds) continue;
+        sums[sec] += p;
+        counts[sec] += 1;
+    }
+
+    const out: []u8 = try allocator.alloc(u8, seconds);
+    defer allocator.free(out);
+    for (0..seconds) |s| {
+        const avg: f32 = if (counts[s] == 0) 0.0 else sums[s] / @as(f32, @floatFromInt(counts[s]));
+        out[s] = if (avg >= threshold) 'O' else '_';
+    }
+
+    std.debug.print("  viz (1s): O=speech _=silence (threshold={d:.2})\n", .{threshold});
+    const cols: usize = 80;
+    var i: usize = 0;
+    while (i < seconds) : (i += cols) {
+        const end: usize = @min(seconds, i + cols);
+        std.debug.print("  {d:0>4}-{d:0>4}: {s}\n", .{ i, end - 1, out[i..end] });
+    }
 }
 
 fn createDeterministicTensor(
@@ -373,7 +428,6 @@ fn exportTinySileroPackage(
     weights: TinySileroWeights,
     chunk_input_len: usize,
     pad_mode: types.PadMode,
-    use_fused_absmean: bool,
     file: std.Io.File,
 ) !void {
     var bld: Builder = api.Builder.init(allocator);
@@ -384,7 +438,7 @@ fn exportTinySileroPackage(
     const c_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.c);
 
     const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
-    const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref }, use_fused_absmean);
+    const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref });
 
     try ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
         .{ .name = ModelTensorNames.prob, .tensor = out.prob },
@@ -417,6 +471,202 @@ fn fillSyntheticAudio(signal: []f32, context_size: usize) void {
         const n0: f32 = 0.02 * @sin(2.0 * std.math.pi * 37.0 * (t / 16_000.0));
         signal[i] = s0 + s1 + n0;
     }
+}
+
+const Wav = struct {
+    sample_rate: u32,
+    samples: []f32,
+};
+
+fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const end_pos: u64 = try f.length(io);
+    const size: usize = std.math.cast(usize, end_pos) orelse return error.InvalidArgument;
+    const buf: []u8 = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    const read_len: usize = try f.readPositionalAll(io, buf, 0);
+    if (read_len != buf.len) return error.InputOutput;
+    return buf;
+}
+
+fn resampleLinearMonoF32(allocator: std.mem.Allocator, input: []const f32, in_rate: u32, out_rate: u32) ![]f32 {
+    if (in_rate == out_rate) return allocator.dupe(f32, input);
+    if (input.len == 0) return allocator.alloc(f32, 0);
+    const out_len: usize = @intCast((@as(u64, input.len) * @as(u64, out_rate) + @as(u64, in_rate) - 1) / @as(u64, in_rate));
+    const out: []f32 = try allocator.alloc(f32, out_len);
+    errdefer allocator.free(out);
+
+    const step: f64 = @as(f64, @floatFromInt(in_rate)) / @as(f64, @floatFromInt(out_rate));
+    for (out, 0..) |*dst, i| {
+        const pos: f64 = @as(f64, @floatFromInt(i)) * step;
+        const idx0: usize = @intFromFloat(@floor(pos));
+        const idx1: usize = @min(idx0 + 1, input.len - 1);
+        const frac: f32 = @floatCast(pos - @as(f64, @floatFromInt(idx0)));
+        const a: f32 = input[idx0];
+        const b: f32 = input[idx1];
+        dst.* = a + (b - a) * frac;
+    }
+    return out;
+}
+
+fn loadWavMonoF32(allocator: std.mem.Allocator, path: []const u8) !Wav {
+    const bytes: []u8 = try readFileAlloc(allocator, path);
+    errdefer allocator.free(bytes);
+
+    const Cursor = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        fn readSlice(self: *@This(), n: usize) ![]const u8 {
+            if (self.pos + n > self.bytes.len) return error.UnexpectedEof;
+            const s = self.bytes[self.pos .. self.pos + n];
+            self.pos += n;
+            return s;
+        }
+
+        fn readU16(self: *@This()) !u16 {
+            const s = try self.readSlice(2);
+            return std.mem.readInt(u16, s[0..2], .little);
+        }
+
+        fn readU32(self: *@This()) !u32 {
+            const s = try self.readSlice(4);
+            return std.mem.readInt(u32, s[0..4], .little);
+        }
+
+        fn readFourCC(self: *@This()) ![4]u8 {
+            const s = try self.readSlice(4);
+            return .{ s[0], s[1], s[2], s[3] };
+        }
+
+        fn skip(self: *@This(), n: usize) !void {
+            _ = try self.readSlice(n);
+        }
+    };
+
+    var cur: Cursor = .{ .bytes = bytes };
+    const riff = try cur.readFourCC();
+    if (!std.mem.eql(u8, riff[0..], "RIFF")) return error.InvalidFormat;
+    _ = try cur.readU32();
+    const wave = try cur.readFourCC();
+    if (!std.mem.eql(u8, wave[0..], "WAVE")) return error.InvalidFormat;
+
+    var fmt_audio_format: u16 = 0;
+    var fmt_channels: u16 = 0;
+    var fmt_sample_rate: u32 = 0;
+    var fmt_bits_per_sample: u16 = 0;
+    var data_bytes: ?[]const u8 = null;
+
+    while (cur.pos + 8 <= cur.bytes.len) {
+        const chunk_id = try cur.readFourCC();
+        const chunk_size = try cur.readU32();
+        const chunk = try cur.readSlice(@intCast(chunk_size));
+        if ((chunk_size & 1) == 1 and cur.pos < cur.bytes.len) {
+            // pad byte to 2-byte alignment
+            try cur.skip(1);
+        }
+
+        if (std.mem.eql(u8, chunk_id[0..], "fmt ")) {
+            if (chunk.len < 16) return error.InvalidFormat;
+            var fc: Cursor = .{ .bytes = chunk };
+            fmt_audio_format = try fc.readU16();
+            fmt_channels = try fc.readU16();
+            fmt_sample_rate = try fc.readU32();
+            _ = try fc.readU32(); // byte rate
+            _ = try fc.readU16(); // block align
+            fmt_bits_per_sample = try fc.readU16();
+        } else if (std.mem.eql(u8, chunk_id[0..], "data")) {
+            data_bytes = chunk;
+        }
+    }
+
+    if (fmt_channels == 0 or fmt_sample_rate == 0 or data_bytes == null) return error.InvalidFormat;
+
+    const channels: usize = @intCast(fmt_channels);
+    const data = data_bytes.?;
+
+    var mono: []f32 = undefined;
+    switch (fmt_audio_format) {
+        1 => { // PCM
+            switch (fmt_bits_per_sample) {
+                16 => {
+                    const frame_bytes: usize = 2 * channels;
+                    if (frame_bytes == 0 or (data.len % frame_bytes) != 0) return error.InvalidFormat;
+                    const frames: usize = data.len / frame_bytes;
+                    mono = try allocator.alloc(f32, frames);
+                    errdefer allocator.free(mono);
+                    var i: usize = 0;
+                    while (i < frames) : (i += 1) {
+                        var acc: f32 = 0.0;
+                        for (0..channels) |ch| {
+                            const off: usize = (i * frame_bytes) + (ch * 2);
+                            const s = std.mem.readInt(i16, data[off .. off + 2][0..2], .little);
+                            acc += @as(f32, @floatFromInt(s)) / 32768.0;
+                        }
+                        mono[i] = acc / @as(f32, @floatFromInt(channels));
+                    }
+                },
+                32 => {
+                    const frame_bytes: usize = 4 * channels;
+                    if (frame_bytes == 0 or (data.len % frame_bytes) != 0) return error.InvalidFormat;
+                    const frames: usize = data.len / frame_bytes;
+                    mono = try allocator.alloc(f32, frames);
+                    errdefer allocator.free(mono);
+                    var i: usize = 0;
+                    while (i < frames) : (i += 1) {
+                        var acc: f32 = 0.0;
+                        for (0..channels) |ch| {
+                            const off: usize = (i * frame_bytes) + (ch * 4);
+                            const s = std.mem.readInt(i32, data[off .. off + 4][0..4], .little);
+                            acc += @as(f32, @floatFromInt(s)) / 2147483648.0;
+                        }
+                        mono[i] = acc / @as(f32, @floatFromInt(channels));
+                    }
+                },
+                else => return error.Unsupported,
+            }
+        },
+        3 => { // IEEE float
+            if (fmt_bits_per_sample != 32) return error.Unsupported;
+            const frame_bytes: usize = 4 * channels;
+            if (frame_bytes == 0 or (data.len % frame_bytes) != 0) return error.InvalidFormat;
+            const frames: usize = data.len / frame_bytes;
+            mono = try allocator.alloc(f32, frames);
+            errdefer allocator.free(mono);
+            var i: usize = 0;
+            while (i < frames) : (i += 1) {
+                var acc: f32 = 0.0;
+                for (0..channels) |ch| {
+                    const off: usize = (i * frame_bytes) + (ch * 4);
+                    const bits = std.mem.readInt(u32, data[off .. off + 4][0..4], .little);
+                    const s: f32 = @bitCast(bits);
+                    acc += s;
+                }
+                mono[i] = acc / @as(f32, @floatFromInt(channels));
+            }
+        },
+        else => return error.Unsupported,
+    }
+
+    // We can now drop the original file bytes.
+    allocator.free(bytes);
+
+    // Resample to 16kHz if needed (simple linear; good enough for an example).
+    const target_sr: u32 = 16_000;
+    if (fmt_sample_rate != target_sr) {
+        const resampled: []f32 = try resampleLinearMonoF32(allocator, mono, fmt_sample_rate, target_sr);
+        allocator.free(mono);
+        mono = resampled;
+        fmt_sample_rate = target_sr;
+    }
+
+    // Clamp any out-of-range values (can happen with float WAVs).
+    for (mono) |*v| v.* = @max(-1.0, @min(1.0, v.*));
+
+    return .{ .sample_rate = fmt_sample_rate, .samples = mono };
 }
 
 fn nowNs() u64 {
@@ -469,7 +719,7 @@ fn mainImpl(args: std.process.Args) !void {
             std.Io.Dir.cwd().deleteFile(io, synthetic_path) catch {};
         }
 
-        try exportTinySileroPackage(&export_ctx, allocator, weights, chunk_input_len, opts.pad_mode, opts.use_fused_complex_abs_mean, file);
+        try exportTinySileroPackage(&export_ctx, allocator, weights, chunk_input_len, opts.pad_mode, file);
         break :blk try ctx.loadModel(file, .{});
     };
     defer loaded_model.deinit();
@@ -489,10 +739,33 @@ fn mainImpl(args: std.process.Args) !void {
     try loaded_model.bindInput(ModelTensorNames.h, h_tensor);
     try loaded_model.bindInput(ModelTensorNames.c, c_tensor);
 
+    var wav_opt: ?Wav = null;
+    defer if (wav_opt) |w| allocator.free(w.samples);
+
+    if (opts.wav_path) |wav_path| {
+        wav_opt = try loadWavMonoF32(allocator, wav_path);
+        const wav = wav_opt.?;
+        if (wav.sample_rate != 16_000) return error.Unsupported;
+        if (opts.chunks == 0) {
+            opts.chunks = std.math.divCeil(usize, wav.samples.len, opts.num_samples) catch return error.InvalidArgument;
+        }
+        if (opts.chunks == 0) return error.InvalidArgument;
+    }
+
     const total_len: usize = opts.context_size + opts.chunks * opts.num_samples;
     const signal: []f32 = try allocator.alloc(f32, total_len);
     defer allocator.free(signal);
-    fillSyntheticAudio(signal, opts.context_size);
+    @memset(signal[0..opts.context_size], 0.0);
+    if (wav_opt) |wav| {
+        const want: usize = opts.chunks * opts.num_samples;
+        const take: usize = @min(want, wav.samples.len);
+        @memcpy(signal[opts.context_size .. opts.context_size + take], wav.samples[0..take]);
+        if (take < want) {
+            @memset(signal[opts.context_size + take .. opts.context_size + want], 0.0);
+        }
+    } else {
+        fillSyntheticAudio(signal, opts.context_size);
+    }
 
     const chunk_buf: []f32 = try allocator.alloc(f32, chunk_input_len);
     defer allocator.free(chunk_buf);
@@ -556,6 +829,11 @@ fn mainImpl(args: std.process.Args) !void {
             };
             probs[chunk_idx] = prob_tmp[0];
 
+            if (opts.print_probs) {
+                const chunk_ms: f64 = (@as(f64, @floatFromInt(chunk_idx)) * @as(f64, @floatFromInt(opts.num_samples)) * 1000.0) / 16000.0;
+                std.debug.print("  chunk {}  t={d:.1}ms  prob={d:.6}\n", .{ chunk_idx, chunk_ms, probs[chunk_idx] });
+            }
+
             const t_h: u64 = if (opts.profile) nowNs() else 0;
             if (opts.profile) t_read_out_ns += (t_h - t_g);
         }
@@ -586,6 +864,10 @@ fn mainImpl(args: std.process.Args) !void {
     std.debug.print("  probs: first={d:.6} last={d:.6} min={d:.6} max={d:.6} mean={d:.6}\n", .{ probs[0], probs[opts.chunks - 1], p_min, p_max, p_mean });
     std.debug.print("  final_state checksum: h0={d:.6} c0={d:.6}\n", .{ h_buf[0], c_buf[0] });
     std.debug.print("  perf: total_chunks={}  chunks/s={d:.2}  us/chunk={d:.2}\n", .{ total_chunks, chunks_per_sec, us_per_chunk });
+
+    if (opts.viz) {
+        try printVizPerSecond(allocator, probs, opts.num_samples, opts.viz_threshold);
+    }
 
     if (opts.profile) {
         const denom: f64 = @as(f64, @floatFromInt(@max(@as(usize, 1), total_chunks)));

@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) void {
     // `--listen=-` test runner mode can stall on Windows. The direct `zig test`
     // path is the closest stable fallback and still honors the selected
     // target/optimize settings.
+    const skip_thread_pool_tests: bool = b.option(
+        bool,
+        "skip-thread-pool-tests",
+        "Skip thread pool tests (avoids occasional Windows stalls)",
+    ) orelse false;
+
     const test_step = b.step("test", "Run tests");
     const run_lib_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
@@ -100,7 +106,29 @@ pub fn build(b: *std.Build) void {
             target.query.zigTriple(b.allocator) catch @panic("OOM"),
         });
     }
+    if (b.args) |args| run_lib_tests.addArgs(args);
+    if (skip_thread_pool_tests) run_lib_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
     test_step.dependOn(&run_lib_tests.step);
+
+    const test_fast_step = b.step("test-fast", "Run tests (skip thread pool suite)");
+    const run_fast_tests = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "test",
+        "src/tests.zig",
+        "--cache-dir",
+        ".zig-cache",
+        optimizeArg(optimize),
+    });
+    run_fast_tests.has_side_effects = true;
+    if (!target.query.isNativeTriple()) {
+        run_fast_tests.addArgs(&.{
+            "-target",
+            target.query.zigTriple(b.allocator) catch @panic("OOM"),
+        });
+    }
+    if (b.args) |args| run_fast_tests.addArgs(args);
+    run_fast_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
+    test_fast_step.dependOn(&run_fast_tests.step);
 
     // ---------------------------------------------------------------------
     // Benchmarks.

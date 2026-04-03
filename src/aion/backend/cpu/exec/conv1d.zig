@@ -960,6 +960,157 @@ fn tryExecConv1DImplicitGemmTileNative(
     return true;
 }
 
+/// Fast path for small convolutions (e.g. Silero VAD feature extraction).
+///
+/// Bypasses tiling infrastructure entirely: reads flat, convolves directly with
+/// SIMD broadcast-accumulate, writes flat.  Only groups=1, rank-3, f32 and
+/// small element counts.
+fn tryExecConv1DSmallDirect(
+    ctx: *ConvExecCtx,
+    s: StepConv1DTiled,
+    out_meta: tensor_store.TensorMeta,
+    x_meta: tensor_store.TensorMeta,
+    w_meta: tensor_store.TensorMeta,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!bool {
+    @setRuntimeSafety(false);
+
+    const rank: usize = @as(usize, out_meta.rank);
+    if (rank != 3) return false;
+    if (s.groups != 1) return false;
+    if (out_meta.dtype != .f32 or x_meta.dtype != .f32 or w_meta.dtype != .f32) return false;
+
+    const batch: usize = out_meta.shape[0];
+    const l_out: usize = out_meta.shape[1];
+    const c_out: usize = out_meta.shape[2];
+    const l_in: usize = x_meta.shape[1];
+    const c_in: usize = x_meta.shape[2];
+    const k_len: usize = w_meta.shape[0];
+
+    // Compute gate: this path is only intended for *very* small convolutions
+    // where tiling + packing overhead dominates (e.g. feature extraction with
+    // tiny sequence lengths). For larger problems, the implicit-GEMM kernels
+    // are dramatically faster.
+    const max_macs: u128 = 2_000_000;
+    var macs: u128 = 1;
+    macs = std.math.mul(u128, macs, @as(u128, batch)) catch return false;
+    macs = std.math.mul(u128, macs, @as(u128, l_out)) catch return false;
+    macs = std.math.mul(u128, macs, @as(u128, c_out)) catch return false;
+    macs = std.math.mul(u128, macs, @as(u128, k_len)) catch return false;
+    macs = std.math.mul(u128, macs, @as(u128, c_in)) catch return false;
+    if (macs > max_macs) return false;
+
+    // Size gate: only small workloads (each buffer < 1 MB).
+    const x_n: usize = batch * l_in * c_in;
+    const w_n: usize = k_len * c_in * c_out;
+    const out_n: usize = batch * l_out * c_out;
+    const limit: usize = 256 * 1024;
+    if (x_n > limit or w_n > limit or out_n > limit) return false;
+
+    // Single scratch allocation for all flat buffers.
+    const total_f32: usize = x_n + w_n + out_n + c_out;
+    const scratch: []f32 = ctx.allocator.alloc(f32, total_f32) catch return false;
+    defer ctx.allocator.free(scratch);
+
+    const x_flat: [*]align(1) const f32 = @ptrCast(scratch.ptr);
+    const w_flat: [*]align(1) const f32 = @ptrCast(scratch.ptr + x_n);
+    const out_flat: [*]align(1) f32 = @ptrCast(scratch.ptr + x_n + w_n);
+
+    try readTensorPackedF32(store, x_meta, s.x, scratch[0..x_n]);
+    try readTensorPackedF32(store, w_meta, s.w, scratch[x_n .. x_n + w_n]);
+
+    var bias_flat: [*]align(1) const f32 = undefined;
+    var has_bias: bool = false;
+    if (s.bias) |b_id| {
+        has_bias = true;
+        const b_meta: tensor_store.TensorMeta = try store.meta(b_id);
+        try readTensorPackedF32(store, b_meta, b_id, scratch[x_n + w_n + out_n ..][0..c_out]);
+        bias_flat = @ptrCast(scratch.ptr + x_n + w_n + out_n);
+    }
+
+    const use_reflect: bool = (s.pad_mode == .reflect);
+    const l_in_i: isize = @intCast(l_in);
+    const stride: usize = s.stride;
+    const dilation: usize = s.dilation;
+    const pad_left: usize = s.pad_left;
+
+    const lanes: usize = 8;
+    const Vec = @Vector(lanes, f32);
+
+    // Zero output.
+    var zi: usize = 0;
+    while (zi < out_n) : (zi += 1) out_flat[zi] = 0.0;
+
+    // Direct convolution: broadcast-accumulate pattern.
+    // For each (batch, output_pos, kernel_tap, input_channel):
+    //   broadcast x_val and fma across a SIMD-width of output channels.
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const x_base: usize = b * l_in * c_in;
+        const out_base: usize = b * l_out * c_out;
+
+        var lo: usize = 0;
+        while (lo < l_out) : (lo += 1) {
+            const out_off: usize = out_base + lo * c_out;
+
+            var kw: usize = 0;
+            while (kw < k_len) : (kw += 1) {
+                const in_nom: isize = @as(isize, @intCast(lo * stride + kw * dilation)) - @as(isize, @intCast(pad_left));
+                const li: usize = if (use_reflect) reflectIndex1D(in_nom, l_in) else blk: {
+                    if (in_nom < 0 or in_nom >= l_in_i) continue;
+                    break :blk @intCast(in_nom);
+                };
+
+                const x_row: usize = x_base + li * c_in;
+                const w_kw: usize = kw * c_in * c_out;
+
+                var ic: usize = 0;
+                while (ic < c_in) : (ic += 1) {
+                    const x_val: f32 = x_flat[x_row + ic];
+                    const w_ic: usize = w_kw + ic * c_out;
+                    const xv: Vec = @splat(x_val);
+
+                    var co: usize = 0;
+                    while (co + lanes <= c_out) : (co += lanes) {
+                        const wp: [*]align(1) const f32 = w_flat + (w_ic + co);
+                        const op: [*]align(1) f32 = out_flat + (out_off + co);
+                        const wv: Vec = @as(*align(1) const Vec, @ptrCast(wp)).*;
+                        var ov: Vec = @as(*align(1) const Vec, @ptrCast(op)).*;
+                        ov += xv * wv;
+                        @as(*align(1) Vec, @ptrCast(op)).* = ov;
+                    }
+                    while (co < c_out) : (co += 1) {
+                        out_flat[out_off + co] += x_val * w_flat[w_ic + co];
+                    }
+                }
+            }
+
+            if (has_bias) {
+                var co: usize = 0;
+                while (co + lanes <= c_out) : (co += lanes) {
+                    const bp: [*]align(1) const f32 = bias_flat + co;
+                    const op: [*]align(1) f32 = out_flat + (out_off + co);
+                    const bv: Vec = @as(*align(1) const Vec, @ptrCast(bp)).*;
+                    var ov: Vec = @as(*align(1) const Vec, @ptrCast(op)).*;
+                    ov += bv;
+                    @as(*align(1) Vec, @ptrCast(op)).* = ov;
+                }
+                while (co < c_out) : (co += 1) {
+                    out_flat[out_off + co] += bias_flat[co];
+                }
+            }
+        }
+    }
+
+    try writeTensorPackedF32(store, out_meta, s.out, scratch[x_n + w_n ..][0..out_n]);
+    return true;
+}
+
+fn tileCount3(meta: tensor_store.TensorMeta) usize {
+    if (meta.tile_counts.len != 3) return 0;
+    return meta.tile_counts[0] * meta.tile_counts[1] * meta.tile_counts[2];
+}
+
 fn execConv1DImplicitGemm(
     ctx: *ConvExecCtx,
     s: StepConv1DTiled,
@@ -968,6 +1119,11 @@ fn execConv1DImplicitGemm(
     w_meta: tensor_store.TensorMeta,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!bool {
+    // Fast path for small convolutions — bypasses all tiling overhead.
+    if (try tryExecConv1DSmallDirect(ctx, s, out_meta, x_meta, w_meta, store)) {
+        return true;
+    }
+
     // Dedicated depthwise kernel (tile-native) when groups == C and W is [K,1,C].
     if (try tryExecConv1DDepthwiseTileNative(ctx, s, out_meta, x_meta, w_meta, store)) {
         return true;

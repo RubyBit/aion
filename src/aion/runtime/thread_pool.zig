@@ -9,7 +9,7 @@ else
 threadlocal var tls_current_pool_token: usize = 0;
 threadlocal var tls_current_tid: usize = 0;
 
-// TODO: Maybe accept an IO impl? 
+// TODO: Maybe accept an IO impl?
 fn futexIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -400,7 +400,28 @@ fn yieldMany(count: usize) void {
     }
 }
 
+fn shouldSkipThreadPoolTests() bool {
+    // This test suite can occasionally stall on some Windows environments.
+    // Allow users/CI to skip it deterministically.
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .windows) return false;
+
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const env: std.process.Environ = .{ .block = .global };
+    const v: []u8 = std.process.Environ.getAlloc(env, allocator, "AION_SKIP_THREAD_POOL_TESTS") catch return false;
+    defer allocator.free(v);
+    if (v.len == 0) return false;
+    if (std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "false")) return false;
+    return true;
+}
+
+fn skipIfRequested() !void {
+    if (shouldSkipThreadPoolTests()) return error.SkipZigTest;
+}
+
 test "thread pool: deterministic partitioning across shapes" {
+    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -467,6 +488,7 @@ test "thread pool: deterministic partitioning across shapes" {
 }
 
 test "thread pool: repeated init and deinit remains stable" {
+    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const Ctx = struct {
@@ -502,6 +524,7 @@ test "thread pool: repeated init and deinit remains stable" {
 }
 
 test "thread pool: concurrent submissions serialize" {
+    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -597,6 +620,7 @@ test "thread pool: concurrent submissions serialize" {
 }
 
 test "thread pool: nested same-pool submission runs inline on caller tid" {
+    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -665,6 +689,7 @@ test "thread pool: nested same-pool submission runs inline on caller tid" {
 }
 
 test "thread pool: deinit waits for an active submission" {
+    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });

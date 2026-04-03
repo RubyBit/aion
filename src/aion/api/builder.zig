@@ -14,6 +14,11 @@ pub const TensorRef = struct {
     value: ValueId,
 };
 
+pub const NamedTensorRef = struct {
+    name: []const u8,
+    tensor: TensorRef,
+};
+
 /// Graph-hidden model builder.
 ///
 /// Under the hood, this builds an `aion.graph.Graph`.
@@ -22,20 +27,74 @@ pub const Builder = struct {
     graph: graph_mod.Graph,
 
     // Optional per-value names for diagnostics/debugging.
-    value_names: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    value_names: std.ArrayList(?[]const u8) = .empty,
+    active_scope_name: ?[]const u8 = null,
+    active_scope_counter: usize = 0,
+    auto_scope_counts: std.StringHashMapUnmanaged(usize) = .{},
 
     const Self = @This();
 
     pub const Error = graph_mod.GraphError;
 
+    pub const Scope = struct {
+        name: []const u8,
+    };
+
     pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .graph = graph_mod.Graph.init(allocator), .value_names = .empty };
+        return .{
+            .allocator = allocator,
+            .graph = graph_mod.Graph.init(allocator),
+            .value_names = .empty,
+            .active_scope_name = null,
+            .active_scope_counter = 0,
+            .auto_scope_counts = .{},
+        };
     }
 
     pub fn deinit(self: *Self) void {
+        self.auto_scope_counts.deinit(self.allocator);
         self.value_names.deinit(self.allocator);
         self.graph.deinit();
         self.* = undefined;
+    }
+
+    pub fn hasActiveScope(self: *const Self) bool {
+        return self.active_scope_name != null;
+    }
+
+    pub fn beginScope(self: *Self, scope_name: []const u8) Error!Scope {
+        if (self.active_scope_name != null) return Error.InvalidArgument;
+
+        const name_copy: []u8 = self.graph.arenaAlloc().alloc(u8, scope_name.len) catch return Error.OutOfMemory;
+        @memcpy(name_copy, scope_name);
+        self.active_scope_name = name_copy;
+        self.active_scope_counter = 0;
+        return .{ .name = name_copy };
+    }
+
+    pub fn beginAutoScope(self: *Self, base_name: []const u8) Error!Scope {
+        if (self.active_scope_name != null) return Error.InvalidArgument;
+
+        const gop = try self.auto_scope_counts.getOrPut(self.allocator, base_name);
+        if (!gop.found_existing) {
+            const key_copy: []u8 = self.graph.arenaAlloc().alloc(u8, base_name.len) catch return Error.OutOfMemory;
+            @memcpy(key_copy, base_name);
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = 0;
+        }
+        const idx: usize = gop.value_ptr.*;
+        gop.value_ptr.* = idx + 1;
+
+        const unique_name = std.fmt.allocPrint(self.graph.arenaAlloc(), "{s}#{d}", .{ base_name, idx }) catch return Error.OutOfMemory;
+        self.active_scope_name = unique_name;
+        self.active_scope_counter = 0;
+        return .{ .name = unique_name };
+    }
+
+    pub fn endScope(self: *Self, scope: Scope) void {
+        _ = scope;
+        self.active_scope_name = null;
+        self.active_scope_counter = 0;
     }
 
     pub fn innerGraph(self: *Self) *graph_mod.Graph {
@@ -57,6 +116,12 @@ pub const Builder = struct {
     /// Like `knownShape`, but returns `error.InvalidArgument` if shape is unknown.
     pub fn requireKnownShape(self: *Self, t: TensorRef) Error![]const usize {
         return self.knownShape(t) orelse Error.InvalidArgument;
+    }
+
+    pub fn valueName(self: *const Self, t: TensorRef) ?[]const u8 {
+        const idx: usize = @intCast(t.value);
+        if (idx >= self.value_names.items.len) return null;
+        return self.value_names.items[idx];
     }
 
     fn ensureNameSlot(self: *Self, vid: ValueId) Error!void {
@@ -85,6 +150,22 @@ pub const Builder = struct {
     pub fn param(self: *Self, t: api_tensor.Tensor) Error!TensorRef {
         const v: ValueId = try self.graph.addInput(t.dtype, t.shape);
         try self.graph.bindExternal(v, @intCast(t.id));
+
+        // Give parameters (external-bound inputs) a stable debug name so loaded
+        // models can find and swap them later.
+        //
+        // Important: do NOT use `autoNameIfUnnamed` here, since that would bump
+        // `active_scope_counter` and perturb op numbering (e.g. `matmul#0`).
+        try self.ensureNameSlot(v);
+        const idx: usize = @intCast(v);
+        if (self.value_names.items[idx] == null) {
+            const generated_name = if (self.active_scope_name) |scope_name|
+                std.fmt.allocPrint(self.graph.arenaAlloc(), "{s}/param@{d}", .{ scope_name, v }) catch return Error.OutOfMemory
+            else
+                std.fmt.allocPrint(self.graph.arenaAlloc(), "param@{d}", .{v}) catch return Error.OutOfMemory;
+            self.value_names.items[idx] = generated_name;
+        }
+
         return .{ .value = v };
     }
 
@@ -95,71 +176,85 @@ pub const Builder = struct {
 
     pub fn matmul(self: *Self, a: TensorRef, b: TensorRef, alpha: f32, beta: f32) Error!TensorRef {
         const out: ValueId = try self.graph.addMatMul(a.value, b.value, alpha, beta);
+        try self.autoNameIfUnnamed(out, "matmul");
         return .{ .value = out };
     }
 
     pub fn add(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addElemwiseBinary(.add, a.value, b.value);
+        try self.autoNameIfUnnamed(out, "add");
         return .{ .value = out };
     }
 
     pub fn mul(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addElemwiseBinary(.mul, a.value, b.value);
+        try self.autoNameIfUnnamed(out, "mul");
         return .{ .value = out };
     }
 
     pub fn broadcastAddLastDim(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addBroadcastLastDimBinary(.add, a.value, b.value);
+        try self.autoNameIfUnnamed(out, "broadcast_add_last_dim");
         return .{ .value = out };
     }
 
     pub fn relu(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addRelu(a.value);
+        try self.autoNameIfUnnamed(out, "relu");
         return .{ .value = out };
     }
 
     pub fn sigmoid(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addUnary(.sigmoid, a.value);
+        try self.autoNameIfUnnamed(out, "sigmoid");
         return .{ .value = out };
     }
 
     pub fn tanh(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addUnary(.tanh, a.value);
+        try self.autoNameIfUnnamed(out, "tanh");
         return .{ .value = out };
     }
 
     pub fn sqrt(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addUnary(.sqrt, a.value);
+        try self.autoNameIfUnnamed(out, "sqrt");
         return .{ .value = out };
     }
 
     pub fn unary(self: *Self, op: types.UnaryOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addUnary(op, a.value);
+        try self.autoNameIfUnnamed(out, @tagName(op));
         return .{ .value = out };
     }
 
     pub fn softmax(self: *Self, a: TensorRef, axis: i32) Error!TensorRef {
         const out: ValueId = try self.graph.addSoftmax(a.value, axis);
+        try self.autoNameIfUnnamed(out, "softmax");
         return .{ .value = out };
     }
 
     pub fn layernorm(self: *Self, x: TensorRef, gamma: TensorRef, beta: TensorRef, eps: f32, normalized_shape: []const usize) Error!TensorRef {
         const out: ValueId = try self.graph.addLayerNorm(x.value, gamma.value, beta.value, eps, normalized_shape);
+        try self.autoNameIfUnnamed(out, "layernorm");
         return .{ .value = out };
     }
 
     pub fn rmsnorm(self: *Self, x: TensorRef, gamma: TensorRef, beta: TensorRef, eps: f32, normalized_shape: []const usize) Error!TensorRef {
         const out: ValueId = try self.graph.addRMSNorm(x.value, gamma.value, beta.value, eps, normalized_shape);
+        try self.autoNameIfUnnamed(out, "rmsnorm");
         return .{ .value = out };
     }
 
     pub fn attention(self: *Self, q: TensorRef, k: TensorRef, v: TensorRef, scale: f32, causal: bool) Error!TensorRef {
         const out: ValueId = try self.graph.addAttention(q.value, k.value, v.value, scale, causal);
+        try self.autoNameIfUnnamed(out, "attention");
         return .{ .value = out };
     }
 
     pub fn mha(self: *Self, q: TensorRef, k: TensorRef, v: TensorRef, scale: f32, causal: bool, heads: usize) Error!TensorRef {
         const out: ValueId = try self.graph.addMultiHeadAttention(q.value, k.value, v.value, scale, causal, heads);
+        try self.autoNameIfUnnamed(out, "mha");
         return .{ .value = out };
     }
 
@@ -200,6 +295,7 @@ pub const Builder = struct {
             pad_mode,
             groups,
         );
+        try self.autoNameIfUnnamed(out, "conv1d");
         return .{ .value = out };
     }
 
@@ -252,21 +348,25 @@ pub const Builder = struct {
             pad_mode,
             groups,
         );
+        try self.autoNameIfUnnamed(out, "conv2d");
         return .{ .value = out };
     }
 
     pub fn copy(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addCopy(a.value);
+        try self.autoNameIfUnnamed(out, "copy");
         return .{ .value = out };
     }
 
     pub fn reduce(self: *Self, op: types.ReduceOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addReduce(op, a.value);
+        try self.autoNameIfUnnamed(out, "reduce");
         return .{ .value = out };
     }
 
     pub fn reduceAxis(self: *Self, op: types.ReduceOp, a: TensorRef, axis: i32) Error!TensorRef {
         const out: ValueId = try self.graph.addReduceAxis(op, a.value, axis);
+        try self.autoNameIfUnnamed(out, "reduce_axis");
         return .{ .value = out };
     }
 
@@ -279,6 +379,7 @@ pub const Builder = struct {
             ids[i] = tensors[i].value;
         }
         const out: ValueId = try self.graph.addConcat(ids[0..tensors.len], axis);
+        try self.autoNameIfUnnamed(out, "concat");
         return .{ .value = out };
     }
 
@@ -306,6 +407,7 @@ pub const Builder = struct {
             if (b_ih) |t| t.value else null,
             if (b_hh) |t| t.value else null,
         );
+        try self.autoNameIfUnnamed(out, "lstm_cell");
         return .{ .value = out };
     }
 
@@ -319,6 +421,7 @@ pub const Builder = struct {
     /// with `re=x[b,t,c]`, `im=x[b,t,c+cutoff]`.
     pub fn complexAbsMean(self: *Self, x: TensorRef, out_channels: usize) Error!TensorRef {
         const out: ValueId = try self.graph.addComplexAbsMean(x.value, out_channels);
+        try self.autoNameIfUnnamed(out, "complex_abs_mean");
         return .{ .value = out };
     }
 
@@ -336,30 +439,52 @@ pub const Builder = struct {
 
     pub fn reshape(self: *Self, a: TensorRef, new_shape: []const usize) Error!TensorRef {
         const out: ValueId = try self.graph.addViewReshape(a.value, new_shape);
+        try self.autoNameIfUnnamed(out, "reshape");
         return .{ .value = out };
     }
 
     pub fn squeeze(self: *Self, a: TensorRef, axis: ?i32) Error!TensorRef {
         const out: ValueId = try self.graph.addViewSqueeze(a.value, axis);
+        try self.autoNameIfUnnamed(out, "squeeze");
         return .{ .value = out };
     }
 
     pub fn unsqueeze(self: *Self, a: TensorRef, axis: i32) Error!TensorRef {
         const out: ValueId = try self.graph.addViewUnsqueeze(a.value, axis);
+        try self.autoNameIfUnnamed(out, "unsqueeze");
         return .{ .value = out };
     }
 
     pub fn transpose2d(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addViewTranspose2D(a.value);
+        try self.autoNameIfUnnamed(out, "transpose2d");
         return .{ .value = out };
     }
 
     pub fn slice(self: *Self, a: TensorRef, starts: []const usize, lens: []const usize) Error!TensorRef {
         const out: ValueId = try self.graph.addViewSliceND(a.value, starts, lens);
+        try self.autoNameIfUnnamed(out, "slice");
         return .{ .value = out };
     }
 
     pub fn slice2d(self: *Self, a: TensorRef, start0: usize, len0: usize, start1: usize, len1: usize) Error!TensorRef {
         return self.slice(a, &[_]usize{ start0, start1 }, &[_]usize{ len0, len1 });
+    }
+
+    fn autoNameIfUnnamed(self: *Self, vid: ValueId, tag: []const u8) Error!void {
+        try self.ensureNameSlot(vid);
+
+        const idx: usize = @intCast(vid);
+        if (self.value_names.items[idx] != null) return;
+
+        const n: usize = self.active_scope_counter;
+        self.active_scope_counter = n + 1;
+
+        const generated_name = if (self.active_scope_name) |scope_name|
+            std.fmt.allocPrint(self.graph.arenaAlloc(), "{s}/{s}#{d}", .{ scope_name, tag, n }) catch return Error.OutOfMemory
+        else
+            std.fmt.allocPrint(self.graph.arenaAlloc(), "{s}#{d}", .{ tag, n }) catch return Error.OutOfMemory;
+
+        self.value_names.items[idx] = generated_name;
     }
 };

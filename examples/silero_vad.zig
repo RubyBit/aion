@@ -29,25 +29,13 @@ const ExampleOptions = struct {
     }
 };
 
-const TensorNames = struct {
-    pub const stft_w: []const u8 = "stft_conv.w";
-
-    pub const conv1_w: []const u8 = "conv1.w";
-    pub const conv1_b: []const u8 = "conv1.b";
-    pub const conv2_w: []const u8 = "conv2.w";
-    pub const conv2_b: []const u8 = "conv2.b";
-    pub const conv3_w: []const u8 = "conv3.w";
-    pub const conv3_b: []const u8 = "conv3.b";
-    pub const conv4_w: []const u8 = "conv4.w";
-    pub const conv4_b: []const u8 = "conv4.b";
-
-    pub const lstm_w_ih: []const u8 = "lstm.w_ih";
-    pub const lstm_w_hh: []const u8 = "lstm.w_hh";
-    pub const lstm_b_ih: []const u8 = "lstm.b_ih";
-    pub const lstm_b_hh: []const u8 = "lstm.b_hh";
-
-    pub const final_w: []const u8 = "final_conv.w";
-    pub const final_b: []const u8 = "final_conv.b";
+const ModelTensorNames = struct {
+    pub const x: []const u8 = "x";
+    pub const h: []const u8 = "h";
+    pub const c: []const u8 = "c";
+    pub const prob: []const u8 = "prob";
+    pub const next_h: []const u8 = "next_h";
+    pub const next_c: []const u8 = "next_c";
 };
 
 const TinySileroWeights = struct {
@@ -77,6 +65,7 @@ const TinySileroState = struct {
 };
 
 const TinySileroForward = struct {
+    features: TensorRef,
     prob: TensorRef,
     h: TensorRef,
     c: TensorRef,
@@ -222,7 +211,7 @@ const TinySileroVAD = struct {
         const probs1: TensorRef = try bld.reduceAxis(.mean, probs2, 1); // [batch]
         const probs: TensorRef = try bld.unsqueeze(probs1, 1); // [batch, 1]
 
-        return .{ .prob = probs, .h = st.h, .c = st.c };
+        return .{ .features = y4_2d, .prob = probs, .h = st.h, .c = st.c };
     }
 };
 
@@ -290,7 +279,7 @@ fn printUsage() void {
         \\  zig build bench-examples -- [options]
         \\
         \\Options:
-        \\  --weights <path>       Optional .aion weights file (named tensors)
+        \\  --weights <path>       Optional .aion model package to load directly
         \\  --chunks <n>           Number of streaming chunks (default: 8)
         \\  --num-samples <n>      Samples per chunk (default: 512)
         \\  --context <n>          Context size prepended to chunk (default: 64)
@@ -300,11 +289,10 @@ fn printUsage() void {
         \\  --profile-steps        Print per-step timings for the first model.run() (adds overhead)
         \\  --no-fused-absmean     Build abs-mean front-end from primitive ops (no fused op)
         \\  -h, --help             Show this help
-        \\n        \\Expected tensor names in --weights file:
-        \\  stft_conv.w
-        \\  conv1.w, conv1.b, conv2.w, conv2.b, conv3.w, conv3.b, conv4.w, conv4.b
-        \\  lstm.w_ih, lstm.w_hh, lstm.b_ih, lstm.b_hh
-        \\  final_conv.w, final_conv.b
+        \\
+        \\If --weights is omitted, the example creates deterministic synthetic weights,
+        \\exports a temporary `.aion` model package, reloads it, and runs streaming
+        \\inference from that package rather than rebuilding the architecture for execution.
         \\
     , .{});
 }
@@ -331,29 +319,6 @@ fn complexAbsMeanUnfused(
 
     // Mean over time axis => [batch, out_channels]
     return bld.reduceAxis(.mean, mag, 1);
-}
-
-fn loadWeightsFromAion(ctx: *api.Context) !TinySileroWeights {
-    return .{
-        .stft_w = try ctx.tensorByName(TensorNames.stft_w),
-
-        .conv1_w = try ctx.tensorByName(TensorNames.conv1_w),
-        .conv1_b = try ctx.tensorByName(TensorNames.conv1_b),
-        .conv2_w = try ctx.tensorByName(TensorNames.conv2_w),
-        .conv2_b = try ctx.tensorByName(TensorNames.conv2_b),
-        .conv3_w = try ctx.tensorByName(TensorNames.conv3_w),
-        .conv3_b = try ctx.tensorByName(TensorNames.conv3_b),
-        .conv4_w = try ctx.tensorByName(TensorNames.conv4_w),
-        .conv4_b = try ctx.tensorByName(TensorNames.conv4_b),
-
-        .lstm_w_ih = try ctx.tensorByName(TensorNames.lstm_w_ih),
-        .lstm_w_hh = try ctx.tensorByName(TensorNames.lstm_w_hh),
-        .lstm_b_ih = try ctx.tensorByName(TensorNames.lstm_b_ih),
-        .lstm_b_hh = try ctx.tensorByName(TensorNames.lstm_b_hh),
-
-        .final_w = try ctx.tensorByName(TensorNames.final_w),
-        .final_b = try ctx.tensorByName(TensorNames.final_b),
-    };
 }
 
 fn createDeterministicTensor(
@@ -402,6 +367,45 @@ fn createSyntheticWeights(ctx: *api.Context, allocator: std.mem.Allocator) !Tiny
     };
 }
 
+fn exportTinySileroPackage(
+    ctx: *api.Context,
+    allocator: std.mem.Allocator,
+    weights: TinySileroWeights,
+    chunk_input_len: usize,
+    pad_mode: types.PadMode,
+    use_fused_absmean: bool,
+    file: std.Io.File,
+) !void {
+    var bld: Builder = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const x_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, chunk_input_len }), ModelTensorNames.x);
+    const h_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.h);
+    const c_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.c);
+
+    const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
+    const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref }, use_fused_absmean);
+
+    try ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = ModelTensorNames.prob, .tensor = out.prob },
+        .{ .name = ModelTensorNames.next_h, .tensor = out.h },
+        .{ .name = ModelTensorNames.next_c, .tensor = out.c },
+    }, .{
+        .metadata = &[_]api.ExportMetadata{
+            .{ .key = "arch", .value = "tiny-silero-vad" },
+        },
+        .input_symbols = &[_]api.DimensionSymbol{
+            .{ .tensor = x_ref, .axis = 0, .name = "batch" },
+            .{ .tensor = h_ref, .axis = 0, .name = "batch" },
+            .{ .tensor = c_ref, .axis = 0, .name = "batch" },
+        },
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input_name = ModelTensorNames.h, .output_name = ModelTensorNames.next_h },
+            .{ .input_name = ModelTensorNames.c, .output_name = ModelTensorNames.next_c },
+        },
+    });
+}
+
 fn fillSyntheticAudio(signal: []f32, context_size: usize) void {
     @memset(signal[0..context_size], 0.0);
 
@@ -442,25 +446,34 @@ fn mainImpl(args: std.process.Args) !void {
     };
     defer opts.deinit(allocator);
 
+    const chunk_input_len: usize = opts.context_size + opts.num_samples;
     var ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1, .profile_steps = opts.profile_steps });
     defer ctx.deinit();
 
-    const weights: TinySileroWeights = if (opts.weights_path) |p| blk: {
-        try ctx.importAionPath(p, .{});
-        std.debug.print("weights: loaded from {s}\n", .{p});
-        break :blk try loadWeightsFromAion(&ctx);
+    var loaded_model: api.LoadedModel = if (opts.weights_path) |p| blk: {
+        std.debug.print("package: loading model package from {s}\n", .{p});
+        break :blk try ctx.loadModelPath(p, .{});
     } else blk: {
-        std.debug.print("weights: using deterministic synthetic tensors\n", .{});
-        break :blk try createSyntheticWeights(&ctx, allocator);
+        std.debug.print("package: exporting deterministic synthetic model to a temporary .aion and reloading it\n", .{});
+
+        var export_ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+        defer export_ctx.deinit();
+        const weights = try createSyntheticWeights(&export_ctx, allocator);
+
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const synthetic_path = ".zig-cache/tiny_silero_vad.synthetic.aion";
+        const file = try std.Io.Dir.cwd().createFile(io, synthetic_path, .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, synthetic_path) catch {};
+        }
+
+        try exportTinySileroPackage(&export_ctx, allocator, weights, chunk_input_len, opts.pad_mode, opts.use_fused_complex_abs_mean, file);
+        break :blk try ctx.loadModel(file, .{});
     };
+    defer loaded_model.deinit();
 
-    const chunk_input_len: usize = opts.context_size + opts.num_samples;
-
-    var bld: Builder = api.Builder.init(allocator);
-    defer bld.deinit();
-
-    // For state tensors we keep the default tiling because the state commit is done via `CopyTiled`,
-    // which requires dst/src tiling to match the compiler's chosen tiling contract.
     const x_shape: [2]usize = .{ 1, chunk_input_len };
     const h_shape: [2]usize = .{ 1, 128 };
     const c_shape: [2]usize = .{ 1, 128 };
@@ -472,36 +485,9 @@ fn mainImpl(args: std.process.Args) !void {
     var zeros_c: [128]f32 = .{0.0} ** 128;
     try h_tensor.writeF32(zeros_h[0..]);
     try c_tensor.writeF32(zeros_c[0..]);
-
-    const x_ref: TensorRef = try bld.param(x_tensor);
-    const h_ref: TensorRef = try bld.param(h_tensor);
-    const c_ref: TensorRef = try bld.param(c_tensor);
-
-    const tiny: TinySileroVAD = TinySileroVAD.bind(&bld, weights, opts.pad_mode) catch |e| {
-        std.debug.print("bind failed: {s}\n", .{@errorName(e)});
-        return e;
-    };
-    const out: TinySileroForward = tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref }, opts.use_fused_complex_abs_mean) catch |e| {
-        std.debug.print("forward graph build failed: {s}\n", .{@errorName(e)});
-        return e;
-    };
-
-    // Keep streaming state *inside* the runtime tensor store:
-    // bind the computed (h, c) directly to the existing external tensors.
-    //
-    // Note: `nn.LSTMCell.forward` materializes h/c from the fused packed state via
-    // slice-copy steps, so this update happens after the fused LSTM read of (h_prev, c_prev).
-    try bld.innerGraph().bindExternal(out.h.value, @intCast(h_tensor.id));
-    try bld.innerGraph().bindExternal(out.c.value, @intCast(c_tensor.id));
-
-    // Only expose probability as an output; state is updated in-place in the bound tensors.
-    var model: api.Model = ctx.compile(&bld, &[_]TensorRef{out.prob}) catch |e| {
-        std.debug.print("compile failed: {s}\n", .{@errorName(e)});
-        return e;
-    };
-    defer model.deinit();
-
-    const prob_t: Tensor = model.outputTensor(0);
+    try loaded_model.bindInput(ModelTensorNames.x, x_tensor);
+    try loaded_model.bindInput(ModelTensorNames.h, h_tensor);
+    try loaded_model.bindInput(ModelTensorNames.c, c_tensor);
 
     const total_len: usize = opts.context_size + opts.chunks * opts.num_samples;
     const signal: []f32 = try allocator.alloc(f32, total_len);
@@ -516,7 +502,9 @@ fn mainImpl(args: std.process.Args) !void {
 
     const probs: []f32 = try allocator.alloc(f32, opts.chunks);
     defer allocator.free(probs);
-
+    var prob_t_opt: ?Tensor = null;
+    var next_h_t_opt: ?Tensor = null;
+    var next_c_t_opt: ?Tensor = null;
     var t_memcpy_ns: u64 = 0;
     var t_write_in_ns: u64 = 0;
     var t_run_ns: u64 = 0;
@@ -526,6 +514,8 @@ fn mainImpl(args: std.process.Args) !void {
     for (0..opts.bench_iters) |_| {
         try h_tensor.writeF32(zeros_h[0..]);
         try c_tensor.writeF32(zeros_c[0..]);
+        try loaded_model.bindInput(ModelTensorNames.h, h_tensor);
+        try loaded_model.bindInput(ModelTensorNames.c, c_tensor);
 
         for (0..opts.chunks) |chunk_idx| {
             const start: usize = chunk_idx * opts.num_samples;
@@ -545,20 +535,27 @@ fn mainImpl(args: std.process.Args) !void {
             if (opts.profile) t_write_in_ns += (t_d - t_c);
 
             const t_e: u64 = if (opts.profile) nowNs() else 0;
-            model.run() catch |e| {
-                std.debug.print("model run failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
+            loaded_model.run() catch |e| {
+                std.debug.print("loaded model run failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
             const t_f: u64 = if (opts.profile) nowNs() else 0;
             if (opts.profile) t_run_ns += (t_f - t_e);
 
             const t_g: u64 = if (opts.profile) nowNs() else 0;
+            if (prob_t_opt == null) {
+                prob_t_opt = try loaded_model.outputTensor(ModelTensorNames.prob);
+                next_h_t_opt = try loaded_model.outputTensor(ModelTensorNames.next_h);
+                next_c_t_opt = try loaded_model.outputTensor(ModelTensorNames.next_c);
+            }
+            const prob_t = prob_t_opt.?;
             var prob_tmp: [1]f32 = .{0.0};
             prob_t.readF32(prob_tmp[0..]) catch |e| {
                 std.debug.print("read prob failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
             probs[chunk_idx] = prob_tmp[0];
+
             const t_h: u64 = if (opts.profile) nowNs() else 0;
             if (opts.profile) t_read_out_ns += (t_h - t_g);
         }
@@ -566,8 +563,8 @@ fn mainImpl(args: std.process.Args) !void {
     const t1_ns: u64 = nowNs();
 
     // Snapshot final streaming state once (for a cheap correctness signal).
-    try h_tensor.readF32(h_buf[0..]);
-    try c_tensor.readF32(c_buf[0..]);
+    try next_h_t_opt.?.readF32(h_buf[0..]);
+    try next_c_t_opt.?.readF32(c_buf[0..]);
 
     const elapsed_ns_u: u64 = @max(@as(u64, 1), t1_ns - t0_ns);
     const total_chunks: usize = opts.bench_iters * opts.chunks;

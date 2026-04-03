@@ -7,10 +7,28 @@
 
 pub const Context = @import("context.zig").Context;
 pub const TilePolicy = @import("context.zig").TilePolicy;
+pub const LoadedModel = @import("context.zig").LoadedModel;
+pub const Weights = @import("context.zig").Weights;
 pub const Tensor = @import("tensor.zig").Tensor;
 pub const Builder = @import("builder.zig").Builder;
 pub const TensorRef = @import("builder.zig").TensorRef;
+pub const NamedTensorRef = @import("builder.zig").NamedTensorRef;
+pub const ModuleDyn = @import("module.zig").ModuleDyn;
+pub const isModuleType = @import("module.zig").isModuleType;
+pub const assertModuleType = @import("module.zig").assertModuleType;
+pub const isForwardModuleType = @import("module.zig").isForwardModuleType;
+pub const assertForwardModuleType = @import("module.zig").assertForwardModuleType;
+pub const moduleDynFrom = @import("module.zig").moduleDynFrom;
+pub const moduleTypeName = @import("module.zig").moduleTypeName;
+pub const beginModuleScope = @import("module.zig").beginModuleScope;
+pub const endModuleScope = @import("module.zig").endModuleScope;
+pub const withModuleScope = @import("module.zig").withModuleScope;
 pub const Model = @import("model.zig").Model;
+pub const LoadModelOptions = @import("context.zig").LoadModelOptions;
+pub const ExportModelOptions = @import("context.zig").ExportModelOptions;
+pub const DimensionSymbol = @import("context.zig").DimensionSymbol;
+pub const ExportMetadata = @import("context.zig").ExportMetadata;
+pub const OutputAlias = @import("context.zig").OutputAlias;
 
 pub const nn = @import("nn.zig");
 

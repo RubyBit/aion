@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const api_builder = @import("builder.zig");
+const module_api = @import("module.zig");
 const api_tensor = @import("tensor.zig");
 const types = @import("../backend/types.zig");
 
@@ -29,6 +30,9 @@ pub const Linear = struct {
 
     /// y = x @ w + b (bias broadcast over last dim if present)
     pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
+        const scope = try module_api.beginModuleScope(@This(), bld, null);
+        defer module_api.endModuleScope(bld, scope);
+
         const y: TensorRef = try bld.matmul(x, self.w, 1.0, 0.0);
         if (self.b) |b0| {
             return bld.broadcastAddLastDim(y, b0);
@@ -65,6 +69,9 @@ pub const Conv2D = struct {
 
     /// NHWC conv2d (channel-last) with weight layout [k_h, k_w, c_in/groups, c_out].
     pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
+        const scope = try module_api.beginModuleScope(@This(), bld, null);
+        defer module_api.endModuleScope(bld, scope);
+
         return bld.conv2dPadMode(
             x,
             self.w,
@@ -107,6 +114,9 @@ pub const Conv1D = struct {
 
     /// NLC (channel-last) conv1d with weight layout [k, c_in/groups, c_out].
     pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
+        const scope = try module_api.beginModuleScope(@This(), bld, null);
+        defer module_api.endModuleScope(bld, scope);
+
         return bld.conv1dPadMode(
             x,
             self.w,
@@ -209,6 +219,9 @@ pub const LSTMCell = struct {
     }
 
     pub fn forward(self: Self, bld: *Builder, x: TensorRef, h_prev: TensorRef, c_prev: TensorRef) Builder.Error!LSTMState {
+        const scope = try module_api.beginModuleScope(@This(), bld, null);
+        defer module_api.endModuleScope(bld, scope);
+
         const x_shape_opt: ?[]const usize = bld.knownShape(x);
         const h_shape_opt: ?[]const usize = bld.knownShape(h_prev);
         const c_shape_opt: ?[]const usize = bld.knownShape(c_prev);

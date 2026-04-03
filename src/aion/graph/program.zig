@@ -845,7 +845,7 @@ pub fn compileGraph(
     }
 
     // Compile into a dynamic step list first.
-    var steps = std.ArrayListUnmanaged(Step).empty;
+    var steps: std.ArrayList(Step) = .empty;
     errdefer steps.deinit(allocator);
 
     // Helper: allocate tensor for a value (owned).
@@ -1533,7 +1533,7 @@ fn ensureAnyTensor(ctx: anytype, value_index: usize) CompileError!TensorId {
 
 fn ensureTilingMaybeRetile(
     allocator: std.mem.Allocator,
-    steps: *std.ArrayListUnmanaged(Step),
+    steps: *std.ArrayList(Step),
     mgr: *StorageManager,
     policy: plan_mod.TilePolicy,
     ctx: anytype,
@@ -1560,7 +1560,7 @@ fn ensureTilingMaybeRetile(
 
 fn ensureTilingScalarMaybeRetile(
     allocator: std.mem.Allocator,
-    steps: *std.ArrayListUnmanaged(Step),
+    steps: *std.ArrayList(Step),
     mgr: *StorageManager,
     policy: plan_mod.TilePolicy,
     ctx: anytype,

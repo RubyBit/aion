@@ -1,24 +1,33 @@
 const std = @import("std");
 
-const aion_file = @import("../storage/aion_file.zig");
 const backend_mod = @import("../backend/backend.zig");
 const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
 const types = @import("../backend/types.zig");
+const package_file = @import("../storage/aion_file.zig");
 const manager_mod = @import("../storage/manager.zig");
 const plan_mod = @import("../graph/plan.zig");
 const graph_mod = @import("../graph/graph.zig");
 const program_mod = @import("../graph/program.zig");
 
 const api_builder = @import("builder.zig");
+const api_loaded_model = @import("loaded_model.zig");
+const api_weights = @import("weights.zig");
 const api_model = @import("model.zig");
+const api_package_export = @import("package_export.zig");
 const api_tensor = @import("tensor.zig");
 const api_tiling = @import("tiling.zig");
 const api_errors = @import("errors.zig");
 
 pub const DType = types.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
-pub const ImportResidency = manager_mod.ImportResidency;
-pub const ImportOptions = manager_mod.ImportAionOptions;
+pub const LoadedModel = api_loaded_model.LoadedModel;
+pub const Weights = api_weights.Weights;
+pub const LoadModelOptions = api_loaded_model.LoadModelOptions;
+pub const NamedTensorRef = api_builder.NamedTensorRef;
+pub const DimensionSymbol = api_package_export.DimensionSymbol;
+pub const ExportMetadata = api_package_export.Metadata;
+pub const OutputAlias = api_package_export.OutputAlias;
+pub const ExportModelOptions = api_package_export.ExportModelOptions;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -90,44 +99,106 @@ pub const Context = struct {
         return self.cpu.backend();
     }
 
-    pub fn importAionFile(self: *Self, file: std.Io.File, opts: ImportOptions) api_errors.LoadError!void {
-        return self.store.importAionFile(file, opts);
-    }
-
-    pub fn importAionPath(self: *Self, path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        const io = io_backend.io();
-        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return aion_file.FileError.IoFailure;
-        defer file.close(io);
-        return self.importAionFile(file, opts);
-    }
-
-    pub fn importAionPathAbsolute(self: *Self, absolute_path: []const u8, opts: ImportOptions) api_errors.LoadError!void {
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        const io = io_backend.io();
-        const file = std.Io.Dir.openFileAbsolute(io, absolute_path, .{}) catch return aion_file.FileError.IoFailure;
-        defer file.close(io);
-        return self.importAionFile(file, opts);
-    }
-
-    pub fn isMappedTensor(self: *Self, name: []const u8) api_errors.ApiError!bool {
-        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
-        return self.store.isMappedTensor(tid);
-    }
-
-    pub fn promoteTensorToOwnedRam(self: *Self, name: []const u8) api_errors.ApiError!void {
-        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
-        return self.store.promoteToOwnedRam(tid);
-    }
-
-    pub fn tensorByName(self: *Self, name: []const u8) api_errors.ApiError!api_tensor.Tensor {
-        const tid: manager_mod.TensorId = self.store.tensorIdByName(name) orelse return api_errors.ApiError.InvalidArgument;
-        const t = try self.store.getConst(tid);
-        return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
-    }
-
     pub fn builder(self: *const Self) api_builder.Builder {
         return api_builder.Builder.init(self.allocator);
+    }
+
+    pub fn exportModel(
+        self: *Self,
+        file: std.Io.File,
+        bld: *api_builder.Builder,
+        outputs: []const NamedTensorRef,
+        opts: ExportModelOptions,
+    ) api_errors.LoadError!void {
+        var pkg = try api_package_export.buildPackage(self.allocator, &self.store, bld, outputs, opts);
+        defer pkg.deinit();
+        return package_file.writeFile(file, &pkg);
+    }
+
+    pub fn exportModelPath(
+        self: *Self,
+        path: []const u8,
+        bld: *api_builder.Builder,
+        outputs: []const NamedTensorRef,
+        opts: ExportModelOptions,
+    ) api_errors.LoadError!void {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.exportModel(file, bld, outputs, opts);
+    }
+
+    pub fn exportModelPathAbsolute(
+        self: *Self,
+        absolute_path: []const u8,
+        bld: *api_builder.Builder,
+        outputs: []const NamedTensorRef,
+        opts: ExportModelOptions,
+    ) api_errors.LoadError!void {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.createFileAbsolute(io, absolute_path, .{ .truncate = true }) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.exportModel(file, bld, outputs, opts);
+    }
+
+    pub fn loadModel(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!LoadedModel {
+        const bytes = try package_file.readAlloc(self.allocator, file);
+        defer self.allocator.free(bytes);
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        var pkg = try package_file.parse(self.allocator, bytes);
+        errdefer pkg.deinit();
+        const initializer_tids = try api_loaded_model.importInitializersForLoadedModel(self.allocator, &self.store, self.policy, &pkg);
+        errdefer self.allocator.free(initializer_tids);
+        return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash);
+    }
+
+    /// Load an AION package as a weights-only container.
+    ///
+    /// This parses the package and imports initializer tensors into the current
+    /// context's storage, but does not instantiate or run the package graph.
+    pub fn loadWeights(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!Weights {
+        const bytes = try package_file.readAlloc(self.allocator, file);
+        defer self.allocator.free(bytes);
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        var pkg = try package_file.parse(self.allocator, bytes);
+        errdefer pkg.deinit();
+        const initializer_tids = try api_weights.importInitializersForWeights(self.allocator, &self.store, self.policy, &pkg);
+        errdefer self.allocator.free(initializer_tids);
+        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, pkg, initializer_tids, hash);
+    }
+
+    pub fn loadModelPath(self: *Self, path: []const u8, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.loadModel(file, opts);
+    }
+
+    pub fn loadWeightsPath(self: *Self, path: []const u8, opts: LoadModelOptions) api_errors.LoadError!Weights {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.loadWeights(file, opts);
+    }
+
+    pub fn loadModelPathAbsolute(self: *Self, absolute_path: []const u8, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.openFileAbsolute(io, absolute_path, .{}) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.loadModel(file, opts);
+    }
+
+    pub fn loadWeightsPathAbsolute(self: *Self, absolute_path: []const u8, opts: LoadModelOptions) api_errors.LoadError!Weights {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const file = std.Io.Dir.openFileAbsolute(io, absolute_path, .{}) catch return package_file.PackageError.IoFailure;
+        defer file.close(io);
+        return self.loadWeights(file, opts);
     }
 
     /// Create a new owned tensor with a default tile shape.

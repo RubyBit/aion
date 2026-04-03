@@ -1,0 +1,93 @@
+const std = @import("std");
+
+const graph_mod = @import("../../graph/graph.zig");
+const package_file = @import("../../storage/aion_file.zig");
+const api_tiling = @import("../tiling.zig");
+const api_errors = @import("../errors.zig");
+
+pub fn optionalizeSymbols(allocator: std.mem.Allocator, values: []const u64) ![]?u64 {
+    const out = try allocator.alloc(?u64, values.len);
+    for (values, 0..) |value, idx| out[idx] = if (value == 0) null else value;
+    return out;
+}
+
+pub fn instantiateNode(
+    allocator: std.mem.Allocator,
+    pkg: *const package_file.Package,
+    symbol_values: []const u64,
+    graph: *graph_mod.Graph,
+    node: package_file.NodeRecord,
+    mapped_inputs: []const graph_mod.ValueId,
+) api_errors.ExecuteError!graph_mod.ValueId {
+    _ = allocator;
+    return switch (node.op) {
+        .MatMul => |mm| try graph.addMatMul(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
+        .ElemwiseBinary => |eb| try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
+        .BroadcastLastDimBinary => |eb| try graph.addBroadcastLastDimBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
+        .Unary => |u| try graph.addUnary(u.op, mapped_inputs[0]),
+        .Softmax => |s| try graph.addSoftmax(mapped_inputs[0], s.axis),
+        .Conv1D => |cv| try graph.addConv1DWithPadMode(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            if (mapped_inputs.len > 2) mapped_inputs[2] else null,
+            @intCast(cv.stride),
+            @intCast(cv.dilation),
+            @intCast(cv.pad_left),
+            @intCast(cv.pad_right),
+            cv.pad_mode,
+            @intCast(cv.groups),
+        ),
+        .Conv2D => |cv| try graph.addConv2DWithPadMode(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            if (mapped_inputs.len > 2) mapped_inputs[2] else null,
+            @intCast(cv.stride_h),
+            @intCast(cv.stride_w),
+            @intCast(cv.dilation_h),
+            @intCast(cv.dilation_w),
+            @intCast(cv.pad_top),
+            @intCast(cv.pad_bottom),
+            @intCast(cv.pad_left),
+            @intCast(cv.pad_right),
+            cv.pad_mode,
+            @intCast(cv.groups),
+        ),
+        .LayerNorm => |ln| blk: {
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            break :blk try graph.addLayerNorm(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], ln.eps, shape);
+        },
+        .RMSNorm => |ln| blk: {
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            break :blk try graph.addRMSNorm(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], ln.eps, shape);
+        },
+        .Attention => |attn| try graph.addAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal),
+        .MultiHeadAttention => |attn| try graph.addMultiHeadAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal, @intCast(attn.heads)),
+        .Reduce => |rr| if (rr.axis) |axis| try graph.addReduceAxis(rr.op, mapped_inputs[0], axis) else try graph.addReduce(rr.op, mapped_inputs[0]),
+        .Concat => |cc| try graph.addConcat(mapped_inputs, cc.axis),
+        .LSTMCell => |lc| try graph.addLSTMCell(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            mapped_inputs[2],
+            mapped_inputs[3],
+            mapped_inputs[4],
+            if (lc.has_bias) mapped_inputs[5] else null,
+            if (lc.has_bias) mapped_inputs[6] else null,
+        ),
+        .ComplexAbsMean => |cm| try graph.addComplexAbsMean(mapped_inputs[0], @intCast(cm.out_channels)),
+        .Copy => try graph.addCopy(mapped_inputs[0]),
+        .ViewReshape => |vr| blk: {
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, vr.new_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            break :blk try graph.addViewReshape(mapped_inputs[0], shape);
+        },
+        .ViewSqueeze => |vs| try graph.addViewSqueeze(mapped_inputs[0], vs.axis),
+        .ViewUnsqueeze => |vu| try graph.addViewUnsqueeze(mapped_inputs[0], vu.axis),
+        .ViewTranspose2D => try graph.addViewTranspose2D(mapped_inputs[0]),
+        .ViewSliceND => |sl| blk: {
+            const lens = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, sl.lens, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            var starts_mem: [api_tiling.MAX_RANK]usize = undefined;
+            if (sl.starts.len > starts_mem.len) return error.InvalidArgument;
+            for (sl.starts, 0..) |value, idx| starts_mem[idx] = std.math.cast(usize, value) orelse return error.InvalidArgument;
+            break :blk try graph.addViewSliceND(mapped_inputs[0], starts_mem[0..sl.starts.len], lens);
+        },
+    };
+}

@@ -1,0 +1,537 @@
+const std = @import("std");
+
+const backend_mod = @import("../backend/backend.zig");
+const graph_mod = @import("../graph/graph.zig");
+const program_mod = @import("../graph/program.zig");
+const package_file = @import("../storage/aion_file.zig");
+
+const api_errors = @import("errors.zig");
+
+const types_mod = @import("loaded_model/types.zig");
+const signatures = @import("loaded_model/signatures.zig");
+const retarget = @import("loaded_model/retarget.zig");
+const instantiate = @import("loaded_model/instantiate.zig");
+const initializers = @import("loaded_model/initializers.zig");
+
+pub const Tensor = types_mod.Tensor;
+pub const StorageManager = types_mod.StorageManager;
+pub const TensorId = types_mod.TensorId;
+pub const DType = types_mod.DType;
+pub const TilePolicy = types_mod.TilePolicy;
+pub const Package = types_mod.Package;
+pub const SignatureInfo = types_mod.SignatureInfo;
+pub const IoAliasInfo = types_mod.IoAliasInfo;
+pub const LoadModelOptions = types_mod.LoadModelOptions;
+
+pub const LoadedModel = struct {
+    allocator: std.mem.Allocator,
+    backend: backend_mod.Backend,
+    store: *StorageManager,
+    policy: TilePolicy,
+    package: Package,
+    initializer_tids: []TensorId,
+    input_signatures: []SignatureInfo,
+    output_signatures: []SignatureInfo,
+    output_aliases: []IoAliasInfo,
+    input_alias_output_indices: []u32,
+    output_alias_input_indices: []u32,
+    bound_inputs: []?Tensor,
+    aliased_input_bind_versions: []u64,
+    run_symbol_bindings: []?u64,
+    run_symbol_values: []u64,
+    run_input_shapes: []usize,
+    run_direct_input_ids: []TensorId,
+    cache_entries: std.ArrayList(CacheEntry) = .empty,
+    last_run_cache_index: ?usize = null,
+    package_hash: u64,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self) void {
+        for (self.cache_entries.items) |*entry| {
+            entry.program.deinit();
+            self.allocator.free(entry.symbol_values);
+            self.allocator.free(entry.input_shapes);
+            self.allocator.free(entry.input_slots);
+            self.allocator.free(entry.direct_input_ids);
+            self.allocator.free(entry.aliased_input_sync_versions);
+        }
+        self.cache_entries.deinit(self.allocator);
+        self.allocator.free(self.initializer_tids);
+        self.allocator.free(self.input_signatures);
+        self.allocator.free(self.output_signatures);
+        self.allocator.free(self.output_aliases);
+        self.allocator.free(self.input_alias_output_indices);
+        self.allocator.free(self.output_alias_input_indices);
+        self.allocator.free(self.bound_inputs);
+        self.allocator.free(self.aliased_input_bind_versions);
+        self.allocator.free(self.run_symbol_bindings);
+        self.allocator.free(self.run_symbol_values);
+        self.allocator.free(self.run_input_shapes);
+        self.allocator.free(self.run_direct_input_ids);
+        self.package.deinit();
+        self.* = undefined;
+    }
+
+    pub fn inputNames(self: *const Self) []const SignatureInfo {
+        return self.input_signatures;
+    }
+
+    pub fn outputNames(self: *const Self) []const SignatureInfo {
+        return self.output_signatures;
+    }
+
+    pub fn outputAliases(self: *const Self) []const IoAliasInfo {
+        return self.output_aliases;
+    }
+
+    /// Return the debug-name table persisted in the loaded package.
+    ///
+    /// Debug names are intended to be user-facing and stable enough for
+    /// diagnostics and tooling (e.g. swapping initializers by name).
+    pub fn debugNames(self: *const Self) []const package_file.DebugName {
+        return self.package.debug_names;
+    }
+
+    /// Return the value index for a debug name, or null if not present.
+    pub fn findValueByDebugName(self: *const Self, name: []const u8) ?u32 {
+        for (self.package.debug_names) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        }
+        return null;
+    }
+
+    /// Return an owned tensor handle for an initializer value.
+    ///
+    /// The returned tensor can be mutated in-place to swap weights without
+    /// recompiling.
+    pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
+        if (value_index >= self.package.values.len) return api_errors.ApiError.InvalidArgument;
+        const value = self.package.values[value_index];
+        if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
+        const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
+        if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
+        const tid: TensorId = self.initializer_tids[init_idx];
+        const meta = try self.store.getConst(tid);
+        return .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
+    }
+
+    /// Like `initializerTensorByValue`, but looks up the initializer via a
+    /// persisted debug name.
+    pub fn initializerTensorByDebugName(self: *Self, debug_name: []const u8) api_errors.ApiError!Tensor {
+        const value_index: u32 = self.findValueByDebugName(debug_name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.initializerTensorByValue(value_index);
+    }
+
+    /// Overwrite an initializer's bytes (copy) without changing tensor IDs.
+    ///
+    /// This is the safest weight-swap primitive: it does not require retargeting
+    /// compiled programs, and it can copy between different (but compatible)
+    /// tilings via pack/unpack when needed.
+    pub fn overwriteInitializerByValue(self: *Self, value_index: u32, src: Tensor) api_errors.ApiError!void {
+        if (src.store != self.store) return api_errors.ApiError.InvalidArgument;
+        const dst: Tensor = try self.initializerTensorByValue(value_index);
+        if (dst.id == src.id) return;
+        try dst.copyFrom(self.allocator, src);
+    }
+
+    pub fn overwriteInitializerByDebugName(self: *Self, debug_name: []const u8, src: Tensor) api_errors.ApiError!void {
+        const value_index: u32 = self.findValueByDebugName(debug_name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.overwriteInitializerByValue(value_index, src);
+    }
+
+    /// Retarget an initializer to a different underlying tensor id.
+    ///
+    /// This updates:
+    /// - the initializer tensor-id mapping used for future cache entries
+    /// - all existing cached compiled programs (in-place patch of tensor ids)
+    ///
+    /// Requirements:
+    /// - `new_tensor` must belong to the same `Context` storage manager
+    /// - layout must be compatible (dtype, shape, tile layout)
+    pub fn retargetInitializerByValue(self: *Self, value_index: u32, new_tensor: Tensor) api_errors.ApiError!void {
+        if (new_tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
+        if (value_index >= self.package.values.len) return api_errors.ApiError.InvalidArgument;
+        const value = self.package.values[value_index];
+        if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
+        const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
+        if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
+
+        const old_tid: TensorId = self.initializer_tids[init_idx];
+        const new_tid: TensorId = new_tensor.id;
+        if (old_tid == new_tid) return;
+
+        const ok = try signatures.tensorsHaveCompatibleLayout(self.store, old_tid, new_tid);
+        if (!ok) return api_errors.ApiError.InvalidArgument;
+
+        self.initializer_tids[init_idx] = new_tid;
+        for (self.cache_entries.items) |*entry| {
+            retarget.retargetProgramTensorIds(&entry.program, old_tid, new_tid);
+        }
+    }
+
+    pub fn retargetInitializerByDebugName(self: *Self, debug_name: []const u8, new_tensor: Tensor) api_errors.ApiError!void {
+        const value_index: u32 = self.findValueByDebugName(debug_name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.retargetInitializerByValue(value_index, new_tensor);
+    }
+
+    pub fn cacheEntryCount(self: *const Self) usize {
+        return self.cache_entries.items.len;
+    }
+
+    pub fn bindInput(self: *Self, name: []const u8, tensor: Tensor) api_errors.ApiError!void {
+        const index = self.findInputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
+        const sig = self.input_signatures[index];
+        if (tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
+        if (tensor.dtype != sig.dtype) return api_errors.ApiError.InvalidArgument;
+        if (tensor.shape.len != sig.rank) return api_errors.ApiError.InvalidArgument;
+        self.bound_inputs[index] = tensor;
+        if (self.inputAliasOutputIndex(index) != null) {
+            self.aliased_input_bind_versions[index] +%= 1;
+            if (self.aliased_input_bind_versions[index] == 0) self.aliased_input_bind_versions[index] = 1;
+        }
+    }
+
+    pub fn run(self: *Self) api_errors.ExecuteError!void {
+        const resolved = try self.resolveBindings();
+        const cache_index = if (try self.findStaticCacheEntry(resolved.direct_input_ids)) |idx|
+            idx
+        else
+            try self.ensureCacheEntry(resolved.symbol_values, resolved.input_shapes, resolved.direct_input_ids);
+        var entry: *CacheEntry = &self.cache_entries.items[cache_index];
+
+        var i: usize = 0;
+        while (i < self.bound_inputs.len) : (i += 1) {
+            const src = self.bound_inputs[i].?;
+            const dst_tid = entry.input_slots[i];
+            const dst_meta = try self.store.getConst(dst_tid);
+            const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
+            if (self.inputAliasOutputIndex(i) != null) {
+                const bind_version = self.aliased_input_bind_versions[i];
+                if (bind_version != 0 and entry.aliased_input_sync_versions[i] != bind_version) {
+                    if (src.id != dst.id) try dst.copyFrom(self.allocator, src);
+                    entry.aliased_input_sync_versions[i] = bind_version;
+                }
+                continue;
+            }
+            if (src.id != dst.id) try dst.copyFrom(self.allocator, src);
+        }
+
+        try self.backend.executeProgram(&entry.program, self.store.tensorStore());
+
+        for (self.output_aliases) |alias| {
+            const dst_tid = entry.input_slots[alias.input_index];
+            const src_tid = entry.program.outputs[alias.output_index];
+            if (dst_tid == src_tid) continue;
+
+            const dst_meta = try self.store.getConst(dst_tid);
+            const src_meta = try self.store.getConst(src_tid);
+            const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
+            const src = Tensor{ .store = self.store, .id = src_tid, .dtype = src_meta.dtype, .shape = src_meta.shape };
+            try dst.copyFrom(self.allocator, src);
+        }
+
+        self.last_run_cache_index = cache_index;
+    }
+
+    pub fn outputTensor(self: *Self, name: []const u8) api_errors.ApiError!Tensor {
+        const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
+        const output_index = self.findOutputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
+        const tid = self.cache_entries.items[cache_index].program.outputs[output_index];
+        const t = try self.store.getConst(tid);
+        return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+    }
+
+    pub fn initLoaded(
+        allocator: std.mem.Allocator,
+        backend: backend_mod.Backend,
+        store: *StorageManager,
+        policy: TilePolicy,
+        package: Package,
+        initializer_tids: []TensorId,
+        package_hash: u64,
+    ) api_errors.LoadError!Self {
+        const input_signatures = try signatures.buildSignatures(allocator, &package, package.inputs);
+        errdefer allocator.free(input_signatures);
+        const output_signatures = try signatures.buildSignatures(allocator, &package, package.outputs);
+        errdefer allocator.free(output_signatures);
+        const output_aliases = try signatures.buildIoAliasInfo(allocator, &package, input_signatures, output_signatures);
+        errdefer allocator.free(output_aliases);
+
+        const input_alias_output_indices = try allocator.alloc(u32, input_signatures.len);
+        errdefer allocator.free(input_alias_output_indices);
+        @memset(input_alias_output_indices, types_mod.invalid_alias_index);
+
+        const output_alias_input_indices = try allocator.alloc(u32, output_signatures.len);
+        errdefer allocator.free(output_alias_input_indices);
+        @memset(output_alias_input_indices, types_mod.invalid_alias_index);
+
+        for (package.io_aliases) |alias| {
+            input_alias_output_indices[alias.input] = alias.output;
+            output_alias_input_indices[alias.output] = alias.input;
+        }
+
+        const bound_inputs = try allocator.alloc(?Tensor, input_signatures.len);
+        errdefer allocator.free(bound_inputs);
+        @memset(bound_inputs, null);
+
+        const aliased_input_bind_versions = try allocator.alloc(u64, input_signatures.len);
+        errdefer allocator.free(aliased_input_bind_versions);
+        @memset(aliased_input_bind_versions, 0);
+
+        var total_rank: usize = 0;
+        for (input_signatures) |sig| total_rank += sig.rank;
+
+        const run_symbol_bindings = try allocator.alloc(?u64, package.dim_symbols.len);
+        errdefer allocator.free(run_symbol_bindings);
+        const run_symbol_values = try allocator.alloc(u64, package.dim_symbols.len);
+        errdefer allocator.free(run_symbol_values);
+        const run_input_shapes = try allocator.alloc(usize, total_rank);
+        errdefer allocator.free(run_input_shapes);
+        const run_direct_input_ids = try allocator.alloc(TensorId, input_signatures.len);
+        errdefer allocator.free(run_direct_input_ids);
+
+        return .{
+            .allocator = allocator,
+            .backend = backend,
+            .store = store,
+            .policy = policy,
+            .package = package,
+            .initializer_tids = initializer_tids,
+            .input_signatures = input_signatures,
+            .output_signatures = output_signatures,
+            .output_aliases = output_aliases,
+            .input_alias_output_indices = input_alias_output_indices,
+            .output_alias_input_indices = output_alias_input_indices,
+            .bound_inputs = bound_inputs,
+            .aliased_input_bind_versions = aliased_input_bind_versions,
+            .run_symbol_bindings = run_symbol_bindings,
+            .run_symbol_values = run_symbol_values,
+            .run_input_shapes = run_input_shapes,
+            .run_direct_input_ids = run_direct_input_ids,
+            .package_hash = package_hash,
+        };
+    }
+
+    fn resolveBindings(self: *Self) error{InvalidArgument}!ResolvedInputs {
+        @memset(self.run_symbol_bindings, null);
+        @memset(self.run_direct_input_ids, types_mod.invalid_tensor_id);
+
+        var shape_cursor: usize = 0;
+        var i: usize = 0;
+        while (i < self.input_signatures.len) : (i += 1) {
+            const tensor = self.bound_inputs[i] orelse return error.InvalidArgument;
+            const sig = self.input_signatures[i];
+            const value = self.package.values[sig.value];
+            if (tensor.dtype != value.dtype or tensor.shape.len != value.rank) return error.InvalidArgument;
+
+            var d: usize = 0;
+            while (d < tensor.shape.len) : (d += 1) {
+                const actual: u64 = @intCast(tensor.shape[d]);
+                try signatures.bindInputDim(&self.package, value.shape_terms[d], actual, self.run_symbol_bindings);
+                self.run_input_shapes[shape_cursor] = tensor.shape[d];
+                shape_cursor += 1;
+            }
+            if (self.inputAliasOutputIndex(i) == null) self.run_direct_input_ids[i] = tensor.id;
+        }
+
+        for (self.run_symbol_bindings, 0..) |value, idx| self.run_symbol_values[idx] = value orelse 0;
+
+        return .{
+            .symbol_values = self.run_symbol_values,
+            .input_shapes = self.run_input_shapes[0..shape_cursor],
+            .direct_input_ids = self.run_direct_input_ids,
+        };
+    }
+
+    fn ensureCacheEntry(
+        self: *Self,
+        symbol_values: []const u64,
+        input_shapes: []const usize,
+        direct_input_ids: []const TensorId,
+    ) api_errors.ExecuteError!usize {
+        for (self.cache_entries.items, 0..) |*entry, idx| {
+            if (signatures.sameU64(entry.symbol_values, symbol_values) and signatures.sameUsize(entry.input_shapes, input_shapes)) {
+                if (try self.prepareCacheEntryInputs(entry, direct_input_ids)) return idx;
+            }
+        }
+
+        const entry = try self.buildCacheEntry(symbol_values, input_shapes, direct_input_ids);
+        try self.cache_entries.append(self.allocator, entry);
+        return self.cache_entries.items.len - 1;
+    }
+
+    fn buildCacheEntry(
+        self: *Self,
+        symbol_values: []const u64,
+        input_shapes: []const usize,
+        direct_input_ids: []const TensorId,
+    ) api_errors.ExecuteError!CacheEntry {
+        var graph = graph_mod.Graph.init(self.allocator);
+        defer graph.deinit();
+
+        var value_map = try self.allocator.alloc(graph_mod.ValueId, self.package.values.len);
+        defer self.allocator.free(value_map);
+        @memset(value_map, std.math.maxInt(graph_mod.ValueId));
+
+        const input_slots = try self.allocator.alloc(TensorId, self.input_signatures.len);
+        errdefer self.allocator.free(input_slots);
+        const entry_direct_input_ids = try self.allocator.dupe(TensorId, direct_input_ids);
+        errdefer self.allocator.free(entry_direct_input_ids);
+        const aliased_input_sync_versions = try self.allocator.alloc(u64, self.input_signatures.len);
+        errdefer self.allocator.free(aliased_input_sync_versions);
+        @memset(aliased_input_sync_versions, 0);
+
+        var input_shape_cursor: usize = 0;
+        for (self.input_signatures, 0..) |sig, sig_idx| {
+            const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
+            const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
+                try initializers.createTensorForShape(self.store, self.policy, sig.dtype, concrete_shape)
+            else blk: {
+                const tid = direct_input_ids[sig_idx];
+                if (tid == types_mod.invalid_tensor_id) return error.InvalidArgument;
+                break :blk tid;
+            };
+            input_slots[sig_idx] = slot_tid;
+            const vid = try graph.addInput(sig.dtype, concrete_shape);
+            try graph.bindExternal(vid, slot_tid);
+            value_map[sig.value] = vid;
+        }
+
+        const optional_symbols = try instantiate.optionalizeSymbols(self.allocator, symbol_values);
+        defer self.allocator.free(optional_symbols);
+
+        for (self.package.values, 0..) |value, idx| {
+            if (value.source != .initializer) continue;
+            const shape = try package_file.resolveShapeTerms(self.allocator, &self.package, value.shape_terms, optional_symbols);
+            defer self.allocator.free(shape);
+            const vid = try graph.addInput(value.dtype, shape);
+            try graph.bindExternal(vid, self.initializer_tids[value.initializer_index.?]);
+            value_map[idx] = vid;
+        }
+
+        for (self.package.nodes) |node| {
+            const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
+            defer self.allocator.free(mapped_inputs);
+            for (node.inputs, 0..) |input, i| {
+                if (input >= value_map.len) return error.InvalidArgument;
+                mapped_inputs[i] = value_map[input];
+            }
+            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs);
+            value_map[node.output] = out_vid;
+        }
+
+        const outputs = try self.allocator.alloc(graph_mod.ValueId, self.package.outputs.len);
+        defer self.allocator.free(outputs);
+        for (self.package.outputs, 0..) |sig, idx| outputs[idx] = value_map[sig.value];
+        try graph.setOutputs(outputs);
+
+        var program = try program_mod.compileGraph(self.allocator, &graph, self.store, self.policy);
+        errdefer program.deinit();
+
+        return .{
+            .symbol_values = try self.allocator.dupe(u64, symbol_values),
+            .input_shapes = try self.allocator.dupe(usize, input_shapes),
+            .input_slots = input_slots,
+            .direct_input_ids = entry_direct_input_ids,
+            .aliased_input_sync_versions = aliased_input_sync_versions,
+            .program = program,
+        };
+    }
+
+    fn findInputIndex(self: *const Self, name: []const u8) ?usize {
+        for (self.input_signatures, 0..) |sig, idx| {
+            if (std.mem.eql(u8, sig.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findOutputIndex(self: *const Self, name: []const u8) ?usize {
+        for (self.output_signatures, 0..) |sig, idx| {
+            if (std.mem.eql(u8, sig.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findStaticCacheEntry(self: *Self, desired_direct_input_ids: []const TensorId) api_errors.ExecuteError!?usize {
+        if (self.package.dim_symbols.len != 0) return null;
+        for (self.cache_entries.items, 0..) |*entry, idx| {
+            if (try self.prepareCacheEntryInputs(entry, desired_direct_input_ids)) return idx;
+        }
+        return null;
+    }
+
+    fn prepareCacheEntryInputs(
+        self: *Self,
+        entry: *CacheEntry,
+        desired_direct_input_ids: []const TensorId,
+    ) api_errors.ExecuteError!bool {
+        var shape_cursor: usize = 0;
+        for (self.input_signatures, 0..) |sig, idx| {
+            const tensor = self.bound_inputs[idx] orelse return false;
+            if (tensor.dtype != sig.dtype) return false;
+            if (tensor.shape.len != sig.rank) return false;
+            for (tensor.shape) |dim| {
+                if (shape_cursor >= entry.input_shapes.len) return false;
+                if (entry.input_shapes[shape_cursor] != dim) return false;
+                shape_cursor += 1;
+            }
+
+            if (self.inputAliasOutputIndex(idx) != null) continue;
+
+            const desired_tid = desired_direct_input_ids[idx];
+            if (desired_tid == types_mod.invalid_tensor_id) return false;
+            const current_tid = entry.direct_input_ids[idx];
+            if (current_tid == types_mod.invalid_tensor_id) return false;
+            if (current_tid == desired_tid) continue;
+            if (!try signatures.tensorsHaveCompatibleLayout(self.store, current_tid, desired_tid)) return false;
+            retarget.retargetProgramTensorIds(&entry.program, current_tid, desired_tid);
+            entry.direct_input_ids[idx] = desired_tid;
+            entry.input_slots[idx] = desired_tid;
+        }
+        return shape_cursor == entry.input_shapes.len;
+    }
+
+    fn inputAliasOutputIndex(self: *const Self, input_index: usize) ?usize {
+        if (input_index >= self.input_alias_output_indices.len) return null;
+        const raw = self.input_alias_output_indices[input_index];
+        if (raw == types_mod.invalid_alias_index) return null;
+        return @intCast(raw);
+    }
+};
+
+const ResolvedInputs = struct {
+    symbol_values: []const u64,
+    input_shapes: []const usize,
+    direct_input_ids: []const TensorId,
+};
+
+const CacheEntry = struct {
+    symbol_values: []u64,
+    input_shapes: []usize,
+    input_slots: []TensorId,
+    direct_input_ids: []TensorId,
+    aliased_input_sync_versions: []u64,
+    program: program_mod.Program,
+};
+
+pub fn importInitializersForLoadedModel(
+    allocator: std.mem.Allocator,
+    store: *StorageManager,
+    policy: TilePolicy,
+    package: *const Package,
+) api_errors.LoadError![]TensorId {
+    return initializers.importInitializersForLoadedModel(allocator, store, policy, package);
+}
+
+fn buildConcreteShapeFromFlat(
+    flat_shapes: []const usize,
+    sigs: []const SignatureInfo,
+    input_index: usize,
+    cursor: *usize,
+) []const usize {
+    const start = cursor.*;
+    const len = sigs[input_index].rank;
+    cursor.* += len;
+    return flat_shapes[start .. start + len];
+}

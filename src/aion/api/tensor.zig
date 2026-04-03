@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const types = @import("../backend/types.zig");
+const backend_utils = @import("../backend/utils.zig");
 const manager_mod = @import("../storage/manager.zig");
 
 pub const DType = types.DType;
@@ -83,6 +84,51 @@ pub const Tensor = struct {
 
     pub fn readPackedQuant(self: Self, out: []u8) StorageError!void {
         return self.store.readToPackedQuant(self.id, out);
+    }
+
+    pub fn packedByteLen(self: Self) StorageError!usize {
+        const elems = try self.elemCount();
+        return backend_utils.requiredBytesForElems(self.dtype, elems) catch StorageError.InvalidArgument;
+    }
+
+    pub fn copyFrom(self: Self, allocator: std.mem.Allocator, src: Self) StorageError!void {
+        if (self.dtype != src.dtype) return StorageError.InvalidArgument;
+        if (self.shape.len != src.shape.len) return StorageError.InvalidArgument;
+        var i: usize = 0;
+        while (i < self.shape.len) : (i += 1) {
+            if (self.shape[i] != src.shape[i]) return StorageError.InvalidArgument;
+        }
+
+        const dst_tensor = try self.store.getMut(self.id);
+        const src_tensor = try src.store.getConst(src.id);
+        if (canRawCopyTiled(dst_tensor, src_tensor)) {
+            @memcpy(dst_tensor.data, src_tensor.data);
+            return;
+        }
+
+        const byte_len = try src.packedByteLen();
+        const buf = allocator.alloc(u8, byte_len) catch return StorageError.OutOfMemory;
+        defer allocator.free(buf);
+
+        if (self.dtype.info().is_quantized) {
+            try src.readPackedQuant(buf);
+            try self.writePackedQuant(buf);
+        } else {
+            try src.readPackedScalar(buf);
+            try self.writePackedScalar(buf);
+        }
+    }
+
+    fn canRawCopyTiled(dst: *const manager_mod.TiledTensor, src: *const manager_mod.TiledTensor) bool {
+        if (dst.dtype != src.dtype) return false;
+        if (dst.rank != src.rank) return false;
+        if (!std.mem.eql(usize, dst.shape, src.shape)) return false;
+        if (!std.mem.eql(usize, dst.tile_shape, src.tile_shape)) return false;
+        if (!std.mem.eql(usize, dst.tile_counts, src.tile_counts)) return false;
+        if (!std.mem.eql(usize, dst.tile_offsets, src.tile_offsets)) return false;
+        if (!std.mem.eql(usize, dst.tile_lens, src.tile_lens)) return false;
+        if (dst.data.len != src.data.len) return false;
+        return true;
     }
 
     /// Write typed scalar tensor data (inferred from `values` element type).

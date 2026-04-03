@@ -1,8 +1,8 @@
 const std = @import("std");
 
 const api = @import("api.zig");
-const aion_file = @import("../storage/aion_file.zig");
 const manager_mod = @import("../storage/manager.zig");
+const package_file = @import("../storage/aion_file.zig");
 const types = @import("../backend/types.zig");
 const fast = @import("../backend/cpu/kernels/fast_math.zig");
 
@@ -792,18 +792,16 @@ test "api: complexAbsMean (split-complex abs mean over time)" {
     }
 }
 
-test "api: importAionFile + tensorByName + readonly param execution" {
+test "api: exportModel + loadModel roundtrip executes without rebuilding architecture" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer src_ctx.deinit();
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
 
-    const w_t: api.Tensor = try src_ctx.fromArray([2][3]f32{
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
         .{ 1.0, -2.0, 0.5 },
         .{ 3.0, 4.0, -1.5 },
     });
-
-    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -811,38 +809,37 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
 
-    const metadata = [_]aion_file.MetadataSource{aion_file.MetadataSource.string("arch", "import-test")};
-    const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = w_src }};
-    try aion_file.writeFile(file, metadata[0..], tensors[0..], .{});
-
-    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer ctx.deinit();
-
-    try ctx.importAionFile(file, .{});
-
-    const w_loaded: api.Tensor = try ctx.tensorByName("w");
-    try std.testing.expectEqual(types.DType.f32, w_loaded.getDType());
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, w_loaded.getShape());
-
-    const w_vals: []f32 = try w_loaded.readAlloc(allocator, f32);
-    defer allocator.free(w_vals);
-    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 0.5, 3.0, 4.0, -1.5 }, w_vals);
-
-    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, w_loaded.writeF32(&[_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }));
-
-    const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
-
     var bld = api.Builder.init(allocator);
     defer bld.deinit();
 
-    const X: api.TensorRef = try bld.param(x_t);
-    const W: api.TensorRef = try bld.param(w_loaded);
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W: api.TensorRef = try bld.param(w_t);
     const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Y },
+    }, .{
+        .metadata = &[_]api.ExportMetadata{
+            .{ .key = "arch", .value = "roundtrip-test" },
+        },
+    });
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
     defer model.deinit();
 
-    const y_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqual(@as(usize, 1), model.inputNames().len);
+    try std.testing.expectEqual(@as(usize, 1), model.outputNames().len);
+    try std.testing.expectEqualStrings("x", model.inputNames()[0].name);
+    try std.testing.expectEqualStrings("y", model.outputNames()[0].name);
+    try std.testing.expectEqual(types.DType.f32, model.inputNames()[0].dtype);
+
+    const x_t: api.Tensor = try load_ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+    try model.bindInput("x", x_t);
+    try model.run();
+
+    const y_t: api.Tensor = try model.outputTensor("y");
     var y_vals: [3]f32 = undefined;
     try y_t.read(&y_vals);
 
@@ -851,101 +848,847 @@ test "api: importAionFile + tensorByName + readonly param execution" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[2], 1e-6);
 }
 
-test "api: importAionPath and importAionPathAbsolute convenience apis" {
+test "api: loadModel can swap initializers by debug name (overwrite + retarget)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer src_ctx.deinit();
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
 
-    const w_t: api.Tensor = try src_ctx.fromArray([2][2]f32{
-        .{ 1.0, 2.0 },
-        .{ 3.0, 4.0 },
+    // Weight W: [2,3]
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, 2.0, 3.0 },
+        .{ 4.0, 5.0, 6.0 },
     });
-    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try createTestFile(tmp.dir, "path_import.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "swap_init.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
 
-    const tensors = [_]aion_file.TensorSource{.{ .name = "w_path", .tensor = w_src }};
-    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
 
-    const relative_path: []const u8 = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "path_import.aion" });
-    defer allocator.free(relative_path);
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W0: api.TensorRef = try bld.param(w_t);
+    const W: api.TensorRef = try bld.name(W0, "W");
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    // Sanity: W must be present in the persisted debug-name table.
+    try std.testing.expect(model.findValueByDebugName("W") != null);
+    const init_t: api.Tensor = try model.initializerTensorByDebugName("W");
+    try std.testing.expectEqual(types.DType.f32, init_t.getDType());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, init_t.getShape());
+
+    const x_t: api.Tensor = try load_ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+    try model.bindInput("x", x_t);
+    try model.run();
+
+    var y_vals: [3]f32 = undefined;
+    {
+        const y_t: api.Tensor = try model.outputTensor("y");
+        try y_t.read(&y_vals);
+    }
+
+    // y = [2,-1] @ W => [ -2, -1, 0 ]
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y_vals[2], 1e-6);
+
+    // Overwrite initializer bytes in-place.
+    const zero_w: api.Tensor = try load_ctx.fromArray([2][3]f32{
+        .{ 0.0, 0.0, 0.0 },
+        .{ 0.0, 0.0, 0.0 },
+    });
+    try model.overwriteInitializerByDebugName("W", zero_w);
+
+    try model.run();
+    {
+        const y_t: api.Tensor = try model.outputTensor("y");
+        try y_t.read(&y_vals);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y_vals[2], 1e-6);
+
+    // Retarget initializer tensor-id to a new tensor (and patch cached programs).
+    var ones_w: api.Tensor = try load_ctx.tensor(.f32, &[_]usize{ 2, 3 });
+    var ones_vals: [6]f32 = .{1.0} ** 6;
+    try ones_w.write(ones_vals[0..]);
+    try model.retargetInitializerByDebugName("W", ones_w);
+
+    try model.run();
+    {
+        const y_t: api.Tensor = try model.outputTensor("y");
+        try y_t.read(&y_vals);
+    }
+    // [2,-1] @ ones => [1,1,1]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[2], 1e-6);
+}
+
+test "api: loadModel can switch a linear head (overwrite head.w + head.b)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // Export model with head0 params.
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const head0_w: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
+    const head0_b: api.Tensor = try export_ctx.fromArray([3]f32{ 0.25, -0.5, 1.0 });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "switch_head.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+
+    var head: nn.Linear = try nn.Linear.bind(&bld, head0_w, head0_b);
+    head.w = try bld.name(head.w, "head.w");
+    if (head.b) |b0| head.b = try bld.name(b0, "head.b");
+
+    const Y: api.TensorRef = try head.forward(&bld, X);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    // Load and run with head0.
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    try std.testing.expect(model.findValueByDebugName("head.w") != null);
+    try std.testing.expect(model.findValueByDebugName("head.b") != null);
+
+    const x_t: api.Tensor = try load_ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+    try model.bindInput("x", x_t);
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    var y_vals: [3]f32 = undefined;
+    {
+        const y_t: api.Tensor = try model.outputTensor("y");
+        try y_t.read(&y_vals);
+    }
+
+    // [2, -1] @ head0_w + head0_b => [-0.75, -8.5, 3.5]
+    try std.testing.expectApproxEqAbs(@as(f32, -0.75), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -8.5), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), y_vals[2], 1e-6);
+
+    // Switch to head1 by overwriting both initializers.
+    const head1_w: api.Tensor = try load_ctx.fromArray([2][3]f32{
+        .{ 0.5, 1.0, -1.0 },
+        .{ 2.0, -0.5, 0.25 },
+    });
+    const head1_b: api.Tensor = try load_ctx.fromArray([3]f32{ -1.0, 0.0, 0.5 });
+
+    try model.overwriteInitializerByDebugName("head.w", head1_w);
+    try model.overwriteInitializerByDebugName("head.b", head1_b);
+
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    {
+        const y_t: api.Tensor = try model.outputTensor("y");
+        try y_t.read(&y_vals);
+    }
+
+    // [2, -1] @ head1_w + head1_b => [-2, 2.5, -1.75]
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.75), y_vals[2], 1e-6);
+}
+
+test "api: loadWeights lets you load a backbone and attach different heads" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // Export a small "backbone" package containing only backbone weights.
+    // We'll then load only its weights and attach different heads in Zig.
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const bb_w: api.Tensor = try export_ctx.fromArray([2][4]f32{
+        .{ 1.0, 0.5, -1.0, 2.0 },
+        .{ -2.0, 1.0, 0.25, -0.5 },
+    });
+    const bb_b: api.Tensor = try export_ctx.fromArray([4]f32{ 0.1, -0.2, 0.3, 0.0 });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "backbone_only.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    {
+        var bld = api.Builder.init(allocator);
+        defer bld.deinit();
+
+        const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+        var bb: nn.Linear = try nn.Linear.bind(&bld, bb_w, bb_b);
+        bb.w = try bld.name(bb.w, "backbone.w");
+        if (bb.b) |b0| bb.b = try bld.name(b0, "backbone.b");
+
+        const Hidden: api.TensorRef = try bb.forward(&bld, X);
+        try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "hidden", .tensor = Hidden }}, .{});
+    }
+
+    // Load *only* weights from that package.
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var weights = try ctx.loadWeights(file, .{});
+    defer weights.deinit();
+
+    const bb_w_loaded: api.Tensor = try weights.initializerTensorByDebugName("backbone.w");
+    const bb_b_loaded: api.Tensor = try weights.initializerTensorByDebugName("backbone.b");
+
+    // Shared input.
+    const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+
+    // Reference hidden = x@W + b.
+    const hidden_ref: [4]f32 = .{
+        2.0 * 1.0 + (-1.0) * (-2.0) + 0.1,
+        2.0 * 0.5 + (-1.0) * (1.0) + (-0.2),
+        2.0 * (-1.0) + (-1.0) * (0.25) + 0.3,
+        2.0 * (2.0) + (-1.0) * (-0.5) + 0.0,
+    };
+
+    // 1) Attach a classification head: hidden@Wc + bc (4 -> 3)
+    const cls_w: api.Tensor = try ctx.fromArray([4][3]f32{
+        .{ 1.0, 0.0, -1.0 },
+        .{ 0.5, 2.0, 1.0 },
+        .{ -2.0, 1.0, 0.25 },
+        .{ 0.0, -1.5, 0.5 },
+    });
+    const cls_b: api.Tensor = try ctx.fromArray([3]f32{ 0.0, 0.1, -0.2 });
+
+    var bld_cls = api.Builder.init(allocator);
+    defer bld_cls.deinit();
+    const Xc: api.TensorRef = try bld_cls.name(try bld_cls.param(x_t), "x");
+    var bb_cls: nn.Linear = try nn.Linear.bind(&bld_cls, bb_w_loaded, bb_b_loaded);
+    const HiddenC: api.TensorRef = try bb_cls.forward(&bld_cls, Xc);
+    var head_cls: nn.Linear = try nn.Linear.bind(&bld_cls, cls_w, cls_b);
+    head_cls.w = try bld_cls.name(head_cls.w, "head.classifier.w");
+    if (head_cls.b) |b0| head_cls.b = try bld_cls.name(b0, "head.classifier.b");
+    const LogitsC: api.TensorRef = try head_cls.forward(&bld_cls, HiddenC);
+
+    var model_cls = try ctx.compile(&bld_cls, &[_]api.TensorRef{LogitsC});
+    defer model_cls.deinit();
+    const out_cls_t: api.Tensor = try model_cls.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3 }, out_cls_t.getShape());
+    var out_cls: [3]f32 = undefined;
+    try out_cls_t.read(&out_cls);
+
+    const cls_ref: [3]f32 = .{
+        hidden_ref[0] * 1.0 + hidden_ref[1] * 0.5 + hidden_ref[2] * (-2.0) + hidden_ref[3] * 0.0 + 0.0,
+        hidden_ref[0] * 0.0 + hidden_ref[1] * 2.0 + hidden_ref[2] * 1.0 + hidden_ref[3] * (-1.5) + 0.1,
+        hidden_ref[0] * (-1.0) + hidden_ref[1] * 1.0 + hidden_ref[2] * 0.25 + hidden_ref[3] * 0.5 + (-0.2),
+    };
+    for (0..3) |i| try std.testing.expectApproxEqAbs(cls_ref[i], out_cls[i], 1e-6);
+
+    // 2) Attach a QA head: two separate linear projections (4 -> 2)
+    const qa_w_s: api.Tensor = try ctx.fromArray([4][2]f32{
+        .{ 1.0, 0.0 },
+        .{ 0.0, 1.0 },
+        .{ 0.5, -0.5 },
+        .{ -1.0, 2.0 },
+    });
+    const qa_w_e: api.Tensor = try ctx.fromArray([4][2]f32{
+        .{ -1.0, 0.25 },
+        .{ 2.0, -0.5 },
+        .{ 0.0, 1.0 },
+        .{ 1.5, -1.0 },
+    });
+
+    var bld_qa = api.Builder.init(allocator);
+    defer bld_qa.deinit();
+    const Xq: api.TensorRef = try bld_qa.name(try bld_qa.param(x_t), "x");
+    var bb_qa: nn.Linear = try nn.Linear.bind(&bld_qa, bb_w_loaded, bb_b_loaded);
+    const HiddenQ: api.TensorRef = try bb_qa.forward(&bld_qa, Xq);
+
+    const Ws: api.TensorRef = try bld_qa.name(try bld_qa.param(qa_w_s), "head.qa.start.w");
+    const We: api.TensorRef = try bld_qa.name(try bld_qa.param(qa_w_e), "head.qa.end.w");
+    const Start: api.TensorRef = try bld_qa.matmul(HiddenQ, Ws, 1.0, 0.0);
+    const End: api.TensorRef = try bld_qa.matmul(HiddenQ, We, 1.0, 0.0);
+
+    var model_qa = try ctx.compile(&bld_qa, &[_]api.TensorRef{ Start, End });
+    defer model_qa.deinit();
+    const out_s_t: api.Tensor = try model_qa.runOutputTensor(0);
+    const out_e_t: api.Tensor = model_qa.outputTensor(1);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2 }, out_s_t.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2 }, out_e_t.getShape());
+
+    var out_s: [2]f32 = undefined;
+    var out_e: [2]f32 = undefined;
+    try out_s_t.read(&out_s);
+    try out_e_t.read(&out_e);
+
+    const qa_s_ref: [2]f32 = .{
+        hidden_ref[0] * 1.0 + hidden_ref[1] * 0.0 + hidden_ref[2] * 0.5 + hidden_ref[3] * (-1.0),
+        hidden_ref[0] * 0.0 + hidden_ref[1] * 1.0 + hidden_ref[2] * (-0.5) + hidden_ref[3] * 2.0,
+    };
+    const qa_e_ref: [2]f32 = .{
+        hidden_ref[0] * (-1.0) + hidden_ref[1] * 2.0 + hidden_ref[2] * 0.0 + hidden_ref[3] * 1.5,
+        hidden_ref[0] * 0.25 + hidden_ref[1] * (-0.5) + hidden_ref[2] * 1.0 + hidden_ref[3] * (-1.0),
+    };
+
+    for (0..2) |i| try std.testing.expectApproxEqAbs(qa_s_ref[i], out_s[i], 1e-6);
+    for (0..2) |i| try std.testing.expectApproxEqAbs(qa_e_ref[i], out_e[i], 1e-6);
+}
+
+test "api: loadModel output aliases keep recurrent state internal" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "aliased_state.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const State = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "state");
+    const Sum = try bld.add(X, State);
+    const NextState = try bld.copy(Sum);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Sum },
+        .{ .name = "next_state", .tensor = NextState },
+    }, .{
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input_name = "state", .output_name = "next_state" },
+        },
+    });
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), model.outputAliases().len);
+    try std.testing.expectEqualStrings("state", model.outputAliases()[0].input_name);
+    try std.testing.expectEqualStrings("next_state", model.outputAliases()[0].output_name);
+
+    const x_t = try load_ctx.fromArray([1][2]f32{.{ 1.0, 2.0 }});
+    const state_t = try load_ctx.fromArray([1][2]f32{.{ 0.0, 0.0 }});
+    try model.bindInput("x", x_t);
+    try model.bindInput("state", state_t);
+    try model.run();
+
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    const next_state_t = try model.outputTensor("next_state");
+
+    var state_vals: [2]f32 = undefined;
+    try next_state_t.read(&state_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), state_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), state_vals[1], 1e-6);
+
+    const y_t = try model.outputTensor("y");
+    var y_vals: [2]f32 = undefined;
+    try y_t.read(&y_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), y_vals[1], 1e-6);
+
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+    const next_state_t_second = try model.outputTensor("next_state");
+    try std.testing.expectEqual(next_state_t.id, next_state_t_second.id);
+    try next_state_t_second.read(&state_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), state_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), state_vals[1], 1e-6);
+
+    const replacement_state = try load_ctx.fromArray([1][2]f32{.{ 5.0, 6.0 }});
+    try model.bindInput("state", replacement_state);
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    const replaced_next_state = try model.outputTensor("next_state");
+    try std.testing.expectEqual(next_state_t.id, replaced_next_state.id);
+    try replaced_next_state.read(&state_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), state_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), state_vals[1], 1e-6);
+}
+
+test "api: exportModelPathAbsolute + loadModelPathAbsolute support symbolic shapes and cache reuse" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const w_t: api.Tensor = try export_ctx.fromArray([3][2]f32{
+        .{ 1.0, 2.0 },
+        .{ 3.0, 4.0 },
+        .{ 5.0, 6.0 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const absolute_path: [:0]u8 = try tmp.parent_dir.realPathFileAlloc(std.testing.io, &tmp.sub_path, allocator);
     defer allocator.free(absolute_path);
-    const absolute_file_path: []const u8 = try std.fs.path.join(allocator, &.{ absolute_path, "path_import.aion" });
+    const absolute_file_path: []const u8 = try std.fs.path.join(allocator, &.{ absolute_path, "dynamic_model.aion" });
     defer allocator.free(absolute_file_path);
 
-    var rel_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer rel_ctx.deinit();
-    try rel_ctx.importAionPath(relative_path, .{});
-    const rel_w = try rel_ctx.tensorByName("w_path");
-    const rel_vals = try rel_w.readAlloc(allocator, f32);
-    defer allocator.free(rel_vals);
-    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0 }, rel_vals);
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
 
-    var abs_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer abs_ctx.deinit();
-    try abs_ctx.importAionPathAbsolute(absolute_file_path, .{});
-    const abs_w = try abs_ctx.tensorByName("w_path");
-    const abs_vals = try abs_w.readAlloc(allocator, f32);
-    defer allocator.free(abs_vals);
-    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0 }, abs_vals);
+    const X0 = try bld.input(.f32, &[_]usize{ 1, 3 });
+    const X = try bld.name(X0, "x");
+    const W: api.TensorRef = try bld.param(w_t);
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+
+    try export_ctx.exportModelPathAbsolute(absolute_file_path, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Y },
+    }, .{
+        .input_symbols = &[_]api.DimensionSymbol{
+            .{ .tensor = X, .axis = 0, .name = "batch" },
+        },
+    });
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModelPathAbsolute(absolute_file_path, .{});
+    defer model.deinit();
+
+    const x_first = try load_ctx.fromArray([2][3]f32{
+        .{ 1.0, 0.0, 1.0 },
+        .{ 0.5, -1.0, 2.0 },
+    });
+    try model.bindInput("x", x_first);
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    const y_first = try model.outputTensor("y");
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 2 }, y_first.getShape());
+    var y_first_vals: [4]f32 = undefined;
+    try y_first.read(&y_first_vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), y_first_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), y_first_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.5), y_first_vals[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), y_first_vals[3], 1e-6);
+
+    const x_same_shape = try load_ctx.fromArray([2][3]f32{
+        .{ 2.0, 1.0, 0.0 },
+        .{ -1.0, 3.0, 0.5 },
+    });
+    try model.bindInput("x", x_same_shape);
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 1), model.cacheEntryCount());
+
+    const x_new_shape = try load_ctx.fromArray([4][3]f32{
+        .{ 1.0, 0.0, 0.0 },
+        .{ 0.0, 1.0, 0.0 },
+        .{ 0.0, 0.0, 1.0 },
+        .{ 1.0, 1.0, 1.0 },
+    });
+    try model.bindInput("x", x_new_shape);
+    try model.run();
+    try std.testing.expectEqual(@as(usize, 2), model.cacheEntryCount());
+
+    const y_new = try model.outputTensor("y");
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 4, 2 }, y_new.getShape());
 }
 
-test "api: import options expose mapped state and promotion to owned ram" {
+test "api.module: vtable dynamic module can build graph" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    var src_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer src_ctx.deinit();
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
 
-    const w_t: api.Tensor = try src_ctx.fromArray([2][2]f32{
-        .{ 1.0, 2.0 },
-        .{ 3.0, 4.0 },
+    const x_t: api.Tensor = try ctx.fromArray([1][3]f32{.{ 1.0, 2.0, 3.0 }});
+    const b_t: api.Tensor = try ctx.fromArray([1][3]f32{.{ 0.5, -1.0, 2.0 }});
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+
+    const DynBiasAdd = struct {
+        bias: api.TensorRef,
+
+        fn name(ctx0: *const anyopaque) []const u8 {
+            _ = ctx0;
+            return "bias_add_dyn";
+        }
+
+        fn forward(ctx0: *anyopaque, bld0: *api.Builder, input: api.TensorRef) anyerror!api.TensorRef {
+            const self: *@This() = @ptrCast(@alignCast(ctx0));
+            return bld0.add(input, self.bias);
+        }
+
+        fn deinit(ctx0: *anyopaque, alloc: std.mem.Allocator) void {
+            _ = alloc;
+            const self: *@This() = @ptrCast(@alignCast(ctx0));
+            self.* = undefined;
+        }
+
+        pub const vtable: api.ModuleDyn.VTable = .{
+            .name = name,
+            .forward = forward,
+            .deinit = deinit,
+        };
+    };
+
+    var dyn_mod_state: DynBiasAdd = .{ .bias = try bld.param(b_t) };
+    var dyn_mod: api.ModuleDyn = api.ModuleDyn.init(&dyn_mod_state, &DynBiasAdd.vtable);
+    defer dyn_mod.deinit(allocator);
+
+    try std.testing.expectEqualStrings("bias_add_dyn", dyn_mod.name());
+
+    const Y: api.TensorRef = try dyn_mod.forward(&bld, X);
+
+    // ModuleDyn.forward should auto-scope when no scope is active.
+    try std.testing.expect(bld.valueName(Y) != null);
+    try std.testing.expectEqualStrings("bias_add_dyn#0/add#0", bld.valueName(Y).?);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const y_t: api.Tensor = try model.runOutputTensor(0);
+    var y_vals: [3]f32 = undefined;
+    try y_t.read(&y_vals);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), y_vals[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), y_vals[2], 1e-6);
+}
+
+test "api.module: isModuleType detects bind+forward protocol" {
+    const Good = struct {
+        pub fn bind() void {}
+        pub fn forward() void {}
+    };
+
+    const MissingBind = struct {
+        pub fn forward() void {}
+    };
+
+    try std.testing.expect(api.isModuleType(nn.Linear));
+    try std.testing.expect(api.isModuleType(Good));
+    try std.testing.expect(!api.isModuleType(MissingBind));
+}
+
+test "api.module: moduleDynFrom converts nn.Linear" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
+    const w_t: api.Tensor = try ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
     });
-    const w_src = try src_ctx.storage().getConst(w_t.tensorId());
+    const b_t: api.Tensor = try ctx.fromArray([3]f32{ 0.25, -0.5, 1.0 });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.param(x_t);
+
+    var linear: nn.Linear = try nn.Linear.bind(&bld, w_t, b_t);
+    var dyn_mod: api.ModuleDyn = api.moduleDynFrom(nn.Linear, &linear);
+
+    try std.testing.expect(api.isForwardModuleType(nn.Linear));
+    try std.testing.expectEqualStrings("Linear", dyn_mod.name());
+
+    const Y: api.TensorRef = try dyn_mod.forward(&bld, X);
+
+    // ModuleDyn.forward should auto-scope, and nn.Linear.forward should *not*
+    // start a nested scope when one is already active.
+    try std.testing.expect(bld.valueName(Y) != null);
+    try std.testing.expectEqualStrings("Linear#0/broadcast_add_last_dim#1", bld.valueName(Y).?);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    var out: [3]f32 = undefined;
+    try out_t.read(&out);
+
+    // [2, -1] @ W + b => [-0.75, -8.5, 3.5]
+    try std.testing.expectApproxEqAbs(@as(f32, -0.75), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -8.5), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), out[2], 1e-6);
+}
+
+test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try createTestFile(tmp.dir, "import_options.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "infer_modules.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
 
-    const tensors = [_]aion_file.TensorSource{.{ .name = "w_opts", .tensor = w_src }};
-    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
 
-    var mapped_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer mapped_ctx.deinit();
-    try mapped_ctx.importAionFile(file, .{ .residency = .mapped });
-    try std.testing.expect(try mapped_ctx.isMappedTensor("w_opts"));
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const linear: nn.Linear = try nn.Linear.bind(&bld, w_t, null);
+    const Y: api.TensorRef = try linear.forward(&bld, X);
 
-    const mapped_tensor = try mapped_ctx.tensorByName("w_opts");
-    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, mapped_tensor.writeF32(&[_]f32{ 9.0, 8.0, 7.0, 6.0 }));
+    try std.testing.expect(bld.valueName(Y) != null);
+    try std.testing.expectEqualStrings("Linear#0/matmul#0", bld.valueName(Y).?);
 
-    try mapped_ctx.promoteTensorToOwnedRam("w_opts");
-    try std.testing.expect(!(try mapped_ctx.isMappedTensor("w_opts")));
-    try mapped_tensor.writeF32(&[_]f32{ 9.0, 8.0, 7.0, 6.0 });
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Y },
+    }, .{});
 
-    const mapped_vals = try mapped_tensor.readAlloc(allocator, f32);
-    defer allocator.free(mapped_vals);
-    try std.testing.expectEqualSlices(f32, &[_]f32{ 9.0, 8.0, 7.0, 6.0 }, mapped_vals);
+    var pkg = try package_file.readPackageFile(allocator, file);
+    defer pkg.deinit();
 
-    var copied_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer copied_ctx.deinit();
-    try copied_ctx.importAionFile(file, .{ .residency = .copied });
-    try std.testing.expect(!(try copied_ctx.isMappedTensor("w_opts")));
+    var found: bool = false;
+    for (pkg.debug_names) |entry| {
+        if (entry.value == Y.value) {
+            found = true;
+            try std.testing.expectEqualStrings("Linear#0/matmul#0", entry.name);
+        }
+    }
+    try std.testing.expect(found);
+}
 
-    const copied_tensor = try copied_ctx.tensorByName("w_opts");
-    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, copied_tensor.writeF32(&[_]f32{ 5.0, 6.0, 7.0, 8.0 }));
+test "api.module: custom module can use introspection scope helpers" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
 
-    try copied_ctx.promoteTensorToOwnedRam("w_opts");
-    try copied_tensor.writeF32(&[_]f32{ 5.0, 6.0, 7.0, 8.0 });
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
 
-    const copied_vals = try copied_tensor.readAlloc(allocator, f32);
-    defer allocator.free(copied_vals);
-    try std.testing.expectEqualSlices(f32, &[_]f32{ 5.0, 6.0, 7.0, 8.0 }, copied_vals);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "custom_helper_scope.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    const Custom = struct {
+        gain: api.TensorRef,
+
+        fn forwardInner(self: @This(), bld: *api.Builder, x: api.TensorRef) api.Builder.Error!api.TensorRef {
+            const gx: api.TensorRef = try bld.broadcastAddLastDim(x, self.gain);
+            return bld.relu(gx);
+        }
+
+        pub fn bind(bld: *api.Builder, gain_t: api.Tensor) api.Builder.Error!@This() {
+            return .{ .gain = try bld.param(gain_t) };
+        }
+
+        pub fn forward(self: @This(), bld: *api.Builder, x: api.TensorRef) api.Builder.Error!api.TensorRef {
+            return api.withModuleScope(@This(), bld, null, forwardInner, .{ self, bld, x });
+        }
+    };
+
+    // Build custom graph and export without explicit module declarations.
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const x_t: api.Tensor = try export_ctx.fromArray([1][2]f32{.{ -2.0, 3.0 }});
+    const gain_t: api.Tensor = try export_ctx.fromArray([2]f32{ 1.0, 1.0 });
+    const X: api.TensorRef = try bld.param(x_t);
+
+    const cmod: Custom = try Custom.bind(&bld, gain_t);
+    const Y: api.TensorRef = try cmod.forward(&bld, X);
+
+    try std.testing.expectEqualStrings("Custom", api.moduleTypeName(Custom));
+    try std.testing.expect(bld.valueName(Y) != null);
+    try std.testing.expectEqualStrings("Custom#0/relu#1", bld.valueName(Y).?);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var pkg = try package_file.readPackageFile(allocator, file);
+    defer pkg.deinit();
+
+    var found: bool = false;
+    for (pkg.debug_names) |entry| {
+        if (entry.value == Y.value) {
+            found = true;
+            try std.testing.expectEqualStrings("Custom#0/relu#1", entry.name);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "api.module: withModuleScope closes scope on error" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Dummy = struct {};
+
+    const Impl = struct {
+        fn fail(bld0: *api.Builder) api.Builder.Error!void {
+            _ = bld0;
+            return api.Builder.Error.InvalidArgument;
+        }
+    };
+
+    try std.testing.expect(!bld.hasActiveScope());
+    try std.testing.expectError(api.Builder.Error.InvalidArgument, api.withModuleScope(Dummy, &bld, null, Impl.fail, .{&bld}));
+    try std.testing.expect(!bld.hasActiveScope());
+}
+
+test "api: explicit builder scope prefixes debug names" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "infer_custom_module.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 3 }), "x");
+    const scope = try bld.beginScope("my.custom.module");
+    defer bld.endScope(scope);
+    const Y1: api.TensorRef = try bld.relu(X);
+    const Y2: api.TensorRef = try bld.mul(Y1, Y1);
+
+    try std.testing.expectEqualStrings("my.custom.module/relu#0", bld.valueName(Y1).?);
+    try std.testing.expectEqualStrings("my.custom.module/mul#1", bld.valueName(Y2).?);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Y2 },
+    }, .{});
+
+    var pkg = try package_file.readPackageFile(allocator, file);
+    defer pkg.deinit();
+
+    var found: bool = false;
+    for (pkg.debug_names) |entry| {
+        if (entry.value == Y2.value) {
+            found = true;
+            try std.testing.expectEqualStrings("my.custom.module/mul#1", entry.name);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "api: explicit custom module scope overrides nn auto module scope" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "custom_overrides_auto_module.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const linear: nn.Linear = try nn.Linear.bind(&bld, w_t, null);
+
+    const scope = try bld.beginScope("user.block");
+    defer bld.endScope(scope);
+    const Y: api.TensorRef = try linear.forward(&bld, X);
+
+    try std.testing.expect(bld.valueName(Y) != null);
+    try std.testing.expectEqualStrings("user.block/matmul#0", bld.valueName(Y).?);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = Y },
+    }, .{});
+
+    var pkg = try package_file.readPackageFile(allocator, file);
+    defer pkg.deinit();
+
+    var found: bool = false;
+    for (pkg.debug_names) |entry| {
+        if (entry.value == Y.value) {
+            found = true;
+            try std.testing.expectEqualStrings("user.block/matmul#0", entry.name);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "api: builder.param auto-generates persisted debug names" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, 2.0, 3.0 },
+        .{ 4.0, 5.0, 6.0 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "param_names.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W: api.TensorRef = try bld.param(w_t);
+
+    const expected = try std.fmt.allocPrint(allocator, "param@{d}", .{W.value});
+    defer allocator.free(expected);
+    try std.testing.expect(bld.valueName(W) != null);
+    try std.testing.expectEqualStrings(expected, bld.valueName(W).?);
+
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var pkg = try package_file.readPackageFile(allocator, file);
+    defer pkg.deinit();
+
+    var found: bool = false;
+    for (pkg.debug_names) |entry| {
+        if (entry.value == W.value) {
+            found = true;
+            try std.testing.expectEqualStrings(expected, entry.name);
+        }
+    }
+    try std.testing.expect(found);
 }

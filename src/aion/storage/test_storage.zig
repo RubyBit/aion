@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const aion_file = @import("aion_file.zig");
+const package_file = @import("aion_file.zig");
 const manager_mod = @import("manager.zig");
 const storage = @import("storage.zig");
 const types = @import("../backend/types.zig");
@@ -151,196 +151,164 @@ test "storage: scalar f32 roundtrip rank-3 pack<->tiles" {
     try std.testing.expectEqualSlices(f32, packed_vals, out);
 }
 
-test "storage file: write/parse tiled tensors roundtrip" {
+test "storage file: model package write/parse roundtrip" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    var t0: storage.TiledTensor = undefined;
-    try t0.init(
-        allocator,
-        .f32,
-        &[_]usize{ 5, 7 },
-        &[_]usize{ 2, 3 },
-        .{ .tile_alignment = 64 },
-    );
-    defer t0.deinit();
+    const w_vals: [6]f32 = .{ 1.0, -2.0, 0.5, 3.0, 4.0, -1.5 };
 
-    const vals0: []f32 = try allocator.alloc(f32, 5 * 7);
-    defer allocator.free(vals0);
-    for (vals0, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 11)) * 0.5;
-    try t0.writeFromPackedScalar(std.mem.sliceAsBytes(vals0));
-
-    var t1: storage.TiledTensor = undefined;
-    try t1.init(
-        allocator,
-        .q8_0,
-        &[_]usize{ 96, 5 },
-        &[_]usize{ 64, 3 },
-        .{ .tile_alignment = 64 },
-    );
-    defer t1.deinit();
-
-    const q_bytes_len: usize = try backend_utils.requiredBytesForElems(types.DType.q8_0, 96 * 5);
-    const q_vals: []u8 = try allocator.alloc(u8, q_bytes_len);
-    defer allocator.free(q_vals);
-    for (q_vals, 0..) |*b, i| b.* = @intCast((i * 17 + 3) % 251);
-    try t1.writeFromPackedQuant(q_vals);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        const file = try createTestFile(tmp.dir, "weights.aion", .{ .read = true, .truncate = true });
-        defer file.close(std.testing.io);
-
-        const metadata = [_]aion_file.MetadataSource{
-            aion_file.MetadataSource.string("arch", "tiny-test"),
-        };
-        const tensors = [_]aion_file.TensorSource{
-            .{ .name = "dense.weight", .tensor = &t0 },
-            .{ .name = "dense.weight_q8", .tensor = &t1 },
-        };
-        try aion_file.writeFile(file, metadata[0..], tensors[0..], .{});
-
-        const bytes: []align(64) u8 = try aion_file.readAlloc(allocator, file);
-        defer allocator.free(bytes);
-
-        const view: aion_file.View = try aion_file.parse(bytes);
-        try std.testing.expectEqual(@as(u64, 1), view.header.kv_count);
-        try std.testing.expectEqual(@as(u64, 2), view.header.tensor_count);
-
-        const kv0 = try view.metadata(0);
-        try std.testing.expectEqual(aion_file.ValueType.string, kv0.value_type);
-        try std.testing.expectEqualStrings("arch", kv0.key);
-        try std.testing.expectEqualStrings("tiny-test", kv0.value);
-
-        const d0_opt = try view.findTensor("dense.weight");
-        try std.testing.expect(d0_opt != null);
-        const d0 = d0_opt.?;
-        try std.testing.expectEqual(types.DType.f32, d0.dtype);
-        try std.testing.expectEqual(@as(u8, 2), d0.rank);
-        try std.testing.expectEqual(@as(u64, @intCast(t0.tile_offsets.len)), d0.tile_count);
-        try view.validateTensorCrc32(d0);
-        const d0_data = try view.tensorDataBytes(d0);
-        try std.testing.expectEqualSlices(u8, t0.data, d0_data);
-        for (t0.tile_offsets, t0.tile_lens, 0..) |off, len, i| {
-            try std.testing.expectEqual(@as(u64, @intCast(off)), try view.tileOffsetAt(d0, i));
-            try std.testing.expectEqual(@as(u64, @intCast(len)), try view.tileLenAt(d0, i));
-            const tile_bytes = try view.tileBytes(d0, i);
-            try std.testing.expectEqualSlices(u8, t0.data[off .. off + len], tile_bytes);
-        }
-
-        const d1_opt = try view.findTensor("dense.weight_q8");
-        try std.testing.expect(d1_opt != null);
-        const d1 = d1_opt.?;
-        try std.testing.expectEqual(types.DType.q8_0, d1.dtype);
-        try std.testing.expectEqual(@as(u8, 2), d1.rank);
-        try view.validateTensorCrc32(d1);
-        const d1_data = try view.tensorDataBytes(d1);
-        try std.testing.expectEqualSlices(u8, t1.data, d1_data);
-    }
-}
-
-test "storage file: mapReadOnly parses without heap copy" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    var tt: storage.TiledTensor = undefined;
-    try tt.init(
-        allocator,
-        .f32,
-        &[_]usize{ 4, 4 },
-        &[_]usize{ 2, 2 },
-        .{ .tile_alignment = 64 },
-    );
-    defer tt.deinit();
-
-    const vals: [16]f32 = .{
-        1.0,  2.0,  3.0,  4.0,
-        5.0,  6.0,  7.0,  8.0,
-        9.0,  10.0, 11.0, 12.0,
-        13.0, 14.0, 15.0, 16.0,
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 1),
+        .values = try allocator.alloc(package_file.ValueRecord, 3),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 1),
+        .inputs = try allocator.alloc(package_file.NamedValue, 1),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 0),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 0),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 1),
+        .debug_names = try allocator.alloc(package_file.DebugName, 1),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 1),
     };
-    try tt.writeFromPackedScalar(std.mem.sliceAsBytes(vals[0..]));
+    defer pkg.deinit();
+
+    pkg.initializers[0] = .{
+        .encoding = .{ .plain = .f32 },
+        .data = try allocator.dupe(u8, std.mem.sliceAsBytes(w_vals[0..])),
+    };
+
+    pkg.values[0] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 1, 2 }),
+    };
+    pkg.values[1] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .initializer,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 2, 3 }),
+        .initializer_index = 0,
+    };
+    pkg.values[2] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+
+    pkg.nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{ 0, 1 }),
+        .output = 2,
+        .op = .{ .MatMul = .{ .alpha = 1.0, .beta = 0.0 } },
+    };
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "x"), .value = 0 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "y"), .value = 2 };
+    pkg.metadata[0] = .{
+        .key = try allocator.dupe(u8, "arch"),
+        .value = try allocator.dupe(u8, "tiny-matmul"),
+    };
+    pkg.debug_names[0] = .{
+        .value = 2,
+        .name = try allocator.dupe(u8, "matmul.out"),
+    };
+    pkg.io_aliases[0] = .{ .input = 0, .output = 0 };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try createTestFile(tmp.dir, "mapped.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "model.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
 
-    const tensors = [_]aion_file.TensorSource{.{ .name = "mapped.weight", .tensor = &tt }};
-    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
 
-    var mapped = try aion_file.MappedFile.mapReadOnly(file);
-    defer mapped.deinit();
-
-    const file_size: usize = @intCast(try file.length(std.testing.io));
-    const bytes = try mapped.logicalBytes(file_size);
-    const view = try aion_file.parse(bytes);
-    const desc = (try view.findTensor("mapped.weight")).?;
-    try view.validateTensorCrc32(desc);
-    const data = try view.tensorDataBytes(desc);
-    try std.testing.expectEqualSlices(u8, tt.data, data);
+    try std.testing.expectEqual(@as(usize, 1), parsed.initializers.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.values.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.nodes.len);
+    try std.testing.expectEqualStrings("x", parsed.inputs[0].name);
+    try std.testing.expectEqualStrings("y", parsed.outputs[0].name);
+    try std.testing.expectEqualStrings("arch", parsed.metadata[0].key);
+    try std.testing.expectEqualStrings("tiny-matmul", parsed.metadata[0].value);
+    try std.testing.expectEqual(@as(usize, 1), parsed.io_aliases.len);
+    try std.testing.expectEqual(@as(u32, 0), parsed.io_aliases[0].input);
+    try std.testing.expectEqual(@as(u32, 0), parsed.io_aliases[0].output);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w_vals[0..]), parsed.initializers[0].data);
 }
 
-test "storage manager: mapped and copied imports expose residency and promotion" {
+test "storage file: dim expressions evaluate after parse" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    var src: storage.TiledTensor = undefined;
-    try src.init(
-        allocator,
-        .f32,
-        &[_]usize{ 2, 2 },
-        &[_]usize{ 2, 2 },
-        .{ .tile_alignment = 64 },
-    );
-    defer src.deinit();
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 1),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .inputs = try allocator.alloc(package_file.NamedValue, 1),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 1),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 2),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
 
-    const src_vals: [4]f32 = .{ 1.0, 2.0, 3.0, 4.0 };
-    try src.writeFromPackedScalar(std.mem.sliceAsBytes(src_vals[0..]));
+    pkg.dim_symbols[0] = .{ .name = try allocator.dupe(u8, "batch") };
+    pkg.dim_exprs[0] = .{ .symbol = 0 };
+    pkg.dim_exprs[1] = .{ .add = .{ .lhs = .{ .expr = 0 }, .rhs = .{ .constant = 1 } } };
+    pkg.values[0] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try allocator.dupe(package_file.ShapeTerm, &[_]package_file.ShapeTerm{.{ .expr = 0 }}),
+    };
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "x"), .value = 0 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "y"), .value = 0 };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    const file = try createTestFile(tmp.dir, "residency.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "dyn.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
 
-    const tensors = [_]aion_file.TensorSource{.{ .name = "w", .tensor = &src }};
-    try aion_file.writeFile(file, &.{}, tensors[0..], .{});
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
 
-    var mapped_sm = manager_mod.StorageManager.init(allocator);
-    defer mapped_sm.deinit();
-    try mapped_sm.importAionFile(file, .{ .residency = .mapped });
+    const symbol_values = [_]?u64{3};
+    try std.testing.expectEqual(@as(u64, 4), try package_file.evaluateShapeTerm(&parsed, .{ .expr = 1 }, symbol_values[0..]));
+}
 
-    const mapped_id = mapped_sm.tensorIdByName("w").?;
-    try std.testing.expect(try mapped_sm.isMappedTensor(mapped_id));
-    try std.testing.expectEqual(manager_mod.TensorResidency.imported_mapped, try mapped_sm.tensorResidency(mapped_id));
-    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, mapped_sm.getMut(mapped_id));
+test "storage file: invalid package is rejected" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
 
-    try mapped_sm.promoteToOwnedRam(mapped_id);
-    try std.testing.expectEqual(manager_mod.TensorResidency.owned, try mapped_sm.tensorResidency(mapped_id));
-    _ = try mapped_sm.getMut(mapped_id);
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 1),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .inputs = try allocator.alloc(package_file.NamedValue, 1),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 0),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 0),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
 
-    var mapped_after: [4]f32 = undefined;
-    try mapped_sm.readToPackedScalar(mapped_id, std.mem.sliceAsBytes(mapped_after[0..]));
-    try std.testing.expectEqualSlices(f32, src_vals[0..], mapped_after[0..]);
+    pkg.values[0] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{4}),
+    };
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "dup"), .value = 0 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "dup"), .value = 0 };
 
-    var copied_sm = manager_mod.StorageManager.init(allocator);
-    defer copied_sm.deinit();
-    try copied_sm.importAionFile(file, .{ .residency = .copied });
-
-    const copied_id = copied_sm.tensorIdByName("w").?;
-    try std.testing.expect(!(try copied_sm.isMappedTensor(copied_id)));
-    try std.testing.expectEqual(manager_mod.TensorResidency.imported_copied, try copied_sm.tensorResidency(copied_id));
-    try std.testing.expectError(manager_mod.StorageError.InvalidArgument, copied_sm.getMut(copied_id));
-
-    try copied_sm.promoteToOwnedRam(copied_id);
-    try std.testing.expectEqual(manager_mod.TensorResidency.owned, try copied_sm.tensorResidency(copied_id));
-    _ = try copied_sm.getMut(copied_id);
-
-    const updated_vals: [4]f32 = .{ 10.0, 20.0, 30.0, 40.0 };
-    try copied_sm.writeFromPackedScalar(copied_id, std.mem.sliceAsBytes(updated_vals[0..]));
-
-    var copied_after: [4]f32 = undefined;
-    try copied_sm.readToPackedScalar(copied_id, std.mem.sliceAsBytes(copied_after[0..]));
-    try std.testing.expectEqualSlices(f32, updated_vals[0..], copied_after[0..]);
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
 }

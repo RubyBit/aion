@@ -1,6 +1,7 @@
 const std = @import("std");
 const conv_utils = @import("conv_utils.zig");
 const conv1d_kernels = @import("../kernels/conv1d.zig");
+const simd = @import("../kernels/simd.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
@@ -987,6 +988,269 @@ fn tryExecConv1DSmallDirect(
     const c_in: usize = x_meta.shape[2];
     const k_len: usize = w_meta.shape[0];
 
+    // Helper: compute tile_total.
+    const calcTileTotal = struct {
+        fn run(meta: tensor_store.TensorMeta) usize {
+            var acc: usize = 1;
+            for (meta.tile_counts) |tc| acc *= tc;
+            return acc;
+        }
+    }.run;
+
+    // Helper: verify a single-tile, packed-contiguous f32 layout and return the usable slice.
+    const PackedTile = struct {
+        vals: []align(1) const f32,
+        token: usize,
+    };
+    const PackedTileMut = struct {
+        vals: []align(1) f32,
+        token: usize,
+    };
+    const tryAcquirePackedF32Const = struct {
+        fn run(store2: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId) ExecuteProgramError!?PackedTile {
+            if (meta.dtype != .f32) return null;
+            const rank2: usize = @as(usize, meta.rank);
+            if (rank2 == 0 or rank2 > 8) return null;
+            if (calcTileTotal(meta) != 1) return null;
+            const t = store2.acquireTileConstLinear(id, 0) catch return null;
+            const view = t.bufferView();
+            if (view.layout.rank != meta.rank) {
+                store2.releaseConst(t.token);
+                return null;
+            }
+            if (view.layout.shape.len != rank2 or meta.shape.len != rank2) {
+                store2.releaseConst(t.token);
+                return null;
+            }
+            var d: usize = 0;
+            while (d < rank2) : (d += 1) {
+                if (view.layout.shape[d] != meta.shape[d]) {
+                    store2.releaseConst(t.token);
+                    return null;
+                }
+            }
+            // Require packed-contiguous row-major in bytes.
+            var expect: isize = @intCast(@sizeOf(f32));
+            var dd: usize = rank2;
+            while (dd > 0) : (dd -= 1) {
+                const i: usize = dd - 1;
+                if (view.layout.strides_bytes[i] != expect) {
+                    store2.releaseConst(t.token);
+                    return null;
+                }
+                if (i > 0) {
+                    const mulv: isize = @intCast(view.layout.shape[i]);
+                    expect *= mulv;
+                }
+            }
+
+            const total_elems: usize = elemCountFromShape(meta.shape) catch {
+                store2.releaseConst(t.token);
+                return null;
+            };
+            const need_bytes: usize = total_elems * @sizeOf(f32);
+            if (t.bytes.len < need_bytes) {
+                store2.releaseConst(t.token);
+                return null;
+            }
+            const all_vals: []align(1) const f32 = bytesAsF32Const(t.bytes[0..need_bytes]);
+            return .{ .vals = all_vals[0..total_elems], .token = t.token };
+        }
+    }.run;
+    const tryAcquirePackedF32Mut = struct {
+        fn run(store2: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId) ExecuteProgramError!?PackedTileMut {
+            if (meta.dtype != .f32) return null;
+            const rank2: usize = @as(usize, meta.rank);
+            if (rank2 == 0 or rank2 > 8) return null;
+            if (calcTileTotal(meta) != 1) return null;
+            var t = store2.acquireTileMutLinear(id, 0) catch return null;
+            const view = t.bufferView();
+            if (view.layout.rank != meta.rank) {
+                store2.releaseMut(t.token);
+                return null;
+            }
+            if (view.layout.shape.len != rank2 or meta.shape.len != rank2) {
+                store2.releaseMut(t.token);
+                return null;
+            }
+            var d: usize = 0;
+            while (d < rank2) : (d += 1) {
+                if (view.layout.shape[d] != meta.shape[d]) {
+                    store2.releaseMut(t.token);
+                    return null;
+                }
+            }
+            var expect: isize = @intCast(@sizeOf(f32));
+            var dd: usize = rank2;
+            while (dd > 0) : (dd -= 1) {
+                const i: usize = dd - 1;
+                if (view.layout.strides_bytes[i] != expect) {
+                    store2.releaseMut(t.token);
+                    return null;
+                }
+                if (i > 0) {
+                    const mulv: isize = @intCast(view.layout.shape[i]);
+                    expect *= mulv;
+                }
+            }
+
+            const total_elems: usize = elemCountFromShape(meta.shape) catch {
+                store2.releaseMut(t.token);
+                return null;
+            };
+            const need_bytes: usize = total_elems * @sizeOf(f32);
+            if (t.bytes.len < need_bytes) {
+                store2.releaseMut(t.token);
+                return null;
+            }
+            const all_vals: []align(1) f32 = bytesAsF32Mut(t.bytes[0..need_bytes]);
+            return .{ .vals = all_vals[0..total_elems], .token = t.token };
+        }
+    }.run;
+
+    // Core compute: assumes NLC packed buffers.
+    const doDirect = struct {
+        fn run(
+            s2: StepConv1DTiled,
+            batch2: usize,
+            l_out2: usize,
+            c_out2: usize,
+            l_in2: usize,
+            c_in2: usize,
+            k_len2: usize,
+            x_flat2: [*]align(1) const f32,
+            w_flat2: [*]align(1) const f32,
+            out_flat2: [*]align(1) f32,
+            bias_flat2: ?[*]align(1) const f32,
+        ) void {
+            const use_reflect2: bool = (s2.pad_mode == .reflect);
+            const l_in_i2: isize = @intCast(l_in2);
+            const stride2: usize = s2.stride;
+            const dilation2: usize = s2.dilation;
+            const pad_left2: usize = s2.pad_left;
+
+            const Vec = @Vector(simd.lanesF32(), f32);
+            const lanes2: usize = @typeInfo(Vec).vector.len;
+            const vecs_per_block: usize = 4;
+            const block_ch: usize = lanes2 * vecs_per_block;
+
+            var b2: usize = 0;
+            while (b2 < batch2) : (b2 += 1) {
+                const x_base2: usize = b2 * l_in2 * c_in2;
+                const out_base2: usize = b2 * l_out2 * c_out2;
+
+                var lo2: usize = 0;
+                while (lo2 < l_out2) : (lo2 += 1) {
+                    const out_off2: usize = out_base2 + lo2 * c_out2;
+
+                    // Block over output channels to keep accumulators in registers.
+                    const full_blocks: usize = (c_out2 / block_ch) * block_ch;
+                    var co0: usize = 0;
+                    while (co0 < full_blocks) : (co0 += block_ch) {
+                        var acc0: Vec = @splat(@as(f32, 0.0));
+                        var acc1: Vec = @splat(@as(f32, 0.0));
+                        var acc2: Vec = @splat(@as(f32, 0.0));
+                        var acc3: Vec = @splat(@as(f32, 0.0));
+                        if (bias_flat2) |bp| {
+                            const b0: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0)).*;
+                            const b1: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + lanes2)).*;
+                            const b2v: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + 2 * lanes2)).*;
+                            const b3: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + 3 * lanes2)).*;
+                            acc0 = b0;
+                            acc1 = b1;
+                            acc2 = b2v;
+                            acc3 = b3;
+                        }
+
+                        var kw2: usize = 0;
+                        while (kw2 < k_len2) : (kw2 += 1) {
+                            const in_nom2: isize = @as(isize, @intCast(lo2 * stride2 + kw2 * dilation2)) - @as(isize, @intCast(pad_left2));
+                            const li2: usize = if (use_reflect2) reflectIndex1D(in_nom2, l_in2) else blk: {
+                                if (in_nom2 < 0 or in_nom2 >= l_in_i2) continue;
+                                break :blk @intCast(in_nom2);
+                            };
+
+                            const x_row2: usize = x_base2 + li2 * c_in2;
+                            const w_kw2: usize = kw2 * c_in2 * c_out2;
+
+                            var ic2: usize = 0;
+                            while (ic2 < c_in2) : (ic2 += 1) {
+                                const x_val2: f32 = x_flat2[x_row2 + ic2];
+                                const xv2: Vec = @splat(x_val2);
+                                const w_ic2: usize = w_kw2 + ic2 * c_out2 + co0;
+                                const w0: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2)).*;
+                                const w1: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + lanes2)).*;
+                                const w2: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + 2 * lanes2)).*;
+                                const w3: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + 3 * lanes2)).*;
+                                acc0 = @mulAdd(Vec, xv2, w0, acc0);
+                                acc1 = @mulAdd(Vec, xv2, w1, acc1);
+                                acc2 = @mulAdd(Vec, xv2, w2, acc2);
+                                acc3 = @mulAdd(Vec, xv2, w3, acc3);
+                            }
+                        }
+
+                        const outp: [*]align(1) f32 = out_flat2 + out_off2 + co0;
+                        @as(*align(1) Vec, @ptrCast(outp)).* = acc0;
+                        @as(*align(1) Vec, @ptrCast(outp + lanes2)).* = acc1;
+                        @as(*align(1) Vec, @ptrCast(outp + 2 * lanes2)).* = acc2;
+                        @as(*align(1) Vec, @ptrCast(outp + 3 * lanes2)).* = acc3;
+                    }
+
+                    // Remaining full vectors.
+                    var co2: usize = full_blocks;
+                    while (co2 + lanes2 <= c_out2) : (co2 += lanes2) {
+                        var accv: Vec = @splat(@as(f32, 0.0));
+                        if (bias_flat2) |bp| {
+                            accv = @as(*align(1) const Vec, @ptrCast(bp + co2)).*;
+                        }
+
+                        var kw2: usize = 0;
+                        while (kw2 < k_len2) : (kw2 += 1) {
+                            const in_nom2: isize = @as(isize, @intCast(lo2 * stride2 + kw2 * dilation2)) - @as(isize, @intCast(pad_left2));
+                            const li2: usize = if (use_reflect2) reflectIndex1D(in_nom2, l_in2) else blk: {
+                                if (in_nom2 < 0 or in_nom2 >= l_in_i2) continue;
+                                break :blk @intCast(in_nom2);
+                            };
+                            const x_row2: usize = x_base2 + li2 * c_in2;
+                            const w_kw2: usize = kw2 * c_in2 * c_out2;
+                            var ic2: usize = 0;
+                            while (ic2 < c_in2) : (ic2 += 1) {
+                                const x_val2: f32 = x_flat2[x_row2 + ic2];
+                                const xv2: Vec = @splat(x_val2);
+                                const w_ic2: usize = w_kw2 + ic2 * c_out2 + co2;
+                                const wv: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2)).*;
+                                accv = @mulAdd(Vec, xv2, wv, accv);
+                            }
+                        }
+                        @as(*align(1) Vec, @ptrCast(out_flat2 + out_off2 + co2)).* = accv;
+                    }
+
+                    // Scalar tail.
+                    while (co2 < c_out2) : (co2 += 1) {
+                        var accs: f32 = if (bias_flat2) |bp| bp[co2] else 0.0;
+                        var kw2: usize = 0;
+                        while (kw2 < k_len2) : (kw2 += 1) {
+                            const in_nom2: isize = @as(isize, @intCast(lo2 * stride2 + kw2 * dilation2)) - @as(isize, @intCast(pad_left2));
+                            const li2: usize = if (use_reflect2) reflectIndex1D(in_nom2, l_in2) else blk: {
+                                if (in_nom2 < 0 or in_nom2 >= l_in_i2) continue;
+                                break :blk @intCast(in_nom2);
+                            };
+                            const x_row2: usize = x_base2 + li2 * c_in2;
+                            const w_kw2: usize = kw2 * c_in2 * c_out2;
+                            var ic2: usize = 0;
+                            while (ic2 < c_in2) : (ic2 += 1) {
+                                const x_val2: f32 = x_flat2[x_row2 + ic2];
+                                const w_idx2: usize = w_kw2 + ic2 * c_out2 + co2;
+                                accs = @mulAdd(f32, x_val2, w_flat2[w_idx2], accs);
+                            }
+                        }
+                        out_flat2[out_off2 + co2] = accs;
+                    }
+                }
+            }
+        }
+    }.run;
+
     // Compute gate: this path is only intended for *very* small convolutions
     // where tiling + packing overhead dominates (e.g. feature extraction with
     // tiny sequence lengths). For larger problems, the implicit-GEMM kernels
@@ -1007,100 +1271,77 @@ fn tryExecConv1DSmallDirect(
     const limit: usize = 256 * 1024;
     if (x_n > limit or w_n > limit or out_n > limit) return false;
 
-    // Single scratch allocation for all flat buffers.
+    // Fastest path: all tensors are a single packed f32 tile we can operate on directly.
+    // This avoids heap allocations and pack/unpack copies in readTensorPackedF32/writeTensorPackedF32.
+    if (try tryAcquirePackedF32Const(store, x_meta, s.x)) |x_tile| {
+        defer store.releaseConst(x_tile.token);
+        if (try tryAcquirePackedF32Const(store, w_meta, s.w)) |w_tile| {
+            defer store.releaseConst(w_tile.token);
+            if (try tryAcquirePackedF32Mut(store, out_meta, s.out)) |out_tile| {
+                defer store.releaseMut(out_tile.token);
+
+                var bias_ptr: ?[*]align(1) const f32 = null;
+                var bias_token: usize = 0;
+                if (s.bias) |b_id| {
+                    const b_meta: tensor_store.TensorMeta = store.meta(b_id) catch {
+                        return false;
+                    };
+                    if (try tryAcquirePackedF32Const(store, b_meta, b_id)) |b_tile| {
+                        bias_ptr = @ptrCast(b_tile.vals.ptr);
+                        bias_token = b_tile.token;
+                    } else {
+                        return false;
+                    }
+                }
+                defer if (bias_ptr != null) store.releaseConst(bias_token);
+
+                doDirect(
+                    s,
+                    batch,
+                    l_out,
+                    c_out,
+                    l_in,
+                    c_in,
+                    k_len,
+                    @ptrCast(x_tile.vals.ptr),
+                    @ptrCast(w_tile.vals.ptr),
+                    @ptrCast(out_tile.vals.ptr),
+                    bias_ptr,
+                );
+                return true;
+            }
+        }
+    }
+
+    // Fallback: keep existing behavior for nontrivial tilings/layouts.
+    // (Still uses the improved register-accumulating microkernel, but with packed copies.)
     const total_f32: usize = x_n + w_n + out_n + c_out;
     const scratch: []f32 = ctx.allocator.alloc(f32, total_f32) catch return false;
     defer ctx.allocator.free(scratch);
 
-    const x_flat: [*]align(1) const f32 = @ptrCast(scratch.ptr);
-    const w_flat: [*]align(1) const f32 = @ptrCast(scratch.ptr + x_n);
-    const out_flat: [*]align(1) f32 = @ptrCast(scratch.ptr + x_n + w_n);
-
     try readTensorPackedF32(store, x_meta, s.x, scratch[0..x_n]);
     try readTensorPackedF32(store, w_meta, s.w, scratch[x_n .. x_n + w_n]);
 
-    var bias_flat: [*]align(1) const f32 = undefined;
-    var has_bias: bool = false;
+    var bias_ptr2: ?[*]align(1) const f32 = null;
     if (s.bias) |b_id| {
-        has_bias = true;
         const b_meta: tensor_store.TensorMeta = try store.meta(b_id);
         try readTensorPackedF32(store, b_meta, b_id, scratch[x_n + w_n + out_n ..][0..c_out]);
-        bias_flat = @ptrCast(scratch.ptr + x_n + w_n + out_n);
+        bias_ptr2 = @ptrCast(scratch.ptr + x_n + w_n + out_n);
     }
 
-    const use_reflect: bool = (s.pad_mode == .reflect);
-    const l_in_i: isize = @intCast(l_in);
-    const stride: usize = s.stride;
-    const dilation: usize = s.dilation;
-    const pad_left: usize = s.pad_left;
-
-    const lanes: usize = 8;
-    const Vec = @Vector(lanes, f32);
-
-    // Zero output.
-    var zi: usize = 0;
-    while (zi < out_n) : (zi += 1) out_flat[zi] = 0.0;
-
-    // Direct convolution: broadcast-accumulate pattern.
-    // For each (batch, output_pos, kernel_tap, input_channel):
-    //   broadcast x_val and fma across a SIMD-width of output channels.
-    var b: usize = 0;
-    while (b < batch) : (b += 1) {
-        const x_base: usize = b * l_in * c_in;
-        const out_base: usize = b * l_out * c_out;
-
-        var lo: usize = 0;
-        while (lo < l_out) : (lo += 1) {
-            const out_off: usize = out_base + lo * c_out;
-
-            var kw: usize = 0;
-            while (kw < k_len) : (kw += 1) {
-                const in_nom: isize = @as(isize, @intCast(lo * stride + kw * dilation)) - @as(isize, @intCast(pad_left));
-                const li: usize = if (use_reflect) reflectIndex1D(in_nom, l_in) else blk: {
-                    if (in_nom < 0 or in_nom >= l_in_i) continue;
-                    break :blk @intCast(in_nom);
-                };
-
-                const x_row: usize = x_base + li * c_in;
-                const w_kw: usize = kw * c_in * c_out;
-
-                var ic: usize = 0;
-                while (ic < c_in) : (ic += 1) {
-                    const x_val: f32 = x_flat[x_row + ic];
-                    const w_ic: usize = w_kw + ic * c_out;
-                    const xv: Vec = @splat(x_val);
-
-                    var co: usize = 0;
-                    while (co + lanes <= c_out) : (co += lanes) {
-                        const wp: [*]align(1) const f32 = w_flat + (w_ic + co);
-                        const op: [*]align(1) f32 = out_flat + (out_off + co);
-                        const wv: Vec = @as(*align(1) const Vec, @ptrCast(wp)).*;
-                        var ov: Vec = @as(*align(1) const Vec, @ptrCast(op)).*;
-                        ov += xv * wv;
-                        @as(*align(1) Vec, @ptrCast(op)).* = ov;
-                    }
-                    while (co < c_out) : (co += 1) {
-                        out_flat[out_off + co] += x_val * w_flat[w_ic + co];
-                    }
-                }
-            }
-
-            if (has_bias) {
-                var co: usize = 0;
-                while (co + lanes <= c_out) : (co += lanes) {
-                    const bp: [*]align(1) const f32 = bias_flat + co;
-                    const op: [*]align(1) f32 = out_flat + (out_off + co);
-                    const bv: Vec = @as(*align(1) const Vec, @ptrCast(bp)).*;
-                    var ov: Vec = @as(*align(1) const Vec, @ptrCast(op)).*;
-                    ov += bv;
-                    @as(*align(1) Vec, @ptrCast(op)).* = ov;
-                }
-                while (co < c_out) : (co += 1) {
-                    out_flat[out_off + co] += bias_flat[co];
-                }
-            }
-        }
-    }
+    doDirect(
+        s,
+        batch,
+        l_out,
+        c_out,
+        l_in,
+        c_in,
+        k_len,
+        @ptrCast(scratch.ptr),
+        @ptrCast(scratch.ptr + x_n),
+        @ptrCast(scratch.ptr + x_n + w_n),
+        bias_ptr2,
+    );
 
     try writeTensorPackedF32(store, out_meta, s.out, scratch[x_n + w_n ..][0..out_n]);
     return true;

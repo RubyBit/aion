@@ -17,9 +17,30 @@ pub const TilingError = error{InvalidArgument};
 /// - This is intentionally conservative; the compiler may still insert retile steps.
 /// - For quantized tensors, callers should prefer op-specific tiling helpers.
 pub fn fillDefaultTileShape(policy: plan_mod.TilePolicy, dtype: types.DType, shape: []const usize, out: []usize) TilingError!void {
-    _ = dtype;
     if (shape.len == 0 or shape.len > MAX_RANK) return TilingError.InvalidArgument;
     if (out.len != shape.len) return TilingError.InvalidArgument;
+
+    // Small tensors: store as a single full tile.
+    //
+    // This mirrors the compiler's tiling policy in `graph/program.zig` and is
+    // especially important for initializer tensors (weights/biases): over-tiling
+    // small constants dramatically increases per-tile acquire/copy overhead.
+    //
+    // For quantized tensors, callers should prefer op-specific tiling helpers
+    // (e.g. chooseQuantMatMulBTiles) to preserve block alignment.
+    if (!dtype.info().is_quantized) {
+        var total: usize = 1;
+        for (shape) |dim| {
+            total = std.math.mul(usize, total, dim) catch {
+                total = policy.small_tensor_threshold + 1;
+                break;
+            };
+        }
+        if (total <= policy.small_tensor_threshold) {
+            @memcpy(out, shape);
+            return;
+        }
+    }
 
     if (shape.len == 1) {
         const t1: [1]usize = plan_mod.chooseTileShape1D(policy, shape[0]);

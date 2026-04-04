@@ -29,3 +29,15 @@ pub const tensor_store = @import("aion/runtime/tensor_store.zig");
 /// into multiple Zig modules (which Zig disallows).
 pub const types = @import("aion/backend/types.zig");
 pub const utils = @import("aion/backend/utils.zig");
+
+/// C ABI entrypoints (for Python/Rust/etc.).
+///
+/// This module defines `pub export` functions with `callconv(.c)`.
+pub const c_api = @import("aion/c_api.zig");
+
+// Zig compilation is lazy; force the module to be analyzed so its exported
+// symbols are emitted into the library even if the Zig-level `c_api` constant
+// is never referenced by Zig callers.
+comptime {
+    _ = c_api;
+}

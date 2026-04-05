@@ -4,3 +4,22 @@
 /.vscode
 /docs
 /models
+/venv
+
+/.venv
+**/.venv
+
+__pycache__/
+.pytest_cache/
+
+# Generated during Python bindings builds (Windows)
+/bindings/python/src/aion/*.dll
+/bindings/python/src/aion/*.pyd
+
+# Generated during Python bindings builds (POSIX)
+/bindings/python/src/aion/*.so
+/bindings/python/src/aion/*.dylib
+
+
+**/build
+**/aion.egg-info

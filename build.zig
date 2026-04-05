@@ -71,11 +71,34 @@ pub fn build(b: *std.Build) void {
         "Library linkage: .static (default) or .dynamic",
     ) orelse .static;
 
+    // When statically linking Aion into a shared object (e.g. Python extension
+    // modules on Linux), the static library objects must be position-independent.
+    //
+    // Enable with: `zig build install -Dpic=true`.
+    const pic: bool = b.option(
+        bool,
+        "pic",
+        "Build the library with position-independent code (useful for FFI)",
+    ) orelse false;
+
     const lib = b.addLibrary(.{
         .name = "aion",
         .root_module = aion_mod,
         .linkage = linkage,
     });
+
+    // When a C/FFI consumer links against the static library on Windows using
+    // MSVC's linker (e.g. Python extensions via setuptools), the final link
+    // step will not automatically pull in Zig/Clang builtins (compiler-rt).
+    // Bundle compiler-rt into the archive so consumers don't need to know
+    // about extra runtime libraries.
+    if (linkage == .static and target.result.os.tag == .windows) {
+        lib.bundle_compiler_rt = true;
+    }
+
+    if (pic) {
+        lib.root_module.pic = true;
+    }
 
     b.installArtifact(lib);
 

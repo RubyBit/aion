@@ -680,18 +680,21 @@ def build_tiny_silero_aion_package(
     num_samples: int,
     context_size: int,
     pad_mode: int,
+    stft_pad_right: int,
 ) -> Package:
     # Model constants (match examples/silero_vad.zig)
     n_fft = 256
     stride = 128
-    pad = 64
     cutoff = (n_fft // 2) + 1
 
     chunk_input_len = int(num_samples + context_size)
     if chunk_input_len < n_fft:
         raise ValueError("chunk_input_len must be >= 256")
 
-    padded_len = chunk_input_len + pad
+    if stft_pad_right < 0:
+        raise ValueError("stft_pad_right must be >= 0")
+
+    padded_len = chunk_input_len + int(stft_pad_right)
     numer = padded_len - n_fft
     t_steps = (numer // stride) + 1
     if t_steps <= 0:
@@ -779,7 +782,14 @@ def build_tiny_silero_aion_package(
     stft = emit(
         NodeKind.Conv1D,
         [x3, stft_w],
-        _node_attr_conv1d(stride=128, dilation=1, pad_left=0, pad_right=64, pad_mode=pad_mode, groups=1),
+        _node_attr_conv1d(
+            stride=128,
+            dilation=1,
+            pad_left=0,
+            pad_right=int(stft_pad_right),
+            pad_mode=pad_mode,
+            groups=1,
+        ),
         out_rank=3,
     )
 
@@ -884,6 +894,12 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--num-samples", type=int, default=512)
     ap.add_argument("--context", type=int, default=64)
     ap.add_argument("--pad-mode", type=str, default="reflect", choices=("reflect", "zero"))
+    ap.add_argument(
+        "--stft-pad-right",
+        type=int,
+        default=64,
+        help="Right padding (in samples) applied to the STFT conv input (default: 64)",
+    )
     ap.add_argument("--print-keys", action="store_true", help="Print all safetensors keys and exit")
     args = ap.parse_args(argv)
 
@@ -899,7 +915,13 @@ def main(argv: Sequence[str]) -> int:
     w = extract_weights(state)
     pad_mode = PadMode.reflect if args.pad_mode == "reflect" else PadMode.zero
 
-    pkg = build_tiny_silero_aion_package(w, num_samples=args.num_samples, context_size=args.context, pad_mode=pad_mode)
+    pkg = build_tiny_silero_aion_package(
+        w,
+        num_samples=args.num_samples,
+        context_size=args.context,
+        pad_mode=pad_mode,
+        stft_pad_right=args.stft_pad_right,
+    )
     write_aion_v4(args.out_aion, pkg)
 
     print("done")

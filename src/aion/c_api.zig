@@ -116,8 +116,8 @@ fn copyStringToBuf(s: []const u8, buf: [*c]u8, cap: usize, out_len: ?*usize) voi
 }
 
 fn getShapeSlice(rank: usize, shape_ptr: [*c]const usize) ?[]const usize {
-    // Rank-0 tensors (scalars) are valid; they have an empty shape.
-    if (rank == 0) return &[_]usize{};
+    // Note: The current high-level Aion API does not allow rank-0 tensors.
+    // Scalars are represented as shape {1}.
     if (shape_ptr == null) return null;
     return shape_ptr[0..rank];
 }

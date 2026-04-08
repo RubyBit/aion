@@ -113,16 +113,7 @@ pub fn freeMetadata(allocator: std.mem.Allocator, values: []package_file.Metadat
 pub fn freeNodes(allocator: std.mem.Allocator, nodes: []package_file.NodeRecord) void {
     for (nodes) |node| {
         allocator.free(node.inputs);
-        switch (node.op) {
-            .LayerNorm => |ln| allocator.free(ln.normalized_shape),
-            .RMSNorm => |ln| allocator.free(ln.normalized_shape),
-            .ViewReshape => |vr| allocator.free(vr.new_shape),
-            .ViewSliceND => |sl| {
-                allocator.free(sl.starts);
-                allocator.free(sl.lens);
-            },
-            else => {},
-        }
+        package_file.deinitNodeOp(allocator, node.op);
     }
     allocator.free(nodes);
 }

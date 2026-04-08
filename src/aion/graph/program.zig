@@ -881,6 +881,8 @@ pub fn compileGraph(
 
     // Lower nodes in order.
     for (graph.nodes.items) |node| {
+        if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return CompileError.InvalidArgument;
+
         const out_idx: usize = @intCast(node.output);
         const out_v = graph.values.items[out_idx];
         const out_dt: types.DType = out_v.dtype.?;
@@ -1382,7 +1384,6 @@ pub fn compileGraph(
             },
 
             .Concat => |cc| {
-                if (node.inputs.len == 0) return CompileError.InvalidArgument;
                 const axis: usize = try normalizeAxis(cc.axis, out_shape.len);
 
                 var out_tile_buf: [MAX_RANK]usize = undefined;
@@ -1405,8 +1406,6 @@ pub fn compileGraph(
             },
 
             .ComplexAbsMean => |cm| {
-                if (node.inputs.len != 1) return CompileError.InvalidArgument;
-
                 const stft_id: usize = @intCast(node.inputs[0]);
 
                 var out_tile_buf: [MAX_RANK]usize = undefined;
@@ -1424,13 +1423,6 @@ pub fn compileGraph(
             },
 
             .LSTMCell => |lc| {
-                // Inputs: x, h_prev, c_prev, w_ih, w_hh (+ optional b_ih, b_hh)
-                if (lc.has_bias) {
-                    if (node.inputs.len != 7) return CompileError.InvalidArgument;
-                } else {
-                    if (node.inputs.len != 5) return CompileError.InvalidArgument;
-                }
-
                 const x_id: usize = @intCast(node.inputs[0]);
                 const h_id: usize = @intCast(node.inputs[1]);
                 const c_id: usize = @intCast(node.inputs[2]);

@@ -30,7 +30,32 @@ pub const Value = struct {
     external: ?ExternalId = null,
 };
 
-pub const Op = union(enum) {
+/// Stable op ids shared by graph ops and serialized package node ops.
+pub const OpTag = enum(u8) {
+    MatMul = 0,
+    ElemwiseBinary = 1,
+    BroadcastLastDimBinary = 2,
+    Unary = 3,
+    Softmax = 4,
+    Conv1D = 5,
+    Conv2D = 6,
+    LayerNorm = 7,
+    RMSNorm = 8,
+    Attention = 9,
+    MultiHeadAttention = 10,
+    Reduce = 11,
+    Concat = 12,
+    LSTMCell = 13,
+    ComplexAbsMean = 14,
+    Copy = 15,
+    ViewReshape = 16,
+    ViewSqueeze = 17,
+    ViewUnsqueeze = 18,
+    ViewTranspose2D = 19,
+    ViewSliceND = 20,
+};
+
+pub const Op = union(OpTag) {
     /// out = alpha * (a @ b) + beta * out
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 
@@ -150,6 +175,62 @@ pub const Op = union(enum) {
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const usize, lens: []const usize },
 };
+
+pub const InputArity = union(enum) {
+    exact: usize,
+    range: struct {
+        min: usize,
+        max: usize,
+    },
+    at_least: usize,
+
+    pub fn allows(self: InputArity, input_count: usize) bool {
+        return switch (self) {
+            .exact => |v| input_count == v,
+            .range => |v| input_count >= v.min and input_count <= v.max,
+            .at_least => |v| input_count >= v,
+        };
+    }
+};
+
+pub fn opInputArity(op: Op) InputArity {
+    return switch (op) {
+        .MatMul => .{ .exact = 2 },
+        .ElemwiseBinary => .{ .exact = 2 },
+        .BroadcastLastDimBinary => .{ .exact = 2 },
+        .Unary => .{ .exact = 1 },
+        .Softmax => .{ .exact = 1 },
+        .Conv1D => .{ .range = .{ .min = 2, .max = 3 } },
+        .Conv2D => .{ .range = .{ .min = 2, .max = 3 } },
+        .LayerNorm => .{ .exact = 3 },
+        .RMSNorm => .{ .exact = 3 },
+        .Attention => .{ .exact = 3 },
+        .MultiHeadAttention => .{ .exact = 3 },
+        .Reduce => .{ .exact = 1 },
+        .Concat => .{ .at_least = 1 },
+        .ComplexAbsMean => .{ .exact = 1 },
+        .LSTMCell => |lc| .{ .exact = if (lc.has_bias) 7 else 5 },
+        .Copy => .{ .exact = 1 },
+        .ViewReshape => .{ .exact = 1 },
+        .ViewSqueeze => .{ .exact = 1 },
+        .ViewUnsqueeze => .{ .exact = 1 },
+        .ViewTranspose2D => .{ .exact = 1 },
+        .ViewSliceND => .{ .exact = 1 },
+    };
+}
+
+pub fn opInputCountValid(op: Op, input_count: usize) bool {
+    const arity: InputArity = opInputArity(op);
+    return arity.allows(input_count);
+}
+
+pub fn opTag(op: Op) OpTag {
+    return std.meta.activeTag(op);
+}
+
+pub fn opId(op: Op) u8 {
+    return @intFromEnum(opTag(op));
+}
 
 pub const Node = struct {
     op: Op,

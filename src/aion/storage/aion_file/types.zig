@@ -123,7 +123,7 @@ pub const IoAlias = struct {
     output: u32,
 };
 
-pub const NodeOp = union(enum) {
+pub const NodeOp = union(graph_mod.OpTag) {
     MatMul: struct { alpha: f32, beta: f32 },
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
@@ -164,6 +164,18 @@ pub const NodeOp = union(enum) {
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const u64, lens: []const ShapeTerm },
 };
+
+/// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
+/// package serialization share one canonical opcode definition.
+pub const NodeOpKind = graph_mod.OpTag;
+
+pub fn nodeOpKind(op: NodeOp) NodeOpKind {
+    return std.meta.activeTag(op);
+}
+
+pub fn parseNodeOpKind(raw: u8) ?NodeOpKind {
+    return std.enums.fromInt(NodeOpKind, raw);
+}
 
 pub const NodeRecord = struct {
     inputs: []const u32,
@@ -433,7 +445,7 @@ fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
     allocator.free(symbols);
 }
 
-fn deinitNodeOp(allocator: std.mem.Allocator, op: NodeOp) void {
+pub fn deinitNodeOp(allocator: std.mem.Allocator, op: NodeOp) void {
     switch (op) {
         .LayerNorm => |ln| allocator.free(ln.normalized_shape),
         .RMSNorm => |ln| allocator.free(ln.normalized_shape),

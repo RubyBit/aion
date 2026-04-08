@@ -20,6 +20,9 @@ pub fn instantiateNode(
     mapped_inputs: []const graph_mod.ValueId,
 ) api_errors.ExecuteError!graph_mod.ValueId {
     _ = allocator;
+
+    const optional_symbols: []?u64 = optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory;
+
     return switch (node.op) {
         .MatMul => |mm| try graph.addMatMul(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
         .ElemwiseBinary => |eb| try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
@@ -53,11 +56,11 @@ pub fn instantiateNode(
             @intCast(cv.groups),
         ),
         .LayerNorm => |ln| blk: {
-            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optional_symbols);
             break :blk try graph.addLayerNorm(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], ln.eps, shape);
         },
         .RMSNorm => |ln| blk: {
-            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optional_symbols);
             break :blk try graph.addRMSNorm(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], ln.eps, shape);
         },
         .Attention => |attn| try graph.addAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal),
@@ -76,14 +79,14 @@ pub fn instantiateNode(
         .ComplexAbsMean => |cm| try graph.addComplexAbsMean(mapped_inputs[0], @intCast(cm.out_channels)),
         .Copy => try graph.addCopy(mapped_inputs[0]),
         .ViewReshape => |vr| blk: {
-            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, vr.new_shape, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, vr.new_shape, optional_symbols);
             break :blk try graph.addViewReshape(mapped_inputs[0], shape);
         },
         .ViewSqueeze => |vs| try graph.addViewSqueeze(mapped_inputs[0], vs.axis),
         .ViewUnsqueeze => |vu| try graph.addViewUnsqueeze(mapped_inputs[0], vu.axis),
         .ViewTranspose2D => try graph.addViewTranspose2D(mapped_inputs[0]),
         .ViewSliceND => |sl| blk: {
-            const lens = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, sl.lens, optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory);
+            const lens = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, sl.lens, optional_symbols);
             var starts_mem: [api_tiling.MAX_RANK]usize = undefined;
             if (sl.starts.len > starts_mem.len) return error.InvalidArgument;
             for (sl.starts, 0..) |value, idx| starts_mem[idx] = std.math.cast(usize, value) orelse return error.InvalidArgument;

@@ -25,6 +25,7 @@ const DebugName = types.DebugName;
 const IoAlias = types.IoAlias;
 const ValueRecord = types.ValueRecord;
 const NodeRecord = types.NodeRecord;
+const NodeOpKind = types.NodeOpKind;
 const NodeOp = types.NodeOp;
 const GraphMeta = types.GraphMeta;
 const Package = types.Package;
@@ -186,7 +187,7 @@ fn encodeNodesSection(allocator: std.mem.Allocator, nodes: []const NodeRecord) P
         var attr: std.ArrayList(u8) = .empty;
         defer attr.deinit(allocator);
         const kind = try encodeNodeOp(&attr, allocator, node.op);
-        try appendInt(&out, allocator, u8, kind);
+        try appendInt(&out, allocator, u8, @intFromEnum(kind));
         try out.appendNTimes(allocator, 0, 3);
         try appendInt(&out, allocator, u32, node.output);
         try appendInt(&out, allocator, u32, @intCast(node.inputs.len));
@@ -197,28 +198,24 @@ fn encodeNodesSection(allocator: std.mem.Allocator, nodes: []const NodeRecord) P
     return out.toOwnedSlice(allocator);
 }
 
-fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeOp) PackageError!u8 {
+fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeOp) PackageError!NodeOpKind {
+    const kind: NodeOpKind = types.nodeOpKind(op);
     switch (op) {
         .MatMul => |mm| {
             try appendInt(out, allocator, f32, mm.alpha);
             try appendInt(out, allocator, f32, mm.beta);
-            return 0;
         },
         .ElemwiseBinary => |eb| {
             try appendInt(out, allocator, u8, @intFromEnum(eb.op));
-            return 1;
         },
         .BroadcastLastDimBinary => |eb| {
             try appendInt(out, allocator, u8, @intFromEnum(eb.op));
-            return 2;
         },
         .Unary => |u| {
             try appendInt(out, allocator, u8, @intFromEnum(u.op));
-            return 3;
         },
         .Softmax => |s| {
             try appendInt(out, allocator, i32, s.axis);
-            return 4;
         },
         .Conv1D => |cv| {
             try appendInt(out, allocator, u64, cv.stride);
@@ -227,7 +224,6 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, u64, cv.pad_right);
             try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
             try appendInt(out, allocator, u64, cv.groups);
-            return 5;
         },
         .Conv2D => |cv| {
             try appendInt(out, allocator, u64, cv.stride_h);
@@ -240,68 +236,57 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, u64, cv.pad_right);
             try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
             try appendInt(out, allocator, u64, cv.groups);
-            return 6;
         },
         .LayerNorm => |ln| {
             try appendInt(out, allocator, f32, ln.eps);
             try appendShapeTermArray(out, allocator, ln.normalized_shape);
-            return 7;
         },
         .RMSNorm => |ln| {
             try appendInt(out, allocator, f32, ln.eps);
             try appendShapeTermArray(out, allocator, ln.normalized_shape);
-            return 8;
         },
         .Attention => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
-            return 9;
         },
         .MultiHeadAttention => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
             try appendInt(out, allocator, u64, attn.heads);
-            return 10;
         },
         .Reduce => |rr| {
             try appendInt(out, allocator, u8, @intFromEnum(rr.op));
             try appendInt(out, allocator, u8, if (rr.axis != null) 1 else 0);
             if (rr.axis) |axis| try appendInt(out, allocator, i32, axis);
-            return 11;
         },
         .Concat => |cc| {
             try appendInt(out, allocator, i32, cc.axis);
-            return 12;
         },
         .LSTMCell => |lc| {
             try appendInt(out, allocator, u8, if (lc.has_bias) 1 else 0);
-            return 13;
         },
         .ComplexAbsMean => |cm| {
             try appendInt(out, allocator, u64, cm.out_channels);
-            return 14;
         },
-        .Copy => return 15,
+        .Copy => {},
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);
-            return 16;
         },
         .ViewSqueeze => |vs| {
             try appendInt(out, allocator, u8, if (vs.axis != null) 1 else 0);
             if (vs.axis) |axis| try appendInt(out, allocator, i32, axis);
-            return 17;
         },
         .ViewUnsqueeze => |vu| {
             try appendInt(out, allocator, i32, vu.axis);
-            return 18;
         },
-        .ViewTranspose2D => return 19,
+        .ViewTranspose2D => {},
         .ViewSliceND => |sl| {
             try appendU64Array(out, allocator, sl.starts);
             try appendShapeTermArray(out, allocator, sl.lens);
-            return 20;
         },
     }
+
+    return kind;
 }
 
 fn encodeSignaturesSection(allocator: std.mem.Allocator, interner: *const StringInterner, inputs: []const NamedValue, outputs: []const NamedValue) PackageError![]u8 {

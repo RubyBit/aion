@@ -104,9 +104,10 @@ pub fn infer(graph: *Graph) InferError!void {
 }
 
 fn inferNode(graph: *Graph, node: Node) InferError!void {
+    if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
+
     switch (node.op) {
         .MatMul => |mm| {
-            try require(node.inputs.len == 2);
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
             try require(a.dtype != null and b.dtype != null);
@@ -167,7 +168,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .ElemwiseBinary => {
-            try require(node.inputs.len == 2);
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
             try require(a.dtype != null and b.dtype != null);
@@ -183,7 +183,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .BroadcastLastDimBinary => {
-            try require(node.inputs.len == 2);
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
             try require(a.dtype != null and b.dtype != null);
@@ -200,7 +199,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Unary => |u| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
@@ -210,7 +208,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Softmax => |sm| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
@@ -219,7 +216,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Conv1D => |cv| {
-            try require(node.inputs.len == 2 or node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const w = try getValue(graph, node.inputs[1]);
             try require(x.dtype != null and w.dtype != null);
@@ -264,7 +260,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Conv2D => |cv| {
-            try require(node.inputs.len == 2 or node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const w = try getValue(graph, node.inputs[1]);
             try require(x.dtype != null and w.dtype != null);
@@ -314,7 +309,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .LayerNorm => |ln| {
-            try require(node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const gamma = try getValue(graph, node.inputs[1]);
             const beta = try getValue(graph, node.inputs[2]);
@@ -342,7 +336,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .RMSNorm => |rn| {
-            try require(node.inputs.len == 3);
             const x = try getValue(graph, node.inputs[0]);
             const gamma = try getValue(graph, node.inputs[1]);
             const beta = try getValue(graph, node.inputs[2]);
@@ -369,7 +362,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Attention => |attn| {
-            try require(node.inputs.len == 3);
             const q = try getValue(graph, node.inputs[0]);
             const k = try getValue(graph, node.inputs[1]);
             const v = try getValue(graph, node.inputs[2]);
@@ -406,7 +398,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .MultiHeadAttention => |attn| {
-            try require(node.inputs.len == 3);
             const q = try getValue(graph, node.inputs[0]);
             const k = try getValue(graph, node.inputs[1]);
             const v = try getValue(graph, node.inputs[2]);
@@ -449,7 +440,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Reduce => |rr| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
@@ -480,7 +470,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Concat => |cc| {
-            try require(node.inputs.len >= 1);
             const first = try getValue(graph, node.inputs[0]);
             try require(first.dtype != null and first.shape.len != 0);
             if (first.dtype.?.info().is_quantized) return InferError.Unsupported;
@@ -515,7 +504,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .ComplexAbsMean => |cm| {
-            try require(node.inputs.len == 1);
             const stft = try getValue(graph, node.inputs[0]);
             try require(stft.dtype != null and stft.shape.len != 0);
 
@@ -540,14 +528,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .LSTMCell => |lc| {
-            // Inputs (required): x, h_prev, c_prev, w_ih, w_hh
-            // Inputs (optional): b_ih, b_hh
-            if (lc.has_bias) {
-                try require(node.inputs.len == 7);
-            } else {
-                try require(node.inputs.len == 5);
-            }
-
             const x = try getValue(graph, node.inputs[0]);
             const h_prev = try getValue(graph, node.inputs[1]);
             const c_prev = try getValue(graph, node.inputs[2]);
@@ -597,14 +577,12 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Copy => {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
             try setInferred(graph, node.output, a.dtype.?, a.shape);
         },
 
         .ViewReshape => |vr| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
 
@@ -618,7 +596,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .ViewSqueeze => |vs| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
 
@@ -659,7 +636,6 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .ViewUnsqueeze => |vu| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
 
@@ -688,14 +664,12 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .ViewTranspose2D => {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len == 2);
             try setInferred(graph, node.output, a.dtype.?, &[_]usize{ a.shape[1], a.shape[0] });
         },
 
         .ViewSliceND => |sl| {
-            try require(node.inputs.len == 1);
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
 

@@ -2,7 +2,7 @@ const package_file = @import("../../storage/aion_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
 
 pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
-    return switch (op) {
+    const out: package_file.NodeOp = switch (op) {
         .MatMul => |mm| .{ .MatMul = .{ .alpha = mm.alpha, .beta = mm.beta } },
         .ElemwiseBinary => |eb| .{ .ElemwiseBinary = .{ .op = eb.op } },
         .BroadcastLastDimBinary => |eb| .{ .BroadcastLastDimBinary = .{ .op = eb.op } },
@@ -49,9 +49,11 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .ViewTranspose2D => .ViewTranspose2D,
         .ViewSliceND => |sl| blk: {
             const starts = try allocator.alloc(u64, sl.starts.len);
+            errdefer allocator.free(starts);
             const lens = try package_file.makeConstantShapeTerms(allocator, sl.lens);
             for (sl.starts, 0..) |value, idx| starts[idx] = @intCast(value);
             break :blk .{ .ViewSliceND = .{ .starts = starts, .lens = lens } };
         },
     };
+    return out;
 }

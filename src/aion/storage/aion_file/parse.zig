@@ -24,6 +24,7 @@ const NamedValue = types.NamedValue;
 const MetadataEntry = types.MetadataEntry;
 const DebugName = types.DebugName;
 const IoAlias = types.IoAlias;
+const NodeOpKind = types.NodeOpKind;
 const NodeOp = types.NodeOp;
 const NodeRecord = types.NodeRecord;
 const GraphMeta = types.GraphMeta;
@@ -358,7 +359,7 @@ fn parseNodesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageErr
     const out = allocator.alloc(NodeRecord, count) catch return PackageError.OutOfMemory;
     errdefer allocator.free(out);
     for (out) |*slot| {
-        const op_kind = try readIntCursor(bytes, &cursor, u8);
+        const op_kind_raw = try readIntCursor(bytes, &cursor, u8);
         _ = try readBytes(bytes, &cursor, 3);
         const output = try readIntCursor(bytes, &cursor, u32);
         const input_count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
@@ -367,23 +368,24 @@ fn parseNodesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageErr
         errdefer allocator.free(inputs);
         for (inputs) |*input| input.* = try readIntCursor(bytes, &cursor, u32);
         const attr_bytes = try readBytes(bytes, &cursor, attr_len);
+        const op_kind: NodeOpKind = types.parseNodeOpKind(op_kind_raw) orelse return PackageError.InvalidFormat;
         const op = try parseNodeOp(allocator, op_kind, attr_bytes);
-        errdefer deinitNodeOp(allocator, op);
+        errdefer types.deinitNodeOp(allocator, op);
         slot.* = .{ .inputs = inputs, .output = output, .op = op };
     }
     if (cursor != bytes.len) return PackageError.InvalidFormat;
     return out;
 }
 
-fn parseNodeOp(allocator: std.mem.Allocator, kind: u8, bytes: []const u8) PackageError!NodeOp {
+fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8) PackageError!NodeOp {
     var cursor: usize = 0;
     const op: NodeOp = switch (kind) {
-        0 => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
-        1 => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
-        2 => .{ .BroadcastLastDimBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
-        3 => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
-        4 => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
-        5 => .{ .Conv1D = .{
+        .MatMul => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
+        .ElemwiseBinary => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
+        .BroadcastLastDimBinary => .{ .BroadcastLastDimBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
+        .Unary => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
+        .Softmax => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .Conv1D => .{ .Conv1D = .{
             .stride = try readIntCursor(bytes, &cursor, u64),
             .dilation = try readIntCursor(bytes, &cursor, u64),
             .pad_left = try readIntCursor(bytes, &cursor, u64),
@@ -391,7 +393,7 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: u8, bytes: []const u8) Packag
             .pad_mode = try readEnumCursor(bytes, &cursor, PadMode),
             .groups = try readIntCursor(bytes, &cursor, u64),
         } },
-        6 => .{ .Conv2D = .{
+        .Conv2D => .{ .Conv2D = .{
             .stride_h = try readIntCursor(bytes, &cursor, u64),
             .stride_w = try readIntCursor(bytes, &cursor, u64),
             .dilation_h = try readIntCursor(bytes, &cursor, u64),
@@ -403,31 +405,30 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: u8, bytes: []const u8) Packag
             .pad_mode = try readEnumCursor(bytes, &cursor, PadMode),
             .groups = try readIntCursor(bytes, &cursor, u64),
         } },
-        7 => .{ .LayerNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        8 => .{ .RMSNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        9 => .{ .Attention = .{ .scale = try readIntCursor(bytes, &cursor, f32), .causal = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
-        10 => .{ .MultiHeadAttention = .{
+        .LayerNorm => .{ .LayerNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
+        .RMSNorm => .{ .RMSNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
+        .Attention => .{ .Attention = .{ .scale = try readIntCursor(bytes, &cursor, f32), .causal = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
+        .MultiHeadAttention => .{ .MultiHeadAttention = .{
             .scale = try readIntCursor(bytes, &cursor, f32),
             .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
             .heads = try readIntCursor(bytes, &cursor, u64),
         } },
-        11 => .{ .Reduce = .{
+        .Reduce => .{ .Reduce = .{
             .op = try readEnumCursor(bytes, &cursor, ReduceOp),
             .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null,
         } },
-        12 => .{ .Concat = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
-        13 => .{ .LSTMCell = .{ .has_bias = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
-        14 => .{ .ComplexAbsMean = .{ .out_channels = try readIntCursor(bytes, &cursor, u64) } },
-        15 => .Copy,
-        16 => .{ .ViewReshape = .{ .new_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        17 => .{ .ViewSqueeze = .{ .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null } },
-        18 => .{ .ViewUnsqueeze = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
-        19 => .ViewTranspose2D,
-        20 => .{ .ViewSliceND = .{
+        .Concat => .{ .Concat = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .LSTMCell => .{ .LSTMCell = .{ .has_bias = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
+        .ComplexAbsMean => .{ .ComplexAbsMean = .{ .out_channels = try readIntCursor(bytes, &cursor, u64) } },
+        .Copy => .Copy,
+        .ViewReshape => .{ .ViewReshape = .{ .new_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
+        .ViewSqueeze => .{ .ViewSqueeze = .{ .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null } },
+        .ViewUnsqueeze => .{ .ViewUnsqueeze = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .ViewTranspose2D => .ViewTranspose2D,
+        .ViewSliceND => .{ .ViewSliceND = .{
             .starts = try readU64Array(allocator, bytes, &cursor),
             .lens = try readShapeTermArray(allocator, bytes, &cursor),
         } },
-        else => return PackageError.InvalidFormat,
     };
     if (cursor != bytes.len) return PackageError.InvalidFormat;
     return op;
@@ -531,19 +532,6 @@ fn parseGraphMetaSection(bytes: []const u8) PackageError!GraphMeta {
     return meta;
 }
 
-fn deinitNodeOp(allocator: std.mem.Allocator, op: NodeOp) void {
-    switch (op) {
-        .LayerNorm => |ln| allocator.free(ln.normalized_shape),
-        .RMSNorm => |ln| allocator.free(ln.normalized_shape),
-        .ViewReshape => |vr| allocator.free(vr.new_shape),
-        .ViewSliceND => |sl| {
-            allocator.free(sl.starts);
-            allocator.free(sl.lens);
-        },
-        else => {},
-    }
-}
-
 fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) void {
     for (initializers) |*init| {
         switch (init.encoding) {
@@ -566,7 +554,7 @@ fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
 fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
     for (nodes) |node| {
         allocator.free(node.inputs);
-        deinitNodeOp(allocator, node.op);
+        types.deinitNodeOp(allocator, node.op);
     }
     allocator.free(nodes);
 }

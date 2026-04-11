@@ -53,6 +53,36 @@ def _flatten_nested(data) -> tuple[tuple[int, ...], list[float]]:
     return _flatten_nested(seq)
 
 
+def _flatten_nested_i32(data) -> tuple[tuple[int, ...], list[int]]:
+    """Infer shape and flatten nested Python sequences to i32 values."""
+
+    if isinstance(data, bool):
+        return (), [int(data)]
+    if isinstance(data, int):
+        return (), [int(data)]
+
+    if isinstance(data, (list, tuple)):
+        if len(data) == 0:
+            return (0,), []
+
+        child_shape, child_vals = _flatten_nested_i32(data[0])
+        out_vals: list[int] = list(child_vals)
+        for item in data[1:]:
+            shp, vals = _flatten_nested_i32(item)
+            if shp != child_shape:
+                raise ValueError(f"ragged nested sequence is not supported: {shp} != {child_shape}")
+            out_vals.extend(vals)
+
+        return (len(data),) + child_shape, out_vals
+
+    # Treat other iterables (e.g. range) as 1D.
+    try:
+        seq = list(data)
+    except TypeError as e:
+        raise TypeError("Tensor data must be a scalar or nested sequence") from e
+    return _flatten_nested_i32(seq)
+
+
 class Tensor:
     """Owns an `AionTensor*` handle; underlying storage is owned by the Context."""
 
@@ -76,8 +106,8 @@ class Tensor:
             ctx = get_default_context()
         if dtype is None:
             dtype = AionDType.AION_DTYPE_F32
-        if dtype != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("only f32 tensor construction is supported by the current C ABI")
+        if dtype in (AionDType.AION_DTYPE_Q4_0, AionDType.AION_DTYPE_Q8_0):
+            raise NotImplementedError("quantized tensor construction is not supported by the current C ABI")
 
         # NumPy fast-path when available.
         try:
@@ -85,12 +115,22 @@ class Tensor:
         except ImportError:
             np = None  # type: ignore
 
-        if np is not None and isinstance(data, np.ndarray):
-            arr = np.asarray(data, dtype=np.float32)
-            shape = tuple(int(x) for x in arr.shape)
-            vals = [float(v) for v in arr.reshape(-1)]
+        if dtype == AionDType.AION_DTYPE_F32:
+            if np is not None and isinstance(data, np.ndarray):
+                arr = np.asarray(data, dtype=np.float32)
+                shape = tuple(int(x) for x in arr.shape)
+                vals = [float(v) for v in arr.reshape(-1)]
+            else:
+                shape, vals = _flatten_nested(data)
+        elif dtype == AionDType.AION_DTYPE_I32:
+            if np is not None and isinstance(data, np.ndarray):
+                arr = np.asarray(data, dtype=np.int32)
+                shape = tuple(int(x) for x in arr.shape)
+                vals = [int(v) for v in arr.reshape(-1)]
+            else:
+                shape, vals = _flatten_nested_i32(data)
         else:
-            shape, vals = _flatten_nested(data)
+            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
 
         shp = _as_shape(shape)
         n = _elem_count(shp)
@@ -101,17 +141,29 @@ class Tensor:
         if len(shp) == 0:
             if len(vals) != 1:
                 raise ValueError(f"expected 1 value for scalar tensor, got {len(vals)}")
-            t = self.scalar_f32(ctx, float(vals[0]))
+            if dtype == AionDType.AION_DTYPE_F32:
+                t = self.scalar_f32(ctx, float(vals[0]))
+            elif dtype == AionDType.AION_DTYPE_I32:
+                t = self.scalar_i32(ctx, int(vals[0]))
+            else:
+                raise NotImplementedError(f"scalar tensor construction not implemented for dtype={dtype}")
             self._adopt(t)
             return
 
         rank = len(shp)
         c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
-        c_vals = ffi.new("float[]", vals)
+
+        if dtype == AionDType.AION_DTYPE_F32:
+            c_vals = ffi.new("float[]", [float(v) for v in vals])
+        elif dtype == AionDType.AION_DTYPE_I32:
+            c_vals = ffi.new("int32_t[]", [int(v) for v in vals])
+        else:
+            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
+
         out_t = ffi.new("AionTensor**")
         st = lib.aion_tensor_create(
             ctx.ptr,
-            int(AionDType.AION_DTYPE_F32),
+            int(dtype),
             rank,
             c_shape,
             c_vals,
@@ -119,7 +171,7 @@ class Tensor:
             out_t,
         )
         raise_for_status(st, ctx.ptr, what="aion_tensor_create")
-        self._init_from_handle(ctx, out_t[0], dtype=AionDType.AION_DTYPE_F32, shape=tuple(shp))
+        self._init_from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
 
     def _init_from_handle(self, ctx, ptr, *, dtype: AionDType | None = None, shape: tuple[int, ...] | None = None) -> None:
         self._ctx_owner = ctx
@@ -255,6 +307,12 @@ class Tensor:
         t.write_f32([float(value)])
         return t
 
+    @classmethod
+    def scalar_i32(cls, ctx, value: int) -> "Tensor":
+        t = cls.empty(ctx, (1,), dtype=AionDType.AION_DTYPE_I32)
+        t.write_i32([int(value)])
+        return t
+
     def numel(self) -> int:
         return _elem_count(self.shape())
 
@@ -280,7 +338,7 @@ class Tensor:
 
     def read_f32(self) -> list[float]:
         if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("only f32 tensor I/O is supported by the current C ABI")
+            raise NotImplementedError("dtype mismatch: expected f32")
 
         shp = self.shape()
         n = _elem_count(shp)
@@ -288,6 +346,17 @@ class Tensor:
         st = lib.aion_tensor_read(self._t, int(AionDType.AION_DTYPE_F32), buf, n)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read")
         return [float(buf[i]) for i in range(n)]
+
+    def read_i32(self) -> list[int]:
+        if self.dtype() != AionDType.AION_DTYPE_I32:
+            raise NotImplementedError("dtype mismatch: expected i32")
+
+        shp = self.shape()
+        n = _elem_count(shp)
+        buf = ffi.new("int32_t[]", n)
+        st = lib.aion_tensor_read(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read")
+        return [int(buf[i]) for i in range(n)]
 
     @overload
     def write_f32(self, values: Iterable[float]) -> None: ...
@@ -297,7 +366,7 @@ class Tensor:
 
     def write_f32(self, values) -> None:
         if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("only f32 tensor I/O is supported by the current C ABI")
+            raise NotImplementedError("dtype mismatch: expected f32")
 
         # Fast-path: NumPy array-like.
         try:
@@ -321,14 +390,37 @@ class Tensor:
         st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_F32), buf, n)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
 
+    def write_i32(self, values: Iterable[int]) -> None:
+        if self.dtype() != AionDType.AION_DTYPE_I32:
+            raise NotImplementedError("dtype mismatch: expected i32")
+
+        shp = self.shape()
+        n = _elem_count(shp)
+        vals = list(values)
+        if len(vals) != n:
+            raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
+
+        buf = ffi.new("int32_t[]", [int(v) for v in vals])
+        st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+
     def read_scalar_f32(self) -> float:
         if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("only f32 tensor I/O is supported by the current C ABI")
+            raise NotImplementedError("dtype mismatch: expected f32")
 
         out = ffi.new("float*")
         st = lib.aion_tensor_read_scalar(self._t, int(AionDType.AION_DTYPE_F32), out)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
         return float(out[0])
+
+    def read_scalar_i32(self) -> int:
+        if self.dtype() != AionDType.AION_DTYPE_I32:
+            raise NotImplementedError("dtype mismatch: expected i32")
+
+        out = ffi.new("int32_t*")
+        st = lib.aion_tensor_read_scalar(self._t, int(AionDType.AION_DTYPE_I32), out)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
+        return int(out[0])
 
     def item_f32(self) -> float:
         """Convenience: return the only element as a Python float (f32 only)."""

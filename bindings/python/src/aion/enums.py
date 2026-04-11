@@ -17,3 +17,4 @@ class AionDType(IntEnum):
     AION_DTYPE_I8 = 2
     AION_DTYPE_Q4_0 = 3
     AION_DTYPE_Q8_0 = 4
+    AION_DTYPE_I32 = 5

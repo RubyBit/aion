@@ -26,6 +26,7 @@ pub fn tileByteSize(meta: tensor_store.TensorMeta) usize {
         .f32 => elems * 4,
         .f16 => elems * 2,
         .i8 => elems,
+        .i32 => elems * 4,
         .q4_0, .q8_0 => blk: {
             const info = meta.dtype.info();
             const blocks = std.math.divCeil(usize, elems, info.block_elems) catch return 0;
@@ -60,6 +61,8 @@ fn scalarElemBytes(dtype: DType) ExecuteProgramError!usize {
     return switch (dtype) {
         .f32 => 4,
         .f16 => 2,
+        .i8 => 1,
+        .i32 => 4,
         else => return BackendError.InvalidArgument,
     };
 }

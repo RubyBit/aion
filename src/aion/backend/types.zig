@@ -29,6 +29,10 @@ pub const DType = enum(u8) {
     i8,
     q4_0,
     q8_0,
+    /// Signed 32-bit integer (e.g. token/position indices).
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI enum codes.
+    i32,
 
     pub fn info(self: DType) DTypeInfo {
         return switch (self) {
@@ -38,6 +42,7 @@ pub const DType = enum(u8) {
             // ggml-compatible block layouts
             .q4_0 => .{ .block_elems = 32, .block_bytes = 18, .is_quantized = true }, // 2B scale + 16B nibbles
             .q8_0 => .{ .block_elems = 32, .block_bytes = 34, .is_quantized = true }, // 2B scale + 32B int8
+            .i32 => .{ .block_elems = 1, .block_bytes = 4, .is_quantized = false },
         };
     }
 

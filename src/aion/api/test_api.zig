@@ -158,6 +158,43 @@ test "api: context constructors + tensor typed IO" {
     try std.testing.expectError(manager_mod.StorageError.InvalidArgument, tf16.write(bad[0..]));
 }
 
+test "api: i32 tensor typed IO + compile+run copy" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // Create an i32 tensor from a Zig array (dtype inference).
+    const in_t: api.Tensor = try ctx.vector([_]i32{ 10, -3, 7, 42 });
+    try std.testing.expectEqual(types.DType.i32, in_t.getDType());
+    try std.testing.expectEqualSlices(usize, &[_]usize{4}, in_t.getShape());
+
+    // Roundtrip read/write for i32.
+    var tmp: [4]i32 = undefined;
+    try in_t.read(&tmp);
+    try std.testing.expectEqual(@as(i32, 10), tmp[0]);
+    try std.testing.expectEqual(@as(i32, -3), tmp[1]);
+    try std.testing.expectEqual(@as(i32, 7), tmp[2]);
+    try std.testing.expectEqual(@as(i32, 42), tmp[3]);
+
+    // Compile a tiny model: out = copy(in)
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+    const X = try bld.param(in_t);
+    const Y = try bld.copy(X);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqual(types.DType.i32, out_t.getDType());
+    try std.testing.expectEqualSlices(usize, &[_]usize{4}, out_t.getShape());
+
+    var out_vals: [4]i32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectEqualSlices(i32, &tmp, &out_vals);
+}
+
 test "api: reduceAxis mean over last dim" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

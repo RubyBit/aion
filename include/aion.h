@@ -51,6 +51,7 @@ typedef enum AionDType {
     AION_DTYPE_I8 = 2,
     AION_DTYPE_Q4_0 = 3,
     AION_DTYPE_Q8_0 = 4,
+  AION_DTYPE_I32 = 5,
 } AionDType;
 
 // -----------------------------------------------------------------------------
@@ -81,7 +82,7 @@ AION_API AionStatus aion_context_create_cpu(size_t thread_count, AionContext** o
 AION_API void aion_context_destroy(AionContext* ctx);
 
 // -----------------------------------------------------------------------------
-// Tensors (v1: f32 I/O)
+// Tensors (scalar I/O)
 // -----------------------------------------------------------------------------
 
 AION_API AionStatus aion_tensor_create_empty(
@@ -97,8 +98,8 @@ AION_API AionStatus aion_tensor_create_empty(
 // If `values != NULL`, `values_len` is the element count.
 //
 // v1 notes:
-// - Initialization from `values` is currently supported only for `AION_DTYPE_F32`.
-// - For other dtypes, pass `values == NULL` and `values_len == 0`.
+// - Initialization from `values` is supported for scalar (non-quantized) dtypes.
+// - For quantized dtypes, pass `values == NULL` and `values_len == 0`.
 AION_API AionStatus aion_tensor_create(
     AionContext* ctx,
     AionDType dtype,
@@ -120,7 +121,7 @@ AION_API AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, siz
 // - `out_len` is element count (not bytes).
 //
 // v1 notes:
-// - Only `AION_DTYPE_F32` is currently supported.
+// - Only scalar (non-quantized) dtypes are supported.
 AION_API AionStatus aion_tensor_read(const AionTensor* t, AionDType dtype, void* out_values, size_t out_len);
 
 // Write tensor contents from a caller-provided buffer.
@@ -129,7 +130,7 @@ AION_API AionStatus aion_tensor_read(const AionTensor* t, AionDType dtype, void*
 // - `values_len` is element count (not bytes).
 //
 // v1 notes:
-// - Only `AION_DTYPE_F32` is currently supported.
+// - Only scalar (non-quantized) dtypes are supported.
 AION_API AionStatus aion_tensor_write(AionTensor* t, AionDType dtype, const void* values, size_t values_len);
 
 // Read a scalar tensor into a single value.
@@ -138,7 +139,7 @@ AION_API AionStatus aion_tensor_write(AionTensor* t, AionDType dtype, const void
 // - Tensor must contain exactly 1 element.
 //
 // v1 notes:
-// - Only `AION_DTYPE_F32` is currently supported.
+// - Only scalar (non-quantized) dtypes are supported.
 AION_API AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype, void* out_value);
 
 // -----------------------------------------------------------------------------

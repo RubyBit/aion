@@ -46,6 +46,8 @@ pub const Tensor = struct {
         return switch (T) {
             f16 => .f16,
             f32 => .f32,
+            i8 => .i8,
+            i32 => .i32,
             else => null,
         };
     }

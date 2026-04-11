@@ -332,6 +332,7 @@ pub fn execCopyTiled(
                 .f32 => elems * 4,
                 .f16 => elems * 2,
                 .i8 => elems,
+                .i32 => elems * 4,
                 .q4_0, .q8_0 => blk: {
                     const info = dtype.info();
                     const blocks = std.math.divCeil(usize, elems, info.block_elems) catch return 0;

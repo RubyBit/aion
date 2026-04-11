@@ -9,6 +9,7 @@
 
 typedef unsigned long long size_t;
 typedef unsigned int uint32_t;
+typedef int int32_t;
 
 typedef struct AionContext AionContext;
 typedef struct AionTensor AionTensor;
@@ -28,6 +29,7 @@ typedef enum AionDType {
     AION_DTYPE_I8 = 2,
     AION_DTYPE_Q4_0 = 3,
     AION_DTYPE_Q8_0 = 4,
+    AION_DTYPE_I32 = 5,
 } AionDType;
 
 uint32_t aion_version_major(void);

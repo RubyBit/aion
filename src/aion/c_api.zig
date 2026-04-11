@@ -18,6 +18,7 @@ pub const AionDType = enum(c_int) {
     AION_DTYPE_I8 = 2,
     AION_DTYPE_Q4_0 = 3,
     AION_DTYPE_Q8_0 = 4,
+    AION_DTYPE_I32 = 5,
 };
 
 pub const AionContext = struct {
@@ -90,6 +91,7 @@ fn dtypeToC(dt: types.DType) AionDType {
         .i8 => .AION_DTYPE_I8,
         .q4_0 => .AION_DTYPE_Q4_0,
         .q8_0 => .AION_DTYPE_Q8_0,
+        .i32 => .AION_DTYPE_I32,
     };
 }
 
@@ -100,7 +102,14 @@ fn dtypeFromC(dt: AionDType) ?types.DType {
         .AION_DTYPE_I8 => .i8,
         .AION_DTYPE_Q4_0 => .q4_0,
         .AION_DTYPE_Q8_0 => .q8_0,
+        .AION_DTYPE_I32 => .i32,
     };
+}
+
+fn requireAligned(ptr: *const anyopaque, alignment: usize) bool {
+    if (alignment <= 1) return true;
+    const raw_addr: usize = @intFromPtr(ptr);
+    return (raw_addr & (alignment - 1)) == 0;
 }
 
 fn copyStringToBuf(s: []const u8, buf: [*c]u8, cap: usize, out_len: ?*usize) void {
@@ -243,16 +252,16 @@ pub export fn aion_tensor_create(
             };
         }
 
-        // v1: initialization from host values is supported only for f32.
-        if (dt != .f32) return .AION_UNSUPPORTED;
+        if (dt.info().is_quantized) return .AION_UNSUPPORTED;
 
-        const raw_addr: usize = @intFromPtr(values_ptr.?);
-        if ((raw_addr & (@alignOf(f32) - 1)) != 0) return .AION_INVALID_ARGUMENT;
+        const elem_bytes: usize = dt.info().block_bytes;
+        if (!requireAligned(values_ptr.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
 
-        const f32_ptr: [*]const f32 = @ptrCast(@alignCast(values_ptr.?));
-        const values: []const f32 = f32_ptr[0..values_len];
+        const total_bytes: usize = std.math.mul(usize, values_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
+        const bytes_ptr: [*]const u8 = @ptrCast(values_ptr.?);
+        const @"packed": []const u8 = bytes_ptr[0..total_bytes];
 
-        break :blk ctx.ctx.fromF32(shape, values) catch |e| {
+        break :blk ctx.ctx.fromPackedScalar(dt, shape, @"packed") catch |e| {
             ctx.setLastError("tensor_create", e);
             return mapError(e);
         };
@@ -312,20 +321,19 @@ pub export fn aion_tensor_read(
     };
     if (out_len != want) return .AION_INVALID_ARGUMENT;
 
-    switch (dt) {
-        .f32 => {
-            const raw_addr: usize = @intFromPtr(out_values.?);
-            if ((raw_addr & (@alignOf(f32) - 1)) != 0) return .AION_INVALID_ARGUMENT;
-            const f32_ptr: [*]f32 = @ptrCast(@alignCast(out_values.?));
-            const dst: []f32 = f32_ptr[0..out_len];
-            t.tensor.readF32(dst) catch |e| {
-                ctx.setLastError("tensor_read", e);
-                return mapError(e);
-            };
-            return .AION_OK;
-        },
-        else => return .AION_UNSUPPORTED,
-    }
+    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
+    const elem_bytes: usize = dt.info().block_bytes;
+    if (!requireAligned(out_values.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
+
+    const total_bytes: usize = std.math.mul(usize, out_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
+    const bytes_ptr: [*]u8 = @ptrCast(out_values.?);
+    const out_bytes: []u8 = bytes_ptr[0..total_bytes];
+
+    t.tensor.readPackedScalar(out_bytes) catch |e| {
+        ctx.setLastError("tensor_read", e);
+        return mapError(e);
+    };
+    return .AION_OK;
 }
 
 pub export fn aion_tensor_write(
@@ -348,20 +356,19 @@ pub export fn aion_tensor_write(
     };
     if (values_len != want) return .AION_INVALID_ARGUMENT;
 
-    switch (dt) {
-        .f32 => {
-            const raw_addr: usize = @intFromPtr(values_ptr.?);
-            if ((raw_addr & (@alignOf(f32) - 1)) != 0) return .AION_INVALID_ARGUMENT;
-            const f32_ptr: [*]const f32 = @ptrCast(@alignCast(values_ptr.?));
-            const src: []const f32 = f32_ptr[0..values_len];
-            t.tensor.writeF32(src) catch |e| {
-                ctx.setLastError("tensor_write", e);
-                return mapError(e);
-            };
-            return .AION_OK;
-        },
-        else => return .AION_UNSUPPORTED,
-    }
+    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
+    const elem_bytes: usize = dt.info().block_bytes;
+    if (!requireAligned(values_ptr.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
+
+    const total_bytes: usize = std.math.mul(usize, values_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
+    const bytes_ptr: [*]const u8 = @ptrCast(values_ptr.?);
+    const @"packed": []const u8 = bytes_ptr[0..total_bytes];
+
+    t.tensor.writePackedScalar(@"packed") catch |e| {
+        ctx.setLastError("tensor_write", e);
+        return mapError(e);
+    };
+    return .AION_OK;
 }
 
 pub export fn aion_tensor_read_scalar(
@@ -383,21 +390,21 @@ pub export fn aion_tensor_read_scalar(
     };
     if (want != 1) return .AION_INVALID_ARGUMENT;
 
-    switch (dt) {
-        .f32 => {
-            const raw_addr: usize = @intFromPtr(out_value.?);
-            if ((raw_addr & (@alignOf(f32) - 1)) != 0) return .AION_INVALID_ARGUMENT;
+    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
+    const elem_bytes: usize = dt.info().block_bytes;
+    if (!requireAligned(out_value.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
 
-            const v: f32 = t.tensor.readScalar(f32) catch |e| {
-                ctx.setLastError("tensor_read_scalar", e);
-                return mapError(e);
-            };
-            const out_f32: *f32 = @ptrCast(@alignCast(out_value.?));
-            out_f32.* = v;
-            return .AION_OK;
-        },
-        else => return .AION_UNSUPPORTED,
-    }
+    var tmp: [8]u8 = undefined;
+    if (elem_bytes > tmp.len) return .AION_UNSUPPORTED;
+    const tmp_slice: []u8 = tmp[0..elem_bytes];
+
+    t.tensor.readPackedScalar(tmp_slice) catch |e| {
+        ctx.setLastError("tensor_read_scalar", e);
+        return mapError(e);
+    };
+    const out_bytes_ptr: [*]u8 = @ptrCast(out_value.?);
+    @memcpy(out_bytes_ptr[0..elem_bytes], tmp_slice);
+    return .AION_OK;
 }
 
 pub export fn aion_loaded_model_load_path(

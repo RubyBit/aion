@@ -47,6 +47,14 @@ pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: Tensor
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
+/// Gather rows from a 2D table using i32 indices.
+///
+/// Shapes:
+/// - table:   [V, D] (f16/f32)
+/// - indices: [B, L] (i32)
+/// - out:     [B, L, D]
+pub const StepGatherRowsTiled = struct { out: TensorId, table: TensorId, indices: TensorId };
+
 pub const StepLSTMCellFused = struct {
     out_state: TensorId,
     x: TensorId,
@@ -89,6 +97,8 @@ pub const Step = union(enum) {
     ReduceAxis: StepReduceAxis,
     ConcatScalar: StepConcatScalar,
     CopyTiled: StepCopyTiled,
+
+    GatherRowsTiled: StepGatherRowsTiled,
 
     LSTMCellFused: StepLSTMCellFused,
 

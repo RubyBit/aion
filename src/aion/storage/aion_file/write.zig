@@ -269,6 +269,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, u64, cm.out_channels);
         },
         .Copy => {},
+        .GatherRows => {},
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);
         },

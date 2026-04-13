@@ -43,6 +43,7 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .LSTMCell => |lc| .{ .LSTMCell = .{ .has_bias = lc.has_bias } },
         .ComplexAbsMean => |cm| .{ .ComplexAbsMean = .{ .out_channels = cm.out_channels } },
         .Copy => .Copy,
+        .GatherRows => .GatherRows,
         .ViewReshape => |vr| .{ .ViewReshape = .{ .new_shape = try package_file.makeConstantShapeTerms(allocator, vr.new_shape) } },
         .ViewSqueeze => |vs| .{ .ViewSqueeze = .{ .axis = vs.axis } },
         .ViewUnsqueeze => |vu| .{ .ViewUnsqueeze = .{ .axis = vu.axis } },

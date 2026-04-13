@@ -358,6 +358,18 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Gather rows from a 2D table using i32 indices.
+    ///
+    /// Shapes:
+    /// - table:   [V, D]
+    /// - indices: [B, L]
+    /// - out:     [B, L, D]
+    pub fn gatherRows(self: *Self, table: TensorRef, indices: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addGatherRows(table.value, indices.value);
+        try self.autoNameIfUnnamed(out, "gather_rows");
+        return .{ .value = out };
+    }
+
     pub fn reduce(self: *Self, op: types.ReduceOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addReduce(op, a.value);
         try self.autoNameIfUnnamed(out, "reduce");

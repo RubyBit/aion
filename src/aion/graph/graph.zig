@@ -53,6 +53,10 @@ pub const OpTag = enum(u8) {
     ViewUnsqueeze = 18,
     ViewTranspose2D = 19,
     ViewSliceND = 20,
+    /// Embedding-style row gather: out[b,l,:] = table[indices[b,l], :]
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    GatherRows = 21,
 };
 
 pub const Op = union(OpTag) {
@@ -174,6 +178,14 @@ pub const Op = union(OpTag) {
     ViewUnsqueeze: struct { axis: i32 },
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const usize, lens: []const usize },
+
+    /// Gather rows from a 2D table using i32 indices.
+    ///
+    /// Shapes:
+    /// - table:   [V, D] (f16/f32)
+    /// - indices: [B, L] (i32)
+    /// - out:     [B, L, D]
+    GatherRows: void,
 };
 
 pub const InputArity = union(enum) {
@@ -216,6 +228,7 @@ pub fn opInputArity(op: Op) InputArity {
         .ViewUnsqueeze => .{ .exact = 1 },
         .ViewTranspose2D => .{ .exact = 1 },
         .ViewSliceND => .{ .exact = 1 },
+        .GatherRows => .{ .exact = 2 },
     };
 }
 
@@ -459,6 +472,10 @@ pub const Graph = struct {
 
     pub fn addCopy(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.Copy, &[_]ValueId{a});
+    }
+
+    pub fn addGatherRows(self: *Self, table: ValueId, indices: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.GatherRows, &[_]ValueId{ table, indices });
     }
 
     pub fn addLSTMCell(

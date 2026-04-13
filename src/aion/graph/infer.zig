@@ -682,5 +682,26 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             try setInferred(graph, node.output, a.dtype.?, sl.lens);
         },
+
+        .GatherRows => {
+            const table = try getValue(graph, node.inputs[0]);
+            const indices = try getValue(graph, node.inputs[1]);
+
+            try require(table.dtype != null and indices.dtype != null);
+            try require(table.shape.len == 2);
+            try require(indices.shape.len == 2);
+
+            // Table: f16/f32 only (quant embeddings can be added later).
+            if (table.dtype.? != .f16 and table.dtype.? != .f32) return InferError.Unsupported;
+
+            // Indices must be i32.
+            if (indices.dtype.? != .i32) return InferError.DTypeMismatch;
+
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, 3) catch return InferError.InvalidGraph;
+            out_shape[0] = indices.shape[0];
+            out_shape[1] = indices.shape[1];
+            out_shape[2] = table.shape[1];
+            try setInferred(graph, node.output, table.dtype.?, out_shape);
+        },
     }
 }

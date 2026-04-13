@@ -1987,6 +1987,199 @@ test "graph: concat axis-1 materialization" {
     }
 }
 
+test "graph: gather rows matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const v: usize = 8;
+    const d: usize = 4;
+    const b: usize = 2;
+    const l: usize = 3;
+
+    const table_buf: []u8 = try allocator.alloc(u8, v * d * 4);
+    defer allocator.free(table_buf);
+    const table_vals: []align(1) f32 = asF32Slice(table_buf);
+    for (0..v) |r| {
+        for (0..d) |c| {
+            table_vals[r * d + c] = @floatFromInt(r * 10 + c);
+        }
+    }
+
+    const idx_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(idx_buf);
+    const idx_ptr: [*]align(1) i32 = @ptrCast(idx_buf.ptr);
+    const idx_vals: []align(1) i32 = idx_ptr[0 .. idx_buf.len / @sizeOf(i32)];
+    idx_vals[0] = 0;
+    idx_vals[1] = 3;
+    idx_vals[2] = 7;
+    idx_vals[3] = 1;
+    idx_vals[4] = 2;
+    idx_vals[5] = 5;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Indices are deliberately mis-tiled to exercise i32 scalar retiling.
+    const table_tid = try sm.createTiledTensor(.f32, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
+    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(table_tid, table_buf);
+    try sm.writeFromPackedScalar(idx_tid, idx_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const table_in = try g.addInput(.f32, &[_]usize{ v, d });
+    const idx_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(table_in, @intCast(table_tid));
+    try g.bindExternal(idx_in, @intCast(idx_tid));
+
+    const out = try g.addGatherRows(table_in, idx_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, b * l * d * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const row: usize = @intCast(idx_vals[bi * l + li]);
+            for (0..d) |di| {
+                const want: f32 = table_vals[row * d + di];
+                const got: f32 = out_vals[(bi * l + li) * d + di];
+                try std.testing.expectApproxEqAbs(want, got, 0.0);
+            }
+        }
+    }
+}
+
+test "graph: gather rows matches reference (f16)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const v: usize = 5;
+    const d: usize = 3;
+    const b: usize = 1;
+    const l: usize = 4;
+
+    const table_buf: []u8 = try allocator.alloc(u8, v * d * @sizeOf(f16));
+    defer allocator.free(table_buf);
+    const table_vals: []align(1) f16 = asF16Slice(table_buf);
+    for (0..v) |r| {
+        for (0..d) |c| {
+            // Small integers are exactly representable in f16.
+            table_vals[r * d + c] = @floatFromInt(r * 10 + c);
+        }
+    }
+
+    const idx_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(idx_buf);
+    const idx_ptr: [*]align(1) i32 = @ptrCast(idx_buf.ptr);
+    const idx_vals: []align(1) i32 = idx_ptr[0 .. idx_buf.len / @sizeOf(i32)];
+    idx_vals[0] = 4;
+    idx_vals[1] = 0;
+    idx_vals[2] = 2;
+    idx_vals[3] = 1;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const table_tid = try sm.createTiledTensor(.f16, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
+    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ b, l }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(table_tid, table_buf);
+    try sm.writeFromPackedScalar(idx_tid, idx_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const table_in = try g.addInput(.f16, &[_]usize{ v, d });
+    const idx_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(table_in, @intCast(table_tid));
+    try g.bindExternal(idx_in, @intCast(idx_tid));
+
+    const out = try g.addGatherRows(table_in, idx_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, b * l * d * @sizeOf(f16));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f16 = asF16Slice(out_buf);
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const row: usize = @intCast(idx_vals[bi * l + li]);
+            for (0..d) |di| {
+                const want: f16 = table_vals[row * d + di];
+                const got: f16 = out_vals[(bi * l + li) * d + di];
+                try std.testing.expectEqual(want, got);
+            }
+        }
+    }
+}
+
+test "graph: gather rows out-of-bounds returns InvalidArgument" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const v: usize = 4;
+    const d: usize = 2;
+    const b: usize = 1;
+    const l: usize = 3;
+
+    const table_buf: []u8 = try allocator.alloc(u8, v * d * 4);
+    defer allocator.free(table_buf);
+    const table_vals: []align(1) f32 = asF32Slice(table_buf);
+    for (0..v * d) |i| table_vals[i] = @floatFromInt(i);
+
+    const idx_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(idx_buf);
+    const idx_ptr: [*]align(1) i32 = @ptrCast(idx_buf.ptr);
+    const idx_vals: []align(1) i32 = idx_ptr[0 .. idx_buf.len / @sizeOf(i32)];
+    idx_vals[0] = 0;
+    idx_vals[1] = -1; // invalid
+    idx_vals[2] = 2;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const table_tid = try sm.createTiledTensor(.f32, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
+    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ b, l }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(table_tid, table_buf);
+    try sm.writeFromPackedScalar(idx_tid, idx_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const table_in = try g.addInput(.f32, &[_]usize{ v, d });
+    const idx_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(table_in, @intCast(table_tid));
+    try g.bindExternal(idx_in, @intCast(idx_tid));
+
+    const out = try g.addGatherRows(table_in, idx_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try std.testing.expectError(types.BackendError.InvalidArgument, cpu.backend().executeProgram(&prog, sm.tensorStore()));
+}
+
 test "graph: conv1d depthwise (NLC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

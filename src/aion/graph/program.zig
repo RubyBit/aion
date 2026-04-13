@@ -85,7 +85,7 @@ fn convOutDim(in_len: usize, kernel: usize, stride: usize, dilation: usize, pad_
 
 fn isScalarSupported(dtype: types.DType) bool {
     return switch (dtype) {
-        .f32, .f16 => true,
+        .f32, .f16, .i8, .i32 => true,
         else => false,
     };
 }
@@ -581,6 +581,40 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try requireSameShape(dst.shape, src.shape);
             try requireSameTileShape(dst, src);
             try requireSameTileCounts(dst, src);
+        },
+
+        .GatherRowsTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const table: *const TiledTensor = mgr.getConst(s.table) catch return CompileError.InvalidArgument;
+            const indices: *const TiledTensor = mgr.getConst(s.indices) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.rank == 3);
+            try compileRequire(table.rank == 2);
+            try compileRequire(indices.rank == 2);
+
+            try compileRequire(!out.dtype.info().is_quantized);
+            try compileRequire(!table.dtype.info().is_quantized);
+            try compileRequire(!indices.dtype.info().is_quantized);
+
+            // Table/output dtype: f16/f32 only.
+            try compileRequire(table.dtype == .f16 or table.dtype == .f32);
+            try compileRequire(out.dtype == table.dtype);
+
+            // Indices: i32.
+            try compileRequire(indices.dtype == .i32);
+
+            // Shape contract.
+            try compileRequire(out.shape[0] == indices.shape[0]);
+            try compileRequire(out.shape[1] == indices.shape[1]);
+            try compileRequire(out.shape[2] == table.shape[1]);
+
+            // Tiling contract:
+            // - indices: single tile (rank-2).
+            // - table: feature dim D is within one tile.
+            // - out: feature dim D is within one tile.
+            try compileRequire(indices.tile_counts[0] == 1 and indices.tile_counts[1] == 1);
+            try compileRequire(table.tile_counts[1] == 1);
+            try compileRequire(out.tile_counts[2] == 1);
         },
 
         .LSTMCellFused => |s| {
@@ -1459,6 +1493,48 @@ pub fn compileGraph(
                     .b_ih = b_ih_tid,
                     .b_hh = b_hh_tid,
                 } });
+            },
+
+            .GatherRows => {
+                const table_id: usize = @intCast(node.inputs[0]);
+                const indices_id: usize = @intCast(node.inputs[1]);
+
+                const table_v = graph.values.items[table_id];
+                const indices_v = graph.values.items[indices_id];
+
+                if (table_v.shape.len != 2 or indices_v.shape.len != 2) return CompileError.InvalidArgument;
+                if (indices_v.dtype.? != .i32) return CompileError.InvalidArgument;
+                if (!(table_v.dtype.? == .f16 or table_v.dtype.? == .f32)) return CompileError.InvalidArgument;
+                if (out_shape.len != 3) return CompileError.InvalidArgument;
+
+                const b: usize = indices_v.shape[0];
+                const l: usize = indices_v.shape[1];
+                const v_rows: usize = table_v.shape[0];
+                const d_embed: usize = table_v.shape[1];
+
+                // Output tiling: tile B as size-1 slices, tile L modestly, keep D contiguous.
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..3];
+                out_tile[0] = 1;
+                out_tile[1] = plan_mod.chooseTileShape1D(policy, l)[0];
+                out_tile[2] = d_embed;
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                // Indices: force single tile (for cheap indexed access).
+                const idx_tile: [2]usize = .{ b, l };
+                const indices_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, indices_id, indices_v.dtype.?, indices_v.shape, idx_tile[0..]);
+
+                // Table: prefer existing tiling when D is already contiguous in-tile.
+                // This avoids expensive re-tiling/copy for huge embedding tables.
+                var table_tid: TensorId = try ensureAnyTensor(&ctx, table_id);
+                const table_cur: *const TiledTensor = mgr.getConst(table_tid) catch return CompileError.InvalidArgument;
+                if (table_cur.tile_counts[1] != 1) {
+                    const tv: usize = plan_mod.chooseTileShape1D(policy, v_rows)[0];
+                    const table_tile: [2]usize = .{ tv, d_embed };
+                    table_tid = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, table_id, table_v.dtype.?, table_v.shape, table_tile[0..]);
+                }
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .GatherRowsTiled = .{ .out = out_tid, .table = table_tid, .indices = indices_tid } });
             },
 
             .Copy => {

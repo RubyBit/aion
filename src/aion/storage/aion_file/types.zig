@@ -163,6 +163,14 @@ pub const NodeOp = union(graph_mod.OpTag) {
     ViewUnsqueeze: struct { axis: i32 },
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const u64, lens: []const ShapeTerm },
+
+    /// Gather rows from a 2D table using i32 indices.
+    ///
+    /// Shapes:
+    /// - table:   [V, D]
+    /// - indices: [B, L]
+    /// - out:     [B, L, D]
+    GatherRows: void,
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and

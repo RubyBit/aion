@@ -17,6 +17,7 @@ const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
 const exec_lstm = @import("exec/lstm.zig");
 const exec_complex_abs_mean = @import("exec/complex_abs_mean.zig");
+const exec_gather = @import("exec/gather.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -340,6 +341,11 @@ pub const CpuBackend = struct {
                 .SliceNDScalar => |s| {
                     const rank: usize = @as(usize, s.rank);
                     try exec_utils.sliceNDCopyScalar(store, s.dst, s.src, s.starts[0..rank]);
+                },
+
+                .GatherRowsTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_gather.execGatherRowsTiled(pool_ptr, self.thread_count, s, store);
                 },
             }
 

@@ -421,6 +421,7 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .LSTMCell => .{ .LSTMCell = .{ .has_bias = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
         .ComplexAbsMean => .{ .ComplexAbsMean = .{ .out_channels = try readIntCursor(bytes, &cursor, u64) } },
         .Copy => .Copy,
+        .GatherRows => .GatherRows,
         .ViewReshape => .{ .ViewReshape = .{ .new_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
         .ViewSqueeze => .{ .ViewSqueeze = .{ .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null } },
         .ViewUnsqueeze => .{ .ViewUnsqueeze = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },

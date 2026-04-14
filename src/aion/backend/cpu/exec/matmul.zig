@@ -267,7 +267,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
 
                             // Fast path for matvec-shaped problems in tiled execution:
                             // when there is exactly one M-tile, packing B for reuse is pointless.
-                            if (is_matvec and t.b_dtype != .f16) {
+                            if (is_matvec and (t.b_dtype != .f16 or t.c_dtype == .f16)) {
                                 const k_tile: usize = b_view.layout.shape[0];
                                 const n_tile: usize = b_view.layout.shape[1];
 
@@ -291,6 +291,10 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
 
                                 switch (t.b_dtype) {
                                     .f32 => t.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                        t.fail(e);
+                                        return;
+                                    },
+                                    .f16 => t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                         t.fail(e);
                                         return;
                                     },
@@ -652,7 +656,11 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         };
                         defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                        try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view.bytes, a_view.bytes, b_view.bytes);
+                        if (m_tile == 1 and c_dtype == .f16) {
+                            try ctx.matvec.matvec_f16(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                        } else {
+                            try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view.bytes, a_view.bytes, b_view.bytes);
+                        }
                     },
                     .q4_0 => {
                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
@@ -857,10 +865,17 @@ fn execMatMulTiledBatched(
                                 },
                                 .f16 => {
                                     const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile) orelse t.matmul_f32;
-                                    matmulF16ViaPackedF32(mk, t.scratch[tid], params, t.c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
+                                    if (m_tile == 1 and t.c_dtype == .f16) {
+                                        t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                            t.fail(e);
+                                            return;
+                                        };
+                                    } else {
+                                        matmulF16ViaPackedF32(mk, t.scratch[tid], params, t.c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                            t.fail(e);
+                                            return;
+                                        };
+                                    }
                                 },
                                 .q4_0, .q8_0 => {
                                     const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
@@ -1005,7 +1020,11 @@ fn execMatMulTiledBatched(
                     };
                     defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                    try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes);
+                    if (m_tile == 1 and c_dtype == .f16) {
+                        try ctx.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes);
+                    } else {
+                        try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes);
+                    }
                 },
                 .q4_0 => {
                     const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)

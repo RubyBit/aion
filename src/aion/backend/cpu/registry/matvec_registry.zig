@@ -28,6 +28,8 @@ pub const Kernels = struct {
 
     matvec_f32: MatvecFn,
     matvec_f32_range: MatvecRangeFn,
+    matvec_f16: MatvecFn,
+    matvec_f16_range: MatvecRangeFn,
 };
 
 pub const VariantId = enum {
@@ -49,6 +51,8 @@ fn kernelsFor(comptime t: Tuning) Kernels {
         .tuning = t,
         .matvec_f32 = K.matvecF32,
         .matvec_f32_range = K.matvecF32Range,
+        .matvec_f16 = K.matvecF16,
+        .matvec_f16_range = K.matvecF16Range,
     };
 }
 

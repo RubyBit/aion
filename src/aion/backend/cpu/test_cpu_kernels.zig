@@ -437,6 +437,40 @@ test "cpu kernels: matvec f32" {
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
 }
 
+test "cpu kernels: matvec f16" {
+    const k: usize = 32;
+    const n: usize = 64;
+    const params: MatMulParams = .{ .m = 1, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
+
+    var prng = std.Random.DefaultPrng.init(0x87654321);
+    const rnd = prng.random();
+
+    var a: [k]f16 = undefined;
+    var b: [k * n]f16 = undefined;
+    for (a[0..]) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+    for (b[0..]) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+
+    var c_ref: [n]f32 = [_]f32{0.0} ** n;
+    var c: [n]f16 = [_]f16{@as(f16, 0.0)} ** n;
+
+    // naive f32 reference from f16 inputs
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        var acc: f32 = 0.0;
+        var kk: usize = 0;
+        while (kk < k) : (kk += 1) {
+            acc += @as(f32, @floatCast(a[kk])) * @as(f32, @floatCast(b[kk * n + j]));
+        }
+        c_ref[j] = acc;
+    }
+
+    try matvecKernelsById(.tuned).matvec_f16(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+
+    var c_f32: [n]f32 = undefined;
+    for (c, 0..) |v, idx| c_f32[idx] = @as(f32, @floatCast(v));
+    try expectSliceApproxEqAbs(c_ref[0..], c_f32[0..], 1e-1);
+}
+
 const Q8_BYTES: usize = types.DType.q8_0.info().block_bytes;
 const Q4_BYTES: usize = types.DType.q4_0.info().block_bytes;
 

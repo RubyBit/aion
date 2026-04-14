@@ -27,6 +27,10 @@ pub fn Kernel(comptime t: Tuning) type {
             return matvecF32Range(params, 0, params.n, c_bytes, a_bytes, b_bytes);
         }
 
+        pub fn matvecF16(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
+            return matvecF16Range(params, 0, params.n, c_bytes, a_bytes, b_bytes);
+        }
+
         pub fn matvecF32Range(
             params: MatMulParams,
             col_start: usize,
@@ -141,6 +145,134 @@ pub fn Kernel(comptime t: Tuning) type {
                                 const idx: usize = j0 + LANES + ii;
                                 const old: f32 = c_all[idx];
                                 c_all[idx] = alpha * res_arr1[ii] + beta * old;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pub fn matvecF16Range(
+            params: MatMulParams,
+            col_start: usize,
+            col_count: usize,
+            c_bytes: []u8,
+            a_bytes: []const u8,
+            b_bytes: []const u8,
+        ) BackendError!void {
+            if (params.m != 1) return BackendError.InvalidArgument;
+            const n_total: usize = params.n;
+            const k: usize = params.k;
+            if (col_start > n_total or col_count > n_total - col_start) return BackendError.InvalidArgument;
+
+            const c_all: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, c_bytes);
+            const a_all: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, a_bytes);
+            const b_all: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, b_bytes);
+
+            if (c_all.len < n_total) return BackendError.InvalidArgument;
+            if (a_all.len < k) return BackendError.InvalidArgument;
+            if (b_all.len < k * n_total) return BackendError.InvalidArgument;
+
+            const alpha: f32 = params.alpha;
+            const beta: f32 = params.beta;
+
+            const VecF = @Vector(LANES, f32);
+            const VecH = @Vector(LANES, f16);
+            const alpha_v: VecF = @splat(alpha);
+            const beta_v: VecF = @splat(beta);
+
+            var jc: usize = 0;
+            while (jc < col_count) : (jc += NC) {
+                const nc: usize = @min(NC, col_count - jc);
+                const base_col: usize = col_start + jc;
+
+                var jr: usize = 0;
+                while (jr < nc) : (jr += NR) {
+                    const nr: usize = @min(NR, nc - jr);
+                    const j0: usize = base_col + jr;
+
+                    var acc0: VecF = @splat(0.0);
+                    var acc1: VecF = @splat(0.0);
+
+                    @setRuntimeSafety(false);
+                    var kk: usize = 0;
+                    while (kk < k) : (kk += 1) {
+                        const a_val: f32 = @as(f32, @floatCast(a_all[kk]));
+                        const a_v: VecF = @splat(a_val);
+
+                        const b_row_off: usize = kk * n_total + j0;
+                        const b_ptr: [*]align(1) const f16 = b_all.ptr + b_row_off;
+
+                        if (PREFETCH_K_DIST != 0 and kk + PREFETCH_K_DIST < k) {
+                            const pf_off: usize = (kk + PREFETCH_K_DIST) * n_total + j0;
+                            @prefetch(@as([*]const u8, @ptrCast(b_all.ptr + pf_off)), .{ .rw = .read, .locality = 3, .cache = .data });
+                        }
+
+                        if (nr >= LANES) {
+                            const b0h: VecH = @as(*align(1) const VecH, @ptrCast(b_ptr)).*;
+                            const b0: VecF = @floatCast(b0h);
+                            acc0 = @mulAdd(VecF, a_v, b0, acc0);
+                        } else {
+                            var tmp: [LANES]f32 = @splat(0.0);
+                            var i: usize = 0;
+                            while (i < nr) : (i += 1) {
+                                tmp[i] = @as(f32, @floatCast(b_ptr[i]));
+                            }
+                            const b0: VecF = tmp;
+                            acc0 = @mulAdd(VecF, a_v, b0, acc0);
+                        }
+
+                        if (nr > LANES) {
+                            const rem: usize = nr - LANES;
+                            if (rem >= LANES) {
+                                const b1h: VecH = @as(*align(1) const VecH, @ptrCast(b_ptr + LANES)).*;
+                                const b1: VecF = @floatCast(b1h);
+                                acc1 = @mulAdd(VecF, a_v, b1, acc1);
+                            } else {
+                                var tmp1: [LANES]f32 = @splat(0.0);
+                                var ii: usize = 0;
+                                while (ii < rem) : (ii += 1) {
+                                    tmp1[ii] = @as(f32, @floatCast(b_ptr[LANES + ii]));
+                                }
+                                const b1: VecF = tmp1;
+                                acc1 = @mulAdd(VecF, a_v, b1, acc1);
+                            }
+                        }
+                    }
+                    @setRuntimeSafety(true);
+
+                    const c_ptr: [*]align(1) f16 = c_all.ptr + j0;
+
+                    if (nr >= LANES) {
+                        const old0_h: VecH = @as(*align(1) const VecH, @ptrCast(c_ptr)).*;
+                        const old0: VecF = @floatCast(old0_h);
+                        const res0f: VecF = if (beta == 0.0) (alpha_v * acc0) else @mulAdd(VecF, alpha_v, acc0, beta_v * old0);
+                        const res0h: VecH = @floatCast(res0f);
+                        @as(*align(1) VecH, @ptrCast(c_ptr)).* = res0h;
+                    } else {
+                        const res_arr0: [LANES]f32 = acc0;
+                        var i: usize = 0;
+                        while (i < nr) : (i += 1) {
+                            const old: f32 = @as(f32, @floatCast(c_all[j0 + i]));
+                            c_all[j0 + i] = @floatCast(alpha * res_arr0[i] + beta * old);
+                        }
+                    }
+
+                    if (nr > LANES) {
+                        const rem: usize = nr - LANES;
+                        if (rem >= LANES) {
+                            const old1_h: VecH = @as(*align(1) const VecH, @ptrCast(c_ptr + LANES)).*;
+                            const old1: VecF = @floatCast(old1_h);
+                            const res1f: VecF = if (beta == 0.0) (alpha_v * acc1) else @mulAdd(VecF, alpha_v, acc1, beta_v * old1);
+                            const res1h: VecH = @floatCast(res1f);
+                            @as(*align(1) VecH, @ptrCast(c_ptr + LANES)).* = res1h;
+                        } else {
+                            const res_arr1: [LANES]f32 = acc1;
+                            var ii: usize = 0;
+                            while (ii < rem) : (ii += 1) {
+                                const idx: usize = j0 + LANES + ii;
+                                const old: f32 = @as(f32, @floatCast(c_all[idx]));
+                                c_all[idx] = @floatCast(alpha * res_arr1[ii] + beta * old);
                             }
                         }
                     }

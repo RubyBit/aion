@@ -171,6 +171,12 @@ pub const NodeOp = union(graph_mod.OpTag) {
     /// - indices: [B, L]
     /// - out:     [B, L, D]
     GatherRows: void,
+
+    RoPE1D: struct {
+        base_frequency: f32,
+        scale_factor: f32,
+        rope_proportion: f32,
+    },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and

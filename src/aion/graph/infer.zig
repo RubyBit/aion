@@ -703,5 +703,26 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             out_shape[2] = table.shape[1];
             try setInferred(graph, node.output, table.dtype.?, out_shape);
         },
+
+        .RoPE1D => |rp| {
+            const x = try getValue(graph, node.inputs[0]);
+            const positions = try getValue(graph, node.inputs[1]);
+
+            try require(x.dtype != null and positions.dtype != null);
+            try require(x.shape.len == 4);
+            try require(positions.shape.len == 2);
+
+            if (x.dtype.? != .f16 and x.dtype.? != .f32) return InferError.Unsupported;
+            if (positions.dtype.? != .i32) return InferError.DTypeMismatch;
+
+            if (positions.shape[0] != x.shape[0] or positions.shape[1] != x.shape[1]) return InferError.ShapeMismatch;
+
+            if (!(rp.base_frequency > 0.0) or !std.math.isFinite(rp.base_frequency)) return InferError.InvalidGraph;
+            if (!(rp.scale_factor > 0.0) or !std.math.isFinite(rp.scale_factor)) return InferError.InvalidGraph;
+            if (!std.math.isFinite(rp.rope_proportion)) return InferError.InvalidGraph;
+            if (rp.rope_proportion < 0.0 or rp.rope_proportion > 1.0) return InferError.InvalidGraph;
+
+            try setInferred(graph, node.output, x.dtype.?, x.shape);
+        },
     }
 }

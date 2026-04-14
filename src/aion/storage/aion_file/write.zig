@@ -270,6 +270,11 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .Copy => {},
         .GatherRows => {},
+        .RoPE1D => |rp| {
+            try appendInt(out, allocator, f32, rp.base_frequency);
+            try appendInt(out, allocator, f32, rp.scale_factor);
+            try appendInt(out, allocator, f32, rp.rope_proportion);
+        },
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);
         },

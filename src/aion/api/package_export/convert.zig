@@ -44,6 +44,11 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .ComplexAbsMean => |cm| .{ .ComplexAbsMean = .{ .out_channels = cm.out_channels } },
         .Copy => .Copy,
         .GatherRows => .GatherRows,
+        .RoPE1D => |rp| .{ .RoPE1D = .{
+            .base_frequency = rp.base_frequency,
+            .scale_factor = rp.scale_factor,
+            .rope_proportion = rp.rope_proportion,
+        } },
         .ViewReshape => |vr| .{ .ViewReshape = .{ .new_shape = try package_file.makeConstantShapeTerms(allocator, vr.new_shape) } },
         .ViewSqueeze => |vs| .{ .ViewSqueeze = .{ .axis = vs.axis } },
         .ViewUnsqueeze => |vu| .{ .ViewUnsqueeze = .{ .axis = vu.axis } },

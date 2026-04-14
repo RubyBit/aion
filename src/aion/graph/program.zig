@@ -617,6 +617,46 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(out.tile_counts[2] == 1);
         },
 
+        .RoPE1DTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            const positions: *const TiledTensor = mgr.getConst(s.positions) catch return CompileError.InvalidArgument;
+
+            try compileRequire(out.rank == 4);
+            try compileRequire(x.rank == 4);
+            try compileRequire(positions.rank == 2);
+
+            try compileRequire(!out.dtype.info().is_quantized);
+            try compileRequire(!x.dtype.info().is_quantized);
+            try compileRequire(!positions.dtype.info().is_quantized);
+
+            try compileRequire(out.dtype == x.dtype);
+            try compileRequire(out.dtype == .f16 or out.dtype == .f32);
+            try compileRequire(positions.dtype == .i32);
+
+            try requireSameShape(out.shape, x.shape);
+            try requireSameTileShape(out, x);
+            try requireSameTileCounts(out, x);
+
+            try compileRequire(positions.shape[0] == out.shape[0]);
+            try compileRequire(positions.shape[1] == out.shape[1]);
+
+            // RoPE v1 contract: full head dimension in one tile.
+            try compileRequire(out.tile_counts[3] == 1);
+            try compileRequire(x.tile_counts[3] == 1);
+
+            // Positions must be tiled identically to [B, L] dimensions of x/out.
+            try compileRequire(positions.tile_shape[0] == out.tile_shape[0]);
+            try compileRequire(positions.tile_shape[1] == out.tile_shape[1]);
+            try compileRequire(positions.tile_counts[0] == out.tile_counts[0]);
+            try compileRequire(positions.tile_counts[1] == out.tile_counts[1]);
+
+            try compileRequire(s.base_frequency > 0.0 and std.math.isFinite(s.base_frequency));
+            try compileRequire(s.scale_factor > 0.0 and std.math.isFinite(s.scale_factor));
+            try compileRequire(std.math.isFinite(s.rope_proportion));
+            try compileRequire(s.rope_proportion >= 0.0 and s.rope_proportion <= 1.0);
+        },
+
         .LSTMCellFused => |s| {
             const out_state: *const TiledTensor = mgr.getConst(s.out_state) catch return CompileError.InvalidArgument;
             const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
@@ -1535,6 +1575,67 @@ pub fn compileGraph(
                 }
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .GatherRowsTiled = .{ .out = out_tid, .table = table_tid, .indices = indices_tid } });
+            },
+
+            .RoPE1D => |rp| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const pos_id: usize = @intCast(node.inputs[1]);
+
+                const x_v = graph.values.items[x_id];
+                const pos_v = graph.values.items[pos_id];
+
+                if (x_v.shape.len != 4 or pos_v.shape.len != 2) return CompileError.InvalidArgument;
+                if (!(x_v.dtype.? == .f16 or x_v.dtype.? == .f32)) return CompileError.InvalidArgument;
+                if (pos_v.dtype.? != .i32) return CompileError.InvalidArgument;
+
+                // RoPE v1 requires full head-dim tiles on input.
+                const x_existing_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
+                const x_existing: *const TiledTensor = mgr.getConst(x_existing_tid) catch return CompileError.InvalidArgument;
+                if (x_existing.rank != 4) return CompileError.InvalidArgument;
+                if (x_existing.tile_counts[3] != 1) return CompileError.InvalidArgument;
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..4];
+                var d: usize = 0;
+                while (d < 4) : (d += 1) {
+                    out_tile[d] = x_existing.tile_shape[d];
+                }
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                const x_tid: TensorId = try ensureTilingScalarMaybeRetile(
+                    allocator,
+                    &steps,
+                    mgr,
+                    policy,
+                    &ctx,
+                    x_id,
+                    x_v.dtype.?,
+                    x_v.shape,
+                    out_tile,
+                );
+
+                // Align positions tiling to [B, L] tile grid of x/out.
+                const pos_tile: [2]usize = .{ out_tile[0], out_tile[1] };
+                const pos_tid: TensorId = try ensureTilingScalarMaybeRetile(
+                    allocator,
+                    &steps,
+                    mgr,
+                    policy,
+                    &ctx,
+                    pos_id,
+                    pos_v.dtype.?,
+                    pos_v.shape,
+                    pos_tile[0..],
+                );
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .RoPE1DTiled = .{
+                    .out = out_tid,
+                    .x = x_tid,
+                    .positions = pos_tid,
+                    .base_frequency = rp.base_frequency,
+                    .scale_factor = rp.scale_factor,
+                    .rope_proportion = rp.rope_proportion,
+                } });
             },
 
             .Copy => {

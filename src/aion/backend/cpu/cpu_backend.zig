@@ -18,6 +18,7 @@ const exec_attention = @import("exec/attention.zig");
 const exec_lstm = @import("exec/lstm.zig");
 const exec_complex_abs_mean = @import("exec/complex_abs_mean.zig");
 const exec_gather = @import("exec/gather.zig");
+const exec_rope = @import("exec/rope.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
@@ -346,6 +347,11 @@ pub const CpuBackend = struct {
                 .GatherRowsTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_gather.execGatherRowsTiled(pool_ptr, self.thread_count, s, store);
+                },
+
+                .RoPE1DTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_rope.execRoPE1DTiled(pool_ptr, self.thread_count, s, store);
                 },
             }
 

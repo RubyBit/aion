@@ -55,6 +55,21 @@ pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 /// - out:     [B, L, D]
 pub const StepGatherRowsTiled = struct { out: TensorId, table: TensorId, indices: TensorId };
 
+/// Rotary positional embedding over 1D positions.
+///
+/// Shapes:
+/// - x:         [B, L, N, H] (f16/f32)
+/// - positions: [B, L] (i32)
+/// - out:       [B, L, N, H]
+pub const StepRoPE1DTiled = struct {
+    out: TensorId,
+    x: TensorId,
+    positions: TensorId,
+    base_frequency: f32,
+    scale_factor: f32,
+    rope_proportion: f32,
+};
+
 pub const StepLSTMCellFused = struct {
     out_state: TensorId,
     x: TensorId,
@@ -99,6 +114,8 @@ pub const Step = union(enum) {
     CopyTiled: StepCopyTiled,
 
     GatherRowsTiled: StepGatherRowsTiled,
+
+    RoPE1DTiled: StepRoPE1DTiled,
 
     LSTMCellFused: StepLSTMCellFused,
 

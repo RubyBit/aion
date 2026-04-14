@@ -2180,6 +2180,217 @@ test "graph: gather rows out-of-bounds returns InvalidArgument" {
     try std.testing.expectError(types.BackendError.InvalidArgument, cpu.backend().executeProgram(&prog, sm.tensorStore()));
 }
 
+test "graph: rope1d matches chunked-halves reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const b: usize = 2;
+    const l: usize = 3;
+    const n: usize = 2;
+    const h: usize = 8;
+    const total: usize = b * l * n * h;
+
+    const base_frequency: f32 = 10000.0;
+    const scale_factor: f32 = 1.0;
+    const rope_proportion: f32 = 0.5;
+
+    const x_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f32));
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+    for (0..total) |i| {
+        x_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.125;
+    }
+
+    const pos_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(pos_buf);
+    const pos_ptr: [*]align(1) i32 = @ptrCast(pos_buf.ptr);
+    const pos_vals: []align(1) i32 = pos_ptr[0 .. pos_buf.len / @sizeOf(i32)];
+    pos_vals[0] = 0;
+    pos_vals[1] = 1;
+    pos_vals[2] = 2;
+    pos_vals[3] = 5;
+    pos_vals[4] = 3;
+    pos_vals[5] = 7;
+
+    const ref_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f32));
+    defer allocator.free(ref_buf);
+    const ref_vals: []align(1) f32 = asF32Slice(ref_buf);
+
+    const pairs_total: usize = h / 2;
+    const rope_pairs_f: f32 = @floor(rope_proportion * @as(f32, @floatFromInt(pairs_total)));
+    const rope_pairs_i: i64 = @intFromFloat(rope_pairs_f);
+    const rope_pairs: usize = if (rope_pairs_i <= 0) 0 else @intCast(rope_pairs_i);
+    const freq_step: f32 = @floatCast(std.math.pow(f64, @as(f64, base_frequency), @as(f64, -2.0 / @as(f32, @floatFromInt(h)))));
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const pos: f32 = @floatFromInt(pos_vals[bi * l + li]);
+            for (0..n) |ni| {
+                const row_off: usize = (((bi * l + li) * n) + ni) * h;
+                const x_row: []align(1) const f32 = x_vals[row_off .. row_off + h];
+                const out_row: []align(1) f32 = ref_vals[row_off .. row_off + h];
+
+                @memcpy(out_row, x_row);
+
+                var ri: usize = 0;
+                var freq: f32 = scale_factor;
+                while (ri < rope_pairs) : (ri += 1) {
+                    const xl: f32 = x_row[ri];
+                    const xr: f32 = x_row[pairs_total + ri];
+                    const angle: f32 = pos * freq;
+                    const c: f32 = @floatCast(std.math.cos(@as(f64, angle)));
+                    const s: f32 = @floatCast(std.math.sin(@as(f64, angle)));
+                    out_row[ri] = xl * c - xr * s;
+                    out_row[pairs_total + ri] = xl * s + xr * c;
+                    freq *= freq_step;
+                }
+            }
+        }
+    }
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ b, l, n, h }, &[_]usize{ 1, 2, 1, h }, .{ .tile_alignment = 64 });
+    const pos_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(pos_tid, pos_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ b, l, n, h });
+    const pos_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+
+    const out = try g.addRoPE1D(x_in, pos_in, base_frequency, scale_factor, rope_proportion);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        try std.testing.expectApproxEqAbs(ref_vals[i], out_vals[i], 2e-5);
+    }
+}
+
+test "graph: rope1d matches chunked-halves reference (f16)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const b: usize = 1;
+    const l: usize = 4;
+    const n: usize = 3;
+    const h: usize = 6;
+    const total: usize = b * l * n * h;
+
+    const base_frequency: f32 = 10000.0;
+    const scale_factor: f32 = 1.0;
+    const rope_proportion: f32 = 1.0;
+
+    const x_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f16));
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f16 = asF16Slice(x_buf);
+    for (0..total) |i| {
+        const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.2;
+        x_vals[i] = @floatCast(v);
+    }
+
+    const pos_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(pos_buf);
+    const pos_ptr: [*]align(1) i32 = @ptrCast(pos_buf.ptr);
+    const pos_vals: []align(1) i32 = pos_ptr[0 .. pos_buf.len / @sizeOf(i32)];
+    pos_vals[0] = 0;
+    pos_vals[1] = 2;
+    pos_vals[2] = 4;
+    pos_vals[3] = 7;
+
+    const ref_f32_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f32));
+    defer allocator.free(ref_f32_buf);
+    const ref_f32: []align(1) f32 = asF32Slice(ref_f32_buf);
+
+    const pairs_total: usize = h / 2;
+    const rope_pairs_f: f32 = @floor(rope_proportion * @as(f32, @floatFromInt(pairs_total)));
+    const rope_pairs_i: i64 = @intFromFloat(rope_pairs_f);
+    const rope_pairs: usize = if (rope_pairs_i <= 0) 0 else @intCast(rope_pairs_i);
+    const freq_step: f32 = @floatCast(std.math.pow(f64, @as(f64, base_frequency), @as(f64, -2.0 / @as(f32, @floatFromInt(h)))));
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const pos: f32 = @floatFromInt(pos_vals[bi * l + li]);
+            for (0..n) |ni| {
+                const row_off: usize = (((bi * l + li) * n) + ni) * h;
+                var j: usize = 0;
+                while (j < h) : (j += 1) {
+                    ref_f32[row_off + j] = @floatCast(x_vals[row_off + j]);
+                }
+
+                var ri: usize = 0;
+                var freq: f32 = scale_factor;
+                while (ri < rope_pairs) : (ri += 1) {
+                    const xl: f32 = @floatCast(x_vals[row_off + ri]);
+                    const xr: f32 = @floatCast(x_vals[row_off + pairs_total + ri]);
+                    const angle: f32 = pos * freq;
+                    const c: f32 = @floatCast(std.math.cos(@as(f64, angle)));
+                    const s: f32 = @floatCast(std.math.sin(@as(f64, angle)));
+                    ref_f32[row_off + ri] = xl * c - xr * s;
+                    ref_f32[row_off + pairs_total + ri] = xl * s + xr * c;
+                    freq *= freq_step;
+                }
+            }
+        }
+    }
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ b, l, n, h }, &[_]usize{ 1, 2, 1, h }, .{ .tile_alignment = 64 });
+    const pos_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(pos_tid, pos_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f16, &[_]usize{ b, l, n, h });
+    const pos_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+
+    const out = try g.addRoPE1D(x_in, pos_in, base_frequency, scale_factor, rope_proportion);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, total * @sizeOf(f16));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f16 = asF16Slice(out_buf);
+
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const want: f32 = ref_f32[i];
+        const got: f32 = @floatCast(out_vals[i]);
+        try std.testing.expectApproxEqAbs(want, got, 3e-2);
+    }
+}
+
 test "graph: conv1d depthwise (NLC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

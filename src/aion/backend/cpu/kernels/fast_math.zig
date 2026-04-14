@@ -148,3 +148,19 @@ pub inline fn tanhApproxVecF32(comptime lanes: usize, x: @Vector(lanes, f32)) @V
     const y: @Vector(lanes, f32) = two * sigmoidApproxVecF32(lanes, two * x) - one;
     return clampVecF32(lanes, y, -1.0, 1.0);
 }
+
+pub const SinCosF32 = struct {
+    sin: f32,
+    cos: f32,
+};
+
+/// Centralized sin/cos helper for kernels.
+///
+/// NOTE: Kept as a dedicated helper so kernel call-sites can remain stable if
+/// we swap in an approximation later.
+pub inline fn sinCosFastF32(x: f32) SinCosF32 {
+    return .{
+        .sin = @floatCast(std.math.sin(@as(f64, x))),
+        .cos = @floatCast(std.math.cos(@as(f64, x))),
+    };
+}

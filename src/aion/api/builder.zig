@@ -370,6 +370,33 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Rotary positional embedding over 1D positions.
+    ///
+    /// Inputs:
+    /// - x:         [B, L, N, H]
+    /// - positions: [B, L] (i32)
+    ///
+    /// Output:
+    /// - out:       [B, L, N, H]
+    pub fn rope1d(
+        self: *Self,
+        x: TensorRef,
+        positions: TensorRef,
+        base_frequency: f32,
+        scale_factor: f32,
+        rope_proportion: f32,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addRoPE1D(
+            x.value,
+            positions.value,
+            base_frequency,
+            scale_factor,
+            rope_proportion,
+        );
+        try self.autoNameIfUnnamed(out, "rope1d");
+        return .{ .value = out };
+    }
+
     pub fn reduce(self: *Self, op: types.ReduceOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addReduce(op, a.value);
         try self.autoNameIfUnnamed(out, "reduce");

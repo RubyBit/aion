@@ -962,6 +962,100 @@ fn benchProgramMultiHeadAttentionSeparateF32(
     );
 }
 
+fn benchProgramRoPE1DF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    batch: usize,
+    seq_len: usize,
+    heads: usize,
+    head_dim: usize,
+    be: Backend,
+) !void {
+    if (head_dim == 0 or (head_dim % 2) != 0) return error.InvalidArgument;
+
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const t_l: [1]usize = plan_mod.chooseTileShape1D(policy, seq_len);
+
+    const x_elems: usize = batch * seq_len * heads * head_dim;
+    const p_elems: usize = batch * seq_len;
+
+    const x: []f32 = try allocator.alloc(f32, x_elems);
+    defer allocator.free(x);
+    fillRandomF32(rnd, x);
+
+    const positions: []i32 = try allocator.alloc(i32, p_elems);
+    defer allocator.free(positions);
+    for (0..batch) |b0| {
+        for (0..seq_len) |t| {
+            const idx: usize = b0 * seq_len + t;
+            positions[idx] = @intCast(t + b0 * 7);
+        }
+    }
+
+    const x_tid: TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ batch, seq_len, heads, head_dim },
+        &[_]usize{ 1, t_l[0], 1, head_dim },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+    const p_tid: TensorId = try sm.createTiledTensor(
+        .i32,
+        &[_]usize{ batch, seq_len },
+        &[_]usize{ 1, t_l[0] },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
+    try sm.writeFromPackedScalar(p_tid, std.mem.sliceAsBytes(positions));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ batch, seq_len, heads, head_dim });
+    const p_in = try g.addInput(.i32, &[_]usize{ batch, seq_len });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(p_in, @intCast(p_tid));
+
+    const y = try g.addRoPE1D(x_in, p_in, 10000.0, 1.0, 1.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    // Approx traffic per iter: read x + read positions + write out.
+    const bytes_per_iter: usize = (2 * x_elems * @sizeOf(f32)) + (p_elems * @sizeOf(i32));
+    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
+    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+
+    const out_buf: []u8 = try allocator.alloc(u8, x_elems * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const idx0: usize = 0;
+    const idx1: usize = (((batch / 2) * seq_len + (seq_len / 2)) * heads + (heads / 2)) * head_dim + (head_dim / 2);
+    const idx2: usize = (((batch - 1) * seq_len + (seq_len - 1)) * heads + (heads - 1)) * head_dim + (head_dim - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    std.debug.print(
+        "program rope1d f32:      {d:.3} GiB/s  (b={} l={} h={} d={}, chk={d:.4})\n",
+        .{ gib_s, batch, seq_len, heads, head_dim, chk },
+    );
+}
+
 fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
@@ -1349,6 +1443,11 @@ fn mainImpl(args: std.process.Args) !void {
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
+    if ((opts.k % 2) == 0) {
+        try benchProgramRoPE1DF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.heads, opts.k, be);
+    } else {
+        std.debug.print("(skipping rope1d f32: k/head_dim={} must be even)\n", .{opts.k});
+    }
     // Convolution program benches (NHWC/NLC, grouped by `groups`).
     try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .zero, "regular", be);
     try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, 1, 1, .zero, "pointwise", be);

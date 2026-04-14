@@ -79,6 +79,13 @@ pub fn instantiateNode(
         .ComplexAbsMean => |cm| try graph.addComplexAbsMean(mapped_inputs[0], @intCast(cm.out_channels)),
         .Copy => try graph.addCopy(mapped_inputs[0]),
         .GatherRows => try graph.addGatherRows(mapped_inputs[0], mapped_inputs[1]),
+        .RoPE1D => |rp| try graph.addRoPE1D(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            rp.base_frequency,
+            rp.scale_factor,
+            rp.rope_proportion,
+        ),
         .ViewReshape => |vr| blk: {
             const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, vr.new_shape, optional_symbols);
             break :blk try graph.addViewReshape(mapped_inputs[0], shape);

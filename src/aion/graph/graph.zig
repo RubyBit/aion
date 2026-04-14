@@ -57,6 +57,11 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     GatherRows = 21,
+
+    /// Rotary positional embedding over 1D positions.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    RoPE1D = 22,
 };
 
 pub const Op = union(OpTag) {
@@ -186,6 +191,26 @@ pub const Op = union(OpTag) {
     /// - indices: [B, L] (i32)
     /// - out:     [B, L, D]
     GatherRows: void,
+
+    /// Rotary positional embedding over head dimension using chunked-halves pairing.
+    ///
+    /// Inputs:
+    /// - x:         [B, L, N, H] (f16/f32)
+    /// - positions: [B, L] (i32)
+    ///
+    /// Output:
+    /// - out:       [B, L, N, H]
+    ///
+    /// Semantics match:
+    /// - pairs_total = floor(H/2)
+    /// - split x into left=x[..., :pairs_total], right=x[..., pairs_total:2*pairs_total], pass=x[..., 2*pairs_total:]
+    /// - rotate first floor(rope_proportion * pairs_total) pairs using
+    ///   theta_i = positions * (scale_factor * base_frequency^(-2*i/H))
+    RoPE1D: struct {
+        base_frequency: f32,
+        scale_factor: f32,
+        rope_proportion: f32,
+    },
 };
 
 pub const InputArity = union(enum) {
@@ -229,6 +254,7 @@ pub fn opInputArity(op: Op) InputArity {
         .ViewTranspose2D => .{ .exact = 1 },
         .ViewSliceND => .{ .exact = 1 },
         .GatherRows => .{ .exact = 2 },
+        .RoPE1D => .{ .exact = 2 },
     };
 }
 
@@ -476,6 +502,24 @@ pub const Graph = struct {
 
     pub fn addGatherRows(self: *Self, table: ValueId, indices: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.GatherRows, &[_]ValueId{ table, indices });
+    }
+
+    pub fn addRoPE1D(
+        self: *Self,
+        x: ValueId,
+        positions: ValueId,
+        base_frequency: f32,
+        scale_factor: f32,
+        rope_proportion: f32,
+    ) GraphError!ValueId {
+        return self.addNodeInternal(
+            .{ .RoPE1D = .{
+                .base_frequency = base_frequency,
+                .scale_factor = scale_factor,
+                .rope_proportion = rope_proportion,
+            } },
+            &[_]ValueId{ x, positions },
+        );
     }
 
     pub fn addLSTMCell(

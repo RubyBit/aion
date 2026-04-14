@@ -154,6 +154,13 @@ pub fn roundUpToMultiple(x: usize, m: usize) usize {
 
 pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
     // Heuristic: try to keep K tiles reasonably sized, but ensure quant alignment.
+    if (b_dtype == .f16) {
+        // For f16, prefer larger K tiles to reduce K-split overhead (especially
+        // when the execution path accumulates in f32 and converts outputs).
+        const base_f16: usize = @min(@as(usize, 512), @max(policy.quant_k_block, k));
+        return @min(base_f16, k);
+    }
+
     const base: usize = @min(@as(usize, 256), @max(policy.quant_k_block, k));
     if (!b_dtype.info().is_quantized) return @min(base, k);
 
@@ -207,7 +214,15 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     // Default: square-ish tiles.
     const min_mn: usize = @min(m, n);
     var side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, min_mn));
-    if (side > 128 and min_mn >= 512) side = 128;
+    if (side > 128 and min_mn >= 512) {
+        // f16 matmul currently routes through packed f32 kernels; larger macro-tiles
+        // reduce repeated conversion/packing overhead across many tiny C tiles.
+        if (b_dtype == .f16) {
+            side = @min(side, 256);
+        } else {
+            side = 128;
+        }
+    }
     const tm: usize = @min(side, m);
     const tn: usize = @min(side, n);
     const tk: usize = chooseMatMulTk(policy, k, b_dtype);

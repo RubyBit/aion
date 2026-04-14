@@ -73,6 +73,90 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
 
+        pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
+            if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const b: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, b_bytes);
+            if (b.len < k * n) return BackendError.InvalidArgument;
+
+            const panel_elems: usize = KC * NR;
+            const panel_count: usize = (n + NR - 1) / NR;
+            const need: usize = panel_count * panel_elems;
+            if (packed_b.len < need) return BackendError.InvalidArgument;
+
+            @memset(packed_b[0..need], 0.0);
+
+            const lanes: usize = LANES;
+            const VF16 = @Vector(lanes, f16);
+            const VF32 = @Vector(lanes, f32);
+
+            var j: usize = 0;
+            while (j < n) : (j += NR) {
+                const nr: usize = @min(NR, n - j);
+                const panel_idx: usize = j / NR;
+                const base: usize = panel_idx * panel_elems;
+
+                var kk: usize = 0;
+                while (kk < k) : (kk += 1) {
+                    const src_row: usize = kk * n + j;
+                    const dst_row: usize = base + kk * NR;
+
+                    var c: usize = 0;
+                    while (c + lanes <= nr) : (c += lanes) {
+                        const src_ptr: [*]align(1) const f16 = @ptrCast(b.ptr + src_row + c);
+                        const hv: VF16 = @as(*align(1) const VF16, @ptrCast(src_ptr)).*;
+                        const fv: VF32 = @floatCast(hv);
+                        const dst_ptr: [*]align(1) f32 = @ptrCast(packed_b.ptr + dst_row + c);
+                        @as(*align(1) VF32, @ptrCast(dst_ptr)).* = fv;
+                    }
+                    while (c < nr) : (c += 1) {
+                        packed_b[dst_row + c] = @as(f32, @floatCast(b[src_row + c]));
+                    }
+                }
+            }
+        }
+
+        pub fn packATileF16ToPackedF32(packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) BackendError!void {
+            if (k > KC) return BackendError.InvalidArgument;
+            const a: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, a_bytes);
+            if (a.len < m * k) return BackendError.InvalidArgument;
+
+            const panel_elems: usize = MR * KC;
+            const panel_count: usize = (m + MR - 1) / MR;
+            const need: usize = panel_count * panel_elems;
+            if (packed_a_out.len < need) return BackendError.InvalidArgument;
+
+            @memset(packed_a_out[0..need], 0.0);
+
+            const lanes: usize = LANES;
+            const VF16 = @Vector(lanes, f16);
+            const VF32 = @Vector(lanes, f32);
+
+            var i: usize = 0;
+            while (i < m) : (i += MR) {
+                const mr: usize = @min(MR, m - i);
+                const panel_idx: usize = i / MR;
+                const base: usize = panel_idx * panel_elems;
+
+                var r: usize = 0;
+                while (r < mr) : (r += 1) {
+                    const src_row: usize = (i + r) * k;
+                    const dst_row: usize = base + r * KC;
+
+                    var kk: usize = 0;
+                    while (kk + lanes <= k) : (kk += lanes) {
+                        const src_ptr: [*]align(1) const f16 = @ptrCast(a.ptr + src_row + kk);
+                        const hv: VF16 = @as(*align(1) const VF16, @ptrCast(src_ptr)).*;
+                        const fv: VF32 = @floatCast(hv);
+                        const dst_ptr: [*]align(1) f32 = @ptrCast(packed_a_out.ptr + dst_row + kk);
+                        @as(*align(1) VF32, @ptrCast(dst_ptr)).* = fv;
+                    }
+                    while (kk < k) : (kk += 1) {
+                        packed_a_out[dst_row + kk] = @as(f32, @floatCast(a[src_row + kk]));
+                    }
+                }
+            }
+        }
+
         pub fn matmulF32PackedB(scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8) BackendError!void {
             const m: usize = params.m;
             const n: usize = params.n;

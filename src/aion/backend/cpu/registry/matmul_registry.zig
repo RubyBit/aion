@@ -22,6 +22,8 @@ pub const F32Kernels = struct {
 
     pack_b_tile: *const fn (scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void,
     pack_a_tile: *const fn (k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) types.BackendError!void,
+    pack_b_tile_f16_to_packed_f32: *const fn (packed_b: []align(32) f32, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void,
+    pack_a_tile_f16_to_packed_f32: *const fn (packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_b: *const fn (scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_ab: *const fn (packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8) types.BackendError!void,
 };
@@ -53,6 +55,8 @@ fn kernelsFor(comptime t: Tuning) F32Kernels {
         .scratch_alignment = K.ScratchAlignment,
         .pack_b_tile = K.packBTileF32,
         .pack_a_tile = K.packATileF32,
+        .pack_b_tile_f16_to_packed_f32 = K.packBTileF16ToPackedF32,
+        .pack_a_tile_f16_to_packed_f32 = K.packATileF16ToPackedF32,
         .matmul_packed_b = K.matmulF32PackedB,
         .matmul_packed_ab = K.matmulF32PackedAB,
     };
@@ -70,10 +74,29 @@ pub fn maxScratchBytes() usize {
     var best: usize = 0;
     inline for (candidates) |c| {
         best = @max(best, c.kernels.scratch_bytes);
+
+        // f16 execution path may route through packed-f32 kernels and, for f16 output,
+        // needs an additional f32 accumulation tile buffer.
+        const pb_bytes: usize = c.kernels.tuning.kc * c.kernels.tuning.nc * @sizeOf(f32);
+        const pa_bytes: usize = c.kernels.tuning.mc * c.kernels.tuning.kc * @sizeOf(f32);
+        const c_tmp_bytes: usize = c.kernels.tuning.mc * c.kernels.tuning.nc * @sizeOf(f32);
+        const f16_via_f32_need: usize = pb_bytes + pa_bytes + c_tmp_bytes;
+        best = @max(best, f16_via_f32_need);
     }
     // Include non-default/special-purpose variants.
     best = @max(best, f32_kc512_nc128.scratch_bytes);
     best = @max(best, f32_kc256_nc128.scratch_bytes);
+
+    const pb_512_128: usize = f32_kc512_nc128.tuning.kc * f32_kc512_nc128.tuning.nc * @sizeOf(f32);
+    const pa_512_128: usize = f32_kc512_nc128.tuning.mc * f32_kc512_nc128.tuning.kc * @sizeOf(f32);
+    const ctmp_512_128: usize = f32_kc512_nc128.tuning.mc * f32_kc512_nc128.tuning.nc * @sizeOf(f32);
+    best = @max(best, pb_512_128 + pa_512_128 + ctmp_512_128);
+
+    const pb_256_128: usize = f32_kc256_nc128.tuning.kc * f32_kc256_nc128.tuning.nc * @sizeOf(f32);
+    const pa_256_128: usize = f32_kc256_nc128.tuning.mc * f32_kc256_nc128.tuning.kc * @sizeOf(f32);
+    const ctmp_256_128: usize = f32_kc256_nc128.tuning.mc * f32_kc256_nc128.tuning.nc * @sizeOf(f32);
+    best = @max(best, pb_256_128 + pa_256_128 + ctmp_256_128);
+
     return best;
 }
 

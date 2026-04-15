@@ -42,6 +42,18 @@ pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: Tenso
 pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool };
 pub const StepMultiHeadAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool, heads: usize };
+pub const StepMultiHeadAttentionCachedTiled = struct {
+    out: TensorId,
+    q: TensorId,
+    k_cache: TensorId,
+    v_cache: TensorId,
+    positions: TensorId,
+    end_index: TensorId,
+    scale: f32,
+    causal: bool,
+    sliding_window: usize,
+    attn_logits_soft_cap: f32,
+};
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: TensorId, axis: usize };
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
@@ -120,6 +132,7 @@ pub const Step = union(enum) {
     RMSNormTiled: StepRMSNormTiled,
     AttentionTiled: StepAttentionTiled,
     MultiHeadAttentionTiled: StepMultiHeadAttentionTiled,
+    MultiHeadAttentionCachedTiled: StepMultiHeadAttentionCachedTiled,
     ReduceAll: StepReduceAll,
     ReduceAxis: StepReduceAxis,
     ConcatScalar: StepConcatScalar,

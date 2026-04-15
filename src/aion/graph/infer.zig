@@ -439,6 +439,71 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, q.dtype.?, out_shape);
         },
 
+        .MultiHeadAttentionCached => |attn| {
+            const q = try getValue(graph, node.inputs[0]);
+            const k_cache = try getValue(graph, node.inputs[1]);
+            const v_cache = try getValue(graph, node.inputs[2]);
+            const positions = try getValue(graph, node.inputs[3]);
+            const end_index = try getValue(graph, node.inputs[4]);
+
+            try require(q.dtype != null and k_cache.dtype != null and v_cache.dtype != null);
+            try require(positions.dtype != null and end_index.dtype != null);
+
+            // q:[B,L_q,H_q,D_k], k_cache:[B,H_kv,T,D_k], v_cache:[B,H_kv,T,D_v]
+            // positions:[B,L_q], end_index:[B]
+            try require(q.shape.len == 4 and k_cache.shape.len == 4 and v_cache.shape.len == 4);
+            try require(positions.shape.len == 2 and end_index.shape.len == 1);
+
+            if (q.dtype.?.info().is_quantized or k_cache.dtype.?.info().is_quantized or v_cache.dtype.?.info().is_quantized) {
+                return InferError.Unsupported;
+            }
+
+            // v2 cached attention accepts mixed scalar dtypes for q/k/v,
+            // while the kernel accumulates in f32 and emits f32.
+            if (q.dtype.? != .f16 and q.dtype.? != .f32) return InferError.Unsupported;
+            if (k_cache.dtype.? != .f16 and k_cache.dtype.? != .f32) return InferError.Unsupported;
+            if (v_cache.dtype.? != .f16 and v_cache.dtype.? != .f32) return InferError.Unsupported;
+
+            if (positions.dtype.? != .i32 or end_index.dtype.? != .i32) return InferError.DTypeMismatch;
+
+            const bsz: usize = q.shape[0];
+            const l_q: usize = q.shape[1];
+            const h_q: usize = q.shape[2];
+            const d_k: usize = q.shape[3];
+
+            const k_b: usize = k_cache.shape[0];
+            const h_kv: usize = k_cache.shape[1];
+            const t_cap_k: usize = k_cache.shape[2];
+            const d_k_cache: usize = k_cache.shape[3];
+
+            const v_b: usize = v_cache.shape[0];
+            const v_h_kv: usize = v_cache.shape[1];
+            const t_cap_v: usize = v_cache.shape[2];
+            const d_v: usize = v_cache.shape[3];
+
+            if (k_b != bsz or v_b != bsz) return InferError.ShapeMismatch;
+            if (h_kv == 0 or h_q == 0) return InferError.ShapeMismatch;
+            if (v_h_kv != h_kv) return InferError.ShapeMismatch;
+            if (h_q % h_kv != 0) return InferError.ShapeMismatch;
+            if (d_k_cache != d_k) return InferError.ShapeMismatch;
+            if (t_cap_k != t_cap_v) return InferError.ShapeMismatch;
+
+            if (positions.shape[0] != bsz or positions.shape[1] != l_q) return InferError.ShapeMismatch;
+            if (end_index.shape[0] != bsz) return InferError.ShapeMismatch;
+
+            if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
+            if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return InferError.InvalidGraph;
+            _ = attn.causal;
+            _ = attn.sliding_window;
+
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, 4) catch return InferError.InvalidGraph;
+            out_shape[0] = bsz;
+            out_shape[1] = l_q;
+            out_shape[2] = h_q;
+            out_shape[3] = d_v;
+            try setInferred(graph, node.output, .f32, out_shape);
+        },
+
         .Reduce => |rr| {
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);

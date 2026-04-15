@@ -179,6 +179,13 @@ pub const NodeOp = union(graph_mod.OpTag) {
     },
 
     KVCacheAppend: void,
+
+    MultiHeadAttentionCached: struct {
+        scale: f32,
+        causal: bool,
+        sliding_window: u64,
+        attn_logits_soft_cap: f32,
+    },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -398,6 +405,11 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             for (ln.normalized_shape) |term| try validateShapeTerm(pkg, term);
         },
         .MultiHeadAttention => |attn| if (attn.heads == 0) return PackageError.InvalidFormat,
+        .MultiHeadAttentionCached => |attn| {
+            _ = attn.causal;
+            if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
+            if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
+        },
         .ComplexAbsMean => |cm| if (cm.out_channels == 0) return PackageError.InvalidFormat,
         .ViewReshape => |vr| {
             if (vr.new_shape.len == 0 or vr.new_shape.len > max_rank) return PackageError.InvalidFormat;

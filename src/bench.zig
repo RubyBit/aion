@@ -1009,6 +1009,175 @@ fn benchProgramMultiHeadAttentionSeparateF32(
     );
 }
 
+fn benchProgramMultiHeadAttentionCachedF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    batch: usize,
+    h_q: usize,
+    h_kv: usize,
+    l_q: usize,
+    t_cache: usize,
+    dk: usize,
+    dv: usize,
+    causal: bool,
+    sliding_window: usize,
+    attn_logits_soft_cap: f32,
+    label: []const u8,
+    be: Backend,
+) !void {
+    if (batch == 0 or h_q == 0 or h_kv == 0 or l_q == 0 or t_cache == 0 or dk == 0 or dv == 0) return error.InvalidArgument;
+    if ((h_q % h_kv) != 0) return error.InvalidArgument;
+    if (!(attn_logits_soft_cap >= 0.0) or !std.math.isFinite(attn_logits_soft_cap)) return error.InvalidArgument;
+
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const st = plan_mod.chooseAttentionTiles(policy, l_q, t_cache, dk, dv);
+
+    const q: []f32 = try allocator.alloc(f32, batch * l_q * h_q * dk);
+    defer allocator.free(q);
+    const k_cache: []f32 = try allocator.alloc(f32, batch * h_kv * t_cache * dk);
+    defer allocator.free(k_cache);
+    const v_cache: []f32 = try allocator.alloc(f32, batch * h_kv * t_cache * dv);
+    defer allocator.free(v_cache);
+    const positions: []i32 = try allocator.alloc(i32, batch * l_q);
+    defer allocator.free(positions);
+    const end_index: []i32 = try allocator.alloc(i32, batch);
+    defer allocator.free(end_index);
+
+    fillRandomF32(rnd, q);
+    fillRandomF32(rnd, k_cache);
+    fillRandomF32(rnd, v_cache);
+
+    // Place query positions near the current cache tail so causal/local windows
+    // exercise realistic decode-time slices.
+    const base_pos: usize = if (t_cache > l_q) t_cache - l_q else 0;
+    for (0..batch) |b0| {
+        end_index[b0] = @intCast(t_cache);
+        for (0..l_q) |l| {
+            positions[b0 * l_q + l] = @intCast(base_pos + l);
+        }
+    }
+
+    const q_tid: TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ batch, l_q, h_q, dk },
+        &[_]usize{ 1, st.tm, 1, dk },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+    const k_tid: TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ batch, h_kv, t_cache, dk },
+        &[_]usize{ 1, 1, st.tn, dk },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+    const v_tid: TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ batch, h_kv, t_cache, dv },
+        &[_]usize{ 1, 1, st.tn, dv },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+    const pos_tid: TensorId = try sm.createTiledTensor(
+        .i32,
+        &[_]usize{ batch, l_q },
+        &[_]usize{ 1, st.tm },
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+    const end_tid: TensorId = try sm.createTiledTensor(
+        .i32,
+        &[_]usize{batch},
+        &[_]usize{batch},
+        .{ .tile_alignment = policy.tile_alignment },
+    );
+
+    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
+    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k_cache));
+    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v_cache));
+    try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(positions));
+    try sm.writeFromPackedScalar(end_tid, std.mem.sliceAsBytes(end_index));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in = try g.addInput(.f32, &[_]usize{ batch, l_q, h_q, dk });
+    const k_in = try g.addInput(.f32, &[_]usize{ batch, h_kv, t_cache, dk });
+    const v_in = try g.addInput(.f32, &[_]usize{ batch, h_kv, t_cache, dv });
+    const p_in = try g.addInput(.i32, &[_]usize{ batch, l_q });
+    const e_in = try g.addInput(.i32, &[_]usize{batch});
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+    try g.bindExternal(p_in, @intCast(pos_tid));
+    try g.bindExternal(e_in, @intCast(end_tid));
+
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
+    const y = try g.addMultiHeadAttentionCached(q_in, k_in, v_in, p_in, e_in, scale, causal, sliding_window, attn_logits_soft_cap);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    // Approx FLOPs (ignoring exp/tanh overhead):
+    // per (b,l,h): 2 * n_eff * (dk + dv)
+    // n_eff is derived from the same range logic used in cached attention.
+    var n_eff_sum: u64 = 0;
+    for (0..l_q) |l| {
+        const q_pos: usize = base_pos + l;
+        var upper: usize = t_cache;
+        if (causal) {
+            const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch return error.InvalidArgument;
+            if (q_pos_next < upper) upper = q_pos_next;
+        }
+
+        var lower: usize = 0;
+        if (sliding_window > 0) {
+            const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch return error.InvalidArgument;
+            const sw_lower: usize = if (q_pos_next > sliding_window) q_pos_next - sliding_window else 0;
+            if (sw_lower > lower) lower = sw_lower;
+        }
+
+        if (upper > lower) n_eff_sum += @intCast(upper - lower);
+    }
+
+    const flops_total_wide: u128 = @as(u128, 2) *
+        @as(u128, batch) *
+        @as(u128, h_q) *
+        @as(u128, n_eff_sum) *
+        (@as(u128, dk) + @as(u128, dv)) *
+        @as(u128, iters);
+    const flops_total: u64 = if (flops_total_wide > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(flops_total_wide);
+    const gflops: f64 = fmtRateGFLOPs(flops_total, ns);
+
+    const out_tid: TensorId = prog.outputs[0];
+    const out_bytes_len: usize = batch * l_q * h_q * dv * @sizeOf(f32);
+    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const idx0: usize = 0;
+    const idx1: usize = (((batch / 2) * l_q + (l_q / 2)) * h_q + (h_q / 2)) * dv + (dv / 2);
+    const idx2: usize = (((batch - 1) * l_q + (l_q - 1)) * h_q + (h_q - 1)) * dv + (dv - 1);
+    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
+
+    const mode: []const u8 = if (causal) "causal" else "noncausal";
+    std.debug.print(
+        "program mha cached f32 {s}/{s}: {d:.2} GFLOP/s (b={} hq={} hkv={} lq={} t={} dk={} dv={} sw={} cap={d:.2}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
+        .{ mode, label, gflops, batch, h_q, h_kv, l_q, t_cache, dk, dv, sliding_window, attn_logits_soft_cap, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
+    );
+}
+
 fn benchProgramRoPE1DF32(
     allocator: std.mem.Allocator,
     rnd: std.Random,
@@ -2017,6 +2186,12 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
     try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
     try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
+    const cached_h_kv: usize = if ((opts.heads % 2) == 0) @max(@as(usize, 1), opts.heads / 2) else 1;
+    try benchProgramMultiHeadAttentionCachedF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, 0, 0.0, "global", be);
+    const cached_sw: usize = @max(@as(usize, 1), opts.n / 2);
+    if (cached_sw > 0 and cached_sw < opts.n) {
+        try benchProgramMultiHeadAttentionCachedF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, cached_sw, 0.0, "window", be);
+    }
     if ((opts.k % 2) == 0) {
         try benchProgramRoPE1DF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.heads, opts.k, be);
     } else {

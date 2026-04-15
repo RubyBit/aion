@@ -67,6 +67,11 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     KVCacheAppend = 23,
+
+    /// Cached grouped-query attention over external KV cache tensors.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    MultiHeadAttentionCached = 24,
 };
 
 pub const Op = union(OpTag) {
@@ -227,6 +232,31 @@ pub const Op = union(OpTag) {
     /// Output:
     /// - out:       [B, H_kv, T, D] (aliased mutation semantics)
     KVCacheAppend: void,
+
+    /// Cached grouped-query attention (GQA) over KV cache tensors.
+    ///
+    /// Inputs:
+    /// - q:         [B, L_q, H_q, D_k]
+    /// - k_cache:   [B, H_kv, T, D_k]
+    /// - v_cache:   [B, H_kv, T, D_v]
+    /// - positions: [B, L_q] (i32)
+    /// - end_index: [B] (i32)
+    ///
+    /// Output:
+    /// - out:       [B, L_q, H_q, D_v]
+    ///
+    /// Semantics:
+    /// - valid keys are in logical range [0, end_index[b])
+    /// - causal mask uses absolute query positions from `positions`
+    /// - sliding_window == 0 means global attention
+    /// - attn_logits_soft_cap == 0 means disabled
+    /// - requires H_q % H_kv == 0
+    MultiHeadAttentionCached: struct {
+        scale: f32,
+        causal: bool,
+        sliding_window: usize,
+        attn_logits_soft_cap: f32,
+    },
 };
 
 pub const InputArity = union(enum) {
@@ -259,6 +289,7 @@ pub fn opInputArity(op: Op) InputArity {
         .RMSNorm => .{ .exact = 3 },
         .Attention => .{ .exact = 3 },
         .MultiHeadAttention => .{ .exact = 3 },
+        .MultiHeadAttentionCached => .{ .exact = 5 },
         .Reduce => .{ .exact = 1 },
         .Concat => .{ .at_least = 1 },
         .ComplexAbsMean => .{ .exact = 1 },
@@ -494,6 +525,29 @@ pub const Graph = struct {
 
     pub fn addMultiHeadAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool, heads: usize) GraphError!ValueId {
         return self.addNodeInternal(.{ .MultiHeadAttention = .{ .scale = scale, .causal = causal, .heads = heads } }, &[_]ValueId{ q, k, v });
+    }
+
+    pub fn addMultiHeadAttentionCached(
+        self: *Self,
+        q: ValueId,
+        k_cache: ValueId,
+        v_cache: ValueId,
+        positions: ValueId,
+        end_index: ValueId,
+        scale: f32,
+        causal: bool,
+        sliding_window: usize,
+        attn_logits_soft_cap: f32,
+    ) GraphError!ValueId {
+        return self.addNodeInternal(
+            .{ .MultiHeadAttentionCached = .{
+                .scale = scale,
+                .causal = causal,
+                .sliding_window = sliding_window,
+                .attn_logits_soft_cap = attn_logits_soft_cap,
+            } },
+            &[_]ValueId{ q, k_cache, v_cache, positions, end_index },
+        );
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {

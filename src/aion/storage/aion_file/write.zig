@@ -254,6 +254,12 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
             try appendInt(out, allocator, u64, attn.heads);
         },
+        .MultiHeadAttentionCached => |attn| {
+            try appendInt(out, allocator, f32, attn.scale);
+            try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
+            try appendInt(out, allocator, u64, attn.sliding_window);
+            try appendInt(out, allocator, f32, attn.attn_logits_soft_cap);
+        },
         .Reduce => |rr| {
             try appendInt(out, allocator, u8, @intFromEnum(rr.op));
             try appendInt(out, allocator, u8, if (rr.axis != null) 1 else 0);

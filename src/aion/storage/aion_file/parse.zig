@@ -413,6 +413,12 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
             .heads = try readIntCursor(bytes, &cursor, u64),
         } },
+        .MultiHeadAttentionCached => .{ .MultiHeadAttentionCached = .{
+            .scale = try readIntCursor(bytes, &cursor, f32),
+            .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
+            .sliding_window = try readIntCursor(bytes, &cursor, u64),
+            .attn_logits_soft_cap = try readIntCursor(bytes, &cursor, f32),
+        } },
         .Reduce => .{ .Reduce = .{
             .op = try readEnumCursor(bytes, &cursor, ReduceOp),
             .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null,

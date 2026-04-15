@@ -38,6 +38,12 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         } },
         .Attention => |attn| .{ .Attention = .{ .scale = attn.scale, .causal = attn.causal } },
         .MultiHeadAttention => |attn| .{ .MultiHeadAttention = .{ .scale = attn.scale, .causal = attn.causal, .heads = attn.heads } },
+        .MultiHeadAttentionCached => |attn| .{ .MultiHeadAttentionCached = .{
+            .scale = attn.scale,
+            .causal = attn.causal,
+            .sliding_window = attn.sliding_window,
+            .attn_logits_soft_cap = attn.attn_logits_soft_cap,
+        } },
         .Reduce => |rr| .{ .Reduce = .{ .op = rr.op, .axis = rr.axis } },
         .Concat => |cc| .{ .Concat = .{ .axis = cc.axis } },
         .LSTMCell => |lc| .{ .LSTMCell = .{ .has_bias = lc.has_bias } },

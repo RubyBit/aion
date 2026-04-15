@@ -65,6 +65,17 @@ pub fn instantiateNode(
         },
         .Attention => |attn| try graph.addAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal),
         .MultiHeadAttention => |attn| try graph.addMultiHeadAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal, @intCast(attn.heads)),
+        .MultiHeadAttentionCached => |attn| try graph.addMultiHeadAttentionCached(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            mapped_inputs[2],
+            mapped_inputs[3],
+            mapped_inputs[4],
+            attn.scale,
+            attn.causal,
+            @intCast(attn.sliding_window),
+            attn.attn_logits_soft_cap,
+        ),
         .Reduce => |rr| if (rr.axis) |axis| try graph.addReduceAxis(rr.op, mapped_inputs[0], axis) else try graph.addReduce(rr.op, mapped_inputs[0]),
         .Concat => |cc| try graph.addConcat(mapped_inputs, cc.axis),
         .LSTMCell => |lc| try graph.addLSTMCell(

@@ -3913,3 +3913,434 @@ test "graph: kv cache append growable policy expands physical capacity" {
     try std.testing.expectEqual(@as(f32, 91.0), out_vals[6]);
     try std.testing.expectEqual(@as(f32, 0.0), out_vals[7]);
 }
+
+fn cachedGqaRefF32(
+    out: []f32,
+    q: []align(1) const f32,
+    k_cache: []align(1) const f32,
+    v_cache: []align(1) const f32,
+    positions: []align(1) const i32,
+    end_index: []align(1) const i32,
+    bsz: usize,
+    l_q: usize,
+    h_q: usize,
+    h_kv: usize,
+    t_cap: usize,
+    d_k: usize,
+    d_v: usize,
+    scale: f32,
+    causal: bool,
+    sliding_window: usize,
+    attn_logits_soft_cap: f32,
+) void {
+    std.debug.assert(out.len == bsz * l_q * h_q * d_v);
+    std.debug.assert(q.len == bsz * l_q * h_q * d_k);
+    std.debug.assert(k_cache.len == bsz * h_kv * t_cap * d_k);
+    std.debug.assert(v_cache.len == bsz * h_kv * t_cap * d_v);
+    std.debug.assert(positions.len == bsz * l_q);
+    std.debug.assert(end_index.len == bsz);
+    std.debug.assert((h_q % h_kv) == 0);
+
+    const groups_per_kv: usize = h_q / h_kv;
+
+    var b: usize = 0;
+    while (b < bsz) : (b += 1) {
+        const valid_end: usize = @intCast(@max(end_index[b], 0));
+
+        var l: usize = 0;
+        while (l < l_q) : (l += 1) {
+            const q_pos: usize = @intCast(@max(positions[b * l_q + l], 0));
+
+            var upper: usize = valid_end;
+            if (causal) {
+                const q_next: usize = q_pos + 1;
+                if (q_next < upper) upper = q_next;
+            }
+
+            var lower: usize = 0;
+            if (sliding_window > 0) {
+                const q_next: usize = q_pos + 1;
+                lower = if (q_next > sliding_window) q_next - sliding_window else 0;
+            }
+
+            var hq_idx: usize = 0;
+            while (hq_idx < h_q) : (hq_idx += 1) {
+                const out_base: usize = (((b * l_q + l) * h_q + hq_idx) * d_v);
+                @memset(out[out_base .. out_base + d_v], 0.0);
+
+                if (lower >= upper) continue;
+
+                const hkv_idx: usize = hq_idx / groups_per_kv;
+
+                const q_base: usize = (((b * l_q + l) * h_q + hq_idx) * d_k);
+                const q_row: []align(1) const f32 = q[q_base .. q_base + d_k];
+
+                var m_state: f32 = -std.math.inf(f32);
+                var l_state: f32 = 0.0;
+
+                var t: usize = lower;
+                while (t < upper) : (t += 1) {
+                    const k_base: usize = (((b * h_kv + hkv_idx) * t_cap + t) * d_k);
+                    const v_base: usize = (((b * h_kv + hkv_idx) * t_cap + t) * d_v);
+
+                    var dot: f32 = 0.0;
+                    var dk_i: usize = 0;
+                    while (dk_i < d_k) : (dk_i += 1) {
+                        dot += q_row[dk_i] * k_cache[k_base + dk_i];
+                    }
+
+                    var logit: f32 = dot * scale;
+                    if (attn_logits_soft_cap > 0.0) {
+                        const x: f64 = @as(f64, @floatCast(logit / attn_logits_soft_cap));
+                        logit = @floatCast(@as(f64, @floatCast(attn_logits_soft_cap)) * std.math.tanh(x));
+                    }
+
+                    const m_new: f32 = @max(m_state, logit);
+                    const rescale: f32 = if (m_state == -std.math.inf(f32))
+                        0.0
+                    else
+                        @floatCast(std.math.exp(@as(f64, @floatCast(m_state - m_new))));
+                    const p_new: f32 = @floatCast(std.math.exp(@as(f64, @floatCast(logit - m_new))));
+
+                    var dv_i: usize = 0;
+                    while (dv_i < d_v) : (dv_i += 1) {
+                        out[out_base + dv_i] = out[out_base + dv_i] * rescale + v_cache[v_base + dv_i] * p_new;
+                    }
+
+                    l_state = l_state * rescale + p_new;
+                    m_state = m_new;
+                }
+
+                if (l_state > 0.0) {
+                    const inv: f32 = 1.0 / l_state;
+                    var dv_i: usize = 0;
+                    while (dv_i < d_v) : (dv_i += 1) {
+                        out[out_base + dv_i] *= inv;
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "graph: cached grouped-query attention matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const bsz: usize = 1;
+    const l_q: usize = 2;
+    const h_q: usize = 4;
+    const h_kv: usize = 2;
+    const t_cap: usize = 6;
+    const d_k: usize = 3;
+    const d_v: usize = 2;
+
+    const scale: f32 = 0.5;
+    const causal: bool = true;
+    const sliding_window: usize = 3;
+    const softcap: f32 = 1.75;
+
+    const q_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_k * @sizeOf(f32));
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t_cap * d_k * @sizeOf(f32));
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t_cap * d_v * @sizeOf(f32));
+    defer allocator.free(v_buf);
+    const pos_buf: []u8 = try allocator.alloc(u8, bsz * l_q * @sizeOf(i32));
+    defer allocator.free(pos_buf);
+    const end_buf: []u8 = try allocator.alloc(u8, bsz * @sizeOf(i32));
+    defer allocator.free(end_buf);
+
+    const q_vals: []align(1) f32 = asF32Slice(q_buf);
+    const k_vals: []align(1) f32 = asF32Slice(k_buf);
+    const v_vals: []align(1) f32 = asF32Slice(v_buf);
+
+    for (q_vals, 0..) |*v0, i| v0.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.07;
+    for (k_vals, 0..) |*v0, i| v0.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9))) * 0.05;
+    for (v_vals, 0..) |*v0, i| v0.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11))) * 0.06;
+
+    const pos_ptr: [*]align(1) i32 = @ptrCast(pos_buf.ptr);
+    const pos_vals: []align(1) i32 = pos_ptr[0 .. pos_buf.len / @sizeOf(i32)];
+    pos_vals[0] = 4;
+    pos_vals[1] = 5;
+
+    const end_ptr: [*]align(1) i32 = @ptrCast(end_buf.ptr);
+    const end_vals: []align(1) i32 = end_ptr[0 .. end_buf.len / @sizeOf(i32)];
+    end_vals[0] = 6;
+
+    const ref_vals: []f32 = try allocator.alloc(f32, bsz * l_q * h_q * d_v);
+    defer allocator.free(ref_vals);
+    cachedGqaRefF32(
+        ref_vals,
+        q_vals,
+        k_vals,
+        v_vals,
+        pos_vals,
+        end_vals,
+        bsz,
+        l_q,
+        h_q,
+        h_kv,
+        t_cap,
+        d_k,
+        d_v,
+        scale,
+        causal,
+        sliding_window,
+        softcap,
+    );
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
+    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_kv, t_cap, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
+    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_kv, t_cap, d_v }, &[_]usize{ 1, 1, 2, d_v }, .{ .tile_alignment = 64 });
+    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+
+    try sm.writeFromPackedScalar(q_tid, q_buf);
+    try sm.writeFromPackedScalar(k_tid, k_buf);
+    try sm.writeFromPackedScalar(v_tid, v_buf);
+    try sm.writeFromPackedScalar(pos_tid, pos_buf);
+    try sm.writeFromPackedScalar(end_tid, end_buf);
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, l_q, h_q, d_k });
+    const k_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, h_kv, t_cap, d_k });
+    const v_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, h_kv, t_cap, d_v });
+    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ bsz, l_q });
+    const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
+
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+    try g.bindExternal(end_in, @intCast(end_tid));
+
+    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(
+        q_in,
+        k_in,
+        v_in,
+        pos_in,
+        end_in,
+        scale,
+        causal,
+        sliding_window,
+        softcap,
+    );
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_v * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    var max_abs: f32 = 0.0;
+    for (out_vals, ref_vals) |got, want| {
+        try std.testing.expect(std.math.isFinite(got));
+        max_abs = @max(max_abs, @abs(got - want));
+    }
+    try std.testing.expect(max_abs <= 8e-2);
+}
+
+test "graph: cached grouped-query attention supports q=f32, kv=f16 with f32 output" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const bsz: usize = 1;
+    const l_q: usize = 2;
+    const h_q: usize = 4;
+    const h_kv: usize = 2;
+    const t_cap: usize = 6;
+    const d_k: usize = 4;
+    const d_v: usize = 3;
+
+    const scale: f32 = 0.5;
+    const causal: bool = true;
+    const sliding_window: usize = 4;
+    const softcap: f32 = 0.0;
+
+    const q_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_k * @sizeOf(f32));
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t_cap * d_k * @sizeOf(f16));
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t_cap * d_v * @sizeOf(f16));
+    defer allocator.free(v_buf);
+    const pos_buf: []u8 = try allocator.alloc(u8, bsz * l_q * @sizeOf(i32));
+    defer allocator.free(pos_buf);
+    const end_buf: []u8 = try allocator.alloc(u8, bsz * @sizeOf(i32));
+    defer allocator.free(end_buf);
+
+    const q_vals: []align(1) f32 = asF32Slice(q_buf);
+    const k_vals_f16: []align(1) f16 = asF16Slice(k_buf);
+    const v_vals_f16: []align(1) f16 = asF16Slice(v_buf);
+
+    const k_ref_f32: []f32 = try allocator.alloc(f32, bsz * h_kv * t_cap * d_k);
+    defer allocator.free(k_ref_f32);
+    const v_ref_f32: []f32 = try allocator.alloc(f32, bsz * h_kv * t_cap * d_v);
+    defer allocator.free(v_ref_f32);
+
+    for (q_vals, 0..) |*v0, i| v0.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14))) * 0.04;
+    for (k_ref_f32, 0..) |*v0, i| {
+        const val: f32 = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15))) * 0.03;
+        v0.* = val;
+        k_vals_f16[i] = @floatCast(val);
+    }
+    for (v_ref_f32, 0..) |*v0, i| {
+        const val: f32 = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18))) * 0.025;
+        v0.* = val;
+        v_vals_f16[i] = @floatCast(val);
+    }
+
+    const pos_ptr: [*]align(1) i32 = @ptrCast(pos_buf.ptr);
+    const pos_vals: []align(1) i32 = pos_ptr[0 .. pos_buf.len / @sizeOf(i32)];
+    pos_vals[0] = 4;
+    pos_vals[1] = 5;
+
+    const end_ptr: [*]align(1) i32 = @ptrCast(end_buf.ptr);
+    const end_vals: []align(1) i32 = end_ptr[0 .. end_buf.len / @sizeOf(i32)];
+    end_vals[0] = 6;
+
+    const ref_vals: []f32 = try allocator.alloc(f32, bsz * l_q * h_q * d_v);
+    defer allocator.free(ref_vals);
+    cachedGqaRefF32(
+        ref_vals,
+        q_vals,
+        k_ref_f32,
+        v_ref_f32,
+        pos_vals,
+        end_vals,
+        bsz,
+        l_q,
+        h_q,
+        h_kv,
+        t_cap,
+        d_k,
+        d_v,
+        scale,
+        causal,
+        sliding_window,
+        softcap,
+    );
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
+    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, h_kv, t_cap, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
+    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, h_kv, t_cap, d_v }, &[_]usize{ 1, 1, 2, d_v }, .{ .tile_alignment = 64 });
+    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+
+    try sm.writeFromPackedScalar(q_tid, q_buf);
+    try sm.writeFromPackedScalar(k_tid, k_buf);
+    try sm.writeFromPackedScalar(v_tid, v_buf);
+    try sm.writeFromPackedScalar(pos_tid, pos_buf);
+    try sm.writeFromPackedScalar(end_tid, end_buf);
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, l_q, h_q, d_k });
+    const k_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, h_kv, t_cap, d_k });
+    const v_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, h_kv, t_cap, d_v });
+    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ bsz, l_q });
+    const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
+
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+    try g.bindExternal(end_in, @intCast(end_tid));
+
+    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(
+        q_in,
+        k_in,
+        v_in,
+        pos_in,
+        end_in,
+        scale,
+        causal,
+        sliding_window,
+        softcap,
+    );
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const out_meta: *const manager_mod.TiledTensor = try sm.getConst(prog.outputs[0]);
+    try std.testing.expectEqual(types.DType.f32, out_meta.dtype);
+
+    var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_v * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    var max_abs: f32 = 0.0;
+    for (out_vals, ref_vals) |got, want| {
+        try std.testing.expect(std.math.isFinite(got));
+        max_abs = @max(max_abs, @abs(got - want));
+    }
+    try std.testing.expect(max_abs <= 1.5e-1);
+}
+
+test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, 3, 2 }, &[_]usize{ 1, 1, 1, 2 }, .{ .tile_alignment = 64 });
+    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
+    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
+    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, 1 }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{ .tile_alignment = 64 });
+
+    var q_init: [1 * 1 * 3 * 2]f32 = .{0.0} ** (1 * 1 * 3 * 2);
+    var k_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
+    var v_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
+    var pos_init: [1]i32 = .{0};
+    var end_init: [1]i32 = .{1};
+
+    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q_init[0..]));
+    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k_init[0..]));
+    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v_init[0..]));
+    try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(pos_init[0..]));
+    try sm.writeFromPackedScalar(end_tid, std.mem.sliceAsBytes(end_init[0..]));
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 1, 3, 2 });
+    const k_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 2, 4, 2 });
+    const v_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 2, 4, 2 });
+    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ 1, 1 });
+    const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{1});
+
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+    try g.bindExternal(end_in, @intCast(end_tid));
+
+    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(q_in, k_in, v_in, pos_in, end_in, 1.0, true, 0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
+    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, policy));
+}

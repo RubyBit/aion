@@ -258,6 +258,33 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    pub fn multiHeadAttentionCached(
+        self: *Self,
+        q: TensorRef,
+        k_cache: TensorRef,
+        v_cache: TensorRef,
+        positions: TensorRef,
+        end_index: TensorRef,
+        scale: f32,
+        causal: bool,
+        sliding_window: usize,
+        attn_logits_soft_cap: f32,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addMultiHeadAttentionCached(
+            q.value,
+            k_cache.value,
+            v_cache.value,
+            positions.value,
+            end_index.value,
+            scale,
+            causal,
+            sliding_window,
+            attn_logits_soft_cap,
+        );
+        try self.autoNameIfUnnamed(out, "mha_cached");
+        return .{ .value = out };
+    }
+
     pub fn conv1d(
         self: *Self,
         x: TensorRef,

@@ -15,6 +15,7 @@ const exec_softmax = @import("exec/softmax.zig");
 const exec_conv = @import("exec/conv.zig");
 const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
+const exec_attention_cached = @import("exec/attention_cached.zig");
 const exec_lstm = @import("exec/lstm.zig");
 const exec_complex_abs_mean = @import("exec/complex_abs_mean.zig");
 const exec_gather = @import("exec/gather.zig");
@@ -300,6 +301,11 @@ pub const CpuBackend = struct {
                 .MultiHeadAttentionTiled => |s| {
                     const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                     try exec_attention.execMultiHeadAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
+                },
+
+                .MultiHeadAttentionCachedTiled => |s| {
+                    const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                    try exec_attention_cached.execMultiHeadAttentionCachedTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
                 },
 
                 .CopyTiled => |s| {

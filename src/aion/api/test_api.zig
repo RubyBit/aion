@@ -1898,3 +1898,110 @@ test "api: kvCacheAppend growable policy expands physical capacity" {
         0.0,
     }, out_vals[0..]);
 }
+
+test "api: multiHeadAttentionCached matches deterministic windowed-causal averages" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // Shapes:
+    // q:       [B=1, Lq=2, Hq=4, Dk=2]
+    // k_cache: [B=1, Hkv=2, T=6, Dk=2]
+    // v_cache: [B=1, Hkv=2, T=6, Dv=1]
+    // positions: [1,2], end_index: [1]
+    var q_vals: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
+    var k_vals: [1 * 2 * 6 * 2]f32 = .{0.0} ** (1 * 2 * 6 * 2);
+    var v_vals: [1 * 2 * 6 * 1]f32 = .{0.0} ** (1 * 2 * 6 * 1);
+
+    // kv-head 0 tokens => [1,2,3,4,5,6]
+    // kv-head 1 tokens => [10,20,30,40,50,60]
+    for (0..6) |t| {
+        v_vals[(0 * 2 * 6 * 1) + (0 * 6 * 1) + (t * 1)] = @as(f32, @floatFromInt(@as(i32, @intCast(t + 1))));
+        v_vals[(0 * 2 * 6 * 1) + (1 * 6 * 1) + (t * 1)] = @as(f32, @floatFromInt(@as(i32, @intCast((t + 1) * 10))));
+    }
+
+    const pos_t: api.Tensor = try ctx.fromArray([1][2]i32{.{ 4, 5 }});
+    const end_t: api.Tensor = try ctx.fromArray([1]i32{6});
+    const q_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 2 }, q_vals[0..]);
+    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 6, 2 }, k_vals[0..]);
+    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 6, 1 }, v_vals[0..]);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Q: api.TensorRef = try bld.param(q_t);
+    const K: api.TensorRef = try bld.param(k_t);
+    const V: api.TensorRef = try bld.param(v_t);
+    const Pos: api.TensorRef = try bld.param(pos_t);
+    const End: api.TensorRef = try bld.param(end_t);
+
+    const Out: api.TensorRef = try bld.multiHeadAttentionCached(
+        Q,
+        K,
+        V,
+        Pos,
+        End,
+        1.0,
+        true,
+        3,
+        0.0,
+    );
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 4, 1 }, out_t.getShape());
+
+    var out_vals: [1 * 2 * 4 * 1]f32 = undefined;
+    try out_t.read(&out_vals);
+
+    // With q/k all zeros, softmax is uniform over valid window.
+    // l=0 (q_pos=4): t in [2,3,4]
+    // l=1 (q_pos=5): t in [3,4,5]
+    // hq 0,1 -> kv 0 ; hq 2,3 -> kv 1
+    const expected: [8]f32 = .{
+        4.0,
+        4.0,
+        40.0,
+        40.0,
+        5.0,
+        5.0,
+        50.0,
+        50.0,
+    };
+    for (out_vals, expected) |got, want| {
+        try std.testing.expect(std.math.isFinite(got));
+        try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
+}
+
+test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var q_vals: [1 * 1 * 3 * 2]f32 = .{0.0} ** (1 * 1 * 3 * 2);
+    var k_vals: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
+    var v_vals: [1 * 2 * 4 * 1]f32 = .{0.0} ** (1 * 2 * 4 * 1);
+
+    const q_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 1, 3, 2 }, q_vals[0..]);
+    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 2 }, k_vals[0..]);
+    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 1 }, v_vals[0..]);
+    const pos_t: api.Tensor = try ctx.fromArray([1][1]i32{.{0}});
+    const end_t: api.Tensor = try ctx.fromArray([1]i32{1});
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Q: api.TensorRef = try bld.param(q_t);
+    const K: api.TensorRef = try bld.param(k_t);
+    const V: api.TensorRef = try bld.param(v_t);
+    const Pos: api.TensorRef = try bld.param(pos_t);
+    const End: api.TensorRef = try bld.param(end_t);
+
+    const Out: api.TensorRef = try bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0);
+    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}));
+}

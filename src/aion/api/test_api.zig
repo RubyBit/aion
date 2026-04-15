@@ -1729,3 +1729,172 @@ test "api: builder.param auto-generates persisted debug names" {
     }
     try std.testing.expect(found);
 }
+
+test "api: kvCacheAppend mutates cache in-place" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][2]f32{
+        .{
+            .{
+                .{ 0.0, 1.0 },
+                .{ 2.0, 3.0 },
+                .{ 4.0, 5.0 },
+                .{ 6.0, 7.0 },
+            },
+        },
+    });
+    const new_t: api.Tensor = try ctx.fromArray([1][1][2][2]f32{
+        .{
+            .{
+                .{ 50.0, 51.0 },
+                .{ 60.0, 61.0 },
+            },
+        },
+    });
+    const end_t: api.Tensor = try ctx.fromArray([1]i32{1});
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Cache: api.TensorRef = try bld.param(cache_t);
+    const New: api.TensorRef = try bld.param(new_t);
+    const End: api.TensorRef = try bld.param(end_t);
+    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqual(cache_t.id, out_t.id);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 4, 2 }, out_t.getShape());
+
+    var out_vals: [8]f32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        0.0,
+        1.0,
+        50.0,
+        51.0,
+        60.0,
+        61.0,
+        6.0,
+        7.0,
+    }, out_vals[0..]);
+}
+
+test "api: kvCacheAppend ring policy wraps" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{
+        .thread_count = 1,
+        .cache_config = .{ .ram_budget_bytes = 1 << 20 },
+    });
+    defer ctx.deinit();
+
+    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][1]f32{
+        .{
+            .{
+                .{0.0},
+                .{1.0},
+                .{2.0},
+                .{3.0},
+            },
+        },
+    });
+    const new_t: api.Tensor = try ctx.fromArray([1][1][2][1]f32{
+        .{
+            .{
+                .{90.0},
+                .{91.0},
+            },
+        },
+    });
+    const end_t: api.Tensor = try ctx.fromArray([1]i32{3});
+    try ctx.setTensorKVCachePolicy(cache_t, .{ .ring = .{ .window_tokens = 4 } });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Cache: api.TensorRef = try bld.param(cache_t);
+    const New: api.TensorRef = try bld.param(new_t);
+    const End: api.TensorRef = try bld.param(end_t);
+    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqual(cache_t.id, out_t.id);
+
+    var out_vals: [4]f32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        91.0,
+        1.0,
+        2.0,
+        90.0,
+    }, out_vals[0..]);
+}
+
+test "api: kvCacheAppend growable policy expands physical capacity" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{
+        .thread_count = 1,
+        .cache_config = .{ .ram_budget_bytes = 1 << 20 },
+    });
+    defer ctx.deinit();
+
+    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][1]f32{
+        .{
+            .{
+                .{0.0},
+                .{1.0},
+                .{2.0},
+                .{3.0},
+            },
+        },
+    });
+    const new_t: api.Tensor = try ctx.fromArray([1][1][2][1]f32{
+        .{
+            .{
+                .{90.0},
+                .{91.0},
+            },
+        },
+    });
+    const end_t: api.Tensor = try ctx.fromArray([1]i32{5});
+
+    try ctx.setTensorKVCachePolicy(cache_t, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Cache: api.TensorRef = try bld.param(cache_t);
+    const New: api.TensorRef = try bld.param(new_t);
+    const End: api.TensorRef = try bld.param(end_t);
+    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqual(cache_t.id, out_t.id);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 8, 1 }, out_t.getShape());
+
+    var out_vals: [8]f32 = undefined;
+    try out_t.read(&out_vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        90.0,
+        91.0,
+        0.0,
+    }, out_vals[0..]);
+}

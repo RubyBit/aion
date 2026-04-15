@@ -177,6 +177,8 @@ pub const NodeOp = union(graph_mod.OpTag) {
         scale_factor: f32,
         rope_proportion: f32,
     },
+
+    KVCacheAppend: void,
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and

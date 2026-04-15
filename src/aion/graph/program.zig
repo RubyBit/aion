@@ -657,6 +657,39 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(s.rope_proportion >= 0.0 and s.rope_proportion <= 1.0);
         },
 
+        .KVCacheAppendTiled => |s| {
+            const cache: *const TiledTensor = mgr.getConst(s.cache) catch return CompileError.InvalidArgument;
+            const new_kv: *const TiledTensor = mgr.getConst(s.new_kv) catch return CompileError.InvalidArgument;
+            const end_idx: *const TiledTensor = mgr.getConst(s.end_index) catch return CompileError.InvalidArgument;
+
+            try compileRequire(cache.rank == 4 and new_kv.rank == 4 and end_idx.rank == 1);
+
+            try compileRequire(!cache.dtype.info().is_quantized);
+            try compileRequire(!new_kv.dtype.info().is_quantized);
+            try compileRequire(!end_idx.dtype.info().is_quantized);
+
+            try compileRequire(cache.dtype == new_kv.dtype);
+            try compileRequire(cache.dtype == .f16 or cache.dtype == .f32);
+            try compileRequire(end_idx.dtype == .i32);
+
+            // Shape contract.
+            try compileRequire(cache.shape[0] == new_kv.shape[0]); // B
+            try compileRequire(cache.shape[1] == new_kv.shape[1]); // H_kv
+            try compileRequire(cache.shape[3] == new_kv.shape[3]); // D
+            try compileRequire(end_idx.shape[0] == cache.shape[0]);
+
+            // v1 tiling safety contract:
+            // - single tile across batch and heads
+            // - full head_dim contiguous in one tile
+            // - single tile for end_index vector
+            try compileRequire(cache.tile_counts[0] == 1 and cache.tile_counts[1] == 1);
+            try compileRequire(new_kv.tile_counts[0] == 1 and new_kv.tile_counts[1] == 1);
+            try compileRequire(cache.tile_counts[3] == 1 and new_kv.tile_counts[3] == 1);
+            try compileRequire(cache.tile_shape[3] == cache.shape[3]);
+            try compileRequire(new_kv.tile_shape[3] == new_kv.shape[3]);
+            try compileRequire(end_idx.tile_counts[0] == 1);
+        },
+
         .LSTMCellFused => |s| {
             const out_state: *const TiledTensor = mgr.getConst(s.out_state) catch return CompileError.InvalidArgument;
             const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
@@ -1635,6 +1668,26 @@ pub fn compileGraph(
                     .base_frequency = rp.base_frequency,
                     .scale_factor = rp.scale_factor,
                     .rope_proportion = rp.rope_proportion,
+                } });
+            },
+
+            .KVCacheAppend => {
+                const cache_id: usize = @intCast(node.inputs[0]);
+                const new_kv_id: usize = @intCast(node.inputs[1]);
+                const end_idx_id: usize = @intCast(node.inputs[2]);
+
+                const cache_tid: TensorId = try ensureAnyTensor(&ctx, cache_id);
+                const new_kv_tid: TensorId = try ensureAnyTensor(&ctx, new_kv_id);
+                const end_idx_tid: TensorId = try ensureAnyTensor(&ctx, end_idx_id);
+
+                // In-place semantics: output aliases cache storage.
+                ctx.value_tensor[out_idx] = cache_tid;
+                ctx.value_has_tensor[out_idx] = true;
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .KVCacheAppendTiled = .{
+                    .cache = cache_tid,
+                    .new_kv = new_kv_tid,
+                    .end_index = end_idx_tid,
                 } });
             },
 

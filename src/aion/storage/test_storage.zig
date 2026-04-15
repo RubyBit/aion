@@ -3,6 +3,7 @@ const std = @import("std");
 const package_file = @import("aion_file.zig");
 const manager_mod = @import("manager.zig");
 const storage = @import("storage.zig");
+const tensor_store = @import("../runtime/tensor_store.zig");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
 const simd = @import("../backend/cpu/kernels/simd.zig");
@@ -311,4 +312,69 @@ test "storage file: invalid package is rejected" {
     pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "dup"), .value = 0 };
 
     try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+}
+
+test "storage cache: lease tokens and policy info" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    try sm.configureCache(.{ .ram_budget_bytes = 1 << 20, .max_live_leases = 2 });
+
+    const tid: manager_mod.TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{8},
+        &[_]usize{4},
+        .{ .tile_alignment = 64 },
+    );
+    try sm.registerKVCachePolicy(tid, .{ .ring = .{ .window_tokens = 4 } });
+
+    const store: tensor_store.TensorStore = sm.tensorStore();
+    const info: tensor_store.KVCachePolicyInfo = store.kvCachePolicyInfo(tid);
+    try std.testing.expectEqual(tensor_store.KVCachePolicyKind.ring, info.kind);
+    try std.testing.expectEqual(@as(usize, 4), info.ring_window_tokens);
+
+    var t0: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
+    defer store.releaseConst(t0.token);
+    const t1: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 1);
+    defer store.releaseConst(t1.token);
+
+    try std.testing.expect(t0.token != 0);
+    try std.testing.expect(t1.token != 0);
+    try std.testing.expect(t0.token != t1.token);
+
+    try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.acquireTileConstLinear(tid, 0));
+
+    store.releaseConst(t0.token);
+    t0.token = 0;
+
+    const t2: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
+    defer store.releaseConst(t2.token);
+    try std.testing.expect(t2.token != 0);
+
+    const mapped_ring: usize = try store.mapKVCacheTime(tid, 5, 4);
+    try std.testing.expectEqual(@as(usize, 1), mapped_ring);
+
+    const grow_tid: manager_mod.TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ 1, 1, 8, 1 },
+        &[_]usize{ 1, 1, 4, 1 },
+        .{ .tile_alignment = 64 },
+    );
+    try sm.registerKVCachePolicy(grow_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
+    const mapped_grow: usize = try store.mapKVCacheTime(grow_tid, 3, 8);
+    try std.testing.expectEqual(@as(usize, 3), mapped_grow);
+    const mapped_grow_expand: usize = try store.mapKVCacheTime(grow_tid, 8, 8);
+    try std.testing.expectEqual(@as(usize, 8), mapped_grow_expand);
+    const grow_meta: *const manager_mod.TiledTensor = try sm.getConst(grow_tid);
+    try std.testing.expectEqual(@as(usize, 16), grow_meta.shape[2]);
+
+    const plain_tid: manager_mod.TensorId = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{8},
+        &[_]usize{4},
+        .{ .tile_alignment = 64 },
+    );
+    try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.mapKVCacheTime(plain_tid, 9, 8));
 }

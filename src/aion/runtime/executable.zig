@@ -70,6 +70,18 @@ pub const StepRoPE1DTiled = struct {
     rope_proportion: f32,
 };
 
+/// In-place KV cache append.
+///
+/// Shapes:
+/// - cache:     [B, H_kv, T, D] (f16/f32), written in-place
+/// - new_kv:    [B, H_kv, new_len, D] (f16/f32), read-only
+/// - end_index: [B] (i32), per-batch append start offsets
+pub const StepKVCacheAppendTiled = struct {
+    cache: TensorId,
+    new_kv: TensorId,
+    end_index: TensorId,
+};
+
 pub const StepLSTMCellFused = struct {
     out_state: TensorId,
     x: TensorId,
@@ -116,6 +128,8 @@ pub const Step = union(enum) {
     GatherRowsTiled: StepGatherRowsTiled,
 
     RoPE1DTiled: StepRoPE1DTiled,
+
+    KVCacheAppendTiled: StepKVCacheAppendTiled,
 
     LSTMCellFused: StepLSTMCellFused,
 

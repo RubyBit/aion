@@ -724,5 +724,26 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             try setInferred(graph, node.output, x.dtype.?, x.shape);
         },
+
+        .KVCacheAppend => {
+            const cache = try getValue(graph, node.inputs[0]);
+            const new_kv = try getValue(graph, node.inputs[1]);
+            const end_index = try getValue(graph, node.inputs[2]);
+
+            try require(cache.dtype != null and new_kv.dtype != null and end_index.dtype != null);
+            try require(cache.shape.len == 4 and new_kv.shape.len == 4 and end_index.shape.len == 1);
+
+            if (cache.dtype.? != new_kv.dtype.?) return InferError.DTypeMismatch;
+            if (cache.dtype.? != .f32 and cache.dtype.? != .f16) return InferError.Unsupported;
+            if (end_index.dtype.? != .i32) return InferError.DTypeMismatch;
+
+            if (cache.shape[0] != new_kv.shape[0]) return InferError.ShapeMismatch;
+            if (cache.shape[1] != new_kv.shape[1]) return InferError.ShapeMismatch;
+            if (cache.shape[3] != new_kv.shape[3]) return InferError.ShapeMismatch;
+            if (end_index.shape[0] != cache.shape[0]) return InferError.ShapeMismatch;
+
+            // In-place append semantics: output aliases cache shape/dtype.
+            try setInferred(graph, node.output, cache.dtype.?, cache.shape);
+        },
     }
 }

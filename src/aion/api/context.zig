@@ -4,6 +4,7 @@ const backend_mod = @import("../backend/backend.zig");
 const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
 const types = @import("../backend/types.zig");
 const package_file = @import("../storage/aion_file.zig");
+const cache_mod = @import("../storage/cache.zig");
 const manager_mod = @import("../storage/manager.zig");
 const plan_mod = @import("../graph/plan.zig");
 const graph_mod = @import("../graph/graph.zig");
@@ -28,6 +29,11 @@ pub const DimensionSymbol = api_package_export.DimensionSymbol;
 pub const ExportMetadata = api_package_export.Metadata;
 pub const OutputAlias = api_package_export.OutputAlias;
 pub const ExportModelOptions = api_package_export.ExportModelOptions;
+pub const CacheConfig = cache_mod.CacheConfig;
+pub const CachePolicy = cache_mod.CachePolicy;
+pub const KVCachePolicy = cache_mod.KVCachePolicy;
+pub const GrowablePolicy = cache_mod.GrowablePolicy;
+pub const RingPolicy = cache_mod.RingPolicy;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -53,6 +59,11 @@ pub const Context = struct {
         /// If null, a default policy is used and users don't need to think about tiling.
         /// Power users can provide this to tune performance.
         tile_policy_override: ?plan_mod.TilePolicy = null,
+
+        /// Optional runtime cache manager configuration.
+        ///
+        /// If null, storage behaves as plain RAM-backed tiled tensors.
+        cache_config: ?cache_mod.CacheConfig = null,
     };
 
     pub fn initCpu(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!Self {
@@ -67,6 +78,15 @@ pub const Context = struct {
 
         var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
         errdefer sm.deinit();
+
+        if (opts.cache_config) |cfg| {
+            sm.configureCache(cfg) catch |e| {
+                return switch (e) {
+                    error.OutOfMemory => api_errors.InitError.OutOfMemory,
+                    else => api_errors.InitError.InvalidArgument,
+                };
+            };
+        }
 
         const out: Self = .{
             .allocator = allocator,
@@ -85,6 +105,15 @@ pub const Context = struct {
 
     pub fn storage(self: *Self) *manager_mod.StorageManager {
         return &self.store;
+    }
+
+    pub fn configureCache(self: *Self, cfg: cache_mod.CacheConfig) api_errors.ApiError!void {
+        try self.store.configureCache(cfg);
+    }
+
+    pub fn setTensorKVCachePolicy(self: *Self, t: api_tensor.Tensor, policy: cache_mod.KVCachePolicy) api_errors.ApiError!void {
+        if (t.store != &self.store) return api_errors.ApiError.InvalidArgument;
+        try self.store.registerKVCachePolicy(t.id, policy);
     }
 
     pub fn tilePolicy(self: *const Self) plan_mod.TilePolicy {

@@ -49,6 +49,7 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
             .scale_factor = rp.scale_factor,
             .rope_proportion = rp.rope_proportion,
         } },
+        .KVCacheAppend => .KVCacheAppend,
         .ViewReshape => |vr| .{ .ViewReshape = .{ .new_shape = try package_file.makeConstantShapeTerms(allocator, vr.new_shape) } },
         .ViewSqueeze => |vs| .{ .ViewSqueeze = .{ .axis = vs.axis } },
         .ViewUnsqueeze => |vu| .{ .ViewUnsqueeze = .{ .axis = vu.axis } },

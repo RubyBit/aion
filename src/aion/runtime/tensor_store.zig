@@ -5,6 +5,17 @@ pub const TensorId = u32;
 
 pub const StoreError = error{ InvalidArgument, OutOfMemory };
 
+pub const KVCachePolicyKind = enum(u8) {
+    none = 0,
+    growable = 1,
+    ring = 2,
+};
+
+pub const KVCachePolicyInfo = struct {
+    kind: KVCachePolicyKind = .none,
+    ring_window_tokens: usize = 0,
+};
+
 pub const TensorMeta = struct {
     dtype: types.DType,
     rank: u8,
@@ -87,6 +98,16 @@ pub const TensorStore = struct {
         /// Release a previously acquired mutable tile lease.
         releaseMut: *const fn (ctx: *anyopaque, token: usize) void,
 
+        /// Optional runtime hint for cache policy bound to a tensor id.
+        ///
+        /// If null, callers must assume `.none` semantics.
+        kvCachePolicyInfo: ?*const fn (ctx: *anyopaque, id: TensorId) KVCachePolicyInfo = null,
+
+        /// Optional logical->physical time-index mapper for KV cache tensors.
+        ///
+        /// If null, mapping defaults to identity with strict bounds checks.
+        mapKVCacheTime: ?*const fn (ctx: *anyopaque, id: TensorId, logical_t: usize, physical_capacity_tokens: usize) StoreError!usize = null,
+
         /// Prefetch hint. Non-blocking.
         ///
         /// In v0 this is only a CPU cache hint. Future implementations may use
@@ -121,6 +142,18 @@ pub const TensorStore = struct {
 
     pub fn releaseMut(self: TensorStore, token: usize) void {
         return self.vtable.releaseMut(self.ctx, token);
+    }
+
+    pub fn kvCachePolicyInfo(self: TensorStore, id: TensorId) KVCachePolicyInfo {
+        if (self.vtable.kvCachePolicyInfo) |cb| return cb(self.ctx, id);
+        return .{};
+    }
+
+    pub fn mapKVCacheTime(self: TensorStore, id: TensorId, logical_t: usize, physical_capacity_tokens: usize) StoreError!usize {
+        if (physical_capacity_tokens == 0) return StoreError.InvalidArgument;
+        if (self.vtable.mapKVCacheTime) |cb| return cb(self.ctx, id, logical_t, physical_capacity_tokens);
+        if (logical_t >= physical_capacity_tokens) return StoreError.InvalidArgument;
+        return logical_t;
     }
 
     pub fn prefetch(self: TensorStore, id: TensorId, ti0: usize, ti1: usize) void {

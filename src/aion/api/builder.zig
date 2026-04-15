@@ -397,6 +397,26 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// In-place KV cache append.
+    ///
+    /// Inputs:
+    /// - cache:     [B, H_kv, T, D]
+    /// - new_kv:    [B, H_kv, new_len, D]
+    /// - end_index: [B] (i32)
+    ///
+    /// Output:
+    /// - out: same shape/dtype as cache (mutated in-place semantics)
+    pub fn kvCacheAppend(
+        self: *Self,
+        cache: TensorRef,
+        new_kv: TensorRef,
+        end_index: TensorRef,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addKVCacheAppend(cache.value, new_kv.value, end_index.value);
+        try self.autoNameIfUnnamed(out, "kv_cache_append");
+        return .{ .value = out };
+    }
+
     pub fn reduce(self: *Self, op: types.ReduceOp, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addReduce(op, a.value);
         try self.autoNameIfUnnamed(out, "reduce");

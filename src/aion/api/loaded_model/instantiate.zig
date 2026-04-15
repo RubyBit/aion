@@ -86,6 +86,7 @@ pub fn instantiateNode(
             rp.scale_factor,
             rp.rope_proportion,
         ),
+        .KVCacheAppend => try graph.addKVCacheAppend(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2]),
         .ViewReshape => |vr| blk: {
             const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, vr.new_shape, optional_symbols);
             break :blk try graph.addViewReshape(mapped_inputs[0], shape);

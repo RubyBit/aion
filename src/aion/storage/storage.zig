@@ -493,6 +493,87 @@ pub const TiledTensor = struct {
         return true;
     }
 
+    /// Grow one axis while preserving existing scalar values.
+    ///
+    /// v1 scope:
+    /// - scalar dtypes only (no quantized remap yet)
+    /// - growth only (`new_size >= current`)
+    /// - shape rank is preserved
+    pub fn growAxisPreserveScalar(self: *Self, axis: usize, new_size: usize) StorageError!void {
+        const rank_usize: usize = @as(usize, self.rank);
+        if (rank_usize == 0 or axis >= rank_usize) return StorageError.InvalidArgument;
+        if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
+
+        const old_size: usize = self.shape[axis];
+        if (new_size < old_size) return StorageError.InvalidArgument;
+        if (new_size == old_size) return;
+
+        var new_shape_mem: [INLINE_RANK]usize = .{0} ** INLINE_RANK;
+        var d: usize = 0;
+        while (d < rank_usize) : (d += 1) {
+            new_shape_mem[d] = self.shape[d];
+        }
+        new_shape_mem[axis] = new_size;
+        const new_shape: []const usize = new_shape_mem[0..rank_usize];
+
+        const elem_bytes: usize = self.dtype.info().block_bytes;
+        const old_elems: usize = try mulAll(self.shape);
+        const new_elems: usize = try mulAll(new_shape);
+
+        const old_bytes: usize = std.math.mul(usize, old_elems, elem_bytes) catch return StorageError.InvalidArgument;
+        const new_bytes: usize = std.math.mul(usize, new_elems, elem_bytes) catch return StorageError.InvalidArgument;
+
+        const old_packed: []u8 = self.allocator.alloc(u8, old_bytes) catch return StorageError.OutOfMemory;
+        defer self.allocator.free(old_packed);
+        try self.readToPackedScalar(old_packed);
+
+        const new_packed: []u8 = self.allocator.alloc(u8, new_bytes) catch return StorageError.OutOfMemory;
+        defer self.allocator.free(new_packed);
+        @memset(new_packed, 0);
+
+        var old_strides_mem: [INLINE_RANK]usize = .{0} ** INLINE_RANK;
+        var new_strides_mem: [INLINE_RANK]usize = .{0} ** INLINE_RANK;
+        try computePackedStridesElems(self.shape, old_strides_mem[0..rank_usize]);
+        try computePackedStridesElems(new_shape, new_strides_mem[0..rank_usize]);
+
+        var coords_mem: [INLINE_RANK]usize = .{0} ** INLINE_RANK;
+        var old_lin: usize = 0;
+        while (old_lin < old_elems) : (old_lin += 1) {
+            try decodeLinearIndex(old_lin, old_strides_mem[0..rank_usize], self.shape, coords_mem[0..rank_usize]);
+
+            var new_lin: usize = 0;
+            d = 0;
+            while (d < rank_usize) : (d += 1) {
+                new_lin = std.math.add(usize, new_lin, coords_mem[d] * new_strides_mem[d]) catch return StorageError.InvalidArgument;
+            }
+
+            const src_off: usize = std.math.mul(usize, old_lin, elem_bytes) catch return StorageError.InvalidArgument;
+            const dst_off: usize = std.math.mul(usize, new_lin, elem_bytes) catch return StorageError.InvalidArgument;
+            @memcpy(new_packed[dst_off .. dst_off + elem_bytes], old_packed[src_off .. src_off + elem_bytes]);
+        }
+
+        var new_tensor: TiledTensor = undefined;
+        try new_tensor.init(
+            self.allocator,
+            self.dtype,
+            new_shape,
+            self.tile_shape,
+            .{ .tile_alignment = self.tile_alignment },
+        );
+        errdefer new_tensor.deinit();
+
+        try new_tensor.writeFromPackedScalar(new_packed);
+
+        self.deinit();
+        self.* = new_tensor;
+
+        // Rebind slices to this instance's storage after moving from a stack-local temp.
+        self.shape = self.shape_storage.constSlice();
+        self.tile_shape = self.tile_shape_storage.constSlice();
+        self.tile_counts = self.tile_counts_storage.constSlice();
+        self.tile_strides = self.tile_strides_storage.constSlice();
+    }
+
     pub fn tileCountTotal(self: Self) usize {
         return self.tile_offsets.len;
     }

@@ -62,6 +62,11 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     RoPE1D = 22,
+
+    /// In-place KV cache append (scatter-write into existing cache tensor).
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    KVCacheAppend = 23,
 };
 
 pub const Op = union(OpTag) {
@@ -211,6 +216,17 @@ pub const Op = union(OpTag) {
         scale_factor: f32,
         rope_proportion: f32,
     },
+
+    /// In-place KV cache append.
+    ///
+    /// Inputs:
+    /// - cache:     [B, H_kv, T, D] (f16/f32)
+    /// - new_kv:    [B, H_kv, new_len, D] (same dtype as cache)
+    /// - end_index: [B] (i32)
+    ///
+    /// Output:
+    /// - out:       [B, H_kv, T, D] (aliased mutation semantics)
+    KVCacheAppend: void,
 };
 
 pub const InputArity = union(enum) {
@@ -255,6 +271,7 @@ pub fn opInputArity(op: Op) InputArity {
         .ViewSliceND => .{ .exact = 1 },
         .GatherRows => .{ .exact = 2 },
         .RoPE1D => .{ .exact = 2 },
+        .KVCacheAppend => .{ .exact = 3 },
     };
 }
 
@@ -519,6 +536,18 @@ pub const Graph = struct {
                 .rope_proportion = rope_proportion,
             } },
             &[_]ValueId{ x, positions },
+        );
+    }
+
+    pub fn addKVCacheAppend(
+        self: *Self,
+        cache: ValueId,
+        new_kv: ValueId,
+        end_index: ValueId,
+    ) GraphError!ValueId {
+        return self.addNodeInternal(
+            .KVCacheAppend,
+            &[_]ValueId{ cache, new_kv, end_index },
         );
     }
 

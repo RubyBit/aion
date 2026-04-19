@@ -13,6 +13,16 @@ const retarget = @import("loaded_model/retarget.zig");
 const instantiate = @import("loaded_model/instantiate.zig");
 const initializers = @import("loaded_model/initializers.zig");
 
+fn traceEnabled() bool {
+    const env: std.process.Environ = .{ .block = .global };
+    const raw: []u8 = std.process.Environ.getAlloc(env, std.heap.page_allocator, "AION_TRACE") catch return false;
+    defer std.heap.page_allocator.free(raw);
+    const trimmed: []const u8 = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    return true;
+}
+
 pub const Tensor = types_mod.Tensor;
 pub const StorageManager = types_mod.StorageManager;
 pub const TensorId = types_mod.TensorId;
@@ -44,8 +54,30 @@ pub const LoadedModel = struct {
     cache_entries: std.ArrayList(CacheEntry) = .empty,
     last_run_cache_index: ?usize = null,
     package_hash: u64,
+    trace_runs: bool = false,
 
     const Self = @This();
+
+    fn debugDumpBoundInputs(self: *const Self, trace: bool) void {
+        if (!trace) return;
+        std.debug.print("[aion][run] bound inputs (name -> dtype/shape/tile):\n", .{});
+        for (self.input_signatures, 0..) |sig, idx| {
+            const t_opt: ?Tensor = self.bound_inputs[idx];
+            if (t_opt == null) {
+                std.debug.print("  - {s}: <unbound>\n", .{sig.name});
+                continue;
+            }
+            const t: Tensor = t_opt.?;
+            const meta = self.store.getConst(t.id) catch {
+                std.debug.print("  - {s}: <invalid tensor id {d}>\n", .{ sig.name, t.id });
+                continue;
+            };
+            std.debug.print(
+                "  - {s}: id={d} dtype={s} rank={d} shape={any} tile_shape={any} tile_counts={any} quant_axis={d} aliased_input={any}\n",
+                .{ sig.name, t.id, @tagName(meta.dtype), meta.rank, meta.shape, meta.tile_shape, meta.tile_counts, meta.quant_axis, (self.inputAliasOutputIndex(idx) != null) },
+            );
+        }
+    }
 
     pub fn deinit(self: *Self) void {
         for (self.cache_entries.items) |*entry| {
@@ -193,42 +225,148 @@ pub const LoadedModel = struct {
     }
 
     pub fn run(self: *Self) api_errors.ExecuteError!void {
-        const resolved = try self.resolveBindings();
-        const cache_index = if (try self.findStaticCacheEntry(resolved.direct_input_ids)) |idx|
+        const trace: bool = self.trace_runs;
+        if (trace) {
+            std.debug.print("[aion][run] begin\n", .{});
+            self.debugDumpBoundInputs(true);
+        }
+
+        const resolved = self.resolveBindings() catch |e| {
+            if (trace) {
+                std.debug.print("[aion][run] resolveBindings failed: {s}\n", .{@errorName(e)});
+            }
+            self.debugDumpBoundInputs(trace);
+            return e;
+        };
+
+        const static_idx_opt: ?usize = self.findStaticCacheEntry(resolved.direct_input_ids) catch |e| {
+            if (trace) {
+                std.debug.print("[aion][run] findStaticCacheEntry failed: {s}\n", .{@errorName(e)});
+            }
+            self.debugDumpBoundInputs(trace);
+            return e;
+        };
+
+        const cache_index: usize = if (static_idx_opt) |idx|
             idx
         else
-            try self.ensureCacheEntry(resolved.symbol_values, resolved.input_shapes, resolved.direct_input_ids);
+            self.ensureCacheEntry(resolved.symbol_values, resolved.input_shapes, resolved.direct_input_ids) catch |e| {
+                if (trace) {
+                    std.debug.print("[aion][run] ensureCacheEntry failed: {s}\n", .{@errorName(e)});
+                }
+                self.debugDumpBoundInputs(trace);
+                return e;
+            };
         var entry: *CacheEntry = &self.cache_entries.items[cache_index];
+
+        if (trace) {
+            std.debug.print(
+                "[aion][run] using cache_index={d} steps={d} outputs={d}\n",
+                .{ cache_index, entry.program.steps.len, entry.program.outputs.len },
+            );
+        }
 
         var i: usize = 0;
         while (i < self.bound_inputs.len) : (i += 1) {
-            const src = self.bound_inputs[i].?;
+            const src_opt: ?Tensor = self.bound_inputs[i];
+            if (src_opt == null) {
+                if (trace) {
+                    std.debug.print("[aion][run] missing bound input at index={d}\n", .{i});
+                }
+                return error.InvalidArgument;
+            }
+            const src: Tensor = src_opt.?;
             const dst_tid = entry.input_slots[i];
-            const dst_meta = try self.store.getConst(dst_tid);
+            const dst_meta = self.store.getConst(dst_tid) catch |e| {
+                if (trace) {
+                    std.debug.print(
+                        "[aion][run] getConst failed for input slot {d} (name={s} tid={d}): {s}\n",
+                        .{ i, self.input_signatures[i].name, dst_tid, @errorName(e) },
+                    );
+                }
+                return e;
+            };
             const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
             if (self.inputAliasOutputIndex(i) != null) {
                 const bind_version = self.aliased_input_bind_versions[i];
                 if (bind_version != 0 and entry.aliased_input_sync_versions[i] != bind_version) {
-                    if (src.id != dst.id) try dst.copyFrom(self.allocator, src);
+                    if (src.id != dst.id) dst.copyFrom(self.allocator, src) catch |e| {
+                        if (trace) {
+                            std.debug.print(
+                                "[aion][run] copyFrom failed for aliased input {s} (src_id={d} dst_id={d}): {s}\n",
+                                .{ self.input_signatures[i].name, src.id, dst.id, @errorName(e) },
+                            );
+                        }
+                        return e;
+                    };
                     entry.aliased_input_sync_versions[i] = bind_version;
                 }
                 continue;
             }
-            if (src.id != dst.id) try dst.copyFrom(self.allocator, src);
+            if (src.id != dst.id) dst.copyFrom(self.allocator, src) catch |e| {
+                if (trace) {
+                    std.debug.print(
+                        "[aion][run] copyFrom failed for input {s} (src_id={d} dst_id={d}): {s}\n",
+                        .{ self.input_signatures[i].name, src.id, dst.id, @errorName(e) },
+                    );
+                }
+                return e;
+            };
         }
 
-        try self.backend.executeProgram(&entry.program, self.store.tensorStore());
+        if (trace) {
+            std.debug.print("[aion][run] executing\n", .{});
+        }
+
+        self.backend.executeProgram(&entry.program, self.store.tensorStore()) catch |e| {
+            if (trace) {
+                std.debug.print("[aion][run] backend.executeProgram failed: {s}\n", .{@errorName(e)});
+            }
+            return e;
+        };
+
+        if (trace) {
+            std.debug.print("[aion][run] executed ok, syncing io_aliases={d}\n", .{self.output_aliases.len});
+        }
 
         for (self.output_aliases) |alias| {
             const dst_tid = entry.input_slots[alias.input_index];
             const src_tid = entry.program.outputs[alias.output_index];
             if (dst_tid == src_tid) continue;
 
-            const dst_meta = try self.store.getConst(dst_tid);
-            const src_meta = try self.store.getConst(src_tid);
+            const dst_meta = self.store.getConst(dst_tid) catch |e| {
+                if (trace) {
+                    std.debug.print(
+                        "[aion][run] getConst failed for io_alias dst (input={s} tid={d}): {s}\n",
+                        .{ alias.input_name, dst_tid, @errorName(e) },
+                    );
+                }
+                return e;
+            };
+            const src_meta = self.store.getConst(src_tid) catch |e| {
+                if (trace) {
+                    std.debug.print(
+                        "[aion][run] getConst failed for io_alias src (output={s} tid={d}): {s}\n",
+                        .{ alias.output_name, src_tid, @errorName(e) },
+                    );
+                }
+                return e;
+            };
             const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
             const src = Tensor{ .store = self.store, .id = src_tid, .dtype = src_meta.dtype, .shape = src_meta.shape };
-            try dst.copyFrom(self.allocator, src);
+            dst.copyFrom(self.allocator, src) catch |e| {
+                if (trace) {
+                    std.debug.print(
+                        "[aion][run] output alias copyFrom failed (input={s} output={s}): {s}\n",
+                        .{ alias.input_name, alias.output_name, @errorName(e) },
+                    );
+                }
+                return e;
+            };
+        }
+
+        if (trace) {
+            std.debug.print("[aion][run] done\n", .{});
         }
 
         self.last_run_cache_index = cache_index;
@@ -255,7 +393,21 @@ pub const LoadedModel = struct {
         errdefer allocator.free(input_signatures);
         const output_signatures = try signatures.buildSignatures(allocator, &package, package.outputs);
         errdefer allocator.free(output_signatures);
-        const output_aliases = try signatures.buildIoAliasInfo(allocator, &package, input_signatures, output_signatures);
+
+        // `io_aliases` are an optimization hint (copy outputs back into input slots).
+        // Some packages may include incompatible aliases; filter them out here so that
+        // executing the model never fails due to alias copyFrom dtype/rank mismatch.
+        var valid_alias_count: usize = 0;
+        for (package.io_aliases) |alias| {
+            const input_index: usize = alias.input;
+            const output_index: usize = alias.output;
+            if (input_index >= input_signatures.len or output_index >= output_signatures.len) continue;
+            if (input_signatures[input_index].dtype != output_signatures[output_index].dtype) continue;
+            if (input_signatures[input_index].rank != output_signatures[output_index].rank) continue;
+            valid_alias_count += 1;
+        }
+
+        const output_aliases = try allocator.alloc(IoAliasInfo, valid_alias_count);
         errdefer allocator.free(output_aliases);
 
         const input_alias_output_indices = try allocator.alloc(u32, input_signatures.len);
@@ -266,10 +418,29 @@ pub const LoadedModel = struct {
         errdefer allocator.free(output_alias_input_indices);
         @memset(output_alias_input_indices, types_mod.invalid_alias_index);
 
+        var alias_cursor: usize = 0;
         for (package.io_aliases) |alias| {
-            input_alias_output_indices[alias.input] = alias.output;
-            output_alias_input_indices[alias.output] = alias.input;
+            const input_index: usize = alias.input;
+            const output_index: usize = alias.output;
+            if (input_index >= input_signatures.len or output_index >= output_signatures.len) continue;
+            if (input_signatures[input_index].dtype != output_signatures[output_index].dtype) continue;
+            if (input_signatures[input_index].rank != output_signatures[output_index].rank) continue;
+
+            if (input_alias_output_indices[input_index] != types_mod.invalid_alias_index) return error.InvalidArgument;
+            if (output_alias_input_indices[output_index] != types_mod.invalid_alias_index) return error.InvalidArgument;
+            input_alias_output_indices[input_index] = @intCast(output_index);
+            output_alias_input_indices[output_index] = @intCast(input_index);
+
+            // Populate the public-facing alias list.
+            output_aliases[alias_cursor] = .{
+                .input_name = input_signatures[input_index].name,
+                .output_name = output_signatures[output_index].name,
+                .input_index = input_index,
+                .output_index = output_index,
+            };
+            alias_cursor += 1;
         }
+        std.debug.assert(alias_cursor == output_aliases.len);
 
         const bound_inputs = try allocator.alloc(?Tensor, input_signatures.len);
         errdefer allocator.free(bound_inputs);
@@ -310,6 +481,7 @@ pub const LoadedModel = struct {
             .run_input_shapes = run_input_shapes,
             .run_direct_input_ids = run_direct_input_ids,
             .package_hash = package_hash,
+            .trace_runs = traceEnabled(),
         };
     }
 
@@ -386,7 +558,11 @@ pub const LoadedModel = struct {
         for (self.input_signatures, 0..) |sig, sig_idx| {
             const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
-                try initializers.createTensorForShape(self.store, self.policy, sig.dtype, concrete_shape)
+                // Aliased inputs (typically KV caches) must persist their full contents
+                // across runs and are consumed by ops like KVCacheAppend that require
+                // single-tile layout on the last axis. Bypass the default tiler, which
+                // would split large caches into a 2D-square grid.
+                try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, concrete_shape)
             else blk: {
                 const tid = direct_input_ids[sig_idx];
                 if (tid == types_mod.invalid_tensor_id) return error.InvalidArgument;

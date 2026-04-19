@@ -6,6 +6,62 @@ pub fn detect() cpuid_root.CpuInfo {
     var info: cpuid_root.CpuInfo = .{ .arch = .x86_64 };
 
     const max_leaf: u32 = cpuid(0, 0).eax;
+
+    // Topology (best-effort).
+    if (max_leaf >= 1) {
+        const l1 = cpuid(1, 0);
+        info.logical_processors = @as(usize, @intCast((l1.ebx >> 16) & 0xFF));
+    }
+
+    // Prefer modern topology leaves (0x1F / 0x0B):
+    // - level type 1 => SMT logical processors per core
+    // - level type 2 => logical processors per package
+    // physical cores per package ~= level2 / level1
+    const topo_leaf: u32 = if (max_leaf >= 0x1F)
+        0x1F
+    else if (max_leaf >= 0x0B)
+        0x0B
+    else
+        0;
+
+    if (topo_leaf != 0) {
+        var smt_logical: usize = 0;
+        var pkg_logical: usize = 0;
+        var subleaf: u32 = 0;
+        while (subleaf < 8) : (subleaf += 1) {
+            const r = cpuid(topo_leaf, subleaf);
+            const level_type: u32 = (r.ecx >> 8) & 0xFF;
+            const logical_at_level: usize = @as(usize, @intCast(r.ebx & 0xFFFF));
+            if (logical_at_level == 0) break;
+
+            switch (level_type) {
+                1 => smt_logical = logical_at_level,
+                2 => pkg_logical = logical_at_level,
+                else => {},
+            }
+        }
+
+        if (pkg_logical != 0) {
+            info.logical_processors = pkg_logical;
+            if (smt_logical != 0) {
+                info.physical_cores = @max(@as(usize, 1), pkg_logical / smt_logical);
+            }
+        }
+    }
+
+    // Fallback topology from deterministic cache params when modern leaves are
+    // unavailable or incomplete.
+    if (info.physical_cores == 0 and max_leaf >= 4) {
+        const l4_0 = cpuid(4, 0);
+        // Deterministic cache leaf encodes "number of cores - 1" in EAX[31:26].
+        if ((l4_0.eax & 0x1F) != 0) {
+            info.physical_cores = @as(usize, @intCast(((l4_0.eax >> 26) & 0x3F) + 1));
+        }
+    }
+    if (info.logical_processors != 0 and info.physical_cores == 0) {
+        info.physical_cores = info.logical_processors;
+    }
+
     if (max_leaf >= 7) {
         const l7_0 = cpuid(7, 0);
         // AVX2: EBX bit 5

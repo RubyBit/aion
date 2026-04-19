@@ -81,7 +81,7 @@ pub fn execElemwiseBinaryTiled(
                         const a_view = a_tile.bufferView();
                         const b_view = b_tile.bufferView();
 
-                        const n: usize = if (out_view.layout.rank == 1) out_view.layout.shape[0] else (out_view.layout.shape[0] * out_view.layout.shape[1]);
+                        const n: usize = exec_utils.elemCountFromTileView(out_view);
                         switch (out_view.dtype) {
                             .f32 => elemwise.elemwiseBinaryF32(t.op, out_view.bytes, a_view.bytes, b_view.bytes, n) catch |e| {
                                 t.fail(e);

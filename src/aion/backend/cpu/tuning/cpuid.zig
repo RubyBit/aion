@@ -32,6 +32,10 @@ pub const CpuInfo = struct {
     arch: Arch = .unknown,
     features: CpuFeatures = .{},
     caches: Caches = .{},
+    /// Logical processors visible to the OS (best-effort).
+    logical_processors: usize = 0,
+    /// Physical core count (best-effort; 0 when unknown).
+    physical_cores: usize = 0,
 };
 
 pub fn detect() CpuInfo {

@@ -218,6 +218,38 @@ pub export fn aion_tensor_create_empty(
     return .AION_OK;
 }
 
+pub export fn aion_tensor_create_empty_tiled(
+    ctx_opt: ?*AionContext,
+    dtype_c: AionDType,
+    rank: usize,
+    shape_ptr: [*c]const usize,
+    tile_shape_ptr: [*c]const usize,
+    out_tensor: ?*?*AionTensor,
+) callconv(.c) AionStatus {
+    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    ctx.clearLastError();
+
+    if (out_tensor == null) return .AION_INVALID_ARGUMENT;
+    out_tensor.?.* = null;
+
+    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
+    const tile_shape: []const usize = getShapeSlice(rank, tile_shape_ptr) orelse return .AION_INVALID_ARGUMENT;
+    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
+
+    const t: api.Tensor = ctx.ctx.tensorTiled(dt, shape, tile_shape) catch |e| {
+        ctx.setLastError("tensor_create_empty_tiled", e);
+        return mapError(e);
+    };
+
+    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+        ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    handle.* = .{ .owner = ctx, .tensor = t };
+    out_tensor.?.* = handle;
+    return .AION_OK;
+}
+
 pub export fn aion_tensor_create(
     ctx_opt: ?*AionContext,
     dtype_c: AionDType,

@@ -78,7 +78,7 @@ pub fn execUnaryTiled(
 
                         const out_view = out_tile.bufferView();
                         const a_view = a_tile.bufferView();
-                        const n: usize = if (out_view.layout.rank == 1) out_view.layout.shape[0] else (out_view.layout.shape[0] * out_view.layout.shape[1]);
+                        const n: usize = exec_utils.elemCountFromTileView(out_view);
 
                         switch (out_view.dtype) {
                             .f32 => dispatchF32(t.op, out_view.bytes, a_view.bytes, n) catch |e| {

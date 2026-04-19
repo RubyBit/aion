@@ -72,6 +72,24 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     MultiHeadAttentionCached = 24,
+
+    /// Elementwise scalar-dtype cast (shape- and layout-preserving).
+    ///
+    /// Supported pairs: f32<->f16. Primary use case: bridging the f32 output of
+    /// quantized matmul to f16 KV caches before `KVCacheAppend`.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    Cast = 25,
+
+    /// Matmul with the right operand conceptually transposed: C[m,n] = sum_k A[m,k] * B[n,k].
+    ///
+    /// Unlike the standard `MatMul` (which expects B shaped `[K, N]` with axis-0 blocks
+    /// for quantized B), `MatMulNT` expects B shaped `[N, K]` with per-row blocks
+    /// (q8_0 `quant_axis == 1`). This is the layout an embedding table already has on
+    /// disk, so tied logits can reuse the token embedding without duplicating it.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    MatMulNT = 26,
 };
 
 pub const Op = union(OpTag) {
@@ -257,6 +275,12 @@ pub const Op = union(OpTag) {
         sliding_window: usize,
         attn_logits_soft_cap: f32,
     },
+
+    /// Elementwise scalar-dtype cast.
+    Cast: struct { to_dtype: DType },
+
+    /// Matmul with B conceptually transposed; see `OpTag.MatMulNT` doc.
+    MatMulNT: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 };
 
 pub const InputArity = union(enum) {
@@ -303,6 +327,8 @@ pub fn opInputArity(op: Op) InputArity {
         .GatherRows => .{ .exact = 2 },
         .RoPE1D => .{ .exact = 2 },
         .KVCacheAppend => .{ .exact = 3 },
+        .Cast => .{ .exact = 1 },
+        .MatMulNT => .{ .exact = 2 },
     };
 }
 
@@ -602,6 +628,17 @@ pub const Graph = struct {
         return self.addNodeInternal(
             .KVCacheAppend,
             &[_]ValueId{ cache, new_kv, end_index },
+        );
+    }
+
+    pub fn addCast(self: *Self, x: ValueId, to_dtype: DType) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Cast = .{ .to_dtype = to_dtype } }, &[_]ValueId{x});
+    }
+
+    pub fn addMatMulNT(self: *Self, a: ValueId, b: ValueId, alpha: f32, beta: f32) GraphError!ValueId {
+        return self.addNodeInternal(
+            .{ .MatMulNT = .{ .alpha = alpha, .beta = beta } },
+            &[_]ValueId{ a, b },
         );
     }
 

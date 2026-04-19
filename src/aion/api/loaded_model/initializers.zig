@@ -21,16 +21,80 @@ pub fn createTensorForShape(
     dtype: types_mod.DType,
     shape: []const usize,
 ) (error{ InvalidArgument, OutOfMemory } || manager_mod.StorageError)!types_mod.TensorId {
+    return createTensorForShapeWithQuantAxis(store, policy, dtype, shape, 0);
+}
+
+/// Create a tensor sized to `shape` but tiled as a single physical tile (tile_shape == shape).
+///
+/// Intended for graph inputs whose on-disk semantics require persisting full-shape data
+/// across runs (notably KV caches aliased to outputs): those tensors are populated by
+/// `copyFrom` on each bind, so any tile split inside them is either wasted work or a
+/// kernel invariant violation. Shape-aligned single-tile allocation avoids both.
+pub fn createTensorSingleTile(
+    store: *types_mod.StorageManager,
+    policy: types_mod.TilePolicy,
+    dtype: types_mod.DType,
+    shape: []const usize,
+) (error{ InvalidArgument, OutOfMemory } || manager_mod.StorageError)!types_mod.TensorId {
+    if (shape.len == 0 or shape.len > api_tiling.MAX_RANK) return error.InvalidArgument;
+    if (dtype.info().is_quantized) {
+        // Quantized single-tile allocation is out of scope for this helper: the block-axis
+        // alignment rules overlap with per-op tiling constraints. Callers that need quant
+        // layouts go through `createTensorForShapeWithQuantAxis`.
+        return error.InvalidArgument;
+    }
+    return store.createTiledTensor(dtype, shape, shape, .{ .tile_alignment = policy.tile_alignment });
+}
+
+/// Like `createTensorForShape`, but with an explicit `quant_axis` for quantized dtypes.
+///
+/// Tiling strategy depends on the block axis:
+/// - `quant_axis == rank-2` (matmul-B weights `[..., K, N]`): use the matmul-B tiling helper.
+/// - `quant_axis == 1` (embedding table `[V, D]`): use the full-row tiling helper so
+///   gather kernels can read one row as a contiguous block run.
+/// - other combinations: fall back to the default tile helper (must keep `tile_shape[quant_axis]`
+///   a multiple of the dtype's `block_elems`).
+pub fn createTensorForShapeWithQuantAxis(
+    store: *types_mod.StorageManager,
+    policy: types_mod.TilePolicy,
+    dtype: types_mod.DType,
+    shape: []const usize,
+    quant_axis: u8,
+) (error{ InvalidArgument, OutOfMemory } || manager_mod.StorageError)!types_mod.TensorId {
+    const is_quant = dtype.info().is_quantized;
+    if (is_quant and @as(usize, quant_axis) >= shape.len) return error.InvalidArgument;
+
     var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
     const tile_shape = tile_mem[0..shape.len];
-    if (dtype.info().is_quantized and shape.len == 2) {
-        const tiles = api_tiling.chooseQuantMatMulBTiles(policy, shape[0], shape[1], dtype);
+
+    const rank: usize = shape.len;
+
+    // Quantized matmul-B tensors use the K axis as the block axis.
+    // This is the canonical layout for dense weights and must preserve block alignment.
+    if (is_quant and rank >= 2 and @as(usize, quant_axis) == (rank - 2)) {
+        var d: usize = 0;
+        while (d + 2 < rank) : (d += 1) {
+            // Batch dims are always tiled as 1 (matches compiler invariants for MatMul).
+            tile_shape[d] = 1;
+        }
+
+        const k: usize = shape[rank - 2];
+        const n: usize = shape[rank - 1];
+        const tiles = api_tiling.chooseQuantMatMulBTiles(policy, k, n, dtype);
+        tile_shape[rank - 2] = tiles[0];
+        tile_shape[rank - 1] = tiles[1];
+    } else if (is_quant and shape.len == 2 and quant_axis == 1) {
+        const tiles = api_tiling.chooseQuantEmbeddingTableTiles(policy, shape[0], shape[1]);
         tile_shape[0] = tiles[0];
         tile_shape[1] = tiles[1];
     } else {
         try api_tiling.fillDefaultTileShape(policy, dtype, shape, tile_shape);
     }
-    return store.createTiledTensor(dtype, shape, tile_shape, .{ .tile_alignment = policy.tile_alignment });
+
+    return store.createTiledTensor(dtype, shape, tile_shape, .{
+        .tile_alignment = policy.tile_alignment,
+        .quant_axis = quant_axis,
+    });
 }
 
 fn resolveConstShape(
@@ -57,17 +121,30 @@ fn initInitializerTensors(
         const value = package.values[value_idx];
         const shape = try resolveConstShape(allocator, package, value);
         defer allocator.free(shape);
-        slot.* = try createTensorForShape(store, policy, value.dtype, shape);
+
+        const init = package.initializers[init_idx];
+        const quant_axis: u8 = switch (init.encoding) {
+            .plain => 0,
+            .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
+        };
+        slot.* = try createTensorForShapeWithQuantAxis(store, policy, value.dtype, shape, quant_axis);
 
         const meta = try store.getConst(slot.*);
         const tensor = types_mod.Tensor{ .store = store, .id = slot.*, .dtype = meta.dtype, .shape = meta.shape };
-        const init = package.initializers[init_idx];
         switch (init.encoding) {
             .plain => try tensor.writePackedScalar(init.data),
             .quantized => try tensor.writePackedQuant(init.data),
         }
     }
     return tids;
+}
+
+fn quantAxisToU8(raw: i32, rank: usize) error{InvalidArgument}!u8 {
+    if (raw < 0) return error.InvalidArgument;
+    const as_usize: usize = @intCast(raw);
+    if (as_usize >= rank) return error.InvalidArgument;
+    if (as_usize > std.math.maxInt(u8)) return error.InvalidArgument;
+    return @intCast(as_usize);
 }
 
 fn findInitializerValueIndex(package: *const types_mod.Package, initializer_index: u32) ?usize {

@@ -54,6 +54,14 @@ AionStatus aion_tensor_create_empty(
     const size_t* shape,
     AionTensor** out_tensor);
 
+AionStatus aion_tensor_create_empty_tiled(
+    AionContext* ctx,
+    AionDType dtype,
+    size_t rank,
+    const size_t* shape,
+    const size_t* tile_shape,
+    AionTensor** out_tensor);
+
 AionStatus aion_tensor_create(
     AionContext* ctx,
     AionDType dtype,

@@ -19,6 +19,22 @@ pub const PackedBView = []align(32) const u8;
 pub const PackBFn = *const fn (scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void;
 pub const MatMulPackedBFn = *const fn (scratch_bytes: []u8, packed_b_view: PackedBView, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void;
 
+/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
+/// where A is M×K f32, B is N×K q8_0 (row-major, contiguous along K), and C is M×n_count f32.
+/// No pre-pack: B's rows are already in the natural access order for A @ B^T.
+pub const MatMulNtQ8_0Fn = *const fn (
+    a_ptr: [*]align(1) const f32,
+    b_ptr: [*]const u8,
+    c_ptr: [*]align(1) f32,
+    m_total: usize,
+    k: usize,
+    n_total: usize,
+    n_start: usize,
+    n_count: usize,
+    alpha: f32,
+    beta: f32,
+) types.BackendError!void;
+
 pub const QuantKernels = struct {
     tuning: Tuning,
 
@@ -31,6 +47,7 @@ pub const QuantKernels = struct {
     pack_b_tile_q8_0: PackBFn,
 
     matmul_packed_b: MatMulPackedBFn,
+    matmul_nt_q8_0: MatMulNtQ8_0Fn,
 };
 
 pub const VariantId = enum { small, medium, large };
@@ -50,6 +67,9 @@ fn kernelsFor(comptime t: Tuning) QuantKernels {
         .pack_b_tile_q4_0 = K.packBTileQ4_0,
         .pack_b_tile_q8_0 = K.packBTileQ8_0,
         .matmul_packed_b = K.matmulQx0PackedB,
+        // NT kernel is independent of (KC, MC, NC) tuning — B has contiguous rows
+        // so no packing is involved. All candidates point at the same kernel.
+        .matmul_nt_q8_0 = quant_matmul.matmulNtQ8_0,
     };
 }
 

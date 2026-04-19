@@ -173,13 +173,20 @@ pub const Context = struct {
     }
 
     pub fn loadModel(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!LoadedModel {
+        // `parseTakeOwned` transfers ownership of `bytes` into the returned Package
+        // (Initializer.data slices borrow into it). `pkg.deinit` frees the buffer.
         const bytes = try package_file.readAlloc(self.allocator, file);
-        defer self.allocator.free(bytes);
+        errdefer self.allocator.free(bytes);
         const hash = std.hash.Wyhash.hash(0, bytes);
-        var pkg = try package_file.parse(self.allocator, bytes);
+        var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
         errdefer pkg.deinit();
         const initializer_tids = try api_loaded_model.importInitializersForLoadedModel(self.allocator, &self.store, self.policy, &pkg);
         errdefer self.allocator.free(initializer_tids);
+        // Weights are now fully copied into the storage manager; the raw package
+        // buffer is no longer needed. Free it now to halve peak RSS (otherwise the
+        // 4–5 GB file buffer would live alongside the tiled tensors for the whole
+        // lifetime of the LoadedModel).
+        pkg.releaseSourceBytes();
         return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash);
     }
 
@@ -189,9 +196,9 @@ pub const Context = struct {
     /// context's storage, but does not instantiate or run the package graph.
     pub fn loadWeights(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!Weights {
         const bytes = try package_file.readAlloc(self.allocator, file);
-        defer self.allocator.free(bytes);
+        errdefer self.allocator.free(bytes);
         const hash = std.hash.Wyhash.hash(0, bytes);
-        var pkg = try package_file.parse(self.allocator, bytes);
+        var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
         errdefer pkg.deinit();
         const initializer_tids = try api_weights.importInitializersForWeights(self.allocator, &self.store, self.policy, &pkg);
         errdefer self.allocator.free(initializer_tids);

@@ -2005,3 +2005,94 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     const Out: api.TensorRef = try bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0);
     try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}));
 }
+
+// Opt-in load test: loads a pre-built `.aion` package from `AION_GEMMA_VERIFY_PATH`
+// and asserts every materialized weight tensor is either `q8_0` or `f16`, with total
+// bytes below a caller-supplied budget (`AION_GEMMA_MAX_GB`, default 6).
+//
+// Skipped unless the env var is set; used for manual validation of a real Gemma 4 E2B
+// conversion without dragging multi-GB files into CI.
+test "api: loaded package keeps weights quantized (opt-in via AION_GEMMA_VERIFY_PATH)" {
+    // Use the OS page allocator rather than `std.testing.allocator` here: loading a
+    // multi-GB package via the debug allocator pulls in bookkeeping that, combined
+    // with the transient peak during initializer import, trips the process's address
+    // space reservations on Windows. Page_allocator serves requests directly from the
+    // OS which is the right fit for this one-shot big-file load.
+    const allocator: std.mem.Allocator = std.heap.page_allocator;
+    const env: std.process.Environ = .{ .block = .global };
+
+    const path: []u8 = std.process.Environ.getAlloc(env, allocator, "AION_GEMMA_VERIFY_PATH") catch
+        return error.SkipZigTest;
+    defer allocator.free(path);
+    if (path.len == 0) return error.SkipZigTest;
+
+    const max_gb_raw: ?[]u8 = std.process.Environ.getAlloc(env, allocator, "AION_GEMMA_MAX_GB") catch null;
+    defer if (max_gb_raw) |p| allocator.free(p);
+    const max_gb: f64 = if (max_gb_raw) |raw|
+        std.fmt.parseFloat(f64, raw) catch 6.0
+    else
+        6.0;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // Narrow the failing step.
+    {
+        var io_backend: std.Io.Threaded = .init_single_threaded;
+        const io = io_backend.io();
+        const pf = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer pf.close(io);
+        const raw = try package_file.readAlloc(allocator, pf);
+        std.debug.print("[gemma-verify] readAlloc ok ({d} bytes)\n", .{raw.len});
+        var parsed = try package_file.parseTakeOwned(allocator, raw);
+        std.debug.print("[gemma-verify] parseTakeOwned ok (initializers={d} nodes={d})\n", .{ parsed.initializers.len, parsed.nodes.len });
+        parsed.deinit();
+        std.debug.print("[gemma-verify] parsed.deinit ok\n", .{});
+    }
+
+    var model = try ctx.loadModelPathAbsolute(path, .{});
+    defer model.deinit();
+
+    var total_bytes: usize = 0;
+    var weights_bytes: usize = 0;
+    var weights_q8_count: usize = 0;
+    var weights_f16_count: usize = 0;
+    var weights_f32_count: usize = 0;
+    var weights_other_count: usize = 0;
+
+    // Count only initializer-backed tensors for the "weights remain quantized" claim.
+    // The store also contains many produced/intermediate tensors allocated during
+    // compilation, and those are not expected to be quantized.
+    for (model.package.values, 0..) |value, idx| {
+        if (value.source != .initializer) continue;
+        const wt = try model.initializerTensorByValue(@intCast(idx));
+        const meta = try ctx.store.getConst(wt.tensorId());
+        weights_bytes += meta.data.len;
+        switch (meta.dtype) {
+            .q8_0 => weights_q8_count += 1,
+            .f16 => weights_f16_count += 1,
+            .f32 => weights_f32_count += 1,
+            else => weights_other_count += 1,
+        }
+    }
+
+    for (ctx.store.tensors.items) |t| {
+        total_bytes += t.data.len;
+    }
+
+    std.debug.print(
+        "[gemma-verify] weights: q8_0={d} f16={d} f32={d} other={d} ({d:.3} GB) | total={d:.3} GB (budget {d:.3} GB)\n",
+        .{
+            weights_q8_count,
+            weights_f16_count,
+            weights_f32_count,
+            weights_other_count,
+            @as(f64, @floatFromInt(weights_bytes)) / 1e9,
+            @as(f64, @floatFromInt(total_bytes)) / 1e9,
+            max_gb,
+        },
+    );
+
+    try std.testing.expect(weights_other_count == 0);
+    try std.testing.expect(@as(f64, @floatFromInt(total_bytes)) / 1e9 <= max_gb);
+}

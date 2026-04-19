@@ -27,6 +27,31 @@ pub const TilePolicy = struct {
     /// as a single tile, eliminating per-tile acquire/release overhead and
     /// enabling the memcpy fast-path in readTensorPackedF32/writeTensorPackedF32.
     small_tensor_threshold: usize = 128 * 1024,
+
+    /// For rank>2 tensors, scalar retiling that changes the last two dims can
+    /// be expensive and may increase peak memory use (a new tiled backing buffer
+    /// is allocated). We still need to allow it for common layout-bridging cases
+    /// (e.g. matmul outputs feeding into another matmul with a different K-tile),
+    /// so this separate threshold bounds when such retiles are permitted.
+    ///
+    /// This is deliberately decoupled from `small_tensor_threshold`: raising the
+    /// latter would also force many tensors into single-tile storage, which can
+    /// harm parallelism. Here we only control whether the compiler may insert a
+    /// `ReTileCopyScalar` that changes the last/2nd-last tile sizes for rank>2.
+    retile_last2d_change_max_elems: usize = 32 * 1024 * 1024,
+
+    // /// Target number of output tiles for matvec-shaped matmuls (M <= 4).
+    // ///
+    // /// Matvec matmuls parallelize over N tiles; with too few tiles, only a fraction
+    // /// of the thread pool does real work. We size `tn` so that we get at least this
+    // /// many tiles along the N axis, rounded to SIMD-friendly multiples of 16. Tuned
+    // /// for 32-core CPUs; leaves a small margin so every worker usually gets one tile.
+    // matvec_min_n_tiles: usize = 32,
+
+    // /// Minimum `tn` for matvec matmuls. Even when the shape would prefer smaller
+    // /// tiles for more parallelism, we keep at least this many columns per tile so
+    // /// per-call packing/dispatch overhead doesn't dominate the inner kernel.
+    // matvec_min_tn: usize = 32,
 };
 
 pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {

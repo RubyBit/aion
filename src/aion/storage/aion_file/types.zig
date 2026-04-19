@@ -186,6 +186,9 @@ pub const NodeOp = union(graph_mod.OpTag) {
         sliding_window: u64,
         attn_logits_soft_cap: f32,
     },
+
+    Cast: struct { to_dtype: DType },
+    MatMulNT: struct { alpha: f32, beta: f32 },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -232,6 +235,13 @@ pub const Package = struct {
     debug_names: []DebugName,
     io_aliases: []IoAlias,
 
+    /// When non-null, this Package owns the raw file-byte buffer and some of its
+    /// internal slices (notably `Initializer.data`, the largest by far) are borrows
+    /// into this buffer instead of separately-allocated copies. `deinit` frees the
+    /// buffer once. Set by `parseTakeOwned`; `parse` leaves it null and keeps the
+    /// original copy-on-parse semantics.
+    source_bytes: ?[]u8 = null,
+
     const Self = @This();
 
     pub fn graphMeta(self: *const Self) GraphMeta {
@@ -249,8 +259,32 @@ pub const Package = struct {
         };
     }
 
+    /// Free the raw file-byte buffer once tensor data has been copied elsewhere.
+    ///
+    /// After this runs, every `Initializer.data` (and borrowed `QuantizedEncoding.params`)
+    /// slice in this Package is emptied — callers must not read them afterwards. This
+    /// exists to reclaim the 4–5 GB file buffer the moment weights have been imported
+    /// into the storage manager, halving peak RSS for loaded models.
+    pub fn releaseSourceBytes(self: *Self) void {
+        const buf = self.source_bytes orelse return;
+        for (self.initializers) |*init| {
+            init.data = &[_]u8{};
+            switch (init.encoding) {
+                .quantized => |*q| {
+                    q.params = &[_]u8{};
+                },
+                else => {},
+            }
+        }
+        self.allocator.free(buf);
+        self.source_bytes = null;
+    }
+
     pub fn deinit(self: *Self) void {
-        freeInitializers(self.allocator, self.initializers);
+        // If we own `source_bytes`, most `Initializer.data` and `QuantizedEncoding.params`
+        // slices borrow into that buffer; skip freeing them individually.
+        const borrowed_init_data: bool = self.source_bytes != null;
+        freeInitializersImpl(self.allocator, self.initializers, borrowed_init_data);
         freeValues(self.allocator, self.values);
         freeNodes(self.allocator, self.nodes);
         freeNamedValues(self.allocator, self.inputs);
@@ -260,6 +294,7 @@ pub const Package = struct {
         freeMetadata(self.allocator, self.metadata);
         freeDebugNames(self.allocator, self.debug_names);
         self.allocator.free(self.io_aliases);
+        if (self.source_bytes) |buf| self.allocator.free(buf);
         self.* = undefined;
     }
 
@@ -383,14 +418,23 @@ fn validateIoAliases(pkg: *const Package) PackageError!void {
         const input_idx: usize = alias.input;
         const output_idx: usize = alias.output;
         if (input_idx >= pkg.inputs.len or output_idx >= pkg.outputs.len) return PackageError.InvalidFormat;
+
+        // The signature entries must reference valid value indices.
+        const input_value_idx: usize = pkg.inputs[input_idx].value;
+        const output_value_idx: usize = pkg.outputs[output_idx].value;
+        if (input_value_idx >= pkg.values.len or output_value_idx >= pkg.values.len) return PackageError.InvalidFormat;
+
+        const input_value = pkg.values[input_value_idx];
+        const output_value = pkg.values[output_value_idx];
+
+        // `io_aliases` are a performance hint (copy output back into an input slot).
+        // They must always be compatible (same dtype + rank).
+        if (input_value.dtype != output_value.dtype) return PackageError.InvalidFormat;
+        if (input_value.rank != output_value.rank) return PackageError.InvalidFormat;
+
         if (used_inputs[input_idx] or used_outputs[output_idx]) return PackageError.InvalidFormat;
         used_inputs[input_idx] = true;
         used_outputs[output_idx] = true;
-
-        const input_value = pkg.values[pkg.inputs[input_idx].value];
-        const output_value = pkg.values[pkg.outputs[output_idx].value];
-        if (input_value.dtype != output_value.dtype) return PackageError.InvalidFormat;
-        if (input_value.rank != output_value.rank) return PackageError.InvalidFormat;
     }
 }
 
@@ -424,15 +468,19 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
 }
 
 fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) void {
+    freeInitializersImpl(allocator, initializers, false);
+}
+
+fn freeInitializersImpl(allocator: std.mem.Allocator, initializers: []Initializer, borrowed_data: bool) void {
     for (initializers) |*init| {
         switch (init.encoding) {
             .plain => {},
             .quantized => |q| {
                 allocator.free(q.scheme);
-                allocator.free(q.params);
+                if (!borrowed_data) allocator.free(q.params);
             },
         }
-        allocator.free(init.data);
+        if (!borrowed_data) allocator.free(init.data);
     }
     allocator.free(initializers);
 }

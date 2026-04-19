@@ -70,3 +70,14 @@ pub fn chooseQuantMatMulBTiles(policy: plan_mod.TilePolicy, k: usize, n: usize, 
     const tiles = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, b_dtype);
     return .{ tiles.tk, tiles.tn };
 }
+
+/// Suggested tiling for a rank-2 quantized embedding table of shape [V, D] with
+/// `quant_axis == 1` (per-row quantization).
+///
+/// Returns `[tv, td]` such that `td == D` and `tv` is a conservative row-count per tile.
+/// Keeping `td == D` means each row of the table is exactly one contiguous run of
+/// `D / block_elems` blocks inside a tile — the layout a row-gather kernel wants.
+pub fn chooseQuantEmbeddingTableTiles(policy: plan_mod.TilePolicy, v: usize, d: usize) [2]usize {
+    const tv: usize = @max(@as(usize, 1), @min(v, policy.base_1d));
+    return .{ tv, d };
+}

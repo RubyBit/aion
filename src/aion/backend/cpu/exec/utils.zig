@@ -42,8 +42,15 @@ pub fn shouldParallelTiles(thread_count: usize, tile_total: usize, tile_bytes: u
     if (tile_total == 0) return false;
     const total_bytes: usize = tile_bytes * tile_total;
     if (total_bytes >= min_total_bytes) return true;
-    // Also allow when we have at least two tiles; matmul-like ops are compute heavy per tile.
-    return tile_total >= 2;
+    // For small total byte volumes, avoid parallel launch overhead unless we have
+    // enough tiles to keep a meaningful subset of workers busy.
+    //
+    // Previous logic (`tile_total >= 2`) was too eager on high-thread-count CPUs,
+    // especially in decode-time graphs with many tiny ops, and could regress
+    // throughput due to synchronization/scheduling overhead.
+    const half_threads_ceil: usize = (thread_count + 1) / 2;
+    const min_tiles_for_parallel: usize = @max(@as(usize, 2), @min(@as(usize, 8), half_threads_ceil));
+    return tile_total >= min_tiles_for_parallel;
 }
 
 pub fn elemCountFromTileView(view: anytype) usize {
@@ -161,41 +168,124 @@ fn writeScalarBytesAt(
     @memcpy(cache.tile.bytes[off .. off + elem_bytes], bytes);
 }
 
-pub fn retileCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
-    const dst_meta = try store.meta(dst_id);
-    const src_meta = try store.meta(src_id);
-    if (dst_meta.rank != src_meta.rank) return BackendError.InvalidArgument;
-    const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
+fn retileCopyScalar2D(
+    store: tensor_store.TensorStore,
+    dst_meta: tensor_store.TensorMeta,
+    src_meta: tensor_store.TensorMeta,
+    dst_id: tensor_store.TensorId,
+    src_id: tensor_store.TensorId,
+    elem_bytes: usize,
+) ExecuteProgramError!void {
+    if (dst_meta.rank != 2 or src_meta.rank != 2) return BackendError.InvalidArgument;
+    if (dst_meta.shape[0] != src_meta.shape[0] or dst_meta.shape[1] != src_meta.shape[1]) return BackendError.InvalidArgument;
 
-    if (dst_meta.rank > 2) {
-        return retileCopyScalarND(store, dst_meta, src_meta, dst_id, src_id, elem_bytes);
-    }
+    const src_ts0: usize = src_meta.tile_shape[0];
+    const src_ts1: usize = src_meta.tile_shape[1];
+    const dst_ts0: usize = dst_meta.tile_shape[0];
+    const dst_ts1: usize = dst_meta.tile_shape[1];
+    if (src_ts0 == 0 or src_ts1 == 0 or dst_ts0 == 0 or dst_ts1 == 0) return BackendError.InvalidArgument;
 
     var src_cache: ScalarTileCacheConst = .{};
     defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
     var dst_cache: ScalarTileCacheMut = .{};
     defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
 
-    var tmp: [4]u8 = .{ 0, 0, 0, 0 };
-    const buf: []u8 = tmp[0..elem_bytes];
+    const dst_tc0: usize = dst_meta.tile_counts[0];
+    const dst_tc1: usize = dst_meta.tile_counts[1];
+    if (dst_tc0 == 0 or dst_tc1 == 0) return BackendError.InvalidArgument;
 
-    if (dst_meta.rank == 1) {
-        var i: usize = 0;
-        while (i < dst_meta.shape[0]) : (i += 1) {
-            try readScalarBytesAt(store, src_meta, src_id, elem_bytes, i, 0, &src_cache, buf);
-            try writeScalarBytesAt(store, dst_meta, dst_id, elem_bytes, i, 0, &dst_cache, buf);
+    var dti0: usize = 0;
+    while (dti0 < dst_tc0) : (dti0 += 1) {
+        var dti1: usize = 0;
+        while (dti1 < dst_tc1) : (dti1 += 1) {
+            try ensureMutTile(&dst_cache, store, dst_id, dti0, dti1);
+
+            const dst_m: usize = dst_cache.tile.shape_mem[0];
+            const dst_n: usize = dst_cache.tile.shape_mem[1];
+            if (dst_m == 0 or dst_n == 0) continue;
+
+            const dst_r0: usize = dti0 * dst_ts0;
+            const dst_c0: usize = dti1 * dst_ts1;
+
+            var lr: usize = 0;
+            while (lr < dst_m) : (lr += 1) {
+                const r: usize = dst_r0 + lr;
+
+                var lc: usize = 0;
+                while (lc < dst_n) {
+                    const c: usize = dst_c0 + lc;
+
+                    const sti0: usize = r / src_ts0;
+                    const sti1: usize = c / src_ts1;
+                    try ensureConstTile(&src_cache, store, src_id, sti0, sti1);
+
+                    const src_m: usize = src_cache.tile.shape_mem[0];
+                    const src_n: usize = src_cache.tile.shape_mem[1];
+
+                    const src_r0: usize = sti0 * src_ts0;
+                    const src_c0: usize = sti1 * src_ts1;
+
+                    const sr: usize = r - src_r0;
+                    const sc: usize = c - src_c0;
+                    if (sr >= src_m or sc >= src_n) return BackendError.InvalidArgument;
+
+                    const src_cols_left: usize = src_n - sc;
+                    const dst_cols_left: usize = dst_n - lc;
+                    const run: usize = if (src_cols_left < dst_cols_left) src_cols_left else dst_cols_left;
+                    if (run == 0) return BackendError.InvalidArgument;
+
+                    const src_off: usize = (sr * src_n + sc) * elem_bytes;
+                    const dst_off: usize = (lr * dst_n + lc) * elem_bytes;
+                    const bytes: usize = run * elem_bytes;
+
+                    if (src_off + bytes > src_cache.tile.bytes.len) return BackendError.InvalidArgument;
+                    if (dst_off + bytes > dst_cache.tile.bytes.len) return BackendError.InvalidArgument;
+
+                    @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + bytes], src_cache.tile.bytes[src_off .. src_off + bytes]);
+                    lc += run;
+                }
+            }
         }
+    }
+}
+
+pub fn retileCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {
+    const dst_meta = try store.meta(dst_id);
+    const src_meta = try store.meta(src_id);
+    if (dst_meta.dtype != src_meta.dtype) return BackendError.InvalidArgument;
+    if (dst_meta.rank != src_meta.rank) return BackendError.InvalidArgument;
+    const rank: usize = @as(usize, dst_meta.rank);
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (dst_meta.shape[d] != src_meta.shape[d]) return BackendError.InvalidArgument;
+    }
+    const elem_bytes: usize = try scalarElemBytes(dst_meta.dtype);
+
+    // Rank-0: single scalar value.
+    if (dst_meta.rank == 0) {
+        const src_tile = try store.acquireTileConst(src_id, 0, 0);
+        defer store.releaseConst(src_tile.token);
+        const dst_tile = try store.acquireTileMut(dst_id, 0, 0);
+        defer store.releaseMut(dst_tile.token);
+
+        if (src_tile.bytes.len < elem_bytes) return BackendError.InvalidArgument;
+        if (dst_tile.bytes.len < elem_bytes) return BackendError.InvalidArgument;
+        @memcpy(dst_tile.bytes[0..elem_bytes], src_tile.bytes[0..elem_bytes]);
         return;
     }
 
-    var r0: usize = 0;
-    while (r0 < dst_meta.shape[0]) : (r0 += 1) {
-        var c0: usize = 0;
-        while (c0 < dst_meta.shape[1]) : (c0 += 1) {
-            try readScalarBytesAt(store, src_meta, src_id, elem_bytes, r0, c0, &src_cache, buf);
-            try writeScalarBytesAt(store, dst_meta, dst_id, elem_bytes, r0, c0, &dst_cache, buf);
-        }
+    // Rank-1: tiling changes preserve linear order; stream copy across tiles.
+    if (dst_meta.rank == 1) {
+        return reshapeCopyScalar(store, dst_id, src_id);
     }
+
+    // Rank-2: copy by row segments, mapping across tile grids.
+    if (dst_meta.rank == 2) {
+        return retileCopyScalar2D(store, dst_meta, src_meta, dst_id, src_id, elem_bytes);
+    }
+
+    // Rank>2: fallback to coordinate-based copier (guarded by compile-time policy).
+    return retileCopyScalarND(store, dst_meta, src_meta, dst_id, src_id, elem_bytes);
 }
 
 const MAX_RANK: usize = 8;
@@ -276,10 +366,22 @@ fn retileCopyScalarND(
     const rank: usize = @as(usize, dst_meta.rank);
     if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
 
-    var strides: [MAX_RANK]usize = undefined;
-    try computePackedStrides(dst_meta.shape, strides[0..rank]);
+    // Fast ND retile: stream contiguous runs along the last dimension.
+    //
+    // For any fixed coordinate of dims [0..rank-2], the last dim forms a contiguous
+    // row in packed row-major layout (stride=1). We copy that row in segments that
+    // do not cross source or destination tile boundaries.
+    if (rank < 2) return BackendError.InvalidArgument;
 
-    var coords: [MAX_RANK]usize = undefined;
+    const last_dim: usize = rank - 1;
+    const row_rank: usize = last_dim; // dims excluding the last
+    const row_shape: []const usize = dst_meta.shape[0..row_rank];
+    if (row_rank == 0) return BackendError.InvalidArgument;
+
+    var row_strides: [MAX_RANK]usize = undefined;
+    try computePackedStrides(row_shape, row_strides[0..row_rank]);
+
+    var row_coords: [MAX_RANK]usize = undefined;
     var src_tile_coords: [MAX_RANK]usize = undefined;
     var dst_tile_coords: [MAX_RANK]usize = undefined;
     var src_local_coords: [MAX_RANK]usize = undefined;
@@ -290,46 +392,108 @@ fn retileCopyScalarND(
     var dst_cache: TileCacheMutND = .{};
     defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
 
-    var tmp: [4]u8 = .{ 0, 0, 0, 0 };
-    const buf: []u8 = tmp[0..elem_bytes];
+    const row_total: usize = elemCountFromShape(row_shape) catch return BackendError.InvalidArgument;
+    const col_total: usize = dst_meta.shape[last_dim];
 
-    const total_elems: usize = elemCountFromShape(dst_meta.shape) catch return BackendError.InvalidArgument;
-    var lin: usize = 0;
-    while (lin < total_elems) : (lin += 1) {
-        try decodeLinearToCoords(lin, strides[0..rank], dst_meta.shape, coords[0..rank]);
+    var row_lin: usize = 0;
+    while (row_lin < row_total) : (row_lin += 1) {
+        try decodeLinearToCoords(row_lin, row_strides[0..row_rank], row_shape, row_coords[0..row_rank]);
 
+        // Tile/local coords for all dims except last.
         var d: usize = 0;
-        while (d < rank) : (d += 1) {
-            dst_tile_coords[d] = coords[d] / dst_meta.tile_shape[d];
-            dst_local_coords[d] = coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
+        while (d < row_rank) : (d += 1) {
+            dst_tile_coords[d] = row_coords[d] / dst_meta.tile_shape[d];
+            dst_local_coords[d] = row_coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
 
-            src_tile_coords[d] = coords[d] / src_meta.tile_shape[d];
-            src_local_coords[d] = coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
+            src_tile_coords[d] = row_coords[d] / src_meta.tile_shape[d];
+            src_local_coords[d] = row_coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
         }
 
-        const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..rank]);
-        const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..rank]);
+        var col: usize = 0;
+        while (col < col_total) {
+            dst_tile_coords[last_dim] = col / dst_meta.tile_shape[last_dim];
+            dst_local_coords[last_dim] = col - dst_tile_coords[last_dim] * dst_meta.tile_shape[last_dim];
 
-        try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, rank);
-        try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, rank);
+            src_tile_coords[last_dim] = col / src_meta.tile_shape[last_dim];
+            src_local_coords[last_dim] = col - src_tile_coords[last_dim] * src_meta.tile_shape[last_dim];
 
-        const src_strides: []const usize = src_cache.strides[0..rank];
-        const dst_strides: []const usize = dst_cache.strides[0..rank];
+            const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..rank]);
+            const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..rank]);
 
-        var src_lin: usize = 0;
-        var dst_lin: usize = 0;
-        d = 0;
-        while (d < rank) : (d += 1) {
-            src_lin = std.math.add(usize, src_lin, src_local_coords[d] * src_strides[d]) catch return BackendError.InvalidArgument;
-            dst_lin = std.math.add(usize, dst_lin, dst_local_coords[d] * dst_strides[d]) catch return BackendError.InvalidArgument;
+            try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, rank);
+            try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, rank);
+
+            const src_tile_cols: usize = src_cache.tile.shape_mem[last_dim];
+            const dst_tile_cols: usize = dst_cache.tile.shape_mem[last_dim];
+            if (src_tile_cols == 0 or dst_tile_cols == 0) return BackendError.InvalidArgument;
+            if (src_local_coords[last_dim] >= src_tile_cols) return BackendError.InvalidArgument;
+            if (dst_local_coords[last_dim] >= dst_tile_cols) return BackendError.InvalidArgument;
+
+            const src_left: usize = src_tile_cols - src_local_coords[last_dim];
+            const dst_left: usize = dst_tile_cols - dst_local_coords[last_dim];
+            var run: usize = if (src_left < dst_left) src_left else dst_left;
+            const total_left: usize = col_total - col;
+            if (run > total_left) run = total_left;
+            if (run == 0) return BackendError.InvalidArgument;
+
+            const src_strides: []const usize = src_cache.strides[0..rank];
+            const dst_strides: []const usize = dst_cache.strides[0..rank];
+
+            // Base linear index for this row within the current tile (excluding last dim).
+            var src_base: usize = 0;
+            var dst_base: usize = 0;
+            d = 0;
+            while (d < row_rank) : (d += 1) {
+                src_base = std.math.add(usize, src_base, src_local_coords[d] * src_strides[d]) catch return BackendError.InvalidArgument;
+                dst_base = std.math.add(usize, dst_base, dst_local_coords[d] * dst_strides[d]) catch return BackendError.InvalidArgument;
+            }
+
+            const src_lin: usize = std.math.add(usize, src_base, src_local_coords[last_dim] * src_strides[last_dim]) catch return BackendError.InvalidArgument;
+            const dst_lin: usize = std.math.add(usize, dst_base, dst_local_coords[last_dim] * dst_strides[last_dim]) catch return BackendError.InvalidArgument;
+
+            const src_off: usize = src_lin * elem_bytes;
+            const dst_off: usize = dst_lin * elem_bytes;
+            const bytes: usize = run * elem_bytes;
+            if (src_off + bytes > src_cache.tile.bytes.len) return BackendError.InvalidArgument;
+            if (dst_off + bytes > dst_cache.tile.bytes.len) return BackendError.InvalidArgument;
+
+            @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + bytes], src_cache.tile.bytes[src_off .. src_off + bytes]);
+            col += run;
         }
-
-        const src_off: usize = src_lin * elem_bytes;
-        const dst_off: usize = dst_lin * elem_bytes;
-
-        @memcpy(buf, src_cache.tile.bytes[src_off .. src_off + elem_bytes]);
-        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + elem_bytes], buf);
     }
+}
+
+test "retileCopyScalarND: rank-3 roundtrips packed values" {
+    const manager_mod = @import("../../../storage/manager.zig");
+    const testing = std.testing;
+
+    var sm = manager_mod.StorageManager.init(testing.allocator);
+    defer sm.deinit();
+
+    const shape = [_]usize{ 2, 3, 17 };
+    const src_tile = [_]usize{ 1, 3, 5 };
+    const dst_tile = [_]usize{ 2, 1, 7 };
+
+    const src_id = try sm.createTiledTensor(.f32, &shape, &src_tile, .{ .tile_alignment = 64 });
+    const dst_id = try sm.createTiledTensor(.f32, &shape, &dst_tile, .{ .tile_alignment = 64 });
+
+    const total: usize = shape[0] * shape[1] * shape[2];
+    const bytes_len: usize = total * @sizeOf(f32);
+    const buf = try testing.allocator.alloc(u8, bytes_len);
+    defer testing.allocator.free(buf);
+    const vals_ptr: [*]align(1) f32 = @ptrCast(buf.ptr);
+    const vals: []align(1) f32 = vals_ptr[0 .. bytes_len / @sizeOf(f32)];
+    for (vals, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 17)) * 0.125;
+    }
+    try sm.writeFromPackedScalar(src_id, buf);
+
+    try retileCopyScalar(sm.tensorStore(), dst_id, src_id);
+
+    const out = try testing.allocator.alloc(u8, bytes_len);
+    defer testing.allocator.free(out);
+    try sm.readToPackedScalar(dst_id, out);
+    try testing.expectEqualSlices(u8, buf, out);
 }
 
 pub fn elemCountFromShape(shape: []const usize) ExecuteProgramError!usize {
@@ -353,76 +517,194 @@ pub fn reshapeCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
     const dst_total: usize = try elemCountFromShape(dst_meta.shape);
     if (src_total != dst_total) return BackendError.InvalidArgument;
 
-    // Stream scalar elements in linear order across tiles.
+    // Fast path: if both tensors are single-tile, packed payload is contiguous
+    // row-major for each side, so reshape is a plain contiguous memcpy.
+    //
+    // This keeps the general row-major-correct ND implementation below for
+    // multi-tile cases (where tile-major byte order can differ from row-major),
+    // while recovering the previous low overhead for common tiny tensors.
     var src_tile_total: usize = 1;
-    var d0: usize = 0;
-    while (d0 < @as(usize, src_meta.rank)) : (d0 += 1) {
-        src_tile_total = std.math.mul(usize, src_tile_total, src_meta.tile_counts[d0]) catch return BackendError.InvalidArgument;
-    }
     var dst_tile_total: usize = 1;
-    var d1: usize = 0;
-    while (d1 < @as(usize, dst_meta.rank)) : (d1 += 1) {
-        dst_tile_total = std.math.mul(usize, dst_tile_total, dst_meta.tile_counts[d1]) catch return BackendError.InvalidArgument;
+    var td: usize = 0;
+    while (td < @as(usize, src_meta.rank)) : (td += 1) {
+        src_tile_total = std.math.mul(usize, src_tile_total, src_meta.tile_counts[td]) catch return BackendError.InvalidArgument;
     }
-    if (src_tile_total == 0 or dst_tile_total == 0) return BackendError.InvalidArgument;
+    td = 0;
+    while (td < @as(usize, dst_meta.rank)) : (td += 1) {
+        dst_tile_total = std.math.mul(usize, dst_tile_total, dst_meta.tile_counts[td]) catch return BackendError.InvalidArgument;
+    }
 
-    var src_tile_index: usize = 0;
-    var dst_tile_index: usize = 0;
+    if (src_tile_total == 1 and dst_tile_total == 1) {
+        const src_tile = try store.acquireTileConstLinear(src_id, 0);
+        defer store.releaseConst(src_tile.token);
+        const dst_tile = try store.acquireTileMutLinear(dst_id, 0);
+        defer store.releaseMut(dst_tile.token);
 
-    var src_tile = try store.acquireTileConstLinear(src_id, src_tile_index);
-    defer store.releaseConst(src_tile.token);
-    var dst_tile = try store.acquireTileMutLinear(dst_id, dst_tile_index);
-    defer store.releaseMut(dst_tile.token);
+        const total_bytes: usize = std.math.mul(usize, dst_total, elem_bytes) catch return BackendError.InvalidArgument;
+        if (src_tile.bytes.len < total_bytes) return BackendError.InvalidArgument;
+        if (dst_tile.bytes.len < total_bytes) return BackendError.InvalidArgument;
 
-    var src_view = src_tile.bufferView();
-    var dst_view = dst_tile.bufferView();
-    var src_n: usize = elemCountFromTileView(src_view);
-    var dst_n: usize = elemCountFromTileView(dst_view);
-    if (src_n * elem_bytes > src_view.bytes.len) return BackendError.InvalidArgument;
-    if (dst_n * elem_bytes > dst_view.bytes.len) return BackendError.InvalidArgument;
+        @memcpy(dst_tile.bytes[0..total_bytes], src_tile.bytes[0..total_bytes]);
+        return;
+    }
 
-    var src_pos: usize = 0;
-    var dst_pos: usize = 0;
+    // Reshape must preserve *row-major element order*.
+    //
+    // IMPORTANT: tiled tensors are stored as packed tiles, so streaming across
+    // tile bytes in linear tile-index order does NOT necessarily match the
+    // logical packed row-major order of the full tensor (unless tiles span the
+    // full trailing dims). For example, a 2x4 matrix with 2x2 tiles packs to:
+    //   [a00,a01,a10,a11, a02,a03,a12,a13] (tile-major)
+    // but packed row-major order is:
+    //   [a00,a01,a02,a03, a10,a11,a12,a13]
+    //
+    // So we copy in row-major linear order by mapping current coordinates to
+    // per-tile offsets, and memcpy contiguous runs along the last dim.
+
+    const src_rank: usize = @as(usize, src_meta.rank);
+    const dst_rank: usize = @as(usize, dst_meta.rank);
+    if (src_rank == 0 or src_rank > MAX_RANK) return BackendError.InvalidArgument;
+    if (dst_rank == 0 or dst_rank > MAX_RANK) return BackendError.InvalidArgument;
+
+    const src_last_dim: usize = src_rank - 1;
+    const dst_last_dim: usize = dst_rank - 1;
+
+    var src_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var dst_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var src_tile_coords: [MAX_RANK]usize = undefined;
+    var dst_tile_coords: [MAX_RANK]usize = undefined;
+    var src_local_coords: [MAX_RANK]usize = undefined;
+    var dst_local_coords: [MAX_RANK]usize = undefined;
+
+    var src_cache: TileCacheConstND = .{};
+    defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
+    var dst_cache: TileCacheMutND = .{};
+    defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
+
     var remaining: usize = dst_total;
-
     while (remaining > 0) {
-        if (src_pos == src_n) {
-            store.releaseConst(src_tile.token);
-            src_tile_index += 1;
-            if (src_tile_index >= src_tile_total) return BackendError.InvalidArgument;
-            src_tile = try store.acquireTileConstLinear(src_id, src_tile_index);
-            src_view = src_tile.bufferView();
-            src_n = elemCountFromTileView(src_view);
-            if (src_n * elem_bytes > src_view.bytes.len) return BackendError.InvalidArgument;
-            src_pos = 0;
+        // Compute tile/local coords for src.
+        var d0: usize = 0;
+        while (d0 < src_rank) : (d0 += 1) {
+            src_tile_coords[d0] = src_coords[d0] / src_meta.tile_shape[d0];
+            src_local_coords[d0] = src_coords[d0] - (src_tile_coords[d0] * src_meta.tile_shape[d0]);
+        }
+        const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..src_rank]);
+        try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, src_rank);
+
+        // Compute tile/local coords for dst.
+        var d1: usize = 0;
+        while (d1 < dst_rank) : (d1 += 1) {
+            dst_tile_coords[d1] = dst_coords[d1] / dst_meta.tile_shape[d1];
+            dst_local_coords[d1] = dst_coords[d1] - (dst_tile_coords[d1] * dst_meta.tile_shape[d1]);
+        }
+        const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..dst_rank]);
+        try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, dst_rank);
+
+        // Limit run so we don't cross either tensor's row boundary (carry) or
+        // either tile boundary along the last dim.
+        const src_row_left: usize = src_meta.shape[src_last_dim] - src_coords[src_last_dim];
+        const dst_row_left: usize = dst_meta.shape[dst_last_dim] - dst_coords[dst_last_dim];
+
+        const src_tile_cols: usize = src_cache.tile.shape_mem[src_last_dim];
+        const dst_tile_cols: usize = dst_cache.tile.shape_mem[dst_last_dim];
+        if (src_tile_cols == 0 or dst_tile_cols == 0) return BackendError.InvalidArgument;
+        if (src_local_coords[src_last_dim] >= src_tile_cols) return BackendError.InvalidArgument;
+        if (dst_local_coords[dst_last_dim] >= dst_tile_cols) return BackendError.InvalidArgument;
+
+        const src_tile_left: usize = src_tile_cols - src_local_coords[src_last_dim];
+        const dst_tile_left: usize = dst_tile_cols - dst_local_coords[dst_last_dim];
+
+        var run: usize = src_row_left;
+        if (dst_row_left < run) run = dst_row_left;
+        if (src_tile_left < run) run = src_tile_left;
+        if (dst_tile_left < run) run = dst_tile_left;
+        if (run > remaining) run = remaining;
+        if (run == 0) return BackendError.InvalidArgument;
+
+        const src_strides: []const usize = src_cache.strides[0..src_rank];
+        const dst_strides: []const usize = dst_cache.strides[0..dst_rank];
+
+        var src_base: usize = 0;
+        var dst_base: usize = 0;
+
+        d0 = 0;
+        while (d0 < src_last_dim) : (d0 += 1) {
+            src_base = std.math.add(usize, src_base, src_local_coords[d0] * src_strides[d0]) catch return BackendError.InvalidArgument;
+        }
+        d1 = 0;
+        while (d1 < dst_last_dim) : (d1 += 1) {
+            dst_base = std.math.add(usize, dst_base, dst_local_coords[d1] * dst_strides[d1]) catch return BackendError.InvalidArgument;
         }
 
-        if (dst_pos == dst_n) {
-            store.releaseMut(dst_tile.token);
-            dst_tile_index += 1;
-            if (dst_tile_index >= dst_tile_total) return BackendError.InvalidArgument;
-            dst_tile = try store.acquireTileMutLinear(dst_id, dst_tile_index);
-            dst_view = dst_tile.bufferView();
-            dst_n = elemCountFromTileView(dst_view);
-            if (dst_n * elem_bytes > dst_view.bytes.len) return BackendError.InvalidArgument;
-            dst_pos = 0;
+        const src_lin: usize = std.math.add(usize, src_base, src_local_coords[src_last_dim] * src_strides[src_last_dim]) catch return BackendError.InvalidArgument;
+        const dst_lin: usize = std.math.add(usize, dst_base, dst_local_coords[dst_last_dim] * dst_strides[dst_last_dim]) catch return BackendError.InvalidArgument;
+
+        const src_off: usize = src_lin * elem_bytes;
+        const dst_off: usize = dst_lin * elem_bytes;
+        const bytes: usize = run * elem_bytes;
+        if (src_off + bytes > src_cache.tile.bytes.len) return BackendError.InvalidArgument;
+        if (dst_off + bytes > dst_cache.tile.bytes.len) return BackendError.InvalidArgument;
+
+        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + bytes], src_cache.tile.bytes[src_off .. src_off + bytes]);
+
+        // Advance coords by `run` along each tensor's last dim (with carry by 1
+        // when we hit the end of the row).
+        src_coords[src_last_dim] += run;
+        if (src_coords[src_last_dim] == src_meta.shape[src_last_dim]) {
+            src_coords[src_last_dim] = 0;
+            var cd: usize = src_last_dim;
+            while (cd > 0) {
+                cd -= 1;
+                src_coords[cd] += 1;
+                if (src_coords[cd] < src_meta.shape[cd]) break;
+                src_coords[cd] = 0;
+            }
         }
 
-        const src_avail: usize = src_n - src_pos;
-        const dst_avail: usize = dst_n - dst_pos;
-        var chunk: usize = if (src_avail < dst_avail) src_avail else dst_avail;
-        if (chunk > remaining) chunk = remaining;
+        dst_coords[dst_last_dim] += run;
+        if (dst_coords[dst_last_dim] == dst_meta.shape[dst_last_dim]) {
+            dst_coords[dst_last_dim] = 0;
+            var cd2: usize = dst_last_dim;
+            while (cd2 > 0) {
+                cd2 -= 1;
+                dst_coords[cd2] += 1;
+                if (dst_coords[cd2] < dst_meta.shape[cd2]) break;
+                dst_coords[cd2] = 0;
+            }
+        }
 
-        const src_off: usize = src_pos * elem_bytes;
-        const dst_off: usize = dst_pos * elem_bytes;
-        const bytes: usize = chunk * elem_bytes;
-
-        @memcpy(dst_view.bytes[dst_off .. dst_off + bytes], src_view.bytes[src_off .. src_off + bytes]);
-
-        src_pos += chunk;
-        dst_pos += chunk;
-        remaining -= chunk;
+        remaining -= run;
     }
+}
+
+test "reshapeCopyScalar: preserves packed row-major order across tiled tensors" {
+    const manager_mod = @import("../../../storage/manager.zig");
+    const testing = std.testing;
+
+    var sm = manager_mod.StorageManager.init(testing.allocator);
+    defer sm.deinit();
+
+    // A 2x4 tensor with 2x2 tiling is packed tile-major in memory, so a naive
+    // linear tile-stream reshape will reorder elements. This test ensures
+    // reshapeCopyScalar uses logical packed row-major order.
+    const src_shape = [_]usize{ 2, 4 };
+    const src_tile = [_]usize{ 2, 2 };
+    const dst_shape = [_]usize{ 4, 2 };
+    const dst_tile = [_]usize{ 2, 2 };
+
+    const src_id = try sm.createTiledTensor(.f32, &src_shape, &src_tile, .{ .tile_alignment = 64 });
+    const dst_id = try sm.createTiledTensor(.f32, &dst_shape, &dst_tile, .{ .tile_alignment = 64 });
+
+    var vals: [8]f32 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    try sm.writeFromPackedScalar(src_id, std.mem.sliceAsBytes(vals[0..]));
+
+    try reshapeCopyScalar(sm.tensorStore(), dst_id, src_id);
+
+    var out: [8]f32 = undefined;
+    try sm.readToPackedScalar(dst_id, std.mem.sliceAsBytes(out[0..]));
+    try testing.expectEqualSlices(f32, vals[0..], out[0..]);
 }
 
 pub fn transpose2DCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.TensorId, src_id: tensor_store.TensorId) ExecuteProgramError!void {

@@ -8,6 +8,11 @@ const exec_utils = @import("utils.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
+const DType = types.DType;
+
+/// q8_0 block: 2-byte f16 scale + 32 i8 values, 34 bytes total.
+const Q8_0_BLOCK_ELEMS: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 34;
 
 fn copyRowVectorized(dst: []u8, src: []const u8) void {
     std.debug.assert(dst.len == src.len);
@@ -36,6 +41,58 @@ fn copyRowVectorized(dst: []u8, src: []const u8) void {
     }
 }
 
+/// Dequantize one q8_0-encoded table row of `d` elements into `dst` scalar bytes.
+///
+/// The source is assumed to be `d / 32` contiguous q8_0 blocks (valid because the
+/// table's `TiledTensor` carries `quant_axis = 1` and `tile_shape[1] = D`, so one row
+/// of a tile is a contiguous run of blocks). The output dtype (`.f16` or `.f32`)
+/// determines `dst`'s element size; callers size `dst` accordingly.
+fn dequantQ8_0Row(dst: []u8, src: []const u8, d: usize, out_dtype: DType) BackendError!void {
+    if ((d % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+    const blocks: usize = d / Q8_0_BLOCK_ELEMS;
+    if (src.len < blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+
+    switch (out_dtype) {
+        .f32 => {
+            if (dst.len < d * @sizeOf(f32)) return BackendError.InvalidArgument;
+            const out_ptr: [*]align(1) f32 = @ptrCast(dst.ptr);
+            var b: usize = 0;
+            while (b < blocks) : (b += 1) {
+                const block_off: usize = b * Q8_0_BLOCK_BYTES;
+                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(src.ptr + block_off)).*;
+                const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
+                const q_ptr: [*]align(1) const i8 = @ptrCast(src.ptr + block_off + 2);
+                const out_row: [*]align(1) f32 = out_ptr + b * Q8_0_BLOCK_ELEMS;
+                var i: usize = 0;
+                while (i < Q8_0_BLOCK_ELEMS) : (i += 1) {
+                    out_row[i] = @as(f32, @floatFromInt(q_ptr[i])) * scale;
+                }
+            }
+        },
+        .f16 => {
+            if (dst.len < d * @sizeOf(f16)) return BackendError.InvalidArgument;
+            const out_ptr: [*]align(1) f16 = @ptrCast(dst.ptr);
+            var b: usize = 0;
+            while (b < blocks) : (b += 1) {
+                const block_off: usize = b * Q8_0_BLOCK_BYTES;
+                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(src.ptr + block_off)).*;
+                const scale_f16: f16 = @bitCast(scale_bits);
+                const q_ptr: [*]align(1) const i8 = @ptrCast(src.ptr + block_off + 2);
+                const out_row: [*]align(1) f16 = out_ptr + b * Q8_0_BLOCK_ELEMS;
+                // Accumulate through f32 to avoid intermediate f16 overflow on large
+                // magnitudes, then round to f16 on store.
+                const scale_f32: f32 = @floatCast(scale_f16);
+                var i: usize = 0;
+                while (i < Q8_0_BLOCK_ELEMS) : (i += 1) {
+                    const v: f32 = @as(f32, @floatFromInt(q_ptr[i])) * scale_f32;
+                    out_row[i] = @floatCast(v);
+                }
+            }
+        },
+        else => return BackendError.InvalidArgument,
+    }
+}
+
 pub fn execGatherRowsTiled(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
@@ -49,14 +106,33 @@ pub fn execGatherRowsTiled(
     // The compiler is responsible for full validation; keep runtime checks minimal.
     if (out_meta.rank != 3 or table_meta.rank != 2 or indices_meta.rank != 2) return BackendError.InvalidArgument;
     if (indices_meta.dtype != .i32) return BackendError.InvalidArgument;
-    if (out_meta.dtype != table_meta.dtype) return BackendError.InvalidArgument;
-    if (!(table_meta.dtype == .f16 or table_meta.dtype == .f32)) return BackendError.InvalidArgument;
 
-    const elem_bytes: usize = switch (table_meta.dtype) {
+    // Two legal table-dtype cases:
+    //   (a) scalar table, same-dtype output: row is memcpy'd.
+    //   (b) q8_0 table (quant_axis=1), output is f16 or f32: row is dequantized on read.
+    const table_is_quant: bool = table_meta.dtype == .q8_0;
+    if (table_is_quant) {
+        if (!(out_meta.dtype == .f16 or out_meta.dtype == .f32)) return BackendError.InvalidArgument;
+        if ((table_meta.shape[1] % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+        // Our tiling helper guarantees `tile_shape[1] == shape[1]` for q8_0 embedding tables,
+        // so every row of a tile is one contiguous block run. Enforce the invariant here.
+        if (table_meta.tile_shape[1] != table_meta.shape[1]) return BackendError.InvalidArgument;
+    } else {
+        if (out_meta.dtype != table_meta.dtype) return BackendError.InvalidArgument;
+        if (!(table_meta.dtype == .f16 or table_meta.dtype == .f32)) return BackendError.InvalidArgument;
+    }
+
+    const out_elem_bytes: usize = switch (out_meta.dtype) {
         .f16 => 2,
         .f32 => 4,
         else => return BackendError.InvalidArgument,
     };
+    // Table-side row stride in bytes. For scalar tables it's D * elem_bytes; for q8_0
+    // it's (D/32) * 34 bytes (one contiguous run of blocks per row).
+    const table_row_bytes: usize = if (table_is_quant)
+        (table_meta.shape[1] / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES
+    else
+        table_meta.shape[1] * out_elem_bytes;
 
     const b_total: usize = indices_meta.shape[0];
     const l_total: usize = indices_meta.shape[1];
@@ -90,7 +166,9 @@ pub fn execGatherRowsTiled(
         b_total: usize,
         l_total: usize,
         v_total: usize,
-        elem_bytes: usize,
+        out_elem_bytes: usize,
+        table_row_bytes: usize,
+        table_is_quant: bool,
         idx_vals: []align(1) const i32,
 
         fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
@@ -119,8 +197,8 @@ pub fn execGatherRowsTiled(
                 if (td == 0) return BackendError.InvalidArgument;
                 if (self.out_meta.shape[2] != td) return BackendError.InvalidArgument;
 
-                const bytes_per_row: usize = std.math.mul(usize, td, self.elem_bytes) catch return BackendError.InvalidArgument;
-                const need_bytes: usize = std.math.mul(usize, std.math.mul(usize, tb, tl) catch return BackendError.InvalidArgument, bytes_per_row) catch return BackendError.InvalidArgument;
+                const out_bytes_per_row: usize = std.math.mul(usize, td, self.out_elem_bytes) catch return BackendError.InvalidArgument;
+                const need_bytes: usize = std.math.mul(usize, std.math.mul(usize, tb, tl) catch return BackendError.InvalidArgument, out_bytes_per_row) catch return BackendError.InvalidArgument;
                 if (need_bytes > out_view.bytes.len) return BackendError.InvalidArgument;
 
                 var lb: usize = 0;
@@ -191,7 +269,7 @@ pub fn execGatherRowsTiled(
                             if (next_ti0 == table_cached_ti0) {
                                 const next_local_r: usize = next_row - next_ti0 * self.table_meta.tile_shape[0];
                                 if (next_local_r < rows_in_tile) {
-                                    const pf_off: usize = (next_local_r * d_in_tile) * self.elem_bytes;
+                                    const pf_off: usize = next_local_r * self.table_row_bytes;
                                     if (pf_off < table_view.bytes.len) {
                                         @prefetch(table_view.bytes[pf_off..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
                                     }
@@ -199,13 +277,22 @@ pub fn execGatherRowsTiled(
                             }
                         }
 
-                        const src_off: usize = (local_r * d_in_tile) * self.elem_bytes;
-                        const dst_off: usize = ((lb * tl + ll) * td) * self.elem_bytes;
+                        const src_off: usize = local_r * self.table_row_bytes;
+                        const dst_off: usize = ((lb * tl + ll) * td) * self.out_elem_bytes;
 
-                        copyRowVectorized(
-                            out_view.bytes[dst_off .. dst_off + bytes_per_row],
-                            table_view.bytes[src_off .. src_off + bytes_per_row],
-                        );
+                        if (self.table_is_quant) {
+                            try dequantQ8_0Row(
+                                out_view.bytes[dst_off .. dst_off + out_bytes_per_row],
+                                table_view.bytes[src_off .. src_off + self.table_row_bytes],
+                                td,
+                                self.out_meta.dtype,
+                            );
+                        } else {
+                            copyRowVectorized(
+                                out_view.bytes[dst_off .. dst_off + out_bytes_per_row],
+                                table_view.bytes[src_off .. src_off + out_bytes_per_row],
+                            );
+                        }
                     }
                 }
             }
@@ -221,7 +308,9 @@ pub fn execGatherRowsTiled(
         .b_total = b_total,
         .l_total = l_total,
         .v_total = v_total,
-        .elem_bytes = elem_bytes,
+        .out_elem_bytes = out_elem_bytes,
+        .table_row_bytes = table_row_bytes,
+        .table_is_quant = table_is_quant,
         .idx_vals = idx_vals,
     };
 

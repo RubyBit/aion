@@ -282,6 +282,13 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, f32, rp.rope_proportion);
         },
         .KVCacheAppend => {},
+        .Cast => |ct| {
+            try appendInt(out, allocator, u8, @intFromEnum(ct.to_dtype));
+        },
+        .MatMulNT => |mm| {
+            try appendInt(out, allocator, f32, mm.alpha);
+            try appendInt(out, allocator, f32, mm.beta);
+        },
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);
         },

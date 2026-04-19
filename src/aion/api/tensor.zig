@@ -109,15 +109,31 @@ pub const Tensor = struct {
         }
 
         const byte_len = try src.packedByteLen();
-        const buf = allocator.alloc(u8, byte_len) catch return StorageError.OutOfMemory;
-        defer allocator.free(buf);
+        // Hot-path optimization: avoid heap alloc/free for small copies
+        // (e.g. recurrent state tensors copied each run).
+        const stack_cap: usize = 4096;
+        if (byte_len <= stack_cap) {
+            var stack_buf: [stack_cap]u8 = undefined;
+            const buf: []u8 = stack_buf[0..byte_len];
+            if (self.dtype.info().is_quantized) {
+                try src.readPackedQuant(buf);
+                try self.writePackedQuant(buf);
+            } else {
+                try src.readPackedScalar(buf);
+                try self.writePackedScalar(buf);
+            }
+            return;
+        }
+
+        const heap_buf = allocator.alloc(u8, byte_len) catch return StorageError.OutOfMemory;
+        defer allocator.free(heap_buf);
 
         if (self.dtype.info().is_quantized) {
-            try src.readPackedQuant(buf);
-            try self.writePackedQuant(buf);
+            try src.readPackedQuant(heap_buf);
+            try self.writePackedQuant(heap_buf);
         } else {
-            try src.readPackedScalar(buf);
-            try self.writePackedScalar(buf);
+            try src.readPackedScalar(heap_buf);
+            try self.writePackedScalar(heap_buf);
         }
     }
 

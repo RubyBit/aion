@@ -14,6 +14,21 @@ pub const Tuning = struct {
     nc: usize,
 };
 
+/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
+/// where A is M×K f32 and B is N×K f32 (row-major, contiguous along K). No packing step.
+pub const MatMulNtF32Fn = *const fn (
+    a_ptr: [*]align(1) const f32,
+    b_ptr: [*]align(1) const f32,
+    c_ptr: [*]align(1) f32,
+    m_total: usize,
+    k: usize,
+    n_total: usize,
+    n_start: usize,
+    n_count: usize,
+    alpha: f32,
+    beta: f32,
+) types.BackendError!void;
+
 pub const F32Kernels = struct {
     tuning: Tuning,
 
@@ -26,6 +41,7 @@ pub const F32Kernels = struct {
     pack_a_tile_f16_to_packed_f32: *const fn (packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_b: *const fn (scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_ab: *const fn (packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8) types.BackendError!void,
+    matmul_nt_f32: MatMulNtF32Fn,
 };
 
 pub const VariantId = enum { small, medium, large };
@@ -59,6 +75,8 @@ fn kernelsFor(comptime t: Tuning) F32Kernels {
         .pack_a_tile_f16_to_packed_f32 = K.packATileF16ToPackedF32,
         .matmul_packed_b = K.matmulF32PackedB,
         .matmul_packed_ab = K.matmulF32PackedAB,
+        // NT kernel doesn't use (KC, MC, NC) tuning — B is already in the right layout.
+        .matmul_nt_f32 = matmul_tuned.matmulNtF32,
     };
 }
 

@@ -112,5 +112,7 @@ pub fn instantiateNode(
             for (sl.starts, 0..) |value, idx| starts_mem[idx] = std.math.cast(usize, value) orelse return error.InvalidArgument;
             break :blk try graph.addViewSliceND(mapped_inputs[0], starts_mem[0..sl.starts.len], lens);
         },
+        .Cast => |ct| try graph.addCast(mapped_inputs[0], ct.to_dtype),
+        .MatMulNT => |mm| try graph.addMatMulNT(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
     };
 }

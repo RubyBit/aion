@@ -20,6 +20,12 @@ const Q4_0_BLOCK_BYTES: usize = types.DType.q4_0.info().block_bytes;
 const Q8_0_BLOCK_ELEMS: usize = types.DType.q8_0.info().block_elems;
 const Q8_0_BLOCK_BYTES: usize = types.DType.q8_0.info().block_bytes;
 
+const BenchSuite = enum {
+    all,
+    matmul,
+    quant_matmul,
+};
+
 const BenchDTypeMode = enum {
     f32,
     f16,
@@ -29,6 +35,8 @@ const BenchDTypeMode = enum {
 const BenchOptions = struct {
     iters: usize = 50,
     threads: usize = 1,
+
+    suite: BenchSuite = .all,
 
     // Batch size for batched matmul benchmarks.
     batch: usize = 4,
@@ -74,6 +82,7 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
+            "  --suite NAME     Bench suite: all|matmul|quant-matmul (default: all)\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
@@ -107,6 +116,13 @@ fn parseBenchDTypeMode(arg: []const u8) !BenchDTypeMode {
     return error.InvalidArgument;
 }
 
+fn parseBenchSuite(arg: []const u8) !BenchSuite {
+    if (std.mem.eql(u8, arg, "all")) return .all;
+    if (std.mem.eql(u8, arg, "matmul")) return .matmul;
+    if (std.mem.eql(u8, arg, "quant-matmul")) return .quant_matmul;
+    return error.InvalidArgument;
+}
+
 fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions {
     var opts: BenchOptions = .{};
 
@@ -122,6 +138,9 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
             opts.quant = false;
         } else if (std.mem.eql(u8, a, "--print-cpuid")) {
             opts.print_cpuid = true;
+        } else if (std.mem.eql(u8, a, "--suite")) {
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.suite = try parseBenchSuite(v);
         } else if (std.mem.eql(u8, a, "--iters")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.iters = try parseUsize(v);
@@ -2173,6 +2192,34 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
 }
 
 fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
+    if (opts.suite == .matmul) {
+        try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
+        try benchProgramMatmulBatchedF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);
+        if (opts.quant) {
+            if (opts.k % 32 != 0) {
+                std.debug.print("(skipping quant matmul: k={} not divisible by 32)\n", .{opts.k});
+            } else {
+                try benchProgramMatmulQuant(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, .q8_0, be);
+                try benchProgramMatmulQuant(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, .q4_0, be);
+            }
+        }
+        return;
+    }
+
+    if (opts.suite == .quant_matmul) {
+        if (!opts.quant) {
+            std.debug.print("(skipping quant matmul suite: --no-quant specified)\n", .{});
+            return;
+        }
+        if (opts.k % 32 != 0) {
+            std.debug.print("(skipping quant matmul: k={} not divisible by 32)\n", .{opts.k});
+            return;
+        }
+        try benchProgramMatmulQuant(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, .q8_0, be);
+        try benchProgramMatmulQuant(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, .q4_0, be);
+        return;
+    }
+
     try benchProgramElemwiseAdd(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramRelu(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramUnary(allocator, rnd, opts.iters, opts.n_elem, .gelu, "gelu", be);
@@ -2252,6 +2299,17 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
 }
 
 fn runF16Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
+    if (opts.suite == .matmul) {
+        try benchProgramMatmulF16(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
+        try benchProgramMatmulBatchedF16(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);
+        std.debug.print("(skipping quant matmul in f16 mode: quant benches currently use f32 activations)\n", .{});
+        return;
+    }
+    if (opts.suite == .quant_matmul) {
+        std.debug.print("(skipping quant matmul suite in f16 mode: quant benches currently use f32 activations)\n", .{});
+        return;
+    }
+
     try benchProgramElemwiseAddF16(allocator, rnd, opts.iters, opts.n_elem, be);
     try benchProgramUnaryF16(allocator, rnd, opts.iters, opts.n_elem, .relu, "relu", be);
     try benchProgramUnaryF16(allocator, rnd, opts.iters, opts.n_elem, .gelu, "gelu", be);

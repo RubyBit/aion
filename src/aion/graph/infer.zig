@@ -756,17 +756,29 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try require(table.shape.len == 2);
             try require(indices.shape.len == 2);
 
-            // Table: f16/f32 only (quant embeddings can be added later).
-            if (table.dtype.? != .f16 and table.dtype.? != .f32) return InferError.Unsupported;
-
             // Indices must be i32.
             if (indices.dtype.? != .i32) return InferError.DTypeMismatch;
+
+            // Two legal dtype regimes (output dtype inferred per regime):
+            //   - scalar table (f16/f32): output matches table.
+            //   - q8_0 table (per-row quant_axis=1, blocks along D): output defaults to f32
+            //     (the residual stream dtype in the Gemma pipeline). If a caller needs f16
+            //     output they should insert an explicit cast; keeping inference deterministic
+            //     avoids ambiguity about which scalar dtype to materialize.
+            const out_dtype: types.DType = switch (table.dtype.?) {
+                .f16, .f32 => table.dtype.?,
+                .q8_0 => blk: {
+                    if ((table.shape[1] % 32) != 0) return InferError.Unsupported;
+                    break :blk .f32;
+                },
+                else => return InferError.Unsupported,
+            };
 
             var out_shape: []usize = graph.arenaAlloc().alloc(usize, 3) catch return InferError.InvalidGraph;
             out_shape[0] = indices.shape[0];
             out_shape[1] = indices.shape[1];
             out_shape[2] = table.shape[1];
-            try setInferred(graph, node.output, table.dtype.?, out_shape);
+            try setInferred(graph, node.output, out_dtype, out_shape);
         },
 
         .RoPE1D => |rp| {
@@ -788,6 +800,46 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (rp.rope_proportion < 0.0 or rp.rope_proportion > 1.0) return InferError.InvalidGraph;
 
             try setInferred(graph, node.output, x.dtype.?, x.shape);
+        },
+
+        .Cast => |ct| {
+            const x = try getValue(graph, node.inputs[0]);
+            try require(x.dtype != null);
+            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (ct.to_dtype.info().is_quantized) return InferError.Unsupported;
+            // v1: only f16<->f32 is supported end-to-end; extend as kernels grow.
+            const ok: bool = (x.dtype.? == .f16 and ct.to_dtype == .f32) or
+                (x.dtype.? == .f32 and ct.to_dtype == .f16) or
+                (x.dtype.? == ct.to_dtype);
+            if (!ok) return InferError.Unsupported;
+            try setInferred(graph, node.output, ct.to_dtype, x.shape);
+        },
+
+        .MatMulNT => |mm| {
+            const a = try getValue(graph, node.inputs[0]);
+            const b = try getValue(graph, node.inputs[1]);
+            try require(a.dtype != null and b.dtype != null);
+            try require(a.shape.len >= 2 and b.shape.len == 2);
+
+            if (!std.math.isFinite(mm.alpha) or !std.math.isFinite(mm.beta)) return InferError.InvalidGraph;
+
+            // A: f32 (residual stream dtype). B: q8_0 with per-row blocks (quant_axis=1).
+            if (a.dtype.? != .f32) return InferError.Unsupported;
+            if (b.dtype.? != .q8_0) return InferError.Unsupported;
+
+            const k_a: usize = a.shape[a.shape.len - 1];
+            const k_b: usize = b.shape[1];
+            const n: usize = b.shape[0];
+            if (k_a != k_b) return InferError.ShapeMismatch;
+            if ((k_a % 32) != 0) return InferError.Unsupported;
+
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, a.shape.len) catch return InferError.InvalidGraph;
+            var d: usize = 0;
+            while (d + 1 < a.shape.len) : (d += 1) {
+                out_shape[d] = a.shape[d];
+            }
+            out_shape[a.shape.len - 1] = n;
+            try setInferred(graph, node.output, .f32, out_shape);
         },
 
         .KVCacheAppend => {

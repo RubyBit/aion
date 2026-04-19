@@ -118,6 +118,54 @@ test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
     try std.testing.expectEqualSlices(u8, packed_bytes_q, out);
 }
 
+test "storage: quant q8_0 roundtrip on quant_axis=1 (embedding table layout)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // [V, D] embedding table with per-row quantization (blocks along axis 1).
+    const v: usize = 10;
+    const d: usize = 96; // multiple of 32
+
+    var tt: storage.TiledTensor = undefined;
+    try tt.init(
+        allocator,
+        .q8_0,
+        &[_]usize{ v, d },
+        &[_]usize{ 4, 64 },
+        .{ .tile_alignment = 64, .quant_axis = 1 },
+    );
+    defer tt.deinit();
+
+    const total_elems: usize = v * d;
+    const total_bytes: usize = try backend_utils.requiredBytesForElems(DType.q8_0, total_elems);
+
+    const packed_bytes: []u8 = try allocator.alloc(u8, total_bytes);
+    defer allocator.free(packed_bytes);
+
+    // Fill with a pattern that lets us verify block-boundary correctness.
+    // Block (row v, block b) byte k => (v*7 + b*13 + k) mod 251.
+    const d_blocks: usize = d / 32; // quant axis at 1, block_elems=32
+    var row: usize = 0;
+    while (row < v) : (row += 1) {
+        var b: usize = 0;
+        while (b < d_blocks) : (b += 1) {
+            const block_off: usize = (row * d_blocks + b) * 34;
+            var kk: usize = 0;
+            while (kk < 34) : (kk += 1) {
+                packed_bytes[block_off + kk] = @intCast((row * 7 + b * 13 + kk) % 251);
+            }
+        }
+    }
+
+    try tt.writeFromPackedQuant(packed_bytes);
+
+    const out: []u8 = try allocator.alloc(u8, total_bytes);
+    defer allocator.free(out);
+    @memset(out, 0);
+
+    try tt.readToPackedQuant(out);
+    try std.testing.expectEqualSlices(u8, packed_bytes, out);
+}
+
 test "storage: scalar f32 roundtrip rank-3 pack<->tiles" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -150,6 +198,105 @@ test "storage: scalar f32 roundtrip rank-3 pack<->tiles" {
 
     try tt.readToPackedScalar(std.mem.sliceAsBytes(out));
     try std.testing.expectEqualSlices(f32, packed_vals, out);
+}
+
+test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 5),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 2),
+        .inputs = try allocator.alloc(package_file.NamedValue, 2),
+        .outputs = try allocator.alloc(package_file.NamedValue, 2),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 0),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 0),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
+
+    // Values: x[3,4] f32, w[5,4] q8_0, cast_out[3,4] f16, mm_out[3,5] f32, dummy public-input-2 f32 for two-input signature.
+    pkg.values[0] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 3, 4 }),
+    };
+    pkg.values[1] = .{
+        .dtype = .q8_0,
+        .rank = 2,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 5, 4 }),
+    };
+    pkg.values[2] = .{
+        .dtype = .f16,
+        .rank = 2,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+    pkg.values[3] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+    pkg.values[4] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+
+    pkg.nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{0}),
+        .output = 2,
+        .op = .{ .Cast = .{ .to_dtype = .f16 } },
+    };
+    pkg.nodes[1] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{ 0, 1 }),
+        .output = 3,
+        .op = .{ .MatMulNT = .{ .alpha = 1.25, .beta = 0.5 } },
+    };
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "x"), .value = 0 };
+    pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "w"), .value = 1 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "cast_out"), .value = 2 };
+    pkg.outputs[1] = .{ .name = try allocator.dupe(u8, "mm_out"), .value = 3 };
+
+    // Bypass Package.validate()'s strict topology check for value[4]: remove it by truncating.
+    const full_values = pkg.values;
+    pkg.values = full_values[0..4];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "cast_mm.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.nodes.len);
+    switch (parsed.nodes[0].op) {
+        .Cast => |ct| try std.testing.expectEqual(types.DType.f16, ct.to_dtype),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.nodes[1].op) {
+        .MatMulNT => |mm| {
+            try std.testing.expectEqual(@as(f32, 1.25), mm.alpha);
+            try std.testing.expectEqual(@as(f32, 0.5), mm.beta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Restore the truncated slot so deinit frees the full allocation.
+    pkg.values = full_values;
+    allocator.free(full_values[4].shape_terms);
 }
 
 test "storage file: model package write/parse roundtrip" {

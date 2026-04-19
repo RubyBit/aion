@@ -37,6 +37,117 @@ test "plan: chooseTileShape2DSquare handles skinny matrices" {
     try std.testing.expect(t1[0] > 1);
 }
 
+test "graph: rmsnorm supports row tiles >256" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 1;
+    const seq: usize = 14;
+    const groups: usize = 35;
+    const hidden: usize = 300;
+
+    const rows: usize = batch * seq * groups;
+    const elems: usize = rows * hidden;
+
+    const x_bytes_len: usize = elems * 4;
+    const g_bytes_len: usize = hidden * 4;
+    const b_bytes_len: usize = hidden * 4;
+
+    const x_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(x_buf);
+    const g_buf: []u8 = try allocator.alloc(u8, g_bytes_len);
+    defer allocator.free(g_buf);
+    const b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
+    defer allocator.free(b_buf);
+
+    const x_vals: []align(1) f32 = asF32Slice(x_buf);
+    const g_vals: []align(1) f32 = asF32Slice(g_buf);
+    const b_vals: []align(1) f32 = asF32Slice(b_buf);
+
+    for (0..elems) |i| {
+        const s: i32 = @as(i32, @intCast(i % 97)) - 48;
+        x_vals[i] = @as(f32, @floatFromInt(s)) * 0.01;
+    }
+    for (0..hidden) |i| {
+        g_vals[i] = 1.0 + (@as(f32, @floatFromInt(i % 13))) * 0.01;
+        b_vals[i] = (@as(f32, @floatFromInt(i % 7))) * 0.001;
+    }
+
+    const eps: f32 = 1e-5;
+
+    // Reference RMSNorm on packed input: y = (x * inv_rms) * gamma + beta.
+    const y_ref_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(y_ref_buf);
+    const y_ref: []align(1) f32 = asF32Slice(y_ref_buf);
+
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        var sumsq: f32 = 0.0;
+        var c: usize = 0;
+        while (c < hidden) : (c += 1) {
+            const v: f32 = x_vals[r * hidden + c];
+            sumsq += v * v;
+        }
+        const msq: f32 = sumsq / @as(f32, @floatFromInt(hidden));
+        const inv: f32 = 1.0 / std.math.sqrt(msq + eps);
+        c = 0;
+        while (c < hidden) : (c += 1) {
+            const x0: f32 = x_vals[r * hidden + c];
+            y_ref[r * hidden + c] = (x0 * inv * g_vals[c]) + b_vals[c];
+        }
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Force a single tile over the leading dims so rows_per_tile = 1*14*35 = 490 (>256).
+    const x_tid = try sm.createTiledTensor(
+        .f32,
+        &[_]usize{ batch, seq, groups, hidden },
+        &[_]usize{ batch, seq, groups, 128 },
+        .{ .tile_alignment = 64 },
+    );
+    const gamma_tid = try sm.createTiledTensor(.f32, &[_]usize{hidden}, &[_]usize{128}, .{ .tile_alignment = 64 });
+    const beta_tid = try sm.createTiledTensor(.f32, &[_]usize{hidden}, &[_]usize{128}, .{ .tile_alignment = 64 });
+
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(gamma_tid, g_buf);
+    try sm.writeFromPackedScalar(beta_tid, b_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f32, &[_]usize{ batch, seq, groups, hidden });
+    const gamma_in = try g.addInput(.f32, &[_]usize{hidden});
+    const beta_in = try g.addInput(.f32, &[_]usize{hidden});
+
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(gamma_in, @intCast(gamma_tid));
+    try g.bindExternal(beta_in, @intCast(beta_tid));
+
+    const y = try g.addRMSNorm(x_in, gamma_in, beta_in, eps, &[_]usize{hidden});
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const y_buf: []u8 = try allocator.alloc(u8, x_bytes_len);
+    defer allocator.free(y_buf);
+    try sm.readToPackedScalar(prog.outputs[0], y_buf);
+    const y_vals: []align(1) f32 = asF32Slice(y_buf);
+
+    var i: usize = 0;
+    while (i < elems) : (i += 1) {
+        try std.testing.expectApproxEqAbs(y_ref[i], y_vals[i], 5e-4);
+    }
+}
+
 const PackedLayout2 = struct {
     shape_mem: [2]usize,
     strides_mem: [2]isize,
@@ -2128,6 +2239,322 @@ test "graph: gather rows matches reference (f16)" {
                 try std.testing.expectEqual(want, got);
             }
         }
+    }
+}
+
+test "graph: gather rows matches reference (q8_0 table, f32 output)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // One q8_0 block per row keeps the packing/dequant trivial to audit.
+    const v: usize = 5;
+    const d: usize = 32;
+    const b: usize = 2;
+    const l: usize = 3;
+
+    // Reference f32 table. Choose a pattern that exercises both signs and a row-varying scale.
+    const ref_vals: []f32 = try allocator.alloc(f32, v * d);
+    defer allocator.free(ref_vals);
+    for (0..v) |r| {
+        const row_scale: f32 = @as(f32, @floatFromInt(r + 1)) * 0.125;
+        for (0..d) |c| {
+            const c_signed: i32 = @as(i32, @intCast(c)) - 16;
+            ref_vals[r * d + c] = @as(f32, @floatFromInt(c_signed)) * row_scale;
+        }
+    }
+
+    // Pack reference table into q8_0 per-row blocks.
+    const block_bytes: usize = 34;
+    const packed_table: []u8 = try allocator.alloc(u8, v * 1 * block_bytes);
+    defer allocator.free(packed_table);
+
+    const dequant_ref: []f32 = try allocator.alloc(f32, v * d);
+    defer allocator.free(dequant_ref);
+
+    for (0..v) |r| {
+        // Find absmax over this row.
+        var absmax: f32 = 0.0;
+        for (0..d) |c| {
+            const a: f32 = @abs(ref_vals[r * d + c]);
+            if (a > absmax) absmax = a;
+        }
+        const scale_f32: f32 = if (absmax == 0.0) 1.0 else absmax / 127.0;
+        const inv_scale: f32 = if (absmax == 0.0) 0.0 else 1.0 / scale_f32;
+        // Round to nearest int8.
+        const scale_f16: f16 = @floatCast(scale_f32);
+        const scale_f32_quantized: f32 = @as(f32, scale_f16);
+        const block_off: usize = r * block_bytes;
+        const scale_bits: u16 = @bitCast(scale_f16);
+        std.mem.writeInt(u16, packed_table[block_off .. block_off + 2][0..2], scale_bits, .little);
+        for (0..d) |c| {
+            const qv_f: f32 = ref_vals[r * d + c] * inv_scale;
+            var qv: i32 = @intFromFloat(@round(qv_f));
+            if (qv > 127) qv = 127;
+            if (qv < -128) qv = -128;
+            const qv_i8: i8 = @intCast(qv);
+            packed_table[block_off + 2 + c] = @bitCast(qv_i8);
+            dequant_ref[r * d + c] = @as(f32, @floatFromInt(qv_i8)) * scale_f32_quantized;
+        }
+    }
+
+    const idx_buf: []u8 = try allocator.alloc(u8, b * l * @sizeOf(i32));
+    defer allocator.free(idx_buf);
+    const idx_ptr: [*]align(1) i32 = @ptrCast(idx_buf.ptr);
+    const idx_vals: []align(1) i32 = idx_ptr[0 .. idx_buf.len / @sizeOf(i32)];
+    idx_vals[0] = 0;
+    idx_vals[1] = 3;
+    idx_vals[2] = 4;
+    idx_vals[3] = 1;
+    idx_vals[4] = 2;
+    idx_vals[5] = 0;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // tile_shape[1] must equal shape[1] for q8_0 embedding tables (one row = one contiguous
+    // block run). tile_shape[0] is a small batch of rows; `2` forces more than one tile.
+    const table_tid = try sm.createTiledTensor(
+        .q8_0,
+        &[_]usize{ v, d },
+        &[_]usize{ 2, d },
+        .{ .tile_alignment = 64, .quant_axis = 1 },
+    );
+    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedQuant(table_tid, packed_table);
+    try sm.writeFromPackedScalar(idx_tid, idx_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const table_in = try g.addInput(.q8_0, &[_]usize{ v, d });
+    const idx_in = try g.addInput(.i32, &[_]usize{ b, l });
+    try g.bindExternal(table_in, @intCast(table_tid));
+    try g.bindExternal(idx_in, @intCast(idx_tid));
+
+    const out = try g.addGatherRows(table_in, idx_in);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, b * l * d * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const row: usize = @intCast(idx_vals[bi * l + li]);
+            for (0..d) |di| {
+                const want: f32 = dequant_ref[row * d + di];
+                const got: f32 = out_vals[(bi * l + li) * d + di];
+                try std.testing.expectApproxEqAbs(want, got, 0.0);
+            }
+        }
+    }
+}
+
+test "graph: cast f32 -> f16 roundtrip matches reference" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 3;
+    const n: usize = 8;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const in_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ m, n }, .{ .tile_alignment = 64 });
+    const in_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f32));
+    defer allocator.free(in_buf);
+    const in_vals: []align(1) f32 = asF32Slice(in_buf);
+    for (0..m * n) |i| in_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 12)) * 0.125;
+    try sm.writeFromPackedScalar(in_tid, in_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x = try g.addInput(.f32, &[_]usize{ m, n });
+    try g.bindExternal(x, @intCast(in_tid));
+    const y = try g.addCast(x, .f16);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f16));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f16 = asF16Slice(out_buf);
+
+    for (0..m * n) |i| {
+        const want: f16 = @floatCast(in_vals[i]);
+        try std.testing.expectEqual(want, out_vals[i]);
+    }
+}
+
+test "graph: cast f16 -> f32 matches reference" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const n: usize = 6;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const in_tid = try sm.createTiledTensor(.f16, &[_]usize{ 1, n }, &[_]usize{ 1, n }, .{ .tile_alignment = 64 });
+    const in_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f16));
+    defer allocator.free(in_buf);
+    const in_vals: []align(1) f16 = asF16Slice(in_buf);
+    // Small exact-representable values.
+    for (0..n) |i| in_vals[i] = @floatFromInt(@as(i32, @intCast(i)) - 3);
+    try sm.writeFromPackedScalar(in_tid, in_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x = try g.addInput(.f16, &[_]usize{ 1, n });
+    try g.bindExternal(x, @intCast(in_tid));
+    const y = try g.addCast(x, .f32);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    for (0..n) |i| {
+        try std.testing.expectEqual(@as(f32, in_vals[i]), out_vals[i]);
+    }
+}
+
+test "graph: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    // C[m, n] = sum_k A[m, k] * B[n, k] — B stored as [N, K] q8_0 with per-row blocks.
+    const m: usize = 3;
+    const k: usize = 64; // two q8_0 blocks per row
+    const n: usize = 5;
+
+    // Reference float values for B with per-row scales.
+    const b_ref: []f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_ref);
+    for (0..n) |row| {
+        const row_scale: f32 = @as(f32, @floatFromInt(row + 1)) * 0.0625;
+        for (0..k) |c| {
+            const c_signed: i32 = @as(i32, @intCast(c)) - 32;
+            b_ref[row * k + c] = @as(f32, @floatFromInt(c_signed)) * row_scale;
+        }
+    }
+
+    // Pack B into q8_0 per-row blocks (mirrors the layout Aion's tiled storage expects).
+    const block_bytes: usize = 34;
+    const blocks_per_row: usize = k / 32;
+    const packed_b: []u8 = try allocator.alloc(u8, n * blocks_per_row * block_bytes);
+    defer allocator.free(packed_b);
+    const dequant_b: []f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(dequant_b);
+
+    for (0..n) |row| {
+        var absmax: f32 = 0.0;
+        for (0..k) |c| {
+            const a: f32 = @abs(b_ref[row * k + c]);
+            if (a > absmax) absmax = a;
+        }
+        const scale_f32: f32 = if (absmax == 0.0) 1.0 else absmax / 127.0;
+        const inv_scale: f32 = if (absmax == 0.0) 0.0 else 1.0 / scale_f32;
+        const scale_f16: f16 = @floatCast(scale_f32);
+        const scale_rounded: f32 = @as(f32, scale_f16);
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const block_off: usize = (row * blocks_per_row + b) * block_bytes;
+            const scale_bits: u16 = @bitCast(scale_f16);
+            std.mem.writeInt(u16, packed_b[block_off .. block_off + 2][0..2], scale_bits, .little);
+            for (0..32) |c_off| {
+                const c: usize = b * 32 + c_off;
+                const qv_f: f32 = b_ref[row * k + c] * inv_scale;
+                var qv: i32 = @intFromFloat(@round(qv_f));
+                if (qv > 127) qv = 127;
+                if (qv < -128) qv = -128;
+                const qv_i8: i8 = @intCast(qv);
+                packed_b[block_off + 2 + c_off] = @bitCast(qv_i8);
+                dequant_b[row * k + c] = @as(f32, @floatFromInt(qv_i8)) * scale_rounded;
+            }
+        }
+    }
+
+    // A values.
+    const a_buf: []f32 = try allocator.alloc(f32, m * k);
+    defer allocator.free(a_buf);
+    for (0..m * k) |i| a_buf[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 50)) * 0.01;
+
+    // Reference: C = A @ dequant_b.T
+    const c_ref: []f32 = try allocator.alloc(f32, m * n);
+    defer allocator.free(c_ref);
+    for (0..m) |mi| {
+        for (0..n) |ni| {
+            var acc: f32 = 0.0;
+            for (0..k) |kk| {
+                acc += a_buf[mi * k + kk] * dequant_b[ni * k + kk];
+            }
+            c_ref[mi * n + ni] = acc;
+        }
+    }
+
+    // Build graph.
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ m, k }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a_buf));
+
+    const b_tid = try sm.createTiledTensor(
+        .q8_0,
+        &[_]usize{ n, k },
+        &[_]usize{ n, k },
+        .{ .tile_alignment = 64, .quant_axis = 1 },
+    );
+    try sm.writeFromPackedQuant(b_tid, packed_b);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const a_in = try g.addInput(.f32, &[_]usize{ m, k });
+    const b_in = try g.addInput(.q8_0, &[_]usize{ n, k });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const c_out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{c_out});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    for (0..m * n) |i| {
+        // SIMD accumulation order differs from the scalar reference, so tolerance is
+        // dominated by f32 rounding rather than q8_0 error.
+        try std.testing.expectApproxEqAbs(c_ref[i], out_vals[i], 1e-4);
     }
 }
 

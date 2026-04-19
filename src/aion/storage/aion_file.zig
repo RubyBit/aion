@@ -45,6 +45,7 @@ pub const resolveShapeTerms = shape.resolveShapeTerms;
 pub const readAlloc = io.readAlloc;
 pub const readPackageFile = io.readPackageFile;
 pub const parse = parse_impl.parse;
+pub const parseTakeOwned = parse_impl.parseTakeOwned;
 pub const validate = types.validate;
 pub const nodeOpKind = types.nodeOpKind;
 pub const parseNodeOpKind = types.parseNodeOpKind;

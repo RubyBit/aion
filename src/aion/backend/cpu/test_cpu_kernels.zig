@@ -10,6 +10,7 @@ const tanh_k = @import("kernels/tanh.zig");
 const sqrt_k = @import("kernels/sqrt.zig");
 const softmax_k = @import("kernels/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
+const quant_matmul_k = @import("kernels/quant_matmul.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
@@ -669,6 +670,55 @@ test "cpu kernels: matvec q8_0" {
     try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
     const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
+    try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
+}
+
+test "cpu kernels: direct matvec q8_0 k-major" {
+    const k: usize = 64;
+    const n: usize = 24;
+    const params: MatMulParams = .{ .m = 1, .n = n, .k = k, .alpha = 1.0, .beta = 0.0 };
+
+    var prng = std.Random.DefaultPrng.init(0x2222);
+    const rnd = prng.random();
+
+    var a: [k]f32 = undefined;
+    for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    // B layout for q8_0 is [k_blocks, n], where each entry is one q8 block.
+    const k_blocks: usize = k / 32;
+    var bq: [k_blocks * n * Q8_BYTES]u8 = undefined;
+    var b_f32: [k * n]f32 = undefined;
+
+    var kb: usize = 0;
+    while (kb < k_blocks) : (kb += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var block: [32]f32 = undefined;
+            var t: usize = 0;
+            while (t < 32) : (t += 1) {
+                const v: f32 = (rnd.float(f32) - 0.5) * 2.0;
+                block[t] = v;
+                b_f32[(kb * 32 + t) * n + j] = v;
+            }
+            const off: usize = (kb * n + j) * Q8_BYTES;
+            const dst: *[Q8_BYTES]u8 = @ptrCast(bq[off..][0..Q8_BYTES]);
+            quantizeQ8_0FromF32Block32(&block, dst);
+        }
+    }
+
+    var c_ref: [n]f32 = [_]f32{0.0} ** n;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        var acc: f32 = 0.0;
+        var kk: usize = 0;
+        while (kk < k) : (kk += 1) {
+            acc += a[kk] * b_f32[kk * n + j];
+        }
+        c_ref[j] = acc;
+    }
+
+    var c: [n]f32 = [_]f32{0.0} ** n;
+    try quant_matmul_k.matvecQ8_0KMajor(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
 

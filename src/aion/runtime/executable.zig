@@ -94,6 +94,23 @@ pub const StepKVCacheAppendTiled = struct {
     end_index: TensorId,
 };
 
+/// Elementwise scalar-dtype cast (f16 <-> f32 in v1).
+pub const StepCastTiled = struct { out: TensorId, x: TensorId, to_dtype: types.DType };
+
+/// Matmul with B conceptually transposed: C[m,n] = sum_k A[m,k] * B[n,k].
+///
+/// Shapes:
+/// - a: f32 with trailing axis `K` (any leading rank; C's leading axes match A's).
+/// - b: q8_0 `[N, K]` with `quant_axis == 1` (per-row blocks).
+/// - c: f32 `[..., N]`.
+pub const StepMatMulNTTiled = struct {
+    c: TensorId,
+    a: TensorId,
+    b: TensorId,
+    alpha: f32,
+    beta: f32,
+};
+
 pub const StepLSTMCellFused = struct {
     out_state: TensorId,
     x: TensorId,
@@ -153,6 +170,9 @@ pub const Step = union(enum) {
     ReshapeScalar: StepReshapeScalar,
     Transpose2DScalar: StepTranspose2DScalar,
     SliceNDScalar: StepSliceNDScalar,
+
+    CastTiled: StepCastTiled,
+    MatMulNTTiled: StepMatMulNTTiled,
 };
 
 /// Validated executable schedule.

@@ -64,6 +64,16 @@ class Lib(Protocol):
         out_tensor: CData,
     ) -> int: ...
 
+    def aion_tensor_create_empty_tiled(
+        self,
+        ctx: CData,
+        dtype: int,
+        rank: int,
+        shape: CData,
+        tile_size: CData,
+        out_tensor: CData,
+    ) -> int: ...
+
     def aion_tensor_destroy(self, t: CData) -> None: ...
     def aion_tensor_dtype(self, t: CData) -> int: ...
     def aion_tensor_rank(self, t: CData) -> int: ...

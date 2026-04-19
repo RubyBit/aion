@@ -322,8 +322,23 @@ inline fn dotRowF32(a: []align(1) const f32, b: []align(1) const f32, n: usize) 
 }
 
 inline fn dotRowF16F16(a: []align(1) const f16, b: []align(1) const f16, n: usize) f32 {
+    const VF = Vec;
+    const VH = @Vector(simd_lanes, f16);
+
     var acc: f32 = 0.0;
     var i: usize = 0;
+    if (n >= simd_lanes) {
+        var vacc: VF = @splat(0.0);
+        const vec_end: usize = n - (n % simd_lanes);
+        while (i < vec_end) : (i += simd_lanes) {
+            const ah: VH = @as(*align(1) const VH, @ptrCast(a[i..].ptr)).*;
+            const bh: VH = @as(*align(1) const VH, @ptrCast(b[i..].ptr)).*;
+            const af: VF = @floatCast(ah);
+            const bf: VF = @floatCast(bh);
+            vacc = @mulAdd(VF, af, bf, vacc);
+        }
+        acc += @reduce(.Add, vacc);
+    }
     while (i < n) : (i += 1) {
         acc += @as(f32, @floatCast(a[i])) * @as(f32, @floatCast(b[i]));
     }
@@ -331,8 +346,22 @@ inline fn dotRowF16F16(a: []align(1) const f16, b: []align(1) const f16, n: usiz
 }
 
 inline fn dotRowF32F16(a: []align(1) const f32, b: []align(1) const f16, n: usize) f32 {
+    const VF = Vec;
+    const VH = @Vector(simd_lanes, f16);
+
     var acc: f32 = 0.0;
     var i: usize = 0;
+    if (n >= simd_lanes) {
+        var vacc: VF = @splat(0.0);
+        const vec_end: usize = n - (n % simd_lanes);
+        while (i < vec_end) : (i += simd_lanes) {
+            const av: VF = @as(*align(1) const VF, @ptrCast(a[i..].ptr)).*;
+            const bh: VH = @as(*align(1) const VH, @ptrCast(b[i..].ptr)).*;
+            const bf: VF = @floatCast(bh);
+            vacc = @mulAdd(VF, av, bf, vacc);
+        }
+        acc += @reduce(.Add, vacc);
+    }
     while (i < n) : (i += 1) {
         acc += a[i] * @as(f32, @floatCast(b[i]));
     }
@@ -340,8 +369,22 @@ inline fn dotRowF32F16(a: []align(1) const f32, b: []align(1) const f16, n: usiz
 }
 
 inline fn dotRowF16F32(a: []align(1) const f16, b: []align(1) const f32, n: usize) f32 {
+    const VF = Vec;
+    const VH = @Vector(simd_lanes, f16);
+
     var acc: f32 = 0.0;
     var i: usize = 0;
+    if (n >= simd_lanes) {
+        var vacc: VF = @splat(0.0);
+        const vec_end: usize = n - (n % simd_lanes);
+        while (i < vec_end) : (i += simd_lanes) {
+            const ah: VH = @as(*align(1) const VH, @ptrCast(a[i..].ptr)).*;
+            const bv: VF = @as(*align(1) const VF, @ptrCast(b[i..].ptr)).*;
+            const af: VF = @floatCast(ah);
+            vacc = @mulAdd(VF, af, bv, vacc);
+        }
+        acc += @reduce(.Add, vacc);
+    }
     while (i < n) : (i += 1) {
         acc += @as(f32, @floatCast(a[i])) * b[i];
     }
@@ -412,7 +455,19 @@ inline fn fusedRescaleAccumulateRowF16(
     rescale: f32,
     p_new: f32,
 ) void {
+    const VF = Vec;
+    const VH = @Vector(simd_lanes, f16);
+    const v_rescale: VF = @splat(rescale);
+    const v_pnew: VF = @splat(p_new);
+
     var i: usize = 0;
+    const vec_end: usize = d_v - (d_v % simd_lanes);
+    while (i < vec_end) : (i += simd_lanes) {
+        const vo: VF = vecLoad(out_row[i..].ptr);
+        const vh: VH = @as(*align(1) const VH, @ptrCast(v_row[i..].ptr)).*;
+        const vv: VF = @floatCast(vh);
+        vecStore(out_row[i..].ptr, vo * v_rescale + vv * v_pnew);
+    }
     while (i < d_v) : (i += 1) {
         out_row[i] = out_row[i] * rescale + @as(f32, @floatCast(v_row[i])) * p_new;
     }
@@ -424,7 +479,18 @@ inline fn accumulateRowScaledF16(
     d_v: usize,
     alpha: f32,
 ) void {
+    const VF = Vec;
+    const VH = @Vector(simd_lanes, f16);
+    const v_alpha: VF = @splat(alpha);
+
     var i: usize = 0;
+    const vec_end: usize = d_v - (d_v % simd_lanes);
+    while (i < vec_end) : (i += simd_lanes) {
+        const vo: VF = vecLoad(out_row[i..].ptr);
+        const vh: VH = @as(*align(1) const VH, @ptrCast(v_row[i..].ptr)).*;
+        const vv: VF = @floatCast(vh);
+        vecStore(out_row[i..].ptr, @mulAdd(VF, vv, v_alpha, vo));
+    }
     while (i < d_v) : (i += 1) {
         out_row[i] += @as(f32, @floatCast(v_row[i])) * alpha;
     }

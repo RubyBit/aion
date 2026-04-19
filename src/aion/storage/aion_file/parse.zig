@@ -30,88 +30,128 @@ const NodeRecord = types.NodeRecord;
 const GraphMeta = types.GraphMeta;
 const Package = types.Package;
 
+/// Parse a `.aion` file and return a `Package`. The returned Package owns its data
+/// (slices are copied out of `bytes`), so the caller remains responsible for the buffer.
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) PackageError!Package {
-    try validateHeader(bytes);
+    return parseImpl(allocator, bytes, null);
+}
 
-    var cursor: usize = 4;
-    _ = try readIntCursor(bytes, &cursor, u32); // version
-    const section_count: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
-    _ = try readIntCursor(bytes, &cursor, u32); // reserved
-    const dir_offset: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
-    const file_size: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
-    _ = try readIntCursor(bytes, &cursor, u64); // flags
-    _ = try readBytes(bytes, &cursor, 32);
-    if (file_size != bytes.len) return PackageError.InvalidFormat;
+/// Parse and transfer ownership of `bytes` into the returned Package.
+///
+/// Large-initializer slices (notably `Initializer.data` and `QuantizedEncoding.params`)
+/// borrow directly into `bytes` rather than being copied out; `Package.deinit` frees
+/// `bytes` after tearing down its other owned allocations. Use this when loading
+/// multi-GB packages to avoid a peak-memory doubling during parse.
+///
+/// Ownership is transferred unconditionally: on error `bytes` is freed inside the
+/// implementation before the error returns, so the caller must not `free(bytes)`
+/// themselves after calling this.
+pub fn parseTakeOwned(allocator: std.mem.Allocator, bytes: []u8) PackageError!Package {
+    return parseImpl(allocator, bytes, bytes);
+}
 
-    var refs: [section_slot_count]?SectionRef = .{null} ** section_slot_count;
-    try readSectionDirectory(bytes, dir_offset, section_count, &refs);
-    try ensureRequiredSections(refs);
+fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u8) PackageError!Package {
+    // If the caller transferred bytes to us, we must free them on any error path that
+    // returns before the Package takes ownership. `pending_bytes` tracks "do we still
+    // owe the caller that free?"; we null it once the Package holds the bytes and its
+    // own deinit takes over.
+    var pending_bytes: ?[]u8 = source_bytes;
+    errdefer if (pending_bytes) |b| allocator.free(b);
 
-    const strings = try parseStringsSection(allocator, sectionBytes(bytes, refs[sectionSlot(.strings)].?));
-    defer freeStringTable(allocator, strings);
+    var pkg: Package = undefined;
+    var graph_meta: GraphMeta = undefined;
 
-    const dim_symbols = if (refs[sectionSlot(.dim_symbols)]) |ref|
-        try parseDimSymbolsSection(allocator, strings, sectionBytes(bytes, ref))
-    else
-        try allocator.alloc(DimSymbol, 0);
-    errdefer freeDimSymbols(allocator, dim_symbols);
+    // Keep all section-level cleanup (errdefer) inside a scope that ends *before*
+    // `pkg.validate()` runs. After the Package is constructed, only `pkg.deinit()`
+    // should own teardown on validation errors.
+    {
+        try validateHeader(bytes);
 
-    const dim_exprs = if (refs[sectionSlot(.dim_exprs)]) |ref|
-        try parseDimExprsSection(allocator, sectionBytes(bytes, ref))
-    else
-        try allocator.alloc(DimExpr, 0);
-    errdefer allocator.free(dim_exprs);
+        var cursor: usize = 4;
+        _ = try readIntCursor(bytes, &cursor, u32); // version
+        const section_count: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+        _ = try readIntCursor(bytes, &cursor, u32); // reserved
+        const dir_offset: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
+        const file_size: usize = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
+        _ = try readIntCursor(bytes, &cursor, u64); // flags
+        _ = try readBytes(bytes, &cursor, 32);
+        if (file_size != bytes.len) return PackageError.InvalidFormat;
 
-    const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.tensors)].?));
-    errdefer freeInitializers(allocator, initializers);
+        var refs: [section_slot_count]?SectionRef = .{null} ** section_slot_count;
+        try readSectionDirectory(bytes, dir_offset, section_count, &refs);
+        try ensureRequiredSections(refs);
 
-    const values = try parseValuesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.values)].?));
-    errdefer freeValues(allocator, values);
+        const strings = try parseStringsSection(allocator, sectionBytes(bytes, refs[sectionSlot(.strings)].?));
+        defer freeStringTable(allocator, strings);
 
-    const nodes = try parseNodesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.nodes)].?));
-    errdefer freeNodes(allocator, nodes);
+        const dim_symbols = if (refs[sectionSlot(.dim_symbols)]) |ref|
+            try parseDimSymbolsSection(allocator, strings, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(DimSymbol, 0);
+        errdefer freeDimSymbols(allocator, dim_symbols);
 
-    const signatures = try parseSignaturesSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.signatures)].?));
-    errdefer {
-        freeNamedValues(allocator, signatures.inputs);
-        freeNamedValues(allocator, signatures.outputs);
+        const dim_exprs = if (refs[sectionSlot(.dim_exprs)]) |ref|
+            try parseDimExprsSection(allocator, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(DimExpr, 0);
+        errdefer allocator.free(dim_exprs);
+
+        const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.tensors)].?), source_bytes != null);
+        errdefer freeInitializers(allocator, initializers);
+
+        const values = try parseValuesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.values)].?));
+        errdefer freeValues(allocator, values);
+
+        const nodes = try parseNodesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.nodes)].?));
+        errdefer freeNodes(allocator, nodes);
+
+        const signatures = try parseSignaturesSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.signatures)].?));
+        errdefer {
+            freeNamedValues(allocator, signatures.inputs);
+            freeNamedValues(allocator, signatures.outputs);
+        }
+
+        const metadata = if (refs[sectionSlot(.metadata)]) |ref|
+            try parseMetadataSection(allocator, strings, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(MetadataEntry, 0);
+        errdefer freeMetadata(allocator, metadata);
+
+        const debug_names = if (refs[sectionSlot(.debug_names)]) |ref|
+            try parseDebugNamesSection(allocator, strings, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(DebugName, 0);
+        errdefer freeDebugNames(allocator, debug_names);
+
+        const io_aliases = if (refs[sectionSlot(.io_aliases)]) |ref|
+            try parseIoAliasesSection(allocator, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(IoAlias, 0);
+        errdefer allocator.free(io_aliases);
+
+        graph_meta = try parseGraphMetaSection(sectionBytes(bytes, refs[sectionSlot(.graph_meta)].?));
+
+        pkg = Package{
+            .allocator = allocator,
+            .initializers = initializers,
+            .values = values,
+            .nodes = nodes,
+            .inputs = signatures.inputs,
+            .outputs = signatures.outputs,
+            .dim_symbols = dim_symbols,
+            .dim_exprs = dim_exprs,
+            .metadata = metadata,
+            .debug_names = debug_names,
+            .io_aliases = io_aliases,
+            .source_bytes = source_bytes,
+        };
+
+        // From this point, the Package owns all allocations above (and optionally
+        // `source_bytes`). Any later error should be handled by `pkg.deinit()`.
+        pending_bytes = null;
     }
 
-    const metadata = if (refs[sectionSlot(.metadata)]) |ref|
-        try parseMetadataSection(allocator, strings, sectionBytes(bytes, ref))
-    else
-        try allocator.alloc(MetadataEntry, 0);
-    errdefer freeMetadata(allocator, metadata);
-
-    const debug_names = if (refs[sectionSlot(.debug_names)]) |ref|
-        try parseDebugNamesSection(allocator, strings, sectionBytes(bytes, ref))
-    else
-        try allocator.alloc(DebugName, 0);
-    errdefer freeDebugNames(allocator, debug_names);
-
-    const io_aliases = if (refs[sectionSlot(.io_aliases)]) |ref|
-        try parseIoAliasesSection(allocator, sectionBytes(bytes, ref))
-    else
-        try allocator.alloc(IoAlias, 0);
-    errdefer allocator.free(io_aliases);
-
-    const graph_meta = try parseGraphMetaSection(sectionBytes(bytes, refs[sectionSlot(.graph_meta)].?));
-
-    var pkg = Package{
-        .allocator = allocator,
-        .initializers = initializers,
-        .values = values,
-        .nodes = nodes,
-        .inputs = signatures.inputs,
-        .outputs = signatures.outputs,
-        .dim_symbols = dim_symbols,
-        .dim_exprs = dim_exprs,
-        .metadata = metadata,
-        .debug_names = debug_names,
-        .io_aliases = io_aliases,
-    };
     errdefer pkg.deinit();
-
     try pkg.validate();
     try validateGraphMeta(&pkg, graph_meta);
     return pkg;
@@ -279,7 +319,12 @@ fn parseDimExprsSection(allocator: std.mem.Allocator, bytes: []const u8) Package
     return out;
 }
 
-fn parseInitializersSection(allocator: std.mem.Allocator, strings: [][]u8, bytes: []const u8) PackageError![]Initializer {
+fn parseInitializersSection(
+    allocator: std.mem.Allocator,
+    strings: [][]u8,
+    bytes: []const u8,
+    borrow_data: bool,
+) PackageError![]Initializer {
     var cursor: usize = 0;
     const count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
     const out = allocator.alloc(Initializer, count) catch return PackageError.OutOfMemory;
@@ -297,16 +342,27 @@ fn parseInitializersSection(allocator: std.mem.Allocator, strings: [][]u8, bytes
         const data_len = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
         const params_raw = try readBytes(bytes, &cursor, params_len);
         const data_raw = try readBytes(bytes, &cursor, data_len);
-        const data = allocator.dupe(u8, data_raw) catch return PackageError.OutOfMemory;
-        errdefer allocator.free(data);
+
+        // `data` and (for quantized kinds) `params` are the largest per-initializer
+        // payloads; when the caller has transferred ownership of the file bytes to the
+        // Package, these can be zero-copy borrows instead of duplicated allocations.
+        const data: []u8 = if (borrow_data)
+            @constCast(data_raw)
+        else
+            allocator.dupe(u8, data_raw) catch return PackageError.OutOfMemory;
+        errdefer if (!borrow_data) allocator.free(data);
+
         slot.* = switch (kind) {
             0 => .{ .encoding = .{ .plain = std.enums.fromInt(DType, plain_dtype_raw) orelse return PackageError.InvalidFormat }, .data = data },
             1 => blk: {
                 if (scheme_idx == invalid_index or scheme_idx >= strings.len) return PackageError.InvalidFormat;
                 const scheme = allocator.dupe(u8, strings[scheme_idx]) catch return PackageError.OutOfMemory;
                 errdefer allocator.free(scheme);
-                const params = allocator.dupe(u8, params_raw) catch return PackageError.OutOfMemory;
-                errdefer allocator.free(params);
+                const params: []u8 = if (borrow_data)
+                    @constCast(params_raw)
+                else
+                    allocator.dupe(u8, params_raw) catch return PackageError.OutOfMemory;
+                errdefer if (!borrow_data) allocator.free(params);
                 break :blk .{
                     .encoding = .{ .quantized = .{
                         .scheme = scheme,
@@ -434,6 +490,11 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .rope_proportion = try readIntCursor(bytes, &cursor, f32),
         } },
         .KVCacheAppend => .KVCacheAppend,
+        .Cast => .{ .Cast = .{ .to_dtype = try readEnumCursor(bytes, &cursor, DType) } },
+        .MatMulNT => .{ .MatMulNT = .{
+            .alpha = try readIntCursor(bytes, &cursor, f32),
+            .beta = try readIntCursor(bytes, &cursor, f32),
+        } },
         .ViewReshape => .{ .ViewReshape = .{ .new_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
         .ViewSqueeze => .{ .ViewSqueeze = .{ .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null } },
         .ViewUnsqueeze => .{ .ViewUnsqueeze = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },

@@ -22,3 +22,5 @@ Deterministic error handling: expose meaningful Zig error unions when I/O stalls
 Configurable prefetch scheduler: exploit predictable execution graphs (e.g., transformer layers) to hide disk I/O behind compute.
 
 Utilizing `zig build bench` we can benchmark the libraries performance ensuring that it meets hpc standards. Also `zig build test` is used to test the library's correctness. Use `zig build test -Dskip-thread-pool-tests=true` to skip tests that require a thread pool (those can stall).
+
+When working with the python bindings, to regenerate them you do cd bindings\python and then uv pip install -e .

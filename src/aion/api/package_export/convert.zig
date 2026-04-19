@@ -67,6 +67,8 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
             for (sl.starts, 0..) |value, idx| starts[idx] = @intCast(value);
             break :blk .{ .ViewSliceND = .{ .starts = starts, .lens = lens } };
         },
+        .Cast => |ct| .{ .Cast = .{ .to_dtype = ct.to_dtype } },
+        .MatMulNT => |mm| .{ .MatMulNT = .{ .alpha = mm.alpha, .beta = mm.beta } },
     };
     return out;
 }

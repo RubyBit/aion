@@ -241,6 +241,38 @@ class Tensor:
         return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
 
     @classmethod
+    def empty_tiled(
+        cls,
+        ctx,
+        shape: Sequence[int],
+        tile_shape: Sequence[int],
+        *,
+        dtype: AionDType | None = None,
+    ) -> "Tensor":
+        """Create an empty tensor with an explicit per-axis tile shape.
+
+        Some graph ops (notably `KVCacheAppend`) require a specific tile layout —
+        e.g. the full `head_dim` contiguous in a single tile. Use this constructor
+        instead of `Tensor.empty` when you need to guarantee that.
+
+        Necessary for now; think in the future we will support automatic layout inference and more graph optimizations.
+        """
+        shp = _as_shape(shape)
+        tshp = _as_shape(tile_shape)
+        if len(tshp) != len(shp):
+            raise ValueError(f"tile_shape rank {len(tshp)} != shape rank {len(shp)}")
+        if dtype is None:
+            dtype = AionDType.AION_DTYPE_F32
+
+        rank = len(shp)
+        c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
+        c_tile = ffi.new("size_t[]", [int(x) for x in tshp]) if rank != 0 else ffi.NULL
+        out_t = ffi.new("AionTensor**")
+        st = lib.aion_tensor_create_empty_tiled(ctx.ptr, int(dtype), rank, c_shape, c_tile, out_t)
+        raise_for_status(st, ctx.ptr, what="aion_tensor_create_empty_tiled")
+        return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+
+    @classmethod
     def zeros(cls, shape: Sequence[int], *, ctx=None, dtype: AionDType | None = None) -> "Tensor":
         """Create a zero-initialized tensor.
 
@@ -438,7 +470,24 @@ class Tensor:
     def zero(self) -> "Tensor":
         """In-place zero fill. Returns self."""
 
-        return self.fill(0.0)
+        dt = self.dtype()
+        if dt == AionDType.AION_DTYPE_F32:
+            return self.fill(0.0)
+
+        n = self.numel()
+        if dt == AionDType.AION_DTYPE_F16:
+            # `aion_tensor_write` expects element-count, not byte-count.
+            buf = ffi.new("uint16_t[]", n)  # zero-initialized; IEEE-754 half 0.0.
+            st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_F16), buf, n)
+            raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+            return self
+        if dt == AionDType.AION_DTYPE_I32:
+            buf = ffi.new("int32_t[]", n)
+            st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
+            raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+            return self
+
+        raise NotImplementedError(f"zero() not implemented for dtype={dt}")
 
     # Optional numpy interop (enabled when numpy is installed).
     def numpy(self) -> NDArrayF32:

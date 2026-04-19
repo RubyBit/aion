@@ -279,5 +279,6 @@ pub fn Kernel(comptime t: Tuning) type {
                 }
             }
         }
+
     };
 }

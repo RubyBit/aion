@@ -23,6 +23,17 @@ const MAX_RANK: usize = 8;
 
 pub const CompileError = error{ InvalidArgument, OutOfMemory } || graph_mod.GraphError || infer_mod.InferError || StorageError;
 
+fn traceEnabled() bool {
+    // Keep tracing opt-in to avoid log spam in normal runs/tests.
+    const env: std.process.Environ = .{ .block = .global };
+    const raw: []u8 = std.process.Environ.getAlloc(env, std.heap.page_allocator, "AION_TRACE") catch return false;
+    defer std.heap.page_allocator.free(raw);
+    const trimmed: []const u8 = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    return true;
+}
+
 fn compileRequire(cond: bool) CompileError!void {
     if (!cond) return CompileError.InvalidArgument;
 }
@@ -223,6 +234,45 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             _ = s.op;
         },
 
+        .CastTiled => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
+            try compileRequire(out.dtype == s.to_dtype);
+            try compileRequire(!x.dtype.info().is_quantized);
+            try compileRequire(!s.to_dtype.info().is_quantized);
+            // v1: only f16<->f32 (and no-op same-dtype) are supported.
+            const from = x.dtype;
+            const to = s.to_dtype;
+            const ok = (from == .f16 and to == .f32) or (from == .f32 and to == .f16) or (from == to);
+            try compileRequire(ok);
+            try compileRequire(out.rank == x.rank);
+            try requireSameShape(out.shape, x.shape);
+            try requireSameTileShape(out, x);
+            try requireSameTileCounts(out, x);
+        },
+
+        .MatMulNTTiled => |s| {
+            const c: *const TiledTensor = mgr.getConst(s.c) catch return CompileError.InvalidArgument;
+            const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
+            const b: *const TiledTensor = mgr.getConst(s.b) catch return CompileError.InvalidArgument;
+            try compileRequire(a.dtype == .f32 and c.dtype == .f32);
+            try compileRequire(b.dtype == .q8_0);
+            try compileRequire(b.rank == 2);
+            try compileRequire(b.quant_axis == 1);
+            try compileRequire(b.tile_shape[1] == b.shape[1]);
+            try compileRequire(a.rank == c.rank);
+            // Trailing dims: A's last == B's K (= b.shape[1]); C's last == B's N (= b.shape[0]).
+            try compileRequire(a.shape[a.rank - 1] == b.shape[1]);
+            try compileRequire(c.shape[c.rank - 1] == b.shape[0]);
+            // Leading dims share.
+            var d: usize = 0;
+            while (d + 1 < a.rank) : (d += 1) {
+                try compileRequire(a.shape[d] == c.shape[d]);
+            }
+            _ = s.alpha;
+            _ = s.beta;
+        },
+
         .SoftmaxTiled => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
@@ -390,12 +440,6 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                 try compileRequire(beta.tile_counts[d] == out.tile_counts[rank - norm_rank + d]);
             }
 
-            // Per-row scratch arrays in exec: rows are leading dims.
-            if (rank > norm_rank) {
-                const row_elems: usize = try productUsize(out.tile_shape[0..(rank - norm_rank)]);
-                try compileRequire(row_elems <= 256);
-            }
-
             try compileRequire(s.eps > 0.0);
         },
 
@@ -434,11 +478,6 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                 try compileRequire(beta.tile_shape[d] == out.tile_shape[rank - norm_rank + d]);
                 try compileRequire(gamma.tile_counts[d] == out.tile_counts[rank - norm_rank + d]);
                 try compileRequire(beta.tile_counts[d] == out.tile_counts[rank - norm_rank + d]);
-            }
-
-            if (rank > norm_rank) {
-                const row_elems: usize = try productUsize(out.tile_shape[0..(rank - norm_rank)]);
-                try compileRequire(row_elems <= 256);
             }
             try compileRequire(s.eps > 0.0);
         },
@@ -643,12 +682,26 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(indices.rank == 2);
 
             try compileRequire(!out.dtype.info().is_quantized);
-            try compileRequire(!table.dtype.info().is_quantized);
             try compileRequire(!indices.dtype.info().is_quantized);
 
-            // Table/output dtype: f16/f32 only.
-            try compileRequire(table.dtype == .f16 or table.dtype == .f32);
-            try compileRequire(out.dtype == table.dtype);
+            // Table dtype / output dtype contract:
+            //   - scalar table (f16/f32): output matches table exactly.
+            //   - q8_0 table (per-row quantized, `quant_axis == 1`): output is f32 or f16,
+            //     and the kernel dequantizes rows on read.
+            switch (table.dtype) {
+                .f16, .f32 => {
+                    try compileRequire(out.dtype == table.dtype);
+                },
+                .q8_0 => {
+                    try compileRequire(out.dtype == .f32 or out.dtype == .f16);
+                    try compileRequire(table.quant_axis == 1);
+                    try compileRequire((table.shape[1] % 32) == 0);
+                    // Tiling invariant: the full feature axis must fit in one tile so a row is
+                    // a contiguous run of blocks.
+                    try compileRequire(table.tile_shape[1] == table.shape[1]);
+                },
+                else => return CompileError.InvalidArgument,
+            }
 
             // Indices: i32.
             try compileRequire(indices.dtype == .i32);
@@ -938,8 +991,64 @@ fn appendStepChecked(
     steps: *std.ArrayList(Step),
     step: Step,
 ) CompileError!void {
-    try validateStep(mgr, step);
+    validateStep(mgr, step) catch |e| {
+        if (traceEnabled()) {
+            std.debug.print("[aion][compile] validateStep failed: step={s} err={s}\n", .{ @tagName(step), @errorName(e) });
+            debugDumpStep(mgr, step);
+        }
+        return e;
+    };
     steps.append(allocator, step) catch return CompileError.OutOfMemory;
+}
+
+fn debugDumpTensorMeta(mgr: *StorageManager, tid: TensorId, label: []const u8) void {
+    const t: *const TiledTensor = mgr.getConst(tid) catch {
+        std.debug.print("  {s}: <invalid tensor id {d}>\n", .{ label, tid });
+        return;
+    };
+    std.debug.print(
+        "  {s}: id={d} dtype={s} rank={d} shape={any} tile_shape={any} tile_counts={any} quant_axis={d}\n",
+        .{ label, tid, @tagName(t.dtype), t.rank, t.shape, t.tile_shape, t.tile_counts, t.quant_axis },
+    );
+}
+
+fn debugDumpStep(mgr: *StorageManager, step: Step) void {
+    switch (step) {
+        .KVCacheAppendTiled => |s| {
+            debugDumpTensorMeta(mgr, s.cache, "cache");
+            debugDumpTensorMeta(mgr, s.new_kv, "new_kv");
+            debugDumpTensorMeta(mgr, s.end_index, "end_index");
+        },
+        .MultiHeadAttentionCachedTiled => |s| {
+            debugDumpTensorMeta(mgr, s.q, "q");
+            debugDumpTensorMeta(mgr, s.k_cache, "k_cache");
+            debugDumpTensorMeta(mgr, s.v_cache, "v_cache");
+            debugDumpTensorMeta(mgr, s.positions, "positions");
+            debugDumpTensorMeta(mgr, s.end_index, "end_index");
+            debugDumpTensorMeta(mgr, s.out, "out");
+        },
+        .RoPE1DTiled => |s| {
+            debugDumpTensorMeta(mgr, s.x, "x");
+            debugDumpTensorMeta(mgr, s.positions, "positions");
+            debugDumpTensorMeta(mgr, s.out, "out");
+        },
+        .GatherRowsTiled => |s| {
+            debugDumpTensorMeta(mgr, s.table, "table");
+            debugDumpTensorMeta(mgr, s.indices, "indices");
+            debugDumpTensorMeta(mgr, s.out, "out");
+        },
+        .MatMulTiled => |s| {
+            debugDumpTensorMeta(mgr, s.a, "a");
+            debugDumpTensorMeta(mgr, s.b, "b");
+            debugDumpTensorMeta(mgr, s.c, "c");
+        },
+        .MatMulNTTiled => |s| {
+            debugDumpTensorMeta(mgr, s.a, "a");
+            debugDumpTensorMeta(mgr, s.b, "b");
+            debugDumpTensorMeta(mgr, s.c, "c");
+        },
+        else => {},
+    }
 }
 
 fn fillTileShapeDefault(policy: plan_mod.TilePolicy, dtype: types.DType, shape: []const usize, out: []usize) CompileError!void {
@@ -1054,9 +1163,17 @@ pub fn compileGraph(
                 const rank: usize = a_v.shape.len;
                 const m: usize = a_v.shape[rank - 2];
                 const k: usize = a_v.shape[rank - 1];
+                const b_dtype: types.DType = b_v.dtype.?;
                 const n: usize = b_v.shape[rank - 1];
 
-                const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, b_v.dtype.?);
+                // Quantized B tensors cannot be re-tiled today (we only have scalar
+                // retile kernels), so their tiling must be stable across dynamic M.
+                // Use a fixed M-hint for quantized B so `MatMul` works for seq==1 and
+                // longer prefill runs without demanding different weight tile shapes.
+                const tiles = if (b_dtype.info().is_quantized) blk: {
+                    const m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+                    break :blk plan_mod.chooseMatMulTiles(policy, m_hint, n, k, b_dtype);
+                } else plan_mod.chooseMatMulTiles(policy, m, n, k, b_dtype);
 
                 var c_tile_buf: [MAX_RANK]usize = undefined;
                 var a_tile_buf: [MAX_RANK]usize = undefined;
@@ -1091,13 +1208,35 @@ pub fn compileGraph(
                 const a_id: usize = @intCast(node.inputs[0]);
                 const b_id: usize = @intCast(node.inputs[1]);
                 const a_v = graph.values.items[a_id];
+                const b_v = graph.values.items[b_id];
                 var tile_buf: [MAX_RANK]usize = undefined;
                 const tile: []usize = tile_buf[0..out_shape.len];
-                try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+
+                // Prefer inheriting tiling from an existing input tensor to avoid
+                // retile failures for large activations (e.g. quant matmul outputs
+                // use a fixed tm/tn, which may differ from the default tiler for
+                // short-and-wide matrices like [14, 12288]).
+                if (ctx.value_has_tensor[a_id]) {
+                    const a_t: *const TiledTensor = try mgr.getConst(ctx.value_tensor[a_id]);
+                    if (a_t.tile_shape.len == out_shape.len) {
+                        @memcpy(tile, a_t.tile_shape);
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                    }
+                } else if (ctx.value_has_tensor[b_id]) {
+                    const b_t: *const TiledTensor = try mgr.getConst(ctx.value_tensor[b_id]);
+                    if (b_t.tile_shape.len == out_shape.len) {
+                        @memcpy(tile, b_t.tile_shape);
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                    }
+                } else {
+                    try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                }
 
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile);
-                const b_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, b_id, a_v.dtype.?, a_v.shape, tile);
+                const b_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, b_id, b_v.dtype.?, b_v.shape, tile);
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .ElemwiseBinaryTiled = .{ .op = eb.op, .out = out_tid, .a = a_tid, .b = b_tid } });
             },
@@ -1110,7 +1249,19 @@ pub fn compileGraph(
 
                 var tile_out_buf: [MAX_RANK]usize = undefined;
                 const tile_out: []usize = tile_out_buf[0..out_shape.len];
-                try fillTileShapeDefault(policy, out_dt, out_shape, tile_out);
+
+                // Prefer inheriting tiling from A when possible (broadcast is
+                // elementwise over the full output shape).
+                if (ctx.value_has_tensor[a_id]) {
+                    const a_t: *const TiledTensor = try mgr.getConst(ctx.value_tensor[a_id]);
+                    if (a_t.tile_shape.len == out_shape.len) {
+                        @memcpy(tile_out, a_t.tile_shape);
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, tile_out);
+                    }
+                } else {
+                    try fillTileShapeDefault(policy, out_dt, out_shape, tile_out);
+                }
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile_out);
                 const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, tile_out);
 
@@ -1720,7 +1871,11 @@ pub fn compileGraph(
 
                 if (table_v.shape.len != 2 or indices_v.shape.len != 2) return CompileError.InvalidArgument;
                 if (indices_v.dtype.? != .i32) return CompileError.InvalidArgument;
-                if (!(table_v.dtype.? == .f16 or table_v.dtype.? == .f32)) return CompileError.InvalidArgument;
+                const table_dtype = table_v.dtype.?;
+                switch (table_dtype) {
+                    .f16, .f32, .q8_0 => {},
+                    else => return CompileError.InvalidArgument,
+                }
                 if (out_shape.len != 3) return CompileError.InvalidArgument;
 
                 const b: usize = indices_v.shape[0];
@@ -1740,14 +1895,21 @@ pub fn compileGraph(
                 const idx_tile: [2]usize = .{ b, l };
                 const indices_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, indices_id, indices_v.dtype.?, indices_v.shape, idx_tile[0..]);
 
-                // Table: prefer existing tiling when D is already contiguous in-tile.
-                // This avoids expensive re-tiling/copy for huge embedding tables.
+                // Table tiling:
+                // - Scalar tables: retile only if D isn't already within one tile (cheap on hit).
+                // - q8_0 tables: layout invariant is `quant_axis == 1` and `tile_shape[1] == D`.
+                //   `TiledTensor` retiling for quant tensors isn't implemented here, so the bound
+                //   storage must already satisfy the invariant. The compile-step validator
+                //   double-checks below.
                 var table_tid: TensorId = try ensureAnyTensor(&ctx, table_id);
                 const table_cur: *const TiledTensor = mgr.getConst(table_tid) catch return CompileError.InvalidArgument;
-                if (table_cur.tile_counts[1] != 1) {
+                if (table_dtype == .q8_0) {
+                    if (table_cur.quant_axis != 1) return CompileError.InvalidArgument;
+                    if (table_cur.tile_shape[1] != d_embed) return CompileError.InvalidArgument;
+                } else if (table_cur.tile_counts[1] != 1) {
                     const tv: usize = plan_mod.chooseTileShape1D(policy, v_rows)[0];
                     const table_tile: [2]usize = .{ tv, d_embed };
-                    table_tid = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, table_id, table_v.dtype.?, table_v.shape, table_tile[0..]);
+                    table_tid = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, table_id, table_dtype, table_v.shape, table_tile[0..]);
                 }
 
                 try appendStepChecked(allocator, mgr, &steps, .{ .GatherRowsTiled = .{ .out = out_tid, .table = table_tid, .indices = indices_tid } });
@@ -1831,6 +1993,78 @@ pub fn compileGraph(
                     .cache = cache_tid,
                     .new_kv = new_kv_tid,
                     .end_index = end_idx_tid,
+                } });
+            },
+
+            .Cast => |ct| {
+                const x_id: usize = @intCast(node.inputs[0]);
+                const x_v = graph.values.items[x_id];
+                var tile_buf: [MAX_RANK]usize = undefined;
+                const tile: []usize = tile_buf[0..out_shape.len];
+
+                // Inherit input tiling when available — Cast is shape/layout-preserving.
+                if (ctx.value_has_tensor[x_id]) {
+                    const x_t: *const TiledTensor = try mgr.getConst(ctx.value_tensor[x_id]);
+                    if (x_t.tile_shape.len == out_shape.len) {
+                        @memcpy(tile, x_t.tile_shape);
+                    } else {
+                        try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                    }
+                } else {
+                    try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+                }
+
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                const x_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, x_id, x_v.dtype.?, x_v.shape, tile);
+                try appendStepChecked(allocator, mgr, &steps, .{ .CastTiled = .{
+                    .out = out_tid,
+                    .x = x_tid,
+                    .to_dtype = ct.to_dtype,
+                } });
+            },
+
+            .MatMulNT => |mm| {
+                const a_id: usize = @intCast(node.inputs[0]);
+                const b_id: usize = @intCast(node.inputs[1]);
+                const a_v = graph.values.items[a_id];
+                const b_v = graph.values.items[b_id];
+                const rank: usize = a_v.shape.len;
+                if (b_v.shape.len != 2) return CompileError.InvalidArgument;
+
+                // B keeps its `[N, K]` `quant_axis == 1` layout with `tile_shape[1] == K`
+                // (per-row contiguous blocks). B's N-axis is typically tiled into row
+                // chunks by the default quant-embedding tiler.
+                const b_tid: TensorId = try ensureAnyTensor(&ctx, b_id);
+                const b_cur: *const TiledTensor = try mgr.getConst(b_tid);
+                if (b_cur.quant_axis != 1) return CompileError.InvalidArgument;
+                if (b_cur.tile_shape[1] != b_cur.shape[1]) return CompileError.InvalidArgument;
+
+                // Tiling invariant for the v1 kernel: A occupies a single tile spanning
+                // `[...leading, K]`, and C is tiled on its trailing N axis with the *same*
+                // N-chunk size as B's axis-0 tiling. That 1:1 alignment lets the kernel
+                // walk `tile_index = 0..tile_count` on B and C in lockstep without random
+                // access across B tiles.
+                var c_tile_buf: [MAX_RANK]usize = undefined;
+                const c_tile: []usize = c_tile_buf[0..rank];
+                var d: usize = 0;
+                while (d + 1 < rank) : (d += 1) c_tile[d] = out_shape[d];
+                c_tile[rank - 1] = b_cur.tile_shape[0];
+
+                const c_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, c_tile);
+
+                var a_tile_buf: [MAX_RANK]usize = undefined;
+                const a_tile: []usize = a_tile_buf[0..rank];
+                d = 0;
+                while (d + 1 < rank) : (d += 1) a_tile[d] = a_v.shape[d];
+                a_tile[rank - 1] = a_v.shape[rank - 1];
+                const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, a_id, a_v.dtype.?, a_v.shape, a_tile);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .MatMulNTTiled = .{
+                    .c = c_tid,
+                    .a = a_tid,
+                    .b = b_tid,
+                    .alpha = mm.alpha,
+                    .beta = mm.beta,
                 } });
             },
 
@@ -1991,11 +2225,36 @@ fn ensureTilingScalarMaybeRetile(
         const total_elems: usize = try elemCount(shape);
         const rank: usize = shape.len;
 
-        // For large tensors, changing the last two dims can turn a cheap retile into
-        // a massive element-wise shuffle; reject it.
-        if (total_elems > policy.small_tensor_threshold) {
-            if (cur_t.tile_shape[rank - 1] != want_tile[rank - 1]) return CompileError.InvalidArgument;
-            if (cur_t.tile_shape[rank - 2] != want_tile[rank - 2]) return CompileError.InvalidArgument;
+        // Even for rank>2 tensors, we sometimes *must* retile across the last
+        // dims to bridge between ops with different canonical tilings (common in
+        // matmul chains). Bound this by a dedicated threshold so we don't have to
+        // over-inflate `small_tensor_threshold` (which would also change default
+        // storage tiling for many tensors).
+        const allow_last2d_change: bool = total_elems <= policy.retile_last2d_change_max_elems;
+
+        // For very large tensors, changing the last two dims can turn a cheap
+        // retile into a massive element-wise shuffle *and* increases peak memory
+        // use (new backing buffer). Reject unless the tensor is within the policy
+        // bound above.
+        if (!allow_last2d_change and total_elems > policy.small_tensor_threshold) {
+            if (cur_t.tile_shape[rank - 1] != want_tile[rank - 1]) {
+                if (traceEnabled()) {
+                    std.debug.print(
+                        "[aion][compile] retile rejected: large tensor last-dim tile change (dtype={s} shape={any} cur_tile={any} want_tile={any})\n",
+                        .{ @tagName(dtype), shape, cur_t.tile_shape, want_tile },
+                    );
+                }
+                return CompileError.InvalidArgument;
+            }
+            if (cur_t.tile_shape[rank - 2] != want_tile[rank - 2]) {
+                if (traceEnabled()) {
+                    std.debug.print(
+                        "[aion][compile] retile rejected: large tensor 2nd-last-dim tile change (dtype={s} shape={any} cur_tile={any} want_tile={any})\n",
+                        .{ @tagName(dtype), shape, cur_t.tile_shape, want_tile },
+                    );
+                }
+                return CompileError.InvalidArgument;
+            }
         }
 
         // Always keep the batch tile grid bounded (even for small tensors), since
@@ -2005,7 +2264,15 @@ fn ensureTilingScalarMaybeRetile(
         while (d + 2 < rank) : (d += 1) {
             batch_tiles = std.math.mul(usize, batch_tiles, cur_t.tile_counts[d]) catch return CompileError.InvalidArgument;
         }
-        if (batch_tiles > policy.batch_retile_max_tiles) return CompileError.InvalidArgument;
+        if (batch_tiles > policy.batch_retile_max_tiles) {
+            if (traceEnabled()) {
+                std.debug.print(
+                    "[aion][compile] retile rejected: batch tile grid too large (tiles={d} max={d}) dtype={s} shape={any} cur_tile={any} want_tile={any}\n",
+                    .{ batch_tiles, policy.batch_retile_max_tiles, @tagName(dtype), shape, cur_t.tile_shape, want_tile },
+                );
+            }
+            return CompileError.InvalidArgument;
+        }
     }
 
     // Allocate new tensor with desired tiling and insert a scalar retile copy.

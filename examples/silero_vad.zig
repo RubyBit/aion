@@ -767,9 +767,6 @@ fn mainImpl(args: std.process.Args) !void {
         fillSyntheticAudio(signal, opts.context_size);
     }
 
-    const chunk_buf: []f32 = try allocator.alloc(f32, chunk_input_len);
-    defer allocator.free(chunk_buf);
-
     var h_buf: [128]f32 = undefined;
     var c_buf: [128]f32 = undefined;
 
@@ -778,7 +775,6 @@ fn mainImpl(args: std.process.Args) !void {
     var prob_t_opt: ?Tensor = null;
     var next_h_t_opt: ?Tensor = null;
     var next_c_t_opt: ?Tensor = null;
-    var t_memcpy_ns: u64 = 0;
     var t_write_in_ns: u64 = 0;
     var t_run_ns: u64 = 0;
     var t_read_out_ns: u64 = 0;
@@ -793,14 +789,10 @@ fn mainImpl(args: std.process.Args) !void {
         for (0..opts.chunks) |chunk_idx| {
             const start: usize = chunk_idx * opts.num_samples;
             const end: usize = start + chunk_input_len;
-
-            const t_a: u64 = if (opts.profile) nowNs() else 0;
-            @memcpy(chunk_buf, signal[start..end]);
-            const t_b: u64 = if (opts.profile) nowNs() else 0;
-            if (opts.profile) t_memcpy_ns += (t_b - t_a);
+            const chunk_slice: []const f32 = signal[start..end];
 
             const t_c: u64 = if (opts.profile) nowNs() else 0;
-            x_tensor.writeF32(chunk_buf) catch |e| {
+            x_tensor.writeF32(chunk_slice) catch |e| {
                 std.debug.print("write input failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
@@ -871,7 +863,7 @@ fn mainImpl(args: std.process.Args) !void {
 
     if (opts.profile) {
         const denom: f64 = @as(f64, @floatFromInt(@max(@as(usize, 1), total_chunks)));
-        const memcpy_us: f64 = @as(f64, @floatFromInt(t_memcpy_ns)) / (denom * 1_000.0);
+        const memcpy_us: f64 = 0.0;
         const write_us: f64 = @as(f64, @floatFromInt(t_write_in_ns)) / (denom * 1_000.0);
         const run_us: f64 = @as(f64, @floatFromInt(t_run_ns)) / (denom * 1_000.0);
         const read_us: f64 = @as(f64, @floatFromInt(t_read_out_ns)) / (denom * 1_000.0);

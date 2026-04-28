@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 
 pub fn SmallVec(comptime T: type, comptime inline_cap: usize) type {

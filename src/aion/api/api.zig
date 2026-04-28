@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //! High-level public API for Aion.
 //!
 //! Design goals (v0):

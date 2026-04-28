@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const builtin = @import("builtin");
 const x86 = @import("x86.zig");

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const package_file = @import("../../storage/aion_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
 

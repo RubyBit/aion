@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const program_mod = @import("../../graph/program.zig");
 const types_mod = @import("types.zig");
 

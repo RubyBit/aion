@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Minimal Aion C ABI declarations for CFFI (API mode).
 
    This is intentionally macro-free and self-contained so CFFI/pycparser can

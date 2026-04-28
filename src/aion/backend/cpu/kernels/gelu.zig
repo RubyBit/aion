@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
 const fast = @import("fast_math.zig");

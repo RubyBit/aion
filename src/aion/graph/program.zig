@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const types = @import("../backend/types.zig");
 const storage = @import("../storage/storage.zig");

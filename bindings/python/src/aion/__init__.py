@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 from .context import Context, get_default_context, reset_default_context

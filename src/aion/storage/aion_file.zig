@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 pub const types = @import("aion_file/types.zig");
 pub const shape = @import("aion_file/shape.zig");
 pub const io = @import("aion_file/io.zig");

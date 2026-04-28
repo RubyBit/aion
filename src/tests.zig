@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+
 //! Test root for `zig build test`.
 //!
 //! Zig compilation is lazy: merely re-exporting a module from `src/root.zig`

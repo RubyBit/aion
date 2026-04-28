@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const conv_utils = @import("conv_utils.zig");
 const conv2d_kernels = @import("../kernels/conv2d.zig");

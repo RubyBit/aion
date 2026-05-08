@@ -174,7 +174,7 @@ def main() -> None:
     p.add_argument(
         "--tokenizer",
         type=str,
-        default=None,
+        default=str(default_tokenizer_path()),
         help=(
             "Path/URL to tokenizer.json or tokenizer.model, or a directory containing them. "
             "If omitted, uses a dummy token id (useful for kernel debugging but not real text)."

@@ -315,10 +315,9 @@ def main() -> None:
             and ("next_v_cache.layer0" in out_names)
         )
 
-        # Allocate KV caches (f16) and zero-init them.
-        # `KVCacheAppend` requires the full head_dim and batch/H_kv axes to live in a
-        # single tile, so we allocate with an explicit tile_shape == shape rather than
-        # letting the default tiler split the last two axes into a 64×64 grid.
+        # Allocate KV caches (f16) and zero-init them. The graph compiler retiles the
+        # cache to satisfy `KVCacheAppend`'s head-dim contiguity requirement on first
+        # run, so the default tiler is fine here.
         k_cache = {}
         v_cache = {}
         for layer in source_layers:
@@ -326,8 +325,8 @@ def main() -> None:
             t_cap = args.global_cache_capacity if is_global_layer(layer) else 512
             shape = (1, 1, int(t_cap), int(head_dim))
 
-            k = aion.Tensor.empty_tiled(ctx, shape, shape, dtype=aion.AionDType.AION_DTYPE_F16)
-            v = aion.Tensor.empty_tiled(ctx, shape, shape, dtype=aion.AionDType.AION_DTYPE_F16)
+            k = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
+            v = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
             k.zero()
             v.zero()
             k_cache[layer] = k

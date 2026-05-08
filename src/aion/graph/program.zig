@@ -782,12 +782,12 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(cache.shape[3] == new_kv.shape[3]); // D
             try compileRequire(end_idx.shape[0] == cache.shape[0]);
 
-            // v1 tiling safety contract:
-            // - single tile across batch and heads
-            // - full head_dim contiguous in one tile
-            // - single tile for end_index vector
-            try compileRequire(cache.tile_counts[0] == 1 and cache.tile_counts[1] == 1);
-            try compileRequire(new_kv.tile_counts[0] == 1 and new_kv.tile_counts[1] == 1);
+            // Tiling contract:
+            // - full head_dim contiguous in one tile (kernel writes a row per (b,h,t)
+            //   as one memcpy, so head_dim must not span tile boundaries)
+            // - single tile for end_index vector (kernel reads it via tile 0)
+            // Batch/heads/time can be arbitrarily tiled — the kernel maps logical
+            // (b, h, t) to tile coords by integer division (kv_cache_append.zig:116-124).
             try compileRequire(cache.tile_counts[3] == 1 and new_kv.tile_counts[3] == 1);
             try compileRequire(cache.tile_shape[3] == cache.shape[3]);
             try compileRequire(new_kv.tile_shape[3] == new_kv.shape[3]);
@@ -1982,11 +1982,40 @@ pub fn compileGraph(
                 const new_kv_id: usize = @intCast(node.inputs[1]);
                 const end_idx_id: usize = @intCast(node.inputs[2]);
 
-                const cache_tid: TensorId = try ensureAnyTensor(&ctx, cache_id);
-                const new_kv_tid: TensorId = try ensureAnyTensor(&ctx, new_kv_id);
+                const cache_v = graph.values.items[cache_id];
+                const new_kv_v = graph.values.items[new_kv_id];
+
+                // Coerce both cache and new_kv to have the full head_dim in a single
+                // tile (the kernel does one memcpy per (b,h,t) row). Other axes keep
+                // whatever tiling they came in with i.e the kernel handles arbitrary
+                // tile_counts on batch/heads/time via integer division.
+                var cache_tid: TensorId = try ensureAnyTensor(&ctx, cache_id);
+                { // not sure if necessary
+                    const cache_cur: *const TiledTensor = try mgr.getConst(cache_tid);
+                    if (@as(usize, cache_cur.rank) != cache_v.shape.len) return CompileError.InvalidArgument;
+                    var want_buf: [MAX_RANK]usize = undefined;
+                    const want: []usize = want_buf[0..cache_v.shape.len];
+                    var d: usize = 0;
+                    while (d < want.len) : (d += 1) want[d] = cache_cur.tile_shape[d];
+                    want[want.len - 1] = cache_v.shape[cache_v.shape.len - 1];
+                    cache_tid = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, cache_id, cache_v.dtype.?, cache_v.shape, want);
+                }
+
+                var new_kv_tid: TensorId = try ensureAnyTensor(&ctx, new_kv_id);
+                {
+                    const nkv_cur: *const TiledTensor = try mgr.getConst(new_kv_tid);
+                    if (@as(usize, nkv_cur.rank) != new_kv_v.shape.len) return CompileError.InvalidArgument;
+                    var want_buf: [MAX_RANK]usize = undefined;
+                    const want: []usize = want_buf[0..new_kv_v.shape.len];
+                    var d: usize = 0;
+                    while (d < want.len) : (d += 1) want[d] = nkv_cur.tile_shape[d];
+                    want[want.len - 1] = new_kv_v.shape[new_kv_v.shape.len - 1];
+                    new_kv_tid = try ensureTilingScalarMaybeRetile(allocator, &steps, mgr, policy, &ctx, new_kv_id, new_kv_v.dtype.?, new_kv_v.shape, want);
+                }
+
                 const end_idx_tid: TensorId = try ensureAnyTensor(&ctx, end_idx_id);
 
-                // In-place semantics: output aliases cache storage.
+                // In-place semantics: output aliases (post-retile) cache storage.
                 ctx.value_tensor[out_idx] = cache_tid;
                 ctx.value_has_tensor[out_idx] = true;
 

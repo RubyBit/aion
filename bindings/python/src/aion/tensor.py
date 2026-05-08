@@ -252,11 +252,11 @@ class Tensor:
     ) -> "Tensor":
         """Create an empty tensor with an explicit per-axis tile shape.
 
-        Some graph ops (notably `KVCacheAppend`) require a specific tile layout —
-        e.g. the full `head_dim` contiguous in a single tile. Use this constructor
-        instead of `Tensor.empty` when you need to guarantee that.
-
-        Necessary for now; think in the future we will support automatic layout inference and more graph optimizations.
+        Use this when you want to pin a specific tile layout — e.g. to skip the
+        one-time retile copy the compiler would otherwise insert when an op needs
+        a different tiling. For most cases `Tensor.empty` is sufficient: the graph
+        compiler retiles inputs as needed (e.g. KV caches consumed by
+        `KVCacheAppend` are coerced to head-dim-contiguous on first run).
         """
         shp = _as_shape(shape)
         tshp = _as_shape(tile_shape)

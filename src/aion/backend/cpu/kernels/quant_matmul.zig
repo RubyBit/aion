@@ -49,9 +49,37 @@ pub fn matmulNtQ8_0(
     if (n_start > n_total) return BackendError.InvalidArgument;
     if (n_count > (n_total - n_start)) return BackendError.InvalidArgument;
 
-    const LANES: comptime_int = 8;
+    const LANES: comptime_int = switch (@import("builtin").cpu.arch) {
+        .x86_64 => 8,
+        .aarch64 => 4,
+        else => 4,
+    };
+    comptime {
+        if ((Q8_0_BLOCK_ELEMS % LANES) != 0) @compileError("q8 NT kernel requires Q8_0_BLOCK_ELEMS to be divisible by SIMD lanes");
+    }
+
+    const chunks_per_block: comptime_int = Q8_0_BLOCK_ELEMS / LANES;
     const VF = @Vector(LANES, f32);
     const VI8 = @Vector(LANES, i8);
+
+    const blockDot = struct {
+        fn run(block_ptr: [*]const u8, a_base: [*]align(1) const f32) f32 {
+            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
+            const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
+            const v_scale: VF = @splat(scale);
+
+            var acc: f32 = 0.0;
+            inline for (0..chunks_per_block) |chunk| {
+                const lane_off: usize = chunk * LANES;
+                const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
+                const av: VF = @as(*align(1) const VF, @ptrCast(a_base + lane_off)).*;
+                const qf: VF = @floatFromInt(qv);
+                const prod: VF = qf * (av * v_scale);
+                acc += @reduce(.Add, prod);
+            }
+            return acc;
+        }
+    }.run;
 
     if (m_total == 1) {
         const a_row: [*]align(1) const f32 = a_ptr;
@@ -64,43 +92,12 @@ pub fn matmulNtQ8_0(
                 @prefetch(b_ptr + (j + 1) * row_bytes, .{ .rw = .read, .locality = 3, .cache = .data });
             }
 
-            var vacc0: VF = @splat(0.0);
-            var vacc1: VF = @splat(0.0);
-            var vacc2: VF = @splat(0.0);
-            var vacc3: VF = @splat(0.0);
-
+            var acc: f32 = 0.0;
             var b: usize = 0;
             while (b < blocks_per_row) : (b += 1) {
                 const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(b_row_base + block_off)).*;
-                const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-                const v_scale: VF = @splat(scale);
-
-                const q_ptr: [*]align(1) const i8 = @ptrCast(b_row_base + block_off + 2);
-                const a_base: [*]align(1) const f32 = a_row + b * Q8_0_BLOCK_ELEMS;
-
-                const q0: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 0)).*;
-                const q1: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 8)).*;
-                const q2: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 16)).*;
-                const q3: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 24)).*;
-
-                const qf0: VF = @floatFromInt(q0);
-                const qf1: VF = @floatFromInt(q1);
-                const qf2: VF = @floatFromInt(q2);
-                const qf3: VF = @floatFromInt(q3);
-
-                const a0: VF = @as(*align(1) const VF, @ptrCast(a_base + 0)).*;
-                const a1: VF = @as(*align(1) const VF, @ptrCast(a_base + 8)).*;
-                const a2: VF = @as(*align(1) const VF, @ptrCast(a_base + 16)).*;
-                const a3: VF = @as(*align(1) const VF, @ptrCast(a_base + 24)).*;
-
-                vacc0 = @mulAdd(VF, a0, qf0 * v_scale, vacc0);
-                vacc1 = @mulAdd(VF, a1, qf1 * v_scale, vacc1);
-                vacc2 = @mulAdd(VF, a2, qf2 * v_scale, vacc2);
-                vacc3 = @mulAdd(VF, a3, qf3 * v_scale, vacc3);
+                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
             }
-
-            const acc: f32 = @reduce(.Add, vacc0) + @reduce(.Add, vacc1) + @reduce(.Add, vacc2) + @reduce(.Add, vacc3);
 
             if (beta == 0.0) {
                 c_ptr[j] = alpha * acc;
@@ -119,43 +116,12 @@ pub fn matmulNtQ8_0(
         while (m < m_total) : (m += 1) {
             const a_row: [*]align(1) const f32 = a_ptr + m * k;
 
-            var vacc0: VF = @splat(0.0);
-            var vacc1: VF = @splat(0.0);
-            var vacc2: VF = @splat(0.0);
-            var vacc3: VF = @splat(0.0);
-
+            var acc: f32 = 0.0;
             var b: usize = 0;
             while (b < blocks_per_row) : (b += 1) {
                 const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(b_row_base + block_off)).*;
-                const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-                const v_scale: VF = @splat(scale);
-
-                const q_ptr: [*]align(1) const i8 = @ptrCast(b_row_base + block_off + 2);
-                const a_base: [*]align(1) const f32 = a_row + b * Q8_0_BLOCK_ELEMS;
-
-                const q0: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 0)).*;
-                const q1: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 8)).*;
-                const q2: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 16)).*;
-                const q3: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 24)).*;
-
-                const qf0: VF = @floatFromInt(q0);
-                const qf1: VF = @floatFromInt(q1);
-                const qf2: VF = @floatFromInt(q2);
-                const qf3: VF = @floatFromInt(q3);
-
-                const a0: VF = @as(*align(1) const VF, @ptrCast(a_base + 0)).*;
-                const a1: VF = @as(*align(1) const VF, @ptrCast(a_base + 8)).*;
-                const a2: VF = @as(*align(1) const VF, @ptrCast(a_base + 16)).*;
-                const a3: VF = @as(*align(1) const VF, @ptrCast(a_base + 24)).*;
-
-                vacc0 = @mulAdd(VF, a0, qf0 * v_scale, vacc0);
-                vacc1 = @mulAdd(VF, a1, qf1 * v_scale, vacc1);
-                vacc2 = @mulAdd(VF, a2, qf2 * v_scale, vacc2);
-                vacc3 = @mulAdd(VF, a3, qf3 * v_scale, vacc3);
+                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
             }
-
-            const acc: f32 = @reduce(.Add, vacc0) + @reduce(.Add, vacc1) + @reduce(.Add, vacc2) + @reduce(.Add, vacc3);
 
             const c_idx: usize = m * n_count + j;
             if (beta == 0.0) {
@@ -190,54 +156,50 @@ pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8
     const needed_b: usize = blocks_per_col * n * Q8_0_BLOCK_BYTES;
     if (b_bytes.len < needed_b) return BackendError.InvalidArgument;
 
-    const LANES: comptime_int = 8;
+    const LANES: comptime_int = switch (@import("builtin").cpu.arch) {
+        .x86_64 => 8,
+        .aarch64 => 4,
+        else => 4,
+    };
+    comptime {
+        if ((Q8_0_BLOCK_ELEMS % LANES) != 0) @compileError("q8 matvec helper requires Q8_0_BLOCK_ELEMS to be divisible by SIMD lanes");
+    }
+
+    const chunks_per_block: comptime_int = Q8_0_BLOCK_ELEMS / LANES;
     const VF = @Vector(LANES, f32);
     const VI8 = @Vector(LANES, i8);
+
+    const blockDot = struct {
+        fn run(block_ptr: [*]const u8, a_base: [*]align(1) const f32) f32 {
+            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
+            const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
+            const v_scale: VF = @splat(scale);
+
+            var acc: f32 = 0.0;
+            inline for (0..chunks_per_block) |chunk| {
+                const lane_off: usize = chunk * LANES;
+                const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
+                const av: VF = @as(*align(1) const VF, @ptrCast(a_base + lane_off)).*;
+                const qf: VF = @floatFromInt(qv);
+                const prod: VF = qf * (av * v_scale);
+                acc += @reduce(.Add, prod);
+            }
+            return acc;
+        }
+    }.run;
 
     const a_row: [*]align(1) const f32 = a.ptr;
     const b_ptr: [*]const u8 = b_bytes.ptr;
 
     var j: usize = 0;
     while (j < n) : (j += 1) {
-        var vacc0: VF = @splat(0.0);
-        var vacc1: VF = @splat(0.0);
-        var vacc2: VF = @splat(0.0);
-        var vacc3: VF = @splat(0.0);
-
+        var acc: f32 = 0.0;
         var kb: usize = 0;
         while (kb < blocks_per_col) : (kb += 1) {
             const block_off: usize = (kb * n + j) * Q8_0_BLOCK_BYTES;
-            const block_ptr: [*]align(1) const u8 = @ptrCast(b_ptr + block_off);
-
-            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-            const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-            const v_scale: VF = @splat(scale);
-
-            const q_ptr: [*]align(1) const i8 = @ptrCast(block_ptr + 2);
-            const a_base: [*]align(1) const f32 = a_row + kb * Q8_0_BLOCK_ELEMS;
-
-            const q0: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 0)).*;
-            const q1: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 8)).*;
-            const q2: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 16)).*;
-            const q3: VI8 = @as(*align(1) const VI8, @ptrCast(q_ptr + 24)).*;
-
-            const qf0: VF = @floatFromInt(q0);
-            const qf1: VF = @floatFromInt(q1);
-            const qf2: VF = @floatFromInt(q2);
-            const qf3: VF = @floatFromInt(q3);
-
-            const a0: VF = @as(*align(1) const VF, @ptrCast(a_base + 0)).*;
-            const a1: VF = @as(*align(1) const VF, @ptrCast(a_base + 8)).*;
-            const a2: VF = @as(*align(1) const VF, @ptrCast(a_base + 16)).*;
-            const a3: VF = @as(*align(1) const VF, @ptrCast(a_base + 24)).*;
-
-            vacc0 = @mulAdd(VF, a0, qf0 * v_scale, vacc0);
-            vacc1 = @mulAdd(VF, a1, qf1 * v_scale, vacc1);
-            vacc2 = @mulAdd(VF, a2, qf2 * v_scale, vacc2);
-            vacc3 = @mulAdd(VF, a3, qf3 * v_scale, vacc3);
+            acc += blockDot(b_ptr + block_off, a_row + kb * Q8_0_BLOCK_ELEMS);
         }
 
-        const acc: f32 = @reduce(.Add, vacc0) + @reduce(.Add, vacc1) + @reduce(.Add, vacc2) + @reduce(.Add, vacc3);
         if (beta == 0.0) {
             c[j] = alpha * acc;
         } else {
@@ -255,12 +217,12 @@ pub fn Kernel(comptime t: Tuning) type {
         pub const MR: usize = t.mr;
         pub const NR: usize = t.nr;
 
-        pub const LANES: usize = simd.lanesF32();
+        pub const LANES: usize = t.lanes;
 
         pub const ScratchAlignment: usize = 32;
 
         comptime {
-            if (NR % LANES != 0) @compileError("NR must be a multiple of SIMD lanes");
+            if (NR != 2 * LANES) @compileError("quant matmul tuned kernel requires NR == 2 * LANES");
             if ((KC % Q8_0_BLOCK_ELEMS) != 0) @compileError("KC must be a multiple of 32");
             if ((NC % NR) != 0) @compileError("NC must be a multiple of NR");
         }
@@ -490,7 +452,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var scales: [num_vecs]VecF = undefined;
                 inline for (0..num_vecs) |v| {
-                    scales[v] = @as(*align(32) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
+                    scales[v] = @as(*align(1) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
                 }
 
                 var t_el: usize = 0;
@@ -564,7 +526,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var scales: [num_vecs]VecF = undefined;
                 inline for (0..num_vecs) |v| {
-                    scales[v] = @as(*align(32) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
+                    scales[v] = @as(*align(1) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
                 }
 
                 var t_el: usize = 0;
@@ -641,7 +603,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var scales: [num_vecs]VecF = undefined;
                 inline for (0..num_vecs) |v| {
-                    scales[v] = @as(*align(32) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
+                    scales[v] = @as(*align(1) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
                 }
 
                 var t_el: usize = 0;
@@ -734,7 +696,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var scales: [num_vecs]VecF = undefined;
                 inline for (0..num_vecs) |v| {
-                    scales[v] = @as(*align(32) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
+                    scales[v] = @as(*align(1) const VecF, @ptrCast(scales_ptr + v * lanes)).*;
                 }
 
                 var t_el: usize = 0;

@@ -435,7 +435,7 @@ test "cpu kernels: matvec f32" {
         c_ref[j] = acc;
     }
 
-    try matvecKernelsById(.tuned).matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvecKernelsById(.avx2).matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
 }
 
@@ -466,7 +466,7 @@ test "cpu kernels: matvec f16" {
         c_ref[j] = acc;
     }
 
-    try matvecKernelsById(.tuned).matvec_f16(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvecKernelsById(.avx2).matvec_f16(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
 
     var c_f32: [n]f32 = undefined;
     for (c, 0..) |v, idx| c_f32[idx] = @as(f32, @floatCast(v));

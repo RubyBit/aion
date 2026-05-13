@@ -1950,7 +1950,8 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     defer sm.deinit();
 
     const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, b_dtype);
+    const quant_m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const tiles = plan_mod.chooseMatMulTiles(policy, quant_m_hint, n, k, b_dtype);
 
     const a: []f32 = try allocator.alloc(f32, m * k);
     defer allocator.free(a);

@@ -67,6 +67,8 @@ pub fn detect() cpuid_root.CpuInfo {
         const l7_0 = cpuid(7, 0);
         // AVX2: EBX bit 5
         info.features.avx2 = ((l7_0.ebx >> 5) & 1) != 0;
+        // AVX512F: EBX bit 16
+        info.features.avx512f = ((l7_0.ebx >> 16) & 1) != 0;
         // AVX-VNNI: ECX bit 4
         info.features.avx_vnni = ((l7_0.ecx >> 4) & 1) != 0;
         // AVX512-VNNI: ECX bit 11

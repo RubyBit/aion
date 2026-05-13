@@ -321,7 +321,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                                             const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
                                                 t.matmul_qx0
                                             else
-                                                (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                                (quant_matmul_registry.selectForTile(t.matmul_qx0, k_tile, n_tile) orelse {
                                                     t.fail(BackendError.InvalidArgument);
                                                     return;
                                                 });
@@ -342,7 +342,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
                                             t.matmul_qx0
                                         else
-                                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                            (quant_matmul_registry.selectForTile(t.matmul_qx0, k_tile, n_tile) orelse {
                                                 t.fail(BackendError.InvalidArgument);
                                                 return;
                                             });
@@ -382,7 +382,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                                     const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
                                         t.matmul_qx0
                                     else
-                                        (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                        (quant_matmul_registry.selectForTile(t.matmul_qx0, k_tile, n_tile) orelse {
                                             t.fail(BackendError.InvalidArgument);
                                             return;
                                         });
@@ -549,7 +549,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                                     const k_tile: usize = b_view.layout.shape[0];
                                     const n_tile: usize = b_view.layout.shape[1];
 
-                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile) orelse t.matmul_f32;
+                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse t.matmul_f32;
                                     if (k_tile > mk.tuning.kc or n_tile > mk.tuning.nc) {
                                         t.fail(BackendError.InvalidArgument);
                                         return;
@@ -672,7 +672,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                             const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
                                 ctx.matmul_f32
                             else
-                                (matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                                (matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                             var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                                 const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -689,7 +689,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         }
                     },
                     .f16 => {
-                        const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile) orelse ctx.matmul_f32;
+                        const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse ctx.matmul_f32;
                         const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                             const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                             const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
@@ -707,7 +707,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                             ctx.matmul_qx0
                         else
-                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                            (quant_matmul_registry.selectForTile(ctx.matmul_qx0, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                             const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -727,7 +727,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                             const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                                 ctx.matmul_qx0
                             else
-                                (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                                (quant_matmul_registry.selectForTile(ctx.matmul_qx0, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                             var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                                 const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -891,7 +891,7 @@ fn execMatMulTiledBatched(
                                         const mk: matmul_registry.F32Kernels = if (k_tile <= t.matmul_f32.tuning.kc and n_tile <= t.matmul_f32.tuning.nc)
                                             t.matmul_f32
                                         else
-                                            (matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                            (matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse {
                                                 t.fail(BackendError.InvalidArgument);
                                                 return;
                                             });
@@ -910,7 +910,7 @@ fn execMatMulTiledBatched(
                                     }
                                 },
                                 .f16 => {
-                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile) orelse t.matmul_f32;
+                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse t.matmul_f32;
                                     if (m_tile == 1 and t.c_dtype == .f16) {
                                         t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                             t.fail(e);
@@ -927,7 +927,7 @@ fn execMatMulTiledBatched(
                                     const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
                                         t.matmul_qx0
                                     else
-                                        (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                        (quant_matmul_registry.selectForTile(t.matmul_qx0, k_tile, n_tile) orelse {
                                             t.fail(BackendError.InvalidArgument);
                                             return;
                                         });
@@ -953,7 +953,7 @@ fn execMatMulTiledBatched(
                                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= t.matmul_qx0.tuning.kc and n_tile <= t.matmul_qx0.tuning.nc)
                                             t.matmul_qx0
                                         else
-                                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse {
+                                            (quant_matmul_registry.selectForTile(t.matmul_qx0, k_tile, n_tile) orelse {
                                                 t.fail(BackendError.InvalidArgument);
                                                 return;
                                             });
@@ -1062,7 +1062,7 @@ fn execMatMulTiledBatched(
                         const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
                             ctx.matmul_f32
                         else
-                            (matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                            (matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                             const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -1079,7 +1079,7 @@ fn execMatMulTiledBatched(
                     }
                 },
                 .f16 => {
-                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile) orelse ctx.matmul_f32;
+                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse ctx.matmul_f32;
                     const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                         const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
                         const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
@@ -1097,7 +1097,7 @@ fn execMatMulTiledBatched(
                     const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                         ctx.matmul_qx0
                     else
-                        (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                        (quant_matmul_registry.selectForTile(ctx.matmul_qx0, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                     var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                         const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -1117,7 +1117,7 @@ fn execMatMulTiledBatched(
                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                             ctx.matmul_qx0
                         else
-                            (quant_matmul_registry.selectForTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
+                            (quant_matmul_registry.selectForTile(ctx.matmul_qx0, k_tile, n_tile) orelse return BackendError.InvalidArgument);
 
                         var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                             const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
@@ -1249,7 +1249,7 @@ fn execMatMulTiledBatchedF16Grouped(
 
                             const k_tile: usize = b_view.layout.shape[m_dim_local];
                             const n_tile_b: usize = b_view.layout.shape[n_dim_local];
-                            const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile_b) orelse t.matmul_f32;
+                            const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile_b) orelse t.matmul_f32;
                             if (k_tile > mk.tuning.kc or n_tile_b > mk.tuning.nc) {
                                 t.fail(BackendError.InvalidArgument);
                                 return;
@@ -1377,7 +1377,7 @@ fn execMatMulTiledBatchedF16Grouped(
 
                 const k_tile: usize = b_view.layout.shape[m_dim];
                 const n_tile_b: usize = b_view.layout.shape[n_dim];
-                const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(k_tile, n_tile_b) orelse ctx.matmul_f32;
+                const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile_b) orelse ctx.matmul_f32;
 
                 const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
                     const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());

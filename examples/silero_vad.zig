@@ -25,8 +25,6 @@ const TensorRef = api.TensorRef;
 
 const ExampleOptions = struct {
     weights_path: ?[]u8 = null,
-    raw_weights_path: ?[]u8 = null,
-    export_path: ?[]u8 = null,
     wav_path: ?[]u8 = null,
     chunks: usize = 8,
     num_samples: usize = 512,
@@ -41,8 +39,6 @@ const ExampleOptions = struct {
 
     pub fn deinit(self: *ExampleOptions, allocator: std.mem.Allocator) void {
         if (self.weights_path) |p| allocator.free(p);
-        if (self.raw_weights_path) |p| allocator.free(p);
-        if (self.export_path) |p| allocator.free(p);
         if (self.wav_path) |p| allocator.free(p);
         self.* = undefined;
     }
@@ -89,6 +85,57 @@ const TinySileroForward = struct {
     h: TensorRef,
     c: TensorRef,
 };
+
+fn loadTinySileroWeights(weights: *api.Weights) !TinySileroWeights {
+    return .{
+        .stft_w = try weights.initializerTensorByDebugName("stft_w"),
+
+        .conv1_w = try weights.initializerTensorByDebugName("conv1_w"),
+        .conv1_b = try weights.initializerTensorByDebugName("conv1_b"),
+        .conv2_w = try weights.initializerTensorByDebugName("conv2_w"),
+        .conv2_b = try weights.initializerTensorByDebugName("conv2_b"),
+        .conv3_w = try weights.initializerTensorByDebugName("conv3_w"),
+        .conv3_b = try weights.initializerTensorByDebugName("conv3_b"),
+        .conv4_w = try weights.initializerTensorByDebugName("conv4_w"),
+        .conv4_b = try weights.initializerTensorByDebugName("conv4_b"),
+
+        .lstm_w_ih = try weights.initializerTensorByDebugName("lstm_w_ih"),
+        .lstm_w_hh = try weights.initializerTensorByDebugName("lstm_w_hh"),
+        .lstm_b_ih = try weights.initializerTensorByDebugName("lstm_b_ih"),
+        .lstm_b_hh = try weights.initializerTensorByDebugName("lstm_b_hh"),
+
+        .final_w = try weights.initializerTensorByDebugName("final_w"),
+        .final_b = try weights.initializerTensorByDebugName("final_b"),
+    };
+}
+
+fn loadTinySileroWeightsFromPath(ctx: *api.Context, path: []const u8) !TinySileroWeights {
+    var weights: api.Weights = try ctx.loadWeightsPath(path, .{});
+    defer weights.deinit();
+    return loadTinySileroWeights(&weights);
+}
+
+fn buildTinySileroModel(
+    ctx: *api.Context,
+    allocator: std.mem.Allocator,
+    weights: TinySileroWeights,
+    pad_mode: types.PadMode,
+    x_tensor: Tensor,
+    h_tensor: Tensor,
+    c_tensor: Tensor,
+) !api.Model {
+    var bld: Builder = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const x_ref: TensorRef = try bld.name(try bld.param(x_tensor), ModelTensorNames.x);
+    const h_ref: TensorRef = try bld.name(try bld.param(h_tensor), ModelTensorNames.h);
+    const c_ref: TensorRef = try bld.name(try bld.param(c_tensor), ModelTensorNames.c);
+
+    const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
+    const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref });
+
+    return try ctx.compile(&bld, &[_]api.TensorRef{ out.prob, out.h, out.c });
+}
 
 const TinySileroVAD = struct {
     n_fft: usize = 256,
@@ -274,14 +321,6 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !ExampleOptio
             } else {
                 return error.InvalidArgument;
             }
-        } else if (std.mem.eql(u8, arg, "--raw-weights")) {
-            const p: []const u8 = it.next() orelse return error.InvalidArgument;
-            if (out.raw_weights_path) |old| allocator.free(old);
-            out.raw_weights_path = try allocator.dupe(u8, p);
-        } else if (std.mem.eql(u8, arg, "--export-aion")) {
-            const p: []const u8 = it.next() orelse return error.InvalidArgument;
-            if (out.export_path) |old| allocator.free(old);
-            out.export_path = try allocator.dupe(u8, p);
         } else if (std.mem.eql(u8, arg, "--wav")) {
             const p: []const u8 = it.next() orelse return error.InvalidArgument;
             if (out.wav_path) |old| allocator.free(old);
@@ -324,10 +363,7 @@ fn printUsage() void {
         \\  zig build bench-examples -- [options]
         \\
         \\Options:
-        \\  --weights <path>       Load a pre-exported .aion model package directly
-        \\  --raw-weights <path>   Load raw f32 weights (from convert_silero_vad.py),
-        \\                         build the graph, export to .aion, and run
-        \\  --export-aion <path>   Save the exported .aion to a permanent path
+        \\  --weights <path>       Load a pre-exported .aion package as weights only
         \\  --wav <path>           Stream audio from a .wav file instead of synthetic audio
         \\  --chunks <n>           Number of streaming chunks (default: 8)
         \\                         If --wav is set, --chunks 0 means "auto" (ceil(len/num_samples))
@@ -342,12 +378,11 @@ fn printUsage() void {
         \\  --profile-steps        Print per-step timings for the first model.run() (adds overhead)
         \\  -h, --help             Show this help
         \\
-        \\Conversion workflow:
-        \\  1. python scripts/convert_silero_vad.py silero_vad_16k.safetensors weights.bin
-        \\  2. zig build examples -- --raw-weights weights.bin --export-aion silero_vad.aion
-        \\  3. zig build examples -- --weights silero_vad.aion
+        \\Weights workflow:
+        \\  1. python scripts/convert_silero_vad_to_aion.py silero_vad_16k.safetensors silero_vad.aion
+        \\  2. zig build examples -- --weights silero_vad.aion
         \\
-        \\If neither --weights nor --raw-weights is given, synthetic weights are used.
+        \\If --weights is omitted, deterministic synthetic weights are used.
         \\
     , .{});
 }
@@ -715,29 +750,13 @@ fn mainImpl(args: std.process.Args) !void {
     var ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1, .profile_steps = opts.profile_steps });
     defer ctx.deinit();
 
-    var loaded_model: api.LoadedModel = if (opts.weights_path) |p| blk: {
-        std.debug.print("package: loading model package from {s}\n", .{p});
-        break :blk try ctx.loadModelPath(p, .{});
+    const tiny_weights: TinySileroWeights = if (opts.weights_path) |p| blk: {
+        std.debug.print("weights: loading weights-only .aion from {s}\n", .{p});
+        break :blk try loadTinySileroWeightsFromPath(&ctx, p);
     } else blk: {
-        std.debug.print("package: exporting deterministic synthetic model to a temporary .aion and reloading it\n", .{});
-
-        var export_ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-        defer export_ctx.deinit();
-        const weights = try createSyntheticWeights(&export_ctx, allocator);
-
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        const io = io_backend.io();
-        const synthetic_path = ".zig-cache/tiny_silero_vad.synthetic.aion";
-        const file = try std.Io.Dir.cwd().createFile(io, synthetic_path, .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, synthetic_path) catch {};
-        }
-
-        try exportTinySileroPackage(&export_ctx, allocator, weights, chunk_input_len, opts.pad_mode, file);
-        break :blk try ctx.loadModel(file, .{});
+        std.debug.print("weights: using deterministic synthetic weights\n", .{});
+        break :blk try createSyntheticWeights(&ctx, allocator);
     };
-    defer loaded_model.deinit();
 
     const x_shape: [2]usize = .{ 1, chunk_input_len };
     const h_shape: [2]usize = .{ 1, 128 };
@@ -750,9 +769,13 @@ fn mainImpl(args: std.process.Args) !void {
     var zeros_c: [128]f32 = .{0.0} ** 128;
     try h_tensor.writeF32(zeros_h[0..]);
     try c_tensor.writeF32(zeros_c[0..]);
-    try loaded_model.bindInput(ModelTensorNames.x, x_tensor);
-    try loaded_model.bindInput(ModelTensorNames.h, h_tensor);
-    try loaded_model.bindInput(ModelTensorNames.c, c_tensor);
+
+    var model: api.Model = try buildTinySileroModel(&ctx, allocator, tiny_weights, opts.pad_mode, x_tensor, h_tensor, c_tensor);
+    defer model.deinit();
+
+    const prob_t: Tensor = model.outputTensor(0);
+    const next_h_t: Tensor = model.outputTensor(1);
+    const next_c_t: Tensor = model.outputTensor(2);
 
     var wav_opt: ?Wav = null;
     defer if (wav_opt) |w| allocator.free(w.samples);
@@ -787,9 +810,6 @@ fn mainImpl(args: std.process.Args) !void {
 
     const probs: []f32 = try allocator.alloc(f32, opts.chunks);
     defer allocator.free(probs);
-    var prob_t_opt: ?Tensor = null;
-    var next_h_t_opt: ?Tensor = null;
-    var next_c_t_opt: ?Tensor = null;
     var t_write_in_ns: u64 = 0;
     var t_run_ns: u64 = 0;
     var t_read_out_ns: u64 = 0;
@@ -798,8 +818,6 @@ fn mainImpl(args: std.process.Args) !void {
     for (0..opts.bench_iters) |_| {
         try h_tensor.writeF32(zeros_h[0..]);
         try c_tensor.writeF32(zeros_c[0..]);
-        try loaded_model.bindInput(ModelTensorNames.h, h_tensor);
-        try loaded_model.bindInput(ModelTensorNames.c, c_tensor);
 
         for (0..opts.chunks) |chunk_idx| {
             const start: usize = chunk_idx * opts.num_samples;
@@ -815,26 +833,31 @@ fn mainImpl(args: std.process.Args) !void {
             if (opts.profile) t_write_in_ns += (t_d - t_c);
 
             const t_e: u64 = if (opts.profile) nowNs() else 0;
-            loaded_model.run() catch |e| {
-                std.debug.print("loaded model run failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
+            model.run() catch |e| {
+                std.debug.print("model run failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
             const t_f: u64 = if (opts.profile) nowNs() else 0;
             if (opts.profile) t_run_ns += (t_f - t_e);
 
             const t_g: u64 = if (opts.profile) nowNs() else 0;
-            if (prob_t_opt == null) {
-                prob_t_opt = try loaded_model.outputTensor(ModelTensorNames.prob);
-                next_h_t_opt = try loaded_model.outputTensor(ModelTensorNames.next_h);
-                next_c_t_opt = try loaded_model.outputTensor(ModelTensorNames.next_c);
-            }
-            const prob_t = prob_t_opt.?;
             var prob_tmp: [1]f32 = .{0.0};
             prob_t.readF32(prob_tmp[0..]) catch |e| {
                 std.debug.print("read prob failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
             probs[chunk_idx] = prob_tmp[0];
+
+            next_h_t.readF32(h_buf[0..]) catch |e| {
+                std.debug.print("read next_h failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
+                return e;
+            };
+            next_c_t.readF32(c_buf[0..]) catch |e| {
+                std.debug.print("read next_c failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
+                return e;
+            };
+            try h_tensor.writeF32(h_buf[0..]);
+            try c_tensor.writeF32(c_buf[0..]);
 
             if (opts.print_probs) {
                 const chunk_ms: f64 = (@as(f64, @floatFromInt(chunk_idx)) * @as(f64, @floatFromInt(opts.num_samples)) * 1000.0) / 16000.0;
@@ -848,8 +871,8 @@ fn mainImpl(args: std.process.Args) !void {
     const t1_ns: u64 = nowNs();
 
     // Snapshot final streaming state once (for a cheap correctness signal).
-    try next_h_t_opt.?.readF32(h_buf[0..]);
-    try next_c_t_opt.?.readF32(c_buf[0..]);
+    try next_h_t.readF32(h_buf[0..]);
+    try next_c_t.readF32(c_buf[0..]);
 
     const elapsed_ns_u: u64 = @max(@as(u64, 1), t1_ns - t0_ns);
     const total_chunks: usize = opts.bench_iters * opts.chunks;

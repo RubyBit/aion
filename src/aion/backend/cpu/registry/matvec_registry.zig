@@ -7,6 +7,9 @@ pub const Tuning = struct {
     /// Micro-tile along N.
     nr: usize,
 
+    /// SIMD lane width used by the tuned kernel.
+    lanes: usize,
+
     /// Outer blocking along N.
     nc: usize,
 
@@ -37,8 +40,8 @@ pub const VariantId = enum {
     /// Baseline SIMD kernel in `matvecmul.zig`.
     baseline,
 
-    /// Comptime-generated kernel (currently same algorithm, parameterized).
-    tuned,
+    avx2,
+    avx512,
 };
 
 pub const Candidate = struct {
@@ -58,11 +61,16 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .tuned, .kernels = kernelsFor(.{ .nr = 16, .nc = 256, .prefetch_k_dist = 4 }) },
+    .{ .id = .baseline, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = 128, .prefetch_k_dist = 4 }) },
+    .{ .id = .avx2, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = 256, .prefetch_k_dist = 4 }) },
+    .{ .id = .avx512, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = 256, .prefetch_k_dist = 4 }) },
 };
 
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    _ = info;
-    // Default to tuned; fall back to baseline by switching this if needed.
-    return candidates[0];
+    const lanes: usize = cpuid.preferredF32Lanes(info);
+    return switch (lanes) {
+        16 => candidates[2],
+        8 => candidates[1],
+        else => candidates[0],
+    };
 }

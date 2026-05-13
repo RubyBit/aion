@@ -22,6 +22,7 @@ const PackedWeightEntry = conv_utils.PackedWeightEntry;
 const getOrCreatePackedWeights = conv_utils.getOrCreatePackedWeights;
 const scratchForTid = conv_utils.scratchForTid;
 const fillWeightBlock = conv_utils.fillWeightBlock;
+const addBiasRowsF32 = conv_utils.addBiasRowsF32;
 const readTensorPackedF32 = conv_utils.readTensorPackedF32;
 const writeTensorPackedF32 = conv_utils.writeTensorPackedF32;
 
@@ -882,31 +883,13 @@ fn tryExecConv1DImplicitGemmTileNative(
                 }
 
                 if (bias_present_local) {
-                    const lanes: usize = 8;
-                    const Vec = @Vector(lanes, f32);
                     var oc_ti2: usize = 0;
                     while (oc_ti2 < t.oc_counts.len) : (oc_ti2 += 1) {
                         const oc_count: usize = t.oc_counts[oc_ti2];
                         const out: []align(1) f32 = t.out_tiles_all[b_out_off + oc_ti2];
                         const bias: []align(1) const f32 = t.bias_slices[oc_ti2];
-
-                        var oc: usize = 0;
-                        while (oc + lanes <= oc_count) : (oc += lanes) {
-                            const bias_v: Vec = @as(*align(1) const Vec, @ptrCast(bias.ptr + oc)).*;
-                            var mr: usize = 0;
-                            while (mr < m_rows) : (mr += 1) {
-                                const row_base: usize = (row0 + mr) * oc_count + oc;
-                                const c_ptr = out.ptr + row_base;
-                                const c_v: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr)).*;
-                                @as(*align(1) Vec, @ptrCast(c_ptr)).* = c_v + bias_v;
-                            }
-                        }
-                        while (oc < oc_count) : (oc += 1) {
-                            var mr: usize = 0;
-                            while (mr < m_rows) : (mr += 1) {
-                                out[(row0 + mr) * oc_count + oc] += bias[oc];
-                            }
-                        }
+                        const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
+                        addBiasRowsF32(out, row0, m_rows, oc_count, oc_count, bias, mk.tuning.lanes);
                     }
                 }
             }

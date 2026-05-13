@@ -2,7 +2,6 @@
 const std = @import("std");
 const attn_kernels = @import("../kernels/attention.zig");
 const cpuid = @import("../tuning/cpuid.zig");
-const simd = @import("../kernels/simd.zig");
 
 pub const Tuning = attn_kernels.Tuning;
 
@@ -61,16 +60,18 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .baseline, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .mr_acc = 8, .vec_lanes = simd.lanesF32() }) },
-    .{ .id = .avx2, .kernels = kernelsFor(.{ .mr = 8, .nr = 16, .mr_acc = 8, .vec_lanes = simd.lanesF32() }) },
-    .{ .id = .avx512, .kernels = kernelsFor(.{ .mr = 8, .nr = 32, .mr_acc = 8, .vec_lanes = simd.lanesF32() }) },
+    .{ .id = .baseline, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .mr_acc = 8, .vec_lanes = 4 }) },
+    .{ .id = .avx2, .kernels = kernelsFor(.{ .mr = 8, .nr = 16, .mr_acc = 8, .vec_lanes = 8 }) },
+    .{ .id = .avx512, .kernels = kernelsFor(.{ .mr = 8, .nr = 32, .mr_acc = 8, .vec_lanes = 16 }) },
 };
 
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    if (info.arch != .x86_64) return candidates[0];
-    if (info.features.avx512_vnni) return candidates[2];
-    if (info.features.avx2) return candidates[1];
-    return candidates[0];
+    const lanes: usize = cpuid.preferredF32Lanes(info);
+    return switch (lanes) {
+        16 => candidates[2],
+        8 => candidates[1],
+        else => candidates[0],
+    };
 }
 
 comptime {

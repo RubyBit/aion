@@ -21,6 +21,7 @@ const PackedWeightEntry = conv_utils.PackedWeightEntry;
 const getOrCreatePackedWeights = conv_utils.getOrCreatePackedWeights;
 const scratchForTid = conv_utils.scratchForTid;
 const fillWeightBlock = conv_utils.fillWeightBlock;
+const addBiasRowsF32 = conv_utils.addBiasRowsF32;
 const readTensorPackedF32 = conv_utils.readTensorPackedF32;
 const writeTensorPackedF32 = conv_utils.writeTensorPackedF32;
 
@@ -935,26 +936,7 @@ fn tryExecConv2DImplicitGemmTileNative(
                     }
 
                     if (bias_present_local) {
-                        const lanes: usize = 8;
-                        const Vec = @Vector(lanes, f32);
-                        var oc: usize = 0;
-                        while (oc + lanes <= t.oc_count) : (oc += lanes) {
-                            const bias_v: Vec = @as(*align(1) const Vec, @ptrCast(t.bias.ptr + oc)).*;
-                            var mr: usize = 0;
-                            while (mr < m_rows) : (mr += 1) {
-                                const row_base: usize = mr * t.oc_count + oc;
-                                const c_ptr = c_slice.ptr + row_base;
-                                const c_v: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr)).*;
-                                @as(*align(1) Vec, @ptrCast(c_ptr)).* = c_v + bias_v;
-                            }
-                        }
-                        while (oc < t.oc_count) : (oc += 1) {
-                            var mr: usize = 0;
-                            while (mr < m_rows) : (mr += 1) {
-                                const row_base: usize = mr * t.oc_count + oc;
-                                c_slice[row_base] += t.bias[oc];
-                            }
-                        }
+                        addBiasRowsF32(c_slice, 0, m_rows, t.oc_count, t.oc_count, t.bias, t.matmul.tuning.lanes);
                     }
 
                     row0 += m_rows;
@@ -1468,26 +1450,7 @@ fn execConv2DImplicitGemm(
                             const c_slice: []f32 = t.out[dst_base .. dst_base + c_len];
                             const bias_slice: []const f32 = t.bias[tile.oc_start .. tile.oc_start + tile.oc_count];
 
-                            const lanes: usize = 8;
-                            const Vec = @Vector(lanes, f32);
-                            var oc: usize = 0;
-                            while (oc + lanes <= tile.oc_count) : (oc += lanes) {
-                                const bias_v: Vec = @as(*align(1) const Vec, @ptrCast(bias_slice.ptr + oc)).*;
-                                var mr: usize = 0;
-                                while (mr < m_rows) : (mr += 1) {
-                                    const row_base: usize = mr * t.params.c_out + oc;
-                                    const c_ptr = c_slice.ptr + row_base;
-                                    const c_v: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr)).*;
-                                    @as(*align(1) Vec, @ptrCast(c_ptr)).* = c_v + bias_v;
-                                }
-                            }
-                            while (oc < tile.oc_count) : (oc += 1) {
-                                var mr: usize = 0;
-                                while (mr < m_rows) : (mr += 1) {
-                                    const row_base: usize = mr * t.params.c_out + oc;
-                                    c_slice[row_base] += bias_slice[oc];
-                                }
-                            }
+                            addBiasRowsF32(c_slice, 0, m_rows, t.params.c_out, tile.oc_count, bias_slice, t.matmul.tuning.lanes);
                         }
                     }
                 }

@@ -33,7 +33,11 @@ pub fn matmulNtF32(
         // n_start only used for caller-side offsetting of b_ptr/c_ptr; kernel operates on [M, n_count].
     }
 
-    const LANES: comptime_int = 8;
+    const LANES: comptime_int = switch (@import("builtin").cpu.arch) {
+        .x86_64 => 8,
+        .aarch64 => 4,
+        else => 4,
+    };
     const VF = @Vector(LANES, f32);
 
     const vec_k: usize = k - (k % (4 * LANES));
@@ -130,7 +134,7 @@ pub fn matmulNtF32(
 
 pub fn Kernel(comptime t: Tuning) type {
     return struct {
-        pub const LANES: usize = simd.lanesF32();
+        pub const LANES: usize = t.lanes;
         pub const KC = t.kc;
         pub const MC = t.mc;
         pub const NC = t.nc;
@@ -138,6 +142,10 @@ pub fn Kernel(comptime t: Tuning) type {
         pub const MR = t.mr;
         pub const NR = t.nr;
         pub const ScratchAlignment: usize = 32;
+
+        comptime {
+            if (NR != 2 * LANES) @compileError("matmul tuned kernel requires NR == 2 * LANES");
+        }
 
         pub fn scratchBytes() usize {
             return (KC * NC + MC * KC) * @sizeOf(f32);
@@ -399,7 +407,7 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = LANES; // 8
+            const lanes = LANES;
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;
@@ -497,7 +505,7 @@ pub fn Kernel(comptime t: Tuning) type {
             nr: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = LANES; // 8
+            const lanes = LANES;
             const Vec = @Vector(lanes, f32);
 
             var acc: [MR][2]Vec = undefined;

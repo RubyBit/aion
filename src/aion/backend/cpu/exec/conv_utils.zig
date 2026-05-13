@@ -51,6 +51,54 @@ pub const PackedWeightEntry = struct {
     block_elems: usize,
 };
 
+fn addBiasRowsF32Vector(
+    comptime lanes: usize,
+    out: []align(1) f32,
+    row_start: usize,
+    rows: usize,
+    row_stride: usize,
+    channel_count: usize,
+    bias: []align(1) const f32,
+) void {
+    const Vec = @Vector(lanes, f32);
+
+    var oc: usize = 0;
+    while (oc + lanes <= channel_count) : (oc += lanes) {
+        const bias_v: Vec = @as(*align(1) const Vec, @ptrCast(bias.ptr + oc)).*;
+        var mr: usize = 0;
+        while (mr < rows) : (mr += 1) {
+            const row_base: usize = (row_start + mr) * row_stride + oc;
+            const c_ptr = out.ptr + row_base;
+            const c_v: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr)).*;
+            @as(*align(1) Vec, @ptrCast(c_ptr)).* = c_v + bias_v;
+        }
+    }
+
+    while (oc < channel_count) : (oc += 1) {
+        var mr: usize = 0;
+        while (mr < rows) : (mr += 1) {
+            out[(row_start + mr) * row_stride + oc] += bias[oc];
+        }
+    }
+}
+
+pub fn addBiasRowsF32(
+    out: []align(1) f32,
+    row_start: usize,
+    rows: usize,
+    row_stride: usize,
+    channel_count: usize,
+    bias: []align(1) const f32,
+    lanes: usize,
+) void {
+    switch (lanes) {
+        16 => addBiasRowsF32Vector(16, out, row_start, rows, row_stride, channel_count, bias),
+        8 => addBiasRowsF32Vector(8, out, row_start, rows, row_stride, channel_count, bias),
+        4 => addBiasRowsF32Vector(4, out, row_start, rows, row_stride, channel_count, bias),
+        else => addBiasRowsF32Vector(1, out, row_start, rows, row_stride, channel_count, bias),
+    }
+}
+
 var g_packed_w_mutex: std.Io.Mutex = .init;
 var g_packed_w_init: bool = false;
 var g_packed_w_cache: std.AutoHashMap(PackedWeightKey, PackedWeightEntry) = undefined;

@@ -9,6 +9,9 @@ pub const Tuning = struct {
     mr: usize,
     nr: usize,
 
+    // SIMD lane width used by the tuned kernel.
+    lanes: usize,
+
     // Cache blocking params.
     kc: usize,
     mc: usize,
@@ -59,7 +62,7 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning) QuantKernels {
-    const K = quant_matmul.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr });
+    const K = quant_matmul.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr, .lanes = t.lanes });
     return .{
         .tuning = t,
         .scratch_bytes = K.scratchBytes(),
@@ -75,9 +78,17 @@ fn kernelsFor(comptime t: Tuning) QuantKernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .small, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 128, .mc = 144, .nc = 128 }) },
-    .{ .id = .medium, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 256, .mc = 144, .nc = 256 }) },
-    .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .kc = 256, .mc = 240, .nc = 512 }) },
+    .{ .id = .small, .kernels = kernelsFor(.{ .mr = 6, .nr = 8, .lanes = 4, .kc = 128, .mc = 144, .nc = 128 }) },
+    .{ .id = .medium, .kernels = kernelsFor(.{ .mr = 6, .nr = 8, .lanes = 4, .kc = 256, .mc = 144, .nc = 256 }) },
+    .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 8, .lanes = 4, .kc = 512, .mc = 240, .nc = 512 }) },
+
+    .{ .id = .small, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .lanes = 8, .kc = 128, .mc = 144, .nc = 128 }) },
+    .{ .id = .medium, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .lanes = 8, .kc = 256, .mc = 144, .nc = 256 }) },
+    .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .lanes = 8, .kc = 512, .mc = 240, .nc = 512 }) },
+
+    .{ .id = .small, .kernels = kernelsFor(.{ .mr = 6, .nr = 32, .lanes = 16, .kc = 128, .mc = 144, .nc = 128 }) },
+    .{ .id = .medium, .kernels = kernelsFor(.{ .mr = 6, .nr = 32, .lanes = 16, .kc = 256, .mc = 144, .nc = 256 }) },
+    .{ .id = .large, .kernels = kernelsFor(.{ .mr = 6, .nr = 32, .lanes = 16, .kc = 512, .mc = 240, .nc = 512 }) },
 };
 
 pub fn maxScratchBytes() usize {
@@ -88,11 +99,13 @@ pub fn maxScratchBytes() usize {
     return best;
 }
 
-pub fn selectForTile(k: usize, n: usize) ?QuantKernels {
+pub fn selectForTile(default_kernels: QuantKernels, k: usize, n: usize) ?QuantKernels {
     // Choose the smallest candidate that can cover the requested tile.
     // (Smaller NC/KC reduces packed-B footprint and scratch bandwidth.)
     var best: ?QuantKernels = null;
-    inline for (candidates) |c| {
+    const lanes: usize = default_kernels.tuning.lanes;
+    for (candidates) |c| {
+        if (c.kernels.tuning.lanes != lanes) continue;
         if (k <= c.kernels.tuning.kc and n <= c.kernels.tuning.nc) {
             if (best == null) {
                 best = c.kernels;
@@ -108,19 +121,37 @@ pub fn selectForTile(k: usize, n: usize) ?QuantKernels {
 }
 
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
+    const lanes: usize = cpuid.preferredF32Lanes(info);
+
     // Similar heuristic to f32: pick largest candidate whose packed-B footprint
     // fits in ~75% of L2.
     const l2_bytes: usize = info.caches.l2_bytes;
-    if (l2_bytes == 0) return candidates[1];
+    if (l2_bytes == 0) {
+        for (candidates) |c| {
+            if (c.id == .medium and c.kernels.tuning.lanes == lanes) return c;
+        }
+        @panic("missing quant matmul medium candidate for lane group");
+    }
 
     const budget: usize = (l2_bytes * 3) / 4;
 
-    var best: Candidate = candidates[0];
-    inline for (candidates) |c| {
+    var best: Candidate = blk: {
+        for (candidates) |c| {
+            if (c.id == .small and c.kernels.tuning.lanes == lanes) break :blk c;
+        }
+        @panic("missing quant matmul small candidate for lane group");
+    };
+    for (candidates) |c| {
+        if (c.kernels.tuning.lanes != lanes) continue;
         const footprint: usize = c.kernels.packed_b_bytes;
         if (footprint <= budget) best = c;
     }
 
-    if (l2_bytes >= (1 * 1024 * 1024) and best.id == .small) return candidates[1];
+    if (l2_bytes >= (1 * 1024 * 1024) and best.id == .small) {
+        for (candidates) |c| {
+            if (c.id == .medium and c.kernels.tuning.lanes == lanes) return c;
+        }
+        @panic("missing quant matmul medium candidate for lane group");
+    }
     return best;
 }

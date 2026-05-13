@@ -14,6 +14,7 @@ pub const CpuFeatures = struct {
     // x86 Features
     avx2: bool = false,
     avx_vnni: bool = false,
+    avx512f: bool = false,
     avx512_vnni: bool = false,
     amx_int8: bool = false,
     // ARM Features
@@ -46,4 +47,21 @@ pub fn detect() CpuInfo {
         return arm.detect();
     }
     return .{};
+}
+
+/// Best-effort preferred SIMD lane width for f32 kernels on the detected CPU.
+///
+/// Registries use this as their lane-group source of truth instead of relying on
+/// compile-time architecture defaults.
+pub fn preferredF32Lanes(info: CpuInfo) usize {
+    return switch (info.arch) {
+        .x86_64 => if (info.features.avx512f or info.features.avx512_vnni)
+            16
+        else if (info.features.avx2)
+            8
+        else
+            4,
+        .aarch64 => 4,
+        else => 4,
+    };
 }

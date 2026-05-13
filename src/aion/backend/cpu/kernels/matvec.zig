@@ -13,7 +13,7 @@ const Tuning = matvec_registry.Tuning;
 /// We keep it fully comptime-specialized so the hot loop remains vectorized.
 pub fn Kernel(comptime t: Tuning) type {
     return struct {
-        pub const LANES: usize = simd.lanesF32();
+        pub const LANES: usize = t.lanes;
         pub const NR: usize = t.nr;
         pub const NC: usize = t.nc;
         pub const PREFETCH_K_DIST: usize = t.prefetch_k_dist;
@@ -280,6 +280,5 @@ pub fn Kernel(comptime t: Tuning) type {
                 }
             }
         }
-
     };
 }

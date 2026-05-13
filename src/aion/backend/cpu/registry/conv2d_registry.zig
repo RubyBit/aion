@@ -18,8 +18,8 @@ pub const Kernels = struct {
 
 pub const VariantId = enum {
     baseline,
-    k3_unroll_avx2,
-    k3_unroll_noavx2,
+    avx2,
+    avx512,
 };
 
 pub const Candidate = struct {
@@ -37,21 +37,18 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .baseline, .kernels = kernelsFor(.{}) },
-    // x86_64 AVX2-ish choice: keep the native lanes (currently 8 on x86_64).
-    .{ .id = .k3_unroll_avx2, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 8 }) },
-    // x86_64 without AVX2: prefer 4 lanes.
-    .{ .id = .k3_unroll_noavx2, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 4 }) },
+    .{ .id = .baseline, .kernels = kernelsFor(.{ .unroll_3x3 = false, .lanes = 4 }) },
+    .{ .id = .avx2, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 8 }) },
+    .{ .id = .avx512, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 16 }) },
 };
 
 pub fn selectHeuristic(cpu: cpuid.CpuInfo) Candidate {
-    // Conservative heuristic: only pick the unrolled 3x3 specialization on x86_64
-    // for now. Pick lanes based on AVX2 availability.
-    if (cpu.arch == .x86_64) {
-        if (cpu.features.avx2) return candidates[1];
-        return candidates[2];
-    }
-    return candidates[0];
+    const lanes: usize = cpuid.preferredF32Lanes(cpu);
+    return switch (lanes) {
+        16 => candidates[2],
+        8 => candidates[1],
+        else => candidates[0],
+    };
 }
 
 comptime {

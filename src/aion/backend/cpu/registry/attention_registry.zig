@@ -2,6 +2,7 @@
 const std = @import("std");
 const attn_kernels = @import("../kernels/attention.zig");
 const cpuid = @import("../tuning/cpuid.zig");
+const cpu_target = @import("cpu_target.zig");
 
 pub const Tuning = attn_kernels.Tuning;
 
@@ -40,7 +41,7 @@ pub const Kernels = struct {
     exp_softmax: *const fn (x: f32) f32,
 };
 
-pub const VariantId = enum { baseline, avx2, avx512 };
+pub const VariantId = cpu_target.SimdWidth;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -60,18 +61,24 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .baseline, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .mr_acc = 8, .vec_lanes = 4 }) },
-    .{ .id = .avx2, .kernels = kernelsFor(.{ .mr = 8, .nr = 16, .mr_acc = 8, .vec_lanes = 8 }) },
-    .{ .id = .avx512, .kernels = kernelsFor(.{ .mr = 8, .nr = 32, .mr_acc = 8, .vec_lanes = 16 }) },
+    .{ .id = .simd128, .kernels = kernelsFor(.{ .mr = 6, .nr = 16, .mr_acc = 8, .vec_lanes = 4 }) },
+    .{ .id = .simd256, .kernels = kernelsFor(.{ .mr = 8, .nr = 16, .mr_acc = 8, .vec_lanes = 8 }) },
+    .{ .id = .simd512, .kernels = kernelsFor(.{ .mr = 8, .nr = 32, .mr_acc = 8, .vec_lanes = 16 }) },
 };
 
+fn candidateForId(id: VariantId) Candidate {
+    for (candidates) |c| {
+        if (c.id == id) return c;
+    }
+    return candidates[0];
+}
+
+pub fn selectForTarget(target: cpu_target.Target) Candidate {
+    return candidateForId(target.simd_width);
+}
+
 pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    const lanes: usize = cpuid.preferredF32Lanes(info);
-    return switch (lanes) {
-        16 => candidates[2],
-        8 => candidates[1],
-        else => candidates[0],
-    };
+    return selectForTarget(cpu_target.fromCpuInfo(info));
 }
 
 comptime {

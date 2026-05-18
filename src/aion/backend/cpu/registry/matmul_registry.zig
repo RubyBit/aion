@@ -3,6 +3,8 @@ const std = @import("std");
 const types = @import("../../types.zig");
 const matmul_tuned = @import("../kernels/matmul_tuned.zig");
 const cpuid = @import("../tuning/cpuid.zig");
+const cpu_target = @import("cpu_target.zig");
+const gemm_shapes = @import("gemm_shapes.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -18,21 +20,6 @@ pub const Tuning = struct {
     nc: usize,
 };
 
-/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
-/// where A is M×K f32 and B is N×K f32 (row-major, contiguous along K). No packing step.
-pub const MatMulNtF32Fn = *const fn (
-    a_ptr: [*]align(1) const f32,
-    b_ptr: [*]align(1) const f32,
-    c_ptr: [*]align(1) f32,
-    m_total: usize,
-    k: usize,
-    n_total: usize,
-    n_start: usize,
-    n_count: usize,
-    alpha: f32,
-    beta: f32,
-) types.BackendError!void;
-
 pub const F32Kernels = struct {
     tuning: Tuning,
 
@@ -45,10 +32,9 @@ pub const F32Kernels = struct {
     pack_a_tile_f16_to_packed_f32: *const fn (packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_b: *const fn (scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_ab: *const fn (packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8) types.BackendError!void,
-    matmul_nt_f32: MatMulNtF32Fn,
 };
 
-pub const VariantId = enum { small, medium, large };
+pub const VariantId = gemm_shapes.PackedVariantId;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -67,8 +53,6 @@ fn kernelsFor(comptime t: Tuning) F32Kernels {
         .pack_a_tile_f16_to_packed_f32 = K.packATileF16ToPackedF32,
         .matmul_packed_b = K.matmulF32PackedB,
         .matmul_packed_ab = K.matmulF32PackedAB,
-        // NT kernel doesn't use (KC, MC, NC) tuning — B is already in the right layout.
-        .matmul_nt_f32 = matmul_tuned.matmulNtF32,
     };
 }
 
@@ -87,10 +71,7 @@ pub const candidates = [_]Candidate{
 };
 
 fn candidateFor(id: VariantId, lanes: usize) Candidate {
-    for (candidates) |c| {
-        if (c.id == id and c.kernels.tuning.lanes == lanes) return c;
-    }
-    @panic("missing matmul kernel candidate for lane group");
+    return gemm_shapes.candidateFor(candidates, id, lanes);
 }
 
 pub fn maxScratchBytes() usize {
@@ -112,24 +93,7 @@ pub fn maxScratchBytes() usize {
 pub fn selectForTile(default_kernels: F32Kernels, k: usize, n: usize) ?F32Kernels {
     // Choose the smallest kernel variant that can cover the requested tile.
     // Smaller KC/NC reduces packed-B footprint and scratch bandwidth.
-    var best: ?F32Kernels = null;
-    const lanes: usize = default_kernels.tuning.lanes;
-
-    for (candidates) |c| {
-        if (c.kernels.tuning.lanes != lanes) continue;
-        if (k <= c.kernels.tuning.kc and n <= c.kernels.tuning.nc) {
-            if (best == null) {
-                best = c.kernels;
-            } else {
-                const cur: F32Kernels = best.?;
-                const cur_area: usize = cur.tuning.kc * cur.tuning.nc;
-                const cand_area: usize = c.kernels.tuning.kc * c.kernels.tuning.nc;
-                if (cand_area < cur_area) best = c.kernels;
-            }
-        }
-    }
-
-    return best;
+    return gemm_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
 }
 
 pub fn selectForConvOcTile(default_kernels: F32Kernels, oc_count: usize) F32Kernels {
@@ -140,8 +104,8 @@ pub fn selectForConvOcTile(default_kernels: F32Kernels, oc_count: usize) F32Kern
     return selectForTile(default_kernels, default_kernels.tuning.kc, oc_count) orelse default_kernels;
 }
 
-pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    const lanes: usize = cpuid.preferredF32Lanes(info);
+pub fn selectForTarget(target: cpu_target.Target) Candidate {
+    const lanes: usize = target.preferred_f32_lanes;
 
     // Heuristic goal: pick the largest variant that still keeps the packed-B tile
     // in L2 (or as much of it as possible).
@@ -156,10 +120,10 @@ pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
     // - but never return `small` when L2 is reasonably sized (>= 1MiB), because
     //   the current tiler commonly uses tk=256.
 
-    const l2_bytes: usize = info.caches.l2_bytes;
+    const l2_bytes: usize = target.caches.l2_bytes;
     if (l2_bytes == 0) return candidateFor(.medium, lanes);
 
-    const budget: usize = (l2_bytes * 3) / 4;
+    const budget: usize = gemm_shapes.l2Budget75(l2_bytes);
 
     var best: Candidate = candidateFor(.small, lanes);
     for (candidates) |c| {
@@ -170,4 +134,8 @@ pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
 
     if (l2_bytes >= (1 * 1024 * 1024) and best.id == .small) return candidateFor(.medium, lanes);
     return best;
+}
+
+pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
+    return selectForTarget(cpu_target.fromCpuInfo(info));
 }

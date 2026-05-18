@@ -3,6 +3,8 @@ const std = @import("std");
 const types = @import("../../types.zig");
 const quant_matmul = @import("../kernels/quant_matmul.zig");
 const cpuid = @import("../tuning/cpuid.zig");
+const cpu_target = @import("cpu_target.zig");
+const gemm_shapes = @import("gemm_shapes.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -23,22 +25,6 @@ pub const PackedBView = []align(32) const u8;
 pub const PackBFn = *const fn (scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void;
 pub const MatMulPackedBFn = *const fn (scratch_bytes: []u8, packed_b_view: PackedBView, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void;
 
-/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
-/// where A is M×K f32, B is N×K q8_0 (row-major, contiguous along K), and C is M×n_count f32.
-/// No pre-pack: B's rows are already in the natural access order for A @ B^T.
-pub const MatMulNtQ8_0Fn = *const fn (
-    a_ptr: [*]align(1) const f32,
-    b_ptr: [*]const u8,
-    c_ptr: [*]align(1) f32,
-    m_total: usize,
-    k: usize,
-    n_total: usize,
-    n_start: usize,
-    n_count: usize,
-    alpha: f32,
-    beta: f32,
-) types.BackendError!void;
-
 pub const QuantKernels = struct {
     tuning: Tuning,
 
@@ -51,10 +37,9 @@ pub const QuantKernels = struct {
     pack_b_tile_q8_0: PackBFn,
 
     matmul_packed_b: MatMulPackedBFn,
-    matmul_nt_q8_0: MatMulNtQ8_0Fn,
 };
 
-pub const VariantId = enum { small, medium, large };
+pub const VariantId = gemm_shapes.PackedVariantId;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -71,9 +56,6 @@ fn kernelsFor(comptime t: Tuning) QuantKernels {
         .pack_b_tile_q4_0 = K.packBTileQ4_0,
         .pack_b_tile_q8_0 = K.packBTileQ8_0,
         .matmul_packed_b = K.matmulQx0PackedB,
-        // NT kernel is independent of (KC, MC, NC) tuning — B has contiguous rows
-        // so no packing is involved. All candidates point at the same kernel.
-        .matmul_nt_q8_0 = quant_matmul.matmulNtQ8_0,
     };
 }
 
@@ -102,30 +84,15 @@ pub fn maxScratchBytes() usize {
 pub fn selectForTile(default_kernels: QuantKernels, k: usize, n: usize) ?QuantKernels {
     // Choose the smallest candidate that can cover the requested tile.
     // (Smaller NC/KC reduces packed-B footprint and scratch bandwidth.)
-    var best: ?QuantKernels = null;
-    const lanes: usize = default_kernels.tuning.lanes;
-    for (candidates) |c| {
-        if (c.kernels.tuning.lanes != lanes) continue;
-        if (k <= c.kernels.tuning.kc and n <= c.kernels.tuning.nc) {
-            if (best == null) {
-                best = c.kernels;
-            } else {
-                const cur = best.?;
-                const cur_area: usize = cur.tuning.kc * cur.tuning.nc;
-                const cand_area: usize = c.kernels.tuning.kc * c.kernels.tuning.nc;
-                if (cand_area < cur_area) best = c.kernels;
-            }
-        }
-    }
-    return best;
+    return gemm_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
 }
 
-pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    const lanes: usize = cpuid.preferredF32Lanes(info);
+pub fn selectForTarget(target: cpu_target.Target) Candidate {
+    const lanes: usize = target.preferred_f32_lanes;
 
     // Similar heuristic to f32: pick largest candidate whose packed-B footprint
     // fits in ~75% of L2.
-    const l2_bytes: usize = info.caches.l2_bytes;
+    const l2_bytes: usize = target.caches.l2_bytes;
     if (l2_bytes == 0) {
         for (candidates) |c| {
             if (c.id == .medium and c.kernels.tuning.lanes == lanes) return c;
@@ -133,7 +100,7 @@ pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
         @panic("missing quant matmul medium candidate for lane group");
     }
 
-    const budget: usize = (l2_bytes * 3) / 4;
+    const budget: usize = gemm_shapes.l2Budget75(l2_bytes);
 
     var best: Candidate = blk: {
         for (candidates) |c| {
@@ -154,4 +121,8 @@ pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
         @panic("missing quant matmul medium candidate for lane group");
     }
     return best;
+}
+
+pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
+    return selectForTarget(cpu_target.fromCpuInfo(info));
 }

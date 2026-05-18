@@ -2,6 +2,7 @@
 const std = @import("std");
 const cpuid = @import("../tuning/cpuid.zig");
 const conv2d_k = @import("../kernels/conv2d.zig");
+const cpu_target = @import("cpu_target.zig");
 
 /// Depthwise Conv2D direct-kernel tuning parameters.
 ///
@@ -16,11 +17,7 @@ pub const Kernels = struct {
     run_item_range: *const fn (t: *const conv2d_k.DepthwiseConv2DTask, start: usize, end: usize) void,
 };
 
-pub const VariantId = enum {
-    baseline,
-    avx2,
-    avx512,
-};
+pub const VariantId = cpu_target.SimdWidth;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -37,18 +34,24 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .baseline, .kernels = kernelsFor(.{ .unroll_3x3 = false, .lanes = 4 }) },
-    .{ .id = .avx2, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 8 }) },
-    .{ .id = .avx512, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 16 }) },
+    .{ .id = .simd128, .kernels = kernelsFor(.{ .unroll_3x3 = false, .lanes = 4 }) },
+    .{ .id = .simd256, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 8 }) },
+    .{ .id = .simd512, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 16 }) },
 };
 
+fn candidateForId(id: VariantId) Candidate {
+    for (candidates) |c| {
+        if (c.id == id) return c;
+    }
+    return candidates[0];
+}
+
+pub fn selectForTarget(target: cpu_target.Target) Candidate {
+    return candidateForId(target.simd_width);
+}
+
 pub fn selectHeuristic(cpu: cpuid.CpuInfo) Candidate {
-    const lanes: usize = cpuid.preferredF32Lanes(cpu);
-    return switch (lanes) {
-        16 => candidates[2],
-        8 => candidates[1],
-        else => candidates[0],
-    };
+    return selectForTarget(cpu_target.fromCpuInfo(cpu));
 }
 
 comptime {

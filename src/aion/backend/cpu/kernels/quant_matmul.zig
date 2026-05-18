@@ -8,6 +8,11 @@ const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
 const Tuning = quant_matmul_registry.Tuning;
 
+pub const MatvecTuning = struct {
+    /// SIMD lane width selected by `matvec_registry`.
+    lanes: usize,
+};
+
 /// q4_0 block: 32 elements stored as 2-byte f16 scale + 16 bytes (32 nibbles)
 pub const Q4_0_BLOCK_ELEMS: usize = 32;
 pub const Q4_0_BLOCK_BYTES: usize = 18;
@@ -16,129 +21,12 @@ pub const Q4_0_BLOCK_BYTES: usize = 18;
 pub const Q8_0_BLOCK_ELEMS: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
 
-/// Compute `C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]`
-/// where A is M×K f32 (row-major, contiguous over K) and B is N×K q8_0 with one contiguous
-/// run of `K/32` blocks per row.
-///
-/// Unlike the tile-packed `matmulQx0PackedB` kernel, this one reads the on-disk Q8_0 layout
-/// directly — there is no pre-pack step because B's rows are already contiguous along K, the
-/// natural access order for A @ B^T. This is the LM-head-style path used by `StepMatMulNTTiled`.
-///
-/// SIMD inner:
-/// - Each Q8_0 block is 32 elements; loaded as 4x `@Vector(8, i8)` plus a 2-byte f16 scale.
-/// - `@floatFromInt(VecI8)` lowers to `vpmovsxbd + vcvtdq2ps` on AVX2, avoiding scalar lane
-///   unpacking.
-/// - Four independent FMA accumulators hide latency inside each block.
-/// - The common decode case (`m_total == 1`) prefetches one B row ahead.
-pub fn matmulNtQ8_0(
-    a_ptr: [*]align(1) const f32,
-    b_ptr: [*]const u8,
-    c_ptr: [*]align(1) f32,
-    m_total: usize,
-    k: usize,
-    n_total: usize,
-    n_start: usize,
-    n_count: usize,
-    alpha: f32,
-    beta: f32,
-) BackendError!void {
-    const blocks_per_row: usize = k / Q8_0_BLOCK_ELEMS;
-    const row_bytes: usize = blocks_per_row * Q8_0_BLOCK_BYTES;
-
-    if ((k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
-    if (n_start > n_total) return BackendError.InvalidArgument;
-    if (n_count > (n_total - n_start)) return BackendError.InvalidArgument;
-
-    const LANES: comptime_int = switch (@import("builtin").cpu.arch) {
-        .x86_64 => 8,
-        .aarch64 => 4,
-        else => 4,
-    };
-    comptime {
-        if ((Q8_0_BLOCK_ELEMS % LANES) != 0) @compileError("q8 NT kernel requires Q8_0_BLOCK_ELEMS to be divisible by SIMD lanes");
-    }
-
-    const chunks_per_block: comptime_int = Q8_0_BLOCK_ELEMS / LANES;
-    const VF = @Vector(LANES, f32);
-    const VI8 = @Vector(LANES, i8);
-
-    const blockDot = struct {
-        fn run(block_ptr: [*]const u8, a_base: [*]align(1) const f32) f32 {
-            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-            const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-            const v_scale: VF = @splat(scale);
-
-            var acc: f32 = 0.0;
-            inline for (0..chunks_per_block) |chunk| {
-                const lane_off: usize = chunk * LANES;
-                const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
-                const av: VF = @as(*align(1) const VF, @ptrCast(a_base + lane_off)).*;
-                const qf: VF = @floatFromInt(qv);
-                const prod: VF = qf * (av * v_scale);
-                acc += @reduce(.Add, prod);
-            }
-            return acc;
-        }
-    }.run;
-
-    if (m_total == 1) {
-        const a_row: [*]align(1) const f32 = a_ptr;
-
-        var j: usize = 0;
-        while (j < n_count) : (j += 1) {
-            const b_row_base: [*]const u8 = b_ptr + j * row_bytes;
-
-            if (j + 1 < n_count) {
-                @prefetch(b_ptr + (j + 1) * row_bytes, .{ .rw = .read, .locality = 3, .cache = .data });
-            }
-
-            var acc: f32 = 0.0;
-            var b: usize = 0;
-            while (b < blocks_per_row) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
-            }
-
-            if (beta == 0.0) {
-                c_ptr[j] = alpha * acc;
-            } else {
-                c_ptr[j] = alpha * acc + beta * c_ptr[j];
-            }
-        }
-        return;
-    }
-
-    var j: usize = 0;
-    while (j < n_count) : (j += 1) {
-        const b_row_base: [*]const u8 = b_ptr + j * row_bytes;
-
-        var m: usize = 0;
-        while (m < m_total) : (m += 1) {
-            const a_row: [*]align(1) const f32 = a_ptr + m * k;
-
-            var acc: f32 = 0.0;
-            var b: usize = 0;
-            while (b < blocks_per_row) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
-            }
-
-            const c_idx: usize = m * n_count + j;
-            if (beta == 0.0) {
-                c_ptr[c_idx] = alpha * acc;
-            } else {
-                c_ptr[c_idx] = alpha * acc + beta * c_ptr[c_idx];
-            }
-        }
-    }
-}
-
 /// Compute `C[0, :] = alpha * A[0, :] @ B + beta * C[0, :]` for q8_0 B without
 /// pre-packing, where:
 /// - A is f32 with shape [1, K] (contiguous over K)
 /// - B is q8_0 in block-major [K/32, N] layout (same as packBTileQ8_0 input)
 /// - C is f32 with shape [1, N]
-pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
+fn matvecQ8_0KMajorImpl(comptime LANES: comptime_int, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
     if (params.m != 1) return BackendError.InvalidArgument;
     if ((params.k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
 
@@ -156,11 +44,6 @@ pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8
     const needed_b: usize = blocks_per_col * n * Q8_0_BLOCK_BYTES;
     if (b_bytes.len < needed_b) return BackendError.InvalidArgument;
 
-    const LANES: comptime_int = switch (@import("builtin").cpu.arch) {
-        .x86_64 => 8,
-        .aarch64 => 4,
-        else => 4,
-    };
     comptime {
         if ((Q8_0_BLOCK_ELEMS % LANES) != 0) @compileError("q8 matvec helper requires Q8_0_BLOCK_ELEMS to be divisible by SIMD lanes");
     }
@@ -206,6 +89,14 @@ pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8
             c[j] = alpha * acc + beta * c[j];
         }
     }
+}
+
+pub fn MatvecKernel(comptime t: MatvecTuning) type {
+    return struct {
+        pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
+            return matvecQ8_0KMajorImpl(t.lanes, params, c_bytes, a_bytes, b_bytes);
+        }
+    };
 }
 
 pub fn Kernel(comptime t: Tuning) type {

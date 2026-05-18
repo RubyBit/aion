@@ -4,6 +4,8 @@ const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const cpu_target = @import("registry/cpu_target.zig");
+const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
 const conv1d_registry = @import("registry/conv1d_registry.zig");
@@ -62,6 +64,8 @@ pub const CpuBackend = struct {
 
     matmul_qx0: quant_matmul_registry.QuantKernels = quant_matmul_registry.candidates[1].kernels,
 
+    matmul_nt: matmul_nt_registry.Kernels = matmul_nt_registry.candidates[0].kernels,
+
     matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
 
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
@@ -117,6 +121,7 @@ pub const CpuBackend = struct {
         const hw_threads_raw: usize = std.Thread.getCpuCount() catch opts.thread_count;
         const hw_threads: usize = if (hw_threads_raw == 0) opts.thread_count else hw_threads_raw;
         const topo_info = cpuid.detect();
+        const target = cpu_target.fromCpuInfo(topo_info);
         // Respect user-requested thread count up to the system's logical CPUs.
         // For decode-heavy workloads on hybrid CPUs, SMT threads can still help,
         // and higher-level tile heuristics decide when to parallelize small ops.
@@ -135,12 +140,13 @@ pub const CpuBackend = struct {
         };
 
         // Kernel selection based on CPU (same for single- and multi-threaded).
-        self.matmul_f32 = matmul_registry.selectHeuristic(topo_info).kernels;
-        self.matmul_qx0 = quant_matmul_registry.selectHeuristic(topo_info).kernels;
-        self.matvec = matvec_registry.selectHeuristic(topo_info).kernels;
-        self.attention_kernels = attention_registry.selectHeuristic(topo_info).kernels;
-        self.depthwise_conv1d = conv1d_registry.selectHeuristic(topo_info).kernels;
-        self.depthwise_conv2d = conv2d_registry.selectHeuristic(topo_info).kernels;
+        self.matmul_f32 = matmul_registry.selectForTarget(target).kernels;
+        self.matmul_qx0 = quant_matmul_registry.selectForTarget(target).kernels;
+        self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
+        self.matvec = matvec_registry.selectForTarget(target).kernels;
+        self.attention_kernels = attention_registry.selectForTarget(target).kernels;
+        self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
+        self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
 
         if (effective_thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = effective_thread_count });
@@ -372,8 +378,7 @@ pub const CpuBackend = struct {
             .MatMulNTTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 const nt_ctx: exec_matmul_nt.MatMulNtExecCtx = .{
-                    .matmul_f32 = self.matmul_f32,
-                    .matmul_qx0 = self.matmul_qx0,
+                    .matmul_nt = self.matmul_nt,
                 };
                 try exec_matmul_nt.execMatMulNTTiled(&nt_ctx, pool_ptr, self.thread_count, s, store);
             },

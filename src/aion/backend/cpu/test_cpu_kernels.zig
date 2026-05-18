@@ -369,7 +369,7 @@ test "cpu kernels: tuned f32 matmul via registry" {
 }
 
 test "cpu kernels: attention calcScores handles partial tiles" {
-    const kernels: attention_registry.Kernels = attentionKernelsById(.baseline);
+    const kernels: attention_registry.Kernels = attentionKernelsById(.simd128);
 
     const M: usize = 7;
     const N: usize = 19;
@@ -435,7 +435,7 @@ test "cpu kernels: matvec f32" {
         c_ref[j] = acc;
     }
 
-    try matvecKernelsById(.avx2).matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvecKernelsById(.simd256).matvec_f32(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 1e-3);
 }
 
@@ -466,7 +466,7 @@ test "cpu kernels: matvec f16" {
         c_ref[j] = acc;
     }
 
-    try matvecKernelsById(.avx2).matvec_f16(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
+    try matvecKernelsById(.simd256).matvec_f16(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), std.mem.sliceAsBytes(b[0..]));
 
     var c_f32: [n]f32 = undefined;
     for (c, 0..) |v, idx| c_f32[idx] = @as(f32, @floatCast(v));
@@ -719,7 +719,8 @@ test "cpu kernels: direct matvec q8_0 k-major" {
     }
 
     var c: [n]f32 = [_]f32{0.0} ** n;
-    try quant_matmul_k.matvecQ8_0KMajor(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
+    const kernels = matvec_registry.candidates[1].kernels;
+    try kernels.matvec_q8_0_kmajor(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
 

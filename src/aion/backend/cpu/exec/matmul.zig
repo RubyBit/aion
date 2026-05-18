@@ -8,10 +8,10 @@ const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 
 const simd = @import("../kernels/simd.zig");
-const quant_matmul_kernels = @import("../kernels/quant_matmul.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
 const quant_matmul_registry = @import("../registry/quant_matmul_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
+const gemm_dispatch = @import("../registry/gemm_dispatch.zig");
 
 const BackendError = types.BackendError;
 const DType = types.DType;
@@ -188,16 +188,6 @@ fn matmulF16ViaPackedF32(
     return runF16TilePackedB(mk, scratch, packed_b_mut, params, c_dtype, c_bytes, a_bytes);
 }
 
-fn shouldUseQ8DirectMatvec(params: MatMulParams, thread_count: usize) bool {
-    if (params.m != 1) return false;
-    if (thread_count <= 1) return false;
-    const work: usize = std.math.mul(usize, params.k, params.n) catch return false;
-    // Direct K-major q8 matvec avoids pack-B cost, but packed kernels can be
-    // faster on tiny workloads (e.g. Silero-sized layers). Use direct mode only
-    // once the tile is large enough to amortize less cache-friendly B traversal.
-    return work >= (64 * 1024);
-}
-
 pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store: tensor_store.TensorStore) ExecuteProgramError!void {
     const c_meta = try store.meta(s.c);
     const a_meta = try store.meta(s.a);
@@ -252,7 +242,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                     if (t.stop.load(.acquire)) return;
 
                     const tc0: usize = t.c_meta.tile_counts[0];
-                    const is_matvec: bool = (t.c_meta.shape[0] == 1);
+                    const is_matvec: bool = gemm_dispatch.isMatvecShape(t.c_meta.shape[0]);
                     const k_tiles: usize = t.a_meta.tile_counts[1];
 
                     var i: usize = start;
@@ -312,8 +302,8 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                                         return;
                                     },
                                     .q8_0 => {
-                                        if (shouldUseQ8DirectMatvec(params, t.thread_count)) {
-                                            quant_matmul_kernels.matvecQ8_0KMajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                        if (gemm_dispatch.shouldUseQ8DirectMatvec(params, t.thread_count)) {
+                                            t.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                                 t.fail(e);
                                                 return;
                                             };
@@ -666,7 +656,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
 
                 switch (b_dtype) {
                     .f32 => {
-                        if (m_tile == 1) {
+                        if (gemm_dispatch.isMatvecShape(m_tile)) {
                             try ctx.matvec.matvec_f32(params, c_view.bytes, a_view.bytes, b_view.bytes);
                         } else {
                             const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
@@ -697,7 +687,7 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         };
                         defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                        if (m_tile == 1 and c_dtype == .f16) {
+                        if (gemm_dispatch.isMatvecShape(m_tile) and c_dtype == .f16) {
                             try ctx.matvec.matvec_f16(params, c_view.bytes, a_view.bytes, b_view.bytes);
                         } else {
                             try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view.bytes, a_view.bytes, b_view.bytes);
@@ -721,8 +711,8 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
                     },
                     .q8_0 => {
-                        if (m_tile == 1 and shouldUseQ8DirectMatvec(params, ctx.thread_count)) {
-                            try quant_matmul_kernels.matvecQ8_0KMajor(params, c_view.bytes, a_view.bytes, b_view.bytes);
+                        if (gemm_dispatch.shouldUseQ8DirectMatvec(params, ctx.thread_count)) {
+                            try ctx.matvec.matvec_q8_0_kmajor(params, c_view.bytes, a_view.bytes, b_view.bytes);
                         } else {
                             const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                                 ctx.matmul_qx0
@@ -882,7 +872,7 @@ fn execMatMulTiledBatched(
 
                             switch (t.b_dtype) {
                                 .f32 => {
-                                    if (m_tile == 1) {
+                                    if (gemm_dispatch.isMatvecShape(m_tile)) {
                                         t.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                             t.fail(e);
                                             return;
@@ -911,7 +901,7 @@ fn execMatMulTiledBatched(
                                 },
                                 .f16 => {
                                     const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse t.matmul_f32;
-                                    if (m_tile == 1 and t.c_dtype == .f16) {
+                                    if (gemm_dispatch.isMatvecShape(m_tile) and t.c_dtype == .f16) {
                                         t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                             t.fail(e);
                                             return;
@@ -944,8 +934,8 @@ fn execMatMulTiledBatched(
                                     };
                                 },
                                 .q8_0 => {
-                                    if (m_tile == 1 and shouldUseQ8DirectMatvec(params, t.thread_count)) {
-                                        quant_matmul_kernels.matvecQ8_0KMajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
+                                    if (gemm_dispatch.shouldUseQ8DirectMatvec(params, t.thread_count)) {
+                                        t.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
                                             t.fail(e);
                                             return;
                                         };
@@ -1056,7 +1046,7 @@ fn execMatMulTiledBatched(
 
             switch (b_dtype) {
                 .f32 => {
-                    if (m_tile == 1) {
+                    if (gemm_dispatch.isMatvecShape(m_tile)) {
                         try ctx.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes);
                     } else {
                         const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
@@ -1087,7 +1077,7 @@ fn execMatMulTiledBatched(
                     };
                     defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
 
-                    if (m_tile == 1 and c_dtype == .f16) {
+                    if (gemm_dispatch.isMatvecShape(m_tile) and c_dtype == .f16) {
                         try ctx.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes);
                     } else {
                         try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes);
@@ -1111,8 +1101,8 @@ fn execMatMulTiledBatched(
                     try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
                 },
                 .q8_0 => {
-                    if (m_tile == 1 and shouldUseQ8DirectMatvec(params, ctx.thread_count)) {
-                        try quant_matmul_kernels.matvecQ8_0KMajor(params, c_view0.bytes, a_view.bytes, b_view.bytes);
+                    if (gemm_dispatch.shouldUseQ8DirectMatvec(params, ctx.thread_count)) {
+                        try ctx.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes);
                     } else {
                         const qk: quant_matmul_registry.QuantKernels = if (k_tile <= ctx.matmul_qx0.tuning.kc and n_tile <= ctx.matmul_qx0.tuning.nc)
                             ctx.matmul_qx0

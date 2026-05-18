@@ -7,8 +7,7 @@ const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 const exec_utils = @import("utils.zig");
 
-const matmul_registry = @import("../registry/matmul_registry.zig");
-const quant_matmul_registry = @import("../registry/quant_matmul_registry.zig");
+const matmul_nt_registry = @import("../registry/matmul_nt_registry.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -19,8 +18,7 @@ const Q8_0_BLOCK_ELEMS: usize = 32;
 const Q8_0_BLOCK_BYTES: usize = 34;
 
 pub const MatMulNtExecCtx = struct {
-    matmul_f32: matmul_registry.F32Kernels,
-    matmul_qx0: quant_matmul_registry.QuantKernels,
+    matmul_nt: matmul_nt_registry.Kernels,
 };
 
 /// C[m, n] = alpha * sum_k A[m, k] * B[n, k]  +  beta * C[m, n]
@@ -30,9 +28,9 @@ pub const MatMulNtExecCtx = struct {
 /// - B: q8_0 `[N, K]` (quant_axis == 1, one row = K/32 contiguous q8_0 blocks) or f32 `[N, K]`.
 /// - C: f32, trailing axis N.
 ///
-/// Actual compute is delegated to the kernel registry:
-/// - Q8_0 → `quant_matmul.matmulNtQ8_0` via `quant_matmul_registry.QuantKernels.matmul_nt_q8_0`
-/// - F32  → `matmul_tuned.matmulNtF32` via `matmul_registry.F32Kernels.matmul_nt_f32`
+/// Actual compute is delegated to the NT matmul registry:
+/// - Q8_0 → `quant_matmul_nt.Kernel(...).matmulNtQ8_0` via `matmul_nt_registry.Kernels.matmul_q8_0`
+/// - F32  → `matmul_nt.Kernel(...).matmulNtF32` via `matmul_nt_registry.Kernels.matmul_f32`
 ///
 /// Parallelism here is over N tiles (B's axis-0 tiling must match C's last-axis tiling,
 /// enforced at compile time). Each worker handles a contiguous range of N tiles.
@@ -97,8 +95,8 @@ pub fn execMatMulNTTiled(
         alpha: f32,
         beta: f32,
         b_dtype: DType,
-        matmul_nt_q8_0: quant_matmul_registry.MatMulNtQ8_0Fn,
-        matmul_nt_f32: matmul_registry.MatMulNtF32Fn,
+        matmul_nt_q8_0: matmul_nt_registry.MatMulNtQ8_0Fn,
+        matmul_nt_f32: matmul_nt_registry.MatMulNtF32Fn,
 
         fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
             var nt: usize = start;
@@ -169,8 +167,8 @@ pub fn execMatMulNTTiled(
         .alpha = s.alpha,
         .beta = s.beta,
         .b_dtype = b_meta.dtype,
-        .matmul_nt_q8_0 = ctx.matmul_qx0.matmul_nt_q8_0,
-        .matmul_nt_f32 = ctx.matmul_f32.matmul_nt_f32,
+        .matmul_nt_q8_0 = ctx.matmul_nt.matmul_q8_0,
+        .matmul_nt_f32 = ctx.matmul_nt.matmul_f32,
     };
     if (pool) |p| {
         const tile_bytes: usize = exec_utils.tileByteSize(c_meta);

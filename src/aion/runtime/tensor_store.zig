@@ -115,6 +115,14 @@ pub const TensorStore = struct {
         /// it to initiate staged tile loads or cache warming.
         prefetch: ?*const fn (ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void = null,
         prefetchLinear: ?*const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) void = null,
+
+        /// Optional no-copy exchange of two tensor backing buffers.
+        ///
+        /// This is intended for loop-carried SSA-style state where the loop body
+        /// writes `next_state` into a scratch tensor, then the runtime makes that
+        /// scratch storage become the carried state for the next iteration.
+        /// Implementations must reject tensors with incompatible dtype/layout.
+        swapTensors: ?*const fn (ctx: *anyopaque, a: TensorId, b: TensorId) StoreError!void = null,
     };
 
     pub fn meta(self: TensorStore, id: TensorId) StoreError!TensorMeta {
@@ -163,6 +171,11 @@ pub const TensorStore = struct {
 
     pub fn prefetchLinear(self: TensorStore, id: TensorId, tile_index: usize) void {
         if (self.vtable.prefetchLinear) |p| p(self.ctx, id, tile_index);
+    }
+
+    pub fn swapTensors(self: TensorStore, a: TensorId, b: TensorId) StoreError!void {
+        if (self.vtable.swapTensors) |swap| return swap(self.ctx, a, b);
+        return StoreError.InvalidArgument;
     }
 };
 

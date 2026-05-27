@@ -68,15 +68,39 @@ pub fn collectIoAliases(
     return out;
 }
 
-pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.NodeRecord {
-    const out = try allocator.alloc(package_file.NodeRecord, graph.nodes.items.len);
+fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node) ![]package_file.NodeRecord {
+    const out = try allocator.alloc(package_file.NodeRecord, nodes.len);
     errdefer allocator.free(out);
-    for (graph.nodes.items, 0..) |node, idx| {
+    for (nodes, 0..) |node, idx| {
         out[idx] = .{
             .inputs = try allocator.dupe(u32, node.inputs),
             .output = node.output,
             .op = try convert.convertOp(allocator, node.op),
         };
+    }
+    return out;
+}
+
+pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.NodeRecord {
+    return collectNodeSlice(allocator, graph.nodes.items);
+}
+
+pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.RegionRecord {
+    const out = try allocator.alloc(package_file.RegionRecord, graph.regions.items.len);
+    errdefer allocator.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |region| {
+            freeNodes(allocator, region.nodes);
+            allocator.free(region.outputs);
+        }
+    }
+    for (graph.regions.items, 0..) |region, idx| {
+        out[idx] = .{
+            .nodes = try collectNodeSlice(allocator, region.nodes),
+            .outputs = try allocator.dupe(u32, region.outputs),
+        };
+        initialized += 1;
     }
     return out;
 }
@@ -109,6 +133,14 @@ pub fn freeMetadata(allocator: std.mem.Allocator, values: []package_file.Metadat
         allocator.free(entry.value);
     }
     allocator.free(values);
+}
+
+pub fn freeRegions(allocator: std.mem.Allocator, regions: []package_file.RegionRecord) void {
+    for (regions) |region| {
+        freeNodes(allocator, region.nodes);
+        allocator.free(region.outputs);
+    }
+    allocator.free(regions);
 }
 
 pub fn freeNodes(allocator: std.mem.Allocator, nodes: []package_file.NodeRecord) void {

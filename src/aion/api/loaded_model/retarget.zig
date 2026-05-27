@@ -24,6 +24,9 @@ const types_mod = @import("types.zig");
 pub fn retargetProgramTensorIds(program: *program_mod.Program, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
     if (old_tid == new_tid) return;
     for (program.steps) |*step| retargetStepTensorIds(step, old_tid, new_tid);
+    for (program.blocks) |*block| {
+        for (block.steps) |*step| retargetStepTensorIds(step, old_tid, new_tid);
+    }
     for (program.outputs) |*tid| retargetTensorId(tid, old_tid, new_tid);
 }
 

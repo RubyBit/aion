@@ -19,6 +19,7 @@ pub fn instantiateNode(
     graph: *graph_mod.Graph,
     node: package_file.NodeRecord,
     mapped_inputs: []const graph_mod.ValueId,
+    region_map: []const graph_mod.RegionId,
 ) api_errors.ExecuteError!graph_mod.ValueId {
     _ = allocator;
 
@@ -115,5 +116,13 @@ pub fn instantiateNode(
         },
         .Cast => |ct| try graph.addCast(mapped_inputs[0], ct.to_dtype),
         .MatMulNT => |mm| try graph.addMatMulNT(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
+        .If => |iff| blk: {
+            if (iff.then_region >= region_map.len or iff.else_region >= region_map.len) return error.InvalidArgument;
+            break :blk try graph.addIf(mapped_inputs[0], region_map[iff.then_region], region_map[iff.else_region]);
+        },
+        .Loop => |lp| blk: {
+            if (lp.body_region >= region_map.len) return error.InvalidArgument;
+            break :blk try graph.addLoop(mapped_inputs[0], region_map[lp.body_region], @intCast(lp.static_max_trip_count));
+        },
     };
 }

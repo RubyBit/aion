@@ -12,7 +12,7 @@ pub const PadMode = backend_types.PadMode;
 pub const ValueId = graph_mod.ValueId;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-pub const current_version: u32 = 4;
+pub const current_version: u32 = 5;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -38,7 +38,7 @@ pub const SectionType = enum(u32) {
     dim_exprs = 8,
     metadata = 9,
     debug_names = 10,
-    // NOTE: v4 removed the `subgraphs` section (formerly 11) entirely.
+    regions = 11,
     io_aliases = 12,
 };
 
@@ -190,6 +190,9 @@ pub const NodeOp = union(graph_mod.OpTag) {
 
     Cast: struct { to_dtype: DType },
     MatMulNT: struct { alpha: f32, beta: f32 },
+
+    If: struct { then_region: u32, else_region: u32 },
+    Loop: struct { body_region: u32, static_max_trip_count: u64 },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -210,9 +213,15 @@ pub const NodeRecord = struct {
     op: NodeOp,
 };
 
+pub const RegionRecord = struct {
+    nodes: []NodeRecord,
+    outputs: []const u32,
+};
+
 pub const GraphMeta = struct {
     value_count: u32,
     node_count: u32,
+    region_count: u32,
     initializer_count: u32,
     input_count: u32,
     output_count: u32,
@@ -228,6 +237,7 @@ pub const Package = struct {
     initializers: []Initializer,
     values: []ValueRecord,
     nodes: []NodeRecord,
+    regions: []RegionRecord = &[_]RegionRecord{},
     inputs: []NamedValue,
     outputs: []NamedValue,
     dim_symbols: []DimSymbol,
@@ -249,6 +259,7 @@ pub const Package = struct {
         return .{
             .value_count = @intCast(self.values.len),
             .node_count = @intCast(self.nodes.len),
+            .region_count = @intCast(self.regions.len),
             .initializer_count = @intCast(self.initializers.len),
             .input_count = @intCast(self.inputs.len),
             .output_count = @intCast(self.outputs.len),
@@ -288,6 +299,7 @@ pub const Package = struct {
         freeInitializersImpl(self.allocator, self.initializers, borrowed_init_data);
         freeValues(self.allocator, self.values);
         freeNodes(self.allocator, self.nodes);
+        freeRegions(self.allocator, self.regions);
         freeNamedValues(self.allocator, self.inputs);
         freeNamedValues(self.allocator, self.outputs);
         freeDimSymbols(self.allocator, self.dim_symbols);
@@ -342,15 +354,19 @@ pub const Package = struct {
             if (sig.value >= self.values.len) return PackageError.InvalidFormat;
         }
 
-        for (self.nodes) |node| {
-            if (node.output >= self.values.len) return PackageError.InvalidFormat;
-            if (self.values[node.output].source != .produced) return PackageError.InvalidFormat;
-            if (producer_counts[node.output] == std.math.maxInt(u8)) return PackageError.InvalidFormat;
-            producer_counts[node.output] += 1;
-            for (node.inputs) |input| {
-                if (input >= self.values.len or !available[input]) return PackageError.InvalidFormat;
+        for (self.regions) |region| {
+            if (region.outputs.len == 0) return PackageError.InvalidFormat;
+            for (region.nodes) |node| {
+                try validateNodeRefs(self, node, &producer_counts, available);
+                available[node.output] = true;
             }
-            try validateNode(self, node);
+            for (region.outputs) |output| {
+                if (output >= self.values.len or !available[output]) return PackageError.InvalidFormat;
+            }
+        }
+
+        for (self.nodes) |node| {
+            try validateNodeRefs(self, node, &producer_counts, available);
             available[node.output] = true;
         }
 
@@ -439,6 +455,17 @@ fn validateIoAliases(pkg: *const Package) PackageError!void {
     }
 }
 
+fn validateNodeRefs(pkg: *const Package, node: NodeRecord, producer_counts: *[]u8, available: []const bool) PackageError!void {
+    if (node.output >= pkg.values.len) return PackageError.InvalidFormat;
+    if (pkg.values[node.output].source != .produced) return PackageError.InvalidFormat;
+    if (producer_counts.*[node.output] == std.math.maxInt(u8)) return PackageError.InvalidFormat;
+    producer_counts.*[node.output] += 1;
+    for (node.inputs) |input| {
+        if (input >= pkg.values.len or !available[input]) return PackageError.InvalidFormat;
+    }
+    try validateNode(pkg, node);
+}
+
 fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
     switch (node.op) {
         .LayerNorm => |ln| {
@@ -456,6 +483,14 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
         },
         .ComplexAbsMean => |cm| if (cm.out_channels == 0) return PackageError.InvalidFormat,
+        .If => |iff| {
+            if (iff.then_region >= pkg.regions.len or iff.else_region >= pkg.regions.len) return PackageError.InvalidFormat;
+            if (pkg.regions[iff.then_region].outputs.len != 1 or pkg.regions[iff.else_region].outputs.len != 1) return PackageError.InvalidFormat;
+        },
+        .Loop => |lp| {
+            if (lp.body_region >= pkg.regions.len or lp.static_max_trip_count == 0) return PackageError.InvalidFormat;
+            if (pkg.regions[lp.body_region].outputs.len != 1) return PackageError.InvalidFormat;
+        },
         .ViewReshape => |vr| {
             if (vr.new_shape.len == 0 or vr.new_shape.len > max_rank) return PackageError.InvalidFormat;
             for (vr.new_shape) |term| try validateShapeTerm(pkg, term);
@@ -489,6 +524,14 @@ fn freeInitializersImpl(allocator: std.mem.Allocator, initializers: []Initialize
 fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
     for (values) |value| allocator.free(value.shape_terms);
     allocator.free(values);
+}
+
+fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
+    for (regions) |region| {
+        freeNodes(allocator, region.nodes);
+        allocator.free(region.outputs);
+    }
+    if (regions.len != 0) allocator.free(regions);
 }
 
 fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {

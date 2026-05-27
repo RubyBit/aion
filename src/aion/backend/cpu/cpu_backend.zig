@@ -223,7 +223,78 @@ pub const CpuBackend = struct {
 
     const ElemwiseExec = exec_elemwise;
 
-    fn execStep(self: *Self, step: executable.Step, store: tensor_store.TensorStore) ExecuteProgramError!void {
+    fn readI32Scalar(store: tensor_store.TensorStore, id: executable.TensorId) ExecuteProgramError!i32 {
+        const meta: tensor_store.TensorMeta = try store.meta(id);
+        if (meta.dtype != .i32 or meta.rank != 1 or meta.shape.len != 1 or meta.shape[0] != 1) return error.InvalidArgument;
+        const tile: tensor_store.TileRefConst = try store.acquireTileConstLinear(id, 0);
+        defer store.releaseConst(tile.token);
+        if (tile.bytes.len < @sizeOf(i32)) return error.InvalidArgument;
+        return std.mem.readInt(i32, tile.bytes[0..@sizeOf(i32)], .little);
+    }
+
+    fn readPredicate(store: tensor_store.TensorStore, id: executable.TensorId) ExecuteProgramError!bool {
+        return (try readI32Scalar(store, id)) != 0;
+    }
+
+    fn readUsizeScalar(store: tensor_store.TensorStore, id: executable.TensorId) ExecuteProgramError!usize {
+        const raw: i32 = try readI32Scalar(store, id);
+        if (raw < 0) return error.InvalidArgument;
+        return @intCast(raw);
+    }
+
+    fn totalTileCount(meta: tensor_store.TensorMeta) ExecuteProgramError!usize {
+        var total: usize = 1;
+        for (meta.tile_counts) |count| {
+            total = std.math.mul(usize, total, count) catch return error.InvalidArgument;
+        }
+        return total;
+    }
+
+    fn copyTensorSameLayout(store: tensor_store.TensorStore, dst: executable.TensorId, src: executable.TensorId) ExecuteProgramError!void {
+        const dst_meta: tensor_store.TensorMeta = try store.meta(dst);
+        const src_meta: tensor_store.TensorMeta = try store.meta(src);
+        if (dst_meta.dtype != src_meta.dtype or dst_meta.rank != src_meta.rank) return error.InvalidArgument;
+        if (dst_meta.shape.len != src_meta.shape.len or dst_meta.tile_shape.len != src_meta.tile_shape.len or dst_meta.tile_counts.len != src_meta.tile_counts.len) return error.InvalidArgument;
+        for (dst_meta.shape, 0..) |v, i| if (v != src_meta.shape[i]) return error.InvalidArgument;
+        for (dst_meta.tile_shape, 0..) |v, i| if (v != src_meta.tile_shape[i]) return error.InvalidArgument;
+        for (dst_meta.tile_counts, 0..) |v, i| if (v != src_meta.tile_counts[i]) return error.InvalidArgument;
+
+        const tile_count: usize = try totalTileCount(dst_meta);
+        var tile_index: usize = 0;
+        while (tile_index < tile_count) : (tile_index += 1) {
+            const src_tile: tensor_store.TileRefConst = try store.acquireTileConstLinear(src, tile_index);
+            defer store.releaseConst(src_tile.token);
+            const dst_tile: tensor_store.TileRefMut = try store.acquireTileMutLinear(dst, tile_index);
+            defer store.releaseMut(dst_tile.token);
+            if (dst_tile.bytes.len != src_tile.bytes.len) return error.InvalidArgument;
+            @memcpy(dst_tile.bytes, src_tile.bytes);
+        }
+    }
+
+    fn copyTensorLists(store: tensor_store.TensorStore, dst: []const executable.TensorId, src: []const executable.TensorId) ExecuteProgramError!void {
+        if (dst.len != src.len) return error.InvalidArgument;
+        for (dst, 0..) |dst_id, i| {
+            try copyTensorSameLayout(store, dst_id, src[i]);
+        }
+    }
+
+    fn swapTensorLists(store: tensor_store.TensorStore, a: []const executable.TensorId, b: []const executable.TensorId) ExecuteProgramError!void {
+        if (a.len != b.len) return error.InvalidArgument;
+        for (a, 0..) |a_id, i| {
+            if (a_id == b[i]) continue;
+            try store.swapTensors(a_id, b[i]);
+        }
+    }
+
+    fn execBlock(self: *Self, prog: *const executable.ExecutableProgram, block_id: executable.BlockId, store: tensor_store.TensorStore) ExecuteProgramError!void {
+        const idx: usize = @intCast(block_id);
+        if (idx >= prog.blocks.len) return error.InvalidArgument;
+        for (prog.blocks[idx].steps) |block_step| {
+            try self.execStep(prog, block_step, store);
+        }
+    }
+
+    fn execStep(self: *Self, prog: *const executable.ExecutableProgram, step: executable.Step, store: tensor_store.TensorStore) ExecuteProgramError!void {
         switch (step) {
             .MatMulTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
@@ -327,6 +398,44 @@ pub const CpuBackend = struct {
                 try exec_complex_abs_mean.execComplexAbsMean(pool_ptr, self.thread_count, s, store);
             },
 
+            .If => |s| {
+                const take_then: bool = try readPredicate(store, s.cond);
+                const count: usize = @intCast(s.output_count);
+                if (count > executable.MAX_CONTROL_OUTPUTS) return error.InvalidArgument;
+                if (take_then) {
+                    try self.execBlock(prog, s.then_block, store);
+                    try copyTensorLists(store, s.outputs[0..count], s.then_outputs[0..count]);
+                } else {
+                    try self.execBlock(prog, s.else_block, store);
+                    try copyTensorLists(store, s.outputs[0..count], s.else_outputs[0..count]);
+                }
+            },
+
+            .Loop => |s| {
+                const carried_count: usize = @intCast(s.carried_count);
+                if (carried_count > executable.MAX_LOOP_CARRIED) return error.InvalidArgument;
+                const requested_iters: usize = if (s.trip_count) |trip_id| try readUsizeScalar(store, trip_id) else s.static_max_trip_count;
+                const max_iters: usize = @min(requested_iters, s.static_max_trip_count);
+
+                var iter: usize = 0;
+                while (iter < max_iters) : (iter += 1) {
+                    if (s.check_before) {
+                        if (s.cond) |cond_id| {
+                            if (!try readPredicate(store, cond_id)) break;
+                        }
+                    }
+
+                    try self.execBlock(prog, s.body_block, store);
+                    try swapTensorLists(store, s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
+
+                    if (!s.check_before) {
+                        if (s.cond) |cond_id| {
+                            if (!try readPredicate(store, cond_id)) break;
+                        }
+                    }
+                }
+            },
+
             .ReduceAll => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_utils.reduceAllScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, store);
@@ -416,7 +525,7 @@ pub const CpuBackend = struct {
             if (trace_exec) {
                 std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step) });
             }
-            self.execStep(step, store) catch |e| {
+            self.execStep(prog, step, store) catch |e| {
                 if (trace_exec) {
                     std.debug.print("[aion][exec] step {d} failed: {s} err={s}\n", .{ step_i, @tagName(step), @errorName(e) });
                 }

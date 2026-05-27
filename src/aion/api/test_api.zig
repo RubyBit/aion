@@ -2097,3 +2097,105 @@ test "api: loaded package keeps weights quantized (opt-in via AION_GEMMA_VERIFY_
     try std.testing.expect(weights_other_count == 0);
     try std.testing.expect(@as(f64, @floatFromInt(total_bytes)) / 1e9 <= max_gb);
 }
+
+test "api: exportModel + loadModel roundtrip for If control-flow model" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const cond_ref: api.TensorRef = try bld.name(try bld.input(.i32, &[_]usize{1}), "cond");
+    const then_ref: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{1}), "then_v");
+    const else_ref: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{1}), "else_v");
+
+    const g = bld.innerGraph();
+    try g.beginRegion();
+    const then_region = try g.endRegion(&[_]u32{then_ref.value});
+    try g.beginRegion();
+    const else_region = try g.endRegion(&[_]u32{else_ref.value});
+    const out_ref: api.TensorRef = .{ .value = try g.addIf(cond_ref.value, then_region, else_region) };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "if_model.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "out", .tensor = out_ref }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    const cond_t: api.Tensor = try load_ctx.vector([_]i32{1});
+    const then_t: api.Tensor = try load_ctx.vector([_]f32{42.0});
+    const else_t: api.Tensor = try load_ctx.vector([_]f32{7.0});
+    try model.bindInput("cond", cond_t);
+    try model.bindInput("then_v", then_t);
+    try model.bindInput("else_v", else_t);
+    try model.run();
+
+    var vals: [1]f32 = undefined;
+    {
+        const out_t: api.Tensor = try model.outputTensor("out");
+        try out_t.read(&vals);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 42.0), vals[0], 1e-6);
+
+    const cond_zero: api.Tensor = try load_ctx.vector([_]i32{0});
+    try model.bindInput("cond", cond_zero);
+    try model.run();
+    {
+        const out_t: api.Tensor = try model.outputTensor("out");
+        try out_t.read(&vals);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), vals[0], 1e-6);
+}
+
+test "api: exportModel + loadModel roundtrip for Loop control-flow model" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const carried_ref: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{1}), "carried");
+    const inc_ref: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{1}), "inc");
+
+    const g = bld.innerGraph();
+    try g.beginRegion();
+    const next = try g.addElemwiseBinary(.add, carried_ref.value, inc_ref.value);
+    const body_region = try g.endRegion(&[_]u32{next});
+    const out_ref: api.TensorRef = .{ .value = try g.addLoop(carried_ref.value, body_region, 4) };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "loop_model.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "out", .tensor = out_ref }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    const carried_t: api.Tensor = try load_ctx.vector([_]f32{1.0});
+    const inc_t: api.Tensor = try load_ctx.vector([_]f32{2.0});
+    try model.bindInput("carried", carried_t);
+    try model.bindInput("inc", inc_t);
+    try model.run();
+
+    var vals: [1]f32 = undefined;
+    {
+        const out_t: api.Tensor = try model.outputTensor("out");
+        try out_t.read(&vals);
+    }
+    // 1.0 + 2.0 * 4 trips = 9.0 (matches graph-level loop test).
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), vals[0], 1e-6);
+}

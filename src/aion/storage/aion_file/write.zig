@@ -26,6 +26,7 @@ const DebugName = types.DebugName;
 const IoAlias = types.IoAlias;
 const ValueRecord = types.ValueRecord;
 const NodeRecord = types.NodeRecord;
+const RegionRecord = types.RegionRecord;
 const NodeOpKind = types.NodeOpKind;
 const NodeOp = types.NodeOp;
 const GraphMeta = types.GraphMeta;
@@ -48,6 +49,7 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
     try sections.append(scratch, .{ .section_type = .tensors, .flags = SectionFlags.required, .bytes = try encodeInitializersSection(scratch, &interner, pkg.initializers) });
     try sections.append(scratch, .{ .section_type = .values, .flags = SectionFlags.required, .bytes = try encodeValuesSection(scratch, pkg.values) });
     try sections.append(scratch, .{ .section_type = .nodes, .flags = SectionFlags.required, .bytes = try encodeNodesSection(scratch, pkg.nodes) });
+    if (pkg.regions.len != 0) try sections.append(scratch, .{ .section_type = .regions, .flags = 0, .bytes = try encodeRegionsSection(scratch, pkg.regions) });
     try sections.append(scratch, .{ .section_type = .signatures, .flags = SectionFlags.required, .bytes = try encodeSignaturesSection(scratch, &interner, pkg.inputs, pkg.outputs) });
     try sections.append(scratch, .{ .section_type = .graph_meta, .flags = SectionFlags.required, .bytes = try encodeGraphMetaSection(scratch, pkg.graphMeta()) });
     if (pkg.dim_symbols.len != 0) try sections.append(scratch, .{ .section_type = .dim_symbols, .flags = 0, .bytes = try encodeDimSymbolsSection(scratch, &interner, pkg.dim_symbols) });
@@ -180,21 +182,37 @@ fn encodeValuesSection(allocator: std.mem.Allocator, values: []const ValueRecord
     return out.toOwnedSlice(allocator);
 }
 
-fn encodeNodesSection(allocator: std.mem.Allocator, nodes: []const NodeRecord) PackageError![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try appendInt(&out, allocator, u32, @intCast(nodes.len));
+fn appendNodeRecords(out: *std.ArrayList(u8), allocator: std.mem.Allocator, nodes: []const NodeRecord) PackageError!void {
+    try appendInt(out, allocator, u32, @intCast(nodes.len));
     for (nodes) |node| {
         var attr: std.ArrayList(u8) = .empty;
         defer attr.deinit(allocator);
         const kind = try encodeNodeOp(&attr, allocator, node.op);
-        try appendInt(&out, allocator, u8, @intFromEnum(kind));
+        try appendInt(out, allocator, u8, @intFromEnum(kind));
         try out.appendNTimes(allocator, 0, 3);
-        try appendInt(&out, allocator, u32, node.output);
-        try appendInt(&out, allocator, u32, @intCast(node.inputs.len));
-        try appendInt(&out, allocator, u32, @intCast(attr.items.len));
-        for (node.inputs) |input| try appendInt(&out, allocator, u32, input);
+        try appendInt(out, allocator, u32, node.output);
+        try appendInt(out, allocator, u32, @intCast(node.inputs.len));
+        try appendInt(out, allocator, u32, @intCast(attr.items.len));
+        for (node.inputs) |input| try appendInt(out, allocator, u32, input);
         try out.appendSlice(allocator, attr.items);
+    }
+}
+
+fn encodeNodesSection(allocator: std.mem.Allocator, nodes: []const NodeRecord) PackageError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendNodeRecords(&out, allocator, nodes);
+    return out.toOwnedSlice(allocator);
+}
+
+fn encodeRegionsSection(allocator: std.mem.Allocator, regions: []const RegionRecord) PackageError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendInt(&out, allocator, u32, @intCast(regions.len));
+    for (regions) |region| {
+        try appendNodeRecords(&out, allocator, region.nodes);
+        try appendInt(&out, allocator, u32, @intCast(region.outputs.len));
+        for (region.outputs) |output| try appendInt(&out, allocator, u32, output);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -290,6 +308,14 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, f32, mm.alpha);
             try appendInt(out, allocator, f32, mm.beta);
         },
+        .If => |iff| {
+            try appendInt(out, allocator, u32, iff.then_region);
+            try appendInt(out, allocator, u32, iff.else_region);
+        },
+        .Loop => |lp| {
+            try appendInt(out, allocator, u32, lp.body_region);
+            try appendInt(out, allocator, u64, lp.static_max_trip_count);
+        },
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);
         },
@@ -358,6 +384,7 @@ fn encodeGraphMetaSection(allocator: std.mem.Allocator, meta: GraphMeta) Package
     errdefer out.deinit(allocator);
     try appendInt(&out, allocator, u32, meta.value_count);
     try appendInt(&out, allocator, u32, meta.node_count);
+    try appendInt(&out, allocator, u32, meta.region_count);
     try appendInt(&out, allocator, u32, meta.initializer_count);
     try appendInt(&out, allocator, u32, meta.input_count);
     try appendInt(&out, allocator, u32, meta.output_count);

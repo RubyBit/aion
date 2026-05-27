@@ -300,6 +300,224 @@ test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
     allocator.free(full_values[4].shape_terms);
 }
 
+test "storage file: if/loop control-flow nodes roundtrip through write/parse" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 8),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 2),
+        .regions = try allocator.alloc(package_file.RegionRecord, 3),
+        .inputs = try allocator.alloc(package_file.NamedValue, 5),
+        .outputs = try allocator.alloc(package_file.NamedValue, 2),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 0),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 0),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
+
+    // Values: 5 public inputs (cond/then_v/else_v/carried/inc), 3 produced (next, if_out, loop_out).
+    pkg.values[0] = .{
+        .dtype = .i32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[1] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[2] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[3] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[4] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[5] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+    pkg.values[6] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+    pkg.values[7] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+
+    // Region 0: then-branch returns then_v (value 1).
+    const then_outputs = try allocator.alloc(u32, 1);
+    then_outputs[0] = 1;
+    pkg.regions[0] = .{
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .outputs = then_outputs,
+    };
+
+    // Region 1: else-branch returns else_v (value 2).
+    const else_outputs = try allocator.alloc(u32, 1);
+    else_outputs[0] = 2;
+    pkg.regions[1] = .{
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .outputs = else_outputs,
+    };
+
+    // Region 2: loop body computes next = carried + inc.
+    const body_nodes = try allocator.alloc(package_file.NodeRecord, 1);
+    body_nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{ 3, 4 }),
+        .output = 5,
+        .op = .{ .ElemwiseBinary = .{ .op = .add } },
+    };
+    const body_outputs = try allocator.alloc(u32, 1);
+    body_outputs[0] = 5;
+    pkg.regions[2] = .{ .nodes = body_nodes, .outputs = body_outputs };
+
+    pkg.nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{0}),
+        .output = 6,
+        .op = .{ .If = .{ .then_region = 0, .else_region = 1 } },
+    };
+    pkg.nodes[1] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{3}),
+        .output = 7,
+        .op = .{ .Loop = .{ .body_region = 2, .static_max_trip_count = 4 } },
+    };
+
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "cond"), .value = 0 };
+    pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "then_v"), .value = 1 };
+    pkg.inputs[2] = .{ .name = try allocator.dupe(u8, "else_v"), .value = 2 };
+    pkg.inputs[3] = .{ .name = try allocator.dupe(u8, "carried"), .value = 3 };
+    pkg.inputs[4] = .{ .name = try allocator.dupe(u8, "inc"), .value = 4 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "if_out"), .value = 6 };
+    pkg.outputs[1] = .{ .name = try allocator.dupe(u8, "loop_out"), .value = 7 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "ctrl_flow.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.regions.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.regions[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.regions[0].outputs.len);
+    try std.testing.expectEqual(@as(u32, 1), parsed.regions[0].outputs[0]);
+    try std.testing.expectEqual(@as(usize, 0), parsed.regions[1].nodes.len);
+    try std.testing.expectEqual(@as(u32, 2), parsed.regions[1].outputs[0]);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.regions[2].nodes.len);
+    try std.testing.expectEqual(@as(u32, 5), parsed.regions[2].outputs[0]);
+    switch (parsed.regions[2].nodes[0].op) {
+        .ElemwiseBinary => |eb| try std.testing.expectEqual(types.ElemwiseBinaryOp.add, eb.op),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 3, 4 }, parsed.regions[2].nodes[0].inputs);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.nodes.len);
+    switch (parsed.nodes[0].op) {
+        .If => |iff| {
+            try std.testing.expectEqual(@as(u32, 0), iff.then_region);
+            try std.testing.expectEqual(@as(u32, 1), iff.else_region);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parsed.nodes[1].op) {
+        .Loop => |lp| {
+            try std.testing.expectEqual(@as(u32, 2), lp.body_region);
+            try std.testing.expectEqual(@as(u64, 4), lp.static_max_trip_count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "storage file: rejects invalid control-flow region id" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 3),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 1),
+        .regions = try allocator.alloc(package_file.RegionRecord, 1),
+        .inputs = try allocator.alloc(package_file.NamedValue, 2),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 0),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 0),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
+
+    pkg.values[0] = .{
+        .dtype = .i32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[1] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[2] = .{
+        .dtype = .f32,
+        .rank = 1,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+
+    const region0_outputs = try allocator.alloc(u32, 1);
+    region0_outputs[0] = 1;
+    pkg.regions[0] = .{
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .outputs = region0_outputs,
+    };
+
+    pkg.nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{0}),
+        .output = 2,
+        // else_region 999 is out of bounds.
+        .op = .{ .If = .{ .then_region = 0, .else_region = 999 } },
+    };
+
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "cond"), .value = 0 };
+    pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "v"), .value = 1 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "out"), .value = 2 };
+
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+}
+
 test "storage file: model package write/parse roundtrip" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

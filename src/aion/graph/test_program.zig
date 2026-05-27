@@ -9,7 +9,6 @@ const graph_mod = @import("graph.zig");
 const infer_mod = @import("infer.zig");
 const plan_mod = @import("plan.zig");
 const program = @import("program.zig");
-
 const Backend = backend_mod.Backend;
 
 fn asF32Slice(buf: []u8) []align(1) f32 {
@@ -22,6 +21,99 @@ fn asF16Slice(buf: []u8) []align(1) f16 {
     std.debug.assert((buf.len % @sizeOf(f16)) == 0);
     const ptr: [*]align(1) f16 = @ptrCast(buf.ptr);
     return ptr[0 .. buf.len / @sizeOf(f16)];
+}
+
+fn writeScalarF32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId, value: f32) !void {
+    var buf: [@sizeOf(f32)]u8 = undefined;
+    asF32Slice(buf[0..])[0] = value;
+    try mgr.writeFromPackedScalar(id, buf[0..]);
+}
+
+fn readScalarF32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId) !f32 {
+    var buf: [@sizeOf(f32)]u8 = undefined;
+    try mgr.readToPackedScalar(id, buf[0..]);
+    return asF32Slice(buf[0..])[0];
+}
+
+fn writeScalarI32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId, value: i32) !void {
+    var buf: [@sizeOf(i32)]u8 = undefined;
+    std.mem.writeInt(i32, buf[0..@sizeOf(i32)], value, .little);
+    try mgr.writeFromPackedScalar(id, buf[0..]);
+}
+
+test "graph: if selects region output" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const cond_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const then_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const else_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    try writeScalarI32(&mgr, cond_tid, 1);
+    try writeScalarF32(&mgr, then_tid, 42.0);
+    try writeScalarF32(&mgr, else_tid, 7.0);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const cond = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(cond, cond_tid);
+    const then_v = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(then_v, then_tid);
+    const else_v = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(else_v, else_tid);
+
+    try g.beginRegion();
+    const then_region = try g.endRegion(&[_]graph_mod.ValueId{then_v});
+    try g.beginRegion();
+    const else_region = try g.endRegion(&[_]graph_mod.ValueId{else_v});
+    const out = try g.addIf(cond, then_region, else_region);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+    try std.testing.expectEqual(@as(f32, 42.0), try readScalarF32(&mgr, prog.outputs[0]));
+
+    try writeScalarI32(&mgr, cond_tid, 0);
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+    try std.testing.expectEqual(@as(f32, 7.0), try readScalarF32(&mgr, prog.outputs[0]));
+}
+
+test "graph: loop carries state with tensor-id alias swap" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const carried_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const inc_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    try writeScalarF32(&mgr, carried_tid, 1.0);
+    try writeScalarF32(&mgr, inc_tid, 2.0);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const carried = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(carried, carried_tid);
+    const inc = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(inc, inc_tid);
+
+    try g.beginRegion();
+    const next = try g.addElemwiseBinary(.add, carried, inc);
+    const body_region = try g.endRegion(&[_]graph_mod.ValueId{next});
+    const out = try g.addLoop(carried, body_region, 4);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+    try std.testing.expectEqual(@as(f32, 9.0), try readScalarF32(&mgr, prog.outputs[0]));
 }
 
 test "plan: chooseTileShape2DSquare handles skinny matrices" {

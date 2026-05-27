@@ -12,6 +12,7 @@ const MAX_CONCAT_INPUTS: usize = 16;
 
 pub const ValueId = u32;
 pub const NodeId = u32;
+pub const RegionId = u32;
 
 /// External binding id (typically a `storage.manager.TensorId`).
 ///
@@ -91,6 +92,12 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     MatMulNT = 26,
+
+    /// Single-output conditional region.
+    If = 27,
+
+    /// Single-carried-value loop region.
+    Loop = 28,
 };
 
 pub const Op = union(OpTag) {
@@ -282,6 +289,12 @@ pub const Op = union(OpTag) {
 
     /// Matmul with B conceptually transposed; see `OpTag.MatMulNT` doc.
     MatMulNT: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
+
+    /// Single-output conditional. Inputs: cond, then_value, else_value.
+    If: struct { then_region: RegionId, else_region: RegionId },
+
+    /// Single-carried-value loop. Inputs: carried_init.
+    Loop: struct { body_region: RegionId, static_max_trip_count: usize },
 };
 
 pub const InputArity = union(enum) {
@@ -330,6 +343,8 @@ pub fn opInputArity(op: Op) InputArity {
         .KVCacheAppend => .{ .exact = 3 },
         .Cast => .{ .exact = 1 },
         .MatMulNT => .{ .exact = 2 },
+        .If => .{ .exact = 3 },
+        .Loop => .{ .exact = 1 },
     };
 }
 
@@ -352,6 +367,11 @@ pub const Node = struct {
     output: ValueId,
 };
 
+pub const Region = struct {
+    nodes: []Node,
+    outputs: []ValueId,
+};
+
 pub const GraphError = error{ InvalidArgument, OutOfMemory };
 
 pub const Graph = struct {
@@ -361,6 +381,9 @@ pub const Graph = struct {
     values: std.ArrayList(Value) = .empty,
     nodes: std.ArrayList(Node) = .empty,
     outputs: std.ArrayList(ValueId) = .empty,
+    regions: std.ArrayList(Region) = .empty,
+    active_region_nodes: std.ArrayList(Node) = .empty,
+    active_region: bool = false,
 
     const Self = @This();
 
@@ -375,6 +398,12 @@ pub const Graph = struct {
         self.values.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
+        for (self.regions.items) |region| {
+            self.allocator.free(region.nodes);
+            self.allocator.free(region.outputs);
+        }
+        self.regions.deinit(self.allocator);
+        self.active_region_nodes.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -415,11 +444,59 @@ pub const Graph = struct {
         const inputs_copy: []ValueId = self.arenaAlloc().alloc(ValueId, inputs.len) catch return GraphError.OutOfMemory;
         @memcpy(inputs_copy, inputs);
 
-        const node_id: NodeId = @intCast(self.nodes.items.len);
-        self.nodes.append(self.allocator, .{ .op = op, .inputs = inputs_copy, .output = out_id }) catch return GraphError.OutOfMemory;
-
-        self.values.items[@intCast(out_id)].producer = node_id;
+        const node: Node = .{ .op = op, .inputs = inputs_copy, .output = out_id };
+        if (self.active_region) {
+            self.active_region_nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            // Mark the value as produced. The sentinel keeps package-export and
+            // input-collection from misclassifying region-internal values as
+            // public inputs; the actual node lives in active_region_nodes, not
+            // in self.nodes, so the id isn't dereferenceable.
+            self.values.items[@intCast(out_id)].producer = std.math.maxInt(NodeId);
+        } else {
+            const node_id: NodeId = @intCast(self.nodes.items.len);
+            self.nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            self.values.items[@intCast(out_id)].producer = node_id;
+        }
         return out_id;
+    }
+
+    pub fn beginRegion(self: *Self) GraphError!void {
+        if (self.active_region) return GraphError.InvalidArgument;
+        self.active_region_nodes.clearRetainingCapacity();
+        self.active_region = true;
+    }
+
+    pub fn endRegion(self: *Self, outputs_in: []const ValueId) GraphError!RegionId {
+        if (!self.active_region) return GraphError.InvalidArgument;
+        if (outputs_in.len == 0) return GraphError.InvalidArgument;
+
+        const nodes_slice: []Node = self.active_region_nodes.toOwnedSlice(self.allocator) catch return GraphError.OutOfMemory;
+        errdefer self.allocator.free(nodes_slice);
+        const outputs_slice: []ValueId = self.allocator.dupe(ValueId, outputs_in) catch return GraphError.OutOfMemory;
+        errdefer self.allocator.free(outputs_slice);
+
+        const id: RegionId = @intCast(self.regions.items.len);
+        self.regions.append(self.allocator, .{ .nodes = nodes_slice, .outputs = outputs_slice }) catch return GraphError.OutOfMemory;
+        self.active_region = false;
+        return id;
+    }
+
+    pub fn addIf(self: *Self, cond: ValueId, then_region: RegionId, else_region: RegionId) GraphError!ValueId {
+        const then_idx: usize = @intCast(then_region);
+        const else_idx: usize = @intCast(else_region);
+        if (then_idx >= self.regions.items.len or else_idx >= self.regions.items.len) return GraphError.InvalidArgument;
+        if (self.regions.items[then_idx].outputs.len != 1 or self.regions.items[else_idx].outputs.len != 1) return GraphError.InvalidArgument;
+        return self.addNodeInternal(
+            .{ .If = .{ .then_region = then_region, .else_region = else_region } },
+            &[_]ValueId{ cond, self.regions.items[then_idx].outputs[0], self.regions.items[else_idx].outputs[0] },
+        );
+    }
+
+    pub fn addLoop(self: *Self, carried_init: ValueId, body_region: RegionId, static_max_trip_count: usize) GraphError!ValueId {
+        const body_idx: usize = @intCast(body_region);
+        if (body_idx >= self.regions.items.len) return GraphError.InvalidArgument;
+        if (self.regions.items[body_idx].outputs.len != 1 or static_max_trip_count == 0) return GraphError.InvalidArgument;
+        return self.addNodeInternal(.{ .Loop = .{ .body_region = body_region, .static_max_trip_count = static_max_trip_count } }, &[_]ValueId{carried_init});
     }
 
     pub fn addMatMul(self: *Self, a: ValueId, b: ValueId, alpha: f32, beta: f32) GraphError!ValueId {

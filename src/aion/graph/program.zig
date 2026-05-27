@@ -252,6 +252,55 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try requireSameTileCounts(out, x);
         },
 
+        .If => |s| {
+            const cond: *const TiledTensor = mgr.getConst(s.cond) catch return CompileError.InvalidArgument;
+            try compileRequire(cond.dtype == .i32 and cond.rank == 1 and cond.shape[0] == 1);
+            const count: usize = @intCast(s.output_count);
+            try compileRequire(count <= executable.MAX_CONTROL_OUTPUTS);
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const out: *const TiledTensor = mgr.getConst(s.outputs[i]) catch return CompileError.InvalidArgument;
+                const then_out: *const TiledTensor = mgr.getConst(s.then_outputs[i]) catch return CompileError.InvalidArgument;
+                const else_out: *const TiledTensor = mgr.getConst(s.else_outputs[i]) catch return CompileError.InvalidArgument;
+                try compileRequire(out.dtype == then_out.dtype and out.dtype == else_out.dtype);
+                try compileRequire(out.rank == then_out.rank and out.rank == else_out.rank);
+                try requireSameShape(out.shape, then_out.shape);
+                try requireSameShape(out.shape, else_out.shape);
+                try requireSameTileShape(out, then_out);
+                try requireSameTileShape(out, else_out);
+                try requireSameTileCounts(out, then_out);
+                try requireSameTileCounts(out, else_out);
+            }
+            _ = s.then_block;
+            _ = s.else_block;
+        },
+
+        .Loop => |s| {
+            if (s.trip_count) |trip_count| {
+                const trip: *const TiledTensor = mgr.getConst(trip_count) catch return CompileError.InvalidArgument;
+                try compileRequire(trip.dtype == .i32 and trip.rank == 1 and trip.shape[0] == 1);
+            }
+            if (s.cond) |cond_id| {
+                const cond: *const TiledTensor = mgr.getConst(cond_id) catch return CompileError.InvalidArgument;
+                try compileRequire(cond.dtype == .i32 and cond.rank == 1 and cond.shape[0] == 1);
+            }
+            try compileRequire(s.static_max_trip_count > 0);
+            const count: usize = @intCast(s.carried_count);
+            try compileRequire(count <= executable.MAX_LOOP_CARRIED);
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const carried: *const TiledTensor = mgr.getConst(s.carried[i]) catch return CompileError.InvalidArgument;
+                const next: *const TiledTensor = mgr.getConst(s.body_carried_outputs[i]) catch return CompileError.InvalidArgument;
+                try compileRequire(carried.dtype == next.dtype);
+                try compileRequire(carried.rank == next.rank);
+                try requireSameShape(carried.shape, next.shape);
+                try requireSameTileShape(carried, next);
+                try requireSameTileCounts(carried, next);
+            }
+            _ = s.check_before;
+            _ = s.body_block;
+        },
+
         .MatMulNTTiled => |s| {
             const c: *const TiledTensor = mgr.getConst(s.c) catch return CompileError.InvalidArgument;
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
@@ -1126,6 +1175,12 @@ pub fn compileGraph(
     var steps: std.ArrayList(Step) = .empty;
     errdefer steps.deinit(allocator);
 
+    var blocks: std.ArrayList(executable.Block) = .empty;
+    errdefer {
+        for (blocks.items) |block| allocator.free(block.steps);
+        blocks.deinit(allocator);
+    }
+
     // Helper: allocate tensor for a value (owned).
     const AllocCtx = struct {
         allocator: std.mem.Allocator,
@@ -1145,6 +1200,62 @@ pub fn compileGraph(
     };
 
     var ctx: AllocCtx = .{ .allocator = allocator, .mgr = mgr, .policy = policy, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor };
+
+    const LowerRegion = struct {
+        fn lower(
+            allocator_: std.mem.Allocator,
+            graph_: *graph_mod.Graph,
+            region: graph_mod.Region,
+            mgr_: *StorageManager,
+            policy_: plan_mod.TilePolicy,
+            ctx_: *AllocCtx,
+            blocks_: *std.ArrayList(executable.Block),
+        ) CompileError!executable.BlockId {
+            var region_steps: std.ArrayList(Step) = .empty;
+            errdefer region_steps.deinit(allocator_);
+
+            for (region.nodes) |rnode| {
+                if (!graph_mod.opInputCountValid(rnode.op, rnode.inputs.len)) return CompileError.InvalidArgument;
+                const out_idx: usize = @intCast(rnode.output);
+                const out_v = graph_.values.items[out_idx];
+                const out_dt: types.DType = out_v.dtype.?;
+                const out_shape: []const usize = out_v.shape;
+
+                switch (rnode.op) {
+                    .ElemwiseBinary => |eb| {
+                        const a_id: usize = @intCast(rnode.inputs[0]);
+                        const b_id: usize = @intCast(rnode.inputs[1]);
+                        const a_v = graph_.values.items[a_id];
+                        const b_v = graph_.values.items[b_id];
+                        var tile_buf: [MAX_RANK]usize = undefined;
+                        const tile: []usize = tile_buf[0..out_shape.len];
+                        try fillTileShapeDefault(policy_, out_dt, out_shape, tile);
+                        const out_tid: TensorId = try ctx_.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                        const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator_, &region_steps, mgr_, policy_, ctx_, a_id, a_v.dtype.?, a_v.shape, tile);
+                        const b_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator_, &region_steps, mgr_, policy_, ctx_, b_id, b_v.dtype.?, b_v.shape, tile);
+                        try appendStepChecked(allocator_, mgr_, &region_steps, .{ .ElemwiseBinaryTiled = .{ .op = eb.op, .out = out_tid, .a = a_tid, .b = b_tid } });
+                    },
+                    .Copy => {
+                        const a_id: usize = @intCast(rnode.inputs[0]);
+                        const a_v = graph_.values.items[a_id];
+                        var tile_buf: [MAX_RANK]usize = undefined;
+                        const tile: []usize = tile_buf[0..out_shape.len];
+                        try fillTileShapeDefault(policy_, out_dt, out_shape, tile);
+                        const out_tid: TensorId = try ctx_.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+                        const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator_, &region_steps, mgr_, policy_, ctx_, a_id, a_v.dtype.?, a_v.shape, tile);
+                        try appendStepChecked(allocator_, mgr_, &region_steps, .{ .CopyTiled = .{ .dst = out_tid, .src = a_tid } });
+                    },
+                    else => return CompileError.InvalidArgument,
+                }
+            }
+
+            const block_steps: []Step = try region_steps.toOwnedSlice(allocator_);
+            errdefer allocator_.free(block_steps);
+            const id: executable.BlockId = @intCast(blocks_.items.len);
+            blocks_.append(allocator_, .{ .steps = block_steps }) catch return CompileError.OutOfMemory;
+            return id;
+        }
+    };
 
     // Lower nodes in order.
     for (graph.nodes.items) |node| {
@@ -2026,6 +2137,66 @@ pub fn compileGraph(
                 } });
             },
 
+            .If => |iff| {
+                const cond_id: usize = @intCast(node.inputs[0]);
+                const then_value_id: usize = @intCast(node.inputs[1]);
+                const else_value_id: usize = @intCast(node.inputs[2]);
+
+                const then_region: graph_mod.Region = graph.regions.items[@intCast(iff.then_region)];
+                const else_region: graph_mod.Region = graph.regions.items[@intCast(iff.else_region)];
+                const then_block: executable.BlockId = try LowerRegion.lower(allocator, graph, then_region, mgr, policy, &ctx, &blocks);
+                const else_block: executable.BlockId = try LowerRegion.lower(allocator, graph, else_region, mgr, policy, &ctx, &blocks);
+
+                const cond_tid: TensorId = try ensureAnyTensor(&ctx, cond_id);
+                const then_tid: TensorId = try ensureAnyTensor(&ctx, then_value_id);
+                const else_tid: TensorId = try ensureAnyTensor(&ctx, else_value_id);
+                const then_t: *const TiledTensor = try mgr.getConst(then_tid);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, then_t.tile_shape);
+
+                var outputs_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
+                var then_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
+                var else_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
+                outputs_arr[0] = out_tid;
+                then_arr[0] = then_tid;
+                else_arr[0] = else_tid;
+                try appendStepChecked(allocator, mgr, &steps, .{ .If = .{
+                    .cond = cond_tid,
+                    .then_block = then_block,
+                    .else_block = else_block,
+                    .output_count = 1,
+                    .outputs = outputs_arr,
+                    .then_outputs = then_arr,
+                    .else_outputs = else_arr,
+                } });
+            },
+
+            .Loop => |lp| {
+                const carried_id: usize = @intCast(node.inputs[0]);
+                const body_region: graph_mod.Region = graph.regions.items[@intCast(lp.body_region)];
+                const body_block: executable.BlockId = try LowerRegion.lower(allocator, graph, body_region, mgr, policy, &ctx, &blocks);
+                const body_out_id: usize = @intCast(body_region.outputs[0]);
+
+                const carried_tid: TensorId = try ensureAnyTensor(&ctx, carried_id);
+                const body_out_tid: TensorId = try ensureAnyTensor(&ctx, body_out_id);
+                ctx.value_tensor[out_idx] = carried_tid;
+                ctx.value_has_tensor[out_idx] = true;
+
+                var carried_arr: [executable.MAX_LOOP_CARRIED]TensorId = .{0} ** executable.MAX_LOOP_CARRIED;
+                var body_arr: [executable.MAX_LOOP_CARRIED]TensorId = .{0} ** executable.MAX_LOOP_CARRIED;
+                carried_arr[0] = carried_tid;
+                body_arr[0] = body_out_tid;
+                try appendStepChecked(allocator, mgr, &steps, .{ .Loop = .{
+                    .trip_count = null,
+                    .static_max_trip_count = lp.static_max_trip_count,
+                    .cond = null,
+                    .check_before = true,
+                    .body_block = body_block,
+                    .carried_count = 1,
+                    .carried = carried_arr,
+                    .body_carried_outputs = body_arr,
+                } });
+            },
+
             .Cast => |ct| {
                 const x_id: usize = @intCast(node.inputs[0]);
                 const x_v = graph.values.items[x_id];
@@ -2190,8 +2361,9 @@ pub fn compileGraph(
     }
 
     const steps_slice: []Step = try steps.toOwnedSlice(allocator);
+    const blocks_slice: []executable.Block = try blocks.toOwnedSlice(allocator);
 
-    return .{ .allocator = allocator, .steps = steps_slice, .outputs = out_ids };
+    return .{ .allocator = allocator, .steps = steps_slice, .blocks = blocks_slice, .outputs = out_ids };
 }
 
 fn ensureAnyTensor(ctx: anytype, value_index: usize) CompileError!TensorId {

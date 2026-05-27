@@ -70,6 +70,8 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         },
         .Cast => |ct| .{ .Cast = .{ .to_dtype = ct.to_dtype } },
         .MatMulNT => |mm| .{ .MatMulNT = .{ .alpha = mm.alpha, .beta = mm.beta } },
+        .If => |iff| .{ .If = .{ .then_region = iff.then_region, .else_region = iff.else_region } },
+        .Loop => |lp| .{ .Loop = .{ .body_region = lp.body_region, .static_max_trip_count = lp.static_max_trip_count } },
     };
     return out;
 }

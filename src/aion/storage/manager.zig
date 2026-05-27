@@ -378,6 +378,31 @@ pub const StorageManager = struct {
                 const tile = t.acquireTileConstLinear(tile_index) catch return;
                 @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
             }
+
+            fn sameShape(a: []const usize, b: []const usize) bool {
+                if (a.len != b.len) return false;
+                for (a, 0..) |v, i| if (v != b[i]) return false;
+                return true;
+            }
+
+            fn swapTensors(ctx: *anyopaque, a_id: tensor_store.TensorId, b_id: tensor_store.TensorId) tensor_store.StoreError!void {
+                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
+                var a: *TiledTensor = sm.getMut(@intCast(a_id)) catch return tensor_store.StoreError.InvalidArgument;
+                var b: *TiledTensor = sm.getMut(@intCast(b_id)) catch return tensor_store.StoreError.InvalidArgument;
+
+                if (a.dtype != b.dtype) return tensor_store.StoreError.InvalidArgument;
+                if (a.rank != b.rank) return tensor_store.StoreError.InvalidArgument;
+                if (a.quant_axis != b.quant_axis) return tensor_store.StoreError.InvalidArgument;
+                if (!sameShape(a.shape, b.shape)) return tensor_store.StoreError.InvalidArgument;
+                if (!sameShape(a.tile_shape, b.tile_shape)) return tensor_store.StoreError.InvalidArgument;
+                if (!sameShape(a.tile_counts, b.tile_counts)) return tensor_store.StoreError.InvalidArgument;
+                if (!sameShape(a.tile_strides, b.tile_strides)) return tensor_store.StoreError.InvalidArgument;
+                if (a.tile_offsets.len != b.tile_offsets.len or a.tile_lens.len != b.tile_lens.len) return tensor_store.StoreError.InvalidArgument;
+                if (a.tile_alignment != b.tile_alignment) return tensor_store.StoreError.InvalidArgument;
+                if (a.owns_data != b.owns_data) return tensor_store.StoreError.InvalidArgument;
+
+                std.mem.swap([]align(64) u8, &a.data, &b.data);
+            }
         };
 
         return .{
@@ -394,6 +419,7 @@ pub const StorageManager = struct {
                 .mapKVCacheTime = Vt.mapKVCacheTime,
                 .prefetch = Vt.prefetch,
                 .prefetchLinear = Vt.prefetchLinear,
+                .swapTensors = Vt.swapTensors,
             },
         };
     }

@@ -104,6 +104,21 @@ pub fn infer(graph: *Graph) InferError!void {
     }
 }
 
+fn inferRegion(graph: *Graph, region_id: graph_mod.RegionId) InferError!graph_mod.Region {
+    const idx: usize = @intCast(region_id);
+    if (idx >= graph.regions.items.len) return InferError.InvalidGraph;
+    const region: graph_mod.Region = graph.regions.items[idx];
+    for (region.nodes) |node| {
+        try inferNode(graph, node);
+    }
+    for (region.outputs) |oid| {
+        const v = try getValue(graph, oid);
+        try require(v.dtype != null);
+        try require(v.shape.len != 0);
+    }
+    return region;
+}
+
 fn inferNode(graph: *Graph, node: Node) InferError!void {
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
 
@@ -814,6 +829,37 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
                 (x.dtype.? == ct.to_dtype);
             if (!ok) return InferError.Unsupported;
             try setInferred(graph, node.output, ct.to_dtype, x.shape);
+        },
+
+        .If => |iff| {
+            const cond = try getValue(graph, node.inputs[0]);
+            try require(cond.dtype != null and cond.shape.len != 0);
+            if (cond.dtype.? != .i32 or cond.shape.len != 1 or cond.shape[0] != 1) return InferError.DTypeMismatch;
+
+            const then_region: graph_mod.Region = try inferRegion(graph, iff.then_region);
+            const else_region: graph_mod.Region = try inferRegion(graph, iff.else_region);
+            if (then_region.outputs.len != 1 or else_region.outputs.len != 1) return InferError.InvalidGraph;
+            const then_v = try getValue(graph, then_region.outputs[0]);
+            const else_v = try getValue(graph, else_region.outputs[0]);
+            try require(then_v.dtype != null and else_v.dtype != null);
+            if (then_v.dtype.? != else_v.dtype.?) return InferError.DTypeMismatch;
+            if (then_v.shape.len != else_v.shape.len) return InferError.ShapeMismatch;
+            for (then_v.shape, 0..) |dim, i| if (dim != else_v.shape[i]) return InferError.ShapeMismatch;
+            try setInferred(graph, node.output, then_v.dtype.?, then_v.shape);
+        },
+
+        .Loop => |lp| {
+            const init_v = try getValue(graph, node.inputs[0]);
+            try require(init_v.dtype != null and init_v.shape.len != 0);
+            if (lp.static_max_trip_count == 0) return InferError.InvalidGraph;
+            const body_region: graph_mod.Region = try inferRegion(graph, lp.body_region);
+            if (body_region.outputs.len != 1) return InferError.InvalidGraph;
+            const body_v = try getValue(graph, body_region.outputs[0]);
+            try require(body_v.dtype != null and body_v.shape.len != 0);
+            if (body_v.dtype.? != init_v.dtype.?) return InferError.DTypeMismatch;
+            if (body_v.shape.len != init_v.shape.len) return InferError.ShapeMismatch;
+            for (body_v.shape, 0..) |dim, i| if (dim != init_v.shape[i]) return InferError.ShapeMismatch;
+            try setInferred(graph, node.output, init_v.dtype.?, init_v.shape);
         },
 
         .MatMulNT => |mm| {

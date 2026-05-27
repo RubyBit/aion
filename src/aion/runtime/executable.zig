@@ -3,8 +3,11 @@ const std = @import("std");
 const types = @import("../backend/types.zig");
 
 pub const TensorId = u32;
+pub const BlockId = u32;
 const MAX_RANK: usize = 8;
 const MAX_CONCAT_INPUTS: usize = 16;
+pub const MAX_CONTROL_OUTPUTS: usize = 16;
+pub const MAX_LOOP_CARRIED: usize = 16;
 
 pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
 pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
@@ -123,6 +126,40 @@ pub const StepLSTMCellFused = struct {
     b_hh: ?TensorId,
 };
 
+/// Branch control flow over a scalar i32 predicate (`0=false`, non-zero=true`).
+///
+/// Both branch blocks are expected to materialize `output_count` tensors with
+/// identical dtype/shape/layout. After the selected block runs, selected branch
+/// result buffers are swapped into `outputs` when the store supports no-copy
+/// swapping. This preserves SSA-style branch-local outputs without copying data.
+pub const StepIf = struct {
+    cond: TensorId,
+    then_block: BlockId,
+    else_block: BlockId,
+    output_count: u8,
+    outputs: [MAX_CONTROL_OUTPUTS]TensorId,
+    then_outputs: [MAX_CONTROL_OUTPUTS]TensorId,
+    else_outputs: [MAX_CONTROL_OUTPUTS]TensorId,
+};
+
+/// Loop control flow with fixed storage and shape-invariant carried tensors.
+///
+/// The body writes next-state tensors into `body_carried_outputs`. After each
+/// body iteration, those tensors are swapped with `carried`, so the next
+/// iteration sees the new state without copying the tensor contents. Swapping
+/// the buffers also leaves the body output tensors available as scratch storage
+/// for the next iteration.
+pub const StepLoop = struct {
+    trip_count: ?TensorId,
+    static_max_trip_count: usize,
+    cond: ?TensorId,
+    check_before: bool,
+    body_block: BlockId,
+    carried_count: u8,
+    carried: [MAX_LOOP_CARRIED]TensorId,
+    body_carried_outputs: [MAX_LOOP_CARRIED]TensorId,
+};
+
 pub const StepComplexAbsMean = struct {
     out: TensorId,
     stft: TensorId,
@@ -164,6 +201,9 @@ pub const Step = union(enum) {
 
     LSTMCellFused: StepLSTMCellFused,
 
+    If: StepIf,
+    Loop: StepLoop,
+
     ComplexAbsMean: StepComplexAbsMean,
 
     ReTileCopyScalar: StepReTileCopyScalar,
@@ -182,15 +222,24 @@ pub const Step = union(enum) {
 /// - Produced by `graph/program.compileGraph` after full graph + storage validation.
 /// - Execution must assume correctness and avoid per-step argument checks.
 /// - Runtime can still fail due to backend errors (e.g. Unsupported) or storage errors.
+pub const Block = struct {
+    steps: []Step,
+};
+
 pub const ExecutableProgram = struct {
     allocator: std.mem.Allocator,
     steps: []Step,
+    blocks: []Block = &[_]Block{},
     outputs: []TensorId,
 
     const Self = @This();
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.steps);
+        for (self.blocks) |block| {
+            if (block.steps.len != 0) self.allocator.free(block.steps);
+        }
+        if (self.blocks.len != 0) self.allocator.free(self.blocks);
         self.allocator.free(self.outputs);
         self.* = undefined;
     }

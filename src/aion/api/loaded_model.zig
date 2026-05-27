@@ -587,6 +587,34 @@ pub const LoadedModel = struct {
             value_map[idx] = vid;
         }
 
+        const region_map = try self.allocator.alloc(graph_mod.RegionId, self.package.regions.len);
+        defer self.allocator.free(region_map);
+        for (self.package.regions, 0..) |region, region_idx| {
+            try graph.beginRegion();
+            errdefer {
+                if (graph.active_region) graph.active_region = false;
+            }
+
+            for (region.nodes) |node| {
+                const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
+                defer self.allocator.free(mapped_inputs);
+                for (node.inputs, 0..) |input, i| {
+                    if (input >= value_map.len) return error.InvalidArgument;
+                    mapped_inputs[i] = value_map[input];
+                }
+                const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map[0..region_idx]);
+                value_map[node.output] = out_vid;
+            }
+
+            const mapped_outputs = try self.allocator.alloc(graph_mod.ValueId, region.outputs.len);
+            defer self.allocator.free(mapped_outputs);
+            for (region.outputs, 0..) |output, i| {
+                if (output >= value_map.len) return error.InvalidArgument;
+                mapped_outputs[i] = value_map[output];
+            }
+            region_map[region_idx] = try graph.endRegion(mapped_outputs);
+        }
+
         for (self.package.nodes) |node| {
             const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
             defer self.allocator.free(mapped_inputs);
@@ -594,7 +622,7 @@ pub const LoadedModel = struct {
                 if (input >= value_map.len) return error.InvalidArgument;
                 mapped_inputs[i] = value_map[input];
             }
-            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs);
+            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map);
             value_map[node.output] = out_vid;
         }
 

@@ -135,12 +135,15 @@ pub fn buildPackage(
     errdefer allocator.free(io_aliases);
     const nodes = try collect.collectNodes(allocator, graph);
     errdefer collect.freeNodes(allocator, nodes);
+    const regions = try collect.collectRegions(allocator, graph);
+    errdefer collect.freeRegions(allocator, regions);
 
     return .{
         .allocator = allocator,
         .initializers = try initializers_list.toOwnedSlice(allocator),
         .values = values,
         .nodes = nodes,
+        .regions = regions,
         .inputs = inputs,
         .outputs = output_values,
         .dim_symbols = try dim_symbols.toOwnedSlice(allocator),

@@ -28,6 +28,7 @@ const IoAlias = types.IoAlias;
 const NodeOpKind = types.NodeOpKind;
 const NodeOp = types.NodeOp;
 const NodeRecord = types.NodeRecord;
+const RegionRecord = types.RegionRecord;
 const GraphMeta = types.GraphMeta;
 const Package = types.Package;
 
@@ -106,6 +107,12 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
         const nodes = try parseNodesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.nodes)].?));
         errdefer freeNodes(allocator, nodes);
 
+        const regions = if (refs[sectionSlot(.regions)]) |ref|
+            try parseRegionsSection(allocator, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(RegionRecord, 0);
+        errdefer freeRegions(allocator, regions);
+
         const signatures = try parseSignaturesSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.signatures)].?));
         errdefer {
             freeNamedValues(allocator, signatures.inputs);
@@ -137,6 +144,7 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
             .initializers = initializers,
             .values = values,
             .nodes = nodes,
+            .regions = regions,
             .inputs = signatures.inputs,
             .outputs = signatures.outputs,
             .dim_symbols = dim_symbols,
@@ -209,6 +217,7 @@ fn validateGraphMeta(pkg: *const Package, meta: GraphMeta) PackageError!void {
     const want = pkg.graphMeta();
     if (want.value_count != meta.value_count) return PackageError.InvalidFormat;
     if (want.node_count != meta.node_count) return PackageError.InvalidFormat;
+    if (want.region_count != meta.region_count) return PackageError.InvalidFormat;
     if (want.initializer_count != meta.initializer_count) return PackageError.InvalidFormat;
     if (want.input_count != meta.input_count) return PackageError.InvalidFormat;
     if (want.output_count != meta.output_count) return PackageError.InvalidFormat;
@@ -231,7 +240,8 @@ fn sectionSlot(section_type: SectionType) usize {
         .dim_exprs => 7,
         .metadata => 8,
         .debug_names => 9,
-        .io_aliases => 10,
+        .regions => 10,
+        .io_aliases => 11,
     };
 }
 
@@ -410,25 +420,63 @@ fn parseValuesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageEr
     return out;
 }
 
-fn parseNodesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageError![]NodeRecord {
-    var cursor: usize = 0;
-    const count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+fn parseNodeRecords(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize) PackageError![]NodeRecord {
+    const count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
     const out = allocator.alloc(NodeRecord, count) catch return PackageError.OutOfMemory;
     errdefer allocator.free(out);
     for (out) |*slot| {
-        const op_kind_raw = try readIntCursor(bytes, &cursor, u8);
-        _ = try readBytes(bytes, &cursor, 3);
-        const output = try readIntCursor(bytes, &cursor, u32);
-        const input_count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
-        const attr_len = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+        const op_kind_raw = try readIntCursor(bytes, cursor, u8);
+        _ = try readBytes(bytes, cursor, 3);
+        const output = try readIntCursor(bytes, cursor, u32);
+        const input_count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
+        const attr_len = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
         const inputs = allocator.alloc(u32, input_count) catch return PackageError.OutOfMemory;
         errdefer allocator.free(inputs);
-        for (inputs) |*input| input.* = try readIntCursor(bytes, &cursor, u32);
-        const attr_bytes = try readBytes(bytes, &cursor, attr_len);
+        for (inputs) |*input| input.* = try readIntCursor(bytes, cursor, u32);
+        const attr_bytes = try readBytes(bytes, cursor, attr_len);
         const op_kind: NodeOpKind = types.parseNodeOpKind(op_kind_raw) orelse return PackageError.InvalidFormat;
         const op = try parseNodeOp(allocator, op_kind, attr_bytes);
         errdefer types.deinitNodeOp(allocator, op);
         slot.* = .{ .inputs = inputs, .output = output, .op = op };
+    }
+    return out;
+}
+
+fn parseNodesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageError![]NodeRecord {
+    var cursor: usize = 0;
+    const out = try parseNodeRecords(allocator, bytes, &cursor);
+    if (cursor != bytes.len) {
+        freeNodes(allocator, out);
+        return PackageError.InvalidFormat;
+    }
+    return out;
+}
+
+fn parseRegionsSection(allocator: std.mem.Allocator, bytes: []const u8) PackageError![]RegionRecord {
+    var cursor: usize = 0;
+    const count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+    const out = allocator.alloc(RegionRecord, count) catch return PackageError.OutOfMemory;
+    errdefer allocator.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |region| {
+            freeNodes(allocator, region.nodes);
+            allocator.free(region.outputs);
+        }
+    }
+    for (out) |*region| {
+        const nodes = try parseNodeRecords(allocator, bytes, &cursor);
+        var nodes_owned: bool = true;
+        errdefer if (nodes_owned) freeNodes(allocator, nodes);
+        const output_count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+        const outputs = allocator.alloc(u32, output_count) catch return PackageError.OutOfMemory;
+        var outputs_owned: bool = true;
+        errdefer if (outputs_owned) allocator.free(outputs);
+        for (outputs) |*output| output.* = try readIntCursor(bytes, &cursor, u32);
+        region.* = .{ .nodes = nodes, .outputs = outputs };
+        nodes_owned = false;
+        outputs_owned = false;
+        initialized += 1;
     }
     if (cursor != bytes.len) return PackageError.InvalidFormat;
     return out;
@@ -442,6 +490,8 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .BroadcastLastDimBinary => .{ .BroadcastLastDimBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
         .Unary => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
         .Softmax => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .If => .{ .If = .{ .then_region = try readIntCursor(bytes, &cursor, u32), .else_region = try readIntCursor(bytes, &cursor, u32) } },
+        .Loop => .{ .Loop = .{ .body_region = try readIntCursor(bytes, &cursor, u32), .static_max_trip_count = try readIntCursor(bytes, &cursor, u64) } },
         .Conv1D => .{ .Conv1D = .{
             .stride = try readIntCursor(bytes, &cursor, u64),
             .dilation = try readIntCursor(bytes, &cursor, u64),
@@ -594,6 +644,7 @@ fn parseGraphMetaSection(bytes: []const u8) PackageError!GraphMeta {
     const meta: GraphMeta = .{
         .value_count = try readIntCursor(bytes, &cursor, u32),
         .node_count = try readIntCursor(bytes, &cursor, u32),
+        .region_count = try readIntCursor(bytes, &cursor, u32),
         .initializer_count = try readIntCursor(bytes, &cursor, u32),
         .input_count = try readIntCursor(bytes, &cursor, u32),
         .output_count = try readIntCursor(bytes, &cursor, u32),
@@ -624,6 +675,14 @@ fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) v
 fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
     for (values) |value| allocator.free(value.shape_terms);
     allocator.free(values);
+}
+
+fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
+    for (regions) |region| {
+        freeNodes(allocator, region.nodes);
+        allocator.free(region.outputs);
+    }
+    allocator.free(regions);
 }
 
 fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {

@@ -37,6 +37,7 @@ pub const IoAlias = types.IoAlias;
 pub const NodeOpKind = types.NodeOpKind;
 pub const NodeOp = types.NodeOp;
 pub const NodeRecord = types.NodeRecord;
+pub const RegionRecord = types.RegionRecord;
 pub const GraphMeta = types.GraphMeta;
 pub const Package = types.Package;
 

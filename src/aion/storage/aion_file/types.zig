@@ -157,7 +157,6 @@ pub const NodeOp = union(graph_mod.OpTag) {
     Reduce: struct { op: ReduceOp, axis: ?i32 },
     Concat: struct { axis: i32 },
     LSTMCell: struct { has_bias: bool },
-    ComplexAbsMean: struct { out_channels: u64 },
     Copy: void,
     ViewReshape: struct { new_shape: []const ShapeTerm },
     ViewSqueeze: struct { axis: ?i32 },
@@ -193,6 +192,9 @@ pub const NodeOp = union(graph_mod.OpTag) {
 
     If: struct { then_region: u32, else_region: u32 },
     Loop: struct { body_region: u32, static_max_trip_count: u64 },
+
+    RFFT: void,
+    STFT: struct { n_fft: u64, hop_length: u64, center: bool },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -482,7 +484,7 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
         },
-        .ComplexAbsMean => |cm| if (cm.out_channels == 0) return PackageError.InvalidFormat,
+        .STFT => |st| if (st.n_fft < 4 or (st.n_fft & (st.n_fft - 1)) != 0 or st.hop_length == 0) return PackageError.InvalidFormat,
         .If => |iff| {
             if (iff.then_region >= pkg.regions.len or iff.else_region >= pkg.regions.len) return PackageError.InvalidFormat;
             if (pkg.regions[iff.then_region].outputs.len != 1 or pkg.regions[iff.else_region].outputs.len != 1) return PackageError.InvalidFormat;

@@ -10,6 +10,8 @@ const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
 const conv1d_registry = @import("registry/conv1d_registry.zig");
 const conv2d_registry = @import("registry/conv2d_registry.zig");
+const fft_registry = @import("registry/fft_registry.zig");
+const fft_kernels = @import("kernels/fft.zig");
 const exec_utils = @import("exec/utils.zig");
 const exec_elemwise = @import("exec/elementwise.zig");
 const exec_unary = @import("exec/unary.zig");
@@ -20,7 +22,8 @@ const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
 const exec_attention_cached = @import("exec/attention_cached.zig");
 const exec_lstm = @import("exec/lstm.zig");
-const exec_complex_abs_mean = @import("exec/complex_abs_mean.zig");
+const exec_rfft = @import("exec/rfft.zig");
+const exec_stft = @import("exec/stft.zig");
 const exec_gather = @import("exec/gather.zig");
 const exec_rope = @import("exec/rope.zig");
 const exec_kv_cache_append = @import("exec/kv_cache_append.zig");
@@ -72,6 +75,12 @@ pub const CpuBackend = struct {
 
     depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
     depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
+
+    fft: fft_registry.FftKernels = fft_registry.candidates[1].kernels,
+
+    // Cached real-FFT plan (bit-reversal + twiddles), reused across RFFT/STFT
+    // steps with the same n_fft to keep plan build off the hot path.
+    fft_plan: ?fft_kernels.Plan = null,
 
     // Per-thread scratch for matmul packing (A/B panels).
     // Size == thread_count. Avoids large per-call stack frames.
@@ -147,6 +156,7 @@ pub const CpuBackend = struct {
         self.attention_kernels = attention_registry.selectForTarget(target).kernels;
         self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
         self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
+        self.fft = fft_registry.selectForTarget(target).kernels;
 
         if (effective_thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = effective_thread_count });
@@ -180,10 +190,29 @@ pub const CpuBackend = struct {
         return self;
     }
 
+    /// Build-or-reuse the cached real-FFT plan for `n_fft`.
+    fn fftPlanFor(self: *Self, n_fft: usize) ExecuteProgramError!*const fft_kernels.Plan {
+        if (self.fft_plan) |*p| {
+            if (p.n_fft == n_fft) return p;
+            p.deinit();
+            self.fft_plan = null;
+        }
+        self.fft_plan = fft_kernels.Plan.init(self.allocator, n_fft) catch |e| switch (e) {
+            error.OutOfMemory => return BackendError.ExecutionFailed,
+            else => return BackendError.InvalidArgument,
+        };
+        return &self.fft_plan.?;
+    }
+
     pub fn deinit(self: *Self) void {
         if (self.pool) |*p| {
             p.deinit();
             self.pool = null;
+        }
+
+        if (self.fft_plan) |*p| {
+            p.deinit();
+            self.fft_plan = null;
         }
 
         if (self.matmul_scratch_f32.len != 0) {
@@ -393,9 +422,16 @@ pub const CpuBackend = struct {
                 try exec_lstm.execLSTMCellFused(pool_ptr, self.thread_count, s, store);
             },
 
-            .ComplexAbsMean => |s| {
+            .RFFT => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_complex_abs_mean.execComplexAbsMean(pool_ptr, self.thread_count, s, store);
+                const plan = try self.fftPlanFor(s.n_fft);
+                try exec_rfft.execRFFT(self.allocator, pool_ptr, self.thread_count, self.fft, plan, s, store);
+            },
+
+            .STFT => |s| {
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                const plan = try self.fftPlanFor(s.n_fft);
+                try exec_stft.execSTFT(self.allocator, pool_ptr, self.thread_count, self.fft, plan, s, store);
             },
 
             .If => |s| {

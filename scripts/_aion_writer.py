@@ -141,7 +141,7 @@ class NodeKind:
     Reduce = 11
     Concat = 12
     LSTMCell = 13
-    ComplexAbsMean = 14
+    # Id 14 is retired (formerly ComplexAbsMean) — left as a gap for ABI stability.
     Copy = 15
     ViewReshape = 16
     ViewSqueeze = 17
@@ -154,6 +154,9 @@ class NodeKind:
     MultiHeadAttentionCached = 24
     Cast = 25
     MatMulNT = 26
+    # If = 27, Loop = 28 (control-flow regions; no writer attr helper yet)
+    RFFT = 29
+    STFT = 30
 
 
 # q8_0 block constants (ggml-compatible).
@@ -494,8 +497,12 @@ def attr_lstm(has_bias: bool) -> bytes:
     return u8(1 if has_bias else 0)
 
 
-def attr_complex_abs_mean(out_channels: int) -> bytes:
-    return u64(out_channels)
+def attr_rfft() -> bytes:
+    return b""
+
+
+def attr_stft(n_fft: int, hop_length: int, center: bool) -> bytes:
+    return u64(n_fft) + u64(hop_length) + u8(1 if center else 0)
 
 
 def attr_view_reshape(new_shape_terms: Sequence[bytes]) -> bytes:

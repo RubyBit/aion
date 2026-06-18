@@ -532,7 +532,12 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         } },
         .Concat => .{ .Concat = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .LSTMCell => .{ .LSTMCell = .{ .has_bias = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
-        .ComplexAbsMean => .{ .ComplexAbsMean = .{ .out_channels = try readIntCursor(bytes, &cursor, u64) } },
+        .RFFT => .RFFT,
+        .STFT => .{ .STFT = .{
+            .n_fft = try readIntCursor(bytes, &cursor, u64),
+            .hop_length = try readIntCursor(bytes, &cursor, u64),
+            .center = (try readIntCursor(bytes, &cursor, u8)) != 0,
+        } },
         .Copy => .Copy,
         .GatherRows => .GatherRows,
         .RoPE1D => .{ .RoPE1D = .{

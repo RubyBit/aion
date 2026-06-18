@@ -21,6 +21,10 @@ pub const InferError = error{
     DTypeMismatch,
 };
 
+fn isPowerOfTwoUsize(n: usize) bool {
+    return n != 0 and (n & (n - 1)) == 0;
+}
+
 fn require(cond: bool) InferError!void {
     if (!cond) return InferError.InvalidGraph;
 }
@@ -584,28 +588,57 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, first.dtype.?, out_shape);
         },
 
-        .ComplexAbsMean => |cm| {
-            const stft = try getValue(graph, node.inputs[0]);
-            try require(stft.dtype != null and stft.shape.len != 0);
+        .RFFT => {
+            const x = try getValue(graph, node.inputs[0]);
+            try require(x.dtype != null and x.shape.len != 0);
 
-            // v0: scalar-only and non-quantized.
-            if (stft.dtype.?.info().is_quantized) return InferError.Unsupported;
-            if (stft.dtype.? != .f32 and stft.dtype.? != .f16) return InferError.Unsupported;
+            // v0: f32 only.
+            if (x.dtype.? != .f32) return InferError.Unsupported;
 
-            if (stft.shape.len != 3) return InferError.RankMismatch;
-            const batch: usize = stft.shape[0];
-            const time: usize = stft.shape[1];
-            const chans2: usize = stft.shape[2];
-            if (batch == 0 or time == 0 or chans2 == 0) return InferError.InvalidGraph;
-            if (chans2 % 2 != 0) return InferError.ShapeMismatch;
+            const n_fft: usize = x.shape[x.shape.len - 1];
+            if (!isPowerOfTwoUsize(n_fft) or n_fft < 4) return InferError.ShapeMismatch;
 
-            const cutoff: usize = chans2 / 2;
-            if (cm.out_channels == 0 or cm.out_channels > cutoff) return InferError.ShapeMismatch;
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, x.shape.len) catch return InferError.InvalidGraph;
+            for (x.shape[0 .. x.shape.len - 1], 0..) |d, i| out_shape[i] = d;
+            // One-sided bins = n_fft/2 + 1; packed real+imag = n_fft + 2.
+            out_shape[x.shape.len - 1] = n_fft + 2;
+            try setInferred(graph, node.output, .f32, out_shape);
+        },
 
-            const out_shape: []usize = graph.arenaAlloc().alloc(usize, 2) catch return InferError.InvalidGraph;
+        .STFT => |st| {
+            const signal = try getValue(graph, node.inputs[0]);
+            const window = try getValue(graph, node.inputs[1]);
+            try require(signal.dtype != null and window.dtype != null);
+
+            // v0: f32 only.
+            if (signal.dtype.? != .f32 or window.dtype.? != .f32) return InferError.Unsupported;
+
+            if (signal.shape.len != 2) return InferError.RankMismatch;
+            if (window.shape.len != 1) return InferError.RankMismatch;
+
+            const n_fft: usize = st.n_fft;
+            const hop: usize = st.hop_length;
+            if (!isPowerOfTwoUsize(n_fft) or n_fft < 4) return InferError.ShapeMismatch;
+            if (hop == 0) return InferError.InvalidGraph;
+            if (window.shape[0] != n_fft) return InferError.ShapeMismatch;
+
+            const batch: usize = signal.shape[0];
+            const samples: usize = signal.shape[1];
+            if (batch == 0 or samples == 0) return InferError.InvalidGraph;
+
+            var num_frames: usize = 0;
+            if (st.center) {
+                num_frames = 1 + samples / hop;
+            } else {
+                if (samples < n_fft) return InferError.ShapeMismatch;
+                num_frames = 1 + (samples - n_fft) / hop;
+            }
+
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, 3) catch return InferError.InvalidGraph;
             out_shape[0] = batch;
-            out_shape[1] = cm.out_channels;
-            try setInferred(graph, node.output, stft.dtype.?, out_shape);
+            out_shape[1] = num_frames;
+            out_shape[2] = n_fft + 2;
+            try setInferred(graph, node.output, .f32, out_shape);
         },
 
         .LSTMCell => |lc| {

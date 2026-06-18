@@ -898,28 +898,40 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             }
         },
 
-        .ComplexAbsMean => |s| {
+        .RFFT => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
-            const stft: *const TiledTensor = mgr.getConst(s.stft) catch return CompileError.InvalidArgument;
+            const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
 
-            try compileRequire(isScalarSupported(out.dtype));
-            try compileRequire(out.dtype == stft.dtype);
-            try compileRequire(!out.dtype.info().is_quantized);
+            try compileRequire(out.dtype == .f32 and x.dtype == .f32);
+            try compileRequire(x.rank >= 1 and out.rank == x.rank);
 
-            try compileRequire(stft.rank == 3);
-            try compileRequire(out.rank == 2);
+            const n_fft: usize = x.shape[@as(usize, x.rank) - 1];
+            try compileRequire(n_fft == s.n_fft);
+            try compileRequire(n_fft >= 4 and (n_fft & (n_fft - 1)) == 0);
 
-            const batch: usize = stft.shape[0];
-            const time: usize = stft.shape[1];
-            const chans2: usize = stft.shape[2];
-            try compileRequire(batch != 0 and time != 0 and chans2 != 0);
-            try compileRequire(chans2 % 2 == 0);
+            var d: usize = 0;
+            while (d + 1 < @as(usize, x.rank)) : (d += 1) {
+                try compileRequire(out.shape[d] == x.shape[d]);
+            }
+            try compileRequire(out.shape[@as(usize, out.rank) - 1] == n_fft + 2);
+        },
 
-            const cutoff: usize = chans2 / 2;
-            try compileRequire(s.out_channels >= 1 and s.out_channels <= cutoff);
+        .STFT => |s| {
+            const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const signal: *const TiledTensor = mgr.getConst(s.signal) catch return CompileError.InvalidArgument;
+            const window: *const TiledTensor = mgr.getConst(s.window) catch return CompileError.InvalidArgument;
 
-            try compileRequire(out.shape[0] == batch);
-            try compileRequire(out.shape[1] == s.out_channels);
+            try compileRequire(out.dtype == .f32 and signal.dtype == .f32 and window.dtype == .f32);
+            try compileRequire(signal.rank == 2 and window.rank == 1 and out.rank == 3);
+
+            const n_fft: usize = s.n_fft;
+            try compileRequire(n_fft >= 4 and (n_fft & (n_fft - 1)) == 0);
+            try compileRequire(s.hop_length != 0);
+            try compileRequire(window.shape[0] == n_fft);
+
+            try compileRequire(out.shape[0] == signal.shape[0]);
+            try compileRequire(out.shape[1] == s.num_frames);
+            try compileRequire(out.shape[2] == n_fft + 2);
         },
 
         .ReduceAll => |s| {
@@ -1918,20 +1930,44 @@ pub fn compileGraph(
                 try appendStepChecked(allocator, mgr, &steps, .{ .ConcatScalar = .{ .out = out_tid, .axis = axis, .input_count = @intCast(node.inputs.len), .inputs = in_ids } });
             },
 
-            .ComplexAbsMean => |cm| {
-                const stft_id: usize = @intCast(node.inputs[0]);
+            .RFFT => {
+                const x_id: usize = @intCast(node.inputs[0]);
 
                 var out_tile_buf: [MAX_RANK]usize = undefined;
                 const out_tile: []usize = out_tile_buf[0..out_shape.len];
                 try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
                 const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
 
-                const stft_tid: TensorId = try ensureAnyTensor(&ctx, stft_id);
+                const x_tid: TensorId = try ensureAnyTensor(&ctx, x_id);
 
-                try appendStepChecked(allocator, mgr, &steps, .{ .ComplexAbsMean = .{
+                const n_fft: usize = out_shape[out_shape.len - 1] - 2;
+                try appendStepChecked(allocator, mgr, &steps, .{ .RFFT = .{
                     .out = out_tid,
-                    .stft = stft_tid,
-                    .out_channels = cm.out_channels,
+                    .x = x_tid,
+                    .n_fft = n_fft,
+                } });
+            },
+
+            .STFT => |st| {
+                const signal_id: usize = @intCast(node.inputs[0]);
+                const window_id: usize = @intCast(node.inputs[1]);
+
+                var out_tile_buf: [MAX_RANK]usize = undefined;
+                const out_tile: []usize = out_tile_buf[0..out_shape.len];
+                try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
+                const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+
+                const signal_tid: TensorId = try ensureAnyTensor(&ctx, signal_id);
+                const window_tid: TensorId = try ensureAnyTensor(&ctx, window_id);
+
+                try appendStepChecked(allocator, mgr, &steps, .{ .STFT = .{
+                    .out = out_tid,
+                    .signal = signal_tid,
+                    .window = window_tid,
+                    .n_fft = st.n_fft,
+                    .hop_length = st.hop_length,
+                    .center = st.center,
+                    .num_frames = out_shape[1],
                 } });
             },
 

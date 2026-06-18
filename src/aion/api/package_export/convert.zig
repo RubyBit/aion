@@ -48,7 +48,8 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .Reduce => |rr| .{ .Reduce = .{ .op = rr.op, .axis = rr.axis } },
         .Concat => |cc| .{ .Concat = .{ .axis = cc.axis } },
         .LSTMCell => |lc| .{ .LSTMCell = .{ .has_bias = lc.has_bias } },
-        .ComplexAbsMean => |cm| .{ .ComplexAbsMean = .{ .out_channels = cm.out_channels } },
+        .RFFT => .RFFT,
+        .STFT => |st| .{ .STFT = .{ .n_fft = st.n_fft, .hop_length = st.hop_length, .center = st.center } },
         .Copy => .Copy,
         .GatherRows => .GatherRows,
         .RoPE1D => |rp| .{ .RoPE1D = .{

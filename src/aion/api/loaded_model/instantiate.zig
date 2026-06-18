@@ -89,7 +89,14 @@ pub fn instantiateNode(
             if (lc.has_bias) mapped_inputs[5] else null,
             if (lc.has_bias) mapped_inputs[6] else null,
         ),
-        .ComplexAbsMean => |cm| try graph.addComplexAbsMean(mapped_inputs[0], @intCast(cm.out_channels)),
+        .RFFT => try graph.addRFFT(mapped_inputs[0]),
+        .STFT => |st| try graph.addSTFT(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            @intCast(st.n_fft),
+            @intCast(st.hop_length),
+            st.center,
+        ),
         .Copy => try graph.addCopy(mapped_inputs[0]),
         .GatherRows => try graph.addGatherRows(mapped_inputs[0], mapped_inputs[1]),
         .RoPE1D => |rp| try graph.addRoPE1D(

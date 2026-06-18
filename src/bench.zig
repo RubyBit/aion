@@ -1199,6 +1199,74 @@ fn benchProgramMultiHeadAttentionCachedF32(
     );
 }
 
+fn benchProgramSTFTF32(
+    allocator: std.mem.Allocator,
+    rnd: std.Random,
+    iters: usize,
+    batch: usize,
+    samples: usize,
+    n_fft: usize,
+    hop: usize,
+    be: Backend,
+) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+
+    const sig: []f32 = try allocator.alloc(f32, batch * samples);
+    defer allocator.free(sig);
+    fillRandomF32(rnd, sig);
+
+    const win: []f32 = try allocator.alloc(f32, n_fft);
+    defer allocator.free(win);
+    for (0..n_fft) |i| win[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft)));
+
+    // Single-tile inputs keep setup simple; the op reads via scalar tile access.
+    const sig_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, samples }, &[_]usize{ batch, samples }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(sig_tid, std.mem.sliceAsBytes(sig));
+    const win_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_fft}, &[_]usize{n_fft}, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(win_tid, std.mem.sliceAsBytes(win));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const sig_in = try g.addInput(.f32, &[_]usize{ batch, samples });
+    try g.bindExternal(sig_in, @intCast(sig_tid));
+    const win_in = try g.addInput(.f32, &[_]usize{n_fft});
+    try g.bindExternal(win_in, @intCast(win_tid));
+    const y = try g.addSTFT(sig_in, win_in, n_fft, hop, true);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const num_frames: usize = 1 + samples / hop;
+    const out_tid: TensorId = prog.outputs[0];
+    const out_elems: usize = batch * num_frames * (n_fft + 2);
+    const out_buf: []f32 = try allocator.alloc(f32, out_elems);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(out_tid, std.mem.sliceAsBytes(out_buf));
+    const chk: f32 = out_buf[0] + out_buf[@min(out_elems - 1, n_fft + 2)];
+
+    // FLOP estimate: per frame, window multiply (~N) + real FFT (~2.5*N*log2 N),
+    // over batch*num_frames frames.
+    const log2n: f64 = std.math.log2(@as(f64, @floatFromInt(n_fft)));
+    const flops_per_frame: f64 = @as(f64, @floatFromInt(n_fft)) + 2.5 * @as(f64, @floatFromInt(n_fft)) * log2n;
+    const total_flops: f64 = flops_per_frame * @as(f64, @floatFromInt(batch * num_frames * iters));
+    const gflops: f64 = total_flops / @as(f64, @floatFromInt(ns));
+    std.debug.print("program stft f32 (nfft={d} hop={d} frames={d}): {d:.3} GFLOP/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ n_fft, hop, num_frames, gflops, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+}
+
 fn benchProgramRoPE1DF32(
     allocator: std.mem.Allocator,
     rnd: std.Random,
@@ -2247,6 +2315,9 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
     } else {
         std.debug.print("(skipping rope1d f32: k/head_dim={} must be even)\n", .{opts.k});
     }
+
+    // STFT front-end (ASR-style: 16 kHz, 32 ms window, 10 ms hop).
+    try benchProgramSTFTF32(allocator, rnd, opts.iters, 1, 16000, 512, 160, be);
 
     try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, opts.conv_k, 1, .zero, "regular", be);
     try benchProgramConv1D(allocator, rnd, opts.iters, opts.conv_batch, opts.conv_l, opts.conv_cin, opts.conv_cout, 1, 1, .zero, "pointwise", be);

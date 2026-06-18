@@ -160,11 +160,21 @@ pub const StepLoop = struct {
     body_carried_outputs: [MAX_LOOP_CARRIED]TensorId,
 };
 
-pub const StepComplexAbsMean = struct {
+pub const StepRFFT = struct {
     out: TensorId,
-    stft: TensorId,
-    /// Number of output channels to produce (must be <= (stft_last_dim/2)).
-    out_channels: usize,
+    x: TensorId,
+    /// Real FFT length (power of two); equals the input's last dimension.
+    n_fft: usize,
+};
+
+pub const StepSTFT = struct {
+    out: TensorId,
+    signal: TensorId,
+    window: TensorId,
+    n_fft: usize,
+    hop_length: usize,
+    center: bool,
+    num_frames: usize,
 };
 
 /// Pack/unpack/re-tiling materialization (scalar only, same shape).
@@ -204,7 +214,8 @@ pub const Step = union(enum) {
     If: StepIf,
     Loop: StepLoop,
 
-    ComplexAbsMean: StepComplexAbsMean,
+    RFFT: StepRFFT,
+    STFT: StepSTFT,
 
     ReTileCopyScalar: StepReTileCopyScalar,
 

@@ -318,20 +318,34 @@ pub fn decodeLinearToCoords(linear: usize, strides: []const usize, shape: []cons
     }
 }
 
-const TileCacheConstND = struct {
+pub const TileCacheConstND = struct {
     valid: bool = false,
     tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefConst = undefined,
     strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+
+    pub fn deinit(self: *TileCacheConstND, store: tensor_store.TensorStore) void {
+        if (self.valid) {
+            store.releaseConst(self.tile.token);
+            self.valid = false;
+        }
+    }
 };
 
-const TileCacheMutND = struct {
+pub const TileCacheMutND = struct {
     valid: bool = false,
     tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefMut = undefined,
     strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+
+    pub fn deinit(self: *TileCacheMutND, store: tensor_store.TensorStore) void {
+        if (self.valid) {
+            store.releaseMut(self.tile.token);
+            self.valid = false;
+        }
+    }
 };
 
 fn ensureConstTileLinear(cache: *TileCacheConstND, store: tensor_store.TensorStore, id: tensor_store.TensorId, tile_index: usize, rank: usize) ExecuteProgramError!void {
@@ -354,6 +368,116 @@ fn ensureMutTileLinear(cache: *TileCacheMutND, store: tensor_store.TensorStore, 
     cache.valid = true;
     const shape: []const usize = cache.tile.bufferView().layout.shape;
     try computePackedStrides(shape, cache.strides[0..rank]);
+}
+
+/// Packed in-tile element offset for logical `coords` given the tile's element
+/// `strides`. Shared by the scalar read/write helpers below; assumes the caller
+/// has already resolved (and cached) the enclosing tile.
+fn scalarElemOffset(
+    meta: tensor_store.TensorMeta,
+    coords: []const usize,
+    strides: []const usize,
+) ExecuteProgramError!usize {
+    const rank: usize = @as(usize, meta.rank);
+    var off_elems: usize = 0;
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        const local: usize = coords[d] - (coords[d] / meta.tile_shape[d]) * meta.tile_shape[d];
+        off_elems = std.math.add(usize, off_elems, local * strides[d]) catch return BackendError.InvalidArgument;
+    }
+    return off_elems;
+}
+
+/// Read one f32 (widening f16) at logical `coords` of tensor `id`. Valid for any
+/// rank up to MAX_RANK and any tiling; the cache amortizes repeated accesses
+/// within the same tile. Layout-independent (slow) per-element path — for the
+/// common single-tile contiguous case, index the raw buffer directly instead.
+pub fn readScalarF32At(
+    store: tensor_store.TensorStore,
+    meta: tensor_store.TensorMeta,
+    id: tensor_store.TensorId,
+    coords: []const usize,
+    cache: *TileCacheConstND,
+) ExecuteProgramError!f32 {
+    const rank: usize = @as(usize, meta.rank);
+    if (coords.len != rank) return BackendError.InvalidArgument;
+    if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
+
+    var tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (coords[d] >= meta.shape[d]) return BackendError.InvalidArgument;
+        tile_coords[d] = coords[d] / meta.tile_shape[d];
+    }
+    const tile_index: usize = try tensor_store.encodeTileIndex(meta, tile_coords[0..rank]);
+    try ensureConstTileLinear(cache, store, id, tile_index, rank);
+
+    const v = cache.tile.bufferView();
+    if (v.dtype != meta.dtype) return BackendError.InvalidArgument;
+    if (@as(usize, v.layout.rank) != rank) return BackendError.InvalidArgument;
+
+    const off_elems: usize = try scalarElemOffset(meta, coords, cache.strides[0..rank]);
+
+    switch (meta.dtype) {
+        .f32 => {
+            const off_bytes: usize = off_elems * 4;
+            if (off_bytes + 4 > v.bytes.len) return BackendError.InvalidArgument;
+            return @as(*align(1) const f32, @ptrCast(v.bytes.ptr + off_bytes)).*;
+        },
+        .f16 => {
+            const off_bytes: usize = off_elems * 2;
+            if (off_bytes + 2 > v.bytes.len) return BackendError.InvalidArgument;
+            const x: f16 = @as(*align(1) const f16, @ptrCast(v.bytes.ptr + off_bytes)).*;
+            return @floatCast(x);
+        },
+        else => return BackendError.InvalidArgument,
+    }
+}
+
+/// Write one f32 (narrowing to f16 if needed) at logical `coords` of tensor `id`.
+/// See `readScalarF32At` for layout/perf notes.
+pub fn writeScalarFromF32At(
+    store: tensor_store.TensorStore,
+    meta: tensor_store.TensorMeta,
+    id: tensor_store.TensorId,
+    coords: []const usize,
+    v_in: f32,
+    cache: *TileCacheMutND,
+) ExecuteProgramError!void {
+    const rank: usize = @as(usize, meta.rank);
+    if (coords.len != rank) return BackendError.InvalidArgument;
+    if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
+
+    var tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (coords[d] >= meta.shape[d]) return BackendError.InvalidArgument;
+        tile_coords[d] = coords[d] / meta.tile_shape[d];
+    }
+    const tile_index: usize = try tensor_store.encodeTileIndex(meta, tile_coords[0..rank]);
+    try ensureMutTileLinear(cache, store, id, tile_index, rank);
+
+    const v = cache.tile.bufferView();
+    if (v.dtype != meta.dtype) return BackendError.InvalidArgument;
+    if (@as(usize, v.layout.rank) != rank) return BackendError.InvalidArgument;
+
+    const off_elems: usize = try scalarElemOffset(meta, coords, cache.strides[0..rank]);
+
+    switch (meta.dtype) {
+        .f32 => {
+            const off_bytes: usize = off_elems * 4;
+            if (off_bytes + 4 > v.bytes.len) return BackendError.InvalidArgument;
+            @as(*align(1) f32, @ptrCast(v.bytes.ptr + off_bytes)).* = v_in;
+        },
+        .f16 => {
+            const off_bytes: usize = off_elems * 2;
+            if (off_bytes + 2 > v.bytes.len) return BackendError.InvalidArgument;
+            @as(*align(1) f16, @ptrCast(v.bytes.ptr + off_bytes)).* = @floatCast(v_in);
+        },
+        else => return BackendError.InvalidArgument,
+    }
 }
 
 fn retileCopyScalarND(

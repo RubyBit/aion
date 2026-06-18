@@ -775,58 +775,176 @@ test "api.nn: lstm cell (single step)" {
     }
 }
 
-test "api: complexAbsMean (split-complex abs mean over time)" {
+fn refOneSidedDft(x: []const f32, out_re: []f32, out_im: []f32) void {
+    const n: usize = x.len;
+    const bins: usize = n / 2 + 1;
+    const n_f: f64 = @floatFromInt(n);
+    for (0..bins) |k| {
+        var sr: f64 = 0;
+        var si: f64 = 0;
+        for (0..n) |m| {
+            const ang: f64 = -2.0 * std.math.pi * @as(f64, @floatFromInt(k)) *
+                @as(f64, @floatFromInt(m)) / n_f;
+            sr += @as(f64, x[m]) * @cos(ang);
+            si += @as(f64, x[m]) * @sin(ang);
+        }
+        out_re[k] = @floatCast(sr);
+        out_im[k] = @floatCast(si);
+    }
+}
+
+test "api: rfft matches one-sided DFT" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    const batch: usize = 2;
-    const time: usize = 3;
-    const cutoff: usize = 3;
-    const chans2: usize = cutoff * 2;
-    const out_channels: usize = 2;
+    const frames: usize = 2;
+    const n_fft: usize = 8;
+    const bins: usize = n_fft / 2 + 1;
 
-    var stft_vals: [batch * time * chans2]f32 = undefined;
-    for (0..stft_vals.len) |i| {
-        stft_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5))) * 0.25;
-    }
-
-    // Reference: out[b,c] = mean_t sqrt(re^2 + im^2).
-    var ref: [batch * out_channels]f32 = .{0.0} ** (batch * out_channels);
-    for (0..batch) |b| {
-        for (0..out_channels) |c| {
-            var acc: f32 = 0.0;
-            for (0..time) |t| {
-                const base: usize = (b * time + t) * chans2;
-                const re: f32 = stft_vals[base + c];
-                const im: f32 = stft_vals[base + (c + cutoff)];
-                acc += @sqrt(re * re + im * im);
-            }
-            ref[b * out_channels + c] = acc / @as(f32, @floatFromInt(time));
-        }
+    var x_vals: [frames * n_fft]f32 = undefined;
+    for (0..x_vals.len) |i| {
+        x_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.3;
     }
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    const stft_t: api.Tensor = try ctx.fromF32(&[_]usize{ batch, time, chans2 }, stft_vals[0..]);
+    const x_t: api.Tensor = try ctx.fromF32(&[_]usize{ frames, n_fft }, x_vals[0..]);
 
     var bld = api.Builder.init(allocator);
     defer bld.deinit();
 
-    const STFT: api.TensorRef = try bld.param(stft_t);
-    const Out: api.TensorRef = try bld.complexAbsMean(STFT, out_channels);
+    const X: api.TensorRef = try bld.param(x_t);
+    const Out: api.TensorRef = try bld.rfft(X);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
-    try std.testing.expectEqualSlices(usize, &[_]usize{ batch, out_channels }, out_t.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ frames, 2 * bins }, out_t.getShape());
 
-    var out_vals: [batch * out_channels]f32 = undefined;
+    var out_vals: [frames * 2 * bins]f32 = undefined;
     try out_t.read(&out_vals);
 
-    for (0..out_vals.len) |i| {
-        try std.testing.expect(std.math.isFinite(out_vals[i]));
-        try std.testing.expectApproxEqAbs(ref[i], out_vals[i], 1e-6);
+    var ref_re: [bins]f32 = undefined;
+    var ref_im: [bins]f32 = undefined;
+    for (0..frames) |f| {
+        refOneSidedDft(x_vals[f * n_fft ..][0..n_fft], ref_re[0..], ref_im[0..]);
+        for (0..bins) |k| {
+            try std.testing.expectApproxEqAbs(ref_re[k], out_vals[f * 2 * bins + k], 1e-3);
+            try std.testing.expectApproxEqAbs(ref_im[k], out_vals[f * 2 * bins + k + bins], 1e-3);
+        }
+    }
+}
+
+fn refReflectIndex(i: i64, n: usize) usize {
+    if (n <= 1) return 0;
+    const period: i64 = 2 * (@as(i64, @intCast(n)) - 1);
+    var m: i64 = @mod(i, period);
+    const ni: i64 = @intCast(n);
+    if (m >= ni) m = period - m;
+    return @intCast(m);
+}
+
+test "api: stft with center reflect-padding matches reference" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const n_fft: usize = 8;
+    const hop: usize = 4;
+    const samples: usize = 20;
+    const bins: usize = n_fft / 2 + 1;
+    const num_frames: usize = 1 + samples / hop; // center=true
+
+    var sig_vals: [samples]f32 = undefined;
+    for (0..samples) |i| sig_vals[i] = @sin(@as(f32, @floatFromInt(i)) * 0.37) + 0.1 * @as(f32, @floatFromInt(i % 3));
+    var win_vals: [n_fft]f32 = undefined;
+    for (0..n_fft) |i| win_vals[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft)));
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const sig_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, samples }, sig_vals[0..]);
+    const win_t: api.Tensor = try ctx.fromF32(&[_]usize{n_fft}, win_vals[0..]);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Sig: api.TensorRef = try bld.param(sig_t);
+    const Win: api.TensorRef = try bld.param(win_t);
+    const Out: api.TensorRef = try bld.stft(Sig, Win, n_fft, hop, true);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, num_frames, 2 * bins }, out_t.getShape());
+
+    var out_vals: [num_frames * 2 * bins]f32 = undefined;
+    try out_t.read(&out_vals);
+
+    const pad: i64 = @intCast(n_fft / 2);
+    var frame: [n_fft]f32 = undefined;
+    var ref_re: [bins]f32 = undefined;
+    var ref_im: [bins]f32 = undefined;
+    for (0..num_frames) |t| {
+        const origin: i64 = @as(i64, @intCast(t * hop)) - pad;
+        for (0..n_fft) |j| {
+            const idx: i64 = origin + @as(i64, @intCast(j));
+            frame[j] = sig_vals[refReflectIndex(idx, samples)] * win_vals[j];
+        }
+        refOneSidedDft(frame[0..], ref_re[0..], ref_im[0..]);
+        for (0..bins) |k| {
+            try std.testing.expectApproxEqAbs(ref_re[k], out_vals[t * 2 * bins + k], 1e-3);
+            try std.testing.expectApproxEqAbs(ref_im[k], out_vals[t * 2 * bins + k + bins], 1e-3);
+        }
+    }
+}
+
+test "api: stft frames + windows + rfft (no center)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const n_fft: usize = 8;
+    const hop: usize = 4;
+    const samples: usize = 16;
+    const bins: usize = n_fft / 2 + 1;
+    const num_frames: usize = 1 + (samples - n_fft) / hop; // = 3
+
+    var sig_vals: [samples]f32 = undefined;
+    for (0..samples) |i| sig_vals[i] = @sin(@as(f32, @floatFromInt(i)) * 0.5);
+    var win_vals: [n_fft]f32 = undefined;
+    for (0..n_fft) |i| win_vals[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft)));
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const sig_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, samples }, sig_vals[0..]);
+    const win_t: api.Tensor = try ctx.fromF32(&[_]usize{n_fft}, win_vals[0..]);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const Sig: api.TensorRef = try bld.param(sig_t);
+    const Win: api.TensorRef = try bld.param(win_t);
+    const Out: api.TensorRef = try bld.stft(Sig, Win, n_fft, hop, false);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    defer model.deinit();
+
+    const out_t: api.Tensor = try model.runOutputTensor(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, num_frames, 2 * bins }, out_t.getShape());
+
+    var out_vals: [num_frames * 2 * bins]f32 = undefined;
+    try out_t.read(&out_vals);
+
+    var frame: [n_fft]f32 = undefined;
+    var ref_re: [bins]f32 = undefined;
+    var ref_im: [bins]f32 = undefined;
+    for (0..num_frames) |t| {
+        for (0..n_fft) |j| frame[j] = sig_vals[t * hop + j] * win_vals[j];
+        refOneSidedDft(frame[0..], ref_re[0..], ref_im[0..]);
+        for (0..bins) |k| {
+            try std.testing.expectApproxEqAbs(ref_re[k], out_vals[t * 2 * bins + k], 1e-3);
+            try std.testing.expectApproxEqAbs(ref_im[k], out_vals[t * 2 * bins + k + bins], 1e-3);
+        }
     }
 }
 

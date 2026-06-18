@@ -48,7 +48,8 @@ pub const OpTag = enum(u8) {
     Reduce = 11,
     Concat = 12,
     LSTMCell = 13,
-    ComplexAbsMean = 14,
+    // Id 14 is retired (formerly ComplexAbsMean) — intentionally left as a gap
+    // to preserve stable on-disk / ABI op ids for the entries below.
     Copy = 15,
     ViewReshape = 16,
     ViewSqueeze = 17,
@@ -98,6 +99,17 @@ pub const OpTag = enum(u8) {
 
     /// Single-carried-value loop region.
     Loop = 28,
+
+    /// Real FFT over the last dimension (power-of-two length).
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    /// (Id 14 is retired — formerly ComplexAbsMean — and intentionally unused.)
+    RFFT = 29,
+
+    /// Short-time Fourier transform (framing + window + real FFT).
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    STFT = 30,
 };
 
 pub const Op = union(OpTag) {
@@ -194,23 +206,6 @@ pub const Op = union(OpTag) {
     /// - state: [batch, 2*hidden] where state[:,0:h]=h_t and state[:,h:2h]=c_t
     LSTMCell: struct { has_bias: bool },
 
-    /// Fused complex-abs (magnitude) + mean reduction over time.
-    ///
-    /// This is a common pattern in audio/signal front-ends when complex values are
-    /// represented as split real/imag halves.
-    ///
-    /// Input:
-    /// - x: [batch, time, 2*cutoff] interpreted as real/imag halves.
-    ///
-    /// Output:
-    /// - out: [batch, out_channels] where out[b,c] = mean_t sqrt(re^2 + im^2)
-    ///   using re=x[b,t,c], im=x[b,t,c+cutoff].
-    ///
-    /// Contract:
-    /// - x.shape[2] must be even
-    /// - out_channels must be in 1..=cutoff
-    ComplexAbsMean: struct { out_channels: usize },
-
     Copy: void,
 
     /// View ops (lowered into materialization steps in v0).
@@ -295,6 +290,36 @@ pub const Op = union(OpTag) {
 
     /// Single-carried-value loop. Inputs: carried_init.
     Loop: struct { body_region: RegionId, static_max_trip_count: usize },
+
+    /// Real FFT over the last (power-of-two) dimension.
+    ///
+    /// Input:
+    /// - x: [.., n_fft] real (f32), n_fft a power of two >= 4.
+    ///
+    /// Output:
+    /// - out: [.., n_fft + 2] packed complex — one-sided bins `n_fft/2 + 1`
+    ///   with real parts in `[0..bins)` and imaginary parts in `[bins..2*bins)`.
+    RFFT: void,
+
+    /// Short-time Fourier transform: frame the signal, apply the window, and
+    /// run a real FFT per frame.
+    ///
+    /// Inputs:
+    /// - signal: [batch, samples] real (f32)
+    /// - window: [n_fft] real (f32) — already padded to n_fft by the caller
+    ///
+    /// Output:
+    /// - out: [batch, num_frames, n_fft + 2] packed complex (real/imag halves,
+    ///   same layout as RFFT).
+    ///
+    /// Framing: with `center`, the signal is reflect-padded by `n_fft/2` on each
+    /// end (torch/NeMo default) and `num_frames = 1 + samples/hop_length`;
+    /// otherwise `num_frames = 1 + (samples - n_fft)/hop_length`.
+    STFT: struct {
+        n_fft: usize,
+        hop_length: usize,
+        center: bool,
+    },
 };
 
 pub const InputArity = union(enum) {
@@ -330,7 +355,6 @@ pub fn opInputArity(op: Op) InputArity {
         .MultiHeadAttentionCached => .{ .exact = 5 },
         .Reduce => .{ .exact = 1 },
         .Concat => .{ .at_least = 1 },
-        .ComplexAbsMean => .{ .exact = 1 },
         .LSTMCell => |lc| .{ .exact = if (lc.has_bias) 7 else 5 },
         .Copy => .{ .exact = 1 },
         .ViewReshape => .{ .exact = 1 },
@@ -345,6 +369,8 @@ pub fn opInputArity(op: Op) InputArity {
         .MatMulNT => .{ .exact = 2 },
         .If => .{ .exact = 3 },
         .Loop => .{ .exact = 1 },
+        .RFFT => .{ .exact = 1 },
+        .STFT => .{ .exact = 2 },
     };
 }
 
@@ -740,9 +766,23 @@ pub const Graph = struct {
         return self.addNodeInternal(op, &[_]ValueId{ x, h_prev, c_prev, w_ih, w_hh });
     }
 
-    pub fn addComplexAbsMean(self: *Self, x: ValueId, out_channels: usize) GraphError!ValueId {
-        if (out_channels == 0) return GraphError.InvalidArgument;
-        return self.addNodeInternal(.{ .ComplexAbsMean = .{ .out_channels = out_channels } }, &[_]ValueId{x});
+    pub fn addRFFT(self: *Self, x: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.RFFT, &[_]ValueId{x});
+    }
+
+    pub fn addSTFT(
+        self: *Self,
+        signal: ValueId,
+        window: ValueId,
+        n_fft: usize,
+        hop_length: usize,
+        center: bool,
+    ) GraphError!ValueId {
+        if (n_fft == 0 or hop_length == 0) return GraphError.InvalidArgument;
+        return self.addNodeInternal(
+            .{ .STFT = .{ .n_fft = n_fft, .hop_length = hop_length, .center = center } },
+            &[_]ValueId{ signal, window },
+        );
     }
 
     pub fn addViewReshape(self: *Self, a: ValueId, new_shape: []const usize) GraphError!ValueId {

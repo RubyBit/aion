@@ -498,17 +498,32 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    /// Fused complex-abs (magnitude) + mean reduction over time.
+    /// Real FFT over the last (power-of-two) dimension.
     ///
-    /// Expects split-complex layout: `x[batch, time, 2*cutoff]` where the last
-    /// dimension is `[real(0..cutoff), imag(0..cutoff)]`.
+    /// Input `x[.., n_fft]` (f32) → output `[.., n_fft+2]` packed complex:
+    /// one-sided bins `n_fft/2+1` with real parts in `[0..bins)` and imaginary
+    /// parts in `[bins..2*bins)`.
+    pub fn rfft(self: *Self, x: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addRFFT(x.value);
+        try self.autoNameIfUnnamed(out, "rfft");
+        return .{ .value = out };
+    }
+
+    /// Short-time Fourier transform.
     ///
-    /// Output: `[batch, out_channels]` where
-    /// $$out[b,c] = \mathrm{mean}_t\, \sqrt{re^2 + im^2}$$
-    /// with `re=x[b,t,c]`, `im=x[b,t,c+cutoff]`.
-    pub fn complexAbsMean(self: *Self, x: TensorRef, out_channels: usize) Error!TensorRef {
-        const out: ValueId = try self.graph.addComplexAbsMean(x.value, out_channels);
-        try self.autoNameIfUnnamed(out, "complex_abs_mean");
+    /// Inputs: `signal[batch, samples]` (f32), `window[n_fft]` (f32, padded to
+    /// `n_fft` by the caller). Output: `[batch, num_frames, n_fft+2]` packed
+    /// complex (same layout as `rfft`). See `Op.STFT` for framing semantics.
+    pub fn stft(
+        self: *Self,
+        signal: TensorRef,
+        window: TensorRef,
+        n_fft: usize,
+        hop_length: usize,
+        center: bool,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addSTFT(signal.value, window.value, n_fft, hop_length, center);
+        try self.autoNameIfUnnamed(out, "stft");
         return .{ .value = out };
     }
 

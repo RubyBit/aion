@@ -290,8 +290,11 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         .LSTMCell => |lc| {
             try appendInt(out, allocator, u8, if (lc.has_bias) 1 else 0);
         },
-        .ComplexAbsMean => |cm| {
-            try appendInt(out, allocator, u64, cm.out_channels);
+        .RFFT => {},
+        .STFT => |st| {
+            try appendInt(out, allocator, u64, st.n_fft);
+            try appendInt(out, allocator, u64, st.hop_length);
+            try appendInt(out, allocator, u8, if (st.center) 1 else 0);
         },
         .Copy => {},
         .GatherRows => {},

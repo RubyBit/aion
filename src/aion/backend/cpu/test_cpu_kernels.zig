@@ -16,6 +16,8 @@ const matmul_registry = @import("registry/matmul_registry.zig");
 const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
+const fft_k = @import("kernels/fft.zig");
+const fft_registry = @import("registry/fft_registry.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;

@@ -51,7 +51,7 @@ import numpy as np
 # ----------------------------- AION v4 constants -----------------------------
 
 MAGIC: bytes = b"AION"
-VERSION: int = 4
+VERSION: int = 5
 HEADER_SIZE: int = 72
 SECTION_DESC_SIZE: int = 24
 INVALID_INDEX_U32: int = 0xFFFFFFFF
@@ -68,6 +68,7 @@ class SectionType:
     dim_exprs = 8
     metadata = 9
     debug_names = 10
+    regions = 11
     io_aliases = 12
 
 
@@ -103,6 +104,13 @@ class ElemwiseBinaryOp:
     sub = 1
     mul = 2
     div = 3
+    # Comparisons (i32 inputs -> i32 {0,1} output). Keep in sync with backend/types.zig.
+    eq = 4
+    ne = 5
+    lt = 6
+    gt = 7
+    le = 8
+    ge = 9
 
 
 class UnaryOp:
@@ -112,6 +120,7 @@ class UnaryOp:
     sigmoid = 3
     tanh = 4
     sqrt = 5
+    log = 6
 
 
 class ReduceOp:
@@ -154,9 +163,13 @@ class NodeKind:
     MultiHeadAttentionCached = 24
     Cast = 25
     MatMulNT = 26
-    # If = 27, Loop = 28 (control-flow regions; no writer attr helper yet)
+    If = 27
+    Loop = 28
     RFFT = 29
     STFT = 30
+    RelPosMHA = 31
+    ArgMax = 32
+    ScatterRow = 33
 
 
 # q8_0 block constants (ggml-compatible).
@@ -375,6 +388,14 @@ class NodeRecord:
 
 
 @dataclass
+class RegionRecord:
+    """A control-flow region body: a node list + the value ids it outputs."""
+
+    nodes: List["NodeRecord"] = field(default_factory=list)
+    outputs: List[int] = field(default_factory=list)
+
+
+@dataclass
 class NamedValue:
     name: str
     value: int
@@ -412,6 +433,7 @@ class Package:
     metadata: List[MetadataEntry] = field(default_factory=list)
     debug_names: List[DebugName] = field(default_factory=list)
     io_aliases: List[IoAlias] = field(default_factory=list)
+    regions: List[RegionRecord] = field(default_factory=list)
 
 
 # ------------------------------- node attrs ---------------------------------
@@ -421,6 +443,21 @@ class Package:
 
 def attr_matmul(alpha: float = 1.0, beta: float = 0.0) -> bytes:
     return f32_bytes(alpha) + f32_bytes(beta)
+
+
+def attr_if(then_region: int, else_region: int) -> bytes:
+    return u32(then_region) + u32(else_region)
+
+
+def attr_loop(body_region: int, static_max_trip_count: int, cond_carry=None,
+              check_before: bool = True, extra_outputs=()) -> bytes:
+    out = bytearray(u32(body_region) + u64(static_max_trip_count))
+    out += i32(-1 if cond_carry is None else int(cond_carry))
+    out += u8(1 if check_before else 0)
+    out += u32(len(extra_outputs))
+    for e in extra_outputs:
+        out += u32(int(e))
+    return bytes(out)
 
 
 def attr_unary(op: int) -> bytes:
@@ -448,6 +485,32 @@ def attr_conv1d(
     )
 
 
+def attr_conv2d(
+    stride_h: int,
+    stride_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    pad_top: int,
+    pad_bottom: int,
+    pad_left: int,
+    pad_right: int,
+    pad_mode: int,
+    groups: int,
+) -> bytes:
+    return (
+        u64(stride_h)
+        + u64(stride_w)
+        + u64(dilation_h)
+        + u64(dilation_w)
+        + u64(pad_top)
+        + u64(pad_bottom)
+        + u64(pad_left)
+        + u64(pad_right)
+        + u8(pad_mode)
+        + u64(groups)
+    )
+
+
 def attr_layernorm(eps: float, normalized_shape_terms: Sequence[bytes]) -> bytes:
     out = bytearray()
     out += f32_bytes(eps)
@@ -467,6 +530,15 @@ def attr_attention(scale: float, causal: bool) -> bytes:
 
 def attr_mha(scale: float, causal: bool, heads: int) -> bytes:
     return f32_bytes(scale) + u8(1 if causal else 0) + u64(heads)
+
+
+def attr_relpos_mha(scale: float, heads: int, has_mask: bool) -> bytes:
+    # Mirrors `encodeNodeOp` for RelPosMHA: f32 scale | u64 heads | u8 has_mask.
+    return f32_bytes(scale) + u64(heads) + u8(1 if has_mask else 0)
+
+
+def attr_argmax(axis: int) -> bytes:
+    return i32(axis)
 
 
 def attr_mha_cached(
@@ -661,6 +733,19 @@ def _encode_nodes(nodes: List[NodeRecord]) -> bytes:
     return bytes(out)
 
 
+def _encode_regions(regions: List[RegionRecord]) -> bytes:
+    # Mirrors `write.zig:encodeRegionsSection`: u32 count, then per region the node
+    # records (u32 count + records, same as the nodes section) + u32 out_count + outputs.
+    out = bytearray()
+    out += u32(len(regions))
+    for region in regions:
+        out += _encode_nodes(region.nodes)  # u32 count + node records
+        out += u32(len(region.outputs))
+        for o in region.outputs:
+            out += u32(int(o))
+    return bytes(out)
+
+
 def _encode_signatures(
     interner: _StringInterner,
     inputs: List[NamedValue],
@@ -709,6 +794,7 @@ def _encode_graph_meta(pkg: Package) -> bytes:
     out = bytearray()
     out += u32(len(pkg.values))
     out += u32(len(pkg.nodes))
+    out += u32(len(pkg.regions))  # region_count (v5)
     out += u32(len(pkg.initializers))
     out += u32(len(pkg.inputs))
     out += u32(len(pkg.outputs))
@@ -758,6 +844,8 @@ def write_aion_v4(path: str, pkg: Package) -> None:
         sections.append((SectionType.metadata, 0, _encode_metadata(interner, pkg.metadata)))
     if pkg.debug_names:
         sections.append((SectionType.debug_names, 0, _encode_debug_names(interner, pkg.debug_names)))
+    if pkg.regions:
+        sections.append((SectionType.regions, 0, _encode_regions(pkg.regions)))
     if pkg.io_aliases:
         sections.append((SectionType.io_aliases, 0, _encode_io_aliases(pkg.io_aliases)))
 

@@ -58,8 +58,31 @@ pub const StepMultiHeadAttentionCachedTiled = struct {
     sliding_window: usize,
     attn_logits_soft_cap: f32,
 };
+/// Relative-positional multi-head self-attention (Transformer-XL / Conformer).
+///
+/// Shapes:
+/// - q, k, v, out: [B, H, T*, D] (q rows T_q; k/v rows T_kv)
+/// - pos_emb:      [H, P, D] (P = 2*T_kv - 1)
+/// - pos_bias_u/_v:[H, D]
+/// - mask (opt):   [T_q, T_kv] additive
+pub const StepRelPosMHATiled = struct {
+    out: TensorId,
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    pos_emb: TensorId,
+    pos_bias_u: TensorId,
+    pos_bias_v: TensorId,
+    mask: ?TensorId,
+    scale: f32,
+    heads: usize,
+};
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: TensorId, axis: usize };
+/// ArgMax over the last axis (v1): out (i32) = index of max of a along axis.
+pub const StepArgMax = struct { out: TensorId, a: TensorId, axis: usize };
+/// In-place row scatter: buf[idx] = src. Output aliases buf (set in lowering).
+pub const StepScatterRow = struct { buf: TensorId, idx: TensorId, src: TensorId };
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
 pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 
@@ -198,6 +221,9 @@ pub const Step = union(enum) {
     AttentionTiled: StepAttentionTiled,
     MultiHeadAttentionTiled: StepMultiHeadAttentionTiled,
     MultiHeadAttentionCachedTiled: StepMultiHeadAttentionCachedTiled,
+    RelPosMHATiled: StepRelPosMHATiled,
+    ArgMax: StepArgMax,
+    ScatterRow: StepScatterRow,
     ReduceAll: StepReduceAll,
     ReduceAxis: StepReduceAxis,
     ConcatScalar: StepConcatScalar,

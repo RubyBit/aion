@@ -39,6 +39,9 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         } },
         .Attention => |attn| .{ .Attention = .{ .scale = attn.scale, .causal = attn.causal } },
         .MultiHeadAttention => |attn| .{ .MultiHeadAttention = .{ .scale = attn.scale, .causal = attn.causal, .heads = attn.heads } },
+        .RelPosMHA => |attn| .{ .RelPosMHA = .{ .scale = attn.scale, .heads = attn.heads, .has_mask = attn.has_mask } },
+        .ArgMax => |am| .{ .ArgMax = .{ .axis = am.axis } },
+        .ScatterRow => .ScatterRow,
         .MultiHeadAttentionCached => |attn| .{ .MultiHeadAttentionCached = .{
             .scale = attn.scale,
             .causal = attn.causal,

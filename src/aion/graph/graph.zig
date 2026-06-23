@@ -110,6 +110,21 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     STFT = 30,
+
+    /// Relative-positional (Transformer-XL / Conformer) multi-head self-attention.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    RelPosMHA = 31,
+
+    /// Index of the maximum value along an axis (v1: last axis). Output dtype i32.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    ArgMax = 32,
+
+    /// In-place scatter of one row: buf[idx] = src. Output aliases buf.
+    ///
+    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
+    ScatterRow = 33,
 };
 
 pub const Op = union(OpTag) {
@@ -288,8 +303,17 @@ pub const Op = union(OpTag) {
     /// Single-output conditional. Inputs: cond, then_value, else_value.
     If: struct { then_region: RegionId, else_region: RegionId },
 
-    /// Single-carried-value loop. Inputs: carried_init.
-    Loop: struct { body_region: RegionId, static_max_trip_count: usize },
+    /// Loop region. Inputs: N carried inits (one per body-region output). The
+    /// node produces N outputs (`output` + `extra_outputs`), each the final value
+    /// of the corresponding carry. `cond_carry`, if set, names a carried index
+    /// whose i32 [1] value is the continue predicate (early exit); `check_before`
+    /// selects top-of-loop vs end-of-loop evaluation.
+    Loop: struct {
+        body_region: RegionId,
+        static_max_trip_count: usize,
+        cond_carry: ?usize = null,
+        check_before: bool = true,
+    },
 
     /// Real FFT over the last (power-of-two) dimension.
     ///
@@ -320,6 +344,28 @@ pub const Op = union(OpTag) {
         hop_length: usize,
         center: bool,
     },
+
+    /// Relative-positional multi-head self-attention.
+    ///
+    /// Inputs (head-second layout):
+    /// - q, k, v:        [B, H, T*, D] (q rows T_q; k/v rows T_kv)
+    /// - pos_emb:        [H, P, D]  (P = 2*T_kv - 1; already projected by linear_pos)
+    /// - pos_bias_u/_v:  [H, D]
+    /// - mask (optional, when has_mask): [T_q, T_kv] additive
+    ///
+    /// Output:
+    /// - out: [B, H, T_q, D]
+    ///
+    /// scores[i,j] = ((q[i]+u)·k[j] + (q[i]+v)·pos_emb[(T_q-1)-i+j]) * scale + mask[i,j]
+    RelPosMHA: struct { scale: f32, heads: usize, has_mask: bool },
+
+    /// Index of max value along `axis` (v1: must be the last axis). Output i32,
+    /// shape = input shape with `axis` removed (rank R-1; rank-1 input -> [1]).
+    ArgMax: struct { axis: i32 },
+
+    /// In-place row scatter: buf[idx] = src. Inputs (buf, idx[1] i32, src). The
+    /// "row" is buf[1:] flattened (scalar for rank-1 buf). Output aliases buf.
+    ScatterRow: void,
 };
 
 pub const InputArity = union(enum) {
@@ -368,9 +414,13 @@ pub fn opInputArity(op: Op) InputArity {
         .Cast => .{ .exact = 1 },
         .MatMulNT => .{ .exact = 2 },
         .If => .{ .exact = 3 },
-        .Loop => .{ .exact = 1 },
+        .Loop => .{ .at_least = 1 },
         .RFFT => .{ .exact = 1 },
         .STFT => .{ .exact = 2 },
+        // q, k, v, pos_emb, pos_bias_u, pos_bias_v, [mask]
+        .RelPosMHA => |r| .{ .exact = if (r.has_mask) 7 else 6 },
+        .ArgMax => .{ .exact = 1 },
+        .ScatterRow => .{ .exact = 3 },
     };
 }
 
@@ -391,6 +441,11 @@ pub const Node = struct {
     op: Op,
     inputs: []const ValueId,
     output: ValueId,
+    /// Additional outputs beyond the primary `output`. Empty for all ops except
+    /// a multi-carry `Loop` (whose i-th final carried tensor is exposed here as
+    /// output i+1). Kept as a separate field so the 73 single-output call sites
+    /// are unaffected.
+    extra_outputs: []const ValueId = &[_]ValueId{},
 };
 
 pub const Region = struct {
@@ -486,6 +541,29 @@ pub const Graph = struct {
         return out_id;
     }
 
+    /// Like `addNodeInternal` but the node produces `n_outputs` values. Returns
+    /// the (arena-owned) output id slice; `node.output` is outs[0] and the rest
+    /// land in `node.extra_outputs`.
+    fn addNodeMulti(self: *Self, op: Op, inputs: []const ValueId, n_outputs: usize) GraphError![]const ValueId {
+        std.debug.assert(n_outputs >= 1);
+        const outs: []ValueId = self.arenaAlloc().alloc(ValueId, n_outputs) catch return GraphError.OutOfMemory;
+        for (outs) |*o| o.* = try self.addValue();
+
+        const inputs_copy: []ValueId = self.arenaAlloc().alloc(ValueId, inputs.len) catch return GraphError.OutOfMemory;
+        @memcpy(inputs_copy, inputs);
+
+        const node: Node = .{ .op = op, .inputs = inputs_copy, .output = outs[0], .extra_outputs = outs[1..] };
+        if (self.active_region) {
+            self.active_region_nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            for (outs) |o| self.values.items[@intCast(o)].producer = std.math.maxInt(NodeId);
+        } else {
+            const node_id: NodeId = @intCast(self.nodes.items.len);
+            self.nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            for (outs) |o| self.values.items[@intCast(o)].producer = node_id;
+        }
+        return outs;
+    }
+
     pub fn beginRegion(self: *Self) GraphError!void {
         if (self.active_region) return GraphError.InvalidArgument;
         self.active_region_nodes.clearRetainingCapacity();
@@ -519,10 +597,34 @@ pub const Graph = struct {
     }
 
     pub fn addLoop(self: *Self, carried_init: ValueId, body_region: RegionId, static_max_trip_count: usize) GraphError!ValueId {
+        const outs = try self.addLoopMulti(&[_]ValueId{carried_init}, body_region, static_max_trip_count, null, true);
+        return outs[0];
+    }
+
+    /// Multi-carry loop. `carried_inits[i]` pairs with body-region output i; the
+    /// returned slice holds the N final carried values. `cond_carry`, if set,
+    /// names the carry index used as the i32 [1] continue predicate.
+    pub fn addLoopMulti(
+        self: *Self,
+        carried_inits: []const ValueId,
+        body_region: RegionId,
+        static_max_trip_count: usize,
+        cond_carry: ?usize,
+        check_before: bool,
+    ) GraphError![]const ValueId {
         const body_idx: usize = @intCast(body_region);
         if (body_idx >= self.regions.items.len) return GraphError.InvalidArgument;
-        if (self.regions.items[body_idx].outputs.len != 1 or static_max_trip_count == 0) return GraphError.InvalidArgument;
-        return self.addNodeInternal(.{ .Loop = .{ .body_region = body_region, .static_max_trip_count = static_max_trip_count } }, &[_]ValueId{carried_init});
+        const n = carried_inits.len;
+        if (n == 0 or self.regions.items[body_idx].outputs.len != n or static_max_trip_count == 0) return GraphError.InvalidArgument;
+        if (cond_carry) |ci| {
+            if (ci >= n) return GraphError.InvalidArgument;
+        }
+        return self.addNodeMulti(.{ .Loop = .{
+            .body_region = body_region,
+            .static_max_trip_count = static_max_trip_count,
+            .cond_carry = cond_carry,
+            .check_before = check_before,
+        } }, carried_inits, n);
     }
 
     pub fn addMatMul(self: *Self, a: ValueId, b: ValueId, alpha: f32, beta: f32) GraphError!ValueId {
@@ -655,6 +757,38 @@ pub const Graph = struct {
 
     pub fn addMultiHeadAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool, heads: usize) GraphError!ValueId {
         return self.addNodeInternal(.{ .MultiHeadAttention = .{ .scale = scale, .causal = causal, .heads = heads } }, &[_]ValueId{ q, k, v });
+    }
+
+    /// Relative-positional multi-head self-attention (Conformer / Transformer-XL).
+    /// `pos_emb` is [H, P, D] (P = 2*T_kv-1, already projected); biases are [H, D];
+    /// `mask` (optional) is an additive [T_q, T_kv] tensor.
+    pub fn addRelPosMHA(
+        self: *Self,
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        pos_emb: ValueId,
+        pos_bias_u: ValueId,
+        pos_bias_v: ValueId,
+        mask: ?ValueId,
+        scale: f32,
+        heads: usize,
+    ) GraphError!ValueId {
+        const op: Op = .{ .RelPosMHA = .{ .scale = scale, .heads = heads, .has_mask = (mask != null) } };
+        if (mask) |m| {
+            return self.addNodeInternal(op, &[_]ValueId{ q, k, v, pos_emb, pos_bias_u, pos_bias_v, m });
+        }
+        return self.addNodeInternal(op, &[_]ValueId{ q, k, v, pos_emb, pos_bias_u, pos_bias_v });
+    }
+
+    /// Index of the max value along `axis` (v1: last axis). Output dtype i32.
+    pub fn addArgMax(self: *Self, x: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .ArgMax = .{ .axis = axis } }, &[_]ValueId{x});
+    }
+
+    /// In-place row scatter: buf[idx] = src. Output aliases buf.
+    pub fn addScatterRow(self: *Self, buf: ValueId, idx: ValueId, src: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.{ .ScatterRow = {} }, &[_]ValueId{ buf, idx, src });
     }
 
     pub fn addMultiHeadAttentionCached(

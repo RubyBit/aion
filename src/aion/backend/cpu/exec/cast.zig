@@ -135,5 +135,32 @@ fn castBytes(from: DType, to: DType, in_bytes: []const u8, out_bytes: []u8) Back
         return;
     }
 
+    if (from == .f32 and to == .i32) {
+        if ((in_bytes.len % @sizeOf(f32)) != 0) return BackendError.InvalidArgument;
+        const n: usize = in_bytes.len / @sizeOf(f32);
+        if (out_bytes.len < n * @sizeOf(i32)) return BackendError.InvalidArgument;
+        const src: [*]align(1) const f32 = @ptrCast(in_bytes.ptr);
+        const dst: [*]align(1) i32 = @ptrCast(out_bytes.ptr);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            // Round-to-nearest; values are exact small integers in the decode loop.
+            dst[i] = @intFromFloat(@round(src[i]));
+        }
+        return;
+    }
+
+    if (from == .i32 and to == .f32) {
+        if ((in_bytes.len % @sizeOf(i32)) != 0) return BackendError.InvalidArgument;
+        const n: usize = in_bytes.len / @sizeOf(i32);
+        if (out_bytes.len < n * @sizeOf(f32)) return BackendError.InvalidArgument;
+        const src: [*]align(1) const i32 = @ptrCast(in_bytes.ptr);
+        const dst: [*]align(1) f32 = @ptrCast(out_bytes.ptr);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            dst[i] = @floatFromInt(src[i]);
+        }
+        return;
+    }
+
     return BackendError.Unsupported;
 }

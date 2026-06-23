@@ -873,8 +873,32 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
         if (dst_meta.shape[d] == 0) return BackendError.InvalidArgument;
     }
 
-    var dst_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    try computePackedStrides(dst_meta.shape, dst_strides[0..rank]);
+    // Find the largest trailing run of dims that are FULLY copied (starts==0,
+    // dst.shape==src.shape) AND single-tile in both tensors. Such dims are the
+    // innermost packed dims of the tile (tile strides are packed over the tile's
+    // shape), so for each outer coordinate the whole run is one contiguous block in
+    // both src and dst tiles — copy it with a single memcpy instead of per element.
+    var run_dims: usize = 0;
+    var run_len: usize = 1;
+    {
+        var dd: usize = rank;
+        while (dd > 0) : (dd -= 1) {
+            const d2: usize = dd - 1;
+            const full_copy: bool = (starts[d2] == 0 and dst_meta.shape[d2] == src_meta.shape[d2]);
+            const single_tile: bool = (dst_meta.tile_shape[d2] >= dst_meta.shape[d2] and src_meta.tile_shape[d2] >= src_meta.shape[d2]);
+            if (full_copy and single_tile) {
+                run_len *= dst_meta.shape[d2];
+                run_dims += 1;
+            } else break;
+        }
+    }
+    const outer_dims: usize = rank - run_dims;
+
+    var outer_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    d = 0;
+    while (d < outer_dims) : (d += 1) outer_shape[d] = dst_meta.shape[d];
+    var outer_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    if (outer_dims > 0) try computePackedStrides(outer_shape[0..outer_dims], outer_strides[0..outer_dims]);
 
     var dst_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
     var src_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
@@ -888,18 +912,19 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
     var dst_cache: TileCacheMutND = .{};
     defer if (dst_cache.valid) store.releaseMut(dst_cache.tile.token);
 
-    const total_out: usize = try elemCountFromShape(dst_meta.shape);
-    var lin: usize = 0;
-    while (lin < total_out) : (lin += 1) {
-        try decodeLinearToCoords(lin, dst_strides[0..rank], dst_meta.shape, dst_coords[0..rank]);
+    const run_bytes: usize = run_len * elem_bytes;
+    const outer_total: usize = if (outer_dims == 0) 1 else try elemCountFromShape(outer_shape[0..outer_dims]);
+    var blk: usize = 0;
+    while (blk < outer_total) : (blk += 1) {
+        if (outer_dims > 0) try decodeLinearToCoords(blk, outer_strides[0..outer_dims], outer_shape[0..outer_dims], dst_coords[0..outer_dims]);
 
         d = 0;
         while (d < rank) : (d += 1) {
-            src_coords[d] = starts[d] + dst_coords[d];
-
+            const dc: usize = if (d < outer_dims) dst_coords[d] else 0; // run dims start at 0
+            dst_coords[d] = dc;
+            src_coords[d] = starts[d] + dc;
             dst_tile_coords[d] = dst_coords[d] / dst_meta.tile_shape[d];
             dst_local_coords[d] = dst_coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
-
             src_tile_coords[d] = src_coords[d] / src_meta.tile_shape[d];
             src_local_coords[d] = src_coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
         }
@@ -920,7 +945,7 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
 
         const dst_off: usize = dst_local_lin * elem_bytes;
         const src_off: usize = src_local_lin * elem_bytes;
-        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + elem_bytes], src_cache.tile.bytes[src_off .. src_off + elem_bytes]);
+        @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + run_bytes], src_cache.tile.bytes[src_off .. src_off + run_bytes]);
     }
 }
 
@@ -982,6 +1007,75 @@ pub fn concatScalar(step: executable.StepConcatScalar, store: tensor_store.Tenso
         axis_sum = std.math.add(usize, axis_sum, m.shape[step.axis]) catch return BackendError.InvalidArgument;
     }
     if (axis_sum != out_meta.shape[step.axis]) return BackendError.InvalidArgument;
+
+    // Fast path: when `axis` and all trailing dims are single-tile in the output and
+    // every input, then for each pre-axis coordinate each input contributes ONE
+    // contiguous block of (axis_len * inner) elements — copy it with a single memcpy
+    // instead of walking the axis (and possibly each element) one at a time. This is
+    // the common case (e.g. cache-prepend Concat along a time axis). The general path
+    // below handles tiled/awkward layouts.
+    fast: {
+        var inner_size: usize = 1;
+        var dchk: usize = step.axis;
+        while (dchk < rank) : (dchk += 1) {
+            if (out_meta.tile_shape[dchk] < out_meta.shape[dchk]) break :fast;
+            var ii: usize = 0;
+            while (ii < count) : (ii += 1) {
+                if (in_metas[ii].tile_shape[dchk] < in_metas[ii].shape[dchk]) break :fast;
+            }
+            if (dchk > step.axis) inner_size *= out_meta.shape[dchk];
+        }
+
+        const pre_count: usize = step.axis;
+        var pre_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var pre_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var dd: usize = 0;
+        while (dd < pre_count) : (dd += 1) pre_shape[dd] = out_meta.shape[dd];
+        if (pre_count >= 1) try computePackedStrides(pre_shape[0..pre_count], pre_strides[0..pre_count]);
+        const pre_total: usize = if (pre_count == 0) 1 else try elemCountFromShape(pre_shape[0..pre_count]);
+
+        var ocache: TileCacheMutND = .{};
+        defer if (ocache.valid) store.releaseMut(ocache.tile.token);
+        var icache: TileCacheConstND = .{};
+        defer if (icache.valid) store.releaseConst(icache.tile.token);
+
+        var pp: usize = 0;
+        while (pp < pre_total) : (pp += 1) {
+            if (pre_count > 0) try decodeLinearToCoords(pp, pre_strides[0..pre_count], pre_shape[0..pre_count], out_coords[0..pre_count]);
+            var si: usize = 0;
+            while (si < count) : (si += 1) {
+                const sm: tensor_store.TensorMeta = in_metas[si];
+                const in_axis_len: usize = sm.shape[step.axis];
+                if (in_axis_len == 0) continue;
+                // out: (pre.., axis = offset, inner = 0); in: (pre.., axis = 0, inner = 0).
+                var d2: usize = 0;
+                while (d2 < rank) : (d2 += 1) {
+                    const pre_c: usize = if (d2 < pre_count) out_coords[d2] else 0;
+                    const out_axis_c: usize = if (d2 == step.axis) in_axis_offsets[si] else pre_c;
+                    out_tile_coords[d2] = out_axis_c / out_meta.tile_shape[d2];
+                    out_local_coords[d2] = out_axis_c - out_tile_coords[d2] * out_meta.tile_shape[d2];
+                    in_tile_coords[d2] = pre_c / sm.tile_shape[d2];
+                    in_local_coords[d2] = pre_c - in_tile_coords[d2] * sm.tile_shape[d2];
+                }
+                const out_ti: usize = try tensor_store.encodeTileIndex(out_meta, out_tile_coords[0..rank]);
+                const in_ti: usize = try tensor_store.encodeTileIndex(sm, in_tile_coords[0..rank]);
+                try ensureMutTileLinear(&ocache, store, step.out, out_ti, rank);
+                try ensureConstTileLinear(&icache, store, step.inputs[si], in_ti, rank);
+                var out_lin: usize = 0;
+                var in_lin: usize = 0;
+                d2 = 0;
+                while (d2 < rank) : (d2 += 1) {
+                    out_lin = std.math.add(usize, out_lin, out_local_coords[d2] * ocache.strides[d2]) catch return BackendError.InvalidArgument;
+                    in_lin = std.math.add(usize, in_lin, in_local_coords[d2] * icache.strides[d2]) catch return BackendError.InvalidArgument;
+                }
+                const bytes: usize = in_axis_len * inner_size * elem_bytes;
+                const out_off: usize = out_lin * elem_bytes;
+                const in_off: usize = in_lin * elem_bytes;
+                @memcpy(ocache.tile.bytes[out_off .. out_off + bytes], icache.tile.bytes[in_off .. in_off + bytes]);
+            }
+        }
+        return;
+    }
 
     var out_cache: TileCacheMutND = .{};
     defer if (out_cache.valid) store.releaseMut(out_cache.tile.token);

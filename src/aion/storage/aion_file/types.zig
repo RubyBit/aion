@@ -191,10 +191,26 @@ pub const NodeOp = union(graph_mod.OpTag) {
     MatMulNT: struct { alpha: f32, beta: f32 },
 
     If: struct { then_region: u32, else_region: u32 },
-    Loop: struct { body_region: u32, static_max_trip_count: u64 },
+    /// Loop with N carried values (N = body-region output count = input count).
+    /// `extra_outputs` holds outputs 1..N (output 0 is the record's `output`);
+    /// `cond_carry`, if set, names the i32 [1] carry used as the continue
+    /// predicate for early exit.
+    Loop: struct {
+        body_region: u32,
+        static_max_trip_count: u64,
+        cond_carry: ?u32 = null,
+        check_before: bool = true,
+        extra_outputs: []const u32 = &[_]u32{},
+    },
 
     RFFT: void,
     STFT: struct { n_fft: u64, hop_length: u64, center: bool },
+
+    RelPosMHA: struct { scale: f32, heads: u64, has_mask: bool },
+
+    ArgMax: struct { axis: i32 },
+
+    ScatterRow: void,
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -356,20 +372,26 @@ pub const Package = struct {
             if (sig.value >= self.values.len) return PackageError.InvalidFormat;
         }
 
-        for (self.regions) |region| {
-            if (region.outputs.len == 0) return PackageError.InvalidFormat;
-            for (region.nodes) |node| {
-                try validateNodeRefs(self, node, &producer_counts, available);
-                available[node.output] = true;
-            }
-            for (region.outputs) |output| {
-                if (output >= self.values.len or !available[output]) return PackageError.InvalidFormat;
-            }
-        }
+        // Regions are validated lazily, just before the main `If`/`Loop` node that
+        // references them — mirroring the loader's lazy instantiation. This lets a
+        // region body reference values produced by earlier main nodes (e.g. an
+        // in-graph decode Loop reading the encoder output).
+        const region_validated = self.allocator.alloc(bool, self.regions.len) catch return PackageError.OutOfMemory;
+        defer self.allocator.free(region_validated);
+        @memset(region_validated, false);
 
         for (self.nodes) |node| {
+            switch (node.op) {
+                .If => |iff| {
+                    try validateRegionLazy(self, @intCast(iff.then_region), &producer_counts, available, region_validated);
+                    try validateRegionLazy(self, @intCast(iff.else_region), &producer_counts, available, region_validated);
+                },
+                .Loop => |lp| try validateRegionLazy(self, @intCast(lp.body_region), &producer_counts, available, region_validated),
+                else => {},
+            }
             try validateNodeRefs(self, node, &producer_counts, available);
             available[node.output] = true;
+            for (nodeExtraOutputs(node)) |extra| available[extra] = true;
         }
 
         for (self.values, 0..) |value, idx| {
@@ -457,11 +479,58 @@ fn validateIoAliases(pkg: *const Package) PackageError!void {
     }
 }
 
+fn validateRegionLazy(
+    pkg: *const Package,
+    region_idx: usize,
+    producer_counts: *[]u8,
+    available: []bool,
+    region_validated: []bool,
+) PackageError!void {
+    if (region_idx >= pkg.regions.len) return PackageError.InvalidFormat;
+    if (region_validated[region_idx]) return;
+    const region = pkg.regions[region_idx];
+    if (region.outputs.len == 0) return PackageError.InvalidFormat;
+    // Pre-validate sub-regions referenced by nested If/Loop nodes.
+    for (region.nodes) |n| {
+        switch (n.op) {
+            .If => |iff| {
+                try validateRegionLazy(pkg, @intCast(iff.then_region), producer_counts, available, region_validated);
+                try validateRegionLazy(pkg, @intCast(iff.else_region), producer_counts, available, region_validated);
+            },
+            .Loop => |lp| try validateRegionLazy(pkg, @intCast(lp.body_region), producer_counts, available, region_validated),
+            else => {},
+        }
+    }
+    for (region.nodes) |node| {
+        try validateNodeRefs(pkg, node, producer_counts, available);
+        available[node.output] = true;
+        for (nodeExtraOutputs(node)) |extra| available[extra] = true;
+    }
+    for (region.outputs) |output| {
+        if (output >= pkg.values.len or !available[output]) return PackageError.InvalidFormat;
+    }
+    region_validated[region_idx] = true;
+}
+
+/// Outputs of a node beyond the primary `output` (multi-carry `Loop` only).
+pub fn nodeExtraOutputs(node: NodeRecord) []const u32 {
+    return switch (node.op) {
+        .Loop => |lp| lp.extra_outputs,
+        else => &[_]u32{},
+    };
+}
+
 fn validateNodeRefs(pkg: *const Package, node: NodeRecord, producer_counts: *[]u8, available: []const bool) PackageError!void {
     if (node.output >= pkg.values.len) return PackageError.InvalidFormat;
     if (pkg.values[node.output].source != .produced) return PackageError.InvalidFormat;
     if (producer_counts.*[node.output] == std.math.maxInt(u8)) return PackageError.InvalidFormat;
     producer_counts.*[node.output] += 1;
+    for (nodeExtraOutputs(node)) |extra| {
+        if (extra >= pkg.values.len) return PackageError.InvalidFormat;
+        if (pkg.values[extra].source != .produced) return PackageError.InvalidFormat;
+        if (producer_counts.*[extra] == std.math.maxInt(u8)) return PackageError.InvalidFormat;
+        producer_counts.*[extra] += 1;
+    }
     for (node.inputs) |input| {
         if (input >= pkg.values.len or !available[input]) return PackageError.InvalidFormat;
     }
@@ -479,6 +548,10 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             for (ln.normalized_shape) |term| try validateShapeTerm(pkg, term);
         },
         .MultiHeadAttention => |attn| if (attn.heads == 0) return PackageError.InvalidFormat,
+        .RelPosMHA => |attn| {
+            if (attn.heads == 0) return PackageError.InvalidFormat;
+            if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
+        },
         .MultiHeadAttentionCached => |attn| {
             _ = attn.causal;
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
@@ -491,7 +564,12 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
         },
         .Loop => |lp| {
             if (lp.body_region >= pkg.regions.len or lp.static_max_trip_count == 0) return PackageError.InvalidFormat;
-            if (pkg.regions[lp.body_region].outputs.len != 1) return PackageError.InvalidFormat;
+            const ncar = pkg.regions[lp.body_region].outputs.len;
+            if (ncar == 0) return PackageError.InvalidFormat;
+            // N carried inits, N body outputs, N node outputs (primary + extras).
+            if (node.inputs.len != ncar or lp.extra_outputs.len + 1 != ncar) return PackageError.InvalidFormat;
+            if (lp.cond_carry) |c| if (c >= ncar) return PackageError.InvalidFormat;
+            for (lp.extra_outputs) |e| if (e >= pkg.values.len) return PackageError.InvalidFormat;
         },
         .ViewReshape => |vr| {
             if (vr.new_shape.len == 0 or vr.new_shape.len > max_rank) return PackageError.InvalidFormat;
@@ -576,6 +654,7 @@ pub fn deinitNodeOp(allocator: std.mem.Allocator, op: NodeOp) void {
             allocator.free(sl.starts);
             allocator.free(sl.lens);
         },
+        .Loop => |lp| if (lp.extra_outputs.len != 0) allocator.free(lp.extra_outputs),
         else => {},
     }
 }

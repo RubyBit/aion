@@ -52,4 +52,5 @@ pub const validate = types.validate;
 pub const nodeOpKind = types.nodeOpKind;
 pub const parseNodeOpKind = types.parseNodeOpKind;
 pub const deinitNodeOp = types.deinitNodeOp;
+pub const nodeExtraOutputs = types.nodeExtraOutputs;
 pub const writeFile = write_impl.writeFile;

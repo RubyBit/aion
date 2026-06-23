@@ -41,6 +41,12 @@ fn writeScalarI32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId, va
     try mgr.writeFromPackedScalar(id, buf[0..]);
 }
 
+fn readScalarI32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId) !i32 {
+    var buf: [@sizeOf(i32)]u8 = undefined;
+    try mgr.readToPackedScalar(id, buf[0..]);
+    return std.mem.readInt(i32, buf[0..@sizeOf(i32)], .little);
+}
+
 test "graph: if selects region output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -114,6 +120,67 @@ test "graph: loop carries state with tensor-id alias swap" {
     defer cpu.deinit();
     try cpu.backend().executeProgram(&prog, mgr.tensorStore());
     try std.testing.expectEqual(@as(f32, 9.0), try readScalarF32(&mgr, prog.outputs[0]));
+}
+
+test "graph: multi-carry loop with early-exit condition" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    // Carries: i (i32), acc (f32), active (i32 predicate). Constants one/ten/limit.
+    const i_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const acc_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const active_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const one_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const ten_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const limit_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    try writeScalarI32(&mgr, i_tid, 0);
+    try writeScalarF32(&mgr, acc_tid, 0.0);
+    try writeScalarI32(&mgr, active_tid, 1);
+    try writeScalarI32(&mgr, one_tid, 1);
+    try writeScalarF32(&mgr, ten_tid, 10.0);
+    try writeScalarI32(&mgr, limit_tid, 3);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const i_in = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(i_in, i_tid);
+    const acc_in = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(acc_in, acc_tid);
+    const active_in = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(active_in, active_tid);
+    const one = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(one, one_tid);
+    const ten = try g.addInput(.f32, &[_]usize{1});
+    try g.bindExternal(ten, ten_tid);
+    const limit = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(limit, limit_tid);
+
+    try g.beginRegion();
+    const i_next = try g.addElemwiseBinary(.add, i_in, one);
+    const acc_next = try g.addElemwiseBinary(.add, acc_in, ten);
+    const active_next = try g.addElemwiseBinary(.lt, i_next, limit); // i32 {0,1}
+    const body_region = try g.endRegion(&[_]graph_mod.ValueId{ i_next, acc_next, active_next });
+
+    // cond_carry = 2 (active); static_max 100 but should stop at 3 iterations.
+    const outs = try g.addLoopMulti(
+        &[_]graph_mod.ValueId{ i_in, acc_in, active_in },
+        body_region,
+        100,
+        2,
+        true,
+    );
+    try g.setOutputs(&[_]graph_mod.ValueId{ outs[1], outs[0] }); // acc, i
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+    try std.testing.expectEqual(@as(f32, 30.0), try readScalarF32(&mgr, prog.outputs[0]));
+    try std.testing.expectEqual(@as(i32, 3), try readScalarI32(&mgr, prog.outputs[1]));
 }
 
 test "plan: chooseTileShape2DSquare handles skinny matrices" {
@@ -839,6 +906,7 @@ test "graph: unary ops match reference (f32)" {
                     break :blk 0.5 * xf * (1.0 + std.math.tanh(inner));
                 },
                 .sqrt => std.math.sqrt(xf),
+                .log => @log(xf), // not in the iterated cases above; arm kept for exhaustiveness
             };
             const ref: f32 = @as(f32, @floatCast(ref64));
 
@@ -855,6 +923,7 @@ test "graph: unary ops match reference (f32)" {
                 .silu => 5e-2,
                 .gelu => 6e-2,
                 .sqrt => 1e-6,
+                .log => 1e-6, // not in the iterated cases above; arm kept for exhaustiveness
             };
 
             // If this fails, include op name for quick debugging.
@@ -1840,6 +1909,402 @@ test "graph: multi-head attention rank-4 batched matches reference (f32)" {
     if (!(max_abs <= 6e-2)) {
         std.debug.print("batched multi-head attention mismatch max_abs={}\n", .{max_abs});
         return error.TestExpectedEqual;
+    }
+}
+
+fn relPosMHARefF32(
+    allocator: std.mem.Allocator,
+    ref: []f32,
+    q: []align(1) const f32,
+    k: []align(1) const f32,
+    v: []align(1) const f32,
+    pe: []align(1) const f32,
+    u: []align(1) const f32,
+    vb: []align(1) const f32,
+    batch: usize,
+    heads: usize,
+    t: usize, // self-attention: T_q == T_kv == t
+    d: usize,
+    scale: f32,
+) void {
+    const p_len: usize = 2 * t - 1;
+    const sc: []f32 = allocator.alloc(f32, t) catch unreachable;
+    defer allocator.free(sc);
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        var h: usize = 0;
+        while (h < heads) : (h += 1) {
+            var i: usize = 0;
+            while (i < t) : (i += 1) {
+                // Layout [B, T, H, D].
+                const q_base: usize = (((b * t + i) * heads + h) * d);
+                var maxv: f32 = -std.math.inf(f32);
+                var j: usize = 0;
+                while (j < t) : (j += 1) {
+                    const k_base: usize = (((b * t + j) * heads + h) * d);
+                    const p_idx: usize = (t - 1) - i + j;
+                    const pe_base: usize = ((h * p_len + p_idx) * d);
+                    var ac: f32 = 0.0;
+                    var bd: f32 = 0.0;
+                    var dd: usize = 0;
+                    while (dd < d) : (dd += 1) {
+                        const qval = q[q_base + dd];
+                        ac += (qval + u[h * d + dd]) * k[k_base + dd];
+                        bd += (qval + vb[h * d + dd]) * pe[pe_base + dd];
+                    }
+                    sc[j] = (ac + bd) * scale;
+                    maxv = @max(maxv, sc[j]);
+                }
+                var sum: f32 = 0.0;
+                j = 0;
+                while (j < t) : (j += 1) {
+                    sc[j] = std.math.exp(sc[j] - maxv);
+                    sum += sc[j];
+                }
+                const out_base: usize = (((b * t + i) * heads + h) * d);
+                var dd: usize = 0;
+                while (dd < d) : (dd += 1) {
+                    var acc: f32 = 0.0;
+                    j = 0;
+                    while (j < t) : (j += 1) {
+                        const v_base: usize = (((b * t + j) * heads + h) * d);
+                        acc += sc[j] * v[v_base + dd];
+                    }
+                    ref[out_base + dd] = acc / sum;
+                }
+            }
+        }
+    }
+}
+
+test "graph: rel-pos multi-head attention matches reference (f32)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 2;
+    const heads: usize = 2;
+    const t: usize = 4; // self-attention: T_q == T_kv
+    const d: usize = 8;
+    const p_len: usize = 2 * t - 1;
+
+    const qkv_len: usize = batch * heads * t * d;
+    const q_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(v_buf);
+    const pe_buf: []u8 = try allocator.alloc(u8, heads * p_len * d * 4);
+    defer allocator.free(pe_buf);
+    const u_buf: []u8 = try allocator.alloc(u8, heads * d * 4);
+    defer allocator.free(u_buf);
+    const vb_buf: []u8 = try allocator.alloc(u8, heads * d * 4);
+    defer allocator.free(vb_buf);
+
+    const q_vals: []align(1) f32 = asF32Slice(q_buf);
+    const k_vals: []align(1) f32 = asF32Slice(k_buf);
+    const v_vals: []align(1) f32 = asF32Slice(v_buf);
+    const pe_vals: []align(1) f32 = asF32Slice(pe_buf);
+    const u_vals: []align(1) f32 = asF32Slice(u_buf);
+    const vb_vals: []align(1) f32 = asF32Slice(vb_buf);
+
+    for (0..qkv_len) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15))) * 0.03;
+    for (0..qkv_len) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14))) * 0.03;
+    for (0..qkv_len) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18))) * 0.02;
+    for (0..heads * p_len * d) |i| pe_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11))) * 0.025;
+    for (0..heads * d) |i| u_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.05;
+    for (0..heads * d) |i| vb_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.04;
+
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d)));
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
+
+    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+    const pe_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, p_len, d }, &[_]usize{ 1, p_len, d }, .{ .tile_alignment = 64 });
+    const u_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
+    const vb_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(q_tid, q_buf);
+    try sm.writeFromPackedScalar(k_tid, k_buf);
+    try sm.writeFromPackedScalar(v_tid, v_buf);
+    try sm.writeFromPackedScalar(pe_tid, pe_buf);
+    try sm.writeFromPackedScalar(u_tid, u_buf);
+    try sm.writeFromPackedScalar(vb_tid, vb_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const q_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+    const k_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+    const v_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+    const pe_in = try g.addInput(.f32, &[_]usize{ heads, p_len, d });
+    const u_in = try g.addInput(.f32, &[_]usize{ heads, d });
+    const vb_in = try g.addInput(.f32, &[_]usize{ heads, d });
+    try g.bindExternal(q_in, @intCast(q_tid));
+    try g.bindExternal(k_in, @intCast(k_tid));
+    try g.bindExternal(v_in, @intCast(v_tid));
+    try g.bindExternal(pe_in, @intCast(pe_tid));
+    try g.bindExternal(u_in, @intCast(u_tid));
+    try g.bindExternal(vb_in, @intCast(vb_tid));
+
+    const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, heads);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f32 = asF32Slice(out_buf);
+
+    const ref: []f32 = try allocator.alloc(f32, qkv_len);
+    defer allocator.free(ref);
+    relPosMHARefF32(allocator, ref, q_vals, k_vals, v_vals, pe_vals, u_vals, vb_vals, batch, heads, t, d, scale);
+
+    var max_abs: f32 = 0.0;
+    for (out_vals, ref) |got, r0| {
+        try std.testing.expect(std.math.isFinite(got));
+        max_abs = @max(max_abs, @abs(got - r0));
+    }
+    if (!(max_abs <= 6e-2)) {
+        std.debug.print("rel-pos mha mismatch max_abs={}\n", .{max_abs});
+        return error.TestExpectedEqual;
+    }
+}
+
+test "graph: argmax over last axis returns i32 indices" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const rows: usize = 3;
+    const n: usize = 8;
+    const vals = [_]f32{
+        0.1, 0.2, 0.9, 0.0, -1.0, 0.3, 0.4, 0.5, // argmax 2
+        5.0, 1.0, 2.0, 3.0, 4.0, 9.0, 8.0, 7.0, // argmax 5
+        -1.0, -2.0, -0.5, -3.0, -4.0, -5.0, -6.0, -7.0, // argmax 2
+    };
+    const expected = [_]i32{ 2, 5, 2 };
+
+    const in_buf: []u8 = try allocator.alloc(u8, rows * n * 4);
+    defer allocator.free(in_buf);
+    const in_vals: []align(1) f32 = asF32Slice(in_buf);
+    for (vals, 0..) |v, i| in_vals[i] = v;
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
+    const in_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, n }, &[_]usize{ rows, n }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(in_tid, in_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x = try g.addInput(.f32, &[_]usize{ rows, n });
+    try g.bindExternal(x, @intCast(in_tid));
+    const y = try g.addArgMax(x, 1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, rows * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    for (0..rows) |i| {
+        const got: i32 = std.mem.readInt(i32, out_buf[i * 4 ..][0..4], .little);
+        try std.testing.expectEqual(expected[i], got);
+    }
+}
+
+test "graph: packed-state loop (slice/cast/i32-add/scatter/concat) — in-graph decode pattern" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const M: usize = 3; // buffer length
+    const L: usize = 2 + M; // [count, last, buf...]
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const state_tid = try mgr.createTiledTensor(.f32, &[_]usize{L}, &[_]usize{L}, .{});
+    const one_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    var s0: [L]f32 = .{0.0} ** L;
+    try mgr.writeFromPackedScalar(state_tid, std.mem.sliceAsBytes(s0[0..]));
+    var onev: [1]i32 = .{1};
+    try mgr.writeFromPackedScalar(one_tid, std.mem.sliceAsBytes(onev[0..]));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const state = try g.addInput(.f32, &[_]usize{L});
+    try g.bindExternal(state, state_tid);
+    const one = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(one, one_tid);
+
+    // Body: buf[count] = count; count += 1. Repack into a new [L] state.
+    try g.beginRegion();
+    const count_f = try g.addViewSliceND(state, &[_]usize{0}, &[_]usize{1}); // [1] f32
+    const last_f = try g.addViewSliceND(state, &[_]usize{1}, &[_]usize{1}); // [1] f32 (unchanged)
+    const buf = try g.addViewSliceND(state, &[_]usize{2}, &[_]usize{M}); // [M] f32
+    const count_i = try g.addCast(count_f, .i32); // [1] i32
+    const buf2 = try g.addScatterRow(buf, count_i, count_f); // buf[count] = count
+    const next_i = try g.addElemwiseBinary(.add, count_i, one); // count+1 (i32)
+    const next_f = try g.addCast(next_i, .f32); // [1] f32
+    const new_state = try g.addConcat(&[_]graph_mod.ValueId{ next_f, last_f, buf2 }, 0); // [L]
+    const body_region = try g.endRegion(&[_]graph_mod.ValueId{new_state});
+    const out = try g.addLoop(state, body_region, M);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+
+    var obuf: [L * 4]u8 = undefined;
+    try mgr.readToPackedScalar(prog.outputs[0], obuf[0..]);
+    const count_out: f32 = @bitCast(std.mem.readInt(u32, obuf[0..4], .little));
+    try std.testing.expect(@abs(count_out - @as(f32, @floatFromInt(M))) <= 1e-5);
+    for (0..M) |i| {
+        const v: f32 = @bitCast(std.mem.readInt(u32, obuf[(2 + i) * 4 ..][0..4], .little));
+        try std.testing.expect(@abs(v - @as(f32, @floatFromInt(i))) <= 1e-5);
+    }
+}
+
+test "graph: scatter row writes value at dynamic index" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const N: usize = 4;
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const buf_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
+    const idx_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const src_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    var bufv: [N]i32 = .{ 10, 20, 30, 40 };
+    var idxv: [1]i32 = .{2};
+    var srcv: [1]i32 = .{99};
+    try mgr.writeFromPackedScalar(buf_tid, std.mem.sliceAsBytes(bufv[0..]));
+    try mgr.writeFromPackedScalar(idx_tid, std.mem.sliceAsBytes(idxv[0..]));
+    try mgr.writeFromPackedScalar(src_tid, std.mem.sliceAsBytes(srcv[0..]));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const buf = try g.addInput(.i32, &[_]usize{N});
+    try g.bindExternal(buf, buf_tid);
+    const idx = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(idx, idx_tid);
+    const src = try g.addInput(.i32, &[_]usize{1});
+    try g.bindExternal(src, src_tid);
+    const out = try g.addScatterRow(buf, idx, src);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+
+    const expect = [_]i32{ 10, 20, 99, 40 };
+    var obuf: [N * 4]u8 = undefined;
+    try mgr.readToPackedScalar(prog.outputs[0], obuf[0..]);
+    for (0..N) |i| try std.testing.expectEqual(expect[i], std.mem.readInt(i32, obuf[i * 4 ..][0..4], .little));
+}
+
+test "graph: i32 elementwise add and eq comparison" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const N: usize = 4;
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const a_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
+    const b_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
+    var abuf: [N]i32 = .{ 4, 3, 5, 2 };
+    var bbuf: [N]i32 = .{ 1, 3, 5, 9 };
+    try mgr.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(abuf[0..]));
+    try mgr.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(bbuf[0..]));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const a = try g.addInput(.i32, &[_]usize{N});
+    try g.bindExternal(a, a_tid);
+    const b = try g.addInput(.i32, &[_]usize{N});
+    try g.bindExternal(b, b_tid);
+    const sum = try g.addElemwiseBinary(.add, a, b);
+    const eq = try g.addElemwiseBinary(.eq, a, b);
+    try g.setOutputs(&[_]graph_mod.ValueId{ sum, eq });
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+
+    const expect_sum = [_]i32{ 5, 6, 10, 11 };
+    const expect_eq = [_]i32{ 0, 1, 1, 0 };
+    var buf: [N * 4]u8 = undefined;
+    try mgr.readToPackedScalar(prog.outputs[0], buf[0..]);
+    for (0..N) |i| try std.testing.expectEqual(expect_sum[i], std.mem.readInt(i32, buf[i * 4 ..][0..4], .little));
+    try mgr.readToPackedScalar(prog.outputs[1], buf[0..]);
+    for (0..N) |i| try std.testing.expectEqual(expect_eq[i], std.mem.readInt(i32, buf[i * 4 ..][0..4], .little));
+}
+
+test "graph: loop body lowers matmul + relu (region full-op lowering)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const N: usize = 4;
+    var mgr = manager_mod.StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const carried_tid = try mgr.createTiledTensor(.f32, &[_]usize{ 1, N }, &[_]usize{ 1, N }, .{});
+    const w_tid = try mgr.createTiledTensor(.f32, &[_]usize{ N, N }, &[_]usize{ N, N }, .{});
+
+    var cbuf: [N]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+    try mgr.writeFromPackedScalar(carried_tid, std.mem.sliceAsBytes(cbuf[0..]));
+    var wbuf: [N * N]f32 = .{0.0} ** (N * N);
+    {
+        var i: usize = 0;
+        while (i < N) : (i += 1) wbuf[i * N + i] = 0.5; // W = 0.5 * I
+    }
+    try mgr.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(wbuf[0..]));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const carried = try g.addInput(.f32, &[_]usize{ 1, N });
+    try g.bindExternal(carried, carried_tid);
+    const w = try g.addInput(.f32, &[_]usize{ N, N });
+    try g.bindExternal(w, w_tid);
+
+    // Loop body: carried = relu(carried @ W). With W = 0.5*I and positive inputs,
+    // each iteration halves the carried vector (relu is a no-op here but exercises
+    // a non-elementwise + unary op inside a region — previously rejected).
+    try g.beginRegion();
+    const mm = try g.addMatMul(carried, w, 1.0, 0.0);
+    const next = try g.addUnary(.relu, mm);
+    const body_region = try g.endRegion(&[_]graph_mod.ValueId{next});
+    const out = try g.addLoop(carried, body_region, 3);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+
+    var obytes: [N * 4]u8 = undefined;
+    try mgr.readToPackedScalar(prog.outputs[0], obytes[0..]);
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const v: f32 = @bitCast(std.mem.readInt(u32, obytes[i * 4 ..][0..4], .little));
+        try std.testing.expect(@abs(v - 0.125) <= 1e-5); // 1.0 * 0.5^3
     }
 }
 

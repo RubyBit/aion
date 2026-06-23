@@ -124,7 +124,15 @@ pub fn getOrCreatePackedWeights(
     if (wv.len < key.k_dim * key.c_out) return BackendError.InvalidArgument;
 
     const k_blocks: usize = (key.k_dim + key.kc - 1) / key.kc;
-    const block_elems: usize = key.kc * key.nc;
+    // The packed-B kernel reads `ceil(c_out/NR)` panels of `kc*NR` each (panel stride
+    // is `kc*NR`, independent of NC). Sizing to `kc*nc` over-allocated massively for
+    // small `c_out` — e.g. a per-output-channel conv weight tile (c_out=1) got a full
+    // `kc*nc` (~1MB) panel to hold a handful of floats, and these entries are cached
+    // for the model's lifetime. Size to the panels actually packed/read.
+    const nr: usize = matmul_f32.tuning.nr;
+    if (nr == 0) return BackendError.InvalidArgument;
+    const n_panels: usize = (key.c_out + nr - 1) / nr;
+    const block_elems: usize = n_panels * key.kc * nr;
     const total_elems: usize = k_blocks * block_elems;
 
     const alloc: std.mem.Allocator = std.heap.page_allocator;

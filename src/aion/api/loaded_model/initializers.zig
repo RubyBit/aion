@@ -16,6 +16,91 @@ pub fn importInitializersForLoadedModel(
     return initInitializerTensors(allocator, store, policy, package);
 }
 
+/// Like `importInitializersForLoadedModel`, but streams each initializer's bytes
+/// straight from `file` into its store tensor instead of copying from the in-memory
+/// file buffer — then frees that buffer up front.
+///
+/// Rationale: the default path keeps the whole `.aion` file resident (initializer
+/// `data` slices borrow into it) *while* it copies every weight into the store,
+/// briefly doubling peak RSS (~2x the file). Here we capture each initializer's
+/// byte offset within the file, release the file buffer via `releaseSourceBytes`,
+/// then read each weight back from disk (OS-cached) into a single reused scratch
+/// buffer as we fill the store. The file blob and the populated store never coexist,
+/// so peak RSS is ~1x the weight size + one initializer's worth of scratch.
+///
+/// `source_bytes` must be the exact buffer the package's initializer slices borrow
+/// into (i.e. the full file image starting at file offset 0). `package.source_bytes`
+/// is consumed (freed) by this call.
+pub fn importInitializersStreaming(
+    allocator: std.mem.Allocator,
+    store: *types_mod.StorageManager,
+    policy: types_mod.TilePolicy,
+    package: *types_mod.Package,
+    file: std.Io.File,
+    source_bytes: []const u8,
+) api_errors.LoadError![]types_mod.TensorId {
+    const n: usize = package.initializers.len;
+
+    // 1. Capture each initializer's (file offset, len) while the borrowed data
+    //    slices are still valid, and find the largest payload (scratch size).
+    const Span = struct { off: u64, len: usize };
+    const spans = try allocator.alloc(Span, n);
+    defer allocator.free(spans);
+    const base: usize = @intFromPtr(source_bytes.ptr);
+    var max_len: usize = 0;
+    for (package.initializers, 0..) |init, i| {
+        const ptr: usize = @intFromPtr(init.data.ptr);
+        if (ptr < base or (ptr + init.data.len) > base + source_bytes.len) {
+            // Initializer doesn't borrow into the file buffer (shouldn't happen for a
+            // freshly parsed package); fall back to the in-memory copy path.
+            return initInitializerTensors(allocator, store, policy, package);
+        }
+        spans[i] = .{ .off = @intCast(ptr - base), .len = init.data.len };
+        max_len = @max(max_len, init.data.len);
+    }
+
+    // 2. Release the file buffer now — before the store fills — so the two never
+    //    coexist. (Empties the borrowed data/params slices; encoding scalars stay.)
+    package.releaseSourceBytes();
+
+    // 3. One reusable scratch buffer, sized to the largest single initializer.
+    const scratch = try allocator.alloc(u8, @max(max_len, 1));
+    defer allocator.free(scratch);
+
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+
+    const tids = try allocator.alloc(types_mod.TensorId, n);
+    errdefer allocator.free(tids);
+    for (tids, 0..) |*slot, init_idx| {
+        const value_idx = findInitializerValueIndex(package, @intCast(init_idx)) orelse return error.InvalidArgument;
+        const value = package.values[value_idx];
+        const shape = try resolveConstShape(allocator, package, value);
+        defer allocator.free(shape);
+
+        const init = package.initializers[init_idx];
+        const quant_axis: u8 = switch (init.encoding) {
+            .plain => 0,
+            .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
+        };
+        slot.* = try createTensorForShapeWithQuantAxis(store, policy, value.dtype, shape, quant_axis);
+
+        // Read this initializer's packed bytes back from disk (OS page cache) into scratch.
+        const span = spans[init_idx];
+        const buf: []u8 = scratch[0..span.len];
+        const got = file.readPositionalAll(io, buf, span.off) catch return error.IoFailure;
+        if (got != span.len) return error.IoFailure;
+
+        const meta = try store.getConst(slot.*);
+        const tensor = types_mod.Tensor{ .store = store, .id = slot.*, .dtype = meta.dtype, .shape = meta.shape };
+        switch (init.encoding) {
+            .plain => try tensor.writePackedScalar(buf),
+            .quantized => try tensor.writePackedQuant(buf),
+        }
+    }
+    return tids;
+}
+
 pub fn createTensorForShape(
     store: *types_mod.StorageManager,
     policy: types_mod.TilePolicy,

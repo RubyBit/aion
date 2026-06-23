@@ -187,7 +187,7 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             _ = mm; // alpha/beta handled in lowering.
         },
 
-        .ElemwiseBinary => {
+        .ElemwiseBinary => |eb| {
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
             try require(a.dtype != null and b.dtype != null);
@@ -199,7 +199,13 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (a.shape.len != b.shape.len) return InferError.ShapeMismatch;
             for (a.shape, 0..) |d, i| if (d != b.shape[i]) return InferError.ShapeMismatch;
 
-            try setInferred(graph, node.output, a.dtype.?, a.shape);
+            if (eb.op.isComparison()) {
+                // v1: comparisons operate on i32 and produce i32 {0,1}.
+                if (a.dtype.? != .i32) return InferError.Unsupported;
+                try setInferred(graph, node.output, .i32, a.shape);
+            } else {
+                try setInferred(graph, node.output, a.dtype.?, a.shape);
+            }
         },
 
         .BroadcastLastDimBinary => {
@@ -856,9 +862,11 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try require(x.dtype != null);
             if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
             if (ct.to_dtype.info().is_quantized) return InferError.Unsupported;
-            // v1: only f16<->f32 is supported end-to-end; extend as kernels grow.
+            // Supported: f16<->f32 and f32<->i32 (the latter for decode indices/counters).
             const ok: bool = (x.dtype.? == .f16 and ct.to_dtype == .f32) or
                 (x.dtype.? == .f32 and ct.to_dtype == .f16) or
+                (x.dtype.? == .f32 and ct.to_dtype == .i32) or
+                (x.dtype.? == .i32 and ct.to_dtype == .f32) or
                 (x.dtype.? == ct.to_dtype);
             if (!ok) return InferError.Unsupported;
             try setInferred(graph, node.output, ct.to_dtype, x.shape);
@@ -882,17 +890,28 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
         },
 
         .Loop => |lp| {
-            const init_v = try getValue(graph, node.inputs[0]);
-            try require(init_v.dtype != null and init_v.shape.len != 0);
             if (lp.static_max_trip_count == 0) return InferError.InvalidGraph;
+            const n = node.inputs.len;
+            if (n == 0 or node.extra_outputs.len + 1 != n) return InferError.InvalidGraph;
             const body_region: graph_mod.Region = try inferRegion(graph, lp.body_region);
-            if (body_region.outputs.len != 1) return InferError.InvalidGraph;
-            const body_v = try getValue(graph, body_region.outputs[0]);
-            try require(body_v.dtype != null and body_v.shape.len != 0);
-            if (body_v.dtype.? != init_v.dtype.?) return InferError.DTypeMismatch;
-            if (body_v.shape.len != init_v.shape.len) return InferError.ShapeMismatch;
-            for (body_v.shape, 0..) |dim, i| if (dim != init_v.shape[i]) return InferError.ShapeMismatch;
-            try setInferred(graph, node.output, init_v.dtype.?, init_v.shape);
+            if (body_region.outputs.len != n) return InferError.InvalidGraph;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const init_v = try getValue(graph, node.inputs[i]);
+                try require(init_v.dtype != null and init_v.shape.len != 0);
+                const body_v = try getValue(graph, body_region.outputs[i]);
+                try require(body_v.dtype != null and body_v.shape.len != 0);
+                if (body_v.dtype.? != init_v.dtype.?) return InferError.DTypeMismatch;
+                if (body_v.shape.len != init_v.shape.len) return InferError.ShapeMismatch;
+                for (body_v.shape, 0..) |dim, j| if (dim != init_v.shape[j]) return InferError.ShapeMismatch;
+                const out_id = if (i == 0) node.output else node.extra_outputs[i - 1];
+                try setInferred(graph, out_id, init_v.dtype.?, init_v.shape);
+            }
+            if (lp.cond_carry) |ci| {
+                if (ci >= n) return InferError.InvalidGraph;
+                const cv = try getValue(graph, node.inputs[ci]);
+                if (cv.dtype.? != .i32 or cv.shape.len != 1 or cv.shape[0] != 1) return InferError.DTypeMismatch;
+            }
         },
 
         .MatMulNT => |mm| {
@@ -941,6 +960,115 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             // In-place append semantics: output aliases cache shape/dtype.
             try setInferred(graph, node.output, cache.dtype.?, cache.shape);
+        },
+
+        .RelPosMHA => |attn| {
+            const q = try getValue(graph, node.inputs[0]);
+            const k = try getValue(graph, node.inputs[1]);
+            const v = try getValue(graph, node.inputs[2]);
+            const pos_emb = try getValue(graph, node.inputs[3]);
+            const bu = try getValue(graph, node.inputs[4]);
+            const bv = try getValue(graph, node.inputs[5]);
+
+            try require(q.dtype != null and k.dtype != null and v.dtype != null);
+            try require(pos_emb.dtype != null and bu.dtype != null and bv.dtype != null);
+
+            // q,k,v:[B,H,T*,D]; pos_emb:[H,P,D]; pos_bias_u/_v:[H,D]
+            try require(q.shape.len == 4 and k.shape.len == 4 and v.shape.len == 4);
+            try require(pos_emb.shape.len == 3 and bu.shape.len == 2 and bv.shape.len == 2);
+
+            if (q.dtype.? != .f32 or k.dtype.? != .f32 or v.dtype.? != .f32) return InferError.DTypeMismatch;
+            if (pos_emb.dtype.? != .f32 or bu.dtype.? != .f32 or bv.dtype.? != .f32) return InferError.DTypeMismatch;
+
+            if (attn.heads == 0) return InferError.InvalidGraph;
+            if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
+
+            // Layout [B, T*, H, D]; pos_emb [H, P, D]; biases [H, D].
+            const B: usize = q.shape[0];
+            const T_q: usize = q.shape[1];
+            const H: usize = q.shape[2];
+            const D: usize = q.shape[3];
+            const T_kv: usize = k.shape[1];
+            const P: usize = pos_emb.shape[1];
+
+            if (H != attn.heads) return InferError.ShapeMismatch;
+            if (k.shape[0] != B or k.shape[2] != H or k.shape[3] != D) return InferError.ShapeMismatch;
+            if (v.shape[0] != B or v.shape[1] != T_kv or v.shape[2] != H or v.shape[3] != D) return InferError.ShapeMismatch;
+            if (pos_emb.shape[0] != H or pos_emb.shape[2] != D) return InferError.ShapeMismatch;
+            if (bu.shape[0] != H or bu.shape[1] != D) return InferError.ShapeMismatch;
+            if (bv.shape[0] != H or bv.shape[1] != D) return InferError.ShapeMismatch;
+            if (T_kv == 0 or P != 2 * T_kv - 1) return InferError.ShapeMismatch;
+            if (T_q > T_kv) return InferError.ShapeMismatch;
+
+            if (attn.has_mask) {
+                try require(node.inputs.len == 7);
+                const mask = try getValue(graph, node.inputs[6]);
+                try require(mask.dtype != null and mask.shape.len == 2);
+                if (mask.dtype.? != .f32) return InferError.DTypeMismatch;
+                if (mask.shape[0] != T_q or mask.shape[1] != T_kv) return InferError.ShapeMismatch;
+            }
+
+            var out_shape: []usize = graph.arenaAlloc().alloc(usize, 4) catch return InferError.InvalidGraph;
+            out_shape[0] = B;
+            out_shape[1] = T_q;
+            out_shape[2] = H;
+            out_shape[3] = D;
+            try setInferred(graph, node.output, q.dtype.?, out_shape);
+        },
+
+        .ArgMax => |am| {
+            const x = try getValue(graph, node.inputs[0]);
+            try require(x.dtype != null and x.shape.len >= 1);
+            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            const rank: usize = x.shape.len;
+            var axis: usize = undefined;
+            if (am.axis < 0) {
+                const a = @as(i64, am.axis) + @as(i64, @intCast(rank));
+                if (a < 0) return InferError.InvalidGraph;
+                axis = @intCast(a);
+            } else {
+                axis = @intCast(am.axis);
+            }
+            if (axis >= rank) return InferError.InvalidGraph;
+            if (x.shape[axis] == 0) return InferError.InvalidGraph;
+
+            if (rank == 1) {
+                var out_shape: []usize = graph.arenaAlloc().alloc(usize, 1) catch return InferError.InvalidGraph;
+                out_shape[0] = 1;
+                try setInferred(graph, node.output, .i32, out_shape);
+            } else {
+                var out_shape: []usize = graph.arenaAlloc().alloc(usize, rank - 1) catch return InferError.InvalidGraph;
+                var dst: usize = 0;
+                var src: usize = 0;
+                while (src < rank) : (src += 1) {
+                    if (src == axis) continue;
+                    out_shape[dst] = x.shape[src];
+                    dst += 1;
+                }
+                try setInferred(graph, node.output, .i32, out_shape);
+            }
+        },
+
+        .ScatterRow => {
+            const buf = try getValue(graph, node.inputs[0]);
+            const idx = try getValue(graph, node.inputs[1]);
+            const src = try getValue(graph, node.inputs[2]);
+            try require(buf.dtype != null and idx.dtype != null and src.dtype != null);
+            try require(buf.shape.len >= 1);
+            if (buf.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (idx.dtype.? != .i32) return InferError.DTypeMismatch;
+            if (idx.shape.len != 1 or idx.shape[0] != 1) return InferError.ShapeMismatch;
+            if (src.dtype.? != buf.dtype.?) return InferError.DTypeMismatch;
+
+            var row_size: usize = 1;
+            var d: usize = 1;
+            while (d < buf.shape.len) : (d += 1) row_size *= buf.shape[d];
+            var src_elems: usize = 1;
+            for (src.shape) |sd| src_elems *= sd;
+            if (src_elems != row_size) return InferError.ShapeMismatch;
+
+            // In-place: output aliases buf shape/dtype.
+            try setInferred(graph, node.output, buf.dtype.?, buf.shape);
         },
     }
 }

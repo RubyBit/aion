@@ -296,6 +296,15 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, u64, st.hop_length);
             try appendInt(out, allocator, u8, if (st.center) 1 else 0);
         },
+        .RelPosMHA => |attn| {
+            try appendInt(out, allocator, f32, attn.scale);
+            try appendInt(out, allocator, u64, attn.heads);
+            try appendInt(out, allocator, u8, if (attn.has_mask) 1 else 0);
+        },
+        .ArgMax => |am| {
+            try appendInt(out, allocator, i32, am.axis);
+        },
+        .ScatterRow => {},
         .Copy => {},
         .GatherRows => {},
         .RoPE1D => |rp| {
@@ -318,6 +327,10 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         .Loop => |lp| {
             try appendInt(out, allocator, u32, lp.body_region);
             try appendInt(out, allocator, u64, lp.static_max_trip_count);
+            try appendInt(out, allocator, i32, if (lp.cond_carry) |c| @intCast(c) else -1);
+            try appendInt(out, allocator, u8, @intFromBool(lp.check_before));
+            try appendInt(out, allocator, u32, @intCast(lp.extra_outputs.len));
+            for (lp.extra_outputs) |e| try appendInt(out, allocator, u32, e);
         },
         .ViewReshape => |vr| {
             try appendShapeTermArray(out, allocator, vr.new_shape);

@@ -177,17 +177,22 @@ pub const Context = struct {
         // `parseTakeOwned` transfers ownership of `bytes` into the returned Package
         // (Initializer.data slices borrow into it). `pkg.deinit` frees the buffer.
         const bytes = try package_file.readAlloc(self.allocator, file);
-        errdefer self.allocator.free(bytes);
+        // `parseTakeOwned` consumes `bytes` unconditionally (frees on error,
+        // transfers ownership to `pkg` on success), so we don't guard `bytes` with
+        // its own errdefer — that would double-free with `pkg.deinit()` / the
+        // streaming import's `releaseSourceBytes()`. Nothing between here and the
+        // call below can fail.
         const hash = std.hash.Wyhash.hash(0, bytes);
         var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
         errdefer pkg.deinit();
-        const initializer_tids = try api_loaded_model.importInitializersForLoadedModel(self.allocator, &self.store, self.policy, &pkg);
+        // Stream weights into the store one initializer at a time, reading each back
+        // from the file and releasing the whole-file buffer up front. This keeps peak
+        // RSS at ~1x the weight size instead of ~2x (the file image and the populated
+        // store never coexist). `importInitializersStreaming` consumes `bytes` via
+        // `pkg.releaseSourceBytes()`, so the `bytes` errdefer above is now a no-op
+        // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
+        const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, self.policy, &pkg, file, bytes);
         errdefer self.allocator.free(initializer_tids);
-        // Weights are now fully copied into the storage manager; the raw package
-        // buffer is no longer needed. Free it now to halve peak RSS (otherwise the
-        // 4–5 GB file buffer would live alongside the tiled tensors for the whole
-        // lifetime of the LoadedModel).
-        pkg.releaseSourceBytes();
         return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash);
     }
 

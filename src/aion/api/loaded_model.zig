@@ -587,43 +587,43 @@ pub const LoadedModel = struct {
             value_map[idx] = vid;
         }
 
+        // Regions are built lazily, just before the main `If`/`Loop` node that
+        // references them. This lets a region body reference values produced by
+        // *earlier main nodes* (e.g. the encoder output feeding an in-graph decode
+        // Loop) — which the old "all regions first" order could not express, since
+        // regions only saw inputs/initializers. Sub-regions are built first
+        // (recursively), so no nested active region is ever needed.
+        const region_built = try self.allocator.alloc(bool, self.package.regions.len);
+        defer self.allocator.free(region_built);
+        @memset(region_built, false);
         const region_map = try self.allocator.alloc(graph_mod.RegionId, self.package.regions.len);
         defer self.allocator.free(region_map);
-        for (self.package.regions, 0..) |region, region_idx| {
-            try graph.beginRegion();
-            errdefer {
-                if (graph.active_region) graph.active_region = false;
-            }
-
-            for (region.nodes) |node| {
-                const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
-                defer self.allocator.free(mapped_inputs);
-                for (node.inputs, 0..) |input, i| {
-                    if (input >= value_map.len) return error.InvalidArgument;
-                    mapped_inputs[i] = value_map[input];
-                }
-                const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map[0..region_idx]);
-                value_map[node.output] = out_vid;
-            }
-
-            const mapped_outputs = try self.allocator.alloc(graph_mod.ValueId, region.outputs.len);
-            defer self.allocator.free(mapped_outputs);
-            for (region.outputs, 0..) |output, i| {
-                if (output >= value_map.len) return error.InvalidArgument;
-                mapped_outputs[i] = value_map[output];
-            }
-            region_map[region_idx] = try graph.endRegion(mapped_outputs);
-        }
 
         for (self.package.nodes) |node| {
+            switch (node.op) {
+                .If => |iff| {
+                    try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.then_region), self.allocator);
+                    try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.else_region), self.allocator);
+                },
+                .Loop => |lp| try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(lp.body_region), self.allocator),
+                else => {},
+            }
+
             const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
             defer self.allocator.free(mapped_inputs);
             for (node.inputs, 0..) |input, i| {
                 if (input >= value_map.len) return error.InvalidArgument;
                 mapped_inputs[i] = value_map[input];
             }
-            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map);
+            const extra_ids = package_file.nodeExtraOutputs(node);
+            const extra_buf = try self.allocator.alloc(graph_mod.ValueId, extra_ids.len);
+            defer self.allocator.free(extra_buf);
+            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map, extra_buf);
             value_map[node.output] = out_vid;
+            for (extra_ids, 0..) |eid, i| {
+                if (eid >= value_map.len) return error.InvalidArgument;
+                value_map[eid] = extra_buf[i];
+            }
         }
 
         const outputs = try self.allocator.alloc(graph_mod.ValueId, self.package.outputs.len);
@@ -720,6 +720,68 @@ const CacheEntry = struct {
     program: program_mod.Program,
 };
 
+/// Build one control-flow region's body into the graph, lazily. Sub-regions
+/// referenced by `If`/`Loop` nodes inside the body are built first (recursively),
+/// so no nested active region is needed. Region nodes may reference any value
+/// already in `value_map` — including outputs of earlier main nodes (e.g. the
+/// encoder output an in-graph decode Loop reads via GatherRows).
+fn ensureRegionBuilt(
+    package: *const Package,
+    symbol_values: []const u64,
+    graph: *graph_mod.Graph,
+    value_map: []graph_mod.ValueId,
+    region_built: []bool,
+    region_map: []graph_mod.RegionId,
+    region_idx: usize,
+    allocator: std.mem.Allocator,
+) api_errors.ExecuteError!void {
+    if (region_idx >= package.regions.len) return error.InvalidArgument;
+    if (region_built[region_idx]) return;
+    const region = package.regions[region_idx];
+
+    // Pre-build sub-regions (so they are complete before this region's beginRegion).
+    for (region.nodes) |n| {
+        switch (n.op) {
+            .If => |iff| {
+                try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(iff.then_region), allocator);
+                try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(iff.else_region), allocator);
+            },
+            .Loop => |lp| try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(lp.body_region), allocator),
+            else => {},
+        }
+    }
+
+    try graph.beginRegion();
+    errdefer {
+        if (graph.active_region) graph.active_region = false;
+    }
+    for (region.nodes) |node| {
+        const mapped_inputs = try allocator.alloc(graph_mod.ValueId, node.inputs.len);
+        defer allocator.free(mapped_inputs);
+        for (node.inputs, 0..) |input, i| {
+            if (input >= value_map.len) return error.InvalidArgument;
+            mapped_inputs[i] = value_map[input];
+        }
+        const extra_ids = package_file.nodeExtraOutputs(node);
+        const extra_buf = try allocator.alloc(graph_mod.ValueId, extra_ids.len);
+        defer allocator.free(extra_buf);
+        const out_vid = try instantiate.instantiateNode(allocator, package, symbol_values, graph, node, mapped_inputs, region_map, extra_buf);
+        value_map[node.output] = out_vid;
+        for (extra_ids, 0..) |eid, i| {
+            if (eid >= value_map.len) return error.InvalidArgument;
+            value_map[eid] = extra_buf[i];
+        }
+    }
+    const mapped_outputs = try allocator.alloc(graph_mod.ValueId, region.outputs.len);
+    defer allocator.free(mapped_outputs);
+    for (region.outputs, 0..) |output, i| {
+        if (output >= value_map.len) return error.InvalidArgument;
+        mapped_outputs[i] = value_map[output];
+    }
+    region_map[region_idx] = try graph.endRegion(mapped_outputs);
+    region_built[region_idx] = true;
+}
+
 pub fn importInitializersForLoadedModel(
     allocator: std.mem.Allocator,
     store: *StorageManager,
@@ -727,6 +789,17 @@ pub fn importInitializersForLoadedModel(
     package: *const Package,
 ) api_errors.LoadError![]TensorId {
     return initializers.importInitializersForLoadedModel(allocator, store, policy, package);
+}
+
+pub fn importInitializersStreaming(
+    allocator: std.mem.Allocator,
+    store: *StorageManager,
+    policy: TilePolicy,
+    package: *Package,
+    file: std.Io.File,
+    source_bytes: []const u8,
+) api_errors.LoadError![]TensorId {
+    return initializers.importInitializersStreaming(allocator, store, policy, package, file, source_bytes);
 }
 
 fn buildConcreteShapeFromFlat(

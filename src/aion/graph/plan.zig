@@ -21,8 +21,12 @@ pub const TilePolicy = struct {
     tile_alignment: usize = 64,
 
     /// Max number of batch tiles to allow when retiling rank>2 scalar tensors.
-    /// Keeps retile cost bounded to preserve perf for large batch grids.
-    batch_retile_max_tiles: usize = 64,
+    /// Bounds the compile-time `ReTileCopyScalar` copy-loop length; it does not
+    /// affect the post-retile tensor's tiling (that is set by `want_tile`). Sized
+    /// generously so ops that bridge a transiently fine-tiled producer (e.g. a
+    /// `reshape` that one-row-tiles a long sequence dim before `RelPosMHA` re-tiles
+    /// it to a single [T, D] panel) are not falsely rejected.
+    batch_retile_max_tiles: usize = 8192,
 
     /// Tensors with total element count at or below this threshold are stored
     /// as a single tile, eliminating per-tile acquire/release overhead and

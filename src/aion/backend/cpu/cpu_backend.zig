@@ -8,6 +8,7 @@ const cpu_target = @import("registry/cpu_target.zig");
 const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
+const relpos_mha_registry = @import("registry/relpos_mha_registry.zig");
 const conv1d_registry = @import("registry/conv1d_registry.zig");
 const conv2d_registry = @import("registry/conv2d_registry.zig");
 const fft_registry = @import("registry/fft_registry.zig");
@@ -21,6 +22,9 @@ const exec_conv = @import("exec/conv.zig");
 const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
 const exec_attention_cached = @import("exec/attention_cached.zig");
+const exec_relpos_mha = @import("exec/relpos_mha.zig");
+const exec_argmax = @import("exec/argmax.zig");
+const exec_scatter = @import("exec/scatter.zig");
 const exec_lstm = @import("exec/lstm.zig");
 const exec_rfft = @import("exec/rfft.zig");
 const exec_stft = @import("exec/stft.zig");
@@ -72,6 +76,7 @@ pub const CpuBackend = struct {
     matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
 
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
+    relpos_mha_kernels: relpos_mha_registry.Kernels = relpos_mha_registry.candidates[0].kernels,
 
     depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
     depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
@@ -154,6 +159,7 @@ pub const CpuBackend = struct {
         self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
         self.matvec = matvec_registry.selectForTarget(target).kernels;
         self.attention_kernels = attention_registry.selectForTarget(target).kernels;
+        self.relpos_mha_kernels = relpos_mha_registry.selectForTarget(target).kernels;
         self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
         self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
         self.fft = fft_registry.selectForTarget(target).kernels;
@@ -410,6 +416,19 @@ pub const CpuBackend = struct {
             .MultiHeadAttentionCachedTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_attention_cached.execMultiHeadAttentionCachedTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
+            },
+
+            .RelPosMHATiled => |s| {
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                try exec_relpos_mha.execRelPosMHATiled(self.allocator, pool_ptr, self.thread_count, self.relpos_mha_kernels, s, store);
+            },
+
+            .ArgMax => |s| {
+                try exec_argmax.execArgMax(s, store);
+            },
+
+            .ScatterRow => |s| {
+                try exec_scatter.execScatterRow(s, store);
             },
 
             .CopyTiled => |s| {

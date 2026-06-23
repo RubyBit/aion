@@ -20,6 +20,9 @@ pub fn instantiateNode(
     node: package_file.NodeRecord,
     mapped_inputs: []const graph_mod.ValueId,
     region_map: []const graph_mod.RegionId,
+    /// Filled with the graph value ids of the node's extra outputs (multi-carry
+    /// `Loop` only); its length must equal the record node's extra-output count.
+    extra_out: []graph_mod.ValueId,
 ) api_errors.ExecuteError!graph_mod.ValueId {
     _ = allocator;
 
@@ -67,6 +70,19 @@ pub fn instantiateNode(
         },
         .Attention => |attn| try graph.addAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal),
         .MultiHeadAttention => |attn| try graph.addMultiHeadAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal, @intCast(attn.heads)),
+        .RelPosMHA => |attn| try graph.addRelPosMHA(
+            mapped_inputs[0],
+            mapped_inputs[1],
+            mapped_inputs[2],
+            mapped_inputs[3],
+            mapped_inputs[4],
+            mapped_inputs[5],
+            if (attn.has_mask) mapped_inputs[6] else null,
+            attn.scale,
+            @intCast(attn.heads),
+        ),
+        .ArgMax => |am| try graph.addArgMax(mapped_inputs[0], am.axis),
+        .ScatterRow => try graph.addScatterRow(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2]),
         .MultiHeadAttentionCached => |attn| try graph.addMultiHeadAttentionCached(
             mapped_inputs[0],
             mapped_inputs[1],
@@ -129,7 +145,16 @@ pub fn instantiateNode(
         },
         .Loop => |lp| blk: {
             if (lp.body_region >= region_map.len) return error.InvalidArgument;
-            break :blk try graph.addLoop(mapped_inputs[0], region_map[lp.body_region], @intCast(lp.static_max_trip_count));
+            const outs = try graph.addLoopMulti(
+                mapped_inputs,
+                region_map[lp.body_region],
+                @intCast(lp.static_max_trip_count),
+                if (lp.cond_carry) |c| @as(usize, @intCast(c)) else null,
+                lp.check_before,
+            );
+            if (outs.len != extra_out.len + 1) return error.InvalidArgument;
+            for (extra_out, 0..) |*e, i| e.* = outs[i + 1];
+            break :blk outs[0];
         },
     };
 }

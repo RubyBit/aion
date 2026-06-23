@@ -45,6 +45,7 @@ pub fn broadcastLastDimBinaryF32(
                 .sub => av - bv,
                 .mul => av * bv,
                 .div => av / bv,
+                else => unreachable,
             };
             @as(*align(1) Vec, @ptrCast(out.ptr + base + c)).* = rv;
         }
@@ -56,6 +57,7 @@ pub fn broadcastLastDimBinaryF32(
                 .sub => av - bv,
                 .mul => av * bv,
                 .div => av / bv,
+                else => unreachable,
             };
         }
     }
@@ -113,6 +115,7 @@ pub fn broadcastLastDimBinaryF16(
                 .sub => af - bf,
                 .mul => af * bf,
                 .div => af / bf,
+                else => unreachable,
             };
             const rh: VecH = @floatCast(rf);
             @as(*align(1) VecH, @ptrCast(out.ptr + base + c)).* = rh;
@@ -125,6 +128,7 @@ pub fn broadcastLastDimBinaryF16(
                 .sub => av - bv,
                 .mul => av * bv,
                 .div => av / bv,
+                else => unreachable,
             };
             out[base + c] = @floatCast(rv);
         }
@@ -175,6 +179,7 @@ pub fn elemwiseBinaryF32(
             .sub => av - bv,
             .mul => av * bv,
             .div => av / bv,
+            else => unreachable, // comparisons produce i32 and route to elemwiseBinaryI32
         };
 
         @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
@@ -193,6 +198,41 @@ pub fn elemwiseBinaryF32(
         .div => {
             while (i < elem_count) : (i += 1) out[i] = a[i] / b[i];
         },
+        else => unreachable,
+    }
+}
+
+/// Integer elementwise binary: arithmetic (add/sub/mul/div) and comparisons
+/// (eq/ne/lt/gt/le/ge -> 1/0). Inputs and output are i32 (comparisons also output i32).
+pub fn elemwiseBinaryI32(
+    op: ElemwiseBinaryOp,
+    out_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+    elem_count: usize,
+) BackendError!void {
+    const out: []align(1) i32 = simd.bytesAsSliceMutUnaligned(i32, out_bytes);
+    const a: []align(1) const i32 = simd.bytesAsSliceConstUnaligned(i32, a_bytes);
+    const b: []align(1) const i32 = simd.bytesAsSliceConstUnaligned(i32, b_bytes);
+    if (out.len < elem_count or a.len < elem_count or b.len < elem_count) {
+        return BackendError.InvalidArgument;
+    }
+    var i: usize = 0;
+    while (i < elem_count) : (i += 1) {
+        const av = a[i];
+        const bv = b[i];
+        out[i] = switch (op) {
+            .add => av + bv,
+            .sub => av - bv,
+            .mul => av * bv,
+            .div => if (bv == 0) 0 else @divTrunc(av, bv),
+            .eq => @intFromBool(av == bv),
+            .ne => @intFromBool(av != bv),
+            .lt => @intFromBool(av < bv),
+            .gt => @intFromBool(av > bv),
+            .le => @intFromBool(av <= bv),
+            .ge => @intFromBool(av >= bv),
+        };
     }
 }
 
@@ -230,6 +270,7 @@ pub fn elemwiseBinaryF16(
             .sub => af - bf,
             .mul => af * bf,
             .div => af / bf,
+            else => unreachable,
         };
         const rh: VecH = @floatCast(rf);
         @as(*align(1) VecH, @ptrCast(out.ptr + i)).* = rh;
@@ -256,5 +297,6 @@ pub fn elemwiseBinaryF16(
                 out[i] = @floatCast(@as(f32, a[i]) / @as(f32, b[i]));
             }
         },
+        else => unreachable,
     }
 }

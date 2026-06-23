@@ -92,6 +92,21 @@ pub const ElemwiseBinaryOp = enum(u8) {
     sub,
     mul,
     div,
+    // Comparisons (appended for on-disk stability). Produce i32 {0,1}; inputs and
+    // output are i32. Used to build If/Loop conditions for in-graph decode.
+    eq,
+    ne,
+    lt,
+    gt,
+    le,
+    ge,
+
+    pub fn isComparison(self: ElemwiseBinaryOp) bool {
+        return switch (self) {
+            .eq, .ne, .lt, .gt, .le, .ge => true,
+            else => false,
+        };
+    }
 };
 
 pub const UnaryOp = enum(u8) {
@@ -101,6 +116,8 @@ pub const UnaryOp = enum(u8) {
     sigmoid,
     tanh,
     sqrt,
+    /// Natural logarithm (in-graph log-mel front-end). Appended to keep enum ids stable.
+    log,
 };
 
 pub const ReduceOp = enum(u8) {

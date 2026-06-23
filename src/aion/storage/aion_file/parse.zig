@@ -491,7 +491,27 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .Unary => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
         .Softmax => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .If => .{ .If = .{ .then_region = try readIntCursor(bytes, &cursor, u32), .else_region = try readIntCursor(bytes, &cursor, u32) } },
-        .Loop => .{ .Loop = .{ .body_region = try readIntCursor(bytes, &cursor, u32), .static_max_trip_count = try readIntCursor(bytes, &cursor, u64) } },
+        .Loop => blk: {
+            const body_region = try readIntCursor(bytes, &cursor, u32);
+            const static_max = try readIntCursor(bytes, &cursor, u64);
+            const cond_raw = try readIntCursor(bytes, &cursor, i32);
+            const check_before = (try readIntCursor(bytes, &cursor, u8)) != 0;
+            const n_extra = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+            const extra: []const u32 = ex: {
+                if (n_extra == 0) break :ex &[_]u32{};
+                const buf = allocator.alloc(u32, n_extra) catch return PackageError.OutOfMemory;
+                errdefer allocator.free(buf);
+                for (buf) |*e| e.* = try readIntCursor(bytes, &cursor, u32);
+                break :ex buf;
+            };
+            break :blk .{ .Loop = .{
+                .body_region = body_region,
+                .static_max_trip_count = static_max,
+                .cond_carry = if (cond_raw < 0) null else @intCast(cond_raw),
+                .check_before = check_before,
+                .extra_outputs = extra,
+            } };
+        },
         .Conv1D => .{ .Conv1D = .{
             .stride = try readIntCursor(bytes, &cursor, u64),
             .dilation = try readIntCursor(bytes, &cursor, u64),
@@ -538,6 +558,13 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .hop_length = try readIntCursor(bytes, &cursor, u64),
             .center = (try readIntCursor(bytes, &cursor, u8)) != 0,
         } },
+        .RelPosMHA => .{ .RelPosMHA = .{
+            .scale = try readIntCursor(bytes, &cursor, f32),
+            .heads = try readIntCursor(bytes, &cursor, u64),
+            .has_mask = (try readIntCursor(bytes, &cursor, u8)) != 0,
+        } },
+        .ArgMax => .{ .ArgMax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .ScatterRow => .ScatterRow,
         .Copy => .Copy,
         .GatherRows => .GatherRows,
         .RoPE1D => .{ .RoPE1D = .{

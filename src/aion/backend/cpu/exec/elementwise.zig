@@ -92,6 +92,10 @@ pub fn execElemwiseBinaryTiled(
                                 t.fail(e);
                                 return;
                             },
+                            .i32 => elemwise.elemwiseBinaryI32(t.op, out_view.bytes, a_view.bytes, b_view.bytes, n) catch |e| {
+                                t.fail(e);
+                                return;
+                            },
                             else => {
                                 t.fail(BackendError.InvalidArgument);
                                 return;
@@ -128,6 +132,7 @@ pub fn execElemwiseBinaryTiled(
         switch (out_view.dtype) {
             .f32 => try elemwise.elemwiseBinaryF32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
             .f16 => try elemwise.elemwiseBinaryF16(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
+            .i32 => try elemwise.elemwiseBinaryI32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
             else => return BackendError.InvalidArgument,
         }
     }
@@ -234,6 +239,10 @@ pub fn execBroadcastLastDimBinaryTiled(
                                     t.fail(e);
                                     return;
                                 },
+                                else => {
+                                    t.fail(BackendError.InvalidArgument);
+                                    return;
+                                },
                             },
                             .f16 => switch (t.op) {
                                 .add => elemwise.broadcastLastDimBinaryF16Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
@@ -250,6 +259,10 @@ pub fn execBroadcastLastDimBinaryTiled(
                                 },
                                 .div => elemwise.broadcastLastDimBinaryF16Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
                                     t.fail(e);
+                                    return;
+                                },
+                                else => {
+                                    t.fail(BackendError.InvalidArgument);
                                     return;
                                 },
                             },
@@ -299,12 +312,14 @@ pub fn execBroadcastLastDimBinaryTiled(
                 .sub => try elemwise.broadcastLastDimBinaryF32Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
                 .mul => try elemwise.broadcastLastDimBinaryF32Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
                 .div => try elemwise.broadcastLastDimBinaryF32Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
+                else => return BackendError.InvalidArgument,
             },
             .f16 => switch (s.op) {
                 .add => try elemwise.broadcastLastDimBinaryF16Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
                 .sub => try elemwise.broadcastLastDimBinaryF16Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
                 .mul => try elemwise.broadcastLastDimBinaryF16Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
                 .div => try elemwise.broadcastLastDimBinaryF16Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
+                else => return BackendError.InvalidArgument,
             },
             else => return BackendError.InvalidArgument,
         }

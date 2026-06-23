@@ -171,7 +171,14 @@ pub fn Kernel(comptime t: Tuning) type {
             const c_stride: usize = if (params.ldc != 0) params.ldc else n;
 
             if (k > KC or n > NC) return BackendError.InvalidArgument;
-            if (packed_b_view.len < KC * NC) return BackendError.InvalidArgument;
+            // Packed-B is `ceil(n/NR)` panels of `KC*NR` each; the panel stride is
+            // `KC*NR` (independent of NC, see the loop below), so a view holding just
+            // the populated panels is sufficient. Requiring the full `KC*NC` here
+            // forced callers that pack only `n` columns (e.g. the conv weight cache,
+            // which packs one output-channel tile at a time) to allocate a full
+            // `KC*NC` panel — ~1MB to hold a handful of floats. Size to what's read.
+            const need_b: usize = ((n + NR - 1) / NR) * (KC * NR);
+            if (packed_b_view.len < need_b) return BackendError.InvalidArgument;
 
             const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
             const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
@@ -232,7 +239,14 @@ pub fn Kernel(comptime t: Tuning) type {
             const c_stride: usize = if (params.ldc != 0) params.ldc else n;
 
             if (k > KC or n > NC) return BackendError.InvalidArgument;
-            if (packed_b_view.len < KC * NC) return BackendError.InvalidArgument;
+            // Packed-B is `ceil(n/NR)` panels of `KC*NR` each; the panel stride is
+            // `KC*NR` (independent of NC, see the loop below), so a view holding just
+            // the populated panels is sufficient. Requiring the full `KC*NC` here
+            // forced callers that pack only `n` columns (e.g. the conv weight cache,
+            // which packs one output-channel tile at a time) to allocate a full
+            // `KC*NC` panel — ~1MB to hold a handful of floats. Size to what's read.
+            const need_b: usize = ((n + NR - 1) / NR) * (KC * NR);
+            if (packed_b_view.len < need_b) return BackendError.InvalidArgument;
 
             const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
             if (m == 0 or n == 0) return BackendError.InvalidArgument;

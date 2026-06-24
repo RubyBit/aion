@@ -54,11 +54,23 @@ pub fn bindInputDim(
     actual: u64,
     symbol_values: []?u64,
 ) error{InvalidArgument}!void {
+    return bindInputDimExprs(pkg.dim_exprs, term, actual, symbol_values);
+}
+
+/// Like `bindInputDim`, but takes the `dim_exprs` table directly instead of a
+/// `Package`, so the execution runtime can bind input dimensions to symbols without
+/// depending on the on-disk package representation.
+pub fn bindInputDimExprs(
+    dim_exprs: []const package_file.DimExpr,
+    term: package_file.ShapeTerm,
+    actual: u64,
+    symbol_values: []?u64,
+) error{InvalidArgument}!void {
     switch (term) {
         .constant => |want| if (want != actual) return error.InvalidArgument,
         .expr => |expr_idx| {
-            if (expr_idx >= pkg.dim_exprs.len) return error.InvalidArgument;
-            switch (pkg.dim_exprs[expr_idx]) {
+            if (expr_idx >= dim_exprs.len) return error.InvalidArgument;
+            switch (dim_exprs[expr_idx]) {
                 .symbol => |sym_idx| {
                     if (sym_idx >= symbol_values.len) return error.InvalidArgument;
                     if (symbol_values[sym_idx]) |current| {

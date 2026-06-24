@@ -102,6 +102,16 @@ pub const Builder = struct {
         return &self.graph;
     }
 
+    /// Transfer ownership of the underlying graph to the caller, replacing it with a
+    /// fresh empty graph so the Builder remains safe to `deinit`. Used by
+    /// `ctx.compile` to hand the graph to the compiled `Model` without a round trip.
+    /// The Builder should not be used to add more ops after this.
+    pub fn takeGraph(self: *Self) graph_mod.Graph {
+        const g = self.graph;
+        self.graph = graph_mod.Graph.init(self.allocator);
+        return g;
+    }
+
     /// Return the known shape for a value, if available.
     ///
     /// Note: many intermediate values only become known after inference at

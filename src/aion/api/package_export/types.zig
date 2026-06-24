@@ -24,9 +24,13 @@ pub const DimensionSymbol = struct {
     name: []const u8,
 };
 
+/// Declares that `output`'s value should be written back into `input`'s slot after
+/// each run (recurrent-state carry — KV caches, LSTM h/c). Referenced by tensor, not
+/// by name: `input` must be a graph input and `output` must be one of the compiled/
+/// exported outputs.
 pub const OutputAlias = struct {
-    input_name: []const u8,
-    output_name: []const u8,
+    input: TensorRef,
+    output: TensorRef,
 };
 
 pub const ExportModelOptions = struct {

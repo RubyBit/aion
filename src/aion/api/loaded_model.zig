@@ -34,15 +34,45 @@ pub const SignatureInfo = types_mod.SignatureInfo;
 pub const IoAliasInfo = types_mod.IoAliasInfo;
 pub const LoadModelOptions = types_mod.LoadModelOptions;
 
-pub const LoadedModel = struct {
+/// In-process Builder graph source (via `ctx.compile`). The graph is compiled
+/// directly — no serialization round trip. Owns the graph + an arena backing the
+/// per-input shape terms / value-id maps.
+pub const BuilderSource = struct {
+    graph: graph_mod.Graph,
+    arena: std.heap.ArenaAllocator,
+    input_value_ids: []const graph_mod.ValueId,
+    output_value_ids: []const graph_mod.ValueId,
+};
+
+/// Where a `Model`'s concrete graphs come from. The runtime is otherwise
+/// source-agnostic: it reads native metadata fields (signatures, shape terms, dim
+/// exprs) and only consults the source to *instantiate* a concrete graph per shape.
+pub const GraphSource = union(enum) {
+    /// Loaded from an `.aion`: instantiate by walking package node records.
+    package: Package,
+    /// Compiled in-process: instantiate by (re)using the retained Builder graph.
+    builder: BuilderSource,
+};
+
+pub const Model = struct {
     allocator: std.mem.Allocator,
     backend: backend_mod.Backend,
     store: *StorageManager,
     policy: TilePolicy,
-    package: Package,
+    /// Where concrete graphs are instantiated from (loaded package vs compiled graph).
+    source: GraphSource,
     initializer_tids: []TensorId,
     input_signatures: []SignatureInfo,
     output_signatures: []SignatureInfo,
+    /// Native per-public-input shape terms (source-agnostic): loaded models borrow
+    /// these from the package's value records; compiled models own constant terms in
+    /// the builder arena. Read by `resolveBindings`/`ensureAutoInputs` so the hot path
+    /// never depends on `Package`.
+    input_shape_terms: []const []const package_file.ShapeTerm,
+    /// Dimension-expression table for symbol resolution (loaded: package's; compiled: empty).
+    dim_exprs: []const package_file.DimExpr,
+    /// Number of dimension symbols (loaded: package's; compiled: 0).
+    dim_symbol_count: usize,
     output_aliases: []IoAliasInfo,
     input_alias_output_indices: []u32,
     output_alias_input_indices: []u32,
@@ -108,6 +138,7 @@ pub const LoadedModel = struct {
         self.allocator.free(self.initializer_tids);
         self.allocator.free(self.input_signatures);
         self.allocator.free(self.output_signatures);
+        self.allocator.free(self.input_shape_terms);
         self.allocator.free(self.output_aliases);
         self.allocator.free(self.input_alias_output_indices);
         self.allocator.free(self.output_alias_input_indices);
@@ -120,7 +151,14 @@ pub const LoadedModel = struct {
         self.allocator.free(self.run_symbol_values);
         self.allocator.free(self.run_input_shapes);
         self.allocator.free(self.run_direct_input_ids);
-        self.package.deinit();
+        switch (self.source) {
+            .package => |*p| p.deinit(),
+            .builder => |*b| {
+                // Owns the Builder graph + an arena backing shape terms / value-id maps.
+                b.graph.deinit();
+                b.arena.deinit();
+            },
+        }
         self.* = undefined;
     }
 
@@ -136,17 +174,26 @@ pub const LoadedModel = struct {
         return self.output_aliases;
     }
 
-    /// Return the debug-name table persisted in the loaded package.
-    ///
-    /// Debug names are intended to be user-facing and stable enough for
-    /// diagnostics and tooling (e.g. swapping initializers by name).
+    /// The backing package, if this model was loaded (not compiled in-process).
+    /// Debug-name lookups and initializer/weight-swap are package-only.
+    fn packageOrNull(self: *const Self) ?*const Package {
+        return switch (self.source) {
+            .package => |*p| p,
+            .builder => null,
+        };
+    }
+
+    /// Return the debug-name table persisted in the loaded package (empty for
+    /// compiled models, which have no debug-name table).
     pub fn debugNames(self: *const Self) []const package_file.DebugName {
-        return self.package.debug_names;
+        const p = self.packageOrNull() orelse return &[_]package_file.DebugName{};
+        return p.debug_names;
     }
 
     /// Return the value index for a debug name, or null if not present.
     pub fn findValueByDebugName(self: *const Self, name: []const u8) ?u32 {
-        for (self.package.debug_names) |entry| {
+        const p = self.packageOrNull() orelse return null;
+        for (p.debug_names) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.value;
         }
         return null;
@@ -157,8 +204,9 @@ pub const LoadedModel = struct {
     /// The returned tensor can be mutated in-place to swap weights without
     /// recompiling.
     pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
-        if (value_index >= self.package.values.len) return api_errors.ApiError.InvalidArgument;
-        const value = self.package.values[value_index];
+        const p = self.packageOrNull() orelse return api_errors.ApiError.InvalidArgument;
+        if (value_index >= p.values.len) return api_errors.ApiError.InvalidArgument;
+        const value = p.values[value_index];
         if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
         const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
         if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
@@ -202,8 +250,9 @@ pub const LoadedModel = struct {
     /// - layout must be compatible (dtype, shape, tile layout)
     pub fn retargetInitializerByValue(self: *Self, value_index: u32, new_tensor: Tensor) api_errors.ApiError!void {
         if (new_tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
-        if (value_index >= self.package.values.len) return api_errors.ApiError.InvalidArgument;
-        const value = self.package.values[value_index];
+        const p = self.packageOrNull() orelse return api_errors.ApiError.InvalidArgument;
+        if (value_index >= p.values.len) return api_errors.ApiError.InvalidArgument;
+        const value = p.values[value_index];
         if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
         const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
         if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
@@ -415,31 +464,81 @@ pub const LoadedModel = struct {
         return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
 
-    pub fn initLoaded(
+    pub fn outputCount(self: *const Self) usize {
+        return self.output_signatures.len;
+    }
+
+    /// Fetch the most recent run's output by position (in declared output order).
+    pub fn outputTensorAt(self: *Self, index: usize) api_errors.ApiError!Tensor {
+        const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
+        if (index >= self.output_signatures.len) return api_errors.ApiError.InvalidArgument;
+        const tid = self.cache_entries.items[cache_index].program.outputs[index];
+        const t = try self.store.getConst(tid);
+        return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+    }
+
+    /// Execute, then return output `index` as a Tensor handle (tensor-first API).
+    pub fn runOutputTensor(self: *Self, index: usize) api_errors.ExecuteError!Tensor {
+        try self.run();
+        return self.outputTensorAt(index) catch error.InvalidArgument;
+    }
+
+    /// Execute, then return output `index` as a newly allocated f32 slice (caller owns).
+    pub fn runOutputF32Alloc(self: *Self, allocator: std.mem.Allocator, index: usize) api_errors.ExecuteError![]f32 {
+        try self.run();
+        const t: Tensor = self.outputTensorAt(index) catch return error.InvalidArgument;
+        return t.readF32Alloc(allocator);
+    }
+
+    /// Execute, then return output `index` as a newly allocated f16 slice (caller owns).
+    pub fn runOutputF16Alloc(self: *Self, allocator: std.mem.Allocator, index: usize) api_errors.ExecuteError![]f16 {
+        try self.run();
+        const t: Tensor = self.outputTensorAt(index) catch return error.InvalidArgument;
+        return t.readF16Alloc(allocator);
+    }
+
+    /// Execute, then return scalar output `index` as f32 (requires f32, exactly 1 element).
+    pub fn runScalarF32(self: *Self, index: usize) api_errors.ExecuteError!f32 {
+        try self.run();
+        const t: Tensor = self.outputTensorAt(index) catch return error.InvalidArgument;
+        const n: usize = try t.elemCount();
+        if (n != 1) return api_errors.ExecuteError.InvalidArgument;
+        var tmp: [1]f32 = .{0.0};
+        try t.readF32(tmp[0..1]);
+        return tmp[0];
+    }
+
+    /// Shared constructor: allocates the runtime bookkeeping arrays + io-alias index
+    /// maps from already-extracted, source-agnostic metadata. Both `initLoaded` and
+    /// `initCompiled` populate the metadata from their source, then delegate here.
+    /// On success the returned `Model` owns `source`, `initializer_tids`,
+    /// `input_signatures`, `output_signatures`, and the outer `input_shape_terms`
+    /// array; on error the caller's `errdefer`s free them.
+    fn initCommon(
         allocator: std.mem.Allocator,
         backend: backend_mod.Backend,
         store: *StorageManager,
         policy: TilePolicy,
-        package: Package,
+        source: GraphSource,
         initializer_tids: []TensorId,
+        input_signatures: []SignatureInfo,
+        output_signatures: []SignatureInfo,
+        input_shape_terms: []const []const package_file.ShapeTerm,
+        dim_exprs: []const package_file.DimExpr,
+        dim_symbol_count: usize,
+        io_aliases: []const package_file.IoAlias,
         package_hash: u64,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
-        const input_signatures = try signatures.buildSignatures(allocator, &package, package.inputs);
-        errdefer allocator.free(input_signatures);
-        const output_signatures = try signatures.buildSignatures(allocator, &package, package.outputs);
-        errdefer allocator.free(output_signatures);
-
         // `io_aliases` are an optimization hint (copy outputs back into input slots).
-        // Some packages may include incompatible aliases; filter them out here so that
-        // executing the model never fails due to alias copyFrom dtype/rank mismatch.
+        // Filter incompatible ones so executing never fails on an alias dtype/rank mismatch.
         var valid_alias_count: usize = 0;
-        for (package.io_aliases) |alias| {
-            const input_index: usize = alias.input;
-            const output_index: usize = alias.output;
-            if (input_index >= input_signatures.len or output_index >= output_signatures.len) continue;
-            if (input_signatures[input_index].dtype != output_signatures[output_index].dtype) continue;
-            if (input_signatures[input_index].rank != output_signatures[output_index].rank) continue;
+        for (io_aliases) |alias| {
+            const ii: usize = alias.input;
+            const oi: usize = alias.output;
+            if (ii >= input_signatures.len or oi >= output_signatures.len) continue;
+            if (input_signatures[ii].dtype != output_signatures[oi].dtype) continue;
+            if (input_signatures[ii].rank != output_signatures[oi].rank) continue;
             valid_alias_count += 1;
         }
 
@@ -455,24 +554,23 @@ pub const LoadedModel = struct {
         @memset(output_alias_input_indices, types_mod.invalid_alias_index);
 
         var alias_cursor: usize = 0;
-        for (package.io_aliases) |alias| {
-            const input_index: usize = alias.input;
-            const output_index: usize = alias.output;
-            if (input_index >= input_signatures.len or output_index >= output_signatures.len) continue;
-            if (input_signatures[input_index].dtype != output_signatures[output_index].dtype) continue;
-            if (input_signatures[input_index].rank != output_signatures[output_index].rank) continue;
+        for (io_aliases) |alias| {
+            const ii: usize = alias.input;
+            const oi: usize = alias.output;
+            if (ii >= input_signatures.len or oi >= output_signatures.len) continue;
+            if (input_signatures[ii].dtype != output_signatures[oi].dtype) continue;
+            if (input_signatures[ii].rank != output_signatures[oi].rank) continue;
 
-            if (input_alias_output_indices[input_index] != types_mod.invalid_alias_index) return error.InvalidArgument;
-            if (output_alias_input_indices[output_index] != types_mod.invalid_alias_index) return error.InvalidArgument;
-            input_alias_output_indices[input_index] = @intCast(output_index);
-            output_alias_input_indices[output_index] = @intCast(input_index);
+            if (input_alias_output_indices[ii] != types_mod.invalid_alias_index) return error.InvalidArgument;
+            if (output_alias_input_indices[oi] != types_mod.invalid_alias_index) return error.InvalidArgument;
+            input_alias_output_indices[ii] = @intCast(oi);
+            output_alias_input_indices[oi] = @intCast(ii);
 
-            // Populate the public-facing alias list.
             output_aliases[alias_cursor] = .{
-                .input_name = input_signatures[input_index].name,
-                .output_name = output_signatures[output_index].name,
-                .input_index = input_index,
-                .output_index = output_index,
+                .input_name = input_signatures[ii].name,
+                .output_name = output_signatures[oi].name,
+                .input_index = ii,
+                .output_index = oi,
             };
             alias_cursor += 1;
         }
@@ -501,9 +599,9 @@ pub const LoadedModel = struct {
         var total_rank: usize = 0;
         for (input_signatures) |sig| total_rank += sig.rank;
 
-        const run_symbol_bindings = try allocator.alloc(?u64, package.dim_symbols.len);
+        const run_symbol_bindings = try allocator.alloc(?u64, dim_symbol_count);
         errdefer allocator.free(run_symbol_bindings);
-        const run_symbol_values = try allocator.alloc(u64, package.dim_symbols.len);
+        const run_symbol_values = try allocator.alloc(u64, dim_symbol_count);
         errdefer allocator.free(run_symbol_values);
         const run_input_shapes = try allocator.alloc(usize, total_rank);
         errdefer allocator.free(run_input_shapes);
@@ -515,10 +613,13 @@ pub const LoadedModel = struct {
             .backend = backend,
             .store = store,
             .policy = policy,
-            .package = package,
+            .source = source,
             .initializer_tids = initializer_tids,
             .input_signatures = input_signatures,
             .output_signatures = output_signatures,
+            .input_shape_terms = input_shape_terms,
+            .dim_exprs = dim_exprs,
+            .dim_symbol_count = dim_symbol_count,
             .output_aliases = output_aliases,
             .input_alias_output_indices = input_alias_output_indices,
             .output_alias_input_indices = output_alias_input_indices,
@@ -537,6 +638,136 @@ pub const LoadedModel = struct {
         };
     }
 
+    /// Build a `Model` from a parsed `.aion` package. Metadata (signatures, shape
+    /// terms, dim exprs) is taken from the package; the package is retained as the
+    /// graph source for per-shape instantiation + weight-swap-by-debug-name.
+    pub fn initLoaded(
+        allocator: std.mem.Allocator,
+        backend: backend_mod.Backend,
+        store: *StorageManager,
+        policy: TilePolicy,
+        package: Package,
+        initializer_tids: []TensorId,
+        package_hash: u64,
+        opts: LoadModelOptions,
+    ) api_errors.LoadError!Self {
+        const input_signatures = try signatures.buildSignatures(allocator, &package, package.inputs);
+        errdefer allocator.free(input_signatures);
+        const output_signatures = try signatures.buildSignatures(allocator, &package, package.outputs);
+        errdefer allocator.free(output_signatures);
+
+        // Borrow each public input's shape terms from its value record (zero-copy;
+        // the package — retained in `source` — keeps them alive).
+        const input_shape_terms = try allocator.alloc([]const package_file.ShapeTerm, input_signatures.len);
+        errdefer allocator.free(input_shape_terms);
+        for (input_signatures, 0..) |sig, i| input_shape_terms[i] = package.values[sig.value].shape_terms;
+
+        return initCommon(
+            allocator,
+            backend,
+            store,
+            policy,
+            .{ .package = package },
+            initializer_tids,
+            input_signatures,
+            output_signatures,
+            input_shape_terms,
+            package.dim_exprs,
+            package.dim_symbols.len,
+            package.io_aliases,
+            package_hash,
+            opts,
+        );
+    }
+
+    /// Build a `Model` from an in-process Builder graph (via `ctx.compile`).
+    ///
+    /// Takes ownership of `graph_in`. Metadata (signatures, constant shape terms) is
+    /// derived natively from the graph + names — no synthetic package, no
+    /// serialization round trip. The program is compiled directly from the retained
+    /// graph by the `builder` source's `instantiate`. `graph_in` must already have had
+    /// shape inference run (concrete shapes). Inputs are the graph's *public* inputs
+    /// (params are baked initializers already bound in the graph).
+    pub fn initCompiled(
+        allocator: std.mem.Allocator,
+        backend: backend_mod.Backend,
+        store: *StorageManager,
+        policy: TilePolicy,
+        graph_in: graph_mod.Graph,
+        input_value_ids: []const graph_mod.ValueId,
+        input_names: []const []const u8,
+        output_value_ids: []const graph_mod.ValueId,
+        output_names: []const []const u8,
+        io_aliases: []const package_file.IoAlias,
+        opts: LoadModelOptions,
+    ) api_errors.LoadError!Self {
+        var graph = graph_in;
+        errdefer graph.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+
+        const n_in = input_value_ids.len;
+        const n_out = output_value_ids.len;
+
+        const input_signatures = try allocator.alloc(SignatureInfo, n_in);
+        errdefer allocator.free(input_signatures);
+        const output_signatures = try allocator.alloc(SignatureInfo, n_out);
+        errdefer allocator.free(output_signatures);
+        const input_shape_terms = try allocator.alloc([]const package_file.ShapeTerm, n_in);
+        errdefer allocator.free(input_shape_terms);
+
+        for (input_value_ids, 0..) |vid, k| {
+            const v = graph.values.items[@intCast(vid)];
+            const dtype = v.dtype orelse return error.InvalidArgument;
+            const terms = try aa.alloc(package_file.ShapeTerm, v.shape.len);
+            for (v.shape, 0..) |d, i| terms[i] = .{ .constant = @intCast(d) };
+            input_signatures[k] = .{ .name = try aa.dupe(u8, input_names[k]), .value = vid, .dtype = dtype, .rank = @intCast(v.shape.len) };
+            input_shape_terms[k] = terms;
+        }
+        for (output_value_ids, 0..) |vid, j| {
+            const v = graph.values.items[@intCast(vid)];
+            const dtype = v.dtype orelse return error.InvalidArgument;
+            output_signatures[j] = .{ .name = try aa.dupe(u8, output_names[j]), .value = vid, .dtype = dtype, .rank = @intCast(v.shape.len) };
+        }
+
+        // IMPORTANT: complete ALL arena allocations *before* copying `arena` into
+        // `source`. `ArenaAllocator` is a value type; copying it snapshots its buffer
+        // state, so allocations made via `aa` after the copy would not be tracked by
+        // the stored arena and would leak.
+        const in_ids_dup = try aa.dupe(graph_mod.ValueId, input_value_ids);
+        const out_ids_dup = try aa.dupe(graph_mod.ValueId, output_value_ids);
+        const aliases_dup = try aa.dupe(package_file.IoAlias, io_aliases);
+
+        const empty_tids = try allocator.alloc(TensorId, 0);
+        errdefer allocator.free(empty_tids);
+
+        const source = GraphSource{ .builder = .{
+            .graph = graph,
+            .arena = arena,
+            .input_value_ids = in_ids_dup,
+            .output_value_ids = out_ids_dup,
+        } };
+
+        return initCommon(
+            allocator,
+            backend,
+            store,
+            policy,
+            source,
+            empty_tids,
+            input_signatures,
+            output_signatures,
+            input_shape_terms,
+            &[_]package_file.DimExpr{},
+            0,
+            aliases_dup,
+            0,
+            opts,
+        );
+    }
+
     fn resolveBindings(self: *Self) error{InvalidArgument}!ResolvedInputs {
         @memset(self.run_symbol_bindings, null);
         @memset(self.run_direct_input_ids, types_mod.invalid_tensor_id);
@@ -546,13 +777,13 @@ pub const LoadedModel = struct {
         while (i < self.input_signatures.len) : (i += 1) {
             const tensor = self.bound_inputs[i] orelse return error.InvalidArgument;
             const sig = self.input_signatures[i];
-            const value = self.package.values[sig.value];
-            if (tensor.dtype != value.dtype or tensor.shape.len != value.rank) return error.InvalidArgument;
+            const terms = self.input_shape_terms[i];
+            if (tensor.dtype != sig.dtype or tensor.shape.len != sig.rank) return error.InvalidArgument;
 
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
                 const actual: u64 = @intCast(tensor.shape[d]);
-                try signatures.bindInputDim(&self.package, value.shape_terms[d], actual, self.run_symbol_bindings);
+                try signatures.bindInputDimExprs(self.dim_exprs, terms[d], actual, self.run_symbol_bindings);
                 self.run_input_shapes[shape_cursor] = tensor.shape[d];
                 shape_cursor += 1;
             }
@@ -575,11 +806,11 @@ pub const LoadedModel = struct {
         @memset(self.run_symbol_bindings, null);
         for (self.input_signatures, 0..) |sig, i| {
             const tensor = self.bound_inputs[i] orelse continue;
-            const value = self.package.values[sig.value];
-            if (tensor.dtype != value.dtype or tensor.shape.len != value.rank) return error.InvalidArgument;
+            const terms = self.input_shape_terms[i];
+            if (tensor.dtype != sig.dtype or tensor.shape.len != sig.rank) return error.InvalidArgument;
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
-                try signatures.bindInputDim(&self.package, value.shape_terms[d], @intCast(tensor.shape[d]), self.run_symbol_bindings);
+                try signatures.bindInputDimExprs(self.dim_exprs, terms[d], @intCast(tensor.shape[d]), self.run_symbol_bindings);
             }
         }
         for (self.run_symbol_bindings, 0..) |v, idx| self.run_symbol_values[idx] = v orelse 0;
@@ -619,9 +850,8 @@ pub const LoadedModel = struct {
 
         for (self.input_signatures, 0..) |sig, i| {
             if (self.bound_inputs[i] != null) continue;
-            const value = self.package.values[sig.value];
 
-            const shape = package_file.resolveShapeTerms(self.allocator, &self.package, value.shape_terms, optional_symbols) catch {
+            const shape = package_file.resolveShapeTermsExprs(self.allocator, self.dim_exprs, self.input_shape_terms[i], optional_symbols) catch {
                 if (trace) std.debug.print(
                     "[aion][run] cannot auto-size unbound input '{s}': a symbolic dimension is not determined by any bound input — bind it explicitly\n",
                     .{sig.name},
@@ -684,33 +914,123 @@ pub const LoadedModel = struct {
         return self.cache_entries.items.len - 1;
     }
 
+    /// Produce a concrete graph for the requested shapes (source-specific), then
+    /// bind public-input slots + compile via the shared `finishCacheEntry`.
     fn buildCacheEntry(
         self: *Self,
         symbol_values: []const u64,
         input_shapes: []const usize,
         direct_input_ids: []const TensorId,
     ) api_errors.ExecuteError!CacheEntry {
-        var graph = graph_mod.Graph.init(self.allocator);
-        defer graph.deinit();
+        switch (self.source) {
+            // Compiled model: the graph already exists (nodes + bound params). Bind
+            // public inputs + compile in place — no graph reconstruction.
+            .builder => |*b| return self.finishCacheEntry(&b.graph, b.input_value_ids, b.output_value_ids, symbol_values, input_shapes, direct_input_ids),
+            // Loaded model: walk the package node records to build a fresh concrete
+            // graph specialized to these shapes/symbols.
+            .package => |*pkg| {
+                var graph = graph_mod.Graph.init(self.allocator);
+                defer graph.deinit();
 
-        var value_map = try self.allocator.alloc(graph_mod.ValueId, self.package.values.len);
-        defer self.allocator.free(value_map);
-        @memset(value_map, std.math.maxInt(graph_mod.ValueId));
+                var value_map = try self.allocator.alloc(graph_mod.ValueId, pkg.values.len);
+                defer self.allocator.free(value_map);
+                @memset(value_map, std.math.maxInt(graph_mod.ValueId));
 
+                const in_ids = try self.allocator.alloc(graph_mod.ValueId, self.input_signatures.len);
+                defer self.allocator.free(in_ids);
+                const out_ids = try self.allocator.alloc(graph_mod.ValueId, self.output_signatures.len);
+                defer self.allocator.free(out_ids);
+
+                // Public inputs: add (unbound — slot binding happens in finishCacheEntry).
+                var input_shape_cursor: usize = 0;
+                for (self.input_signatures, 0..) |sig, sig_idx| {
+                    const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
+                    const vid = try graph.addInput(sig.dtype, concrete_shape);
+                    value_map[sig.value] = vid;
+                    in_ids[sig_idx] = vid;
+                }
+
+                const optional_symbols = try instantiate.optionalizeSymbols(self.allocator, symbol_values);
+                defer self.allocator.free(optional_symbols);
+
+                // Initializers (weights): bound to their store tensors.
+                for (pkg.values, 0..) |value, idx| {
+                    if (value.source != .initializer) continue;
+                    const shape = try package_file.resolveShapeTerms(self.allocator, pkg, value.shape_terms, optional_symbols);
+                    defer self.allocator.free(shape);
+                    const vid = try graph.addInput(value.dtype, shape);
+                    try graph.bindExternal(vid, self.initializer_tids[value.initializer_index.?]);
+                    value_map[idx] = vid;
+                }
+
+                // Regions are built lazily, just before the main `If`/`Loop` node that
+                // references them, so a region body can reference values produced by
+                // earlier main nodes (e.g. an in-graph decode Loop reading the encoder out).
+                const region_built = try self.allocator.alloc(bool, pkg.regions.len);
+                defer self.allocator.free(region_built);
+                @memset(region_built, false);
+                const region_map = try self.allocator.alloc(graph_mod.RegionId, pkg.regions.len);
+                defer self.allocator.free(region_map);
+
+                for (pkg.nodes) |node| {
+                    switch (node.op) {
+                        .If => |iff| {
+                            try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.then_region), self.allocator);
+                            try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.else_region), self.allocator);
+                        },
+                        .Loop => |lp| try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(lp.body_region), self.allocator),
+                        else => {},
+                    }
+
+                    const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
+                    defer self.allocator.free(mapped_inputs);
+                    for (node.inputs, 0..) |input, i| {
+                        if (input >= value_map.len) return error.InvalidArgument;
+                        mapped_inputs[i] = value_map[input];
+                    }
+                    const extra_ids = package_file.nodeExtraOutputs(node);
+                    const extra_buf = try self.allocator.alloc(graph_mod.ValueId, extra_ids.len);
+                    defer self.allocator.free(extra_buf);
+                    const out_vid = try instantiate.instantiateNode(self.allocator, pkg, symbol_values, &graph, node, mapped_inputs, region_map, extra_buf);
+                    value_map[node.output] = out_vid;
+                    for (extra_ids, 0..) |eid, i| {
+                        if (eid >= value_map.len) return error.InvalidArgument;
+                        value_map[eid] = extra_buf[i];
+                    }
+                }
+
+                for (pkg.outputs, 0..) |sig, idx| out_ids[idx] = value_map[sig.value];
+
+                return self.finishCacheEntry(&graph, in_ids, out_ids, symbol_values, input_shapes, direct_input_ids);
+            },
+        }
+    }
+
+    /// Shared tail of cache-entry construction: bind each public input's value to its
+    /// slot (aliased → model-level shared state slot; non-aliased → the caller's
+    /// tensor), set outputs, and compile. Operates on `graph` in place.
+    fn finishCacheEntry(
+        self: *Self,
+        graph: *graph_mod.Graph,
+        in_ids: []const graph_mod.ValueId,
+        out_ids: []const graph_mod.ValueId,
+        symbol_values: []const u64,
+        input_shapes: []const usize,
+        direct_input_ids: []const TensorId,
+    ) api_errors.ExecuteError!CacheEntry {
         const input_slots = try self.allocator.alloc(TensorId, self.input_signatures.len);
         errdefer self.allocator.free(input_slots);
         const entry_direct_input_ids = try self.allocator.dupe(TensorId, direct_input_ids);
         errdefer self.allocator.free(entry_direct_input_ids);
 
         var input_shape_cursor: usize = 0;
-        for (self.input_signatures, 0..) |sig, sig_idx| {
+        for (self.input_signatures, 0..) |_, sig_idx| {
             const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
                 // Aliased inputs (KV caches, recurrent state) use a model-level slot
                 // shared by every cache entry, so state carries across entries with
-                // different input shapes (prefill vs decode). The slot is single-tile
-                // (KVCacheAppend needs a contiguous last axis); the default tiler would
-                // split large caches into a 2D-square grid.
+                // different input shapes (prefill vs decode). Single-tile (KVCacheAppend
+                // needs a contiguous last axis; the default tiler would split it).
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
             else blk: {
                 const tid = direct_input_ids[sig_idx];
@@ -718,68 +1038,12 @@ pub const LoadedModel = struct {
                 break :blk tid;
             };
             input_slots[sig_idx] = slot_tid;
-            const vid = try graph.addInput(sig.dtype, concrete_shape);
-            try graph.bindExternal(vid, slot_tid);
-            value_map[sig.value] = vid;
+            try graph.bindExternal(in_ids[sig_idx], slot_tid);
         }
 
-        const optional_symbols = try instantiate.optionalizeSymbols(self.allocator, symbol_values);
-        defer self.allocator.free(optional_symbols);
+        try graph.setOutputs(out_ids);
 
-        for (self.package.values, 0..) |value, idx| {
-            if (value.source != .initializer) continue;
-            const shape = try package_file.resolveShapeTerms(self.allocator, &self.package, value.shape_terms, optional_symbols);
-            defer self.allocator.free(shape);
-            const vid = try graph.addInput(value.dtype, shape);
-            try graph.bindExternal(vid, self.initializer_tids[value.initializer_index.?]);
-            value_map[idx] = vid;
-        }
-
-        // Regions are built lazily, just before the main `If`/`Loop` node that
-        // references them. This lets a region body reference values produced by
-        // *earlier main nodes* (e.g. the encoder output feeding an in-graph decode
-        // Loop) — which the old "all regions first" order could not express, since
-        // regions only saw inputs/initializers. Sub-regions are built first
-        // (recursively), so no nested active region is ever needed.
-        const region_built = try self.allocator.alloc(bool, self.package.regions.len);
-        defer self.allocator.free(region_built);
-        @memset(region_built, false);
-        const region_map = try self.allocator.alloc(graph_mod.RegionId, self.package.regions.len);
-        defer self.allocator.free(region_map);
-
-        for (self.package.nodes) |node| {
-            switch (node.op) {
-                .If => |iff| {
-                    try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.then_region), self.allocator);
-                    try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.else_region), self.allocator);
-                },
-                .Loop => |lp| try ensureRegionBuilt(&self.package, symbol_values, &graph, value_map, region_built, region_map, @intCast(lp.body_region), self.allocator),
-                else => {},
-            }
-
-            const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
-            defer self.allocator.free(mapped_inputs);
-            for (node.inputs, 0..) |input, i| {
-                if (input >= value_map.len) return error.InvalidArgument;
-                mapped_inputs[i] = value_map[input];
-            }
-            const extra_ids = package_file.nodeExtraOutputs(node);
-            const extra_buf = try self.allocator.alloc(graph_mod.ValueId, extra_ids.len);
-            defer self.allocator.free(extra_buf);
-            const out_vid = try instantiate.instantiateNode(self.allocator, &self.package, symbol_values, &graph, node, mapped_inputs, region_map, extra_buf);
-            value_map[node.output] = out_vid;
-            for (extra_ids, 0..) |eid, i| {
-                if (eid >= value_map.len) return error.InvalidArgument;
-                value_map[eid] = extra_buf[i];
-            }
-        }
-
-        const outputs = try self.allocator.alloc(graph_mod.ValueId, self.package.outputs.len);
-        defer self.allocator.free(outputs);
-        for (self.package.outputs, 0..) |sig, idx| outputs[idx] = value_map[sig.value];
-        try graph.setOutputs(outputs);
-
-        var program = try program_mod.compileGraph(self.allocator, &graph, self.store, self.policy);
+        var program = try program_mod.compileGraph(self.allocator, graph, self.store, self.policy);
         errdefer program.deinit();
 
         return .{
@@ -824,7 +1088,7 @@ pub const LoadedModel = struct {
     }
 
     fn findStaticCacheEntry(self: *Self, desired_direct_input_ids: []const TensorId) api_errors.ExecuteError!?usize {
-        if (self.package.dim_symbols.len != 0) return null;
+        if (self.dim_symbol_count != 0) return null;
         for (self.cache_entries.items, 0..) |*entry, idx| {
             if (try self.prepareCacheEntryInputs(entry, desired_direct_input_ids)) return idx;
         }
@@ -869,6 +1133,10 @@ pub const LoadedModel = struct {
         return @intCast(raw);
     }
 };
+
+/// Backwards-compatible alias. `Model` is the single unified executable type,
+/// produced by both `ctx.compile` (in-process graph) and `ctx.loadModel*` (package).
+pub const LoadedModel = Model;
 
 const ResolvedInputs = struct {
     symbol_values: []const u64,

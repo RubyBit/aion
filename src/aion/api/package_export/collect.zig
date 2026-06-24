@@ -61,8 +61,8 @@ pub fn collectIoAliases(
     errdefer allocator.free(out);
     for (aliases, 0..) |alias, idx| {
         out[idx] = .{
-            .input = try findNamedValueIndex(inputs, alias.input_name),
-            .output = try findNamedValueIndex(outputs, alias.output_name),
+            .input = try findNamedValueByValueId(inputs, alias.input.value),
+            .output = try findNamedValueByValueId(outputs, alias.output.value),
         };
     }
     return out;
@@ -108,6 +108,13 @@ pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]
 pub fn findNamedValueIndex(named_values: []const package_file.NamedValue, name: []const u8) !u32 {
     for (named_values, 0..) |entry, idx| {
         if (std.mem.eql(u8, entry.name, name)) return @intCast(idx);
+    }
+    return error.InvalidArgument;
+}
+
+fn findNamedValueByValueId(named_values: []const package_file.NamedValue, value: u32) !u32 {
+    for (named_values, 0..) |entry, idx| {
+        if (entry.value == value) return @intCast(idx);
     }
     return error.InvalidArgument;
 }

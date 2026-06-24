@@ -99,7 +99,7 @@ test "api: build+compile+run (matmul/broadcast/relu/copy/reduce)" {
     const G = try bld.mul(F, F);
     const Out = try bld.reduce(.mean, G);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -184,7 +184,7 @@ test "api: i32 tensor typed IO + compile+run copy" {
     const X = try bld.param(in_t);
     const Y = try bld.copy(X);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -213,7 +213,7 @@ test "api: reduceAxis mean over last dim" {
     const X: api.TensorRef = try bld.param(x_t);
     const Y: api.TensorRef = try bld.reduceAxis(.mean, X, -1);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -251,7 +251,7 @@ test "api: squeeze and unsqueeze roundtrip" {
     const U0: api.TensorRef = try bld.unsqueeze(S, 0);
     const U1: api.TensorRef = try bld.unsqueeze(U0, 2);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{ U1, S });
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ U1, S }, .{});
     defer model.deinit();
 
     const out_u: api.Tensor = try model.runOutputTensor(0);
@@ -261,7 +261,7 @@ test "api: squeeze and unsqueeze roundtrip" {
     try out_u.read(&out_u_vals);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 }, out_u_vals[0..]);
 
-    const out_s: api.Tensor = model.outputTensor(1);
+    const out_s: api.Tensor = try model.outputTensorAt(1);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, out_s.getShape());
 
     // Invalid squeeze axis (dimension != 1) is validated during infer/compile.
@@ -270,7 +270,7 @@ test "api: squeeze and unsqueeze roundtrip" {
     const X_bad: api.TensorRef = try bld_bad.param(x_t);
     const S_bad: api.TensorRef = try bld_bad.squeeze(X_bad, null);
     const Bad: api.TensorRef = try bld_bad.squeeze(S_bad, 1);
-    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld_bad, &[_]api.TensorRef{Bad}));
+    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld_bad, &[_]api.TensorRef{Bad}, .{}));
 }
 
 test "api.nn: Conv1D bind+forward" {
@@ -310,7 +310,7 @@ test "api.nn: Conv1D bind+forward" {
 
     const Y: api.TensorRef = try conv.forward(&bld, X);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -349,7 +349,7 @@ test "api: generic nd slice" {
     const X: api.TensorRef = try bld.param(x_t);
     const S: api.TensorRef = try bld.slice(X, &[_]usize{ 1, 1, 0 }, &[_]usize{ 1, 2, 3 });
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{S});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{S}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -377,7 +377,7 @@ test "api: concat and stack" {
 
     const C: api.TensorRef = try bld.concat(&[_]api.TensorRef{ A, B }, 1);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{C});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{C}, .{});
     defer model.deinit();
 
     const out_c: api.Tensor = try model.runOutputTensor(0);
@@ -392,7 +392,7 @@ test "api: concat and stack" {
     const B2: api.TensorRef = try bld2.param(a_t);
     const S: api.TensorRef = try bld2.stack(&[_]api.TensorRef{ A2, B2 }, 0);
 
-    var model2 = try ctx.compile(&bld2, &[_]api.TensorRef{S});
+    var model2 = try ctx.compile(&bld2, &[_]api.TensorRef{S}, .{});
     defer model2.deinit();
 
     const out_s: api.Tensor = try model2.runOutputTensor(0);
@@ -425,7 +425,7 @@ test "api: model outputCount/outputTensor + builder.name" {
     const Y: api.TensorRef = try bld.relu(C);
     const Mean: api.TensorRef = try bld.reduce(.mean, C);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{ Mean, Y });
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ Mean, Y }, .{});
     defer model.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), model.outputCount());
@@ -434,7 +434,7 @@ test "api: model outputCount/outputTensor + builder.name" {
     const out0: f32 = try out0_t.readScalar(f32);
     try std.testing.expect(std.math.isFinite(out0));
 
-    const out1_t: api.Tensor = model.outputTensor(1);
+    const out1_t: api.Tensor = try model.outputTensorAt(1);
     try std.testing.expectEqual(types.DType.f32, out1_t.getDType());
     try std.testing.expectEqualSlices(usize, &[_]usize{ m_dim, n_dim }, out1_t.getShape());
 
@@ -633,7 +633,7 @@ test "api.nn: mini resnet (conv/residual/linear/softmax)" {
     const Logits: api.TensorRef = try fc.forward(&bld, Mean2);
     const Probs: api.TensorRef = try nn.softmaxLastDim(&bld, Logits);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Probs});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Probs}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -754,7 +754,7 @@ test "api.nn: lstm cell (single step)" {
     const cell: nn.LSTMCell = try nn.LSTMCell.bind(&bld, w_ih_t, w_hh_t, b_ih_t, b_hh_t);
     const st: nn.LSTMState = try cell.forward(&bld, X, H0, C0);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{ st.h, st.c });
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ st.h, st.c }, .{});
     defer model.deinit();
 
     const out_h_t: api.Tensor = try model.runOutputTensor(0);
@@ -816,7 +816,7 @@ test "api: rfft matches one-sided DFT" {
     const X: api.TensorRef = try bld.param(x_t);
     const Out: api.TensorRef = try bld.rfft(X);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -872,7 +872,7 @@ test "api: stft with center reflect-padding matches reference" {
     const Win: api.TensorRef = try bld.param(win_t);
     const Out: api.TensorRef = try bld.stft(Sig, Win, n_fft, hop, true);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -926,7 +926,7 @@ test "api: stft frames + windows + rfft (no center)" {
     const Win: api.TensorRef = try bld.param(win_t);
     const Out: api.TensorRef = try bld.stft(Sig, Win, n_fft, hop, false);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -1029,7 +1029,7 @@ test "api: unbound recurrent state auto-initializes, carries across runs, and re
         .{ .name = "state_out", .tensor = StateOut },
     }, .{
         .output_aliases = &[_]api.OutputAlias{
-            .{ .input_name = "state_in", .output_name = "state_out" },
+            .{ .input = StateIn, .output = StateOut },
         },
     });
 
@@ -1098,7 +1098,7 @@ test "api: recurrent state carries across cache entries with different input sha
             .{ .tensor = X, .axis = 1, .name = "S" },
         },
         .output_aliases = &[_]api.OutputAlias{
-            .{ .input_name = "state_in", .output_name = "state_out" },
+            .{ .input = StateIn, .output = StateOut },
         },
     });
 
@@ -1150,6 +1150,51 @@ test "api: recurrent state carries across cache entries with different input sha
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), v[0], 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), v[1], 1e-6);
     }
+}
+
+test "api: compile io-alias gives auto-init + carry + reset (no export/load)" {
+    // The unified Model from ctx.compile must support the same recurrent-state
+    // ergonomics as a loaded model: unbound aliased state auto-zeros, carries across
+    // runs, and resetState clears it — all in-process, no .aion round trip.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const StateIn: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "state_in");
+    // Name the output so the io-alias can reference it; pass it as a bare TensorRef.
+    const StateOut: api.TensorRef = try bld.name(try bld.add(StateIn, X), "state_out");
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{StateOut}, .{
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input = StateIn, .output = StateOut },
+        },
+    });
+    defer model.deinit();
+
+    const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 1.0, 2.0 }});
+    try model.bindInput("x", x_t); // never bind state_in
+
+    const expect = struct {
+        fn run(m: *api.Model, e0: f32, e1: f32) !void {
+            try m.run();
+            const out: api.Tensor = try m.outputTensor("state_out");
+            var vals: [2]f32 = undefined;
+            try out.read(&vals);
+            try std.testing.expectApproxEqAbs(e0, vals[0], 1e-6);
+            try std.testing.expectApproxEqAbs(e1, vals[1], 1e-6);
+        }
+    };
+
+    try expect.run(&model, 1.0, 2.0); // auto-zeroed state
+    try expect.run(&model, 2.0, 4.0); // carried
+    try expect.run(&model, 3.0, 6.0);
+    try model.resetState();
+    try expect.run(&model, 1.0, 2.0); // cleared
 }
 
 test "api: loadModel with auto_init_inputs=false errors on an unbound input" {
@@ -1429,7 +1474,7 @@ test "api: loadWeights lets you load a backbone and attach different heads" {
     if (head_cls.b) |b0| head_cls.b = try bld_cls.name(b0, "head.classifier.b");
     const LogitsC: api.TensorRef = try head_cls.forward(&bld_cls, HiddenC);
 
-    var model_cls = try ctx.compile(&bld_cls, &[_]api.TensorRef{LogitsC});
+    var model_cls = try ctx.compile(&bld_cls, &[_]api.TensorRef{LogitsC}, .{});
     defer model_cls.deinit();
     const out_cls_t: api.Tensor = try model_cls.runOutputTensor(0);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3 }, out_cls_t.getShape());
@@ -1468,10 +1513,10 @@ test "api: loadWeights lets you load a backbone and attach different heads" {
     const Start: api.TensorRef = try bld_qa.matmul(HiddenQ, Ws, 1.0, 0.0);
     const End: api.TensorRef = try bld_qa.matmul(HiddenQ, We, 1.0, 0.0);
 
-    var model_qa = try ctx.compile(&bld_qa, &[_]api.TensorRef{ Start, End });
+    var model_qa = try ctx.compile(&bld_qa, &[_]api.TensorRef{ Start, End }, .{});
     defer model_qa.deinit();
     const out_s_t: api.Tensor = try model_qa.runOutputTensor(0);
-    const out_e_t: api.Tensor = model_qa.outputTensor(1);
+    const out_e_t: api.Tensor = try model_qa.outputTensorAt(1);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2 }, out_s_t.getShape());
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2 }, out_e_t.getShape());
 
@@ -1518,7 +1563,7 @@ test "api: loadModel output aliases keep recurrent state internal" {
         .{ .name = "next_state", .tensor = NextState },
     }, .{
         .output_aliases = &[_]api.OutputAlias{
-            .{ .input_name = "state", .output_name = "next_state" },
+            .{ .input = State, .output = NextState },
         },
     });
 
@@ -1706,7 +1751,7 @@ test "api.module: vtable dynamic module can build graph" {
     try std.testing.expect(bld.valueName(Y) != null);
     try std.testing.expectEqualStrings("bias_add_dyn#0/add#0", bld.valueName(Y).?);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
 
     const y_t: api.Tensor = try model.runOutputTensor(0);
@@ -1764,7 +1809,7 @@ test "api.module: moduleDynFrom converts nn.Linear" {
     try std.testing.expect(bld.valueName(Y) != null);
     try std.testing.expectEqualStrings("Linear#0/broadcast_add_last_dim#1", bld.valueName(Y).?);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -2066,7 +2111,7 @@ test "api: kvCacheAppend mutates cache in-place" {
     const End: api.TensorRef = try bld.param(end_t);
     const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -2125,7 +2170,7 @@ test "api: kvCacheAppend ring policy wraps" {
     const End: api.TensorRef = try bld.param(end_t);
     const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -2180,7 +2225,7 @@ test "api: kvCacheAppend growable policy expands physical capacity" {
     const End: api.TensorRef = try bld.param(end_t);
     const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -2250,7 +2295,7 @@ test "api: multiHeadAttentionCached matches deterministic windowed-causal averag
         0.0,
     );
 
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out});
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
@@ -2305,7 +2350,7 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     const End: api.TensorRef = try bld.param(end_t);
 
     const Out: api.TensorRef = try bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0);
-    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}));
+    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}, .{}));
 }
 
 // Opt-in load test: loads a pre-built `.aion` package from `AION_GEMMA_VERIFY_PATH`
@@ -2365,7 +2410,7 @@ test "api: loaded package keeps weights quantized (opt-in via AION_GEMMA_VERIFY_
     // Count only initializer-backed tensors for the "weights remain quantized" claim.
     // The store also contains many produced/intermediate tensors allocated during
     // compilation, and those are not expected to be quantized.
-    for (model.package.values, 0..) |value, idx| {
+    for (model.source.package.values, 0..) |value, idx| {
         if (value.source != .initializer) continue;
         const wt = try model.initializerTensorByValue(@intCast(idx));
         const meta = try ctx.store.getConst(wt.tensorId());

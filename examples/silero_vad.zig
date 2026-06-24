@@ -120,21 +120,33 @@ fn buildTinySileroModel(
     allocator: std.mem.Allocator,
     weights: TinySileroWeights,
     pad_mode: types.PadMode,
-    x_tensor: Tensor,
-    h_tensor: Tensor,
-    c_tensor: Tensor,
+    chunk_input_len: usize,
 ) !api.Model {
     var bld: Builder = api.Builder.init(allocator);
     defer bld.deinit();
 
-    const x_ref: TensorRef = try bld.name(try bld.param(x_tensor), ModelTensorNames.x);
-    const h_ref: TensorRef = try bld.name(try bld.param(h_tensor), ModelTensorNames.h);
-    const c_ref: TensorRef = try bld.name(try bld.param(c_tensor), ModelTensorNames.c);
+    // x is a real per-chunk input; h/c are recurrent state declared as public
+    // inputs and io-aliased to their outputs, so the runtime auto-zeros them on the
+    // first run and carries them across chunks — no manual state threading.
+    const x_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, chunk_input_len }), ModelTensorNames.x);
+    const h_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.h);
+    const c_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.c);
 
     const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
     const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref });
 
-    return try ctx.compile(&bld, &[_]api.TensorRef{ out.prob, out.h, out.c });
+    // Name the outputs so they can be read by name and referenced by io-aliases,
+    // then hand them to `compile` as bare TensorRefs.
+    const prob_ref: TensorRef = try bld.name(out.prob, ModelTensorNames.prob);
+    const next_h_ref: TensorRef = try bld.name(out.h, ModelTensorNames.next_h);
+    const next_c_ref: TensorRef = try bld.name(out.c, ModelTensorNames.next_c);
+
+    return try ctx.compile(&bld, &[_]api.TensorRef{ prob_ref, next_h_ref, next_c_ref }, .{
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input = h_ref, .output = next_h_ref },
+            .{ .input = c_ref, .output = next_c_ref },
+        },
+    });
 }
 
 const TinySileroVAD = struct {
@@ -504,8 +516,8 @@ fn exportTinySileroPackage(
             .{ .tensor = c_ref, .axis = 0, .name = "batch" },
         },
         .output_aliases = &[_]api.OutputAlias{
-            .{ .input_name = ModelTensorNames.h, .output_name = ModelTensorNames.next_h },
-            .{ .input_name = ModelTensorNames.c, .output_name = ModelTensorNames.next_c },
+            .{ .input = h_ref, .output = out.h },
+            .{ .input = c_ref, .output = out.c },
         },
     });
 }
@@ -758,24 +770,12 @@ fn mainImpl(args: std.process.Args) !void {
         break :blk try createSyntheticWeights(&ctx, allocator);
     };
 
-    const x_shape: [2]usize = .{ 1, chunk_input_len };
-    const h_shape: [2]usize = .{ 1, 128 };
-    const c_shape: [2]usize = .{ 1, 128 };
-    const x_tensor: Tensor = try ctx.tensor(.f32, x_shape[0..2]);
-    const h_tensor: Tensor = try ctx.tensor(.f32, h_shape[0..2]);
-    const c_tensor: Tensor = try ctx.tensor(.f32, c_shape[0..2]);
-
-    var zeros_h: [128]f32 = .{0.0} ** 128;
-    var zeros_c: [128]f32 = .{0.0} ** 128;
-    try h_tensor.writeF32(zeros_h[0..]);
-    try c_tensor.writeF32(zeros_c[0..]);
-
-    var model: api.Model = try buildTinySileroModel(&ctx, allocator, tiny_weights, opts.pad_mode, x_tensor, h_tensor, c_tensor);
+    var model: api.Model = try buildTinySileroModel(&ctx, allocator, tiny_weights, opts.pad_mode, chunk_input_len);
     defer model.deinit();
 
-    const prob_t: Tensor = model.outputTensor(0);
-    const next_h_t: Tensor = model.outputTensor(1);
-    const next_c_t: Tensor = model.outputTensor(2);
+    // One reusable input tensor for `x`. The LSTM state (h/c) is io-aliased and
+    // carried by the runtime, so it is never bound here.
+    const x_tensor: Tensor = try ctx.tensor(.f32, &[_]usize{ 1, chunk_input_len });
 
     var wav_opt: ?Wav = null;
     defer if (wav_opt) |w| allocator.free(w.samples);
@@ -816,8 +816,8 @@ fn mainImpl(args: std.process.Args) !void {
 
     const t0_ns: u64 = nowNs();
     for (0..opts.bench_iters) |_| {
-        try h_tensor.writeF32(zeros_h[0..]);
-        try c_tensor.writeF32(zeros_c[0..]);
+        // Each pass is an independent stream: clear the carried LSTM state.
+        try model.resetState();
 
         for (0..opts.chunks) |chunk_idx| {
             const start: usize = chunk_idx * opts.num_samples;
@@ -829,6 +829,7 @@ fn mainImpl(args: std.process.Args) !void {
                 std.debug.print("write input failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
+            try model.bindInput(ModelTensorNames.x, x_tensor);
             const t_d: u64 = if (opts.profile) nowNs() else 0;
             if (opts.profile) t_write_in_ns += (t_d - t_c);
 
@@ -842,22 +843,15 @@ fn mainImpl(args: std.process.Args) !void {
 
             const t_g: u64 = if (opts.profile) nowNs() else 0;
             var prob_tmp: [1]f32 = .{0.0};
+            const prob_t: Tensor = model.outputTensor(ModelTensorNames.prob) catch |e| {
+                std.debug.print("fetch prob failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
+                return e;
+            };
             prob_t.readF32(prob_tmp[0..]) catch |e| {
                 std.debug.print("read prob failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
                 return e;
             };
             probs[chunk_idx] = prob_tmp[0];
-
-            next_h_t.readF32(h_buf[0..]) catch |e| {
-                std.debug.print("read next_h failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
-                return e;
-            };
-            next_c_t.readF32(c_buf[0..]) catch |e| {
-                std.debug.print("read next_c failed at chunk {}: {s}\n", .{ chunk_idx, @errorName(e) });
-                return e;
-            };
-            try h_tensor.writeF32(h_buf[0..]);
-            try c_tensor.writeF32(c_buf[0..]);
 
             if (opts.print_probs) {
                 const chunk_ms: f64 = (@as(f64, @floatFromInt(chunk_idx)) * @as(f64, @floatFromInt(opts.num_samples)) * 1000.0) / 16000.0;
@@ -871,8 +865,12 @@ fn mainImpl(args: std.process.Args) !void {
     const t1_ns: u64 = nowNs();
 
     // Snapshot final streaming state once (for a cheap correctness signal).
-    try next_h_t.readF32(h_buf[0..]);
-    try next_c_t.readF32(c_buf[0..]);
+    {
+        const nh: Tensor = try model.outputTensor(ModelTensorNames.next_h);
+        try nh.readF32(h_buf[0..]);
+        const nc: Tensor = try model.outputTensor(ModelTensorNames.next_c);
+        try nc.readF32(c_buf[0..]);
+    }
 
     const elapsed_ns_u: u64 = @max(@as(u64, 1), t1_ns - t0_ns);
     const total_chunks: usize = opts.bench_iters * opts.chunks;

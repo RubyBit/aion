@@ -10,11 +10,11 @@ const manager_mod = @import("../storage/manager.zig");
 const plan_mod = @import("../graph/plan.zig");
 const graph_mod = @import("../graph/graph.zig");
 const program_mod = @import("../graph/program.zig");
+const infer_mod = @import("../graph/infer.zig");
 
 const api_builder = @import("builder.zig");
 const api_loaded_model = @import("loaded_model.zig");
 const api_weights = @import("weights.zig");
-const api_model = @import("model.zig");
 const api_package_export = @import("package_export.zig");
 const api_tensor = @import("tensor.zig");
 const api_tiling = @import("tiling.zig");
@@ -22,6 +22,7 @@ const api_errors = @import("errors.zig");
 
 pub const DType = types.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
+pub const Model = api_loaded_model.Model;
 pub const LoadedModel = api_loaded_model.LoadedModel;
 pub const Weights = api_weights.Weights;
 pub const LoadModelOptions = api_loaded_model.LoadModelOptions;
@@ -433,21 +434,93 @@ pub const Context = struct {
         return self.fromPackedScalar(dt, shape, packed_bytes);
     }
 
-    /// Compile a builder into a runnable model.
-    pub fn compile(self: *Self, b: *api_builder.Builder, outputs: []const api_builder.TensorRef) api_errors.ApiError!api_model.Model {
+    /// Compile a builder into a runnable `Model` (in-process graph source) — the
+    /// in-process analogue of `exportModel`.
+    ///
+    /// Outputs are bare `TensorRef`s: each output's *name* is the one already attached
+    /// to the value by the builder (`bld.name(ref, "...")`, else the op's auto-name),
+    /// so there is no need to wrap them in `NamedTensorRef`. Access outputs by name via
+    /// `outputTensor` or by position via `outputTensorAt`/`runOutputTensor`. Name an
+    /// output explicitly when you need to reference it (e.g. in `opts.output_aliases`).
+    ///
+    /// `opts.output_aliases` declares io-alias recurrent-state carry (by name);
+    /// `opts.input_symbols` (variable shapes) is not yet supported on the compile path
+    /// — use `exportModel`+`loadModel` for that.
+    pub fn compile(
+        self: *Self,
+        b: *api_builder.Builder,
+        outputs: []const api_builder.TensorRef,
+        opts: ExportModelOptions,
+    ) api_errors.ApiError!Model {
         if (outputs.len == 0) return api_errors.ApiError.InvalidArgument;
+        if (opts.input_symbols.len != 0) return api_errors.ApiError.InvalidArgument; // concrete-only for now
 
         const g: *graph_mod.Graph = b.innerGraph();
+        try infer_mod.infer(g);
 
-        // Set graph outputs.
-        const tmp: []graph_mod.ValueId = try self.allocator.alloc(graph_mod.ValueId, outputs.len);
-        defer self.allocator.free(tmp);
-        for (outputs, 0..) |o, i| tmp[i] = o.value;
-        try g.setOutputs(tmp);
+        // Names that are auto-generated (unnamed public inputs) live here until
+        // `initCompiled` copies them into the model's arena.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
 
-        var prog = try program_mod.compileGraph(self.allocator, g, &self.store, self.policy);
-        errdefer prog.deinit();
+        // Public inputs = graph leaves with no producer and no external binding
+        // (params are external-bound and become baked initializers).
+        var input_ids: std.ArrayList(graph_mod.ValueId) = .empty;
+        defer input_ids.deinit(self.allocator);
+        var input_names: std.ArrayList([]const u8) = .empty;
+        defer input_names.deinit(self.allocator);
+        for (g.values.items, 0..) |v, idx| {
+            if (v.producer != null or v.external != null) continue;
+            const vid: graph_mod.ValueId = @intCast(idx);
+            const nm = b.valueName(.{ .value = vid }) orelse
+                (std.fmt.allocPrint(sa, "input{d}", .{input_ids.items.len}) catch return error.OutOfMemory);
+            try input_ids.append(self.allocator, vid);
+            try input_names.append(self.allocator, nm);
+        }
 
-        return .{ .allocator = self.allocator, .ctx = self, .program = prog };
+        const out_ids = try self.allocator.alloc(graph_mod.ValueId, outputs.len);
+        defer self.allocator.free(out_ids);
+        const out_names = try self.allocator.alloc([]const u8, outputs.len);
+        defer self.allocator.free(out_names);
+        for (outputs, 0..) |o, i| {
+            out_ids[i] = o.value;
+            // The output's name is whatever the builder attached to the value
+            // (explicit `bld.name` or the op auto-name); fall back to positional.
+            out_names[i] = b.valueName(o) orelse
+                (std.fmt.allocPrint(sa, "output{d}", .{i}) catch return error.OutOfMemory);
+        }
+
+        // Map each alias (by tensor) to (input index, output index) pairs.
+        var aliases: std.ArrayList(package_file.IoAlias) = .empty;
+        defer aliases.deinit(self.allocator);
+        for (opts.output_aliases) |al| {
+            const in_idx = findValueIdIndex(input_ids.items, al.input.value) orelse return api_errors.ApiError.InvalidArgument;
+            const out_idx = findValueIdIndex(out_ids, al.output.value) orelse return api_errors.ApiError.InvalidArgument;
+            try aliases.append(self.allocator, .{ .input = @intCast(in_idx), .output = @intCast(out_idx) });
+        }
+
+        // Transfer graph ownership to the model; the builder keeps a fresh empty graph.
+        const owned_graph = b.takeGraph();
+        return api_loaded_model.Model.initCompiled(
+            self.allocator,
+            self.backend(),
+            &self.store,
+            self.policy,
+            owned_graph,
+            input_ids.items,
+            input_names.items,
+            out_ids,
+            out_names,
+            aliases.items,
+            .{},
+        );
     }
 };
+
+fn findValueIdIndex(ids: []const graph_mod.ValueId, id: graph_mod.ValueId) ?usize {
+    for (ids, 0..) |v, i| {
+        if (v == id) return i;
+    }
+    return null;
+}

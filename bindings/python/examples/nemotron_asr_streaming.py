@@ -121,21 +121,19 @@ def run_single_file(model_path: str, audio: np.ndarray, t_mel: int, max_out: int
     exposed as named carries; the initial state is fresh bookkeeping
     (frame/sym/count = 0, active = 1) plus blank-SOS last_token and zero LSTM
     state. (For streaming, last_out + h*/c*_out are IoAlias'd back.)
+
+    Only the inputs with a non-zero initial value are bound here (audio, the
+    active flag, blank-SOS last_token). The zero LSTM state (h0/c0/h1/c1) and the
+    zero bookkeeping carries (frame/sym/count/toks) are left unbound: the runtime
+    auto-initializes any unbound input to zeros (LoadModelOptions.auto_init_inputs).
     """
     m = aion.load_model(model_path, thread_count=threads)
     ctx = m.context
     n = (t_mel - 1) * HOP  # samples whose center-STFT yields t_mel frames
     a = _fit_samples(audio, n).astype(np.float32)
     m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
-    m.bind_input("frame_in", _i32(ctx, [0]))
-    m.bind_input("sym_in", _i32(ctx, [0]))
-    m.bind_input("count_in", _i32(ctx, [0]))
     m.bind_input("active_in", _i32(ctx, [1]))
     m.bind_input("last_in", _i32(ctx, [BLANK]))
-    zero = np.zeros((1, PRED_HIDDEN), np.float32)
-    for nm in ("h0_in", "c0_in", "h1_in", "c1_in"):
-        m.bind_input(nm, aion.Tensor.from_numpy(ctx, zero))
-    m.bind_input("toks_in", _i32(ctx, np.zeros((max_out, 1), np.int32)))
     m.run()
     oc = m.output_tensor("out_count")
     count = int(oc.read_i32()[0])
@@ -163,18 +161,17 @@ def run_streaming(stream_full_path, audio, tokenizer, threads, att_left=70, att_
 
     All streaming state is threaded *inside the runtime*: the per-layer K/V + conv
     caches and the persistent decode state (last_token + LSTM h/c) are IoAlias'd
-    output->input, and each decode-Loop carry leaves its final value in its own
-    input slot. So those inputs are bound ONCE (zeros) and never rebound — the
-    runtime carries them across runs. Tensor storage is owned by the Context for
-    its whole lifetime, so creating fresh inputs per chunk would leak ~15 MB/step
-    (the 24 K/V caches dominate). Bind-once + write-in-place => zero per-step alloc.
-    Only the per-run inputs change: audio/cache_mask (rewritten in place) and the
-    per-run decode bookkeeping (frame/sym/count/active/toks), which are Loop carries
-    re-seeded to their start values each chunk."""
+    output->input. They start at zero, so we leave them UNBOUND and let the runtime
+    auto-initialize each to zeros on first use and carry the io-aliased ones across
+    runs (LoadModelOptions.auto_init_inputs, on by default). The auto slots are
+    allocated once and reused, so there is no per-step allocation. Only a few inputs
+    are bound here: audio/cache_mask (rewritten in place each chunk) and the per-run
+    decode bookkeeping (frame/sym/count/active/toks), which are Loop carries re-seeded
+    to their start values each chunk. `last_in` also needs an explicit seed because
+    it starts at the (non-zero) blank SOS token."""
     import sentencepiece as spm
     chunk = att_right + 1
     t_kv = att_left + chunk
-    nl, d, head, hd = 24, 1024, 8, 128
     need = 2 + chunk + 1; wmel = 40   # mel window sized to chunk (matches converter)
     while _calc_len(wmel) < need:
         wmel += 8
@@ -197,14 +194,12 @@ def run_streaming(stream_full_path, audio, tokenizer, threads, att_left=70, att_
     m.bind_input("frame_in", t_frame); m.bind_input("sym_in", t_sym)
     m.bind_input("count_in", t_count); m.bind_input("active_in", t_active)
     m.bind_input("toks_in", t_toks)
-    # Persistent state (IoAlias'd / self-carried) — bound once, threaded by runtime.
+    # Persistent state — the 24 per-layer K/V + conv caches and the decode LSTM
+    # state (h0/c0/h1/c1) are IoAlias'd output->input in the model and start at
+    # zero, so we leave them UNBOUND: the runtime auto-zeros each on first use and
+    # carries it across runs (auto-init + auto-carry). Only `last_in` needs an
+    # explicit seed because it starts at the (non-zero) blank SOS token.
     m.bind_input("last_in", _i32(ctx, [BLANK]))
-    for nm in ("h0_in", "c0_in", "h1_in", "c1_in"):
-        m.bind_input(nm, fn(np.zeros((1, PRED_HIDDEN), np.float32)))
-    for li in range(nl):
-        m.bind_input(f"kcache_{li}_in", fn(np.zeros((1, att_left, head, hd), np.float32)))
-        m.bind_input(f"vcache_{li}_in", fn(np.zeros((1, att_left, head, hd), np.float32)))
-        m.bind_input(f"conv_cache_{li}_in", fn(np.zeros((1, 8, d), np.float32)))
 
     tokens = []
     buf = np.concatenate([np.zeros(pad, np.float32), audio.astype(np.float32)])

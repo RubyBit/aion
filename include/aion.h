@@ -195,6 +195,9 @@ AION_API AionStatus aion_loaded_model_output_rank(const AionLoadedModel* m, size
 
 AION_API AionStatus aion_loaded_model_bind_input(AionLoadedModel* m, const char* name, const AionTensor* tensor);
 AION_API AionStatus aion_loaded_model_run(AionLoadedModel* m);
+/* Zero all recurrent (io-aliased) input state, e.g. KV caches and LSTM h/c.
+   Use between independent sequences. No-op before the first run. */
+AION_API AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
 AION_API AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
 
 #ifdef __cplusplus

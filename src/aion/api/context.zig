@@ -173,7 +173,7 @@ pub const Context = struct {
         return self.exportModel(file, bld, outputs, opts);
     }
 
-    pub fn loadModel(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!LoadedModel {
+    pub fn loadModel(self: *Self, file: std.Io.File, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
         // `parseTakeOwned` transfers ownership of `bytes` into the returned Package
         // (Initializer.data slices borrow into it). `pkg.deinit` frees the buffer.
         const bytes = try package_file.readAlloc(self.allocator, file);
@@ -193,7 +193,7 @@ pub const Context = struct {
         // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
         const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, self.policy, &pkg, file, bytes);
         errdefer self.allocator.free(initializer_tids);
-        return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash);
+        return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash, opts);
     }
 
     /// Load an AION package as a weights-only container.

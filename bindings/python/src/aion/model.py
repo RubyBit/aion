@@ -229,6 +229,15 @@ class LoadedModel:
         st = lib.aion_loaded_model_run(self._m)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_run")
 
+    def reset_state(self) -> None:
+        """Zero all recurrent (io-aliased) input state — KV caches, LSTM h/c, etc.
+
+        Call this between independent sequences (e.g. utterances) instead of
+        reloading the model. No-op before the first ``run()``.
+        """
+        st = lib.aion_loaded_model_reset_state(self._m)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_reset_state")
+
     def output_tensor(self, name: str):
         if not isinstance(name, str):
             raise TypeError("name must be a str")

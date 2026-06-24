@@ -27,7 +27,19 @@ pub const IoAliasInfo = struct {
     output_index: usize,
 };
 
-pub const LoadModelOptions = struct {};
+pub const LoadModelOptions = struct {
+    /// When true (the default), any graph input the caller does not bind before
+    /// `run()` is auto-allocated and zero-initialized, with its shape inferred from
+    /// the symbol bindings contributed by the inputs that *were* bound. Recurrent
+    /// (io-aliased) state inputs additionally carry their contents across runs.
+    ///
+    /// When false, `run()` preserves strict binding: any unbound input is an error.
+    ///
+    /// Note: auto-init seeds zeros. Inputs that need a non-zero initial value
+    /// (e.g. a "still active" flag or a blank token id) must still be bound
+    /// explicitly by the caller.
+    auto_init_inputs: bool = true,
+};
 
 pub const invalid_alias_index: u32 = std.math.maxInt(u32);
 pub const invalid_tensor_id: TensorId = std.math.maxInt(TensorId);

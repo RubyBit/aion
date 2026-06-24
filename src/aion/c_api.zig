@@ -606,6 +606,18 @@ pub export fn aion_loaded_model_run(m_opt: ?*AionLoadedModel) callconv(.c) AionS
     return .AION_OK;
 }
 
+pub export fn aion_loaded_model_reset_state(m_opt: ?*AionLoadedModel) callconv(.c) AionStatus {
+    const m: *AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = m.owner;
+    ctx.clearLastError();
+
+    m.model.resetState() catch |e| {
+        ctx.setLastError("loaded_model_reset_state", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
 pub export fn aion_loaded_model_output_tensor(
     m_opt: ?*AionLoadedModel,
     name: ?[*:0]const u8,

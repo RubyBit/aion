@@ -48,6 +48,22 @@ pub const LoadedModel = struct {
     output_alias_input_indices: []u32,
     bound_inputs: []?Tensor,
     aliased_input_bind_versions: []u64,
+    /// Persistent store tensors auto-allocated for inputs the caller never binds
+    /// (zero-initialized; aliased ones carry state across runs). One slot per input;
+    /// `invalid_tensor_id` until first auto-init. See `ensureAutoInputs`.
+    auto_input_tids: []TensorId,
+    auto_init_inputs: bool,
+    /// Model-level (NOT per cache-entry) backing storage for io-aliased "state"
+    /// inputs — KV caches, LSTM h/c, decode carries. Every compiled cache entry
+    /// binds the SAME slot for a given aliased input, so recurrent state carries
+    /// across entries with different input shapes (e.g. prefill seq=S -> decode
+    /// seq=1). One slot per input; `invalid_tensor_id` for non-aliased / not-yet-built.
+    aliased_state_tids: []TensorId,
+    /// Per-input bind-version that has already been copied into `aliased_state_tids`.
+    /// Tracked at model level (not per entry) so the caller's bound tensor is seeded
+    /// into the shared slot exactly once per bind, not re-copied when a new-shape
+    /// entry first runs (which would clobber carried state).
+    aliased_state_synced_versions: []u64,
     run_symbol_bindings: []?u64,
     run_symbol_values: []u64,
     run_input_shapes: []usize,
@@ -87,7 +103,6 @@ pub const LoadedModel = struct {
             self.allocator.free(entry.input_shapes);
             self.allocator.free(entry.input_slots);
             self.allocator.free(entry.direct_input_ids);
-            self.allocator.free(entry.aliased_input_sync_versions);
         }
         self.cache_entries.deinit(self.allocator);
         self.allocator.free(self.initializer_tids);
@@ -98,6 +113,9 @@ pub const LoadedModel = struct {
         self.allocator.free(self.output_alias_input_indices);
         self.allocator.free(self.bound_inputs);
         self.allocator.free(self.aliased_input_bind_versions);
+        self.allocator.free(self.auto_input_tids);
+        self.allocator.free(self.aliased_state_tids);
+        self.allocator.free(self.aliased_state_synced_versions);
         self.allocator.free(self.run_symbol_bindings);
         self.allocator.free(self.run_symbol_values);
         self.allocator.free(self.run_input_shapes);
@@ -225,12 +243,28 @@ pub const LoadedModel = struct {
         }
     }
 
+    /// Reset recurrent state: zero every io-aliased "state" slot (KV caches, LSTM
+    /// h/c, decode state). The slots are shared across all compiled cache entries,
+    /// so one pass clears the state seen by every entry. Use between independent
+    /// sequences (e.g. utterances) without reloading the model. A no-op before the
+    /// first `run()` (no slots allocated yet).
+    pub fn resetState(self: *Self) api_errors.ExecuteError!void {
+        for (self.aliased_state_tids) |tid| {
+            if (tid == types_mod.invalid_tensor_id) continue;
+            initializers.zeroStoreTensor(self.store, tid) catch return error.InvalidArgument;
+        }
+    }
+
     pub fn run(self: *Self) api_errors.ExecuteError!void {
         const trace: bool = self.trace_runs;
-        if (trace) {
-            std.debug.print("[aion][run] begin\n", .{});
-            self.debugDumpBoundInputs(true);
-        }
+        if (trace) std.debug.print("[aion][run] begin\n", .{});
+
+        // Fill any input the caller never bound with a persistent, zero-initialized
+        // slot (recurrent/aliased ones carry their contents across runs). After this,
+        // every input is bound and the rest of `run()` proceeds unchanged.
+        try self.ensureAutoInputs(trace);
+
+        if (trace) self.debugDumpBoundInputs(true);
 
         const resolved = self.resolveBindings() catch |e| {
             if (trace) {
@@ -290,7 +324,7 @@ pub const LoadedModel = struct {
             const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
             if (self.inputAliasOutputIndex(i) != null) {
                 const bind_version = self.aliased_input_bind_versions[i];
-                if (bind_version != 0 and entry.aliased_input_sync_versions[i] != bind_version) {
+                if (bind_version != 0 and self.aliased_state_synced_versions[i] != bind_version) {
                     if (src.id != dst.id) dst.copyFrom(self.allocator, src) catch |e| {
                         if (trace) {
                             std.debug.print(
@@ -300,7 +334,7 @@ pub const LoadedModel = struct {
                         }
                         return e;
                     };
-                    entry.aliased_input_sync_versions[i] = bind_version;
+                    self.aliased_state_synced_versions[i] = bind_version;
                 }
                 continue;
             }
@@ -389,6 +423,7 @@ pub const LoadedModel = struct {
         package: Package,
         initializer_tids: []TensorId,
         package_hash: u64,
+        opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
         const input_signatures = try signatures.buildSignatures(allocator, &package, package.inputs);
         errdefer allocator.free(input_signatures);
@@ -451,6 +486,18 @@ pub const LoadedModel = struct {
         errdefer allocator.free(aliased_input_bind_versions);
         @memset(aliased_input_bind_versions, 0);
 
+        const auto_input_tids = try allocator.alloc(TensorId, input_signatures.len);
+        errdefer allocator.free(auto_input_tids);
+        @memset(auto_input_tids, types_mod.invalid_tensor_id);
+
+        const aliased_state_tids = try allocator.alloc(TensorId, input_signatures.len);
+        errdefer allocator.free(aliased_state_tids);
+        @memset(aliased_state_tids, types_mod.invalid_tensor_id);
+
+        const aliased_state_synced_versions = try allocator.alloc(u64, input_signatures.len);
+        errdefer allocator.free(aliased_state_synced_versions);
+        @memset(aliased_state_synced_versions, 0);
+
         var total_rank: usize = 0;
         for (input_signatures) |sig| total_rank += sig.rank;
 
@@ -477,6 +524,10 @@ pub const LoadedModel = struct {
             .output_alias_input_indices = output_alias_input_indices,
             .bound_inputs = bound_inputs,
             .aliased_input_bind_versions = aliased_input_bind_versions,
+            .auto_input_tids = auto_input_tids,
+            .auto_init_inputs = opts.auto_init_inputs,
+            .aliased_state_tids = aliased_state_tids,
+            .aliased_state_synced_versions = aliased_state_synced_versions,
             .run_symbol_bindings = run_symbol_bindings,
             .run_symbol_values = run_symbol_values,
             .run_input_shapes = run_input_shapes,
@@ -517,6 +568,105 @@ pub const LoadedModel = struct {
         };
     }
 
+    /// Resolve dimension symbols from the inputs the caller actually bound (skipping
+    /// unbound ones). Returns `run_symbol_values` (scratch), with undetermined
+    /// symbols left as 0. Used by `ensureAutoInputs` to size unbound inputs.
+    fn resolveSymbolsFromBoundInputs(self: *Self) error{InvalidArgument}![]const u64 {
+        @memset(self.run_symbol_bindings, null);
+        for (self.input_signatures, 0..) |sig, i| {
+            const tensor = self.bound_inputs[i] orelse continue;
+            const value = self.package.values[sig.value];
+            if (tensor.dtype != value.dtype or tensor.shape.len != value.rank) return error.InvalidArgument;
+            var d: usize = 0;
+            while (d < tensor.shape.len) : (d += 1) {
+                try signatures.bindInputDim(&self.package, value.shape_terms[d], @intCast(tensor.shape[d]), self.run_symbol_bindings);
+            }
+        }
+        for (self.run_symbol_bindings, 0..) |v, idx| self.run_symbol_values[idx] = v orelse 0;
+        return self.run_symbol_values;
+    }
+
+    /// Bind any input the caller left unbound to a persistent, zero-initialized slot
+    /// whose shape is inferred from the symbols contributed by the bound inputs.
+    ///
+    /// Aliased (recurrent) inputs are seeded once and then carry their contents
+    /// across runs via the output-alias sync at the end of `run()`; non-aliased
+    /// unbound inputs simply stay zero. When `auto_init_inputs` is disabled this is
+    /// strict: the first unbound input is an error.
+    fn ensureAutoInputs(self: *Self, trace: bool) api_errors.ExecuteError!void {
+        var any_unbound = false;
+        for (self.bound_inputs) |b| {
+            if (b == null) {
+                any_unbound = true;
+                break;
+            }
+        }
+        if (!any_unbound) return;
+
+        if (!self.auto_init_inputs) {
+            for (self.input_signatures, 0..) |sig, i| {
+                if (self.bound_inputs[i] == null) {
+                    if (trace) std.debug.print("[aion][run] strict mode: required input '{s}' is unbound\n", .{sig.name});
+                    return error.InvalidArgument;
+                }
+            }
+            return;
+        }
+
+        const symbol_values = try self.resolveSymbolsFromBoundInputs();
+        const optional_symbols = instantiate.optionalizeSymbols(self.allocator, symbol_values) catch return error.OutOfMemory;
+        defer self.allocator.free(optional_symbols);
+
+        for (self.input_signatures, 0..) |sig, i| {
+            if (self.bound_inputs[i] != null) continue;
+            const value = self.package.values[sig.value];
+
+            const shape = package_file.resolveShapeTerms(self.allocator, &self.package, value.shape_terms, optional_symbols) catch {
+                if (trace) std.debug.print(
+                    "[aion][run] cannot auto-size unbound input '{s}': a symbolic dimension is not determined by any bound input — bind it explicitly\n",
+                    .{sig.name},
+                );
+                return error.InvalidArgument;
+            };
+            defer self.allocator.free(shape);
+
+            const is_aliased = self.inputAliasOutputIndex(i) != null;
+
+            // Allocate a fresh zero slot if none exists yet or the resolved shape changed.
+            const need_new = blk: {
+                const cur = self.auto_input_tids[i];
+                if (cur == types_mod.invalid_tensor_id) break :blk true;
+                const meta = self.store.getConst(cur) catch break :blk true;
+                break :blk !signatures.sameUsize(meta.shape, shape);
+            };
+
+            if (need_new) {
+                const tid = if (is_aliased)
+                    try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, shape)
+                else
+                    try initializers.createTensorForShape(self.store, self.policy, sig.dtype, shape);
+                // Freshly created store tensors are zero-initialized.
+                self.auto_input_tids[i] = tid;
+                if (trace) std.debug.print(
+                    "[aion][run] auto-init input '{s}' dtype={s} shape={any} aliased={any}\n",
+                    .{ sig.name, @tagName(sig.dtype), shape, is_aliased },
+                );
+            }
+
+            const tid = self.auto_input_tids[i];
+            const meta = try self.store.getConst(tid);
+            self.bound_inputs[i] = .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
+
+            // Seed the zero slot into the cache entry exactly once; from then on the
+            // alias sync carries state. Bumping only on a fresh allocation avoids
+            // clobbering carried state on later runs.
+            if (is_aliased and need_new) {
+                self.aliased_input_bind_versions[i] +%= 1;
+                if (self.aliased_input_bind_versions[i] == 0) self.aliased_input_bind_versions[i] = 1;
+            }
+        }
+    }
+
     fn ensureCacheEntry(
         self: *Self,
         symbol_values: []const u64,
@@ -551,19 +701,17 @@ pub const LoadedModel = struct {
         errdefer self.allocator.free(input_slots);
         const entry_direct_input_ids = try self.allocator.dupe(TensorId, direct_input_ids);
         errdefer self.allocator.free(entry_direct_input_ids);
-        const aliased_input_sync_versions = try self.allocator.alloc(u64, self.input_signatures.len);
-        errdefer self.allocator.free(aliased_input_sync_versions);
-        @memset(aliased_input_sync_versions, 0);
 
         var input_shape_cursor: usize = 0;
         for (self.input_signatures, 0..) |sig, sig_idx| {
             const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
-                // Aliased inputs (typically KV caches) must persist their full contents
-                // across runs and are consumed by ops like KVCacheAppend that require
-                // single-tile layout on the last axis. Bypass the default tiler, which
-                // would split large caches into a 2D-square grid.
-                try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, concrete_shape)
+                // Aliased inputs (KV caches, recurrent state) use a model-level slot
+                // shared by every cache entry, so state carries across entries with
+                // different input shapes (prefill vs decode). The slot is single-tile
+                // (KVCacheAppend needs a contiguous last axis); the default tiler would
+                // split large caches into a 2D-square grid.
+                try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
             else blk: {
                 const tid = direct_input_ids[sig_idx];
                 if (tid == types_mod.invalid_tensor_id) return error.InvalidArgument;
@@ -639,9 +787,26 @@ pub const LoadedModel = struct {
             .input_shapes = try self.allocator.dupe(usize, input_shapes),
             .input_slots = input_slots,
             .direct_input_ids = entry_direct_input_ids,
-            .aliased_input_sync_versions = aliased_input_sync_versions,
             .program = program,
         };
+    }
+
+    /// Return the model-level backing slot for io-aliased input `input_index`,
+    /// allocating a zeroed single-tile tensor on first use. If a slot already
+    /// exists with a different shape (a capacity change), it is replaced and the
+    /// seed must be re-copied, so the synced version is reset.
+    fn ensureAliasedStateSlot(self: *Self, input_index: usize, shape: []const usize) api_errors.ExecuteError!TensorId {
+        const sig = self.input_signatures[input_index];
+        const cur = self.aliased_state_tids[input_index];
+        if (cur != types_mod.invalid_tensor_id) {
+            const meta = self.store.getConst(cur) catch return error.InvalidArgument;
+            if (signatures.sameUsize(meta.shape, shape)) return cur;
+            // Shape (capacity) changed: re-seed into the new slot on the next run.
+            self.aliased_state_synced_versions[input_index] = 0;
+        }
+        const tid = try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, shape);
+        self.aliased_state_tids[input_index] = tid;
+        return tid;
     }
 
     fn findInputIndex(self: *const Self, name: []const u8) ?usize {
@@ -716,7 +881,6 @@ const CacheEntry = struct {
     input_shapes: []usize,
     input_slots: []TensorId,
     direct_input_ids: []TensorId,
-    aliased_input_sync_versions: []u64,
     program: program_mod.Program,
 };
 

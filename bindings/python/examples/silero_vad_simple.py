@@ -49,34 +49,25 @@ def main() -> None:
     chunk_input_len = args.context_size + args.num_samples
 
     with aion.load_model(str(model_path), thread_count=args.thread_count) as model:
-        # Matches the model exported by examples/silero_vad.zig.
+        # Matches the model exported by examples/silero_vad.zig. The LSTM state
+        # (h, c) is io-aliased to its outputs (next_h, next_c) in the .aion, so we
+        # never bind it: the runtime auto-initializes h/c to zeros on the first run
+        # and carries them across chunks by itself. We only bind the real input `x`.
         x_name = "x"
-        h_name = "h"
-        c_name = "c"
         prob_name = "prob"
-        next_h_name = "next_h"
-        next_c_name = "next_c"
 
         ctx = model.context
 
         x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.AionDType.AION_DTYPE_F32)
-        h_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_F32)
-        c_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_F32)
 
         prob_t = None
-        # Keep these alive so alias/state tensors stay materialized in the runtime.
-        next_h_t = None
-        next_c_t = None
-
         probs = np.zeros(args.chunks, dtype=np.float32)
 
         try:
             t0 = time.perf_counter_ns()
             for _ in range(args.bench_iters):
-                h_t.zero()
-                c_t.zero()
-                h_in = h_t
-                c_in = c_t
+                # Each pass is an independent stream: clear the carried LSTM state.
+                model.reset_state()
 
                 for chunk_idx in range(args.chunks):
                     start = chunk_idx * args.num_samples
@@ -85,18 +76,12 @@ def main() -> None:
 
                     x_t.write_from_numpy(x)
                     model.bind_input(x_name, x_t)
-                    model.bind_input(h_name, h_in)
-                    model.bind_input(c_name, c_in)
                     model.run()
 
                     if prob_t is None:
                         prob_t = model.output_tensor(prob_name)
-                        next_h_t = model.output_tensor(next_h_name)
-                        next_c_t = model.output_tensor(next_c_name)
 
                     probs[chunk_idx] = prob_t.read_f32()[0]
-                    h_in = next_h_t
-                    c_in = next_c_t
 
                     if args.print_probs:
                         t_ms = (chunk_idx * args.num_samples * 1000.0) / 16_000.0
@@ -106,13 +91,7 @@ def main() -> None:
         finally:
             if prob_t is not None:
                 prob_t.close()
-            if next_h_t is not None:
-                next_h_t.close()
-            if next_c_t is not None:
-                next_c_t.close()
             x_t.close()
-            h_t.close()
-            c_t.close()
 
     total_chunks = args.chunks * args.bench_iters
     elapsed_ns = max(1, t1 - t0)

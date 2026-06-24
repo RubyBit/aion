@@ -1004,6 +1004,189 @@ test "api: exportModel + loadModel roundtrip executes without rebuilding archite
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[2], 1e-6);
 }
 
+test "api: unbound recurrent state auto-initializes, carries across runs, and resets" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "recurrent.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    // state_out = state_in + x ; state_out is aliased back to state_in so the
+    // accumulator persists across runs.
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const StateIn: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "state_in");
+    const StateOut: api.TensorRef = try bld.add(StateIn, X);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "state_out", .tensor = StateOut },
+    }, .{
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input_name = "state_in", .output_name = "state_out" },
+        },
+    });
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    // Bind only the real input; never bind "state_in".
+    const x_t: api.Tensor = try load_ctx.fromArray([1][2]f32{.{ 1.0, 2.0 }});
+    try model.bindInput("x", x_t);
+
+    const expect = struct {
+        fn run(m: *api.LoadedModel, e0: f32, e1: f32) !void {
+            try m.run();
+            const out: api.Tensor = try m.outputTensor("state_out");
+            var vals: [2]f32 = undefined;
+            try out.read(&vals);
+            try std.testing.expectApproxEqAbs(e0, vals[0], 1e-6);
+            try std.testing.expectApproxEqAbs(e1, vals[1], 1e-6);
+        }
+    };
+
+    // Run 1: state auto-zeroed -> 0 + x.
+    try expect.run(&model, 1.0, 2.0);
+    // Run 2/3: state carried via the io-alias -> accumulates.
+    try expect.run(&model, 2.0, 4.0);
+    try expect.run(&model, 3.0, 6.0);
+
+    // Reset clears the carried state; accumulation starts over.
+    try model.resetState();
+    try expect.run(&model, 1.0, 2.0);
+    try expect.run(&model, 2.0, 4.0);
+}
+
+test "api: recurrent state carries across cache entries with different input shapes" {
+    // Mirrors the prefill(seq=S) -> decode(seq=1) shape change of an LLM: a model
+    // run at two different sequence lengths compiles two distinct cache entries.
+    // The io-aliased accumulator must carry across them (shared model-level state).
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "recurrent_multishape.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    // state_out = sum_over_seq(x) + state_in ; state_out aliased back to state_in.
+    // x has a symbolic seq dim, so different seq lengths -> different cache entries.
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2 }), "x");
+    const StateIn: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "state_in");
+    const Summed: api.TensorRef = try bld.reduceAxis(.sum, X, 1); // [1, 2]
+    const StateOut: api.TensorRef = try bld.add(Summed, StateIn);
+
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "state_out", .tensor = StateOut },
+    }, .{
+        .input_symbols = &[_]api.DimensionSymbol{
+            .{ .tensor = X, .axis = 1, .name = "S" },
+        },
+        .output_aliases = &[_]api.OutputAlias{
+            .{ .input_name = "state_in", .output_name = "state_out" },
+        },
+    });
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    const readState = struct {
+        fn go(m: *api.LoadedModel) ![2]f32 {
+            try m.run();
+            const out: api.Tensor = try m.outputTensor("state_out");
+            var vals: [2]f32 = undefined;
+            try out.read(&vals);
+            return vals;
+        }
+    };
+
+    // Run 1: "prefill" seq=2, x = [[[1,1],[1,1]]] -> sum=[2,2], state 0 -> [2,2].
+    const x2: api.Tensor = try load_ctx.fromArray([1][2][2]f32{.{ .{ 1.0, 1.0 }, .{ 1.0, 1.0 } }});
+    try model.bindInput("x", x2);
+    {
+        const v = try readState.go(&model);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), v[0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), v[1], 1e-6);
+    }
+
+    // Run 2: "decode" seq=1 (a different cache entry), x=[[[1,1]]] -> sum=[1,1].
+    // If state carries across the shape change, this accumulates onto [2,2] -> [3,3].
+    const x1: api.Tensor = try load_ctx.fromArray([1][1][2]f32{.{.{ 1.0, 1.0 }}});
+    try model.bindInput("x", x1);
+    {
+        const v = try readState.go(&model);
+        try std.testing.expectApproxEqAbs(@as(f32, 3.0), v[0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 3.0), v[1], 1e-6);
+    }
+    // Run 3: same seq=1 entry -> [4,4].
+    {
+        const v = try readState.go(&model);
+        try std.testing.expectApproxEqAbs(@as(f32, 4.0), v[0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 4.0), v[1], 1e-6);
+    }
+
+    // Reset clears the shared state; accumulation restarts.
+    try model.resetState();
+    {
+        const v = try readState.go(&model);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v[0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v[1], 1e-6);
+    }
+}
+
+test "api: loadModel with auto_init_inputs=false errors on an unbound input" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try createTestFile(tmp.dir, "strict.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W: api.TensorRef = try bld.param(w_t);
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    var model = try load_ctx.loadModel(file, .{ .auto_init_inputs = false });
+    defer model.deinit();
+
+    // "x" is never bound; strict mode must refuse to run.
+    try std.testing.expectError(error.InvalidArgument, model.run());
+}
+
 test "api: loadModel can swap initializers by debug name (overwrite + retarget)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

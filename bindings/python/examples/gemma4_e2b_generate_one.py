@@ -13,7 +13,6 @@ import numpy as np
 
 import aion
 
-# TODO: I want to improve a bit the aion api as I don't quite like some of the ergonomics with the bindings (e.g caches).
 
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
@@ -304,20 +303,14 @@ def main() -> None:
     with aion.load_model(str(model_path), thread_count=args.thread_count) as model:
         ctx = model.context
 
-        # Gemma models currently expose KV caches as functional outputs:
-        #   inputs:  k_cache.layerN / v_cache.layerN
-        #   outputs: next_k_cache.layerN / next_v_cache.layerN
-        # The caller must feed the `next_*` outputs back as the next step's
-        # `*_cache.*` inputs. (They are not guaranteed to be mutated in-place.)
-        out_names = set(model.output_names())
-        has_next_caches = (
-            ("next_k_cache.layer0" in out_names)
-            and ("next_v_cache.layer0" in out_names)
-        )
-
-        # Allocate KV caches (f16) and zero-init them. The graph compiler retiles the
-        # cache to satisfy `KVCacheAppend`'s head-dim contiguity requirement on first
-        # run, so the default tiler is fine here.
+        # The KV caches are io-aliased to their `next_*_cache.layerN` outputs, and
+        # the runtime backs each aliased input with a model-level state slot shared
+        # across cache entries. So even though prefill (seq=S) and decode (seq=1)
+        # compile to two different entries, the appended K/V carries across them
+        # automatically: we bind the caches ONCE and never swap outputs into inputs.
+        # We still allocate them explicitly (rather than letting auto-init zero them)
+        # because the global layers' time axis is a free capacity symbol `G` the
+        # caller chooses — no bound input lets the runtime infer it.
         k_cache = {}
         v_cache = {}
         for layer in source_layers:
@@ -344,35 +337,11 @@ def main() -> None:
         tokens_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
         positions_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
 
-        # Bind initial KV caches.
+        # Bind the KV caches once. The shared aliased state slots carry the appended
+        # K/V across every run (prefill and each decode step) with no rebinding.
         for layer in source_layers:
             model.bind_input(f"k_cache.layer{layer}", k_cache[layer])
             model.bind_input(f"v_cache.layer{layer}", v_cache[layer])
-
-        def swap_next_caches_into_inputs() -> None:
-            """Fetch `next_*` cache outputs and re-bind them as the next inputs."""
-
-            if not has_next_caches:
-                # Older/alternate graphs may mutate in-place (no next_* outputs).
-                return
-
-            for layer in source_layers:
-                next_k = model.output_tensor(f"next_k_cache.layer{layer}")
-                next_v = model.output_tensor(f"next_v_cache.layer{layer}")
-
-                old_k = k_cache[layer]
-                old_v = v_cache[layer]
-                k_cache[layer] = next_k
-                v_cache[layer] = next_v
-
-                model.bind_input(f"k_cache.layer{layer}", next_k)
-                model.bind_input(f"v_cache.layer{layer}", next_v)
-
-                # Avoid double-destroy if the graph aliases input->output.
-                if old_k.ptr != next_k.ptr:
-                    old_k.close()
-                if old_v.ptr != next_v.ptr:
-                    old_v.close()
 
         try:
             # ---- Prefill ----
@@ -386,8 +355,8 @@ def main() -> None:
             model.run()
             prefill_run_ns = time.perf_counter_ns() - t0_prefill_run_ns
 
-            # Update caches for the decode loop.
-            swap_next_caches_into_inputs()
+            # No cache bookkeeping: the shared aliased slots already hold prefill's
+            # K/V and carry it into the decode loop automatically.
 
             t0_logits_ns = time.perf_counter_ns()
             logits_t = model.output_tensor("logits")
@@ -452,9 +421,6 @@ def main() -> None:
                 model.run()
                 decode_steps_executed += 1
                 decode_total_run_ns += time.perf_counter_ns() - t0_step_run_ns
-
-                # Persist the newly appended token into KV caches.
-                swap_next_caches_into_inputs()
 
                 t0_step_logits_ns = time.perf_counter_ns()
                 logits_t = model.output_tensor("logits")

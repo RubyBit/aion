@@ -99,4 +99,5 @@ AionStatus aion_loaded_model_output_rank(const AionLoadedModel* m, size_t index,
 
 AionStatus aion_loaded_model_bind_input(AionLoadedModel* m, const char* name, const AionTensor* tensor);
 AionStatus aion_loaded_model_run(AionLoadedModel* m);
+AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
 AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);

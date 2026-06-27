@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const builtin = @import("builtin");
+const root = @import("root");
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
+const dispatch_table = @import("multiversion/table.zig");
+const kernel_dispatch = @import("multiversion/dispatch.zig");
+const env = @import("../../env.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
-const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const matmul_q_registry = @import("registry/matmul_q_registry.zig");
 const cpu_target = @import("registry/cpu_target.zig");
 const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
@@ -45,6 +50,18 @@ const BackendError = types.BackendError;
 const DType = types.DType;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
+/// True only for the portable library artifact (built with `-Dmultiversion=true`,
+/// whose root `src/root.zig` sets `aion_multiversion`) on x86. In that build the
+/// per-tier kernel objects are linked and runtime dispatch selects among them.
+///
+/// For unit tests, benchmarks, examples and ordinary dev builds the compilation
+/// root does not declare `aion_multiversion`, so this is comptime-false and the
+/// in-module `selectForTarget` path is used (and the `extern` tier accessors are
+/// never referenced). The `@import("root")` indirection is what lets the raw
+/// `zig test` build — which never compiles `src/root.zig` — compile cleanly.
+const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch.isAARCH64()) and
+    (if (@hasDecl(root, "aion_multiversion")) root.aion_multiversion else false);
+
 /// CPU Backend implementation.
 /// Owns threading strategy (v0: single-threaded, later: thread pool).
 pub const CpuBackend = struct {
@@ -69,7 +86,7 @@ pub const CpuBackend = struct {
 
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
-    matmul_qx0: quant_matmul_registry.QuantKernels = quant_matmul_registry.candidates[1].kernels,
+    matmul_qx0: matmul_q_registry.QuantKernels = matmul_q_registry.candidates[1].kernels,
 
     matmul_nt: matmul_nt_registry.Kernels = matmul_nt_registry.candidates[0].kernels,
 
@@ -103,15 +120,8 @@ pub const CpuBackend = struct {
         return envFlagEnabled("AION_PROFILE_STEPS");
     }
 
-    fn envFlagEnabled(name: []const u8) bool {
-        const env: std.process.Environ = .{ .block = .global };
-        const raw: []u8 = std.process.Environ.getAlloc(env, std.heap.page_allocator, name) catch return false;
-        defer std.heap.page_allocator.free(raw);
-        const trimmed: []const u8 = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        if (std.mem.eql(u8, trimmed, "0")) return false;
-        if (std.mem.eql(u8, trimmed, "false")) return false;
-        return true;
+    fn envFlagEnabled(name: [:0]const u8) bool {
+        return env.flagEnabled(name);
     }
 
     pub const Options = struct {
@@ -135,7 +145,6 @@ pub const CpuBackend = struct {
         const hw_threads_raw: usize = std.Thread.getCpuCount() catch opts.thread_count;
         const hw_threads: usize = if (hw_threads_raw == 0) opts.thread_count else hw_threads_raw;
         const topo_info = cpuid.detect();
-        const target = cpu_target.fromCpuInfo(topo_info);
         // Respect user-requested thread count up to the system's logical CPUs.
         // For decode-heavy workloads on hybrid CPUs, SMT threads can still help,
         // and higher-level tile heuristics decide when to parallelize small ops.
@@ -154,15 +163,36 @@ pub const CpuBackend = struct {
         };
 
         // Kernel selection based on CPU (same for single- and multi-threaded).
-        self.matmul_f32 = matmul_registry.selectForTarget(target).kernels;
-        self.matmul_qx0 = quant_matmul_registry.selectForTarget(target).kernels;
-        self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
-        self.matvec = matvec_registry.selectForTarget(target).kernels;
-        self.attention_kernels = attention_registry.selectForTarget(target).kernels;
-        self.relpos_mha_kernels = relpos_mha_registry.selectForTarget(target).kernels;
-        self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
-        self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
-        self.fft = fft_registry.selectForTarget(target).kernels;
+        if (multiversion_enabled) {
+            // Portable build: pick the linked tier object matching the runtime CPU,
+            // then choose packed-GEMM tiles by L2 size. The kernel fn pointers come
+            // from the per-ISA tier object; the main module holds none of them.
+            const table = kernel_dispatch.selectTable(topo_info);
+            if (table.abi_version != dispatch_table.ABI_VERSION) {
+                @panic("aion: kernel dispatch ABI version mismatch (rebuild tier objects)");
+            }
+            const l2_bytes: usize = topo_info.caches.l2_bytes;
+            self.matmul_f32 = kernel_dispatch.pickMatmul(table, l2_bytes);
+            self.matmul_qx0 = kernel_dispatch.pickQuant(table, l2_bytes);
+            self.matmul_nt = table.matmul_nt;
+            self.matvec = table.matvec;
+            self.attention_kernels = table.attention;
+            self.relpos_mha_kernels = table.relpos_mha;
+            self.depthwise_conv1d = table.conv1d;
+            self.depthwise_conv2d = table.conv2d;
+            self.fft = table.fft;
+        } else {
+            const target = cpu_target.fromCpuInfo(topo_info);
+            self.matmul_f32 = matmul_registry.selectForTarget(target).kernels;
+            self.matmul_qx0 = matmul_q_registry.selectForTarget(target).kernels;
+            self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
+            self.matvec = matvec_registry.selectForTarget(target).kernels;
+            self.attention_kernels = attention_registry.selectForTarget(target).kernels;
+            self.relpos_mha_kernels = relpos_mha_registry.selectForTarget(target).kernels;
+            self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
+            self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
+            self.fft = fft_registry.selectForTarget(target).kernels;
+        }
 
         if (effective_thread_count > 1) {
             const p = try thread_pool.ThreadPool.init(allocator, .{ .thread_count = effective_thread_count });
@@ -187,7 +217,13 @@ pub const CpuBackend = struct {
             var j: usize = 0;
             while (j < i) : (j += 1) allocator.free(mm[j]);
         }
-        const scratch_bytes: usize = @max(matmul_registry.maxScratchBytes(), quant_matmul_registry.maxScratchBytes());
+        // Cover both the comptime registry maxima and the actually-selected kernels'
+        // needs. The multiversion VNNI quant kernel has its own packed-B + activation
+        // scratch sizing that the registry maxima don't account for.
+        const scratch_bytes: usize = @max(
+            @max(matmul_registry.maxScratchBytes(), matmul_q_registry.maxScratchBytes()),
+            @max(self.matmul_f32.scratch_bytes, self.matmul_qx0.scratch_bytes),
+        );
         while (i < effective_thread_count) : (i += 1) {
             mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_bytes);
         }

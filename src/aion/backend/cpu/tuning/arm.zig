@@ -9,7 +9,7 @@ pub fn detect() cpuid_root.CpuInfo {
         .features = .{ .neon = true },
     };
 
-    if (builtin.os.tag == .linux or builtin.os.tag == .android) {
+    if (builtin.os.tag == .linux) {
         const AT_HWCAP = 16;
         const AT_HWCAP2 = 26;
         const hwcaps = std.os.linux.getauxval(AT_HWCAP);
@@ -91,7 +91,7 @@ fn readFileTrimAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, path: []const u8
     errdefer alloc.free(data);
 
     const read_len = try f.readPositionalAll(io, data, 0);
-    const trimmed = std.mem.trimRight(u8, data[0..read_len], "\r\n\t ");
+    const trimmed = std.mem.trimEnd(u8, data[0..read_len], "\r\n\t ");
     if (trimmed.len == data.len) return data;
 
     const out = try alloc.dupe(u8, trimmed);
@@ -157,10 +157,10 @@ fn detectCachesArmLinux(alloc: std.mem.Allocator) cpuid_root.Caches {
 }
 
 fn detectCaches() cpuid_root.Caches {
-    if (builtin.os.tag == .linux or builtin.os.tag == .android) {
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        return detectCachesArmLinux(gpa.allocator());
+    if (builtin.os.tag == .linux) {
+        // Runs once at init; page_allocator is fine and avoids depending on the
+        // (renamed) general-purpose/debug allocator type across Zig versions.
+        return detectCachesArmLinux(std.heap.page_allocator);
     }
     if (builtin.os.tag.isDarwin()) {
         return .{

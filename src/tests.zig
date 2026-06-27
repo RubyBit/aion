@@ -17,6 +17,7 @@ comptime {
     _ = @import("aion/storage/test_storage.zig");
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
     _ = @import("aion/backend/cpu/kernels/fft.zig");
+    _ = @import("aion/backend/cpu/kernels/matmul_q_i8.zig");
 
     _ = @import("aion/graph/test_program.zig");
 

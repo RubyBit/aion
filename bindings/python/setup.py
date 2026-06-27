@@ -2,57 +2,32 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_ext import build_ext as _build_ext
 
 
-def _import_build_zig():
-    # setup.py lives at: bindings/python/setup.py
-    python_root = Path(__file__).resolve().parent
-    tools_dir = python_root / "tools"
-    sys.path.insert(0, str(tools_dir))
-    try:
-        import build_zig  # type: ignore
-    finally:
-        try:
-            sys.path.remove(str(tools_dir))
-        except ValueError:
-            pass
-    return build_zig
-
-
 class build_ext(_build_ext):
-    """Build the cffi extension, ensuring Aion is built first.
+    """Build the cffi extension.
 
-    On Windows, we build Aion as a DLL and bundle it into the wheel next to the
-    extension module.
+    Aion is built (via tools/build_zig.py) and static-linked into the extension
+    module by the cffi builder at `src/aion/_ffi/build.py` — that file calls
+    `build_zig.build_aion()` when cffi imports it during `super().run()` below.
+    This hook only pins the Zig install prefix to a deterministic location under
+    `build_temp` so repeated builds reuse the same artifacts.
     """
 
     def run(self):
-        _import_build_zig()
-
-        # Use a deterministic prefix under build_temp so repeated builds reuse artifacts.
-        prefix = (Path(self.build_temp).resolve() / "aion-zig-prefix")
+        prefix = Path(self.build_temp).resolve() / "aion-zig-prefix"
         prefix.mkdir(parents=True, exist_ok=True)
-
-        # Tell the cffi builder to reuse this prefix.
         os.environ["AION_PY_BUILD_PREFIX"] = str(prefix)
 
-        # Keep platform defaults explicit.
-        os.environ.setdefault("AION_PY_LINKAGE", "static")
-
-        # Default to native CPU tuning for local builds unless explicitly overridden.
+        # Native CPU tuning for local builds unless explicitly overridden.
         os.environ.setdefault("AION_PY_CPU", "native")
-
-        #artifacts = build_zig.build_aion(prefix=prefix)
 
         super().run()
 
-        # If we ever build a shared library on Windows again, we can bundle it
-        # here. For now we aim to static-link Aion into the extension module.
 
 # cffi will import the builder referenced below during the build.
 setup(

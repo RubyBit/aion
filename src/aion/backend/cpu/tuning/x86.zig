@@ -69,12 +69,18 @@ pub fn detect() cpuid_root.CpuInfo {
         info.features.avx2 = ((l7_0.ebx >> 5) & 1) != 0;
         // AVX512F: EBX bit 16
         info.features.avx512f = ((l7_0.ebx >> 16) & 1) != 0;
-        // AVX-VNNI: ECX bit 4
-        info.features.avx_vnni = ((l7_0.ecx >> 4) & 1) != 0;
-        // AVX512-VNNI: ECX bit 11
+        // AVX512-VNNI: leaf 7 sub-leaf 0, ECX bit 11
         info.features.avx512_vnni = ((l7_0.ecx >> 11) & 1) != 0;
-        // AMX-INT8: EDX bit 25
+        // AMX-INT8: leaf 7 sub-leaf 0, EDX bit 25
         info.features.amx_int8 = ((l7_0.edx >> 25) & 1) != 0;
+
+        // AVX-VNNI (the VEX-encoded form on Alder/Raptor Lake — distinct from
+        // AVX512-VNNI) is reported in leaf 7 SUB-LEAF 1, EAX bit 4. l7_0.eax holds
+        // the max sub-leaf, so only probe sub-leaf 1 when it exists.
+        if (l7_0.eax >= 1) {
+            const l7_1 = cpuid(7, 1);
+            info.features.avx_vnni = ((l7_1.eax >> 4) & 1) != 0;
+        }
     }
 
     info.caches = detectCaches();

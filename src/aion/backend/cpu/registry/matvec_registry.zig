@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const types = @import("../../types.zig");
 const matvec_tuned = @import("../kernels/matvec.zig");
-const quant_matmul = @import("../kernels/quant_matmul.zig");
+const matvec_q = @import("../kernels/matvec_q.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 const cpu_target = @import("cpu_target.zig");
 
@@ -51,7 +51,7 @@ pub const Candidate = struct {
 
 fn kernelsFor(comptime t: Tuning) Kernels {
     const K = matvec_tuned.Kernel(t);
-    const Q8_0 = quant_matmul.MatvecKernel(.{ .lanes = t.lanes });
+    const Q8_0 = matvec_q.MatvecKernel(.{ .lanes = t.lanes });
     return .{
         .tuning = t,
         .matvec_f32 = K.matvecF32,

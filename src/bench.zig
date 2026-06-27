@@ -3,6 +3,11 @@
 const std = @import("std");
 const aion = @import("aion");
 
+/// Mirror the library's multiversion switch so the CPU backend (which reads
+/// `@import("root")`) dispatches to the linked per-ISA tier objects. `build.zig`
+/// links those objects into this exe and supplies `build_options.multiversion`.
+pub const aion_multiversion: bool = @import("build_options").multiversion;
+
 const Backend = aion.backend.Backend;
 const CpuBackend = aion.cpu.CpuBackend;
 
@@ -25,7 +30,7 @@ const Q8_0_BLOCK_BYTES: usize = types.DType.q8_0.info().block_bytes;
 const BenchSuite = enum {
     all,
     matmul,
-    quant_matmul,
+    matmul_q,
 };
 
 const BenchDTypeMode = enum {
@@ -121,7 +126,7 @@ fn parseBenchDTypeMode(arg: []const u8) !BenchDTypeMode {
 fn parseBenchSuite(arg: []const u8) !BenchSuite {
     if (std.mem.eql(u8, arg, "all")) return .all;
     if (std.mem.eql(u8, arg, "matmul")) return .matmul;
-    if (std.mem.eql(u8, arg, "quant-matmul")) return .quant_matmul;
+    if (std.mem.eql(u8, arg, "quant-matmul")) return .matmul_q;
     return error.InvalidArgument;
 }
 
@@ -2277,7 +2282,7 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
         return;
     }
 
-    if (opts.suite == .quant_matmul) {
+    if (opts.suite == .matmul_q) {
         if (!opts.quant) {
             std.debug.print("(skipping quant matmul suite: --no-quant specified)\n", .{});
             return;
@@ -2379,7 +2384,7 @@ fn runF16Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
         std.debug.print("(skipping quant matmul in f16 mode: quant benches currently use f32 activations)\n", .{});
         return;
     }
-    if (opts.suite == .quant_matmul) {
+    if (opts.suite == .matmul_q) {
         std.debug.print("(skipping quant matmul suite in f16 mode: quant benches currently use f32 activations)\n", .{});
         return;
     }

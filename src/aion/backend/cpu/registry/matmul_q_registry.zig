@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+//
+// Registry naming convention (CPU kernels):
+//   * One registry file per operation. `matmul_nt_registry` and `matvec_registry`
+//     bundle f32 + quant in a single `Kernels` struct because those kernels share a
+//     call shape.
+//   * Packed GEMM is the exception: f32 (`matmul_registry`) and quant
+//     (`matmul_q_registry`, here) have genuinely different pack/scratch/packed-B
+//     ABIs, so they stay in separate files with distinct `*Kernels` structs.
+//   * ISA is never in a filename — it's a comptime parameter (e.g. `matmul_q_i8`'s
+//     `DotEnc`), selected at runtime via the multiversion tier dispatch.
 const std = @import("std");
 const types = @import("../../types.zig");
-const quant_matmul = @import("../kernels/quant_matmul.zig");
+const matmul_q = @import("../kernels/matmul_q.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 const cpu_target = @import("cpu_target.zig");
-const gemm_shapes = @import("gemm_shapes.zig");
+const matmul_shapes = @import("matmul_shapes.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -39,7 +49,7 @@ pub const QuantKernels = struct {
     matmul_packed_b: MatMulPackedBFn,
 };
 
-pub const VariantId = gemm_shapes.PackedVariantId;
+pub const VariantId = matmul_shapes.PackedVariantId;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -47,7 +57,7 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning) QuantKernels {
-    const K = quant_matmul.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr, .lanes = t.lanes });
+    const K = matmul_q.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr, .lanes = t.lanes });
     return .{
         .tuning = t,
         .scratch_bytes = K.scratchBytes(),
@@ -84,7 +94,7 @@ pub fn maxScratchBytes() usize {
 pub fn selectForTile(default_kernels: QuantKernels, k: usize, n: usize) ?QuantKernels {
     // Choose the smallest candidate that can cover the requested tile.
     // (Smaller NC/KC reduces packed-B footprint and scratch bandwidth.)
-    return gemm_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
+    return matmul_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
 }
 
 pub fn selectForTarget(target: cpu_target.Target) Candidate {
@@ -100,7 +110,7 @@ pub fn selectForTarget(target: cpu_target.Target) Candidate {
         @panic("missing quant matmul medium candidate for lane group");
     }
 
-    const budget: usize = gemm_shapes.l2Budget75(l2_bytes);
+    const budget: usize = matmul_shapes.l2Budget75(l2_bytes);
 
     var best: Candidate = blk: {
         for (candidates) |c| {

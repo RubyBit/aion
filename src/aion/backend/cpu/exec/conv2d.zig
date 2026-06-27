@@ -1192,7 +1192,7 @@ fn execConv2DImplicitGemm(
             const scratch_use: []align(32) u8 = if (t.use_local_scratch) local_scratch else scratch;
 
             // Reuse the matmul scratch's packed-A region ("pa") to avoid allocating a packed-A buffer.
-            // Layout matches matmul_tuned.Kernel.splitScratch(): pb = KC*NC, pa = MC*KC.
+            // Layout matches matmul.Kernel.splitScratch(): pb = KC*NC, pa = MC*KC.
             const pb_elems: usize = t.kc * t.matmul.tuning.nc;
             const pa_elems: usize = t.m_cap * t.kc;
             const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_use));

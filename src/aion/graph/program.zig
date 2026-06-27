@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const env = @import("../env.zig");
 const types = @import("../backend/types.zig");
 const storage = @import("../storage/storage.zig");
 const executable = @import("../runtime/executable.zig");
@@ -26,13 +27,7 @@ pub const CompileError = error{ InvalidArgument, OutOfMemory } || graph_mod.Grap
 
 fn traceEnabled() bool {
     // Keep tracing opt-in to avoid log spam in normal runs/tests.
-    const env: std.process.Environ = .{ .block = .global };
-    const raw: []u8 = std.process.Environ.getAlloc(env, std.heap.page_allocator, "AION_TRACE") catch return false;
-    defer std.heap.page_allocator.free(raw);
-    const trimmed: []const u8 = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    if (std.mem.eql(u8, trimmed, "0")) return false;
-    return true;
+    return env.flagEnabled("AION_TRACE");
 }
 
 fn compileRequire(cond: bool) CompileError!void {

@@ -11,9 +11,9 @@ const tanh_k = @import("kernels/tanh.zig");
 const sqrt_k = @import("kernels/sqrt.zig");
 const softmax_k = @import("kernels/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
-const quant_matmul_k = @import("kernels/quant_matmul.zig");
+const matmul_q_k = @import("kernels/matmul_q.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
-const quant_matmul_registry = @import("registry/quant_matmul_registry.zig");
+const matmul_q_registry = @import("registry/matmul_q_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
 const fft_k = @import("kernels/fft.zig");
@@ -55,8 +55,8 @@ fn matmulKernelsById(id: matmul_registry.VariantId) matmul_registry.F32Kernels {
     @panic("missing matmul kernel variant");
 }
 
-fn quantMatmulKernelsById(id: quant_matmul_registry.VariantId) quant_matmul_registry.QuantKernels {
-    inline for (quant_matmul_registry.candidates) |c| {
+fn quantMatmulKernelsById(id: matmul_q_registry.VariantId) matmul_q_registry.QuantKernels {
+    inline for (matmul_q_registry.candidates) |c| {
         if (c.id == id) return c.kernels;
     }
     @panic("missing quant matmul kernel variant");
@@ -569,12 +569,12 @@ test "cpu kernels: tuned q8_0 matmul via registry" {
     var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
     try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
-    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
 
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
@@ -615,12 +615,12 @@ test "cpu kernels: tuned q4_0 matmul via registry" {
     var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
     try kernels.pack_b_tile_q4_0(scratch, k, n, bq[0..]);
-    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
 
     // q4 is much noisier.
@@ -666,12 +666,12 @@ test "cpu kernels: matvec q8_0" {
     }
 
     var c: [n]f32 = [_]f32{0.0} ** n;
-    const kernels: quant_matmul_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
     try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
-    const packed_b_view: quant_matmul_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
+    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
@@ -728,5 +728,5 @@ test "cpu kernels: direct matvec q8_0 k-major" {
 
 comptime {
     _ = BackendError;
-    _ = quant_matmul_registry;
+    _ = matmul_q_registry;
 }

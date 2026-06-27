@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const types = @import("../../types.zig");
-const matmul_tuned = @import("../kernels/matmul_tuned.zig");
+const matmul = @import("../kernels/matmul.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 const cpu_target = @import("cpu_target.zig");
-const gemm_shapes = @import("gemm_shapes.zig");
+const matmul_shapes = @import("matmul_shapes.zig");
 
 pub const Tuning = struct {
     // Micro-kernel tiles
@@ -34,7 +34,7 @@ pub const F32Kernels = struct {
     matmul_packed_ab: *const fn (packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8) types.BackendError!void,
 };
 
-pub const VariantId = gemm_shapes.PackedVariantId;
+pub const VariantId = matmul_shapes.PackedVariantId;
 
 pub const Candidate = struct {
     id: VariantId,
@@ -42,7 +42,7 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning) F32Kernels {
-    const K = matmul_tuned.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr, .lanes = t.lanes });
+    const K = matmul.Kernel(.{ .kc = t.kc, .mc = t.mc, .nc = t.nc, .mr = t.mr, .nr = t.nr, .lanes = t.lanes });
     return .{
         .tuning = t,
         .scratch_bytes = K.scratchBytes(),
@@ -71,7 +71,7 @@ pub const candidates = [_]Candidate{
 };
 
 fn candidateFor(id: VariantId, lanes: usize) Candidate {
-    return gemm_shapes.candidateFor(candidates, id, lanes);
+    return matmul_shapes.candidateFor(candidates, id, lanes);
 }
 
 pub fn maxScratchBytes() usize {
@@ -93,7 +93,7 @@ pub fn maxScratchBytes() usize {
 pub fn selectForTile(default_kernels: F32Kernels, k: usize, n: usize) ?F32Kernels {
     // Choose the smallest kernel variant that can cover the requested tile.
     // Smaller KC/NC reduces packed-B footprint and scratch bandwidth.
-    return gemm_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
+    return matmul_shapes.selectSmallestCoveringKernels(candidates, default_kernels, k, n);
 }
 
 pub fn selectForConvOcTile(default_kernels: F32Kernels, oc_count: usize) F32Kernels {
@@ -123,7 +123,7 @@ pub fn selectForTarget(target: cpu_target.Target) Candidate {
     const l2_bytes: usize = target.caches.l2_bytes;
     if (l2_bytes == 0) return candidateFor(.medium, lanes);
 
-    const budget: usize = gemm_shapes.l2Budget75(l2_bytes);
+    const budget: usize = matmul_shapes.l2Budget75(l2_bytes);
 
     var best: Candidate = candidateFor(.small, lanes);
     for (candidates) |c| {

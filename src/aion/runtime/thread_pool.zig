@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const env_util = @import("../env.zig");
 
 const worker_slot_cache_line_bytes: usize = 64;
 const worker_slot_padding_bytes: usize = if (@sizeOf(std.atomic.Value(u32)) < worker_slot_cache_line_bytes)
@@ -407,14 +408,7 @@ fn shouldSkipThreadPoolTests() bool {
     const builtin = @import("builtin");
     if (builtin.os.tag != .windows) return false;
 
-    const allocator: std.mem.Allocator = std.testing.allocator;
-    const env: std.process.Environ = .{ .block = .global };
-    const v: []u8 = std.process.Environ.getAlloc(env, allocator, "AION_SKIP_THREAD_POOL_TESTS") catch return false;
-    defer allocator.free(v);
-    if (v.len == 0) return false;
-    if (std.mem.eql(u8, v, "0")) return false;
-    if (std.mem.eql(u8, v, "false")) return false;
-    return true;
+    return env_util.flagEnabled("AION_SKIP_THREAD_POOL_TESTS");
 }
 
 fn skipIfRequested() !void {

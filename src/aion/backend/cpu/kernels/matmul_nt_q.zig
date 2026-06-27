@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const types = @import("../../types.zig");
 const matmul_nt = @import("matmul_nt.zig");
-const quant_matmul = @import("quant_matmul.zig");
+const matmul_q = @import("matmul_q.zig");
 
 const BackendError = types.BackendError;
-const Q8_0_BLOCK_ELEMS: usize = quant_matmul.Q8_0_BLOCK_ELEMS;
-const Q8_0_BLOCK_BYTES: usize = quant_matmul.Q8_0_BLOCK_BYTES;
+const Q8_0_BLOCK_ELEMS: usize = matmul_q.Q8_0_BLOCK_ELEMS;
+const Q8_0_BLOCK_BYTES: usize = matmul_q.Q8_0_BLOCK_BYTES;
 
 /// Compute `C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]`
 /// where A is M×K f32 (row-major, contiguous over K) and B is N×K q8_0 with one contiguous

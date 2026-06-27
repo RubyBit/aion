@@ -29,7 +29,7 @@ pub const MatMulNtExecCtx = struct {
 /// - C: f32, trailing axis N.
 ///
 /// Actual compute is delegated to the NT matmul registry:
-/// - Q8_0 → `quant_matmul_nt.Kernel(...).matmulNtQ8_0` via `matmul_nt_registry.Kernels.matmul_q8_0`
+/// - Q8_0 → `matmul_nt_q.Kernel(...).matmulNtQ8_0` via `matmul_nt_registry.Kernels.matmul_q8_0`
 /// - F32  → `matmul_nt.Kernel(...).matmulNtF32` via `matmul_nt_registry.Kernels.matmul_f32`
 ///
 /// Parallelism here is over N tiles (B's axis-0 tiling must match C's last-axis tiling,

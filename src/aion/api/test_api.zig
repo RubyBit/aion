@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const env_util = @import("../env.zig");
 
 const api = @import("api.zig");
 const manager_mod = @import("../storage/manager.zig");
@@ -2366,14 +2367,13 @@ test "api: loaded package keeps weights quantized (opt-in via AION_GEMMA_VERIFY_
     // space reservations on Windows. Page_allocator serves requests directly from the
     // OS which is the right fit for this one-shot big-file load.
     const allocator: std.mem.Allocator = std.heap.page_allocator;
-    const env: std.process.Environ = .{ .block = .global };
 
-    const path: []u8 = std.process.Environ.getAlloc(env, allocator, "AION_GEMMA_VERIFY_PATH") catch
+    const path: []u8 = env_util.getOwned(allocator, "AION_GEMMA_VERIFY_PATH") orelse
         return error.SkipZigTest;
     defer allocator.free(path);
     if (path.len == 0) return error.SkipZigTest;
 
-    const max_gb_raw: ?[]u8 = std.process.Environ.getAlloc(env, allocator, "AION_GEMMA_MAX_GB") catch null;
+    const max_gb_raw: ?[]u8 = env_util.getOwned(allocator, "AION_GEMMA_MAX_GB");
     defer if (max_gb_raw) |p| allocator.free(p);
     const max_gb: f64 = if (max_gb_raw) |raw|
         std.fmt.parseFloat(f64, raw) catch 6.0

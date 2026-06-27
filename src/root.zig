@@ -37,6 +37,15 @@ pub const utils = @import("aion/backend/utils.zig");
 /// This module defines `pub export` functions with `callconv(.c)`.
 pub const c_api = @import("aion/c_api.zig");
 
+/// Enables portable multi-ISA CPU kernel dispatch when the library is built with
+/// `-Dmultiversion=true`. Driven by `build.zig` through the `build_options` module.
+///
+/// This declaration lives on the library root (not inside the backend) on purpose:
+/// the CPU backend reads it via `@import("root")`, so builds whose compilation root
+/// is not this file (unit tests, benchmarks, examples) simply don't see it and fall
+/// back to in-module kernel selection — without needing the `build_options` module.
+pub const aion_multiversion: bool = @import("build_options").multiversion;
+
 // Zig compilation is lazy; force the module to be analyzed so its exported
 // symbols are emitted into the library even if the Zig-level `c_api` constant
 // is never referenced by Zig callers.

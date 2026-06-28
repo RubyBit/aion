@@ -914,6 +914,67 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
 
     const run_bytes: usize = run_len * elem_bytes;
     const outer_total: usize = if (outer_dims == 0) 1 else try elemCountFromShape(outer_shape[0..outer_dims]);
+
+    // Fast path for the no-trailing-run case (e.g. a slice along the last dim, or a
+    // fully-copied-but-multi-tile last dim). The generic loop below would degrade to a
+    // 1-element memcpy with full tile-coordinate math *per element*. Instead, walk the
+    // last dim in tile-contiguous chunks (stride-1 within a tile), copying up to a whole
+    // in-tile run per memcpy — ~tile_shape[last]x fewer iterations. Correct for any
+    // `starts` (aligned or not): the chunk is bounded by the distance to the next tile
+    // boundary in both src and dst.
+    if (run_dims == 0 and rank >= 1) {
+        const last: usize = rank - 1;
+        const o_dims: usize = rank - 1; // outer = all dims except the last
+        var o_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        if (o_dims > 0) try computePackedStrides(dst_meta.shape[0..o_dims], o_strides[0..o_dims]);
+        const o_total: usize = if (o_dims == 0) 1 else try elemCountFromShape(dst_meta.shape[0..o_dims]);
+        const n_last: usize = dst_meta.shape[last];
+
+        var ob: usize = 0;
+        while (ob < o_total) : (ob += 1) {
+            if (o_dims > 0) try decodeLinearToCoords(ob, o_strides[0..o_dims], dst_meta.shape[0..o_dims], dst_coords[0..o_dims]);
+            var c: usize = 0;
+            while (c < n_last) {
+                dst_coords[last] = c;
+                d = 0;
+                while (d < rank) : (d += 1) {
+                    src_coords[d] = starts[d] + dst_coords[d];
+                    dst_tile_coords[d] = dst_coords[d] / dst_meta.tile_shape[d];
+                    dst_local_coords[d] = dst_coords[d] - dst_tile_coords[d] * dst_meta.tile_shape[d];
+                    src_tile_coords[d] = src_coords[d] / src_meta.tile_shape[d];
+                    src_local_coords[d] = src_coords[d] - src_tile_coords[d] * src_meta.tile_shape[d];
+                }
+
+                // Max contiguous run: to the next tile boundary in both tensors, capped
+                // by the elements left in the slice.
+                var chunk: usize = n_last - c;
+                const dst_room: usize = dst_meta.tile_shape[last] - dst_local_coords[last];
+                const src_room: usize = src_meta.tile_shape[last] - src_local_coords[last];
+                if (dst_room < chunk) chunk = dst_room;
+                if (src_room < chunk) chunk = src_room;
+
+                const dst_tile_index: usize = try tensor_store.encodeTileIndex(dst_meta, dst_tile_coords[0..rank]);
+                const src_tile_index: usize = try tensor_store.encodeTileIndex(src_meta, src_tile_coords[0..rank]);
+                try ensureMutTileLinear(&dst_cache, store, dst_id, dst_tile_index, rank);
+                try ensureConstTileLinear(&src_cache, store, src_id, src_tile_index, rank);
+
+                var dst_local_lin: usize = 0;
+                var src_local_lin: usize = 0;
+                d = 0;
+                while (d < rank) : (d += 1) {
+                    dst_local_lin = std.math.add(usize, dst_local_lin, dst_local_coords[d] * dst_cache.strides[d]) catch return BackendError.InvalidArgument;
+                    src_local_lin = std.math.add(usize, src_local_lin, src_local_coords[d] * src_cache.strides[d]) catch return BackendError.InvalidArgument;
+                }
+                const dst_off: usize = dst_local_lin * elem_bytes;
+                const src_off: usize = src_local_lin * elem_bytes;
+                const nbytes: usize = chunk * elem_bytes;
+                @memcpy(dst_cache.tile.bytes[dst_off .. dst_off + nbytes], src_cache.tile.bytes[src_off .. src_off + nbytes]);
+                c += chunk;
+            }
+        }
+        return;
+    }
+
     var blk: usize = 0;
     while (blk < outer_total) : (blk += 1) {
         if (outer_dims > 0) try decodeLinearToCoords(blk, outer_strides[0..outer_dims], outer_shape[0..outer_dims], dst_coords[0..outer_dims]);

@@ -732,7 +732,6 @@ class _LayerWeights:
     post_pli_ln: int
     skip_scale: float
 
-    q_proj: int
     o_proj: int
     q_norm: int
 
@@ -740,12 +739,30 @@ class _LayerWeights:
     v_proj: Optional[int]
     k_norm: Optional[int]
 
-    gate_proj: int
-    up_proj: int
     down_proj: int
 
     pli_gate: int
     pli_proj: int
+
+    # Per-layer FFN width. Gemma 4 E2B is elastic: layers 0..14 use FFN=6144, layers
+    # 15..34 use FFN=12288. The fused gate/up split point must therefore be per-layer,
+    # NOT the FFN_DIM constant.
+    ffn_dim: int = FFN_DIM
+
+    # Attention Q projection: non-source layers use a standalone `q_proj`; source layers
+    # (0..14, which also compute K/V) fuse Q+K+V into one matmul-B split by slices, same
+    # rationale as the gate/up fusion below.
+    q_proj: Optional[int] = None
+    qkv_proj: Optional[int] = None
+
+    # FFN gate/up: either stored separately (debug single-block path) or fused into a
+    # single [in, 2*ffn_dim] matmul-B (main path) and split with two slices in the graph.
+    # Fusing halves the decode op count for the FFN's biggest matmul and lets the GEMV
+    # amortize per-op overhead (~1.9x faster on the gate/up step; see `zig build bench
+    # -- --suite decode`). Defaulted so each emit path sets only what it uses.
+    gate_proj: Optional[int] = None
+    up_proj: Optional[int] = None
+    gateup_proj: Optional[int] = None
 
 
 @dataclass
@@ -784,6 +801,11 @@ def _emit_weights(loader: _WeightLoader, b: _PackageBuilder) -> Tuple[_SharedWei
 
         is_source = layer in SOURCE_LAYERS
 
+        # Elastic FFN: per-layer width is the gate_proj output dim (6144 or 12288).
+        gate_w = loader.get_f32(f"{pfx}.mlp.gate_proj.weight")
+        up_w = loader.get_f32(f"{pfx}.mlp.up_proj.weight")
+        layer_ffn = int(gate_w.shape[0])
+
         lw = _LayerWeights(
             input_ln=f32v(name("input_layernorm.weight"), loader.get_f32(f"{pfx}.input_layernorm.weight")),
             post_attn_ln=f32v(name("post_attention_layernorm.weight"), loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
@@ -791,20 +813,37 @@ def _emit_weights(loader: _WeightLoader, b: _PackageBuilder) -> Tuple[_SharedWei
             post_ffn_ln=f32v(name("post_feedforward_layernorm.weight"), loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
             post_pli_ln=f32v(name("post_per_layer_input_norm.weight"), loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
             skip_scale=float(loader.get_f32(f"{pfx}.layer_scalar").reshape(-1)[0]),
-            q_proj=b.add_q8_0_matmul_b(name("self_attn.q_proj.weight"), loader.get_f32(f"{pfx}.self_attn.q_proj.weight")),
             o_proj=b.add_q8_0_matmul_b(name("self_attn.o_proj.weight"), loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
             q_norm=f32v(name("self_attn.q_norm.weight"), loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
             k_proj=None, v_proj=None, k_norm=None,
-            gate_proj=b.add_q8_0_matmul_b(name("mlp.gate_proj.weight"), loader.get_f32(f"{pfx}.mlp.gate_proj.weight")),
-            up_proj=b.add_q8_0_matmul_b(name("mlp.up_proj.weight"), loader.get_f32(f"{pfx}.mlp.up_proj.weight")),
+            # Fuse gate_proj+up_proj into one [2*ffn, in] weight (PyTorch [out, in]),
+            # concatenated along the output axis: rows [0:ffn]=gate, [ffn:]=up.
+            ffn_dim=layer_ffn,
+            gateup_proj=b.add_q8_0_matmul_b(
+                name("mlp.gateup_proj.weight"),
+                np.concatenate([gate_w, up_w], axis=0),
+            ),
             down_proj=b.add_q8_0_matmul_b(name("mlp.down_proj.weight"), loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
             pli_gate=b.add_q8_0_matmul_b(name("per_layer_input_gate.weight"), loader.get_f32(f"{pfx}.per_layer_input_gate.weight")),
             pli_proj=b.add_q8_0_matmul_b(name("per_layer_projection.weight"), loader.get_f32(f"{pfx}.per_layer_projection.weight")),
         )
         if is_source:
-            lw.k_proj = b.add_q8_0_matmul_b(name("self_attn.k_proj.weight"), loader.get_f32(f"{pfx}.self_attn.k_proj.weight"))
-            lw.v_proj = b.add_q8_0_matmul_b(name("self_attn.v_proj.weight"), loader.get_f32(f"{pfx}.self_attn.v_proj.weight"))
+            # Source layers fuse Q+K+V into one matmul-B (rows: Q, then K, then V),
+            # split back with slices in the forward graph.
+            lw.qkv_proj = b.add_q8_0_matmul_b(
+                name("self_attn.qkv_proj.weight"),
+                np.concatenate(
+                    [
+                        loader.get_f32(f"{pfx}.self_attn.q_proj.weight"),
+                        loader.get_f32(f"{pfx}.self_attn.k_proj.weight"),
+                        loader.get_f32(f"{pfx}.self_attn.v_proj.weight"),
+                    ],
+                    axis=0,
+                ),
+            )
             lw.k_norm = f32v(name("self_attn.k_norm.weight"), loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
+        else:
+            lw.q_proj = b.add_q8_0_matmul_b(name("self_attn.q_proj.weight"), loader.get_f32(f"{pfx}.self_attn.q_proj.weight"))
         layers.append(lw)
 
     return shared, layers
@@ -879,16 +918,25 @@ def _emit_forward(
         # 1) Pre-attn norm on x.
         x_norm = b.rmsnorm(x, lw.input_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
 
-        # 2) Q projection, reshape to [B, S, H, D_k], norm, rope.
-        q_flat = b.matmul(x_norm, lw.q_proj)  # [B, S, H*D_k]
+        # 2) Q projection (non-source) or fused QKV projection split by slices (source).
+        q_out = NUM_HEADS * head_dim
+        kv_out = NUM_KV_HEADS * head_dim
+        if is_source:
+            assert lw.qkv_proj is not None
+            qkv = b.matmul(x_norm, lw.qkv_proj)  # [B, S, q_out + 2*kv_out]
+            q_flat = b.slice_nd(qkv, (0, 0, 0), ("batch", "seq", q_out))
+            k_flat = b.slice_nd(qkv, (0, 0, q_out), ("batch", "seq", kv_out))
+            v_flat = b.slice_nd(qkv, (0, 0, q_out + kv_out), ("batch", "seq", kv_out))
+        else:
+            q_flat = b.matmul(x_norm, lw.q_proj)  # [B, S, H*D_k]
+
         q = b.reshape(q_flat, ("batch", "seq", NUM_HEADS, head_dim))
         q = b.rmsnorm(q, lw.q_norm, b.zero_beta((head_dim,)), (head_dim,))
         q = b.rope1d(q, positions, rope_base, rope_proportion=rope_prop)
 
-        # 3) For source layers: compute K/V and append (after cast to f16).
+        # 3) For source layers: norm/rope/append the K/V slices (after cast to f16).
         if is_source:
-            assert lw.k_proj is not None and lw.v_proj is not None and lw.k_norm is not None
-            k_flat = b.matmul(x_norm, lw.k_proj)  # [B, S, D_k]
+            assert lw.k_norm is not None
             k4 = b.reshape(k_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
             k4 = b.rmsnorm(k4, lw.k_norm, b.zero_beta((head_dim,)), (head_dim,))
             k4 = b.rope1d(k4, positions, rope_base, rope_proportion=rope_prop)
@@ -898,7 +946,6 @@ def _emit_forward(
             k_f16 = b.cast(k4_t, aw.DType.f16)
             k_cache_cur[layer_idx] = b.kv_cache_append(k_cache_cur[layer_idx], k_f16, cache_write_index)
 
-            v_flat = b.matmul(x_norm, lw.v_proj)
             v4 = b.reshape(v_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
             # Gemma4 uses V-norm, but it is parameterless (gamma is implicitly all-ones).
             v4 = b.rmsnorm(v4, b.scale_broadcast_vec(head_dim, 1.0), b.zero_beta((head_dim,)), (head_dim,))
@@ -927,10 +974,13 @@ def _emit_forward(
         o_out = b.rmsnorm(o_out, lw.post_attn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
         x = b.elemwise(aw.ElemwiseBinaryOp.add, x, o_out)
 
-        # 6) FFN: pre-ffn norm, gate/up, gelu, multiply, down, residual, post-ffn norm.
+        # 6) FFN: pre-ffn norm, fused gate/up matmul (split via slices), gelu, multiply,
+        #    down, residual, post-ffn norm.
         ff_in = b.rmsnorm(x, lw.pre_ffn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-        gate = b.matmul(ff_in, lw.gate_proj)           # [B, S, FFN_DIM]
-        up = b.matmul(ff_in, lw.up_proj)               # [B, S, FFN_DIM]
+        ffn = lw.ffn_dim                               # per-layer (elastic): 6144 or 12288
+        gate_up = b.matmul(ff_in, lw.gateup_proj)      # [B, S, 2*ffn]
+        gate = b.slice_nd(gate_up, (0, 0, 0), ("batch", "seq", ffn))    # rows [0:ffn]
+        up = b.slice_nd(gate_up, (0, 0, ffn), ("batch", "seq", ffn))    # rows [ffn:]
         gate_act = b.unary(aw.UnaryOp.gelu, gate)
         ff = b.elemwise(aw.ElemwiseBinaryOp.mul, gate_act, up)
         ff = b.matmul(ff, lw.down_proj)                # [B, S, EMBED_DIM]

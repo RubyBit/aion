@@ -31,6 +31,7 @@ const BenchSuite = enum {
     all,
     matmul,
     matmul_q,
+    decode,
 };
 
 const BenchDTypeMode = enum {
@@ -89,7 +90,7 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
-            "  --suite NAME     Bench suite: all|matmul|quant-matmul (default: all)\n" ++
+            "  --suite NAME     Bench suite: all|matmul|quant-matmul|decode (default: all)\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
@@ -127,6 +128,7 @@ fn parseBenchSuite(arg: []const u8) !BenchSuite {
     if (std.mem.eql(u8, arg, "all")) return .all;
     if (std.mem.eql(u8, arg, "matmul")) return .matmul;
     if (std.mem.eql(u8, arg, "quant-matmul")) return .matmul_q;
+    if (std.mem.eql(u8, arg, "decode")) return .decode;
     return error.InvalidArgument;
 }
 
@@ -2077,6 +2079,178 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     std.debug.print("program matmul {s}:      {d:.2} GFLOP/s (m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ name, gflops, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
 }
 
+// ---------------------------------------------------------------------------
+// Decode (autoregressive GEMV) suite.
+//
+// Reproduces the per-token decode shapes of a transformer (M=1, q8_0 weights)
+// through the real graph/program/executor path, isolated from model load. Compares
+// the two weight layouts the runtime can use:
+//   * MatMul   : B stored `[1, K, N]` (block-major over K) — the projection path.
+//   * MatMulNT : B stored `[N, K]`    (per-output-row contiguous K) — the tied-logits
+//                path. `tn` is B's N-axis tile = how finely N parallelizes.
+// Reported as GiB/s of q8_0 weight bytes streamed (the decode-relevant metric).
+// ---------------------------------------------------------------------------
+
+fn buildQuantB_Q8_0_NT(allocator: std.mem.Allocator, rnd: std.Random, n: usize, k: usize) ![]u8 {
+    // NT B is `[N, K]` (quant_axis=1): per row j, K/32 contiguous blocks.
+    // offset(j, kb) = (j*k_blocks + kb) * block_bytes.
+    if (k % Q8_0_BLOCK_ELEMS != 0) return error.InvalidArgument;
+    const k_blocks: usize = k / Q8_0_BLOCK_ELEMS;
+
+    const b_f32: []f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_f32);
+    fillRandomF32(rnd, b_f32);
+
+    const out: []u8 = try allocator.alloc(u8, n * k_blocks * Q8_0_BLOCK_BYTES);
+    for (0..n) |j| {
+        for (0..k_blocks) |kb| {
+            var block_vals: [32]f32 = undefined;
+            for (0..32) |t| block_vals[t] = b_f32[j * k + kb * 32 + t];
+            const off: usize = (j * k_blocks + kb) * Q8_0_BLOCK_BYTES;
+            quantizeQ8_0FromF32Block32(&block_vals, @ptrCast(out[off..][0..Q8_0_BLOCK_BYTES]));
+        }
+    }
+    return out;
+}
+
+fn decodeWeightGiBs(k: usize, n: usize, iters: usize, ns: u64) f64 {
+    const bytes: u64 = @as(u64, @intCast((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES)) * @as(u64, @intCast(iters));
+    return fmtRateGiBPerSec(bytes, ns);
+}
+
+fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, label: []const u8, be: Backend) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Production-faithful policy (the model loads with `TilePolicy{}` defaults, i.e.
+    // base_square_2d=64) so this reproduces the model's actual decode tiling — NOT
+    // the bench-wide defaultTilePolicy() which bumps base_square_2d to 256.
+    const policy: plan_mod.TilePolicy = .{};
+    const m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const tiles = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, .q8_0);
+
+    const a: []f32 = try allocator.alloc(f32, k);
+    defer allocator.free(a);
+    fillRandomF32(rnd, a);
+
+    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+
+    const b_bytes: []u8 = try buildQuantB_Q8_0(allocator, rnd, k, n);
+    defer allocator.free(b_bytes);
+    const b_tid: TensorId = try sm.createTiledTensor(.q8_0, &[_]usize{ 1, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment, .quant_axis = 1 });
+    try sm.writeFromPackedQuant(b_tid, b_bytes);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const a_in = try g.addInput(.f32, &[_]usize{ 1, 1, k });
+    const b_in = try g.addInput(.q8_0, &[_]usize{ 1, k, n });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const ov = asF32Slice(out_buf);
+    const chk: f32 = ov[0] + ov[n / 2] + ov[n - 1];
+
+    std.debug.print(
+        "decode {s:<16} MatMul       K={d:<5} N={d:<6} tn={d:<4} tk={d:<4}: {d:6.2} GiB/s  ({d:.3} ms/iter, chk={d:.3})\n",
+        .{ label, k, n, tiles.tn, tiles.tk, decodeWeightGiBs(k, n, iters, ns), nsToMillisecondsPerIter(ns, iters), chk },
+    );
+}
+
+fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, tn: usize, label: []const u8, be: Backend) !void {
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const policy: plan_mod.TilePolicy = defaultTilePolicy();
+    const tn_eff: usize = @max(@as(usize, 1), @min(tn, n));
+
+    const a: []f32 = try allocator.alloc(f32, k);
+    defer allocator.free(a);
+    fillRandomF32(rnd, a);
+
+    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, k }, &[_]usize{ 1, 1, k }, .{ .tile_alignment = policy.tile_alignment });
+    try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
+
+    const b_bytes: []u8 = try buildQuantB_Q8_0_NT(allocator, rnd, n, k);
+    defer allocator.free(b_bytes);
+    // NT B `[N, K]`, quant_axis=1, tile_shape[1] == K (full-K per row).
+    const b_tid: TensorId = try sm.createTiledTensor(.q8_0, &[_]usize{ n, k }, &[_]usize{ tn_eff, k }, .{ .tile_alignment = policy.tile_alignment, .quant_axis = 1 });
+    try sm.writeFromPackedQuant(b_tid, b_bytes);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const a_in = try g.addInput(.f32, &[_]usize{ 1, 1, k });
+    const b_in = try g.addInput(.q8_0, &[_]usize{ n, k });
+    try g.bindExternal(a_in, @intCast(a_tid));
+    try g.bindExternal(b_in, @intCast(b_tid));
+    const out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    const ns: u64 = try benchLoop(iters, struct {
+        be: Backend,
+        sm: *StorageManager,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.be.executeProgram(self.prog, self.sm.tensorStore());
+        }
+    }{ .be = be, .sm = &sm, .prog = &prog });
+
+    const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const ov = asF32Slice(out_buf);
+    const chk: f32 = ov[0] + ov[n / 2] + ov[n - 1];
+
+    std.debug.print(
+        "decode {s:<16} MatMulNT     K={d:<5} N={d:<6} tn={d:<4}        : {d:6.2} GiB/s  ({d:.3} ms/iter, chk={d:.3})\n",
+        .{ label, k, n, tn_eff, decodeWeightGiBs(k, n, iters, ns), nsToMillisecondsPerIter(ns, iters), chk },
+    );
+}
+
+fn runDecodeSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
+    const Shape = struct { label: []const u8, k: usize, n: usize };
+    // Gemma 4 E2B per-token decode GEMV shapes.
+    const shapes = [_]Shape{
+        .{ .label = "ffn_gate_up", .k = 1536, .n = 6144 },
+        .{ .label = "ffn_gateup_FUSED", .k = 1536, .n = 12288 }, // gate+up concatenated (1 op vs 2)
+        .{ .label = "ffn_down", .k = 6144, .n = 1536 },
+        .{ .label = "q_proj_local", .k = 1536, .n = 2048 },
+        .{ .label = "o_proj_local", .k = 2048, .n = 1536 },
+        .{ .label = "q_proj_global", .k = 1536, .n = 4096 },
+        .{ .label = "qkv_FUSED_local", .k = 1536, .n = 2560 }, // q2048+k256+v256 (1 op vs 3)
+        .{ .label = "qkv_FUSED_global", .k = 1536, .n = 5120 }, // q4096+k512+v512
+    };
+    const tn_sweep = [_]usize{ 64, 256, 1024 };
+
+    for (shapes) |s| {
+        try benchDecodeMatMul(allocator, rnd, opts.iters, s.k, s.n, s.label, be);
+        for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, s.k, s.n, tn, s.label, be);
+        std.debug.print("\n", .{});
+    }
+    // Tied-logits projection: NT only (the real model path), huge N.
+    for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, 1536, 262144, tn, "logits_tied", be);
+}
+
 fn makeCpuBackend(allocator: std.mem.Allocator, threads: usize) !CpuBackend {
     if (threads == 1) {
         return CpuBackend.init(allocator);
@@ -2268,6 +2442,11 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
 }
 
 fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
+    if (opts.suite == .decode) {
+        try runDecodeSuite(allocator, rnd, opts, be);
+        return;
+    }
+
     if (opts.suite == .matmul) {
         try benchProgramMatmulF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, be);
         try benchProgramMatmulBatchedF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.n, opts.k, be);

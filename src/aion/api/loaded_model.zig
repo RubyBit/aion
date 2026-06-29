@@ -14,6 +14,7 @@ const signatures = @import("loaded_model/signatures.zig");
 const retarget = @import("loaded_model/retarget.zig");
 const instantiate = @import("loaded_model/instantiate.zig");
 const initializers = @import("loaded_model/initializers.zig");
+const fuse = @import("../graph/opt/fuse_horizontal_matmul.zig");
 
 fn traceEnabled() bool {
     return env_util.flagEnabled("AION_TRACE");
@@ -194,18 +195,26 @@ pub const Model = struct {
         return null;
     }
 
-    /// Return an owned tensor handle for an initializer value.
-    ///
-    /// The returned tensor can be mutated in-place to swap weights without
-    /// recompiling.
-    pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
+    /// Resolve an initializer value index to its store tensor id.
+    fn initializerTidByValue(self: *Self, value_index: u32) api_errors.ApiError!TensorId {
         const p = self.packageOrNull() orelse return api_errors.ApiError.InvalidArgument;
         if (value_index >= p.values.len) return api_errors.ApiError.InvalidArgument;
         const value = p.values[value_index];
         if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
         const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
         if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
-        const tid: TensorId = self.initializer_tids[init_idx];
+        return self.initializer_tids[init_idx];
+    }
+
+    /// Return an owned tensor handle for an initializer value.
+    ///
+    /// The returned tensor can be mutated in-place to swap weights without
+    /// recompiling. NOT available for a weight that an optimization pass fused into
+    /// a combined tensor — that weight has no standalone in-place storage; use
+    /// `overwriteInitializerByValue`, which writes through to the fused weight.
+    pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
+        const tid: TensorId = try self.initializerTidByValue(value_index);
+        if (self.store.findDerivedWeightBySource(tid) != null) return api_errors.ApiError.InvalidArgument;
         const meta = try self.store.getConst(tid);
         return .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
     }
@@ -224,14 +233,48 @@ pub const Model = struct {
     /// tilings via pack/unpack when needed.
     pub fn overwriteInitializerByValue(self: *Self, value_index: u32, src: Tensor) api_errors.ApiError!void {
         if (src.store != self.store) return api_errors.ApiError.InvalidArgument;
-        const dst: Tensor = try self.initializerTensorByValue(value_index);
-        if (dst.id == src.id) return;
+        const tid: TensorId = try self.initializerTidByValue(value_index);
+
+        // If this weight was fused into a combined tensor, the fused tensor is the
+        // canonical store — write through to its sub-region (the original buffer may
+        // have been reclaimed). Takes effect next run with no recompile.
+        if (self.store.findDerivedWeightBySource(tid)) |ref| {
+            return fuse.overwriteFusedColumns(self.allocator, self.store, ref, src.id) catch api_errors.ApiError.InvalidArgument;
+        }
+
+        if (tid == src.id) return;
+        const meta = try self.store.getConst(tid);
+        const dst: Tensor = .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
         try dst.copyFrom(self.allocator, src);
     }
 
     pub fn overwriteInitializerByDebugName(self: *Self, debug_name: []const u8, src: Tensor) api_errors.ApiError!void {
         const value_index: u32 = self.findValueByDebugName(debug_name) orelse return api_errors.ApiError.InvalidArgument;
         return self.overwriteInitializerByValue(value_index, src);
+    }
+
+    /// Read an initializer's current bytes into `dst` (the read counterpart of
+    /// `overwriteInitializerByValue`). Works whether or not the weight was fused: a
+    /// fused weight has no standalone storage, so its value is materialized out of
+    /// the combined tensor — mirrors `_packed_params` unpacking on read. `dst` must
+    /// match the logical weight's dtype/shape and is owned by the caller.
+    pub fn readInitializerByValue(self: *Self, value_index: u32, dst: Tensor) api_errors.ApiError!void {
+        if (dst.store != self.store) return api_errors.ApiError.InvalidArgument;
+        const tid: TensorId = try self.initializerTidByValue(value_index);
+
+        if (self.store.findDerivedWeightBySource(tid)) |ref| {
+            return fuse.readFusedColumns(self.allocator, self.store, ref, dst.id) catch api_errors.ApiError.InvalidArgument;
+        }
+
+        if (tid == dst.id) return;
+        const meta = try self.store.getConst(tid);
+        const src: Tensor = .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
+        try dst.copyFrom(self.allocator, src);
+    }
+
+    pub fn readInitializerByDebugName(self: *Self, debug_name: []const u8, dst: Tensor) api_errors.ApiError!void {
+        const value_index: u32 = self.findValueByDebugName(debug_name) orelse return api_errors.ApiError.InvalidArgument;
+        return self.readInitializerByValue(value_index, dst);
     }
 
     /// Retarget an initializer to a different underlying tensor id.
@@ -255,6 +298,13 @@ pub const Model = struct {
         const old_tid: TensorId = self.initializer_tids[init_idx];
         const new_tid: TensorId = new_tensor.id;
         if (old_tid == new_tid) return;
+
+        // A fused weight isn't referenced by the program (the combined tensor is), so
+        // retargeting its id would patch nothing. Write the new contents through to
+        // the fused weight's sub-region instead; the alias mapping stays put.
+        if (self.store.findDerivedWeightBySource(old_tid)) |ref| {
+            return fuse.overwriteFusedColumns(self.allocator, self.store, ref, new_tid) catch api_errors.ApiError.InvalidArgument;
+        }
 
         const ok = try signatures.tensorsHaveCompatibleLayout(self.store, old_tid, new_tid);
         if (!ok) return api_errors.ApiError.InvalidArgument;
@@ -906,7 +956,28 @@ pub const Model = struct {
 
         const entry = try self.buildCacheEntry(symbol_values, input_shapes, direct_input_ids);
         try self.cache_entries.append(self.allocator, entry);
+        self.reclaimFusedInitializers();
         return self.cache_entries.items.len - 1;
+    }
+
+    /// Reclaim weights that an optimization pass fused into a combined tensor: their
+    /// data is now redundant with the fused weight (the canonical store), so free
+    /// the backing buffer while keeping metadata. Lifecycle lives here, not in the
+    /// pass. A weight is freed only if no compiled program still references it
+    /// directly (guards a weight shared with an unfused op). Idempotent; weight-swap
+    /// stays correct via write-through to the fused weight.
+    fn reclaimFusedInitializers(self: *Self) void {
+        for (self.initializer_tids) |tid| {
+            if (self.store.findDerivedWeightBySource(tid) == null) continue;
+            var referenced = false;
+            for (self.cache_entries.items) |*entry| {
+                if (retarget.programReferencesTensorId(&entry.program, tid)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) self.store.releaseTensorData(tid) catch {};
+        }
     }
 
     /// Produce a concrete graph for the requested shapes (source-specific), then

@@ -461,6 +461,16 @@ pub const TiledTensor = struct {
         self.tile_lens = tile_lens;
     }
 
+    /// Frees the (large) tile-backing buffer while keeping shape/tiling metadata,
+    /// so the tensor id stays valid for metadata-only uses (e.g. external-binding
+    /// shape/dtype validation) but holds no data. Used to reclaim a weight that an
+    /// optimization pass has fused away; executing against it afterward is a bug.
+    /// Idempotent.
+    pub fn releaseData(self: *Self) void {
+        if (self.data.len != 0 and self.owns_data) self.allocator.free(self.data);
+        self.data = &[_]u8{};
+    }
+
     pub fn deinit(self: *Self) void {
         if (self.meta.len != 0) {
             self.allocator.free(self.meta);

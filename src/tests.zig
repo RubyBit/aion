@@ -20,6 +20,7 @@ comptime {
     _ = @import("aion/backend/cpu/kernels/matmul_q_i8.zig");
 
     _ = @import("aion/graph/test_program.zig");
+    _ = @import("aion/graph/opt/test_fuse_horizontal_matmul.zig");
 
     _ = @import("aion/api/test_api.zig");
 }

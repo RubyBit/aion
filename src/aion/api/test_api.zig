@@ -1321,6 +1321,146 @@ test "api: loadModel can swap initializers by debug name (overwrite + retarget)"
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), y_vals[2], 1e-6);
 }
 
+/// Pack a `[K, N]` f32 matmul-B weight to q8_0 (blocks along K, per column).
+fn packQ8WeightKN(allocator: std.mem.Allocator, vals: []const f32, k: usize, n: usize) ![]u8 {
+    const kb = k / 32;
+    const buf = try allocator.alloc(u8, kb * n * 34);
+    for (0..kb) |b| {
+        for (0..n) |j| {
+            var absmax: f32 = 0;
+            for (0..32) |t| absmax = @max(absmax, @abs(vals[(b * 32 + t) * n + j]));
+            const scale: f32 = if (absmax == 0) 1 else absmax / 127.0;
+            const inv: f32 = if (absmax == 0) 0 else 1.0 / scale;
+            const sf16: f16 = @floatCast(scale);
+            const off = (b * n + j) * 34;
+            std.mem.writeInt(u16, buf[off .. off + 2][0..2], @bitCast(sf16), .little);
+            for (0..32) |t| {
+                var q: i32 = @intFromFloat(@round(vals[(b * 32 + t) * n + j] * inv));
+                q = @max(@as(i32, -128), @min(@as(i32, 127), q));
+                buf[off + 2 + t] = @bitCast(@as(i8, @intCast(q)));
+            }
+        }
+    }
+    return buf;
+}
+
+test "api: weight-swap writes through a fused projection (in-place handle refused)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 64;
+    const Nq: usize = 32;
+    const Nk: usize = 32;
+    const M: usize = 2;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    // Two q8_0 projections off a shared input — the compiler fuses them at load.
+    const qv = try allocator.alloc(f32, K * Nq);
+    defer allocator.free(qv);
+    for (qv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.1;
+    const kv = try allocator.alloc(f32, K * Nk);
+    defer allocator.free(kv);
+    for (kv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.1;
+    const q_packed = try packQ8WeightKN(allocator, qv, K, Nq);
+    defer allocator.free(q_packed);
+    const k_packed = try packQ8WeightKN(allocator, kv, K, Nk);
+    defer allocator.free(k_packed);
+
+    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, q_packed);
+    const wk = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nk }, k_packed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "fused_swap.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ M, K }), "x");
+    const Q = try bld.name(try bld.param(wq), "q");
+    const Kp = try bld.name(try bld.param(wk), "k");
+    const Oq = try bld.matmul(X, Q, 1.0, 0.0);
+    const Ok = try bld.matmul(X, Kp, 1.0, 0.0);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "oq", .tensor = Oq },
+        .{ .name = "ok", .tensor = Ok },
+    }, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+    var model = try load_ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    const xv = try allocator.alloc(f32, M * K);
+    defer allocator.free(xv);
+    for (xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+    const x_t = try load_ctx.fromF32(&[_]usize{ M, K }, xv);
+    try model.bindInput("x", x_t);
+    try model.run();
+
+    var oq_before: [M * Nq]f32 = undefined;
+    var ok_before: [M * Nk]f32 = undefined;
+    {
+        const t = try model.outputTensor("oq");
+        try t.read(&oq_before);
+    }
+    {
+        const t = try model.outputTensor("ok");
+        try t.read(&ok_before);
+    }
+    // Sanity: q's output is meaningfully non-zero so the swap below is observable.
+    var any_nonzero = false;
+    for (oq_before) |v| {
+        if (@abs(v) > 1e-3) any_nonzero = true;
+    }
+    try std.testing.expect(any_nonzero);
+
+    // "q" was fused into the combined weight: no standalone in-place handle...
+    try std.testing.expectError(error.InvalidArgument, model.initializerTensorByDebugName("q"));
+
+    // ...but its current value is still readable — materialized out of the fused
+    // weight (the read counterpart of write-through). It must be non-zero here.
+    const zero_packed = try allocator.alloc(u8, (K / 32) * Nq * 34);
+    defer allocator.free(zero_packed);
+    @memset(zero_packed, 0);
+    const q_back = try allocator.alloc(u8, (K / 32) * Nq * 34);
+    defer allocator.free(q_back);
+
+    var scratch_q = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, zero_packed);
+    try model.readInitializerByDebugName("q", scratch_q);
+    try scratch_q.readPackedQuant(q_back);
+    var q_back_nonzero = false;
+    for (q_back) |b| {
+        if (b != 0) q_back_nonzero = true;
+    }
+    try std.testing.expect(q_back_nonzero);
+
+    // Swap "q" for an all-zero weight via write-through, then re-run.
+    const zero_w = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, zero_packed);
+    try model.overwriteInitializerByDebugName("q", zero_w);
+    try model.run();
+
+    var oq_after: [M * Nq]f32 = undefined;
+    var ok_after: [M * Nk]f32 = undefined;
+    {
+        const t = try model.outputTensor("oq");
+        try t.read(&oq_after);
+    }
+    {
+        const t = try model.outputTensor("ok");
+        try t.read(&ok_after);
+    }
+    // q's output collapses to zero (write-through landed in q's columns)...
+    for (oq_after) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
+    // ...and k's output is untouched (isolation across the fused weight).
+    for (ok_after, ok_before) |a, b| try std.testing.expectApproxEqAbs(b, a, 1e-6);
+
+    // Read-back now reflects the swap: q materializes as all-zero.
+    try model.readInitializerByDebugName("q", scratch_q);
+    try scratch_q.readPackedQuant(q_back);
+    for (q_back) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
 test "api: loadModel can switch a linear head (overwrite head.w + head.b)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

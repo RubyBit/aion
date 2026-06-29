@@ -28,6 +28,17 @@ pub const StorageManager = struct {
     tensors: std.ArrayList(*TiledTensor) = .empty,
     cache: ?Cache = null,
 
+    /// Memoizes weight tensors derived from a set of source tensors by an
+    /// optimization pass — concatenated, bias-folded, norm-folded, or otherwise
+    /// fused weights. Keyed by an opaque pass-defined `kind` (so distinct
+    /// derivations don't alias over the same sources) plus the ordered source ids.
+    /// Model weights are shape-independent, so a derived weight is identical across
+    /// the per-shape recompiles that hit the same store; without this memo each
+    /// recompile would re-derive and leak (tensors are only freed on `deinit`).
+    derived_weight_cache: std.ArrayList(DerivedWeight) = .empty,
+
+    const DerivedWeight = struct { kind: u32, sources: []TensorId, result: TensorId };
+
     const Self = @This();
 
     fn mapCacheError(err: cache_mod.CacheError) StorageError {
@@ -58,12 +69,47 @@ pub const StorageManager = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.cache) |*c| c.deinit();
+        for (self.derived_weight_cache.items) |entry| self.allocator.free(entry.sources);
+        self.derived_weight_cache.deinit(self.allocator);
         for (self.tensors.items) |t| {
             t.deinit();
             self.allocator.destroy(t);
         }
         self.tensors.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Look up a previously derived weight for `(kind, sources)`. `kind` namespaces
+    /// distinct derivations so they don't alias over the same sources. Null on miss.
+    pub fn lookupDerivedWeight(self: *const Self, kind: u32, sources: []const TensorId) ?TensorId {
+        for (self.derived_weight_cache.items) |entry| {
+            if (entry.kind != kind or entry.sources.len != sources.len) continue;
+            if (std.mem.eql(TensorId, entry.sources, sources)) return entry.result;
+        }
+        return null;
+    }
+
+    /// Record a derived weight, taking an owned copy of `sources` as the key.
+    pub fn recordDerivedWeight(self: *Self, kind: u32, sources: []const TensorId, result: TensorId) StorageError!void {
+        const ids_copy: []TensorId = self.allocator.dupe(TensorId, sources) catch return StorageError.OutOfMemory;
+        errdefer self.allocator.free(ids_copy);
+        self.derived_weight_cache.append(self.allocator, .{ .kind = kind, .sources = ids_copy, .result = result }) catch return StorageError.OutOfMemory;
+    }
+
+    /// A derived-weight entry seen from one of its sources: the fused `result`, the
+    /// full ordered `sources`, and the queried source's `index` within them.
+    /// Lets a weight-swap resolve "this logical weight is region `index` of `result`".
+    pub const DerivedSourceRef = struct { kind: u32, result: TensorId, sources: []const TensorId, index: usize };
+
+    /// Find the derived weight `source_tid` was folded into (if any), so a swap can
+    /// write through to the fused tensor. Returns the first match.
+    pub fn findDerivedWeightBySource(self: *const Self, source_tid: TensorId) ?DerivedSourceRef {
+        for (self.derived_weight_cache.items) |entry| {
+            for (entry.sources, 0..) |sid, i| {
+                if (sid == source_tid) return .{ .kind = entry.kind, .result = entry.result, .sources = entry.sources, .index = i };
+            }
+        }
+        return null;
     }
 
     pub fn configureCache(self: *Self, cfg: CacheConfig) StorageError!void {
@@ -126,6 +172,15 @@ pub const StorageManager = struct {
         const idx: usize = @intCast(id);
         if (idx >= self.tensors.items.len) return StorageError.InvalidArgument;
         return self.tensors.items[idx];
+    }
+
+    /// Free a tensor's backing buffer (keeping metadata) to reclaim memory once it
+    /// is provably unused by the compiled program — e.g. a weight an optimization
+    /// pass has fused away. The id stays valid for shape/dtype validation;
+    /// executing against the tensor afterward is a bug. Idempotent.
+    pub fn releaseTensorData(self: *Self, id: TensorId) StorageError!void {
+        const t: *TiledTensor = try self.getMut(id);
+        t.releaseData();
     }
 
     pub fn writeFromPackedScalar(self: *Self, id: TensorId, packed_bytes: []const u8) StorageError!void {

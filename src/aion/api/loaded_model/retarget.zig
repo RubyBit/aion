@@ -82,3 +82,47 @@ fn retargetTensorIdsInValue(comptime T: type, value: *T, old_tid: types_mod.Tens
 fn retargetTensorId(slot: *types_mod.TensorId, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
     if (slot.* == old_tid) slot.* = new_tid;
 }
+
+/// Read-only counterpart: does any step/output of `program` reference `tid`?
+/// Used to confirm a fused-away weight is safe to reclaim (nothing still reads it).
+pub fn programReferencesTensorId(program: *const program_mod.Program, tid: types_mod.TensorId) bool {
+    for (program.steps) |*step| if (stepReferencesTensorId(step, tid)) return true;
+    for (program.blocks) |*block| {
+        for (block.steps) |*step| if (stepReferencesTensorId(step, tid)) return true;
+    }
+    for (program.outputs) |out| if (out == tid) return true;
+    return false;
+}
+
+fn stepReferencesTensorId(step: *const program_mod.Step, tid: types_mod.TensorId) bool {
+    switch (step.*) {
+        inline else => |*payload| return valueReferencesTensorId(@TypeOf(payload.*), payload, tid),
+    }
+}
+
+fn valueReferencesTensorId(comptime T: type, value: *const T, tid: types_mod.TensorId) bool {
+    switch (@typeInfo(T)) {
+        .int => return (T == types_mod.TensorId and value.* == tid),
+        .optional => |opt| {
+            if (value.*) |*child| return valueReferencesTensorId(opt.child, child, tid);
+            return false;
+        },
+        .array => |arr| {
+            var i: usize = 0;
+            while (i < arr.len) : (i += 1) {
+                if (valueReferencesTensorId(arr.child, &value.*[i], tid)) return true;
+            }
+            return false;
+        },
+        .@"struct" => |s| {
+            inline for (s.fields) |field| {
+                if (valueReferencesTensorId(field.type, &@field(value.*, field.name), tid)) return true;
+            }
+            return false;
+        },
+        .@"union" => switch (value.*) {
+            inline else => |*payload| return valueReferencesTensorId(@TypeOf(payload.*), payload, tid),
+        },
+        else => return false,
+    }
+}

@@ -24,3 +24,5 @@ __pycache__/
 **/build
 **/aion.egg-info
 bindings/python/src/Release
+
+zig-pkg

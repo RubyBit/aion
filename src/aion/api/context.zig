@@ -40,7 +40,9 @@ pub const RingPolicy = cache_mod.RingPolicy;
 pub const Context = struct {
     allocator: std.mem.Allocator,
 
-    /// v0: CPU backend only (other backends can be added later).
+    /// The built-in CPU backend, constructed and owned by the Context. The GPU
+    /// backend is driven directly through the `Backend` vtable
+    /// (`aion.gpu.GpuBackend.backend().executeProgram`), not via the Context.
     cpu: cpu_backend_mod.CpuBackend,
 
     store: manager_mod.StorageManager,
@@ -68,19 +70,28 @@ pub const Context = struct {
         cache_config: ?cache_mod.CacheConfig = null,
     };
 
-    pub fn initCpu(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!Self {
-        var cpu: cpu_backend_mod.CpuBackend = if (opts.thread_count <= 1)
-            cpu_backend_mod.CpuBackend.init(allocator)
-        else
-            try cpu_backend_mod.CpuBackend.initWithOptions(allocator, .{ .thread_count = opts.thread_count, .profile_steps = opts.profile_steps });
+    /// Construct a context with the built-in CPU backend.
+    pub fn init(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!Self {
+        var cpu = try initCpuBackend(allocator, opts);
         errdefer cpu.deinit();
+        var sm = try makeStore(allocator, opts);
+        errdefer sm.deinit();
+        return .{
+            .allocator = allocator,
+            .cpu = cpu,
+            .store = sm,
+            .policy = opts.tile_policy_override orelse plan_mod.tilePolicyForTarget(.{ .kind = .cpu }),
+        };
+    }
 
-        // Ensure the flag is applied for both init paths.
-        cpu.profile_steps = opts.profile_steps;
+    /// `init` alias kept for callers/tests that name the CPU path explicitly.
+    pub fn initCpu(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!Self {
+        return init(allocator, opts);
+    }
 
+    fn makeStore(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!manager_mod.StorageManager {
         var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
         errdefer sm.deinit();
-
         if (opts.cache_config) |cfg| {
             sm.configureCache(cfg) catch |e| {
                 return switch (e) {
@@ -89,14 +100,18 @@ pub const Context = struct {
                 };
             };
         }
+        return sm;
+    }
 
-        const out: Self = .{
-            .allocator = allocator,
-            .cpu = cpu,
-            .store = sm,
-            .policy = opts.tile_policy_override orelse plan_mod.TilePolicy{},
-        };
-        return out;
+    fn initCpuBackend(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!cpu_backend_mod.CpuBackend {
+        var cpu: cpu_backend_mod.CpuBackend = if (opts.thread_count <= 1)
+            cpu_backend_mod.CpuBackend.init(allocator)
+        else
+            try cpu_backend_mod.CpuBackend.initWithOptions(allocator, .{ .thread_count = opts.thread_count, .profile_steps = opts.profile_steps });
+
+        // Ensure the flag is applied for both init paths.
+        cpu.profile_steps = opts.profile_steps;
+        return cpu;
     }
 
     pub fn deinit(self: *Self) void {

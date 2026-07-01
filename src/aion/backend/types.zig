@@ -6,6 +6,8 @@ pub const BackendKind = enum(u9) {
     cuda,
     metal,
     vulkan, // I guess with compute shaders
+    /// Portable GPU backend over WebGPU (wgpu-native): runs on D3D12/Metal/Vulkan.
+    webgpu,
 };
 
 pub const BackendCaps = packed struct(u64) {

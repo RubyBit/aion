@@ -26,7 +26,7 @@ pub const TensorMeta = struct {
     tile_strides: []const usize,
 };
 
-const INLINE_RANK: usize = 8;
+pub const INLINE_RANK: usize = 8;
 
 pub const TileRefConst = struct {
     bytes: []const u8,
@@ -84,6 +84,19 @@ pub const TileRefMut = struct {
 ///
 /// Future out-of-core storage can turn tokens into real pin/lease handles for
 /// cache residency, staging buffers, and deterministic I/O failure boundaries.
+///
+/// Device seam: this vtable is THE boundary a device (GPU) backend intercepts.
+/// Execution touches storage only through here (no kernel reaches into the
+/// `StorageManager` directly), so a device-residency store can transparently
+/// stage tiles host<->device behind these methods. Two contracts the residency
+/// layer relies on, and that callers MUST uphold:
+///   - Lease discipline: every `acquireTile*` is paired with exactly one
+///     matching `release*` (no leak, no double-release). Validated by
+///     `runtime/checked_store.zig`'s `CheckedTensorStore`.
+///   - Read/write intent: `acquireTileConst` signals read-only access;
+///     `acquireTileMut` signals a write. A device store uses this to decide
+///     when a host->device upload is needed and when a tile must be marked
+///     dirty for device->host flush. Do not acquire `Mut` for read-only use.
 pub const TensorStore = struct {
     ctx: *anyopaque,
     vtable: *const VTable,

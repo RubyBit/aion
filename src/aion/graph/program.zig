@@ -98,6 +98,17 @@ fn isScalarSupported(dtype: types.DType) bool {
     };
 }
 
+// CPU-kernel scratch limits used by the validation guard below. These mirror
+// the tiling caps in `TilePolicy` (softmax_row_cap / attn_*), but apply to the
+// *kernel's* bounded (stack) scratch rather than the tiling heuristic. A GPU
+// backend lowers through its own path with its own (much larger) limits; these
+// are the CPU contract. Kept as named constants — not magic numbers — so the
+// coupling to `plan.TilePolicy` defaults is explicit and auditable.
+const CPU_SOFTMAX_ROW_SCRATCH_MAX: usize = 256; // == plan.TilePolicy.softmax_row_cap
+const CPU_ATTN_MAX_Q_ROWS: usize = 256; // == plan.TilePolicy.attn_max_q_rows
+const CPU_ATTN_MAX_K_ROWS: usize = 128; // == plan.TilePolicy.attn_k_tile_cap
+const CPU_ATTN_MAX_V_COLS: usize = 64; // == plan.TilePolicy.attn_v_tile_cap
+
 fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
     switch (step) {
         .MatMulTiled => |s| {
@@ -336,7 +347,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
 
             // Per-row scratch in exec uses stack arrays sized by tile_shape[0].
             if (rank == 1) {
-                try compileRequire(out.tile_shape[0] <= 256);
+                try compileRequire(out.tile_shape[0] <= CPU_SOFTMAX_ROW_SCRATCH_MAX);
             } else {
                 var row_elems: usize = 1;
                 var d: usize = 0;
@@ -344,7 +355,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                     if (d == axis) continue;
                     row_elems = std.math.mul(usize, row_elems, out.tile_shape[d]) catch return CompileError.InvalidArgument;
                 }
-                try compileRequire(row_elems <= 256);
+                try compileRequire(row_elems <= CPU_SOFTMAX_ROW_SCRATCH_MAX);
             }
         },
 
@@ -583,9 +594,9 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(q.tile_counts[rank - 1] == k.tile_counts[rank - 1]);
 
             // Scratch limits (v0): keep per-tile row scratch bounded.
-            try compileRequire(out.tile_shape[rank - 2] <= 256);
-            try compileRequire(k.tile_shape[rank - 2] <= 128);
-            try compileRequire(out.tile_shape[rank - 1] <= 64);
+            try compileRequire(out.tile_shape[rank - 2] <= CPU_ATTN_MAX_Q_ROWS);
+            try compileRequire(k.tile_shape[rank - 2] <= CPU_ATTN_MAX_K_ROWS);
+            try compileRequire(out.tile_shape[rank - 1] <= CPU_ATTN_MAX_V_COLS);
             try compileRequire(q.tile_shape[rank - 1] > 0);
 
             try compileRequire(s.scale > 0.0);
@@ -649,9 +660,9 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(q.tile_counts[rank - 1] == k.tile_counts[rank - 1]);
 
             // Scratch limits (v0): keep per-tile row scratch bounded.
-            try compileRequire(out.tile_shape[rank - 2] <= 256);
-            try compileRequire(k.tile_shape[rank - 2] <= 128);
-            try compileRequire(out.tile_shape[rank - 1] <= 64);
+            try compileRequire(out.tile_shape[rank - 2] <= CPU_ATTN_MAX_Q_ROWS);
+            try compileRequire(k.tile_shape[rank - 2] <= CPU_ATTN_MAX_K_ROWS);
+            try compileRequire(out.tile_shape[rank - 1] <= CPU_ATTN_MAX_V_COLS);
             try compileRequire(q.tile_shape[rank - 1] > 0);
 
             try compileRequire(s.scale > 0.0);

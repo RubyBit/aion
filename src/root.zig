@@ -24,6 +24,19 @@ pub const api = @import("aion/api/api.zig");
 pub const runtime = @import("aion/runtime/executable.zig");
 pub const tensor_store = @import("aion/runtime/tensor_store.zig");
 
+/// WebGPU GPU backend — feature-gated (`-Dgpu` → `build_options.enable_gpu`).
+/// When disabled the backend source is never analyzed, so wgpu is not fetched
+/// or linked (Rust `#[cfg(feature = "gpu")]` equivalent). When enabled,
+/// `aion.gpu.GpuBackend` + `aion.gpu.wgpu` (device selection) are available.
+pub const gpu = if (@import("build_options").enable_gpu)
+    @import("aion/backend/gpu/backend.zig")
+else
+    struct {};
+/// Device-memory abstraction + residency decorator. The seam a GPU backend
+/// implements (`DeviceMemory`) and the host<->device staging layer.
+pub const device_memory = @import("aion/runtime/residency/device_memory.zig");
+pub const resident_store = @import("aion/runtime/residency/resident_store.zig");
+
 /// Publicly exposed backend types and helpers.
 ///
 /// These are kept as separate modules so consumers (and our own tooling like

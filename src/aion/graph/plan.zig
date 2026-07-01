@@ -4,8 +4,25 @@ const std = @import("std");
 const types = @import("../backend/types.zig");
 
 pub const DType = types.DType;
+pub const BackendKind = types.BackendKind;
+pub const BackendCaps = types.BackendCaps;
+
+/// Describes the backend a graph is being compiled for. Today only `.cpu` is
+/// realized; this is the seam through which a GPU backend selects a different
+/// `TilePolicy` (see `TilePolicy.forTarget`) without the lowering pipeline
+/// changing. The compiled `TilePolicy` carries `target_kind`, so `lowerNode`
+/// can branch per-target later via the policy it already receives — no extra
+/// parameter threading required.
+pub const CompileTarget = struct {
+    kind: BackendKind = .cpu,
+    caps: BackendCaps = .{},
+};
 
 pub const TilePolicy = struct {
+    /// Backend this policy was derived for. Defaults to `.cpu` so a bare
+    /// `TilePolicy{}` is unchanged from before this field existed.
+    target_kind: BackendKind = .cpu,
+
     /// Default square tile side for rank-2 tensors.
     ///
     /// Note: transpose materialization is simplest when tiles are square.
@@ -45,6 +62,29 @@ pub const TilePolicy = struct {
     /// `ReTileCopyScalar` that changes the last/2nd-last tile sizes for rank>2.
     retile_last2d_change_max_elems: usize = 32 * 1024 * 1024,
 
+    // ---- Per-row / attention scratch caps ----
+    //
+    // These bound tile sizes along axes that the CPU kernels back with bounded
+    // (often stack) scratch. They are lifted out of magic constants so a GPU
+    // target (via `forTarget`) can relax them — GPU kernels stage scratch in
+    // shared/global memory and tolerate much larger tiles. The CPU defaults here
+    // reproduce the previous hard-coded values exactly (byte-identical programs).
+
+    /// Max rows per tile for row-wise softmax/layernorm/rmsnorm (per-row scratch).
+    /// Used by both the tiling chooser and the compile-time validation guard.
+    softmax_row_cap: usize = 256,
+
+    /// Attention query-row tile target (heuristic; favors tile-level parallelism).
+    attn_q_tile: usize = 32,
+    /// Attention key-block tile cap (chooser cap AND validation key-rows limit).
+    attn_k_tile_cap: usize = 128,
+    /// Attention value/output-column tile cap (chooser cap AND validation limit).
+    attn_v_tile_cap: usize = 64,
+    /// Attention head-dim tile cap (chooser).
+    attn_head_tile_cap: usize = 128,
+    /// Max attention query rows per tile accepted by the CPU kernel (validation).
+    attn_max_q_rows: usize = 256,
+
     // /// Target number of output tiles for matvec-shaped matmuls (M <= 4).
     // ///
     // /// Matvec matmuls parallelize over N tiles; with too few tiles, only a fraction
@@ -58,6 +98,41 @@ pub const TilePolicy = struct {
     // /// per-call packing/dispatch overhead doesn't dominate the inner kernel.
     // matvec_min_tn: usize = 32,
 };
+
+/// Macro tile-side cap for GPU targets. GPU wants FEW, LARGE tiles (the opposite
+/// of the CPU's many-small-tiles-for-thread-parallelism heuristic): one large tile
+/// per output collapses a matmul to a single dispatch with K accumulated in-kernel.
+const GPU_MACRO_TILE_CAP: usize = 4096;
+/// K-tile cap for GPU targets — full-K in one tile when K is moderate, so there is
+/// one dispatch per output tile (no per-k-tile global-memory C round-trip).
+///
+/// `GPU_MACRO_TILE_CAP * GPU_K_TILE_CAP * 4 bytes` is the largest f32 tile we
+/// emit (2048*2048*4 = 16 MiB). Kept conservative: WebGPU's default
+/// `maxStorageBufferBindingSize` is 128 MiB, but a discrete NVIDIA adapter under
+/// wgpu-native rejected a 32 MiB binding here, so we stay well below until the
+/// backend queries the real device limit (a planned follow-up) and can size tiles
+/// to it. Until then, square shapes ≤2048 stay a single dispatch; larger ones tile
+/// into ≤16 MiB pieces (still far fewer/larger than the CPU policy).
+const GPU_K_TILE_CAP: usize = 4096;
+
+/// Default tiling policy for a compile target. CPU returns the historical
+/// defaults; GPU targets get large base tile sizes so typical tensors land in a
+/// single tile (few, large dispatches). The matmul choosers additionally branch
+/// on `target_kind` (see `chooseMatMulTiles`/`chooseMatMulTk`).
+pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
+    return switch (target.kind) {
+        .cpu => .{ .target_kind = target.kind },
+        // GPU kernels stage scratch in shared/global memory and tolerate much
+        // larger tiles than the CPU's cache-blocked kernels. Large bases push most
+        // tensors to a single tile; the per-row/attention caps stay at their
+        // defaults for now (matmul + elementwise are the realized GPU paths).
+        .cuda, .metal, .vulkan, .webgpu => .{
+            .target_kind = target.kind,
+            .base_square_2d = GPU_MACRO_TILE_CAP,
+            .base_1d = 1 << 24, // 16M elems → typical vectors are a single tile
+        },
+    };
+}
 
 pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
     const t: usize = @min(policy.base_1d, if (n == 0) 1 else n);
@@ -88,7 +163,7 @@ pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize 
 pub fn chooseSoftmaxTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
     // Softmax is row-wise and needs per-row scratch. Prefer modest row tiles.
     // Keep tm small to allow stack scratch in exec and increase parallelism.
-    const tm_cap: usize = 256;
+    const tm_cap: usize = policy.softmax_row_cap;
     const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
 
     // Favor wide tiles along the reduction axis to reduce tile overhead.
@@ -99,7 +174,7 @@ pub fn chooseSoftmaxTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: u
 
 pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usize, tn: usize } {
     // LayerNorm/RMSNorm are row-wise and need per-row scratch. Keep tm small.
-    const tm_cap: usize = 256;
+    const tm_cap: usize = policy.softmax_row_cap;
     const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
     // Favor decent width along last dim; cap to base_square_2d like softmax.
     const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
@@ -110,15 +185,15 @@ pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, d
     // Attention is row-wise over queries, and needs per-query scratch.
     // IMPORTANT: we parallelize attention primarily across query tiles.
     // Keep tm modest so we have enough tile-level parallelism on many-core CPUs.
-    const tm_cap: usize = 32;
+    const tm_cap: usize = policy.attn_q_tile;
     const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
 
     // Block keys modestly so per-row score scratch stays small.
-    const tn_cap: usize = 128;
+    const tn_cap: usize = policy.attn_k_tile_cap;
     const tn: usize = @max(@as(usize, 1), @min(n, @min(tn_cap, policy.base_square_2d)));
 
     // Block value/output columns to bound the accumulator scratch.
-    const tv_cap: usize = 64;
+    const tv_cap: usize = policy.attn_v_tile_cap;
     var tv_target: usize = @min(dv, @min(tv_cap, policy.base_square_2d));
     if (tv_target >= 16) {
         tv_target = roundDownToMultiple(tv_target, 16);
@@ -127,7 +202,7 @@ pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, d
     const tv: usize = @max(@as(usize, 1), @min(tv_target, dv));
 
     // Block head dim reasonably; keep it SIMD-friendly.
-    var tk_target: usize = @min(@as(usize, 128), dk);
+    var tk_target: usize = @min(policy.attn_head_tile_cap, dk);
     if (tk_target >= 16) {
         tk_target = roundDownToMultiple(tk_target, 16);
         if (tk_target == 0) tk_target = @min(@as(usize, 16), dk);
@@ -183,6 +258,16 @@ pub fn roundUpToMultiple(x: usize, m: usize) usize {
 }
 
 pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
+    // GPU: keep K in a single (large, bounded) tile so the kernel accumulates all
+    // of K within one dispatch instead of round-tripping C through global memory
+    // per k-tile. Respect quant block alignment.
+    if (policy.target_kind != .cpu) {
+        const cap: usize = @min(k, GPU_K_TILE_CAP);
+        if (!b_dtype.info().is_quantized) return @max(@as(usize, 1), cap);
+        const be: usize = b_dtype.info().block_elems;
+        return @max(be, roundDownToMultiple(cap, be));
+    }
+
     // Heuristic: try to keep K tiles reasonably sized, but ensure quant alignment.
     if (b_dtype == .f16) {
         // For f16, prefer larger K tiles to reduce K-split overhead (especially
@@ -214,6 +299,16 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     //
     // Heuristic: when one dimension is tiny, tile fully along that dim and use a wide
     // tile along the other dim (rounded to SIMD-friendly multiples of 16).
+    // GPU: few, large tiles. One ≤cap×cap output tile (typically a single tile for
+    // moderate shapes → one dispatch) with full-or-large K. No CPU 128-cap (that
+    // exists to spread work across cores; the GPU parallelizes within a dispatch).
+    if (policy.target_kind != .cpu) {
+        const tm: usize = @max(@as(usize, 1), @min(m, GPU_MACRO_TILE_CAP));
+        const tn: usize = @max(@as(usize, 1), @min(n, GPU_MACRO_TILE_CAP));
+        const tk: usize = chooseMatMulTk(policy, k, b_dtype);
+        return .{ .tm = tm, .tn = tn, .tk = tk };
+    }
+
     if (m <= 4 and n >= 64) {
         const tm: usize = @max(@as(usize, 1), m);
 

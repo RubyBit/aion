@@ -13,6 +13,11 @@ const std = @import("std");
 comptime {
     _ = @import("aion/backend/backend.zig");
     _ = @import("aion/runtime/thread_pool.zig");
+    _ = @import("aion/runtime/residency/checked_store.zig");
+    _ = @import("aion/runtime/residency/test_checked_store.zig");
+    _ = @import("aion/runtime/residency/device_memory.zig");
+    _ = @import("aion/runtime/residency/resident_store.zig");
+    _ = @import("aion/runtime/residency/test_resident_store.zig");
     _ = @import("aion/storage/storage.zig");
     _ = @import("aion/storage/test_storage.zig");
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
@@ -20,6 +25,7 @@ comptime {
     _ = @import("aion/backend/cpu/kernels/matmul_q_i8.zig");
 
     _ = @import("aion/graph/test_program.zig");
+    _ = @import("aion/graph/test_program_golden.zig");
     _ = @import("aion/graph/opt/test_fuse_horizontal_matmul.zig");
 
     _ = @import("aion/api/test_api.zig");

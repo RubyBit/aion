@@ -27,6 +27,7 @@ pub const tensor_store = @import("aion/runtime/tensor_store.zig");
 /// WebGPU GPU backend — feature-gated (`-Dgpu` → `build_options.enable_gpu`).
 /// When disabled the backend source is never analyzed, so wgpu is not fetched
 /// or linked (Rust `#[cfg(feature = "gpu")]` equivalent). When enabled,
+/// `build.zig` gives the module the wgpu bindings and native link inputs, and
 /// `aion.gpu.GpuBackend` + `aion.gpu.wgpu` (device selection) are available.
 pub const gpu = if (@import("build_options").enable_gpu)
     @import("aion/backend/gpu/backend.zig")
@@ -50,13 +51,9 @@ pub const utils = @import("aion/backend/utils.zig");
 /// This module defines `pub export` functions with `callconv(.c)`.
 pub const c_api = @import("aion/c_api.zig");
 
-/// Enables portable multi-ISA CPU kernel dispatch when the library is built with
-/// `-Dmultiversion=true`. Driven by `build.zig` through the `build_options` module.
-///
-/// This declaration lives on the library root (not inside the backend) on purpose:
-/// the CPU backend reads it via `@import("root")`, so builds whose compilation root
-/// is not this file (unit tests, benchmarks, examples) simply don't see it and fall
-/// back to in-module kernel selection — without needing the `build_options` module.
+/// Mirrors `build_options.multiversion` for callers that want to inspect whether
+/// this `aion` module was built with portable multi-ISA CPU dispatch enabled.
+/// The CPU backend reads `build_options` directly; this is just public metadata.
 pub const aion_multiversion: bool = @import("build_options").multiversion;
 
 // Zig compilation is lazy; force the module to be analyzed so its exported

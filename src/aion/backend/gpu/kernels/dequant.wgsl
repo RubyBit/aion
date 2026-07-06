@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+//
+// Layout/dtype conversion passes that feed the f32 GEMM: they materialize a
+// B tile into a transient f32 scratch buffer so the autotuned f32 kernel can
+// consume weights stored in other dtypes/orientations (the M>1 MatMulNT path).
+// One extra bandwidth pass over B — cheap next to the GEMM it unblocks; the
+// frame's pass ordering serializes scratch reuse across tiles.
+//
+//   q8_nt_to_f32t : B q8_0 [N, K] (NT)  -> scratch f32 [K, N]  (dequant + transpose)
+//   f32_nt_t      : B f32  [N, K] (NT)  -> scratch f32 [K, N]  (transpose)
+//   f16_to_f32    : same-layout f16 -> f32 widen (for f16 GEMM / cast)
+//
+// q8_0 rows are walked in word-aligned BLOCK PAIRS (see matmul_nt_gemv.wgsl for
+// the 17-word layout); the backend requires K % 64 == 0 for the q8_0 path.
+// Grid-stride dispatch (see elementwise.wgsl).
+
+@group(0) @binding(0) var<storage, read>       src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform>             p: Params;
+
+// n/k: B tile rows/cols. src_wpr = u32 words per source row. dst_row = f32
+// elements per dst row ( == n for the transposed layouts). count = total work
+// items (pairs for q8, elements for the others).
+struct Params { n: u32, k: u32, src_wpr: u32, dst_row: u32, count: u32 };
+
+fn i8x4f(w: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32(i32(w << 24u) >> 24u),
+        f32(i32(w << 16u) >> 24u),
+        f32(i32(w << 8u) >> 24u),
+        f32(i32(w) >> 24u),
+    );
+}
+
+// One work item = one block pair of row n: dequantize 64 elements k0..k0+63
+// into the transposed scratch (dst[k * dst_row + n]).
+@compute @workgroup_size(64)
+fn q8_nt_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    let pairs = p.k / 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let n = i / pairs;
+        let pi = i % pairs;
+        let base = n * p.src_wpr + pi * 17u;
+        let k0 = pi * 64u;
+
+        let w0 = src[base];
+        let d0 = unpack2x16float(w0).x;
+        let d1 = unpack2x16float(src[base + 8u]).y;
+
+        var prev = w0;
+        for (var j = 0u; j < 8u; j += 1u) {
+            let cur = src[base + 1u + j];
+            let q = i8x4f((prev >> 16u) | (cur << 16u)) * d0;
+            let kb = k0 + j * 4u;
+            dst[kb * p.dst_row + n] = q.x;
+            dst[(kb + 1u) * p.dst_row + n] = q.y;
+            dst[(kb + 2u) * p.dst_row + n] = q.z;
+            dst[(kb + 3u) * p.dst_row + n] = q.w;
+            prev = cur;
+        }
+        for (var j = 0u; j < 8u; j += 1u) {
+            let q = i8x4f(src[base + 9u + j]) * d1;
+            let kb = k0 + 32u + j * 4u;
+            dst[kb * p.dst_row + n] = q.x;
+            dst[(kb + 1u) * p.dst_row + n] = q.y;
+            dst[(kb + 2u) * p.dst_row + n] = q.z;
+            dst[(kb + 3u) * p.dst_row + n] = q.w;
+        }
+    }
+}
+
+// One work item = one element: dst[k * dst_row + n] = B[n, k].
+@compute @workgroup_size(64)
+fn f32_nt_t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let n = i / p.k;
+        let k = i % p.k;
+        dst[k * p.dst_row + n] = bitcast<f32>(src[n * p.src_wpr + k]);
+    }
+}
+
+// Dequantize ONE contiguous q8_0 row (a gather-row fetch): the row's block
+// pairs start at word offset `src_wpr` and land contiguously at f32 element
+// offset `dst_row`. `count` = block pairs (row elems / 64). Field reuse of
+// Params is deliberate — one uniform layout for the whole module.
+@compute @workgroup_size(64)
+fn q8_row_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let base = p.src_wpr + i * 17u;
+        let e0 = p.dst_row + i * 64u;
+
+        let w0 = src[base];
+        let d0 = unpack2x16float(w0).x;
+        let d1 = unpack2x16float(src[base + 8u]).y;
+
+        var prev = w0;
+        for (var j = 0u; j < 8u; j += 1u) {
+            let cur = src[base + 1u + j];
+            let q = i8x4f((prev >> 16u) | (cur << 16u)) * d0;
+            let e = e0 + j * 4u;
+            dst[e] = q.x;
+            dst[e + 1u] = q.y;
+            dst[e + 2u] = q.z;
+            dst[e + 3u] = q.w;
+            prev = cur;
+        }
+        for (var j = 0u; j < 8u; j += 1u) {
+            let q = i8x4f(src[base + 9u + j]) * d1;
+            let e = e0 + 32u + j * 4u;
+            dst[e] = q.x;
+            dst[e + 1u] = q.y;
+            dst[e + 2u] = q.z;
+            dst[e + 3u] = q.w;
+        }
+    }
+}
+
+// One work item = one u32 word = two f16 values widened in place-order.
+@compute @workgroup_size(64)
+fn f16_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let v = unpack2x16float(src[i]);
+        dst[i * 2u] = v.x;
+        dst[i * 2u + 1u] = v.y;
+    }
+}
+
+// One work item = one element. Round half AWAY from zero to match the CPU's
+// `@round` (WGSL's builtin round() is half-to-even, which differs at exact
+// .5 values). The i32 result is smuggled through the f32 dst binding.
+@compute @workgroup_size(64)
+fn f32_to_i32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let v = bitcast<f32>(src[i]);
+        dst[i] = bitcast<f32>(i32(sign(v) * floor(abs(v) + 0.5)));
+    }
+}
+
+// One work item = one element: widen i32 (read via the u32 src binding) to f32.
+@compute @workgroup_size(64)
+fn i32_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        dst[i] = f32(bitcast<i32>(src[i]));
+    }
+}
+
+// One work item = one OUTPUT u32 word = two f32 values narrowed to f16. The
+// packed word is smuggled through the f32 dst binding via bitcast (WGSL can't
+// bind array<f16> without the shader-f16 extension).
+@compute @workgroup_size(64)
+fn f32_to_f16(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) {
+        let v = vec2<f32>(bitcast<f32>(src[i * 2u]), bitcast<f32>(src[i * 2u + 1u]));
+        dst[i] = bitcast<f32>(pack2x16float(v));
+    }
+}

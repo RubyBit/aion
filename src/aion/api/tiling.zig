@@ -61,6 +61,38 @@ pub fn fillDefaultTileShape(policy: plan_mod.TilePolicy, dtype: types.DType, sha
     out[shape.len - 1] = t2[1];
 }
 
+/// Choose the tile shape a tensor of `shape`/`dtype`/`quant_axis` should use for a
+/// given policy — the same selection `createTensorForShapeWithQuantAxis` applies at
+/// weight import, factored out so device migration (`Tensor.to`) re-tiles identically.
+/// Fills `out` (must be `shape.len` long).
+pub fn chooseTileShapeForTensor(
+    policy: plan_mod.TilePolicy,
+    dtype: types.DType,
+    shape: []const usize,
+    quant_axis: u8,
+    out: []usize,
+) TilingError!void {
+    if (shape.len == 0 or shape.len > MAX_RANK) return TilingError.InvalidArgument;
+    if (out.len != shape.len) return TilingError.InvalidArgument;
+
+    const is_quant = dtype.info().is_quantized;
+    const rank: usize = shape.len;
+
+    if (is_quant and rank >= 2 and @as(usize, quant_axis) == (rank - 2)) {
+        var d: usize = 0;
+        while (d + 2 < rank) : (d += 1) out[d] = 1;
+        const tiles = chooseQuantMatMulBTiles(policy, shape[rank - 2], shape[rank - 1], dtype);
+        out[rank - 2] = tiles[0];
+        out[rank - 1] = tiles[1];
+    } else if (is_quant and rank == 2 and quant_axis == 1) {
+        const tiles = chooseQuantEmbeddingTableTiles(policy, shape[0], shape[1]);
+        out[0] = tiles[0];
+        out[1] = tiles[1];
+    } else {
+        try fillDefaultTileShape(policy, dtype, shape, out);
+    }
+}
+
 /// Suggested tiling for a quantized matmul-B weight matrix of shape [k, n].
 ///
 /// This is used to avoid users having to reason about quant block alignment.

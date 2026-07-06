@@ -36,6 +36,9 @@ pub const KVCachePolicy = @import("context.zig").KVCachePolicy;
 pub const GrowablePolicy = @import("context.zig").GrowablePolicy;
 pub const RingPolicy = @import("context.zig").RingPolicy;
 
+pub const DeviceSelector = @import("device.zig").DeviceSelector;
+pub const GpuOptions = @import("device.zig").GpuOptions;
+
 pub const nn = @import("nn.zig");
 
 pub const ApiError = @import("errors.zig").ApiError;

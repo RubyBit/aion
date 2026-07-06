@@ -5,6 +5,7 @@ const manager_mod = @import("../../storage/manager.zig");
 const package_file = @import("../../storage/aion_file.zig");
 const plan_mod = @import("../../graph/plan.zig");
 const api_tensor = @import("../tensor.zig");
+const device_mod = @import("../device.zig");
 
 pub const Tensor = api_tensor.Tensor;
 pub const StorageManager = manager_mod.StorageManager;
@@ -39,6 +40,11 @@ pub const LoadModelOptions = struct {
     /// (e.g. a "still active" flag or a blank token id) must still be bound
     /// explicitly by the caller.
     auto_init_inputs: bool = true,
+
+    /// Which device to load/run this model on. Defaults to `.cpu` (byte-identical
+    /// to the pre-device behavior). `.gpu = i` requires that GPU to have been
+    /// registered on the `Context` via `Options.gpus`; weights are tiled for it.
+    device: device_mod.DeviceSelector = .cpu,
 };
 
 pub const invalid_alias_index: u32 = std.math.maxInt(u32);

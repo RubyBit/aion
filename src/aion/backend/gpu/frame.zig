@@ -11,9 +11,11 @@
 //! bind groups) are owned by the frame and released after submit — the queue keeps
 //! its own references alive until the GPU is done.
 //!
-//! Note: this assumes no host reads happen mid-program. That holds for all
-//! currently-supported steps; control-flow ops (If/Loop) that read predicates on
-//! the host would need a submit/flush split and remain unsupported for now.
+//! Host reads mid-program (control-flow predicates) need a SUBMIT/FLUSH SPLIT:
+//! the backend submits the pending frame, waits for the GPU, host-reads the
+//! predicate, then continues recording into a FRESH frame. `records` counts the
+//! commands recorded since init so the backend can skip the round-trip when
+//! nothing is pending (see `GpuBackend`'s If/Loop handling).
 
 const std = @import("std");
 const wgpu = @import("wgpu.zig");
@@ -30,9 +32,15 @@ pub const Frame = struct {
     encoder: c.WGPUCommandEncoder,
     transient_buffers: std.ArrayList(c.WGPUBuffer),
     transient_groups: std.ArrayList(c.WGPUBindGroup),
+    /// Commands recorded since init — lets the backend skip a submit/sync when
+    /// a control-flow host read finds nothing pending.
+    records: usize = 0,
 
     const Self = @This();
-    const MAX_BINDINGS = 8;
+    // 9 storage buffers + the trailing uniform. WebGPU's default
+    // maxStorageBuffersPerShaderStage is 8, which the widest kernels
+    // (RelPosMHA, LSTM) hit exactly.
+    const MAX_BINDINGS = 10;
 
     pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu) FrameError!Self {
         const enc = c.wgpuDeviceCreateCommandEncoder(gpu.device, null) orelse return error.ExecutionFailed;
@@ -111,6 +119,15 @@ pub const Frame = struct {
         c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
         c.wgpuComputePassEncoderEnd(pass);
         c.wgpuComputePassEncoderRelease(pass);
+        self.records += 1;
+    }
+
+    /// Record a device buffer copy. Copies are encoder-level commands, ordered
+    /// with the surrounding compute passes. WebGPU requires `bytes` and both
+    /// offsets be multiples of 4 (callers check).
+    pub fn recordCopy(self: *Self, src: c.WGPUBuffer, src_off: u64, dst: c.WGPUBuffer, dst_off: u64, bytes: u64) void {
+        c.wgpuCommandEncoderCopyBufferToBuffer(self.encoder, src, src_off, dst, dst_off, bytes);
+        self.records += 1;
     }
 
     /// Finish the encoder and submit the whole batch once.

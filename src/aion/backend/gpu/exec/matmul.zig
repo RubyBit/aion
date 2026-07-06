@@ -13,8 +13,8 @@ const wgpu = @import("../wgpu.zig");
 const pipelines = @import("../pipelines.zig");
 const autotune = @import("../autotune.zig");
 const context = @import("../context.zig");
-const codegen = @import("codegen.zig");
-const configs = @import("configs.zig");
+const codegen = @import("../matmul/codegen.zig");
+const configs = @import("../matmul/configs.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
@@ -30,7 +30,9 @@ const StepMatMul = executable.StepMatMulTiled;
 
 /// Uniform params for the tiled GEMM kernel; field order matches the WGSL
 /// `struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32> }`.
-const MatMulParams = extern struct {
+/// Shared with the MatMulNT executor (matmul_nt.zig), which drives the same GEMM
+/// pipelines over a dequantized scratch B.
+pub const MatMulParams = extern struct {
     m: u32,
     n: u32,
     k: u32,
@@ -50,13 +52,11 @@ fn syncDevice(ctx: Ctx) void {
 }
 
 /// A config is eligible only when it fits this device's limits and, for vec4
-/// loads, A/B row strides are 16-byte aligned.
-fn eligibleConfig(cfg: MatmulConfig, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize) bool {
+/// loads, A/B row strides are 16-byte aligned. (Also used by nt.zig.)
+pub fn eligibleConfig(cfg: MatmulConfig, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize) bool {
     if (codegen.sharedBytes(cfg) > limits.max_shared_bytes) return false;
     if (cfg.threads() > limits.max_invocations) return false;
     if (cfg.threads() > limits.max_workgroup_size_x) return false;
-    // Subgroup kernels are specialized to a 32-wide subgroup and need the feature.
-    if (cfg.subgroup and limits.fixedSubgroupSize() != codegen.SUBGROUP_SIZE) return false;
     if (!cfg.vec4_load) return true;
     return @rem(a_row_bytes, 16) == 0 and @rem(b_row_bytes, 16) == 0;
 }
@@ -96,20 +96,19 @@ fn fullTileCompatible(cfg: MatmulConfig, c_meta: TensorMeta, a_meta: TensorMeta,
         b_meta.tile_shape[1] % cfg.bn == 0;
 }
 
-fn forcedConfigIndex(ctx: Ctx, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!?usize {
-    _ = ctx;
+fn forcedConfigIndex(generated: []const Generated, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!?usize {
     const env = std.c.getenv("AION_MATMUL_CONFIG") orelse return null;
     const raw = std.mem.span(env);
 
     const maybe_idx = std.fmt.parseInt(usize, raw, 10) catch null;
     if (maybe_idx) |idx| {
-        if (idx >= configs.generated.len) return error.Unsupported;
-        const cfg = configs.generated[idx].cfg;
+        if (idx >= generated.len) return error.Unsupported;
+        const cfg = generated[idx].cfg;
         if (!fullTileCompatible(cfg, c_meta, a_meta, b_meta) or !eligibleConfig(cfg, limits, a_row_bytes, b_row_bytes)) return error.Unsupported;
         return idx;
     }
 
-    for (configs.generated, 0..) |g, idx| {
+    for (generated, 0..) |g, idx| {
         if (std.mem.eql(u8, raw, g.entry)) {
             if (!fullTileCompatible(g.cfg, c_meta, a_meta, b_meta) or !eligibleConfig(g.cfg, limits, a_row_bytes, b_row_bytes)) return error.Unsupported;
             return idx;
@@ -132,30 +131,37 @@ test "matmul eligibility respects device limits" {
 pub const Matmul = struct {
     tune: autotune.Cache,
     last_choice: ?usize = null,
+    /// Arena holding the runtime-generated kernel WGSL (`generated`), built once at
+    /// init. Owned here; freed in `deinit`.
+    arena: std.heap.ArenaAllocator,
+    generated: []const Generated,
 
     pub fn init(allocator: std.mem.Allocator) Matmul {
-        return .{ .tune = autotune.Cache.init(allocator) };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        const generated = configs.generate(arena.allocator());
+        return .{ .tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated };
     }
     pub fn deinit(self: *Matmul) void {
         self.tune.deinit();
+        self.arena.deinit();
     }
 
     pub fn lastChoiceEntry(self: *const Matmul) ?[:0]const u8 {
         const idx = self.last_choice orelse return null;
-        if (idx >= configs.generated.len) return null;
-        return configs.generated[idx].entry;
+        if (idx >= self.generated.len) return null;
+        return self.generated[idx].entry;
     }
 
     pub fn lastChoiceThreads(self: *const Matmul) ?u32 {
         const idx = self.last_choice orelse return null;
-        if (idx >= configs.generated.len) return null;
-        return configs.generated[idx].cfg.threads();
+        if (idx >= self.generated.len) return null;
+        return self.generated[idx].cfg.threads();
     }
 
     pub fn lastChoiceSharedBytes(self: *const Matmul) ?u32 {
         const idx = self.last_choice orelse return null;
-        if (idx >= configs.generated.len) return null;
-        return codegen.sharedBytes(configs.generated[idx].cfg);
+        if (idx >= self.generated.len) return null;
+        return codegen.sharedBytes(self.generated[idx].cfg);
     }
 
     pub fn exec(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul) ExecuteProgramError!void {
@@ -173,7 +179,7 @@ pub const Matmul = struct {
         try ensureTileBindingFits(ctx, b_meta);
 
         const idx = try self.chooseConfig(ctx, s, c_meta, a_meta, b_meta);
-        const g = configs.generated[idx];
+        const g = self.generated[idx];
         const built = try ctx.pipes.get(g.desc, g.entry);
 
         const tc_m = c_meta.tile_counts[0];
@@ -207,7 +213,7 @@ pub const Matmul = struct {
         const b_row_bytes = db0.strides_mem[0];
         ctx.rstore.tensorStore().releaseConst(db0.token);
 
-        if (try forcedConfigIndex(ctx, ctx.gpu.limits, a_row_bytes, b_row_bytes, c_meta, a_meta, b_meta)) |idx| {
+        if (try forcedConfigIndex(self.generated, ctx.gpu.limits, a_row_bytes, b_row_bytes, c_meta, a_meta, b_meta)) |idx| {
             self.last_choice = idx;
             return idx;
         }
@@ -220,13 +226,14 @@ pub const Matmul = struct {
             b_meta: TensorMeta,
             a_row_bytes: isize,
             b_row_bytes: isize,
+            generated: []const Generated,
 
             pub fn eligible(t: @This(), idx: usize) bool {
-                const cfg = configs.generated[idx].cfg;
+                const cfg = t.generated[idx].cfg;
                 return fullTileCompatible(cfg, t.c_meta, t.a_meta, t.b_meta) and eligibleConfig(cfg, t.ctx.gpu.limits, t.a_row_bytes, t.b_row_bytes);
             }
             pub fn timeNs(t: @This(), idx: usize) ?u64 {
-                const g = configs.generated[idx];
+                const g = t.generated[idx];
                 const built = t.ctx.pipes.get(g.desc, g.entry) catch return null;
                 var best: ?u64 = null;
                 var rep: usize = 0;
@@ -245,9 +252,10 @@ pub const Matmul = struct {
             .b_meta = b_meta,
             .a_row_bytes = a_row_bytes,
             .b_row_bytes = b_row_bytes,
+            .generated = self.generated,
         };
         const key = autotune.shapeKey(c_meta.tile_shape[0], c_meta.tile_shape[1], a_meta.tile_shape[1]);
-        const idx = autotune.pickBest(&self.tune, key, configs.generated.len, tctx) orelse return error.ExecutionFailed;
+        const idx = autotune.pickBest(&self.tune, key, self.generated.len, tctx) orelse return error.ExecutionFailed;
         self.last_choice = idx;
         return idx;
     }

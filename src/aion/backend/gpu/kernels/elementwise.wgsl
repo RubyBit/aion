@@ -6,6 +6,10 @@
 // buffer). The element count comes from a uniform (binding 3) rather than
 // `arrayLength`, so a tile's logical length is explicit and not tied to the
 // device buffer's allocated size.
+//
+// Grid-stride: WebGPU caps workgroups per dimension at 65535, and GPU-policy
+// tiles reach 16M+ elements (262144 groups of 64). Each thread therefore loops
+// with stride = total threads; the backend dispatches at most MAX_GROUPS_1D.
 
 @group(0) @binding(0) var<storage, read>       a: array<f32>;
 @group(0) @binding(1) var<storage, read>       b: array<f32>;
@@ -15,25 +19,25 @@
 struct Params { n: u32 };
 
 @compute @workgroup_size(64)
-fn add(@builtin(global_invocation_id) g: vec3<u32>) {
-    let i = g.x;
-    if (i < p.n) { o[i] = a[i] + b[i]; }
+fn add(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = a[i] + b[i]; }
 }
 
 @compute @workgroup_size(64)
-fn sub(@builtin(global_invocation_id) g: vec3<u32>) {
-    let i = g.x;
-    if (i < p.n) { o[i] = a[i] - b[i]; }
+fn sub(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = a[i] - b[i]; }
 }
 
 @compute @workgroup_size(64)
-fn mul(@builtin(global_invocation_id) g: vec3<u32>) {
-    let i = g.x;
-    if (i < p.n) { o[i] = a[i] * b[i]; }
+fn mul(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = a[i] * b[i]; }
 }
 
 @compute @workgroup_size(64)
-fn divide(@builtin(global_invocation_id) g: vec3<u32>) {
-    let i = g.x;
-    if (i < p.n) { o[i] = a[i] / b[i]; }
+fn divide(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = a[i] / b[i]; }
 }

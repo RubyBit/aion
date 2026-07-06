@@ -7,7 +7,10 @@ const manager_mod = @import("../storage/manager.zig");
 const graph_mod = @import("../graph/graph.zig");
 const program_mod = @import("../graph/program.zig");
 
-pub const InitError = error{ InvalidArgument, OutOfMemory } || std.Thread.SpawnError;
+/// `BackendUnavailable`: a GPU device was requested (`Options.gpus`) but no
+/// adapter/device is present, or the library was built without GPU support
+/// (`-Dgpu=false`). No silent CPU fallback — the caller decides.
+pub const InitError = error{ InvalidArgument, OutOfMemory, BackendUnavailable } || std.Thread.SpawnError;
 
 pub const LoadError = package_file.PackageError || graph_mod.GraphError || manager_mod.StorageError || program_mod.CompileError;
 

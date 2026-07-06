@@ -28,6 +28,19 @@ pub const TensorMeta = struct {
 
 pub const INLINE_RANK: usize = 8;
 
+/// A tile whose bytes live in device-owned buffers (a tensor migrated via
+/// `moveTensor` under move semantics). `handle` is a `DeviceMemory.DeviceHandle`
+/// (kept as `u64` here so this generic seam names no GPU API). `shape`/`strides`
+/// describe the logical tile exactly as a host `TileRef` would.
+pub const DeviceTileRef = struct {
+    handle: u64,
+    len: usize,
+    dtype: types.DType,
+    rank: u8,
+    shape_mem: [INLINE_RANK]usize,
+    strides_mem: [INLINE_RANK]isize,
+};
+
 pub const TileRefConst = struct {
     bytes: []const u8,
     dtype: types.DType,
@@ -136,6 +149,13 @@ pub const TensorStore = struct {
         /// scratch storage become the carried state for the next iteration.
         /// Implementations must reject tensors with incompatible dtype/layout.
         swapTensors: ?*const fn (ctx: *anyopaque, a: TensorId, b: TensorId) StoreError!void = null,
+
+        /// Optional: if the tensor's bytes have been migrated to device-owned
+        /// buffers (move semantics), return the device handle + per-tile layout for
+        /// `tile_index`. Returns null when the tensor is host-resident (the caller —
+        /// a residency layer — should stage it via `acquireTile*` as usual). If null
+        /// (unset), all tensors are treated as host-resident.
+        deviceTile: ?*const fn (ctx: *anyopaque, id: TensorId, tile_index: usize) StoreError!?DeviceTileRef = null,
     };
 
     pub fn meta(self: TensorStore, id: TensorId) StoreError!TensorMeta {
@@ -189,6 +209,13 @@ pub const TensorStore = struct {
     pub fn swapTensors(self: TensorStore, a: TensorId, b: TensorId) StoreError!void {
         if (self.vtable.swapTensors) |swap| return swap(self.ctx, a, b);
         return StoreError.InvalidArgument;
+    }
+
+    /// Null when the store has no device-residency notion or the tensor is
+    /// host-resident; otherwise the device handle + layout for `tile_index`.
+    pub fn deviceTile(self: TensorStore, id: TensorId, tile_index: usize) StoreError!?DeviceTileRef {
+        if (self.vtable.deviceTile) |cb| return cb(self.ctx, id, tile_index);
+        return null;
     }
 };
 

@@ -13,6 +13,7 @@ const graph_mod = @import("graph.zig");
 const plan = @import("plan.zig");
 const manager_mod = @import("../storage/manager.zig");
 const fuse_horizontal_matmul = @import("opt/fuse_horizontal_matmul.zig");
+const lower_pointwise_conv = @import("opt/lower_pointwise_conv.zig");
 
 const Graph = graph_mod.Graph;
 const StorageManager = manager_mod.StorageManager;
@@ -32,6 +33,9 @@ pub const DerivedWeightKind = enum(u32) {
 /// Which optimization passes run. All default-on; flip a field off to bisect a
 /// regression or to A/B a pass in tests/benches.
 pub const OptPolicy = struct {
+    /// Lower pointwise (1x1, groups=1, unit-stride, unpadded) Conv1D to MatMul so
+    /// it takes the autotuned GEMM path. See `opt/lower_pointwise_conv.zig`.
+    lower_pointwise_conv: bool = true,
     /// Fuse parallel projections off a shared input (Q/K/V, gate/up, …) into one
     /// wide MatMul + slices. See `opt/fuse_horizontal_matmul.zig`.
     fuse_horizontal_matmul: bool = true,
@@ -46,6 +50,11 @@ pub fn run(
     policy: TilePolicy,
     opt: OptPolicy,
 ) Error!void {
+    // Lower pointwise convs first so the resulting MatMuls are visible to the
+    // horizontal-fusion pass.
+    if (opt.lower_pointwise_conv) {
+        try lower_pointwise_conv.run(allocator, graph);
+    }
     if (opt.fuse_horizontal_matmul) {
         try fuse_horizontal_matmul.run(allocator, graph, mgr, policy);
     }

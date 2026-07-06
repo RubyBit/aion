@@ -205,3 +205,44 @@ test "resident store: swapTensors carries device residency" {
     try mock.device().copyD2H(std.mem.sliceAsBytes(dev_view[0..]), da.handle, 0);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 5, 6, 7, 8 }, &dev_view);
 }
+
+test "resident store: growable kv cache flushes and refreshes device residency" {
+    const a = std.testing.allocator;
+    var mgr = try manager_mod.StorageManager.initWithCache(a, .{ .ram_budget_bytes = 1 << 20 });
+    defer mgr.deinit();
+
+    const cache = try mgr.createTiledTensor(.f32, &[_]usize{ 1, 1, 2, 1 }, &[_]usize{ 1, 1, 2, 1 }, .{});
+    try mgr.registerKVCachePolicy(cache, .{ .growable = .{
+        .initial_capacity_tokens = 2,
+        .growth_numerator = 2,
+        .growth_denominator = 1,
+    } });
+
+    try writeF32(&mgr, cache, &[_]f32{ 1, 2 });
+
+    var mock = device_memory.MockDeviceMemory.init(a);
+    defer mock.deinit();
+    var rstore = resident.ResidentTensorStore.init(a, mgr.tensorStore(), mock.device());
+    defer rstore.deinit();
+    const store = rstore.tensorStore();
+
+    const d0 = try rstore.acquireTileDeviceMutLinear(cache, 0);
+    try mock.device().copyH2D(d0.handle, 0, std.mem.sliceAsBytes(@constCast(&[_]f32{ 10, 20 })));
+    store.releaseMut(d0.token);
+
+    _ = try store.mapKVCacheTime(cache, 3, 2);
+
+    const meta = try store.meta(cache);
+    try std.testing.expectEqual(@as(usize, 4), meta.shape[2]);
+
+    var host: [4]f32 = undefined;
+    try mgr.readToPackedScalar(cache, std.mem.sliceAsBytes(host[0..]));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 10, 20, 0, 0 }, host[0..]);
+    try std.testing.expectEqual(@as(usize, 1), mock.d2h_count);
+
+    const d1 = try rstore.acquireTileDeviceConstLinear(cache, 0);
+    store.releaseConst(d1.token);
+    try std.testing.expectEqual(@as(usize, 16), d1.len);
+    try std.testing.expect(d1.handle != d0.handle);
+    try std.testing.expectEqual(@as(usize, 3), mock.h2d_count);
+}

@@ -19,6 +19,11 @@ const api_package_export = @import("package_export.zig");
 const api_tensor = @import("tensor.zig");
 const api_tiling = @import("tiling.zig");
 const api_errors = @import("errors.zig");
+const device_mod = @import("device.zig");
+const build_options = @import("build_options");
+/// GPU device bundle module — only reached (and thus only analyzed / linked
+/// against wgpu) when the GPU feature is enabled. Empty struct otherwise.
+const gpu_device_mod = if (build_options.enable_gpu) @import("gpu_device.zig") else struct {};
 
 pub const DType = types.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
@@ -36,17 +41,28 @@ pub const CachePolicy = cache_mod.CachePolicy;
 pub const KVCachePolicy = cache_mod.KVCachePolicy;
 pub const GrowablePolicy = cache_mod.GrowablePolicy;
 pub const RingPolicy = cache_mod.RingPolicy;
+pub const DeviceSelector = device_mod.DeviceSelector;
+pub const GpuOptions = device_mod.GpuOptions;
+
+/// `[]*GpuDevice` when GPU is enabled, `void` otherwise (standard conditional-
+/// compilation field pattern — mirrors `root.zig`'s gated `gpu` decl).
+const GpuDeviceSlot = if (build_options.enable_gpu) []*gpu_device_mod.GpuDevice else void;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
 
-    /// The built-in CPU backend, constructed and owned by the Context. The GPU
-    /// backend is driven directly through the `Backend` vtable
-    /// (`aion.gpu.GpuBackend.backend().executeProgram`), not via the Context.
+    /// The built-in CPU backend, constructed and owned by the Context.
     cpu: cpu_backend_mod.CpuBackend,
 
     store: manager_mod.StorageManager,
     policy: plan_mod.TilePolicy,
+
+    /// Registered GPU devices (heap-pinned bundles), index-aligned with the
+    /// `.gpu = i` selector. Empty when none requested; `void` on a CPU-only build.
+    gpu_devices: GpuDeviceSlot = if (build_options.enable_gpu) &.{} else {},
+    /// Heap-owned registry backing handed to `store.setDeviceRegistry` (borrowed
+    /// by the store). One entry per GPU device; heap-stable across Context moves.
+    device_entries: []manager_mod.StorageManager.DeviceEntry = &.{},
 
     const Self = @This();
 
@@ -68,20 +84,86 @@ pub const Context = struct {
         ///
         /// If null, storage behaves as plain RAM-backed tiled tensors.
         cache_config: ?cache_mod.CacheConfig = null,
+
+        /// GPU devices to create, one per entry (index = the `.gpu = i` selector).
+        /// Empty (default) → CPU-only, unchanged behavior. Requires `-Dgpu`; a
+        /// missing adapter or a CPU-only build yields `error.BackendUnavailable`.
+        gpus: []const device_mod.GpuOptions = &.{},
     };
 
-    /// Construct a context with the built-in CPU backend.
+    /// Construct a context. With no `opts.gpus` this is the CPU-only path,
+    /// byte-identical to before. Requested GPU devices are created here (pinned).
     pub fn init(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!Self {
         var cpu = try initCpuBackend(allocator, opts);
         errdefer cpu.deinit();
         var sm = try makeStore(allocator, opts);
         errdefer sm.deinit();
-        return .{
+
+        var self: Self = .{
             .allocator = allocator,
             .cpu = cpu,
             .store = sm,
             .policy = opts.tile_policy_override orelse plan_mod.tilePolicyForTarget(.{ .kind = .cpu }),
+            .gpu_devices = if (build_options.enable_gpu) &.{} else {},
+            .device_entries = &.{},
         };
+        // On failure past this point, the errdefers above free `cpu`/`sm` (which
+        // `self` shares by value); `self` is discarded, never returned.
+        if (opts.gpus.len != 0) try self.initGpuDevices(opts.gpus);
+        return self;
+    }
+
+    /// Create the requested GPU device bundles and register them with the store so
+    /// `Tensor.to` / `moveTensor` can migrate tensors. Gated: on a CPU-only build
+    /// this returns `BackendUnavailable` (the GPU branch is comptime-pruned).
+    fn initGpuDevices(self: *Self, gpus: []const device_mod.GpuOptions) api_errors.InitError!void {
+        if (build_options.enable_gpu) {
+            const n = gpus.len;
+            const bundles = self.allocator.alloc(*gpu_device_mod.GpuDevice, n) catch return api_errors.InitError.OutOfMemory;
+            errdefer self.allocator.free(bundles);
+            const entries = self.allocator.alloc(manager_mod.StorageManager.DeviceEntry, n) catch return api_errors.InitError.OutOfMemory;
+            errdefer self.allocator.free(entries);
+
+            var created: usize = 0;
+            errdefer {
+                var j: usize = 0;
+                while (j < created) : (j += 1) gpu_device_mod.destroy(self.allocator, bundles[j]);
+            }
+            while (created < n) : (created += 1) {
+                const bundle = gpu_device_mod.create(self.allocator, gpus[created]) catch |e| return switch (e) {
+                    error.OutOfMemory => api_errors.InitError.OutOfMemory,
+                    error.BackendUnavailable => api_errors.InitError.BackendUnavailable,
+                };
+                bundles[created] = bundle;
+                entries[created] = .{ .mem = bundle.deviceMemory(), .policy = bundle.policy };
+            }
+
+            self.gpu_devices = bundles;
+            self.device_entries = entries;
+            self.store.setDeviceRegistry(self.policy, entries);
+        } else {
+            return api_errors.InitError.BackendUnavailable;
+        }
+    }
+
+    /// Resolve a device selector to a concrete backend + tile policy (+ device
+    /// memory for GPU). Computed on demand — never cached on the Context.
+    fn resolveDevice(self: *Self, sel: device_mod.DeviceSelector) error{InvalidArgument}!device_mod.Device {
+        switch (sel) {
+            .cpu => return .{ .ref = .{ .kind = .cpu }, .backend = self.backend(), .policy = self.policy, .device_memory = null },
+            .gpu => |idx| {
+                if (build_options.enable_gpu) {
+                    if (idx >= self.gpu_devices.len or idx > 255) return error.InvalidArgument;
+                    const b = self.gpu_devices[idx];
+                    return .{
+                        .ref = .{ .kind = .gpu, .index = @intCast(idx) },
+                        .backend = b.backend.backend(),
+                        .policy = b.policy,
+                        .device_memory = b.deviceMemory(),
+                    };
+                } else return error.InvalidArgument;
+            },
+        }
     }
 
     /// `init` alias kept for callers/tests that name the CPU path explicitly.
@@ -115,7 +197,14 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free the store first: device-resident tensors release their buffers
+        // through the (still-alive) GPU device memory. Only then tear down bundles.
         self.store.deinit();
+        if (build_options.enable_gpu) {
+            for (self.gpu_devices) |b| gpu_device_mod.destroy(self.allocator, b);
+            if (self.gpu_devices.len != 0) self.allocator.free(self.gpu_devices);
+        }
+        if (self.device_entries.len != 0) self.allocator.free(self.device_entries);
         self.cpu.deinit();
         self.* = undefined;
     }
@@ -190,6 +279,9 @@ pub const Context = struct {
     }
 
     pub fn loadModel(self: *Self, file: std.Io.File, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
+        // Resolve the target device: its backend runs the model and its tile policy
+        // shapes both the imported weights and the per-shape JIT compiles.
+        const dev = try self.resolveDevice(opts.device);
         // `parseTakeOwned` transfers ownership of `bytes` into the returned Package
         // (Initializer.data slices borrow into it). `pkg.deinit` frees the buffer.
         const bytes = try package_file.readAlloc(self.allocator, file);
@@ -207,9 +299,9 @@ pub const Context = struct {
         // store never coexist). `importInitializersStreaming` consumes `bytes` via
         // `pkg.releaseSourceBytes()`, so the `bytes` errdefer above is now a no-op
         // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
-        const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, self.policy, &pkg, file, bytes);
+        const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, dev.policy, &pkg, file, bytes);
         errdefer self.allocator.free(initializer_tids);
-        return api_loaded_model.LoadedModel.initLoaded(self.allocator, self.backend(), &self.store, self.policy, pkg, initializer_tids, hash, opts);
+        return api_loaded_model.LoadedModel.initLoaded(self.allocator, dev.backend, &self.store, dev.policy, pkg, initializer_tids, hash, opts);
     }
 
     /// Load an AION package as a weights-only container.
@@ -461,14 +553,30 @@ pub const Context = struct {
     /// `opts.output_aliases` declares io-alias recurrent-state carry (by name);
     /// `opts.input_symbols` (variable shapes) is not yet supported on the compile path
     /// — use `exportModel`+`loadModel` for that.
+    /// Compile a builder graph into an in-process model on the CPU (default device).
     pub fn compile(
         self: *Self,
         b: *api_builder.Builder,
         outputs: []const api_builder.TensorRef,
         opts: ExportModelOptions,
     ) api_errors.ApiError!Model {
+        return self.compileOn(.cpu, b, outputs, opts);
+    }
+
+    /// Like `compile`, but targets `dev_sel` (e.g. `.{ .gpu = 0 }`). The model's
+    /// backend + tile policy follow the device; auto-allocated inputs/outputs and
+    /// the per-shape JIT are tiled for it.
+    pub fn compileOn(
+        self: *Self,
+        dev_sel: device_mod.DeviceSelector,
+        b: *api_builder.Builder,
+        outputs: []const api_builder.TensorRef,
+        opts: ExportModelOptions,
+    ) api_errors.ApiError!Model {
         if (outputs.len == 0) return api_errors.ApiError.InvalidArgument;
         if (opts.input_symbols.len != 0) return api_errors.ApiError.InvalidArgument; // concrete-only for now
+
+        const dev = try self.resolveDevice(dev_sel);
 
         const g: *graph_mod.Graph = b.innerGraph();
         try infer_mod.infer(g);
@@ -519,9 +627,9 @@ pub const Context = struct {
         const owned_graph = b.takeGraph();
         return api_loaded_model.Model.initCompiled(
             self.allocator,
-            self.backend(),
+            dev.backend,
             &self.store,
-            self.policy,
+            dev.policy,
             owned_graph,
             input_ids.items,
             input_names.items,

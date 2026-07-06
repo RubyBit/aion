@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("root");
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
 const dispatch_table = @import("multiversion/table.zig");
@@ -44,23 +43,24 @@ const cpuid = @import("tuning/cpuid.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 
 const Backend = backend_mod.Backend;
+const Session = backend_mod.Session;
 const BackendKind = types.BackendKind;
 const BackendCaps = types.BackendCaps;
 const BackendError = types.BackendError;
 const DType = types.DType;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
-/// True only for the portable library artifact (built with `-Dmultiversion=true`,
-/// whose root `src/root.zig` sets `aion_multiversion`) on x86. In that build the
-/// per-tier kernel objects are linked and runtime dispatch selects among them.
+/// True when built with `-Dmultiversion=true` (the default): the per-ISA tier
+/// kernel objects are attached to the `aion` module by `build.zig`, every
+/// artifact that imports the module links them transitively, and runtime CPUID
+/// dispatch selects among them here.
 ///
-/// For unit tests, benchmarks, examples and ordinary dev builds the compilation
-/// root does not declare `aion_multiversion`, so this is comptime-false and the
-/// in-module `selectForTarget` path is used (and the `extern` tier accessors are
-/// never referenced). The `@import("root")` indirection is what lets the raw
-/// `zig test` build — which never compiles `src/root.zig` — compile cleanly.
+/// When false (`-Dmultiversion=false`, or the raw `zig test` invocation, whose
+/// build_options module is passed on the CLI with multiversion=false) the
+/// in-module `selectForTarget` path is used and the `extern` tier accessors
+/// are never referenced — so no tier objects need to be linked.
 const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch.isAARCH64()) and
-    (if (@hasDecl(root, "aion_multiversion")) root.aion_multiversion else false);
+    @import("build_options").multiversion;
 
 /// CPU Backend implementation.
 /// Owns threading strategy (v0: single-threaded, later: thread pool).
@@ -289,8 +289,37 @@ pub const CpuBackend = struct {
         .name = nameImpl,
         .caps = capsImpl,
         .deinit = deinitImpl,
-        .executeProgram = executeProgramImpl,
+        .createSession = createSessionImpl,
     };
+
+    /// CPU has no per-store residency, so a session is just a `(backend, store)`
+    /// pair. `execute` runs a program straight against the bound store.
+    const CpuSession = struct {
+        cpu: *Self,
+        store: tensor_store.TensorStore,
+
+        fn execute(ctx: *anyopaque, prog: *const executable.ExecutableProgram) ExecuteProgramError!void {
+            const s: *CpuSession = @ptrCast(@alignCast(ctx));
+            return s.cpu.runProgram(prog, s.store);
+        }
+
+        fn deinitSession(ctx: *anyopaque) void {
+            const s: *CpuSession = @ptrCast(@alignCast(ctx));
+            s.cpu.allocator.destroy(s);
+        }
+
+        const session_vtable = Session.VTable{
+            .execute = execute,
+            .deinit = deinitSession,
+        };
+    };
+
+    fn createSessionImpl(ctx: *anyopaque, store: tensor_store.TensorStore) tensor_store.StoreError!Session {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const s = self.allocator.create(CpuSession) catch return error.OutOfMemory;
+        s.* = .{ .cpu = self, .store = store };
+        return .{ .ctx = @ptrCast(s), .vtable = &CpuSession.session_vtable };
+    }
 
     const ElemwiseExec = exec_elemwise;
 
@@ -585,9 +614,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn executeProgramImpl(ctx: *anyopaque, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore) ExecuteProgramError!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-
+    fn runProgram(self: *Self, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore) ExecuteProgramError!void {
         const do_profile: bool = self.profile_steps or self.profile_steps_env;
 
         const nowNs = struct {

@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+//
+// Fused single-timestep LSTM cell, one thread per (batch, hidden) element:
+//   gates[k] = b_ih[kH+j] + b_hh[kH+j] + x[b] @ w_ih[:, kH+j] + h_prev[b] @ w_hh[:, kH+j]
+//   (gate order i, f, g, o — PyTorch chunks of H)
+//   c_t = sigmoid(f) * c_prev + sigmoid(i) * tanh(g)
+//   h_t = sigmoid(o) * tanh(c_t)
+//   out[b] = [h_t | c_t]           ([batch, 2H])
+//
+// All tensors packed single tiles: x [B, I], h/c [B, H], w_ih [I, 4H],
+// w_hh [H, 4H], biases [4H]. When p.has_bias == 0 the bias bindings are
+// dummies (the backend rebinds w_ih). Weight reads are column-strided —
+// correctness-first; pre-transposed weights are the perf follow-up if LSTM
+// models show up hot on GPU.
+
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       h_prev: array<f32>;
+@group(0) @binding(2) var<storage, read>       c_prev: array<f32>;
+@group(0) @binding(3) var<storage, read>       w_ih: array<f32>;
+@group(0) @binding(4) var<storage, read>       w_hh: array<f32>;
+@group(0) @binding(5) var<storage, read>       b_ih: array<f32>;
+@group(0) @binding(6) var<storage, read>       b_hh: array<f32>;
+@group(0) @binding(7) var<storage, read_write> o: array<f32>;
+@group(0) @binding(8) var<uniform>             p: Params;
+
+struct Params {
+    batch: u32,
+    input_size: u32,
+    hidden: u32,
+    has_bias: u32,
+    total: u32, // batch * hidden
+};
+
+const WG: u32 = 64u;
+
+fn sigmoid(v: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-v));
+}
+
+@compute @workgroup_size(64)
+fn lstm_cell(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    let gate_dim = 4u * p.hidden;
+
+    for (var idx = gid.x; idx < p.total; idx += stride) {
+        let b = idx / p.hidden;
+        let j = idx % p.hidden;
+
+        var g: array<f32, 4>;
+        for (var kk = 0u; kk < 4u; kk += 1u) {
+            let col = kk * p.hidden + j;
+            var acc = 0.0;
+            if (p.has_bias != 0u) { acc = b_ih[col] + b_hh[col]; }
+            let xb = b * p.input_size;
+            for (var t = 0u; t < p.input_size; t += 1u) {
+                acc += x[xb + t] * w_ih[t * gate_dim + col];
+            }
+            let hb = b * p.hidden;
+            for (var t = 0u; t < p.hidden; t += 1u) {
+                acc += h_prev[hb + t] * w_hh[t * gate_dim + col];
+            }
+            g[kk] = acc;
+        }
+
+        let i_gate = sigmoid(g[0]);
+        let f_gate = sigmoid(g[1]);
+        let g_gate = tanh(g[2]);
+        let o_gate = sigmoid(g[3]);
+
+        let c_t = f_gate * c_prev[b * p.hidden + j] + i_gate * g_gate;
+        let h_t = o_gate * tanh(c_t);
+
+        let ob = b * 2u * p.hidden;
+        o[ob + j] = h_t;
+        o[ob + p.hidden + j] = c_t;
+    }
+}

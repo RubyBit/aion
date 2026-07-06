@@ -26,7 +26,7 @@ comptime {
 
     _ = @import("aion/graph/test_program.zig");
     _ = @import("aion/graph/test_program_golden.zig");
-    _ = @import("aion/graph/opt/test_fuse_horizontal_matmul.zig");
+    _ = @import("aion/graph/opt/test_optimize.zig");
 
     _ = @import("aion/api/test_api.zig");
 }

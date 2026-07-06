@@ -4,6 +4,10 @@ const std = @import("std");
 const types = @import("../backend/types.zig");
 const utils = @import("../backend/utils.zig");
 const small_vec = @import("../small_vec.zig");
+// Device-memory vtable + handle type. This module is std-only (no wgpu), so
+// importing it keeps `storage.zig` GPU-API-agnostic and introduces no import
+// cycle: the dependency edge is storage -> runtime/residency/device_memory -> std.
+const dm = @import("../runtime/residency/device_memory.zig");
 
 const SmallVec = small_vec.SmallVec;
 const INLINE_RANK: usize = 8;
@@ -136,6 +140,21 @@ pub const TileViewMut = struct {
     }
 };
 
+/// Which device a tensor's bytes currently live on. Move semantics: a tensor is
+/// resident on exactly one device at a time. `.gpu` uses `index` to name which GPU
+/// in the Context's device registry (multi-GPU); `.cpu` ignores `index`.
+pub const DeviceRef = packed struct(u16) {
+    kind: enum(u8) { cpu = 0, gpu = 1 } = .cpu,
+    index: u8 = 0,
+
+    pub fn isCpu(self: DeviceRef) bool {
+        return self.kind == .cpu;
+    }
+    pub fn eql(a: DeviceRef, b: DeviceRef) bool {
+        return a.kind == b.kind and a.index == b.index;
+    }
+};
+
 /// RAM-only tiled tensor storage, backed by a single contiguous allocation.
 ///
 /// Important: This storage is *physically tiled* (tiles are stored contiguously, in tile-major order).
@@ -183,6 +202,19 @@ pub const TiledTensor = struct {
 
     // Alignment between tiles in the backing buffer.
     tile_alignment: usize = 64,
+
+    // --- Device residency (move semantics) ---
+    // A tensor lives on exactly one device. On `.cpu`, bytes are in `data` and
+    // `tile_handles` is empty. On a `.gpu` device (after `StorageManager.moveTensor`),
+    // `data` is freed and the bytes live in per-tile device buffers named by
+    // `tile_handles` (index-parallel to `tile_offsets`), allocated from `dev`.
+    // Disambiguation: `data.len == 0 && device.kind == .cpu` means released/dead;
+    // `data.len == 0 && device.kind == .gpu` means live on the device.
+    device: DeviceRef = .{},
+    /// Owned: freed (and each handle released via `dev`) in `deinit`.
+    tile_handles: []dm.DeviceHandle = &[_]dm.DeviceHandle{},
+    /// Borrowed (non-owning) device-memory interface for `tile_handles`.
+    dev: ?dm.DeviceMemory = null,
 
     const Self = @This();
 
@@ -472,6 +504,17 @@ pub const TiledTensor = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Device buffers travel with the tensor: release each handle through the
+        // borrowed `dev`, then free the handle slice itself.
+        if (self.tile_handles.len != 0) {
+            if (self.dev) |d| {
+                for (self.tile_handles) |h| d.free(h);
+            }
+            self.allocator.free(self.tile_handles);
+            self.tile_handles = &[_]dm.DeviceHandle{};
+        }
+        self.dev = null;
+        self.device = .{};
         if (self.meta.len != 0) {
             self.allocator.free(self.meta);
             self.meta = &[_]usize{};
@@ -498,7 +541,21 @@ pub const TiledTensor = struct {
         return self.owns_data;
     }
 
+    /// True when the tensor's bytes live on a non-cpu device (host `data` freed).
+    pub fn onDevice(self: *const Self) bool {
+        return self.device.kind != .cpu;
+    }
+
+    /// Byte length of this tensor in packed row-major (block-major for quant) form —
+    /// the device-independent intermediate used when migrating between devices.
+    pub fn packedByteLen(self: *const Self) StorageError!usize {
+        const elems: usize = try mulAll(self.shape);
+        return utils.requiredBytesForElems(self.dtype, elems) catch StorageError.InvalidArgument;
+    }
+
     pub fn promoteToOwned(self: *Self) StorageError!bool {
+        // Nothing to promote when the bytes live on a device (no host buffer).
+        if (self.onDevice()) return false;
         if (self.owns_data) return false;
 
         const owned_copy: []align(64) u8 = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), self.data.len) catch return StorageError.OutOfMemory;
@@ -516,10 +573,14 @@ pub const TiledTensor = struct {
     /// - scalar dtypes only (no quantized remap yet)
     /// - growth only (`new_size >= current`)
     /// - shape rank is preserved
+    /// - the grown axis is re-tiled to the new capacity, keeping growable KV
+    ///   caches contiguous for device backends that bind the cache as one buffer
     pub fn growAxisPreserveScalar(self: *Self, axis: usize, new_size: usize) StorageError!void {
         const rank_usize: usize = @as(usize, self.rank);
         if (rank_usize == 0 or axis >= rank_usize) return StorageError.InvalidArgument;
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
+        // Growable KV caches stay cpu-resident (v1): device-side growth is unsupported.
+        if (self.onDevice()) return StorageError.InvalidArgument;
 
         const old_size: usize = self.shape[axis];
         if (new_size < old_size) return StorageError.InvalidArgument;
@@ -532,6 +593,14 @@ pub const TiledTensor = struct {
         }
         new_shape_mem[axis] = new_size;
         const new_shape: []const usize = new_shape_mem[0..rank_usize];
+
+        var new_tile_shape_mem: [INLINE_RANK]usize = .{0} ** INLINE_RANK;
+        d = 0;
+        while (d < rank_usize) : (d += 1) {
+            new_tile_shape_mem[d] = self.tile_shape[d];
+        }
+        new_tile_shape_mem[axis] = @max(new_tile_shape_mem[axis], new_size);
+        const new_tile_shape: []const usize = new_tile_shape_mem[0..rank_usize];
 
         const elem_bytes: usize = self.dtype.info().block_bytes;
         const old_elems: usize = try mulAll(self.shape);
@@ -574,7 +643,7 @@ pub const TiledTensor = struct {
             self.allocator,
             self.dtype,
             new_shape,
-            self.tile_shape,
+            new_tile_shape,
             .{ .tile_alignment = self.tile_alignment },
         );
         errdefer new_tensor.deinit();
@@ -661,6 +730,26 @@ pub const TiledTensor = struct {
         return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, tile_dims.constSlice(), elem_bytes);
     }
 
+    /// Per-tile logical layout (dtype/rank/shape/strides) WITHOUT touching `data`.
+    /// Used to describe a device-resident tile whose host bytes have been freed
+    /// (`device.kind == .gpu`). The returned view's `bytes` slice is empty.
+    pub fn tileLayoutLinear(self: *const Self, tile_index: usize) StorageError!TileViewConst {
+        if (tile_index >= self.tile_offsets.len) return StorageError.InvalidArgument;
+        if (@as(usize, self.rank) > INLINE_RANK) return StorageError.InvalidArgument;
+
+        var tile_coords: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_coords.deinit();
+        var tile_dims: SmallVec(usize, INLINE_RANK) = SmallVec(usize, INLINE_RANK).initWithLen(self.allocator, @as(usize, self.rank)) catch return StorageError.OutOfMemory;
+        defer tile_dims.deinit();
+
+        try decodeTileCoords(tile_index, self.tile_counts, self.tile_strides, tile_coords.slice());
+        try computeTileDimsND(self.shape, self.tile_shape, tile_coords.constSlice(), tile_dims.slice());
+
+        const di = self.dtype.info();
+        const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
+        return TileViewConst.init(&[_]u8{}, self.dtype, self.rank, tile_dims.constSlice(), elem_bytes);
+    }
+
     pub fn acquireTileMut(self: *Self, ti0: usize, ti1: usize) StorageError!TileViewMut {
         if (self.rank > 2) return StorageError.InvalidArgument;
         const idx: usize = try self.tileIndex(ti0, ti1);
@@ -700,6 +789,7 @@ pub const TiledTensor = struct {
     /// For rank-1, `packed` is a contiguous vector.
     /// For rank-2, `packed` is row-major contiguous.
     pub fn writeFromPackedScalar(self: *Self, packed_bytes: []const u8) StorageError!void {
+        if (self.onDevice()) return StorageError.InvalidArgument; // host bytes freed; migrate with .to(.cpu) first
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
 
         const need_total: usize = self.requiredBytesPackedScalar();
@@ -824,6 +914,7 @@ pub const TiledTensor = struct {
 
     /// Reads tiled scalar storage back into packed row-major.
     pub fn readToPackedScalar(self: *const Self, out: []u8) StorageError!void {
+        if (self.onDevice()) return StorageError.InvalidArgument; // host bytes freed; migrate with .to(.cpu) first
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
 
         const need_total: usize = self.requiredBytesPackedScalar();
@@ -906,6 +997,7 @@ pub const TiledTensor = struct {
     ) StorageError!void {
         std.debug.assert((packed_src == null) != (packed_dst == null));
 
+        if (self.onDevice()) return StorageError.InvalidArgument; // host bytes freed; migrate with .to(.cpu) first
         const di = self.dtype.info();
         if (!di.is_quantized) return StorageError.InvalidArgument;
         if (self.rank == 0) return StorageError.InvalidArgument;

@@ -4,11 +4,15 @@ const std = @import("std");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
 const manager_mod = @import("../storage/manager.zig");
+const api_tiling = @import("tiling.zig");
+const device_mod = @import("device.zig");
 
 pub const DType = types.DType;
 pub const TensorId = manager_mod.TensorId;
 pub const StorageManager = manager_mod.StorageManager;
 pub const StorageError = manager_mod.StorageError;
+pub const DeviceRef = manager_mod.DeviceRef;
+pub const DeviceSelector = device_mod.DeviceSelector;
 
 /// User-visible owned tensor handle.
 ///
@@ -33,6 +37,39 @@ pub const Tensor = struct {
 
     pub fn getShape(self: Self) []const usize {
         return self.shape;
+    }
+
+    /// Migrate this tensor to `sel` (move semantics: the source-device copy is
+    /// freed), re-tiling to the target device's geometry. `.gpu = i` requires that
+    /// GPU to be registered on the owning `Context`. Idempotent when already there.
+    /// After the move, host `read`/`write` require migrating back with `.to(.cpu)`.
+    pub fn to(self: *Self, sel: DeviceSelector) StorageError!void {
+        const target: DeviceRef = switch (sel) {
+            .cpu => .{ .kind = .cpu },
+            .gpu => |idx| blk: {
+                if (idx > 255) return StorageError.InvalidArgument;
+                break :blk .{ .kind = .gpu, .index = @intCast(idx) };
+            },
+        };
+
+        const t = try self.store.getConst(self.id);
+        if (t.device.eql(target)) return;
+        if (@as(usize, t.rank) > api_tiling.MAX_RANK) return StorageError.InvalidArgument;
+
+        const policy = self.store.policyFor(target);
+        const dev = self.store.deviceMemoryFor(target);
+        if (target.kind != .cpu and dev == null) return StorageError.InvalidArgument; // GPU not registered
+
+        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
+        const tile_shape = tile_mem[0..@as(usize, t.rank)];
+        api_tiling.chooseTileShapeForTensor(policy, t.dtype, t.shape, t.quant_axis, tile_shape) catch return StorageError.InvalidArgument;
+
+        try self.store.moveTensor(self.id, target, dev, tile_shape, policy.tile_alignment);
+
+        // The metadata slice may have been reallocated by the re-tile; refresh caches.
+        const nt = try self.store.getConst(self.id);
+        self.dtype = nt.dtype;
+        self.shape = nt.shape;
     }
 
     pub fn elemCount(self: Self) StorageError!usize {

@@ -23,14 +23,6 @@ const ThreadPool = @import("../../runtime/thread_pool.zig").ThreadPool;
 /// single-core bandwidth, so keep it (also covers the decode logits/argmax case).
 const PARALLEL_MEMCPY_MIN_BYTES: usize = 8 * 1024 * 1024;
 
-/// Monotonic nanosecond clock (for optional D2H profiling via AION_D2H_PROFILE).
-fn nowNs() u64 {
-    const ts: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);
-    const ns: i96 = ts.toNanoseconds();
-    if (ns <= 0) return 0;
-    return @intCast(@min(ns, @as(i96, std.math.maxInt(u64))));
-}
-
 const dm = @import("../../runtime/residency/device_memory.zig");
 const DeviceMemory = dm.DeviceMemory;
 const DeviceHandle = dm.DeviceHandle;
@@ -51,8 +43,6 @@ pub const WgpuDeviceMemory = struct {
     // readbacks (the single serial memcpy is ~half the D2H cost). Set by the owner
     // (GpuBackend); null = single-threaded memcpy.
     pool: ?*ThreadPool = null,
-    // Per-stage D2H timing to stderr when AION_D2H_PROFILE is set (read once).
-    profile: bool = false,
 
     const Self = @This();
 
@@ -75,7 +65,7 @@ pub const WgpuDeviceMemory = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu) Self {
-        return .{ .allocator = allocator, .gpu = gpu, .profile = std.c.getenv("AION_D2H_PROFILE") != null };
+        return .{ .allocator = allocator, .gpu = gpu };
     }
 
     pub fn deinit(self: *Self) void {
@@ -164,9 +154,6 @@ pub const WgpuDeviceMemory = struct {
 
         // Copy device->staging on the queue, then block until all prior submits
         // (the compute that produced `buf`) and this copy have completed.
-        const prof = self.profile;
-        const t0 = if (prof) nowNs() else 0;
-
         const enc = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
         c.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, dst.len);
         const cmd = c.wgpuCommandEncoderFinish(enc, null);
@@ -175,20 +162,10 @@ pub const WgpuDeviceMemory = struct {
         c.wgpuCommandBufferRelease(cmd);
         _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
 
-        const t1 = if (prof) nowNs() else 0;
-
         self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, dst.len) catch return DeviceError.InvalidArgument;
         const mapped = c.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return DeviceError.InvalidArgument;
-
-        const t2 = if (prof) nowNs() else 0;
-
         self.copyHostBytes(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);
         c.wgpuBufferUnmap(staging);
-
-        if (prof) {
-            const t3 = nowNs();
-            std.debug.print("[d2h {d}KB] copy+poll={d}us map={d}us memcpy={d}us\n", .{ dst.len / 1024, (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000 });
-        }
     }
 
     const vtable = DeviceMemory.VTable{

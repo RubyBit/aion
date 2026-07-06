@@ -130,6 +130,16 @@ pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
             .target_kind = target.kind,
             .base_square_2d = GPU_MACRO_TILE_CAP,
             .base_1d = 1 << 24, // 16M elems → typical vectors are a single tile
+            // Attention on GPU streams keys inside one kernel (shared-memory
+            // online softmax), so a slice's whole q/k/v/out should land in ONE
+            // tile — the caps that bound the CPU kernels' stack scratch don't
+            // apply. The GPU attention exec binds one buffer per operand per
+            // slice and rejects multi-tile last-two-dims with Unsupported.
+            .attn_q_tile = GPU_MACRO_TILE_CAP,
+            .attn_k_tile_cap = GPU_MACRO_TILE_CAP,
+            .attn_v_tile_cap = GPU_MACRO_TILE_CAP,
+            .attn_head_tile_cap = GPU_MACRO_TILE_CAP,
+            .attn_max_q_rows = GPU_MACRO_TILE_CAP,
         },
     };
 }
@@ -182,6 +192,17 @@ pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usiz
 }
 
 pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, dv: usize) struct { tm: usize, tn: usize, tk: usize, tv: usize } {
+    // GPU targets: one tile per slice dimension (the kernel streams keys and
+    // holds no per-tile stack scratch), and no ×16 rounding — a split dv/dk
+    // tile would force the exec into multi-buffer bindings for no benefit.
+    if (policy.target_kind != .cpu) {
+        const tm_g: usize = @max(@as(usize, 1), @min(m, @min(policy.attn_q_tile, policy.base_1d)));
+        const tn_g: usize = @max(@as(usize, 1), @min(n, @min(policy.attn_k_tile_cap, policy.base_square_2d)));
+        const tk_g: usize = @max(@as(usize, 1), @min(dk, policy.attn_head_tile_cap));
+        const tv_g: usize = @max(@as(usize, 1), @min(dv, policy.attn_v_tile_cap));
+        return .{ .tm = tm_g, .tn = tn_g, .tk = tk_g, .tv = tv_g };
+    }
+
     // Attention is row-wise over queries, and needs per-query scratch.
     // IMPORTANT: we parallelize attention primarily across query tiles.
     // Keep tm modest so we have enough tile-level parallelism on many-core CPUs.

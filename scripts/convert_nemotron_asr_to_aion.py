@@ -497,11 +497,13 @@ def build_encoder(loader: _Loader, b: _Builder, t_mel: int,
         att = b.matmul(att, b.q8_matmul_b(f"{pf}.self_attn.linear_out.weight", loader.get(f"{pf}.self_attn.linear_out.weight")))
         h = b.add(h, att)
 
-        # Conv module
+        # Conv module. Pointwise convs are k=1 == matmul; store them q8 and route
+        # through the fast matmul path (matches _stream_conformer_layers). Only the
+        # depthwise conv stays f32 (tiny, precision-sensitive — not a matmul).
         hn = ln(h, f"{pf}.norm_conv", (D_MODEL,))
-        pw1 = b.f32(f"{pf}.conv.pointwise_conv1.weight",
-                    np.transpose(loader.get(f"{pf}.conv.pointwise_conv1.weight"), (2, 1, 0)))  # [1,1024,2048]
-        c = b.conv1d(hn, pw1, None, stride=1, dilation=1, pad_left=0, pad_right=0, groups=1)  # [1,T,2048]
+        pw1 = b.q8_matmul_b(f"{pf}.conv.pointwise_conv1.weight",
+                            loader.get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0])  # [2048,1024]
+        c = b.matmul(hn, pw1)  # [1,T,2048]
         a = b.slice_nd(c, (0, 0, 0), (1, t_out, D_MODEL))
         g = b.slice_nd(c, (0, 0, D_MODEL), (1, t_out, D_MODEL))
         c = b.mul(a, b.unary(aw.UnaryOp.sigmoid, g))  # GLU
@@ -510,9 +512,9 @@ def build_encoder(loader: _Loader, b: _Builder, t_mel: int,
         c = b.conv1d(c, dw, None, stride=1, dilation=1, pad_left=CONV_K - 1, pad_right=0, groups=D_MODEL)
         c = ln(c, f"{pf}.conv.batch_norm", (D_MODEL,))  # LayerNorm slot
         c = b.unary(aw.UnaryOp.silu, c)
-        pw2 = b.f32(f"{pf}.conv.pointwise_conv2.weight",
-                    np.transpose(loader.get(f"{pf}.conv.pointwise_conv2.weight"), (2, 1, 0)))  # [1,1024,1024]
-        c = b.conv1d(c, pw2, None, stride=1, dilation=1, pad_left=0, pad_right=0, groups=1)
+        pw2 = b.q8_matmul_b(f"{pf}.conv.pointwise_conv2.weight",
+                            loader.get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0])  # [1024,1024]
+        c = b.matmul(c, pw2)  # [1,T,1024]
         h = b.add(h, c)
 
         # FF2 (x0.5)

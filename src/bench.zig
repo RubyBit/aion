@@ -2,11 +2,7 @@
 
 const std = @import("std");
 const aion = @import("aion");
-
-/// Mirror the library's multiversion switch so the CPU backend (which reads
-/// `@import("root")`) dispatches to the linked per-ISA tier objects. `build.zig`
-/// links those objects into this exe and supplies `build_options.multiversion`.
-pub const aion_multiversion: bool = @import("build_options").multiversion;
+const bk = @import("bench_kernels"); // shared op list + unified reporter (parity with gpu-bench)
 
 const Backend = aion.backend.Backend;
 const CpuBackend = aion.cpu.CpuBackend;
@@ -32,6 +28,7 @@ const BenchSuite = enum {
     matmul,
     matmul_q,
     decode,
+    kernels, // shared fixed-shape sweep, in parity with gpu-bench --suite kernels
 };
 
 const BenchDTypeMode = enum {
@@ -80,6 +77,9 @@ const BenchOptions = struct {
 
     // Reflect convolution benchmarks.
     reflect_conv: bool = true,
+
+    // Optional label filter for the kernels suite (--op <label>).
+    op_filter: ?[]const u8 = null,
 };
 
 fn printUsage() void {
@@ -90,7 +90,8 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
-            "  --suite NAME     Bench suite: all|matmul|quant-matmul|decode (default: all)\n" ++
+            "  --suite NAME     Bench suite: all|matmul|quant-matmul|decode|kernels (default: all)\n" ++
+            "  --op LABEL       kernels suite: run only the op with this label\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
@@ -129,6 +130,7 @@ fn parseBenchSuite(arg: []const u8) !BenchSuite {
     if (std.mem.eql(u8, arg, "matmul")) return .matmul;
     if (std.mem.eql(u8, arg, "quant-matmul")) return .matmul_q;
     if (std.mem.eql(u8, arg, "decode")) return .decode;
+    if (std.mem.eql(u8, arg, "kernels")) return .kernels;
     return error.InvalidArgument;
 }
 
@@ -150,6 +152,8 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
         } else if (std.mem.eql(u8, a, "--suite")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.suite = try parseBenchSuite(v);
+        } else if (std.mem.eql(u8, a, "--op")) {
+            opts.op_filter = it.next() orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, a, "--iters")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.iters = try parseUsize(v);
@@ -282,18 +286,10 @@ fn benchProgramConv1D(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(l_out)) * @as(u64, @intCast(c_out)) *
         @as(u64, @intCast(kernel * c_in_g));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * l_out * c_out * @sizeOf(f32);
@@ -306,19 +302,7 @@ fn benchProgramConv1D(
     const idx2: usize = (batch - 1) * l_out * c_out + (l_out - 1) * c_out + (c_out - 1);
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    std.debug.print("program conv1d {s}:      {d:.2} GFLOP/s (b={} l={} cin={} cout={} k={} g={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{
-        label,
-        gflops,
-        batch,
-        l_in,
-        c_in,
-        c_out,
-        kernel,
-        groups,
-        chk,
-        nsToMilliseconds(ns),
-        nsToMillisecondsPerIter(ns, iters),
-    });
+    rep("conv1d {s}", .{label}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramConv2D(
@@ -393,18 +377,10 @@ fn benchProgramConv2D(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(h_out)) * @as(u64, @intCast(w_out)) *
         @as(u64, @intCast(c_out)) * @as(u64, @intCast(k_h * k_w * c_in_g));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * h_out * w_out * c_out * @sizeOf(f32);
@@ -417,20 +393,7 @@ fn benchProgramConv2D(
     const idx2: usize = ((batch - 1) * h_out * w_out * c_out) + ((h_out - 1) * w_out * c_out) + ((w_out - 1) * c_out) + (c_out - 1);
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    std.debug.print("program conv2d {s}:      {d:.2} GFLOP/s (b={} h={} w={} cin={} cout={} k={} g={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{
-        label,
-        gflops,
-        batch,
-        h_in,
-        w_in,
-        c_in,
-        c_out,
-        kernel,
-        groups,
-        chk,
-        nsToMilliseconds(ns),
-        nsToMillisecondsPerIter(ns, iters),
-    });
+    rep("conv2d {s}", .{label}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn readF32AtTiled(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f32 {
@@ -475,6 +438,14 @@ fn asF16Slice(buf: []u8) []align(1) f16 {
     return ptr[0 .. buf.len / @sizeOf(f16)];
 }
 
+/// Format a label and forward to the shared unified reporter. `bytes`/`flops` are
+/// PER-ITERATION (0 to omit that column); `bk.report` derives GB/s and GFLOP/s.
+fn rep(comptime fmt: []const u8, args: anytype, iters: usize, ns: u64, bytes: f64, flops: f64, chk: f64) void {
+    var buf: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, fmt, args) catch "?";
+    bk.report(.{ .label = label, .iters = iters, .ns = ns, .bytes = bytes, .flops = flops, .chk = chk });
+}
+
 fn defaultTilePolicy() plan_mod.TilePolicy {
     // Chosen to be representative for CPU cache-friendly tiling and quant block alignment.
     // Increased base_square_2d to 256 to allow kernels to use L2 blocking effectively.
@@ -513,23 +484,13 @@ fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters:
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(3 * n_elem * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem / 2, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem - 1, 0);
-    std.debug.print("program elemwise add f32: {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("elemwise_add", .{}, iters, ns, @floatFromInt(3 * n_elem * @sizeOf(f32)), 0, chk);
 }
 
 fn benchProgramRelu(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
@@ -569,24 +530,14 @@ fn benchProgramUnary(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    // One input read + one output write.
-    const bytes: u64 = @as(u64, @intCast(2 * n_elem * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem / 2, 0) +
         try readF32AtTiled(&sm, out_tid, n_elem - 1, 0);
-    std.debug.print("program unary {s} f32:    {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ label, gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    // One input read + one output write.
+    rep("unary_{s}", .{label}, iters, ns, @floatFromInt(2 * n_elem * @sizeOf(f32)), 0, chk);
 }
 
 fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
@@ -614,21 +565,11 @@ fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(n_elem * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const sum: f32 = try readF32AtTiled(&sm, out_tid, 0, 0);
-    std.debug.print("program reduce sum f32:   {d:.3} GiB/s  (sum={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, sum, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("reduce_sum", .{}, iters, ns, @floatFromInt(n_elem * @sizeOf(f32)), 0, sum);
 }
 
 fn benchProgramReduceAxisF32(
@@ -665,14 +606,7 @@ fn benchProgramReduceAxisF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_t = try sm.getConst(out_tid);
@@ -683,8 +617,6 @@ fn benchProgramReduceAxisF32(
 
     // Approx memory traffic: one full input read + one output write.
     const bytes_per_iter: usize = (m * n + out_elems) * @sizeOf(f32);
-    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
 
     const out_bytes_len: usize = out_elems * @sizeOf(f32);
     const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
@@ -697,17 +629,7 @@ fn benchProgramReduceAxisF32(
     const idx2: usize = out_elems - 1;
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    std.debug.print("program reduce axis mean f32 {s}: {d:.3} GiB/s  (m={} n={} axis={}, out={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{
-        label,
-        gib_s,
-        m,
-        n,
-        axis,
-        out_elems,
-        chk,
-        nsToMilliseconds(ns),
-        nsToMillisecondsPerIter(ns, iters),
-    });
+    rep("reduce_ax_{s}", .{label}, iters, ns, @floatFromInt(bytes_per_iter), 0, chk);
 }
 
 fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -735,24 +657,13 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    // Report as actual memory traffic (2 reads of input, 3 accesses to output).
-    const bytes: u64 = @as(u64, @intCast(2 * m * n * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
-    std.debug.print("program softmax f32:     {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("softmax", .{}, iters, ns, @floatFromInt(2 * m * n * @sizeOf(f32)), 0, chk);
 }
 
 fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -795,24 +706,14 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    // Our implementation reads X twice (stats + apply), reads gamma/beta once, writes Y once.
-    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
-    std.debug.print("program layernorm f32:   {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    // reads X twice (stats + apply), gamma/beta once, writes Y once.
+    rep("layernorm", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f32)), 0, chk);
 }
 
 fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -855,23 +756,13 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f32))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
-    std.debug.print("program rmsnorm f32:     {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("rmsnorm", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f32)), 0, chk);
 }
 
 fn benchProgramAttentionF32(
@@ -925,20 +816,12 @@ fn benchProgramAttentionF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     // FLOPs (ignoring softmax exp overhead):
     // - QK^T: 2*m*n*dk
     // - P@V:  2*m*n*dv
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
@@ -946,10 +829,7 @@ fn benchProgramAttentionF32(
         try readF32AtTiled(&sm, out_tid, m - 1, dv - 1);
 
     const mode: []const u8 = if (causal) "causal" else "noncausal";
-    std.debug.print(
-        "program attention f32 {s}: {d:.2} GFLOP/s (m={} n={} dk={} dv={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
-        .{ mode, gflops, m, n, dk, dv, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
-    );
+    rep("attn_{s}", .{mode}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMultiHeadAttentionSeparateF32(
@@ -1005,18 +885,10 @@ fn benchProgramMultiHeadAttentionSeparateF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(heads)) * @as(u64, @intCast(m_head)) * @as(u64, @intCast(n_head)) *
         (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * heads * m_head * dv * @sizeOf(f32);
@@ -1031,10 +903,7 @@ fn benchProgramMultiHeadAttentionSeparateF32(
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
     const mode: []const u8 = if (causal) "causal" else "noncausal";
-    std.debug.print(
-        "program mha separate f32 {s}: {d:.2} GFLOP/s (b={} h={} m={} n={} dk={} dv={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
-        .{ mode, gflops, batch, heads, m_head, n_head, dk, dv, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
-    );
+    rep("mha_sep_{s}", .{mode}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMultiHeadAttentionCachedF32(
@@ -1147,14 +1016,7 @@ fn benchProgramMultiHeadAttentionCachedF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     // Approx FLOPs (ignoring exp/tanh overhead):
     // per (b,l,h): 2 * n_eff * (dk + dv)
@@ -1185,7 +1047,6 @@ fn benchProgramMultiHeadAttentionCachedF32(
         (@as(u128, dk) + @as(u128, dv)) *
         @as(u128, iters);
     const flops_total: u64 = if (flops_total_wide > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(flops_total_wide);
-    const gflops: f64 = fmtRateGFLOPs(flops_total, ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * l_q * h_q * dv * @sizeOf(f32);
@@ -1200,10 +1061,7 @@ fn benchProgramMultiHeadAttentionCachedF32(
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
     const mode: []const u8 = if (causal) "causal" else "noncausal";
-    std.debug.print(
-        "program mha cached f32 {s}/{s}: {d:.2} GFLOP/s (b={} hq={} hkv={} lq={} t={} dk={} dv={} sw={} cap={d:.2}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
-        .{ mode, label, gflops, batch, h_q, h_kv, l_q, t_cache, dk, dv, sliding_window, attn_logits_soft_cap, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
-    );
+    rep("mhac_{s}_{s}", .{ mode, label }, iters, ns, 0, @as(f64, @floatFromInt(flops_total)) / @as(f64, @floatFromInt(iters)), chk);
 }
 
 fn benchProgramSTFTF32(
@@ -1248,14 +1106,7 @@ fn benchProgramSTFTF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const num_frames: usize = 1 + samples / hop;
     const out_tid: TensorId = prog.outputs[0];
@@ -1269,9 +1120,7 @@ fn benchProgramSTFTF32(
     // over batch*num_frames frames.
     const log2n: f64 = std.math.log2(@as(f64, @floatFromInt(n_fft)));
     const flops_per_frame: f64 = @as(f64, @floatFromInt(n_fft)) + 2.5 * @as(f64, @floatFromInt(n_fft)) * log2n;
-    const total_flops: f64 = flops_per_frame * @as(f64, @floatFromInt(batch * num_frames * iters));
-    const gflops: f64 = total_flops / @as(f64, @floatFromInt(ns));
-    std.debug.print("program stft f32 (nfft={d} hop={d} frames={d}): {d:.3} GFLOP/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ n_fft, hop, num_frames, gflops, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("stft", .{}, iters, ns, 0, flops_per_frame * @as(f64, @floatFromInt(batch * num_frames)), chk);
 }
 
 fn benchProgramRoPE1DF32(
@@ -1338,19 +1187,10 @@ fn benchProgramRoPE1DF32(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     // Approx traffic per iter: read x + read positions + write out.
     const bytes_per_iter: usize = (2 * x_elems * @sizeOf(f32)) + (p_elems * @sizeOf(i32));
-    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
 
     const out_buf: []u8 = try allocator.alloc(u8, x_elems * @sizeOf(f32));
     defer allocator.free(out_buf);
@@ -1362,10 +1202,7 @@ fn benchProgramRoPE1DF32(
     const idx2: usize = (((batch - 1) * seq_len + (seq_len - 1)) * heads + (heads - 1)) * head_dim + (head_dim - 1);
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    std.debug.print(
-        "program rope1d f32:      {d:.3} GiB/s  (b={} l={} h={} d={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
-        .{ gib_s, batch, seq_len, heads, head_dim, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
-    );
+    rep("rope1d_f32", .{}, iters, ns, @floatFromInt(bytes_per_iter), 0, chk);
 }
 
 fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
@@ -1400,23 +1237,13 @@ fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, ite
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(3 * n_elem * @sizeOf(f16))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem / 2, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem - 1, 0)));
-    std.debug.print("program elemwise add f16: {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("elemwise_add_f16", .{}, iters, ns, @floatFromInt(3 * n_elem * @sizeOf(f16)), 0, chk);
 }
 
 fn benchProgramUnaryF16(
@@ -1452,23 +1279,13 @@ fn benchProgramUnaryF16(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(2 * n_elem * @sizeOf(f16))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem / 2, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem - 1, 0)));
-    std.debug.print("program unary {s} f16:    {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ label, gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("unary_{s}_f16", .{label}, iters, ns, @floatFromInt(2 * n_elem * @sizeOf(f16)), 0, chk);
 }
 
 fn benchProgramReduceSumF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
@@ -1496,21 +1313,11 @@ fn benchProgramReduceSumF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(n_elem * @sizeOf(f16))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const sum: f32 = @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0));
-    std.debug.print("program reduce sum f16:   {d:.3} GiB/s  (sum={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, sum, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("reduce_sum_f16", .{}, iters, ns, @floatFromInt(n_elem * @sizeOf(f16)), 0, sum);
 }
 
 fn benchProgramReduceAxisF16(
@@ -1547,14 +1354,7 @@ fn benchProgramReduceAxisF16(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_t = try sm.getConst(out_tid);
@@ -1562,8 +1362,6 @@ fn benchProgramReduceAxisF16(
     for (out_t.shape) |dim| out_elems *= dim;
 
     const bytes_per_iter: usize = (m * n + out_elems) * @sizeOf(f16);
-    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
 
     const out_bytes_len: usize = out_elems * @sizeOf(f16);
     const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
@@ -1576,17 +1374,7 @@ fn benchProgramReduceAxisF16(
     const idx2: usize = out_elems - 1;
     const chk: f32 = @as(f32, @floatCast(out_vals[idx0])) + @as(f32, @floatCast(out_vals[idx1])) + @as(f32, @floatCast(out_vals[idx2]));
 
-    std.debug.print("program reduce axis mean f16 {s}: {d:.3} GiB/s  (m={} n={} axis={}, out={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{
-        label,
-        gib_s,
-        m,
-        n,
-        axis,
-        out_elems,
-        chk,
-        nsToMilliseconds(ns),
-        nsToMillisecondsPerIter(ns, iters),
-    });
+    rep("reduce_ax_{s}_f16", .{label}, iters, ns, @floatFromInt(bytes_per_iter), 0, chk);
 }
 
 fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -1629,23 +1417,13 @@ fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f16))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
-    std.debug.print("program layernorm f16:   {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("layernorm_f16", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f16)), 0, chk);
 }
 
 fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, be: Backend) !void {
@@ -1688,23 +1466,13 @@ fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
-
-    const bytes: u64 = @as(u64, @intCast(5 * m * n * @sizeOf(f16))) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
-    std.debug.print("program rmsnorm f16:     {d:.3} GiB/s  (chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gib_s, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("rmsnorm_f16", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f16)), 0, chk);
 }
 
 fn benchProgramRoPE1DF16(
@@ -1771,18 +1539,9 @@ fn benchProgramRoPE1DF16(
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const bytes_per_iter: usize = (2 * x_elems * @sizeOf(f16)) + (p_elems * @sizeOf(i32));
-    const bytes: u64 = @as(u64, @intCast(bytes_per_iter)) * @as(u64, @intCast(iters));
-    const gib_s: f64 = fmtRateGiBPerSec(bytes, ns);
 
     const out_buf: []u8 = try allocator.alloc(u8, x_elems * @sizeOf(f16));
     defer allocator.free(out_buf);
@@ -1794,10 +1553,7 @@ fn benchProgramRoPE1DF16(
     const idx2: usize = (((batch - 1) * seq_len + (seq_len - 1)) * heads + (heads - 1)) * head_dim + (head_dim - 1);
     const chk: f32 = @as(f32, @floatCast(out_vals[idx0])) + @as(f32, @floatCast(out_vals[idx1])) + @as(f32, @floatCast(out_vals[idx2]));
 
-    std.debug.print(
-        "program rope1d f16:      {d:.3} GiB/s  (b={} l={} h={} d={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n",
-        .{ gib_s, batch, seq_len, heads, head_dim, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) },
-    );
+    rep("rope1d_f16", .{}, iters, ns, @floatFromInt(bytes_per_iter), 0, chk);
 }
 
 fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
@@ -1832,23 +1588,14 @@ fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
-
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
         @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
-    std.debug.print("program matmul f16:       {d:.2} GFLOP/s (m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gflops, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("matmul_f16", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, batch: usize, m: usize, n: usize, k: usize, be: Backend) !void {
@@ -1883,17 +1630,9 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * m * n * @sizeOf(f16);
@@ -1907,7 +1646,7 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     const idx2: usize = (batch - 1) * m * n + (m - 1) * n + (n - 1);
     const chk: f32 = @as(f32, @floatCast(out_vals[idx0])) + @as(f32, @floatCast(out_vals[idx1])) + @as(f32, @floatCast(out_vals[idx2]));
 
-    std.debug.print("program matmul batched f16: {d:.2} GFLOP/s (b={} m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gflops, batch, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("matmul_bat_f16", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, be: Backend) !void {
@@ -1942,23 +1681,14 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
-
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
-    std.debug.print("program matmul f32:       {d:.2} GFLOP/s (m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gflops, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("matmul_f32", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, batch: usize, m: usize, n: usize, k: usize, be: Backend) !void {
@@ -1993,17 +1723,9 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
 
     const out_tid: TensorId = prog.outputs[0];
     const out_bytes_len: usize = batch * m * n * @sizeOf(f32);
@@ -2017,7 +1739,7 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     const idx2: usize = (batch - 1) * m * n + (m - 1) * n + (n - 1);
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    std.debug.print("program matmul batched f32: {d:.2} GFLOP/s (b={} m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ gflops, batch, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("matmul_bat_f32", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, n: usize, k: usize, b_dtype: types.DType, be: Backend) !void {
@@ -2058,25 +1780,16 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
-    const gflops: f64 = fmtRateGFLOPs(flops_per * @as(u64, @intCast(iters)), ns);
-
     const out_tid: TensorId = prog.outputs[0];
     const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
         try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
         try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
 
     const name: []const u8 = if (b_dtype == .q8_0) "q8_0" else "q4_0";
-    std.debug.print("program matmul {s}:      {d:.2} GFLOP/s (m={} n={} k={}, chk={d:.4}, wall={d:.3} ms, iter={d:.3} ms)\n", .{ name, gflops, m, n, k, chk, nsToMilliseconds(ns), nsToMillisecondsPerIter(ns, iters) });
+    rep("matmul_{s}", .{name}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
 // ---------------------------------------------------------------------------
@@ -2153,14 +1866,7 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
     defer allocator.free(out_buf);
@@ -2168,10 +1874,7 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     const ov = asF32Slice(out_buf);
     const chk: f32 = ov[0] + ov[n / 2] + ov[n - 1];
 
-    std.debug.print(
-        "decode {s:<16} MatMul       K={d:<5} N={d:<6} tn={d:<4} tk={d:<4}: {d:6.2} GiB/s  ({d:.3} ms/iter, chk={d:.3})\n",
-        .{ label, k, n, tiles.tn, tiles.tk, decodeWeightGiBs(k, n, iters, ns), nsToMillisecondsPerIter(ns, iters), chk },
-    );
+    rep("dec_{s}", .{label}, iters, ns, @floatFromInt((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES), 0, chk);
 }
 
 fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, tn: usize, label: []const u8, be: Backend) !void {
@@ -2206,14 +1909,7 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
     defer prog.deinit();
 
-    const ns: u64 = try benchLoop(iters, struct {
-        be: Backend,
-        sm: *StorageManager,
-        prog: *const program_mod.Program,
-        fn run(self: @This()) !void {
-            try self.be.executeProgram(self.prog, self.sm.tensorStore());
-        }
-    }{ .be = be, .sm = &sm, .prog = &prog });
+    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
     defer allocator.free(out_buf);
@@ -2221,10 +1917,7 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
     const ov = asF32Slice(out_buf);
     const chk: f32 = ov[0] + ov[n / 2] + ov[n - 1];
 
-    std.debug.print(
-        "decode {s:<16} MatMulNT     K={d:<5} N={d:<6} tn={d:<4}        : {d:6.2} GiB/s  ({d:.3} ms/iter, chk={d:.3})\n",
-        .{ label, k, n, tn_eff, decodeWeightGiBs(k, n, iters, ns), nsToMillisecondsPerIter(ns, iters), chk },
-    );
+    rep("dec_nt_{s}", .{label}, iters, ns, @floatFromInt((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES), 0, chk);
 }
 
 fn runDecodeSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
@@ -2292,6 +1985,22 @@ fn nowNs() u64 {
     if (ns <= 0) return 0;
     const max_u64_i96: i96 = @as(i96, std.math.maxInt(u64));
     return @intCast(@min(ns, max_u64_i96));
+}
+
+/// Time `iters` executions of `prog` against a single persistent execution
+/// session (created once, reused across the loop). This keeps device residency
+/// warm on the GPU backend — a fresh session per iteration would re-upload
+/// weights every time and wreck the numbers. CPU sessions are near-free.
+fn benchProgram(iters: usize, be: Backend, sm: *StorageManager, prog: *const program_mod.Program) !u64 {
+    var session = try be.createSession(sm.tensorStore());
+    defer session.deinit();
+    return benchLoop(iters, struct {
+        session: aion.backend.Session,
+        prog: *const program_mod.Program,
+        fn run(self: @This()) !void {
+            try self.session.execute(self.prog);
+        }
+    }{ .session = session, .prog = prog });
 }
 
 fn benchLoop(iters: usize, work_in: anytype) !u64 {
@@ -2439,6 +2148,43 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
     }
 
     return out;
+}
+
+/// One row of the shared kernels sweep on the CPU backend — same op list, shapes,
+/// and report format as `gpu-bench --suite kernels`, so the two are directly
+/// comparable. Ops the CPU executors reject (tile caps) surface as a failed row.
+fn benchKernelCpu(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend, op: bk.KOp) !void {
+    const info = bk.kInfo(op);
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+    var built = try bk.buildK(allocator, &sm, op, defaultTilePolicy());
+    defer built.prog.deinit();
+    const ns = try bk.timeBackend(be, &built.prog, sm.tensorStore(), opts.iters);
+
+    const buf = try allocator.alloc(u8, info.out_elems * 4);
+    defer allocator.free(buf);
+    try sm.readToPackedScalar(built.out, buf);
+    var chk: f64 = 0;
+    if (info.out_i32) {
+        const vals: []align(1) const i32 = @alignCast(std.mem.bytesAsSlice(i32, buf));
+        chk = @floatFromInt(vals[0] +% vals[vals.len / 2] +% vals[vals.len - 1]);
+    } else {
+        const vals: []align(1) const f32 = @alignCast(std.mem.bytesAsSlice(f32, buf));
+        chk = @as(f64, vals[0]) + @as(f64, vals[vals.len / 2]) + @as(f64, vals[vals.len - 1]);
+    }
+    bk.report(.{ .label = info.label, .iters = opts.iters, .ns = ns, .bytes = info.bytes, .flops = info.flops, .chk = chk });
+}
+
+fn runKernelsSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) void {
+    std.debug.print("kernel sweep (fixed shapes), iters={d}\n", .{opts.iters});
+    for (std.enums.values(bk.KOp)) |op| {
+        if (opts.op_filter) |flt| {
+            if (!std.mem.eql(u8, bk.kInfo(op).label, flt)) continue;
+        }
+        benchKernelCpu(allocator, opts, be, op) catch |e| {
+            std.debug.print("  {s:<16} unsupported/failed: {s}\n", .{ bk.kInfo(op).label, @errorName(e) });
+        };
+    }
 }
 
 fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
@@ -2628,6 +2374,12 @@ fn mainImpl(args: std.process.Args) !void {
     const be: Backend = cpu.backend();
 
     std.debug.print("Aion bench (threads={}, iters={}, dtype={s})\n", .{ opts.threads, opts.iters, @tagName(opts.dtype_mode) });
+
+    // The kernels sweep is f32-only and shared with gpu-bench; run it directly.
+    if (opts.suite == .kernels) {
+        runKernelsSuite(allocator, opts, be);
+        return;
+    }
 
     switch (opts.dtype_mode) {
         .f32 => try runF32Benches(allocator, rnd, opts, be),

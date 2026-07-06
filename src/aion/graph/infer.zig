@@ -922,15 +922,16 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             if (!std.math.isFinite(mm.alpha) or !std.math.isFinite(mm.beta)) return InferError.InvalidGraph;
 
-            // A: f32 (residual stream dtype). B: q8_0 with per-row blocks (quant_axis=1).
+            // A: f32 (residual stream dtype). B: q8_0 with per-row blocks
+            // (quant_axis=1) or plain f32 [N, K].
             if (a.dtype.? != .f32) return InferError.Unsupported;
-            if (b.dtype.? != .q8_0) return InferError.Unsupported;
+            if (b.dtype.? != .q8_0 and b.dtype.? != .f32) return InferError.Unsupported;
 
             const k_a: usize = a.shape[a.shape.len - 1];
             const k_b: usize = b.shape[1];
             const n: usize = b.shape[0];
             if (k_a != k_b) return InferError.ShapeMismatch;
-            if ((k_a % 32) != 0) return InferError.Unsupported;
+            if (b.dtype.? == .q8_0 and (k_a % 32) != 0) return InferError.Unsupported;
 
             var out_shape: []usize = graph.arenaAlloc().alloc(usize, a.shape.len) catch return InferError.InvalidGraph;
             var d: usize = 0;

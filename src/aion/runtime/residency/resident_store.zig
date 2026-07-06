@@ -132,6 +132,23 @@ pub const ResidentTensorStore = struct {
     }
 
     fn deviceAcquire(self: *Self, id: TensorId, tile_index: usize, is_mut: bool) StoreError!TileRefDevice {
+        // Move semantics: if the tensor's bytes already live in device-owned buffers
+        // (migrated via `moveTensor`/`Tensor.to`), hand that buffer straight through —
+        // no staging, no dirty tracking, no host copy. We still issue a device token so
+        // lease discipline holds; release is a no-op lookup (no `TileState` exists).
+        if (try self.inner.deviceTile(id, tile_index)) |dt| {
+            return .{
+                .handle = dt.handle,
+                .offset = 0,
+                .len = dt.len,
+                .dtype = dt.dtype,
+                .rank = dt.rank,
+                .shape_mem = dt.shape_mem,
+                .strides_mem = dt.strides_mem,
+                .token = try self.issueToken(key(id, tile_index), is_mut),
+            };
+        }
+
         // Unified memory: host and device share physical memory. Bind the host
         // allocation directly — no device buffer, no copy, no dirty tracking.
         // Re-resolve the current host slice each call so this stays correct
@@ -198,6 +215,20 @@ pub const ResidentTensorStore = struct {
 
     pub fn acquireTileDeviceMutLinear(self: *Self, id: TensorId, tile_index: usize) StoreError!TileRefDevice {
         return self.deviceAcquire(id, tile_index, true);
+    }
+
+    /// True if tile `(id, tile_index)` has a device write not yet flushed to host
+    /// (the device copy is newer than host). Lets a caller that wants to read this
+    /// tile on the host decide whether a device sync is actually required: a
+    /// host-resident (clean) tile can be read directly with no GPU stall.
+    ///
+    /// Note dev_dirty is set at device-mut-lease *release* time — i.e. as soon as
+    /// a dispatch that writes the tile is recorded — so a `true` result can refer
+    /// to a dispatch still pending in the current (unsubmitted) frame. Callers
+    /// must therefore submit any pending GPU work before reading such a tile.
+    pub fn tileDeviceDirty(self: *Self, id: TensorId, tile_index: usize) bool {
+        const st = self.states.get(key(id, tile_index)) orelse return false;
+        return st.dev_dirty;
     }
 
     // ---- vtable: host pass-through (with coherency) ----
@@ -279,7 +310,16 @@ pub const ResidentTensorStore = struct {
 
     fn mapKVCacheTime(ctx: *anyopaque, id: TensorId, logical_t: usize, physical_capacity_tokens: usize) StoreError!usize {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.inner.mapKVCacheTime(id, logical_t, physical_capacity_tokens);
+        const info = self.inner.kvCachePolicyInfo(id);
+        if (info.kind != .growable) return self.inner.mapKVCacheTime(id, logical_t, physical_capacity_tokens);
+
+        const before = try self.inner.meta(id);
+        const before_sig = GeometrySnapshot.init(before);
+        try self.flushAllDevDirty(id);
+        const mapped = try self.inner.mapKVCacheTime(id, logical_t, physical_capacity_tokens);
+        const after = try self.inner.meta(id);
+        if (!before_sig.eql(after)) try self.dropDeviceStatesForTensor(id);
+        return mapped;
     }
 
     fn prefetch(ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void {
@@ -297,6 +337,59 @@ pub const ResidentTensorStore = struct {
         var total: usize = 1;
         for (m.tile_counts) |c| total *= c;
         return total;
+    }
+
+    const GeometrySnapshot = struct {
+        dtype: @import("../../backend/types.zig").DType,
+        rank: u8,
+        shape: [tensor_store.INLINE_RANK]usize = @splat(0),
+        tile_shape: [tensor_store.INLINE_RANK]usize = @splat(0),
+        tile_counts: [tensor_store.INLINE_RANK]usize = @splat(0),
+        tile_strides: [tensor_store.INLINE_RANK]usize = @splat(0),
+
+        fn init(m: TensorMeta) GeometrySnapshot {
+            var out: GeometrySnapshot = .{ .dtype = m.dtype, .rank = m.rank };
+            const rank: usize = @as(usize, m.rank);
+            @memcpy(out.shape[0..rank], m.shape[0..rank]);
+            @memcpy(out.tile_shape[0..rank], m.tile_shape[0..rank]);
+            @memcpy(out.tile_counts[0..rank], m.tile_counts[0..rank]);
+            @memcpy(out.tile_strides[0..rank], m.tile_strides[0..rank]);
+            return out;
+        }
+
+        fn eql(self: GeometrySnapshot, m: TensorMeta) bool {
+            const rank: usize = @as(usize, self.rank);
+            if (self.rank != m.rank or self.dtype != m.dtype) return false;
+            if (!std.mem.eql(usize, self.shape[0..rank], m.shape)) return false;
+            if (!std.mem.eql(usize, self.tile_shape[0..rank], m.tile_shape)) return false;
+            if (!std.mem.eql(usize, self.tile_counts[0..rank], m.tile_counts)) return false;
+            if (!std.mem.eql(usize, self.tile_strides[0..rank], m.tile_strides)) return false;
+            return true;
+        }
+    };
+
+    fn flushAllDevDirty(self: *Self, id: TensorId) StoreError!void {
+        const n = try self.totalTiles(id);
+        var i: usize = 0;
+        while (i < n) : (i += 1) try self.flushIfDevDirty(id, i);
+    }
+
+    fn dropDeviceStatesForTensor(self: *Self, id: TensorId) StoreError!void {
+        var keys = std.ArrayList(u64).empty;
+        defer keys.deinit(self.allocator);
+
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            if ((e.key_ptr.* >> 32) == @as(u64, id)) {
+                keys.append(self.allocator, e.key_ptr.*) catch return StoreError.OutOfMemory;
+            }
+        }
+
+        for (keys.items) |k| {
+            if (self.states.fetchRemove(k)) |kv| {
+                if (kv.value.handle != 0) self.dev.free(kv.value.handle);
+            }
+        }
     }
 
     fn swapTensors(ctx: *anyopaque, a: TensorId, b: TensorId) StoreError!void {

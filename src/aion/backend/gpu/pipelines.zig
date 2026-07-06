@@ -5,8 +5,9 @@
 //! This is the GPU analogue of the CPU backend's kernel registry: a `KernelDesc`
 //! names a WGSL source blob (embedded at comptime), and `Pipelines` lazily builds
 //! and caches the GPU objects derived from it — one `WGPUShaderModule` per kernel,
-//! and a `{pipeline, bind-group-layout}` pair per entry point. Entry-point names
-//! are unique across all kernels, so they key the pipeline cache directly.
+//! and a `{pipeline, bind-group-layout}` pair per (kernel, entry point). Entry
+//! names may repeat across kernels (elementwise.wgsl and elementwise_i32.wgsl
+//! both export `add`), so the pipeline cache keys on the composite.
 //!
 //! Pipelines are created with an auto-derived layout; we cache
 //! `getBindGroupLayout(0)` alongside each pipeline so the layout is reflected
@@ -32,24 +33,27 @@ pub const Built = struct {
 
 pub const Pipelines = struct {
     gpu: *wgpu.Gpu,
+    allocator: std.mem.Allocator,
     modules: std.StringHashMap(c.WGPUShaderModule), // key: kernel name
-    entries: std.StringHashMap(Built), // key: entry-point name (globally unique)
+    entries: std.StringHashMap(Built), // key: "<kernel>\x00<entry>" (owned)
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu) Self {
         return .{
             .gpu = gpu,
+            .allocator = allocator,
             .modules = std.StringHashMap(c.WGPUShaderModule).init(allocator),
             .entries = std.StringHashMap(Built).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        var eit = self.entries.valueIterator();
-        while (eit.next()) |b| {
-            c.wgpuBindGroupLayoutRelease(b.bgl);
-            c.wgpuComputePipelineRelease(b.pipeline);
+        var eit = self.entries.iterator();
+        while (eit.next()) |e| {
+            c.wgpuBindGroupLayoutRelease(e.value_ptr.bgl);
+            c.wgpuComputePipelineRelease(e.value_ptr.pipeline);
+            self.allocator.free(e.key_ptr.*);
         }
         self.entries.deinit();
         var mit = self.modules.valueIterator();
@@ -72,7 +76,9 @@ pub const Pipelines = struct {
 
     /// Get-or-build the pipeline + bind-group layout for `entry` in `kernel`.
     pub fn get(self: *Self, kernel: KernelDesc, entry: [:0]const u8) error{ExecutionFailed}!Built {
-        if (self.entries.get(entry)) |b| return b;
+        var key_buf: [128]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ kernel.name, entry }) catch return error.ExecutionFailed;
+        if (self.entries.get(key)) |b| return b;
         const module = try self.moduleFor(kernel);
 
         var cpd: c.WGPUComputePipelineDescriptor = std.mem.zeroes(c.WGPUComputePipelineDescriptor);
@@ -86,7 +92,13 @@ pub const Pipelines = struct {
             return error.ExecutionFailed;
         };
         const built: Built = .{ .pipeline = pipeline, .bgl = bgl };
-        self.entries.put(entry, built) catch {
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            c.wgpuBindGroupLayoutRelease(bgl);
+            c.wgpuComputePipelineRelease(pipeline);
+            return error.ExecutionFailed;
+        };
+        self.entries.put(owned_key, built) catch {
+            self.allocator.free(owned_key);
             c.wgpuBindGroupLayoutRelease(bgl);
             c.wgpuComputePipelineRelease(pipeline);
             return error.ExecutionFailed;

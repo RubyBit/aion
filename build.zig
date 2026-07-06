@@ -54,14 +54,11 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    // Portable multi-ISA CPU kernels: when enabled (the default), the shipped
-    // library's main module is compiled at the x86_64_v3 floor (AVX2 + FMA) and
-    // per-ISA kernel objects (v3/v3_vnni/v4) are linked in, with runtime CPUID
-    // dispatch selecting among them. The benchmark exe also links the tier objects
-    // and dispatches, so it measures exactly the kernels the shipped library runs.
-    //
-    // The exported `aion` module used by examples (and external source consumers)
-    // stays at the native target with dispatch off, so it is unaffected.
+    // Portable multi-ISA CPU kernels: when enabled (the default), the public
+    // `aion` module and shipped library are compiled at the x86_64_v3 floor
+    // (AVX2 + FMA) and carry per-ISA kernel objects (v3/v3_vnni/v4). Runtime
+    // CPUID dispatch selects among them, and any Zig artifact that imports the
+    // module links the tier objects transitively.
     // Pass `-Dmultiversion=false` for a plain native library (fast dev iteration).
     const multiversion: bool = b.option(
         bool,
@@ -101,7 +98,7 @@ pub fn build(b: *std.Build) void {
     } else target;
 
     const linkage = b.option(
-        std.builtin.LinkMode, 
+        std.builtin.LinkMode,
         "linkage",
         "Library linkage: .static (default) or .dynamic",
     ) orelse .static;
@@ -121,58 +118,51 @@ pub fn build(b: *std.Build) void {
     // compiles the in-tree gpu code; `-Dgpu=false` excludes it entirely (no wgpu
     // fetch/link). Drives `build_options.enable_gpu`, read by root.zig.
     const want_gpu = b.option(bool, "gpu", "Build the WebGPU (wgpu-native) backend (default true; -Dgpu=false to skip)") orelse true;
-    // Resolve the prebuilt wgpu archive up front. Null when disabled, on an
+    // Resolve the prebuilt wgpu package up front. Null when disabled, on an
     // unsupported target, or on the lazy-fetch's first pass (build re-runs once
     // fetched). `enable_gpu` follows this so the in-tree gpu code is only enabled
-    // once its `wgpu` import is actually wired — never half-configured.
+    // once its `wgpu` import is actually wired - never half-configured.
     const wgpu_dep: ?WgpuDep = if (want_gpu) wgpuDependency(b, target) else null;
     const enable_gpu = wgpu_dep != null;
 
-    // Expose a public Zig module for consumers (and our examples). It stays at the
-    // user's target with dispatch off — multiversioning targets the shipped library
-    // artifact, not source consumers who compile for their own CPU.
+    // Expose a public Zig module for consumers (and our examples). With
+    // multiversioning enabled this is the same portable-dispatch module shape as
+    // the installed library: v3 floor on x86_64 plus transitive tier objects.
     // In a dependent package's build.zig:
     //   const aion_dep = b.dependency("aion", .{});
     //   exe.root_module.addImport("aion", aion_dep.module("aion"));
     const aion_mod = b.addModule("aion", .{
         .root_source_file = b.path("src/root.zig"),
-        .target = target,
+        .target = main_target,
         .optimize = optimize,
         .imports = &.{},
     });
-    // One shared `build_options` module instance for the native world (exported
-    // module + bench). Sharing the same instance (rather than addOptions on each)
-    // avoids two Options modules wrapping the same generated file when their values
-    // coincide — which Zig rejects ("file exists in two modules"). Examples/external
-    // consumers never use `aion_mod`'s root as their compilation root, so this value
-    // only actually drives dispatch for the bench exe (which links the tier objects).
-    const native_build_options = b.addOptions();
-    native_build_options.addOption(bool, "multiversion", want_multiversion);
-    native_build_options.addOption(bool, "enable_gpu", enable_gpu);
-    const native_build_options_mod = native_build_options.createModule();
-    aion_mod.addImport("build_options", native_build_options_mod);
+    const aion_build_options = b.addOptions();
+    aion_build_options.addOption(bool, "multiversion", want_multiversion);
+    aion_build_options.addOption(bool, "enable_gpu", enable_gpu);
+    aion_mod.addImport("build_options", aion_build_options.createModule());
 
-    // When the GPU feature is on, give the `aion` module the translate-c'd `wgpu`
-    // bindings so its (in-tree, feature-gated) gpu backend compiles. The wgpu
-    // import lives on the module; the library *link* is added per-artifact (only
-    // the gpu test references `aion.gpu`, so bench/examples/lib never pull wgpu).
+    // When the GPU feature is on, the `aion` module carries both the translate-c'd
+    // `wgpu` bindings and the native wgpu link inputs. Importers inherit those
+    // link inputs transitively; `-Dgpu=false` keeps consumers CPU-only.
     if (wgpu_dep) |wd| {
         const translate = b.addTranslateC(.{
             .root_source_file = wd.dep.path("include/webgpu/wgpu.h"),
-            .target = target,
+            .target = main_target,
             .optimize = optimize,
         });
         translate.addIncludePath(wd.dep.path("include/webgpu"));
         aion_mod.addImport("wgpu", translate.createModule());
+        wd.link(aion_mod);
     }
 
     // Portable multiversioning: compile `kernels_export.zig` once per ISA tier.
     // Each object is built at its own CPU model/feature set, so its `@Vector`
     // kernels lower to that ISA (e.g. the v4 object emits real AVX-512). The
     // objects share no global symbols except their uniquely-named accessor, so the
-    // per-tier kernel copies don't collide. Built once and shared by the shipped
-    // library and the benchmark exe.
-    var tier_objs: [3]*std.Build.Step.Compile = undefined;  
+    // per-tier kernel copies don't collide. Built once and attached to the public
+    // module plus the shipped C/FFI library.
+    var tier_objs: [3]*std.Build.Step.Compile = undefined;
     var n_tiers: usize = 0;
 
     // Builds one tier object from `tier_kernels_root.zig` at `tier_target`, with
@@ -248,6 +238,8 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    for (tier_objs[0..n_tiers]) |o| aion_mod.addObject(o);
+
     // Shipped library: main module floored to x86_64_v3, dispatch on, tier
     // objects linked. This is the artifact installed to `zig-out/lib`.
     const lib_mod = b.createModule(.{
@@ -303,10 +295,13 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     const test_step = b.step("test", "Run tests");
+    const test_build_options = b.addOptions();
+    test_build_options.addOption(bool, "multiversion", false);
+    test_build_options.addOption(bool, "enable_gpu", false);
+
     const run_lib_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "test",
-        "src/tests.zig",
         "--cache-dir",
         ".zig-cache",
         optimizeArg(optimize),
@@ -319,6 +314,7 @@ pub fn build(b: *std.Build) void {
         });
     }
     if (b.args) |args| run_lib_tests.addArgs(args);
+    addRawTestModules(b, run_lib_tests, test_build_options);
     if (skip_thread_pool_tests) run_lib_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
     test_step.dependOn(&run_lib_tests.step);
 
@@ -326,7 +322,6 @@ pub fn build(b: *std.Build) void {
     const run_fast_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "test",
-        "src/tests.zig",
         "--cache-dir",
         ".zig-cache",
         optimizeArg(optimize),
@@ -339,6 +334,7 @@ pub fn build(b: *std.Build) void {
         });
     }
     if (b.args) |args| run_fast_tests.addArgs(args);
+    addRawTestModules(b, run_fast_tests, test_build_options);
     run_fast_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
     test_fast_step.dependOn(&run_fast_tests.step);
 
@@ -346,27 +342,33 @@ pub fn build(b: *std.Build) void {
     // Benchmarks.
     // Run with: zig build bench -Doptimize=ReleaseFast -- [bench args]
     // ---------------------------------------------------------------------
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
+    // Shared benchmark core (op list + unified reporter), imported by both the
+    // CPU `bench` and the GPU `gpu-bench` so their ops and output stay in parity.
+    const bench_kernels_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_kernels.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "aion", .module = aion_mod },
         },
     });
-    // `src/bench.zig` sets `aion_multiversion` from this, so the CPU backend
-    // (which reads `@import("root")`) dispatches to the linked tier objects —
-    // i.e. the benchmark measures the same kernels the shipped library runs.
-    // Reuses the shared instance to avoid the duplicate-options-file conflict.
-    bench_mod.addImport("build_options", native_build_options_mod);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aion", .module = aion_mod },
+            .{ .name = "bench_kernels", .module = bench_kernels_mod },
+        },
+    });
 
     const bench_exe = b.addExecutable(.{
         .name = "aion-bench",
         .root_module = bench_mod,
     });
-    for (tier_objs[0..n_tiers]) |o| bench_exe.root_module.addObject(o);
-
     const run_bench = b.addRunArtifact(bench_exe);
+    if (wgpu_dep) |wd| wd.prepareRun(b, run_bench);
     if (b.args) |args| run_bench.addArgs(args);
 
     const bench_step = b.step("bench", "Run microbenchmarks");
@@ -386,13 +388,22 @@ pub fn build(b: *std.Build) void {
         const gpu_test_step = b.step("gpu-test", "Build and run the GPU backend test");
         gpu_test_step.dependOn(&gpu_run.step);
 
-        // Fold the GPU test into the default test suites.
+        // API-level device-selection test (Context.gpus / compileOn(.gpu) / .to()).
+        // Must live in its own artifact against `aion_mod` (enable_gpu=true); the raw
+        // `test`/`test-fast` runner compiles `test_api.zig` with enable_gpu=false, so
+        // the GPU path would be comptime-pruned there.
+        const api_gpu_run = addApiGpuTest(b, target, optimize, aion_mod, wd, gpu_check);
+        gpu_test_step.dependOn(&api_gpu_run.step);
+
+        // Fold the GPU tests into the default test suites.
         test_step.dependOn(&gpu_run.step);
         test_fast_step.dependOn(&gpu_run.step);
+        test_step.dependOn(&api_gpu_run.step);
+        test_fast_step.dependOn(&api_gpu_run.step);
 
-        // CPU-vs-GPU benchmark (separate artifact; keeps `bench` wgpu-free).
+        // CPU-vs-GPU benchmark (separate artifact for GPU-specific workloads).
         //   zig build gpu-bench -Doptimize=ReleaseFast -- --m 1024 --n 1024 --k 1024
-        const gpu_bench_run = addGpuBench(b, target, optimize, aion_mod, wd, gpu_check);
+        const gpu_bench_run = addGpuBench(b, target, optimize, aion_mod, bench_kernels_mod, wd, gpu_check);
         if (b.args) |args| gpu_bench_run.addArgs(args);
         const gpu_bench_step = b.step("gpu-bench", "Build and run the CPU-vs-GPU benchmark");
         gpu_bench_step.dependOn(&gpu_bench_run.step);
@@ -442,12 +453,13 @@ pub fn build(b: *std.Build) void {
                 .name = b.fmt("aion-example-{s}", .{stem}),
                 .root_module = ex_mod,
             });
-
             const run_ex = b.addRunArtifact(ex_exe);
+            if (wgpu_dep) |wd| wd.prepareRun(b, run_ex);
             if (b.args) |args| run_ex.addArgs(args);
             examples_step.dependOn(&run_ex.step);
 
             const run_ex_bench = b.addRunArtifact(ex_exe);
+            if (wgpu_dep) |wd| wd.prepareRun(b, run_ex_bench);
             run_ex_bench.addArgs(&.{ "--bench-iters", "10" });
             if (b.args) |args| run_ex_bench.addArgs(args);
             bench_examples_step.dependOn(&run_ex_bench.step);
@@ -470,60 +482,59 @@ pub fn build(b: *std.Build) void {
 const WgpuDep = struct {
     dep: *std.Build.Dependency,
     os: std.Target.Os.Tag,
+
+    fn link(self: WgpuDep, mod: *std.Build.Module) void {
+        mod.addLibraryPath(self.dep.path("lib"));
+        switch (self.os) {
+            .windows => mod.addObjectFile(self.dep.path("lib/wgpu_native.dll.lib")),
+            else => {
+                mod.linkSystemLibrary("wgpu_native", .{ .use_pkg_config = .no });
+                mod.addRPath(self.dep.path("lib"));
+            },
+        }
+    }
+
+    fn prepareRun(self: WgpuDep, b: *std.Build, run: *std.Build.Step.Run) void {
+        if (self.os == .windows) {
+            run.addPathDir(self.dep.path("lib").getPath(b));
+        }
+    }
 };
 
-/// Dependency name for the prebuilt wgpu-native archive matching `t`, or null
-/// for an unsupported target triple. Written with independent `return`s (rather
-/// than an `if (cond) "lit" else null` expression) so each value coerces to
-/// `?[]const u8` on its own — avoids a pointer-vs-optional peer-type resolution
-/// that crashes some zls versions during inlay-hint analysis.
-fn wgpuDepName(t: std.Target) ?[]const u8 {
-    switch (t.os.tag) {
-        .windows => if (t.cpu.arch == .x86_64) return "wgpu_windows_x86_64",
-        .linux => if (t.cpu.arch == .x86_64) return "wgpu_linux_x86_64",
-        .macos => switch (t.cpu.arch) {
-            .aarch64 => return "wgpu_macos_aarch64",
-            .x86_64 => return "wgpu_macos_x86_64",
-            else => {},
-        },
-        else => {},
-    }
-    return null;
-}
-
-/// Select the prebuilt wgpu-native archive matching the build target. Lazy:
+/// Select the prebuilt wgpu-native package matching the build target. Lazy:
 /// returns null (triggering a fetch + build re-run) the first time, and null
 /// for unsupported target triples (with a helpful message).
 fn wgpuDependency(b: *std.Build, target: std.Build.ResolvedTarget) ?WgpuDep {
     const t = target.result;
-    const n = wgpuDepName(t) orelse {
+    const name: ?[]const u8 = switch (t.os.tag) {
+        .windows => if (t.cpu.arch == .x86_64) "wgpu_windows_x86_64" else null,
+        .linux => if (t.cpu.arch == .x86_64) "wgpu_linux_x86_64" else null,
+        .macos => switch (t.cpu.arch) {
+            .aarch64 => "wgpu_macos_aarch64",
+            .x86_64 => "wgpu_macos_x86_64",
+            else => null,
+        },
+        else => null,
+    };
+    const dep_name = name orelse {
         std.debug.print("gpu: no prebuilt wgpu-native for {s}-{s}\n", .{ @tagName(t.cpu.arch), @tagName(t.os.tag) });
         return null;
     };
-    const dep = b.lazyDependency(n, .{}) orelse return null;
+    const dep = b.lazyDependency(dep_name, .{}) orelse return null;
     return .{ .dep = dep, .os = t.os.tag };
 }
 
-/// Link the prebuilt wgpu-native library into a GPU artifact's module and make its
-/// run step able to find the shared lib. Shared by the gpu test + gpu bench (both
-/// reference `aion.gpu`, so their compilation pulls the gpu code and must link wgpu).
-fn linkWgpu(b: *std.Build, mod: *std.Build.Module, run: *std.Build.Step.Run, wd: WgpuDep) void {
-    mod.addLibraryPath(wd.dep.path("lib"));
-    switch (wd.os) {
-        .windows => {
-            mod.addObjectFile(wd.dep.path("lib/wgpu_native.dll.lib"));
-            run.addPathDir(wd.dep.path("lib").getPath(b));
-        },
-        else => {
-            mod.linkSystemLibrary("wgpu_native", .{});
-            mod.addRPath(wd.dep.path("lib"));
-        },
-    }
+/// Keep the raw `zig test` runner workaround, but provide the generated options
+/// module that `cpu_backend.zig` imports directly.
+fn addRawTestModules(b: *std.Build, run: *std.Build.Step.Run, options: *std.Build.Step.Options) void {
+    run.addArgs(&.{ "--dep", "build_options" });
+    run.addPrefixedFileArg("-Mroot=", b.path("src/tests.zig"));
+    run.addPrefixedFileArg("-Mbuild_options=", options.getOutput());
 }
 
 /// The CPU-vs-GPU correctness test artifact. Its module imports the `aion` module
-/// (whose in-tree gpu backend already has the `wgpu` bindings); the test references
-/// `aion.gpu`, so its compilation pulls the gpu code and must link the wgpu library.
+/// (whose in-tree gpu backend already has the `wgpu` bindings and native link
+/// inputs); the test references `aion.gpu`, so its compilation pulls the gpu code.
 /// `check_step` gets a compile-only dependency for zls build-on-save; the returned
 /// run step is wired into `gpu-test` and the default test suites.
 fn addGpuTest(
@@ -544,20 +555,48 @@ fn addGpuTest(
 
     const gpu_test = b.addTest(.{ .name = "aion-gpu-test", .root_module = test_mod });
     const run = b.addRunArtifact(gpu_test);
-    linkWgpu(b, test_mod, run, wd);
+    wd.prepareRun(b, run);
 
     check_step.dependOn(&gpu_test.step); // compile-only, for zls build-on-save
     return run;
 }
 
+/// The API-level GPU device-selection test artifact. Imports `aion` (enable_gpu=true)
+/// and drives the public `Context` device API (`.gpus`, `compileOn(.gpu)`, `.to()`).
+/// Skips at runtime when no adapter is present.
+fn addApiGpuTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    aion_mod: *std.Build.Module,
+    wd: WgpuDep,
+    check_step: *std.Build.Step,
+) *std.Build.Step.Run {
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/aion/api/test_api_gpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.addImport("aion", aion_mod);
+
+    const api_gpu_test = b.addTest(.{ .name = "aion-api-gpu-test", .root_module = test_mod });
+    const run = b.addRunArtifact(api_gpu_test);
+    wd.prepareRun(b, run);
+
+    check_step.dependOn(&api_gpu_test.step); // compile-only, for zls build-on-save
+    return run;
+}
+
 /// The CPU-vs-GPU benchmark exe (`zig build gpu-bench`). Like the test, it imports
-/// `aion` and links wgpu; kept separate from the main `bench` exe so a plain
-/// `zig build bench` never pulls wgpu.
+/// `aion` and gets wgpu transitively from that module; kept separate from the main
+/// `bench` exe because it runs GPU-specific workloads.
 fn addGpuBench(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     aion_mod: *std.Build.Module,
+    bench_kernels_mod: *std.Build.Module,
     wd: WgpuDep,
     check_step: *std.Build.Step,
 ) *std.Build.Step.Run {
@@ -568,10 +607,11 @@ fn addGpuBench(
         .link_libc = true,
     });
     bench_mod.addImport("aion", aion_mod);
+    bench_mod.addImport("bench_kernels", bench_kernels_mod);
 
     const bench = b.addExecutable(.{ .name = "aion-gpu-bench", .root_module = bench_mod });
     const run = b.addRunArtifact(bench);
-    linkWgpu(b, bench_mod, run, wd);
+    wd.prepareRun(b, run);
 
     check_step.dependOn(&bench.step); // compile-only, for zls build-on-save
     return run;

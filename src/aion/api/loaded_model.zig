@@ -54,6 +54,10 @@ pub const Model = struct {
     allocator: std.mem.Allocator,
     backend: backend_mod.Backend,
     store: *StorageManager,
+    /// Execution session bound to `store`. Owns the backend's per-store state
+    /// (device residency on GPU) for this model's lifetime, so weights stay
+    /// device-resident across `run` calls. Released in `deinit`.
+    session: backend_mod.Session,
     policy: TilePolicy,
     /// Where concrete graphs are instantiated from (loaded package vs compiled graph).
     source: GraphSource,
@@ -123,6 +127,9 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Release device residency first — device buffers free through the still-alive
+        // backend/device (Context must outlive its models; see Context.deinit ordering).
+        self.session.deinit();
         for (self.cache_entries.items) |*entry| {
             entry.program.deinit();
             self.allocator.free(entry.symbol_values);
@@ -447,9 +454,9 @@ pub const Model = struct {
             std.debug.print("[aion][run] executing\n", .{});
         }
 
-        self.backend.executeProgram(&entry.program, self.store.tensorStore()) catch |e| {
+        self.session.execute(&entry.program) catch |e| {
             if (trace) {
-                std.debug.print("[aion][run] backend.executeProgram failed: {s}\n", .{@errorName(e)});
+                std.debug.print("[aion][run] session.execute failed: {s}\n", .{@errorName(e)});
             }
             return e;
         };
@@ -653,10 +660,16 @@ pub const Model = struct {
         const run_direct_input_ids = try allocator.alloc(TensorId, input_signatures.len);
         errdefer allocator.free(run_direct_input_ids);
 
+        // Bind an execution session to the store now. Per-model lifetime: device
+        // residency persists across `run` calls and is torn down in `deinit`.
+        const session = try backend.createSession(store.tensorStore());
+        errdefer session.deinit();
+
         return .{
             .allocator = allocator,
             .backend = backend,
             .store = store,
+            .session = session,
             .policy = policy,
             .source = source,
             .initializer_tids = initializer_tids,

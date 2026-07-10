@@ -71,6 +71,34 @@ typedef enum AionDType {
   AION_DTYPE_I32 = 5,
 } AionDType;
 
+// Device selector. A tensor/model lives on exactly one device at a time.
+// For CPU, `index` is ignored; for GPU it names the registered GPU.
+typedef enum AionDeviceKind {
+    AION_DEVICE_CPU = 0,
+    AION_DEVICE_GPU = 1,
+} AionDeviceKind;
+
+typedef enum AionGpuPower {
+    AION_GPU_POWER_DEFAULT = 0,
+    AION_GPU_POWER_LOW = 1,
+    AION_GPU_POWER_HIGH = 2,
+} AionGpuPower;
+
+typedef enum AionGpuBackend {
+    AION_GPU_BACKEND_ANY = 0,
+    AION_GPU_BACKEND_VULKAN = 1,
+    AION_GPU_BACKEND_D3D12 = 2,
+    AION_GPU_BACKEND_METAL = 3,
+    AION_GPU_BACKEND_GL = 4,
+} AionGpuBackend;
+
+// Per-GPU creation options. `adapter_index < 0` means auto (no explicit adapter).
+typedef struct AionGpuOptions {
+    AionGpuPower power;
+    AionGpuBackend backend;
+    int32_t adapter_index;
+} AionGpuOptions;
+
 // -----------------------------------------------------------------------------
 // Version / diagnostics
 // -----------------------------------------------------------------------------
@@ -96,6 +124,20 @@ AION_API AionStatus aion_context_last_error_message(
 // -----------------------------------------------------------------------------
 
 AION_API AionStatus aion_context_create_cpu(size_t thread_count, AionContext** out_ctx);
+
+// Create a context, optionally registering GPUs.
+//
+// - `gpus` points to `gpu_count` option structs (may be NULL when `gpu_count == 0`).
+//   `gpus[i]` becomes the device selected by `(AION_DEVICE_GPU, i)`.
+// - On a CPU-only build (compiled without `-Dgpu`), a non-zero `gpu_count`
+//   returns AION_UNSUPPORTED.
+// - At most 16 GPUs may be registered per call.
+AION_API AionStatus aion_context_create(
+    size_t thread_count,
+    const AionGpuOptions* gpus,
+    size_t gpu_count,
+    AionContext** out_ctx);
+
 AION_API void aion_context_destroy(AionContext* ctx);
 
 // -----------------------------------------------------------------------------
@@ -143,6 +185,16 @@ AION_API AionStatus aion_tensor_create(
 
 AION_API void aion_tensor_destroy(AionTensor* t);
 
+// Migrate a tensor to `(kind, index)` (move semantics: the source-device copy
+// is freed). After moving off the CPU, host read/write fail until the tensor is
+// migrated back with `aion_tensor_to(t, AION_DEVICE_CPU, 0)`. Idempotent when
+// already on the target device.
+AION_API AionStatus aion_tensor_to(AionTensor* t, AionDeviceKind kind, uint32_t index);
+
+// Report the device a tensor is currently resident on. Either out-pointer may
+// be NULL if that field is not needed.
+AION_API AionStatus aion_tensor_device(const AionTensor* t, AionDeviceKind* out_kind, uint32_t* out_index);
+
 AION_API AionDType aion_tensor_dtype(const AionTensor* t);
 AION_API size_t aion_tensor_rank(const AionTensor* t);
 AION_API AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, size_t out_rank);
@@ -180,6 +232,13 @@ AION_API AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype
 
 AION_API AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, AionLoadedModel** out_model);
 AION_API AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, AionLoadedModel** out_model);
+
+// Like the loaders above, but place the model on `(kind, index)`. The model's
+// backend and tile policy follow the device; bound CPU inputs are auto-migrated
+// on run and outputs are flushed back to host for reading.
+AION_API AionStatus aion_loaded_model_load_path_on(AionContext* ctx, const char* path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
+AION_API AionStatus aion_loaded_model_load_path_absolute_on(AionContext* ctx, const char* absolute_path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
+
 AION_API void aion_loaded_model_destroy(AionLoadedModel* m);
 
 AION_API size_t aion_loaded_model_input_count(const AionLoadedModel* m);

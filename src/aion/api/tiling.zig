@@ -85,7 +85,7 @@ pub fn chooseTileShapeForTensor(
         out[rank - 2] = tiles[0];
         out[rank - 1] = tiles[1];
     } else if (is_quant and rank == 2 and quant_axis == 1) {
-        const tiles = chooseQuantEmbeddingTableTiles(policy, shape[0], shape[1]);
+        const tiles = chooseQuantEmbeddingTableTiles(policy, dtype, shape[0], shape[1]);
         out[0] = tiles[0];
         out[1] = tiles[1];
     } else {
@@ -110,7 +110,20 @@ pub fn chooseQuantMatMulBTiles(policy: plan_mod.TilePolicy, k: usize, n: usize, 
 /// Returns `[tv, td]` such that `td == D` and `tv` is a conservative row-count per tile.
 /// Keeping `td == D` means each row of the table is exactly one contiguous run of
 /// `D / block_elems` blocks inside a tile — the layout a row-gather kernel wants.
-pub fn chooseQuantEmbeddingTableTiles(policy: plan_mod.TilePolicy, v: usize, d: usize) [2]usize {
-    const tv: usize = @max(@as(usize, 1), @min(v, policy.base_1d));
+pub fn chooseQuantEmbeddingTableTiles(policy: plan_mod.TilePolicy, dtype: types.DType, v: usize, d: usize) [2]usize {
+    var tv: usize = @max(@as(usize, 1), @min(v, policy.base_1d));
+    // Keep whole rows (dim1 = d) but cap the row count so a single tile fits the
+    // device binding limit. A multi-GB quantized vocab table is split along v; the
+    // gather op then resolves the right tile per row.
+    if (policy.max_binding_bytes > 0) {
+        const info = dtype.info();
+        const per_row: usize = (d / info.block_elems) * info.block_bytes;
+        if (per_row > 0) {
+            // 3/4 margin leaves headroom for allocation rounding / other limits.
+            const budget: usize = policy.max_binding_bytes / 4 * 3;
+            const cap_rows: usize = @max(@as(usize, 1), budget / per_row);
+            tv = @min(tv, cap_rows);
+        }
+    }
     return .{ tv, d };
 }

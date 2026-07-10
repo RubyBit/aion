@@ -125,6 +125,21 @@ pub fn build(b: *std.Build) void {
     const wgpu_dep: ?WgpuDep = if (want_gpu) wgpuDependency(b, target) else null;
     const enable_gpu = wgpu_dep != null;
 
+    // Target used to translate `wgpu.h`. MSVC's <stdint.h> uses non-standard
+    // integer suffixes (e.g. `4294967295ui32`) that Zig's translate-c rejects, so
+    // when building for -windows-msvc we translate against the GNU libc headers
+    // instead. wgpu's public types are all fixed-width, so the generated bindings
+    // are ABI-identical to what MSVC would produce; only the header parse differs.
+    const wgpu_tc_target: std.Build.ResolvedTarget = blk: {
+        const t = main_target.result;
+        if (t.os.tag == .windows and t.abi == .msvc) {
+            var q = main_target.query;
+            q.abi = .gnu;
+            break :blk b.resolveTargetQuery(q);
+        }
+        break :blk main_target;
+    };
+
     // Expose a public Zig module for consumers (and our examples). With
     // multiversioning enabled this is the same portable-dispatch module shape as
     // the installed library: v3 floor on x86_64 plus transitive tier objects.
@@ -148,7 +163,7 @@ pub fn build(b: *std.Build) void {
     if (wgpu_dep) |wd| {
         const translate = b.addTranslateC(.{
             .root_source_file = wd.dep.path("include/webgpu/wgpu.h"),
-            .target = main_target,
+            .target = wgpu_tc_target,
             .optimize = optimize,
         });
         translate.addIncludePath(wd.dep.path("include/webgpu"));
@@ -250,10 +265,23 @@ pub fn build(b: *std.Build) void {
     {
         const bo = b.addOptions();
         bo.addOption(bool, "multiversion", want_multiversion);
-        // The shipped C-ABI library stays CPU-only (no wgpu); the GPU backend is
-        // for Zig consumers via the `aion` module.
-        bo.addOption(bool, "enable_gpu", false);
+        // The C-ABI library follows the GPU feature flag so C/FFI consumers (the
+        // Python bindings) can create GPU devices when built with `-Dgpu`. The
+        // static archive only needs the `wgpu` *import* to compile; wgpu symbols
+        // stay undefined and are resolved at the consumer's final link (e.g. the
+        // Python extension adds `wgpu_native.dll.lib`). So we import wgpu below
+        // but do NOT `wd.link(lib_mod)` (you can't link into a static archive).
+        bo.addOption(bool, "enable_gpu", enable_gpu);
         lib_mod.addOptions("build_options", bo);
+    }
+    if (wgpu_dep) |wd| {
+        const translate_lib = b.addTranslateC(.{
+            .root_source_file = wd.dep.path("include/webgpu/wgpu.h"),
+            .target = wgpu_tc_target,
+            .optimize = optimize,
+        });
+        translate_lib.addIncludePath(wd.dep.path("include/webgpu"));
+        lib_mod.addImport("wgpu", translate_lib.createModule());
     }
 
     const lib = b.addLibrary(.{
@@ -282,6 +310,20 @@ pub fn build(b: *std.Build) void {
     // Install public C header for FFI consumers.
     const install_header = b.addInstallFile(b.path("include/aion.h"), "include/aion.h");
     b.getInstallStep().dependOn(&install_header.step);
+
+    // When the GPU backend is linked, a consumer that *statically* links `aion`
+    // (e.g. the Python cffi extension) must resolve the wgpu symbols at its own
+    // final link and load `wgpu_native.dll` at runtime. Install both so the
+    // downstream build can find them in the prefix. On Windows the import lib +
+    // DLL both live in the dep's `lib/` (see `WgpuDep.prepareRun`).
+    if (wgpu_dep) |wd| {
+        if (target.result.os.tag == .windows) {
+            const inst_implib = b.addInstallLibFile(wd.dep.path("lib/wgpu_native.dll.lib"), "wgpu_native.dll.lib");
+            b.getInstallStep().dependOn(&inst_implib.step);
+            const inst_dll = b.addInstallBinFile(wd.dep.path("lib/wgpu_native.dll"), "wgpu_native.dll");
+            b.getInstallStep().dependOn(&inst_dll.step);
+        }
+    }
 
     // Unit tests.
     // On this Zig snapshot, running the test artifact through Build's special

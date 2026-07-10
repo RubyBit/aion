@@ -26,8 +26,18 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.26"]
+# GPU is a source-build feature toggle, not a runtime dependency: this marker
+# signals intent, but the wgpu-native backend is only linked when the extension
+# is (re)built with AION_PY_GPU=1. See README ("GPU support").
+gpu = []
+
+# PEP 735 dependency groups: local dev/test environments, not package extras.
+# `uv sync` installs the `dev` group by default; use `--group test` for just the
+# test deps, or `--no-default-groups` for a runtime-only environment.
+[dependency-groups]
 test = ["pytest>=9"]
 dev = [
+  "tokenizers>=0.23.1",
   "pytest>=9",
   "numpy>=1.26",
   "torch>=2.2",
@@ -36,6 +46,14 @@ dev = [
   "soundfile>=0.12",
   "sounddevice>=0.4",  # microphone capture for the mic example
 ]
+
+# Persistent native-build switches for these bindings (read by tools/build_zig.py).
+# `gpu = true` links the wgpu-native GPU backend into the extension. Under uv the
+# build cache is env-blind, so this pyproject switch — not just `AION_PY_GPU` — is
+# what reliably (re)builds with GPU. The `AION_PY_GPU` env var still overrides
+# (set `0` to force CPU-only, e.g. for portable CPU wheels).
+[tool.aion]
+gpu = true
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -49,5 +67,6 @@ version = {attr = "aion.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Native artifact(s) and typing/stub metadata.
-aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "_ffi/*.h"]
+# Native artifact(s) and typing/stub metadata. `*.dll` covers the wgpu runtime
+# shipped beside the extension in GPU builds.
+aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "*.dll", "_ffi/*.h"]

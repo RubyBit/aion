@@ -353,6 +353,41 @@ test "gpu backend: layernorm matches CPU" {
     try expectGpuMatchesCpu(buildLayerNorm, RW_M * RW_N, 1e-4);
 }
 
+// The RNNT decoder's state gate (`sel_row`): keep + (take-keep)*emit, done via
+// reshape [1,H]->[H,1], bcast_mul by scalar emit [1], reshape back, add. This is
+// the exact op chain the in-graph loop runs every iteration for h0/c0/h1/c1.
+// `emit` (0 or 1) is baked into the b input's data seed.
+fn buildSelRow(alloc: std.mem.Allocator, mgr: *StorageManager, emit: f32) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const H: usize = 640;
+    const keep = try makeInput(&g, mgr, &.{ 1, H }, &.{ 1, H }, 40);
+    const take = try makeInput(&g, mgr, &.{ 1, H }, &.{ 1, H }, 41);
+    const emit_id = try mgr.createTiledTensor(.f32, &.{1}, &.{1}, .{});
+    try mgr.writeFromPackedScalar(emit_id, std.mem.sliceAsBytes(&[_]f32{emit}));
+    const emit_f = try g.addInput(.f32, &.{1});
+    try g.bindExternal(emit_f, emit_id);
+
+    const diff = try g.addElemwiseBinary(.sub, take, keep); // [1,H]
+    const diff_c = try g.addViewReshape(diff, &.{ H, 1 }); // [H,1]
+    const scaled_c = try g.addBroadcastLastDimBinary(.mul, diff_c, emit_f); // [H,1]
+    const scaled = try g.addViewReshape(scaled_c, &.{ 1, H }); // [1,H]
+    const out = try g.addElemwiseBinary(.add, keep, scaled); // [1,H]
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+fn buildSelRowEmit(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildSelRow(alloc, mgr, 1.0);
+}
+fn buildSelRowKeep(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildSelRow(alloc, mgr, 0.0);
+}
+test "gpu backend: sel_row state gate (emit=1) matches CPU" {
+    try expectGpuMatchesCpu(buildSelRowEmit, 640, 1e-5);
+}
+test "gpu backend: sel_row state gate (emit=0) matches CPU" {
+    try expectGpuMatchesCpu(buildSelRowKeep, 640, 1e-5);
+}
+
 fn buildBroadcast(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
@@ -495,6 +530,127 @@ test "gpu backend: matmul NT f32 GEMM (M=16, multi-N-tile) matches CPU" {
     try expectGpuMatchesCpu(buildNtF32Gemm, 16 * 50, 1e-4);
 }
 
+// ---- MatMul (plain, K-major q8_0 B) — the Gemma decode GEMV -----------------
+
+/// Pack f32 [k, n] (row-major) into ggml q8_0 blocks quantized ALONG K: block
+/// grid [k/32, n], row-major, block (bk, col) holds B[bk*32 .. +31, col]. This
+/// is the layout `matmul_gemv.wgsl` / `q8_kmajor_to_f32` consume.
+fn packQ8Kmajor(alloc: std.mem.Allocator, vals: []const f32, k: usize, n: usize) ![]u8 {
+    const bpr = k / 32;
+    const out = try alloc.alloc(u8, bpr * n * 34);
+    for (0..bpr) |bk| {
+        for (0..n) |col| {
+            var absmax: f32 = 0;
+            for (0..32) |kk| absmax = @max(absmax, @abs(vals[(bk * 32 + kk) * n + col]));
+            const scale: f32 = if (absmax == 0) 1.0 else absmax / 127.0;
+            const inv: f32 = if (absmax == 0) 0 else 1.0 / scale;
+            const off = (bk * n + col) * 34;
+            std.mem.writeInt(u16, out[off..][0..2], @bitCast(@as(f16, @floatCast(scale))), .little);
+            for (0..32) |kk| {
+                const v = vals[(bk * 32 + kk) * n + col];
+                const q: i32 = std.math.clamp(@as(i32, @intFromFloat(@round(v * inv))), -128, 127);
+                out[off + 2 + kk] = @bitCast(@as(i8, @intCast(q)));
+            }
+        }
+    }
+    return out;
+}
+
+// The fused GEMV computes `f32 activation · dequant(B)` — the exact same thing
+// the (production-validated) dequant→GEMM path does. We validate it against a
+// host-computed dequant reference rather than the CPU backend: for these small
+// test shapes the CPU routes M==1 through an int8-GEMM that quantizes the
+// activation too (a *different*, lossier algorithm), so a CPU cross-check would
+// compare apples to oranges. On real Gemma shapes the CPU uses the f32-A path.
+fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !void {
+    var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    const a = try alloc.alloc(f32, k);
+    defer alloc.free(a);
+    for (a, 0..) |*v, i| {
+        const kk: u32 = @intCast((i * 2654435761 + 20) % 1000);
+        v.* = (@as(f32, @floatFromInt(kk)) - 500.0) * 0.004;
+    }
+    const b = try alloc.alloc(f32, k * n);
+    defer alloc.free(b);
+    for (b, 0..) |*v, i| {
+        const p: u32 = @intCast((i * 2654435761 + 21) % 1000);
+        v.* = (@as(f32, @floatFromInt(p)) - 500.0) * 0.004;
+    }
+    const packed_b = try packQ8Kmajor(alloc, b, k, n);
+    defer alloc.free(packed_b);
+
+    // Host reference: f32 A · dequant(B), per output column.
+    const ref = try alloc.alloc(f32, n);
+    defer alloc.free(ref);
+    for (0..n) |col| {
+        var acc: f32 = 0;
+        for (0..k / 32) |bk| {
+            const off = (bk * n + col) * 34;
+            const scale: f32 = @as(f16, @bitCast(std.mem.readInt(u16, packed_b[off..][0..2], .little)));
+            for (0..32) |kk| {
+                const q: i8 = @bitCast(packed_b[off + 2 + kk]);
+                acc += a[bk * 32 + kk] * (@as(f32, @floatFromInt(q)) * scale);
+            }
+        }
+        ref[col] = acc;
+    }
+
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const a_id = try mgr.createTiledTensor(.f32, &.{ 1, k }, &.{ 1, k }, .{});
+    try mgr.writeFromPackedScalar(a_id, std.mem.sliceAsBytes(a));
+    const av = try g.addInput(.f32, &.{ 1, k });
+    try g.bindExternal(av, a_id);
+    const b_id = try mgr.createTiledTensor(.q8_0, &.{ k, n }, &.{ k, n }, .{ .tile_alignment = 64, .quant_axis = 0 });
+    try mgr.writeFromPackedQuant(b_id, packed_b);
+    const bv = try g.addInput(.q8_0, &.{ k, n });
+    try g.bindExternal(bv, b_id);
+    const cv = try g.addMatMul(av, bv, 1.0, 0.0);
+    var built = try finishProgGpuTiled(alloc, &g, &mgr, cv);
+    defer built.prog.deinit();
+
+    try gb.backend().executeProgram(&built.prog, mgr.tensorStore());
+    const out = try alloc.alloc(f32, n);
+    defer alloc.free(out);
+    try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(out));
+
+    for (ref, out, 0..) |r, o, i| {
+        std.testing.expectApproxEqAbs(r, o, tol) catch |e| {
+            std.debug.print("q8 gemv mismatch at [{d}]: ref={d} gpu={d}\n", .{ i, r, o });
+            return e;
+        };
+    }
+}
+
+// K = 256 (8 blocks = one partial 16-block chunk), N = 128 (64 column pairs).
+test "gpu backend: matmul q8_0 (K-major) matvec (M=1)" {
+    try expectQ8KMajorGemv(std.testing.allocator, 256, 128, 1e-3);
+}
+
+// K = 1024 spans multiple 16-block chunks (32 block-rows / 16 = 2 chunks) to
+// exercise the shared-A chunk loop and its tail.
+test "gpu backend: matmul q8_0 (K-major) matvec (M=1, multi-chunk K)" {
+    try expectQ8KMajorGemv(std.testing.allocator, 1024, 128, 2e-3);
+}
+
+// Odd N exercises the per-column `gemv_q8_kmajor_odd` path (mixed block
+// alignment); N=65 → columns straddle both parities.
+test "gpu backend: matmul q8_0 (K-major) matvec (M=1, odd N)" {
+    try expectQ8KMajorGemv(std.testing.allocator, 256, 65, 2e-3);
+}
+
+// The RNNT joint's vocab+blank projection shape (K=640, N=1025) — the blank is
+// the last (odd) column, so a subtle odd-path bug would bias emit-vs-blank.
+test "gpu backend: matmul q8_0 (K-major) matvec (M=1, RNNT joint shape)" {
+    try expectQ8KMajorGemv(std.testing.allocator, 640, 1025, 2e-3);
+}
+
 // ---- decode ops: gather / rope / kv-append -----------------------------------
 
 fn makeInputI32(g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const usize, vals: []const i32) !aion.graph.ValueId {
@@ -562,6 +718,66 @@ fn buildGatherQ8(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 
 test "gpu backend: gather rows (q8_0 table) matches CPU" {
     try expectGpuMatchesCpu(buildGatherQ8, 2 * 5 * 128, 1e-6);
+}
+
+fn buildGatherQ8SingleTile(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+
+    const v = 64;
+    const d = 128; // % 64 == 0
+    const table_vals = try alloc.alloc(f32, v * d);
+    defer alloc.free(table_vals);
+    for (table_vals, 0..) |*val, i| {
+        const p: u32 = @intCast((i * 2654435761 + 41) % 1000);
+        val.* = (@as(f32, @floatFromInt(p)) - 500.0) * 0.004;
+    }
+    const packed_t = try packQ8(alloc, table_vals, v, d);
+    defer alloc.free(packed_t);
+    // Single-tile table (tile == full shape) -> the device-side q8 gather kernel
+    // (row index resolved on-GPU, no host read).
+    const t_id = try mgr.createTiledTensor(.q8_0, &.{ v, d }, &.{ v, d }, .{ .tile_alignment = 64, .quant_axis = 1 });
+    try mgr.writeFromPackedQuant(t_id, packed_t);
+    const tv = try g.addInput(.q8_0, &.{ v, d });
+    try g.bindExternal(tv, t_id);
+
+    const idx = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
+    const out = try g.addGatherRows(tv, idx);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: gather rows (q8_0 single-tile table, device-side kernel) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherQ8SingleTile, 2 * 5 * 128, 1e-6);
+}
+
+// Regression guard for the token-doubling class: the gather index is COMPUTED ON
+// DEVICE (idx = base + 0, an i32 elementwise op) rather than host-bound. The
+// device gather kernels read it on-GPU; the host-fallback path must submit the
+// producing dispatch before its record-time read. Either way the freshly
+// computed index — not a stale prior value — must feed the gather. Covers both a
+// single-tile f32 table (device kernel) and a multi-tile table (host fallback).
+fn buildGatherDeviceIdx(comptime multi_tile: bool) fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg {
+    return struct {
+        fn build(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+            var g = Graph.init(alloc);
+            defer g.deinit();
+            const table_tile: [2]usize = if (multi_tile) .{ 16, 32 } else .{ 64, 32 };
+            const table = try makeInput(&g, mgr, &.{ 64, 32 }, &table_tile, 41);
+            const base = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
+            const zero = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &[_]i32{0} ** 10);
+            const idx = try g.addElemwiseBinary(.add, base, zero); // device-computed index
+            const out = try g.addGatherRows(table, idx);
+            return finishProg(alloc, &g, mgr, out);
+        }
+    }.build;
+}
+
+test "gpu backend: gather rows with device-computed index (single-tile) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherDeviceIdx(false), 2 * 5 * 32, 0.0);
+}
+
+test "gpu backend: gather rows with device-computed index (multi-tile fallback) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherDeviceIdx(true), 2 * 5 * 32, 0.0);
 }
 
 fn buildRope(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -825,6 +1041,40 @@ fn buildArgMax(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
+// RNNT joint shape: one row of 1025 (vocab+blank). Exercises argmax over an odd
+// wide row where the winner can be the LAST index (the blank) — the decode's
+// emit-vs-blank decision. `spike_at` (< 0 = none) forces a clear max there.
+fn buildArgMax1025(alloc: std.mem.Allocator, mgr: *StorageManager, spike_at: i64) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const n: usize = 1025;
+    const id = try mgr.createTiledTensor(.f32, &.{ 1, n }, &.{ 1, n }, .{});
+    const data = try mgr.allocator.alloc(f32, n);
+    defer mgr.allocator.free(data);
+    for (data, 0..) |*v, i| {
+        const k: u32 = @intCast((i * 2654435761 + 88) % 1000);
+        v.* = (@as(f32, @floatFromInt(k)) - 500.0) * 0.004;
+    }
+    if (spike_at >= 0) data[@intCast(spike_at)] = 99.0;
+    try mgr.writeFromPackedScalar(id, std.mem.sliceAsBytes(data));
+    const x = try g.addInput(.f32, &.{ 1, n });
+    try g.bindExternal(x, id);
+    const out = try g.addArgMax(x, -1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+fn buildArgMax1025Plain(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildArgMax1025(alloc, mgr, -1);
+}
+fn buildArgMax1025Blank(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildArgMax1025(alloc, mgr, 1024); // max at the last (blank) index
+}
+test "gpu backend: argmax [1,1025] matches CPU" {
+    try expectGpuMatchesCpuI32(buildArgMax1025Plain, 1);
+}
+test "gpu backend: argmax [1,1025] winner at last index matches CPU" {
+    try expectGpuMatchesCpuI32(buildArgMax1025Blank, 1);
+}
+
 test "gpu backend: argmax (last axis) matches CPU" {
     // i32 outputs are compared as raw bits (identical or fail).
     try expectGpuMatchesCpu(buildArgMax, 6, 0.0);
@@ -842,6 +1092,25 @@ fn buildScatterRow(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 
 test "gpu backend: scatter-row matches CPU" {
     try expectGpuMatchesCpu(buildScatterRow, 8 * 16, 0.0);
+}
+
+// Regression guard: the scatter destination index is COMPUTED ON DEVICE (the
+// decode-loop emit case). The device scatter kernel reads it on-GPU, so the row
+// must land at the freshly computed index, not a stale one.
+fn buildScatterDeviceIdx(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const buf = try makeInput(&g, mgr, &.{ 8, 16 }, &.{ 8, 16 }, 81);
+    const base = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{5});
+    const zero = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{0});
+    const idx = try g.addElemwiseBinary(.add, base, zero); // device-computed index
+    const src = try makeInput(&g, mgr, &.{16}, &.{16}, 82);
+    const out = try g.addScatterRow(buf, idx, src);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+
+test "gpu backend: scatter-row with device-computed index matches CPU" {
+    try expectGpuMatchesCpu(buildScatterDeviceIdx, 8 * 16, 0.0);
 }
 
 // ---- lstm / fft / stft / rel-pos mha ------------------------------------------
@@ -962,6 +1231,72 @@ fn buildViewChain(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 
 test "gpu backend: view chain (reshape/transpose/slice) matches CPU" {
     try expectGpuMatchesCpu(buildViewChain, 8 * 2, 0.0);
+}
+
+// Contiguous-slab reshape fast path: a MULTI-tile input whose tiles are each a
+// contiguous packed slab (row-tiled leading dim, whole trailing dims) reshaped
+// through the packed representation. Mirrors the encoder's [1,T,1024] <-> per-time
+// tiling that dominated GPU time before gatherScatterTiles used a buffer copy
+// instead of the strided gather/scatter kernel. Both backends run the identical
+// program, so the result must be byte-exact.
+fn buildReshapeContiguousMultiTile(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    // Input tiled [1,6,8] -> 4 contiguous 48-element tiles along dim 0.
+    const x = try makeInput(&g, mgr, &.{ 4, 6, 8 }, &.{ 1, 6, 8 }, 77);
+    const rs = try g.addViewReshape(x, &.{ 4, 48 }); // regroup whole trailing dims
+    const back = try g.addViewReshape(rs, &.{ 4, 6, 8 });
+    const y = try g.addElemwiseBinary(.add, back, x);
+    return finishProgGpuTiled(alloc, &g, mgr, y);
+}
+
+test "gpu backend: contiguous multi-tile reshape matches CPU" {
+    try expectGpuMatchesCpu(buildReshapeContiguousMultiTile, 4 * 6 * 8, 0.0);
+}
+
+// Slice a MULTI-tile tensor along a dim OTHER than its split dim: input tiled by
+// dim 2 (the "head" axis) but sliced along dim 1 (the "time" axis). The single-
+// split-dim fast path can't express this, so it packs to a contiguous scratch and
+// gathers the slice out. Mirrors the streaming attention-cache "keep last N frames"
+// update ([1,84,8,128] tiled by head, sliced along time).
+fn buildSliceNonSplitDim(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    // [1,6,4,8] tiled [1,6,1,8] -> 4 tiles split along dim 2.
+    const x = try makeInput(&g, mgr, &.{ 1, 6, 4, 8 }, &.{ 1, 6, 1, 8 }, 88);
+    const sl = try g.addViewSliceND(x, &.{ 0, 2, 0, 0 }, &.{ 1, 4, 4, 8 }); // slice dim 1: [2,6)
+    return finishProgGpuTiled(alloc, &g, mgr, sl);
+}
+
+test "gpu backend: slice multi-tile along non-split dim matches CPU" {
+    try expectGpuMatchesCpu(buildSliceNonSplitDim, 1 * 4 * 4 * 8, 0.0);
+}
+
+// The RNNT decoder splits its fused LSTM output [1, 2H] into h=[1,H] (offset 0)
+// and c=[1,H] (offset H). Exercise the second-half slice specifically (H=640).
+fn buildSliceSecondHalf(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 1280 }, &.{ 1, 1280 }, 30);
+    const out = try g.addViewSliceND(x, &.{ 0, 640 }, &.{ 1, 640 });
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: slice second half [1,1280]->[1,640] matches CPU" {
+    try expectGpuMatchesCpu(buildSliceSecondHalf, 640, 0.0);
+}
+
+// The RNNT decoder's state gate multiplies a per-hidden delta [H,1] by the scalar
+// emit flag [1] (BroadcastLastDim with a size-1 last dim on the left operand).
+fn buildBcastMulColVec(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const a = try makeInput(&g, mgr, &.{ 640, 1 }, &.{ 640, 1 }, 31);
+    const b = try makeInput(&g, mgr, &.{1}, &.{1}, 32);
+    const out = try g.addBroadcastLastDimBinary(.mul, a, b);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: bcast_mul [640,1]x[1] matches CPU" {
+    try expectGpuMatchesCpu(buildBcastMulColVec, 640, 1e-5);
 }
 
 // ---- i32 elementwise / cast -------------------------------------------------------

@@ -26,15 +26,193 @@ const Built = pipelines.Built;
 
 pub const FrameError = error{ExecutionFailed};
 
+/// A grow-only ring of same-sized uniform buffers, reused across `executeProgram`
+/// runs. Each decode step records ~700 tiny per-dispatch uniforms; without a pool
+/// that is ~700 `wgpuDeviceCreateBuffer` + release driver calls per step, a large
+/// chunk of the CPU record cost. The pool hands buffers out by a cursor that the
+/// backend `reset`s at the start of each run — safe to reuse because the previous
+/// run's final readback poll guarantees its GPU work (and thus all its uniform
+/// reads) completed. Within a run the cursor only advances (never reuses an
+/// in-flight buffer), growing the pool to the run's dispatch count.
+pub const UniformPool = struct {
+    gpu: *wgpu.Gpu,
+    allocator: std.mem.Allocator,
+    buffers: std.ArrayList(c.WGPUBuffer) = .empty,
+    cursor: usize = 0,
+    /// Every uniform in these kernels is <= 96 bytes; one fixed size fits all and
+    /// lets any pooled buffer serve any dispatch.
+    pub const SLOT_BYTES: u64 = 256;
+
+    pub fn reset(self: *UniformPool) void {
+        self.cursor = 0;
+    }
+
+    /// Next free pooled buffer (creates one if the cursor passed the high-water
+    /// mark). Caller writes its params and must NOT release it.
+    pub fn next(self: *UniformPool) FrameError!c.WGPUBuffer {
+        if (self.cursor < self.buffers.items.len) {
+            const b = self.buffers.items[self.cursor];
+            self.cursor += 1;
+            return b;
+        }
+        const b = wgpu.createUniformBuffer(self.gpu.device, SLOT_BYTES) catch return error.ExecutionFailed;
+        self.buffers.append(self.allocator, b) catch {
+            c.wgpuBufferRelease(b);
+            return error.ExecutionFailed;
+        };
+        self.cursor += 1;
+        return b;
+    }
+
+    pub fn deinit(self: *UniformPool) void {
+        for (self.buffers.items) |b| c.wgpuBufferRelease(b);
+        self.buffers.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Caches the (uniform buffer + bind group) for each dispatch, reused across
+/// `executeProgram` runs. The decode program is IDENTICAL every step — same
+/// pipelines, same resident device buffers, same params — so a bind group built
+/// once can be replayed, skipping the ~700 `wgpuDeviceCreateBindGroup` (+ uniform
+/// create/write) driver calls that otherwise dominate the CPU record cost of a
+/// step. Entries are keyed positionally by a per-run cursor (the backend `reset`s
+/// it each run); every reuse VALIDATES pipeline + buffer handles + sizes + uniform
+/// bytes, so a changed program / migrated buffer / changed param safely rebuilds
+/// that entry (self-correcting, never stale). Bounded: steady-state decode reuses
+/// the same ~N entries forever.
+pub const BindGroupCache = struct {
+    gpu: *wgpu.Gpu,
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    cursor: usize = 0,
+
+    const MAX_B = 10;
+    const Entry = struct {
+        pipeline: c.WGPUComputePipeline,
+        bind_group: c.WGPUBindGroup,
+        uniform_buf: c.WGPUBuffer,
+        n: usize,
+        bufs: [MAX_B]c.WGPUBuffer,
+        sizes: [MAX_B]u64,
+        ubytes: [UniformPool.SLOT_BYTES]u8,
+        ulen: usize,
+        ub_size: u64,
+    };
+
+    pub fn reset(self: *BindGroupCache) void {
+        self.cursor = 0;
+    }
+
+    pub fn deinit(self: *BindGroupCache) void {
+        for (self.entries.items) |e| {
+            c.wgpuBindGroupRelease(e.bind_group);
+            c.wgpuBufferRelease(e.uniform_buf);
+        }
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn matches(e: *const Entry, built: Built, buffers: []const c.WGPUBuffer, sizes: []const u64, ubytes: []const u8) bool {
+        if (e.pipeline != built.pipeline or e.n != buffers.len or e.ulen != ubytes.len) return false;
+        for (buffers, 0..) |b, i| {
+            if (e.bufs[i] != b or e.sizes[i] != sizes[i]) return false;
+        }
+        return std.mem.eql(u8, e.ubytes[0..e.ulen], ubytes);
+    }
+
+    fn buildEntry(self: *BindGroupCache, built: Built, buffers: []const c.WGPUBuffer, sizes: []const u64, ubytes: []const u8, ub_size: u64) FrameError!Entry {
+        const ub = wgpu.createUniformBuffer(self.gpu.device, UniformPool.SLOT_BYTES) catch return error.ExecutionFailed;
+        errdefer c.wgpuBufferRelease(ub);
+        c.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, ubytes.ptr, ubytes.len);
+
+        var entries: [MAX_B]c.WGPUBindGroupEntry = undefined;
+        for (buffers, 0..) |buf, i| {
+            entries[i] = std.mem.zeroes(c.WGPUBindGroupEntry);
+            entries[i].binding = @intCast(i);
+            entries[i].buffer = buf;
+            entries[i].size = sizes[i];
+        }
+        entries[buffers.len] = std.mem.zeroes(c.WGPUBindGroupEntry);
+        entries[buffers.len].binding = @intCast(buffers.len);
+        entries[buffers.len].buffer = ub;
+        entries[buffers.len].size = ub_size;
+
+        var bgd: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
+        bgd.layout = built.bgl;
+        bgd.entryCount = buffers.len + 1;
+        bgd.entries = &entries;
+        const bg = c.wgpuDeviceCreateBindGroup(self.gpu.device, &bgd) orelse return error.ExecutionFailed;
+
+        var e: Entry = .{
+            .pipeline = built.pipeline,
+            .bind_group = bg,
+            .uniform_buf = ub,
+            .n = buffers.len,
+            .bufs = undefined,
+            .sizes = undefined,
+            .ubytes = undefined,
+            .ulen = ubytes.len,
+            .ub_size = ub_size,
+        };
+        for (buffers, 0..) |b, i| {
+            e.bufs[i] = b;
+            e.sizes[i] = sizes[i];
+        }
+        @memcpy(e.ubytes[0..ubytes.len], ubytes);
+        return e;
+    }
+
+    /// Return the bind group for this dispatch, building + caching (or rebuilding
+    /// on a validation miss) as needed. Advances the cursor.
+    pub fn acquire(self: *BindGroupCache, built: Built, buffers: []const c.WGPUBuffer, sizes: []const u64, ubytes: []const u8, ub_size: u64) FrameError!c.WGPUBindGroup {
+        const idx = self.cursor;
+        if (idx < self.entries.items.len) {
+            const e = &self.entries.items[idx];
+            if (matches(e, built, buffers, sizes, ubytes)) {
+                self.cursor += 1;
+                return e.bind_group;
+            }
+            // Mismatch: rebuild this slot in place.
+            const ne = try self.buildEntry(built, buffers, sizes, ubytes, ub_size);
+            c.wgpuBindGroupRelease(e.bind_group);
+            c.wgpuBufferRelease(e.uniform_buf);
+            e.* = ne;
+            self.cursor += 1;
+            return ne.bind_group;
+        }
+        const ne = try self.buildEntry(built, buffers, sizes, ubytes, ub_size);
+        self.entries.append(self.allocator, ne) catch {
+            c.wgpuBindGroupRelease(ne.bind_group);
+            c.wgpuBufferRelease(ne.uniform_buf);
+            return error.ExecutionFailed;
+        };
+        self.cursor += 1;
+        return ne.bind_group;
+    }
+};
+
 pub const Frame = struct {
     gpu: *wgpu.Gpu,
     allocator: std.mem.Allocator,
     encoder: c.WGPUCommandEncoder,
     transient_buffers: std.ArrayList(c.WGPUBuffer),
     transient_groups: std.ArrayList(c.WGPUBindGroup),
+    /// Optional backend-owned uniform pool. When set, per-dispatch uniforms are
+    /// borrowed from it (not created/released per call). Null for standalone
+    /// frames (autotune/bench), which keep the create-and-release path.
+    uniform_pool: ?*UniformPool = null,
+    /// Optional backend-owned bind-group cache. When set, per-dispatch uniforms
+    /// AND bind groups are reused across runs (see `BindGroupCache`). Takes
+    /// precedence over `uniform_pool`. Null for standalone frames.
+    bind_cache: ?*BindGroupCache = null,
     /// Commands recorded since init — lets the backend skip a submit/sync when
     /// a control-flow host read finds nothing pending.
     records: usize = 0,
+    /// Count of `flushInPlace` submits over this frame's lifetime (each a
+    /// pipeline break forced by control flow or a record-time host read).
+    /// Diagnostic only (the profiler reports it).
+    submits: usize = 0,
 
     const Self = @This();
     // 9 storage buffers + the trailing uniform. WebGPU's default
@@ -81,11 +259,32 @@ pub const Frame = struct {
 
         // Uniform buffer (params). Round size up to a multiple of 16.
         const ub_size: u64 = (@as(u64, uniform_bytes.len) + 15) & ~@as(u64, 15);
-        const ub = wgpu.createUniformBuffer(self.gpu.device, ub_size) catch return error.ExecutionFailed;
-        self.transient_buffers.append(self.allocator, ub) catch {
-            c.wgpuBufferRelease(ub);
-            return error.ExecutionFailed;
-        };
+
+        // Fast path: reuse a cached (uniform + bind group) for this dispatch.
+        if (self.bind_cache) |cache| {
+            std.debug.assert(ub_size <= UniformPool.SLOT_BYTES);
+            const bg = try cache.acquire(built, buffers, buf_sizes, uniform_bytes, ub_size);
+            const pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+            c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
+            c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
+            c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
+            c.wgpuComputePassEncoderEnd(pass);
+            c.wgpuComputePassEncoderRelease(pass);
+            self.records += 1;
+            return;
+        }
+
+        var ub: c.WGPUBuffer = undefined;
+        if (self.uniform_pool) |pool| {
+            std.debug.assert(ub_size <= UniformPool.SLOT_BYTES);
+            ub = try pool.next(); // pool owns the buffer; not appended to transients
+        } else {
+            ub = wgpu.createUniformBuffer(self.gpu.device, ub_size) catch return error.ExecutionFailed;
+            self.transient_buffers.append(self.allocator, ub) catch {
+                c.wgpuBufferRelease(ub);
+                return error.ExecutionFailed;
+            };
+        }
         c.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, uniform_bytes.ptr, uniform_bytes.len);
 
         // Bind group: storage buffers then the uniform at the trailing binding.
@@ -128,6 +327,28 @@ pub const Frame = struct {
     pub fn recordCopy(self: *Self, src: c.WGPUBuffer, src_off: u64, dst: c.WGPUBuffer, dst_off: u64, bytes: u64) void {
         c.wgpuCommandEncoderCopyBufferToBuffer(self.encoder, src, src_off, dst, dst_off, bytes);
         self.records += 1;
+    }
+
+    /// Submit whatever is pending and continue recording into a FRESH encoder,
+    /// reusing the SAME `Frame` object (and its uniform pool / bind-group cache).
+    /// No-op when nothing is recorded. Deliberately does NOT poll: queue
+    /// submissions execute in order, so a later D2H readback (whose own poll
+    /// waits for all prior submitted work) or a later frame sees these results.
+    /// This is the single mechanism behind every mid-program flush — control-flow
+    /// predicate reads, record-time host index reads, and the chunked-submit
+    /// overlap all funnel through here.
+    pub fn flushInPlace(self: *Self) FrameError!void {
+        if (self.records == 0) return;
+        self.submit(); // finishes + releases the encoder, sets encoder = null
+        // The queue holds its own references to the submitted bind groups /
+        // uniforms until the GPU is done, so releasing our handles now is safe.
+        for (self.transient_groups.items) |g| c.wgpuBindGroupRelease(g);
+        for (self.transient_buffers.items) |b| c.wgpuBufferRelease(b);
+        self.transient_groups.clearRetainingCapacity();
+        self.transient_buffers.clearRetainingCapacity();
+        self.encoder = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, null) orelse return error.ExecutionFailed;
+        self.records = 0;
+        self.submits += 1;
     }
 
     /// Finish the encoder and submit the whole batch once.

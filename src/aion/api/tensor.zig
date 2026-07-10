@@ -72,6 +72,13 @@ pub const Tensor = struct {
         self.shape = nt.shape;
     }
 
+    /// The device this tensor is currently resident on.
+    ///
+    /// A tensor lives on exactly one device at a time; migrate with `to`.
+    pub fn device(self: Self) StorageError!DeviceRef {
+        return self.store.tensorDevice(self.id);
+    }
+
     pub fn elemCount(self: Self) StorageError!usize {
         var count: usize = 1;
         for (self.shape) |d| {
@@ -143,6 +150,7 @@ pub const Tensor = struct {
         const src_tensor = try src.store.getConst(src.id);
         if (canRawCopyTiled(dst_tensor, src_tensor)) {
             @memcpy(dst_tensor.data, src_tensor.data);
+            dst_tensor.host_seq +%= 1; // host mutation: invalidate any device copy
             return;
         }
 

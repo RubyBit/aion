@@ -37,6 +37,12 @@ pub const TilePolicy = struct {
     /// Tile alignment in bytes for `TiledTensor` backing.
     tile_alignment: usize = 64,
 
+    /// Device storage-buffer binding-size limit in bytes (0 = unknown/uncapped).
+    /// Set for GPU targets from the real device limit so the tiling choosers cap
+    /// any single tile to something the backend can bind (e.g. a large quantized
+    /// embedding table gets split along its row axis instead of one huge tile).
+    max_binding_bytes: usize = 0,
+
     /// Max number of batch tiles to allow when retiling rank>2 scalar tensors.
     /// Bounds the compile-time `ReTileCopyScalar` copy-loop length; it does not
     /// affect the post-retile tensor's tiling (that is set by `want_tile`). Sized
@@ -164,6 +170,16 @@ pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize 
     if (n <= 1) {
         const tm: usize = @max(@as(usize, 1), @min(m, policy.base_1d));
         return .{ tm, 1 };
+    }
+
+    // GPU targets: keep the last (row) dim WHOLE up to the macro-tile cap so the
+    // row-wise/elementwise/norm kernels (which require the reduced last axis in one
+    // tile) see contiguous rows. Square tiling — which exists for CPU transpose
+    // materialization — would split a wide row across tiles and defeat them.
+    if (policy.target_kind != .cpu) {
+        const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+        const tm: usize = @max(@as(usize, 1), @min(m, policy.base_square_2d));
+        return .{ tm, tn };
     }
 
     const side: usize = @max(@as(usize, 1), @min(policy.base_square_2d, @min(m, n)));

@@ -216,6 +216,14 @@ pub const TiledTensor = struct {
     /// Borrowed (non-owning) device-memory interface for `tile_handles`.
     dev: ?dm.DeviceMemory = null,
 
+    /// Monotonic host-write counter. Bumped on every host-side mutation of the
+    /// bytes (packed writes, `copyFrom`, zero-init). A device-residency layer
+    /// (`ResidentTensorStore`) records the value it last uploaded and re-uploads
+    /// when it changes — so host writes made out-of-band (the C ABI, a model's
+    /// per-run input seeding / io-alias write-back) correctly invalidate the
+    /// device copy across runs. D2H flushes deliberately do NOT bump it.
+    host_seq: u64 = 0,
+
     const Self = @This();
 
     pub const InitOptions = struct {
@@ -791,6 +799,7 @@ pub const TiledTensor = struct {
     pub fn writeFromPackedScalar(self: *Self, packed_bytes: []const u8) StorageError!void {
         if (self.onDevice()) return StorageError.InvalidArgument; // host bytes freed; migrate with .to(.cpu) first
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
+        self.host_seq +%= 1;
 
         const need_total: usize = self.requiredBytesPackedScalar();
         if (packed_bytes.len < need_total) return StorageError.InvalidArgument;
@@ -979,6 +988,7 @@ pub const TiledTensor = struct {
     ///   `shape` with `shape[quant_axis]` replaced by `shape[quant_axis] / block_elems`.
     /// - `packed_bytes` is row-major over that block-space shape, each element being one block.
     pub fn writeFromPackedQuant(self: *Self, packed_bytes: []const u8) StorageError!void {
+        self.host_seq +%= 1;
         return self.forEachQuantBlock(packed_bytes, null);
     }
 

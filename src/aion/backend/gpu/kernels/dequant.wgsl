@@ -118,6 +118,54 @@ fn q8_row_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
+// q8_0 tile [K, N] quantized along K (ggml MatMul-B convention): blocks tile a
+// [K/32, N] grid, row-major, so consecutive blocks run along N. -> f32 [K, N]
+// (same logical layout) for a normal [K,N] GEMM B operand. One work item = one
+// block PAIR (two adjacent N columns, same 32-K range) so the 68-byte pair is
+// word-aligned (17 u32). Each block's 32 int8 scatter down a column at stride N.
+// Requires K % 32 == 0 and N % 2 == 0.
+//   p.k = K, p.n = N, p.dst_row = N, p.count = (K/32) * (N/2) block pairs.
+@compute @workgroup_size(64)
+fn q8_kmajor_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    let pairs_per_bk = p.n / 2u; // column pairs per block-row
+    for (var i = g.x; i < p.count; i += step) {
+        let bk = i / pairs_per_bk; // which 32-K block-row
+        let np = i % pairs_per_bk; // which column pair
+        let n0 = np * 2u;
+        let k0 = bk * 32u;
+        // Linear block index of (bk, n0) in the [K/32, N] grid is bk*N + n0
+        // (even, since N is even) → word base = (bk*N + n0)/2 * 17.
+        let base = ((bk * p.n + n0) / 2u) * 17u;
+
+        let w0 = src[base];
+        let d0 = unpack2x16float(w0).x;        // scale of block (bk, n0)
+        let d1 = unpack2x16float(src[base + 8u]).y; // scale of block (bk, n0+1)
+
+        // Block A -> column n0.
+        var prev = w0;
+        for (var j = 0u; j < 8u; j += 1u) {
+            let cur = src[base + 1u + j];
+            let q = i8x4f((prev >> 16u) | (cur << 16u)) * d0;
+            let kb = k0 + j * 4u;
+            dst[kb * p.dst_row + n0] = q.x;
+            dst[(kb + 1u) * p.dst_row + n0] = q.y;
+            dst[(kb + 2u) * p.dst_row + n0] = q.z;
+            dst[(kb + 3u) * p.dst_row + n0] = q.w;
+            prev = cur;
+        }
+        // Block B -> column n0+1.
+        for (var j = 0u; j < 8u; j += 1u) {
+            let q = i8x4f(src[base + 9u + j]) * d1;
+            let kb = k0 + j * 4u;
+            dst[kb * p.dst_row + n0 + 1u] = q.x;
+            dst[(kb + 1u) * p.dst_row + n0 + 1u] = q.y;
+            dst[(kb + 2u) * p.dst_row + n0 + 1u] = q.z;
+            dst[(kb + 3u) * p.dst_row + n0 + 1u] = q.w;
+        }
+    }
+}
+
 // One work item = one u32 word = two f16 values widened in place-order.
 @compute @workgroup_size(64)
 fn f16_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {

@@ -22,6 +22,33 @@ pub const AionDType = enum(c_int) {
     AION_DTYPE_I32 = 5,
 };
 
+pub const AionDeviceKind = enum(c_int) {
+    AION_DEVICE_CPU = 0,
+    AION_DEVICE_GPU = 1,
+};
+
+pub const AionGpuPower = enum(c_int) {
+    AION_GPU_POWER_DEFAULT = 0,
+    AION_GPU_POWER_LOW = 1,
+    AION_GPU_POWER_HIGH = 2,
+};
+
+pub const AionGpuBackend = enum(c_int) {
+    AION_GPU_BACKEND_ANY = 0,
+    AION_GPU_BACKEND_VULKAN = 1,
+    AION_GPU_BACKEND_D3D12 = 2,
+    AION_GPU_BACKEND_METAL = 3,
+    AION_GPU_BACKEND_GL = 4,
+};
+
+/// Per-GPU creation options mirrored from `api.GpuOptions`.
+/// `adapter_index < 0` means "auto" (no explicit adapter).
+pub const AionGpuOptions = extern struct {
+    power: AionGpuPower = .AION_GPU_POWER_DEFAULT,
+    backend: AionGpuBackend = .AION_GPU_BACKEND_ANY,
+    adapter_index: i32 = -1,
+};
+
 pub const AionContext = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     ctx: api.Context = undefined,
@@ -29,9 +56,9 @@ pub const AionContext = struct {
     last_err_buf: [512]u8 = .{0} ** 512,
     last_err_len: usize = 0,
 
-    fn init(thread_count: usize) !AionContext {
+    fn init(thread_count: usize, gpus: []const api.GpuOptions) !AionContext {
         var out: AionContext = .{};
-        out.ctx = try api.Context.initCpu(out.allocator, .{ .thread_count = thread_count });
+        out.ctx = try api.Context.init(out.allocator, .{ .thread_count = thread_count, .gpus = gpus });
         out.clearLastError();
         return out;
     }
@@ -79,6 +106,7 @@ fn mapError(err: anyerror) AionStatus {
         error.Unsupported => .AION_UNSUPPORTED,
         error.UnsupportedVersion => .AION_UNSUPPORTED,
         error.UnsupportedFeature => .AION_UNSUPPORTED,
+        error.BackendUnavailable => .AION_UNSUPPORTED,
         error.InvalidFormat => .AION_INVALID_ARGUMENT,
         error.IoFailure => .AION_INTERNAL_ERROR,
         else => .AION_INTERNAL_ERROR,
@@ -104,6 +132,31 @@ fn dtypeFromC(dt: AionDType) ?types.DType {
         .AION_DTYPE_Q4_0 => .q4_0,
         .AION_DTYPE_Q8_0 => .q8_0,
         .AION_DTYPE_I32 => .i32,
+    };
+}
+
+fn deviceFromC(kind: AionDeviceKind, index: u32) api.DeviceSelector {
+    return switch (kind) {
+        .AION_DEVICE_CPU => .cpu,
+        .AION_DEVICE_GPU => .{ .gpu = @as(usize, index) },
+    };
+}
+
+fn gpuOptionsFromC(c: AionGpuOptions) api.GpuOptions {
+    return .{
+        .power = switch (c.power) {
+            .AION_GPU_POWER_DEFAULT => .default,
+            .AION_GPU_POWER_LOW => .low,
+            .AION_GPU_POWER_HIGH => .high,
+        },
+        .backend = switch (c.backend) {
+            .AION_GPU_BACKEND_ANY => .any,
+            .AION_GPU_BACKEND_VULKAN => .vulkan,
+            .AION_GPU_BACKEND_D3D12 => .d3d12,
+            .AION_GPU_BACKEND_METAL => .metal,
+            .AION_GPU_BACKEND_GL => .gl,
+        },
+        .adapter_index = if (c.adapter_index < 0) null else @as(usize, @intCast(c.adapter_index)),
     };
 }
 
@@ -173,10 +226,44 @@ pub export fn aion_context_create_cpu(thread_count: usize, out_ctx: ?*?*AionCont
     const ctx_ptr: *AionContext = std.heap.page_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
     errdefer std.heap.page_allocator.destroy(ctx_ptr);
 
-    ctx_ptr.* = AionContext.init(thread_count) catch |e| {
+    ctx_ptr.* = AionContext.init(thread_count, &.{}) catch |e| {
         const st = mapError(e);
         // No context to store the error yet.
         return st;
+    };
+
+    out_ctx.?.* = ctx_ptr;
+    return .AION_OK;
+}
+
+/// Maximum number of GPUs accepted by `aion_context_create` in one call.
+const MAX_GPUS: usize = 16;
+
+pub export fn aion_context_create(
+    thread_count: usize,
+    gpus_ptr: [*c]const AionGpuOptions,
+    gpu_count: usize,
+    out_ctx: ?*?*AionContext,
+) callconv(.c) AionStatus {
+    if (out_ctx == null) return .AION_INVALID_ARGUMENT;
+    out_ctx.?.* = null;
+    if (thread_count == 0) return .AION_INVALID_ARGUMENT;
+    if (gpu_count > MAX_GPUS) return .AION_INVALID_ARGUMENT;
+    if (gpu_count != 0 and gpus_ptr == null) return .AION_INVALID_ARGUMENT;
+
+    var gpu_buf: [MAX_GPUS]api.GpuOptions = undefined;
+    var i: usize = 0;
+    while (i < gpu_count) : (i += 1) {
+        gpu_buf[i] = gpuOptionsFromC(gpus_ptr[i]);
+    }
+    const gpus: []const api.GpuOptions = gpu_buf[0..gpu_count];
+
+    const ctx_ptr: *AionContext = std.heap.page_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
+    errdefer std.heap.page_allocator.destroy(ctx_ptr);
+
+    ctx_ptr.* = AionContext.init(thread_count, gpus) catch |e| {
+        // No context to store the error yet.
+        return mapError(e);
     };
 
     out_ctx.?.* = ctx_ptr;
@@ -315,6 +402,51 @@ pub export fn aion_tensor_destroy(t_opt: ?*AionTensor) callconv(.c) void {
     std.heap.page_allocator.destroy(t);
 }
 
+/// Migrate a tensor to `(kind, index)`.
+///
+/// Move semantics: the source-device copy is freed. After moving off the CPU,
+/// host `aion_tensor_read`/`aion_tensor_write` fail until migrated back to the
+/// CPU with `aion_tensor_to(t, AION_DEVICE_CPU, 0)`.
+pub export fn aion_tensor_to(
+    t_opt: ?*AionTensor,
+    kind: AionDeviceKind,
+    index: u32,
+) callconv(.c) AionStatus {
+    const t: *AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = t.owner;
+    ctx.clearLastError();
+
+    const sel = deviceFromC(kind, index);
+    t.tensor.to(sel) catch |e| {
+        ctx.setLastError("tensor_to", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+/// Report the device a tensor is currently resident on. Either output pointer
+/// may be NULL if that field is not needed.
+pub export fn aion_tensor_device(
+    t_opt: ?*const AionTensor,
+    out_kind: ?*AionDeviceKind,
+    out_index: ?*u32,
+) callconv(.c) AionStatus {
+    const t: *const AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = t.owner;
+    ctx.clearLastError();
+
+    const ref = t.tensor.device() catch |e| {
+        ctx.setLastError("tensor_device", e);
+        return mapError(e);
+    };
+    if (out_kind) |p| p.* = switch (ref.kind) {
+        .cpu => .AION_DEVICE_CPU,
+        .gpu => .AION_DEVICE_GPU,
+    };
+    if (out_index) |p| p.* = @as(u32, ref.index);
+    return .AION_OK;
+}
+
 pub export fn aion_tensor_dtype(t_opt: ?*const AionTensor) callconv(.c) AionDType {
     const t: *const AionTensor = t_opt orelse return .AION_DTYPE_F32;
     return dtypeToC(t.tensor.getDType());
@@ -440,11 +572,14 @@ pub export fn aion_tensor_read_scalar(
     return .AION_OK;
 }
 
-pub export fn aion_loaded_model_load_path(
+fn loadModelImpl(
     ctx_opt: ?*AionContext,
     path: ?[*:0]const u8,
+    absolute: bool,
+    opts: api.LoadModelOptions,
     out_model: ?*?*AionLoadedModel,
-) callconv(.c) AionStatus {
+    comptime what: []const u8,
+) AionStatus {
     const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
     ctx.clearLastError();
 
@@ -453,8 +588,11 @@ pub export fn aion_loaded_model_load_path(
     if (path == null) return .AION_INVALID_ARGUMENT;
 
     const p: []const u8 = std.mem.span(path.?);
-    const lm: api.LoadedModel = ctx.ctx.loadModelPath(p, .{}) catch |e| {
-        ctx.setLastError("load_model_path", e);
+    const lm: api.LoadedModel = (if (absolute)
+        ctx.ctx.loadModelPathAbsolute(p, opts)
+    else
+        ctx.ctx.loadModelPath(p, opts)) catch |e| {
+        ctx.setLastError(what, e);
         return mapError(e);
     };
 
@@ -467,31 +605,45 @@ pub export fn aion_loaded_model_load_path(
     return .AION_OK;
 }
 
+pub export fn aion_loaded_model_load_path(
+    ctx_opt: ?*AionContext,
+    path: ?[*:0]const u8,
+    out_model: ?*?*AionLoadedModel,
+) callconv(.c) AionStatus {
+    return loadModelImpl(ctx_opt, path, false, .{}, out_model, "load_model_path");
+}
+
 pub export fn aion_loaded_model_load_path_absolute(
     ctx_opt: ?*AionContext,
     path: ?[*:0]const u8,
     out_model: ?*?*AionLoadedModel,
 ) callconv(.c) AionStatus {
-    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
-    ctx.clearLastError();
+    return loadModelImpl(ctx_opt, path, true, .{}, out_model, "load_model_path_absolute");
+}
 
-    if (out_model == null) return .AION_INVALID_ARGUMENT;
-    out_model.?.* = null;
-    if (path == null) return .AION_INVALID_ARGUMENT;
+/// Like `aion_loaded_model_load_path`, but loads the model onto `(kind, index)`.
+/// The model's backend and tile policy follow the device; inputs are auto-migrated
+/// on run and outputs flushed back to host.
+pub export fn aion_loaded_model_load_path_on(
+    ctx_opt: ?*AionContext,
+    path: ?[*:0]const u8,
+    kind: AionDeviceKind,
+    index: u32,
+    out_model: ?*?*AionLoadedModel,
+) callconv(.c) AionStatus {
+    const opts: api.LoadModelOptions = .{ .device = deviceFromC(kind, index) };
+    return loadModelImpl(ctx_opt, path, false, opts, out_model, "load_model_path_on");
+}
 
-    const p: []const u8 = std.mem.span(path.?);
-    const lm: api.LoadedModel = ctx.ctx.loadModelPathAbsolute(p, .{}) catch |e| {
-        ctx.setLastError("load_model_path_absolute", e);
-        return mapError(e);
-    };
-
-    const handle: *AionLoadedModel = std.heap.page_allocator.create(AionLoadedModel) catch {
-        ctx.setLastError("loaded_model_handle_alloc", error.OutOfMemory);
-        return .AION_OUT_OF_MEMORY;
-    };
-    handle.* = .{ .owner = ctx, .model = lm };
-    out_model.?.* = handle;
-    return .AION_OK;
+pub export fn aion_loaded_model_load_path_absolute_on(
+    ctx_opt: ?*AionContext,
+    path: ?[*:0]const u8,
+    kind: AionDeviceKind,
+    index: u32,
+    out_model: ?*?*AionLoadedModel,
+) callconv(.c) AionStatus {
+    const opts: api.LoadModelOptions = .{ .device = deviceFromC(kind, index) };
+    return loadModelImpl(ctx_opt, path, true, opts, out_model, "load_model_path_absolute_on");
 }
 
 pub export fn aion_loaded_model_destroy(m_opt: ?*AionLoadedModel) callconv(.c) void {

@@ -13,6 +13,8 @@ import numpy as np
 
 import aion
 
+from _common import add_device_args, load_model_with_device
+
 
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
@@ -211,6 +213,7 @@ def main() -> None:
     )
     p.add_argument("--max-new-tokens", type=int, default=1)
     p.add_argument("--thread-count", type=int, default=1, help="Context thread count (default: 1)")
+    add_device_args(p)
     p.add_argument("--timing", action="store_true", help="Print per-stage timing and throughput")
     p.add_argument(
         "--profile-backend",
@@ -300,7 +303,9 @@ def main() -> None:
     # Model interface expects caches for layers 0..14 (15 source layers).
     source_layers = list(range(15))
 
-    with aion.load_model(str(model_path), thread_count=args.thread_count) as model:
+    model, device_str = load_model_with_device(str(model_path), args, thread_count=args.thread_count)
+    print(f"device: {device_str}")
+    with model:
         ctx = model.context
 
         # The KV caches are io-aliased to their `next_*_cache.layerN` outputs, and

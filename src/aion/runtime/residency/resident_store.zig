@@ -60,6 +60,10 @@ const TileState = struct {
     resident: bool = false, // device buffer holds a valid copy
     host_dirty: bool = false, // host written since last H2D (device stale)
     dev_dirty: bool = false, // device written since last D2H (host stale)
+    /// The owning tensor's `host_seq` at the last H2D upload. When the current
+    /// `host_seq` differs, the host bytes changed out-of-band (via the C ABI or a
+    /// model's per-run seeding / io-alias write-back) and we must re-upload.
+    uploaded_seq: u64 = 0,
 };
 
 const Lease = struct {
@@ -171,6 +175,7 @@ pub const ResidentTensorStore = struct {
 
         // Discrete memory: stage into a device-owned buffer with dirty tracking.
         // Source-of-truth host tile (also gives us the layout metadata).
+        const host_seq = (try self.inner.meta(id)).host_seq;
         const host = try self.inner.acquireTileConstLinear(id, tile_index);
         defer self.inner.releaseConst(host.token);
 
@@ -180,13 +185,17 @@ pub const ResidentTensorStore = struct {
             st.handle = self.dev.alloc(host.bytes.len, 64) catch |e| return deviceErrToStore(e);
             st.len = host.bytes.len;
         }
-        // Upload if the device copy is missing or stale (host newer). dev_dirty
-        // and host_dirty are mutually exclusive, so this never clobbers unflushed
-        // device writes.
-        if (!st.resident or st.host_dirty) {
+        // Upload if the device copy is missing, stale via a tracked host lease
+        // (host_dirty), or stale via an out-of-band host write (host_seq changed
+        // since our last upload — the C ABI / model per-run seeding / io-alias
+        // write-back mutate the host store directly, bypassing our vtable). After
+        // H2D the two copies match, so neither side is dirty.
+        if (!st.resident or st.host_dirty or st.uploaded_seq != host_seq) {
             self.dev.copyH2D(st.handle, 0, host.bytes) catch |e| return deviceErrToStore(e);
             st.resident = true;
             st.host_dirty = false;
+            st.dev_dirty = false;
+            st.uploaded_seq = host_seq;
         }
 
         return .{

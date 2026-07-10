@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Iterable, List, Mapping
 
+from .device import DeviceLike, _is_cpu, _normalize_device
 from .errors import raise_for_status
 from ._ffi import ffi, lib
 from .enums import AionDType
@@ -89,7 +90,16 @@ class LoadedModel:
             pass
 
     @classmethod
-    def load(cls, ctx, path: str) -> "LoadedModel":
+    def load(cls, ctx, path: str, *, device: DeviceLike = None) -> "LoadedModel":
+        """Load a model onto `device` (default CPU).
+
+        The GPU it targets must be registered on `ctx` (see `Context(gpus=...)`
+        or `Context.gpu()`). The model's backend and tiling follow the device;
+        keep binding CPU input tensors — the runtime migrates them on `run()` and
+        flushes outputs back to host for reading. Do NOT bind a device-resident
+        tensor (from `tensor.to("gpu")`) as a model input.
+        """
+
         if not isinstance(path, str):
             raise TypeError("path must be a str")
 
@@ -97,12 +107,23 @@ class LoadedModel:
         # The Zig side expects NUL-terminated C strings.
         b = path.encode("utf-8")
         c_path = ffi.new("char[]", b)
-        if os.path.isabs(path):
-            st = lib.aion_loaded_model_load_path_absolute(ctx.ptr, c_path, out_m)
-            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute")
+        absolute = os.path.isabs(path)
+
+        if device is None or _is_cpu(device):
+            if absolute:
+                st = lib.aion_loaded_model_load_path_absolute(ctx.ptr, c_path, out_m)
+                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute")
+            else:
+                st = lib.aion_loaded_model_load_path(ctx.ptr, c_path, out_m)
+                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path")
         else:
-            st = lib.aion_loaded_model_load_path(ctx.ptr, c_path, out_m)
-            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path")
+            kind, index = _normalize_device(device)
+            if absolute:
+                st = lib.aion_loaded_model_load_path_absolute_on(ctx.ptr, c_path, int(kind), int(index), out_m)
+                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute_on")
+            else:
+                st = lib.aion_loaded_model_load_path_on(ctx.ptr, c_path, int(kind), int(index), out_m)
+                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_on")
 
         return cls(ctx, out_m[0])
 

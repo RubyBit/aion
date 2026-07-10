@@ -33,6 +33,31 @@ typedef enum AionDType {
     AION_DTYPE_I32 = 5,
 } AionDType;
 
+typedef enum AionDeviceKind {
+    AION_DEVICE_CPU = 0,
+    AION_DEVICE_GPU = 1,
+} AionDeviceKind;
+
+typedef enum AionGpuPower {
+    AION_GPU_POWER_DEFAULT = 0,
+    AION_GPU_POWER_LOW = 1,
+    AION_GPU_POWER_HIGH = 2,
+} AionGpuPower;
+
+typedef enum AionGpuBackend {
+    AION_GPU_BACKEND_ANY = 0,
+    AION_GPU_BACKEND_VULKAN = 1,
+    AION_GPU_BACKEND_D3D12 = 2,
+    AION_GPU_BACKEND_METAL = 3,
+    AION_GPU_BACKEND_GL = 4,
+} AionGpuBackend;
+
+typedef struct AionGpuOptions {
+    AionGpuPower power;
+    AionGpuBackend backend;
+    int32_t adapter_index;
+} AionGpuOptions;
+
 uint32_t aion_version_major(void);
 uint32_t aion_version_minor(void);
 uint32_t aion_version_patch(void);
@@ -46,6 +71,11 @@ AionStatus aion_context_last_error_message(
     size_t* out_len);
 
 AionStatus aion_context_create_cpu(size_t thread_count, AionContext** out_ctx);
+AionStatus aion_context_create(
+    size_t thread_count,
+    const AionGpuOptions* gpus,
+    size_t gpu_count,
+    AionContext** out_ctx);
 void aion_context_destroy(AionContext* ctx);
 
 AionStatus aion_tensor_create_empty(
@@ -74,6 +104,9 @@ AionStatus aion_tensor_create(
 
 void aion_tensor_destroy(AionTensor* t);
 
+AionStatus aion_tensor_to(AionTensor* t, AionDeviceKind kind, uint32_t index);
+AionStatus aion_tensor_device(const AionTensor* t, AionDeviceKind* out_kind, uint32_t* out_index);
+
 AionDType aion_tensor_dtype(const AionTensor* t);
 size_t aion_tensor_rank(const AionTensor* t);
 AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, size_t out_rank);
@@ -84,6 +117,8 @@ AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype, void* o
 
 AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, AionLoadedModel** out_model);
 AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, AionLoadedModel** out_model);
+AionStatus aion_loaded_model_load_path_on(AionContext* ctx, const char* path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
+AionStatus aion_loaded_model_load_path_absolute_on(AionContext* ctx, const char* absolute_path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
 void aion_loaded_model_destroy(AionLoadedModel* m);
 
 size_t aion_loaded_model_input_count(const AionLoadedModel* m);

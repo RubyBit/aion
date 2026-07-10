@@ -11,6 +11,7 @@ const wgpu_dm = @import("device_memory.zig");
 const pipelines = @import("pipelines.zig");
 const resident = @import("../../runtime/residency/resident_store.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
+const Frame = @import("frame.zig").Frame;
 
 pub const Ctx = struct {
     gpu: *wgpu.Gpu,
@@ -23,6 +24,21 @@ pub const Ctx = struct {
     /// one frame: dispatches in a pass are ordered, and each multi-stage op
     /// consumes its partials before the next op overwrites them.
     scratch: *ScratchPool,
+
+    /// Submit the pending frame before an imminent record-time HOST read of
+    /// tile `(id, 0)`, but ONLY when that tile is device-dirty (a GPU write not
+    /// yet flushed to host). This is the single invariant that keeps
+    /// control-flow-driven decode correct: any op that resolves an index/offset
+    /// on the host at record time (gather/scatter/kv-append fallbacks) must call
+    /// this immediately before it reads that value, so a producer still sitting
+    /// in the unsubmitted frame is queued and the following D2H poll waits for
+    /// it. Co-locating it with the host read (rather than blanket-syncing before
+    /// the op) means device-path ops — which read their index on-device — pay
+    /// nothing, and no future host-read site can silently reintroduce the stale-
+    /// index (token-doubling) hazard. No-op for host-resident indices.
+    pub fn submitPendingIfDeviceDirty(ctx: Ctx, frame: *Frame, id: tensor_store.TensorId) error{ExecutionFailed}!void {
+        if (ctx.rstore.tileDeviceDirty(id, 0)) try frame.flushInPlace();
+    }
 };
 
 /// Grow-only pooled device buffer (same pattern as MatmulNt's dequant scratch,
@@ -48,7 +64,10 @@ pub const ScratchPool = struct {
         }
         const MiB: u64 = 1024 * 1024;
         const cap = (bytes + MiB - 1) / MiB * MiB;
-        const b = wgpu.createBuffer(gpu.device, cap, wgpu.c.WGPUBufferUsage_Storage) catch return error.ExecutionFailed;
+        // Storage for compute stages + copy src/dst so it can also serve as a
+        // packed staging buffer for view materialization (reshape/retile/conv-x).
+        const usage = wgpu.c.WGPUBufferUsage_Storage | wgpu.c.WGPUBufferUsage_CopySrc | wgpu.c.WGPUBufferUsage_CopyDst;
+        const b = wgpu.createBuffer(gpu.device, cap, usage) catch return error.ExecutionFailed;
         self.buf = b;
         self.cap = cap;
         return b;

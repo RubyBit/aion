@@ -43,8 +43,11 @@ const WG_1D: u32 = 64;
 const Q8RowParams = extern struct { n: u32 = 0, k: u32 = 0, src_wpr: u32, dst_row: u32, count: u32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 /// Matches rope.wgsl `Params`.
 const RopeParams = extern struct { count: u32, th: u32, tn: u32, pairs_total: u32, rope_pairs: u32, freq_step: f32, scale_factor: f32, _pad: u32 = 0 };
-/// Matches gather.wgsl `Params`.
-const GatherRowsParams = extern struct { rows: u32, d: u32, v: u32, total: u32 };
+/// Matches gather.wgsl `Params` (shared by all three gather.wgsl entry points).
+/// `wpr` = u32 words per q8_0 table row (unused by the f32 gather / scatter).
+/// `total` = work items: output elements (f32 gather), block pairs (q8 gather),
+/// or words per row (scatter). See each entry point for the field mapping.
+const GatherParams = extern struct { rows: u32, d: u32, v: u32, wpr: u32 = 0, total: u32 };
 
 fn groups1D(n: u32) u32 {
     return @max(1, @min(context.ceilDiv(n, WG_1D), context.MAX_GROUPS_1D));
@@ -127,7 +130,7 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRowsTiled
             if (t_n < v_total * d_total or o_n < rows * d_total or i_n < rows) break :fast;
 
             const total = std.math.cast(u32, rows * d_total) orelse break :fast;
-            const params: GatherRowsParams = .{
+            const params: GatherParams = .{
                 .rows = @intCast(rows),
                 .d = @intCast(d_total),
                 .v = @intCast(v_total),
@@ -145,6 +148,54 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRowsTiled
         }
     }
 
+    // Fast path: q8_0 single-tile table → ONE device-side dequant-gather dispatch
+    // with the index read on-device. Same win as the f32 path for quantized
+    // embedding tables (the autoregressive-decode common case): no per-row encoder
+    // copies and no host index read (which forces a control-flow sync when a GPU
+    // op produced the index). The checks above already guarantee d_total % 64 == 0
+    // and table cols whole for a quant table.
+    if (table_is_quant and out_meta.dtype == .f32 and
+        context.totalTiles(table_meta) == 1 and context.totalTiles(out_meta) == 1)
+    {
+        const dt = ctx.rstore.acquireTileDeviceConstLinear(s.table, 0) catch return error.ExecutionFailed;
+        defer hs.releaseConst(dt.token);
+        const di = ctx.rstore.acquireTileDeviceConstLinear(s.indices, 0) catch return error.ExecutionFailed;
+        defer hs.releaseConst(di.token);
+        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+        defer hs.releaseMut(dout.token);
+        if (context.storageBindingFits(ctx, dt.len) and context.storageBindingFits(ctx, dout.len)) fast: {
+            const o_n = context.packedElems(dout.rank, dout.shape_mem[0..3], dout.strides_mem[0..3]) orelse break :fast;
+            const i_n = context.packedElemsSized(di.rank, di.shape_mem[0..2], di.strides_mem[0..2], @sizeOf(i32)) orelse break :fast;
+            const rows = b_total * l_total;
+            const wpr = (d_total / 64) * 17; // u32 words per q8_0 table row
+            if (o_n < rows * d_total or i_n < rows) break :fast;
+            if (dt.len < v_total * wpr * @sizeOf(u32)) break :fast;
+
+            const total_pairs = std.math.cast(u32, rows * (d_total / 64)) orelse break :fast;
+            const params: GatherParams = .{
+                .rows = @intCast(rows),
+                .d = @intCast(d_total),
+                .v = @intCast(v_total),
+                .wpr = @intCast(wpr),
+                .total = total_pairs,
+            };
+            const built = try ctx.pipes.get(gather_kernel, "gather_q8_rows_f32");
+            const bufs = [_]c.WGPUBuffer{
+                ctx.devmem.bufferFor(dt.handle).?,
+                ctx.devmem.bufferFor(di.handle).?,
+                ctx.devmem.bufferFor(dout.handle).?,
+            };
+            const sizes = [_]u64{ dt.len, di.len, dout.len };
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(total_pairs), 1, 1 });
+            return;
+        }
+    }
+
+    // Host fallback (multi-tile / f16 / non-64-aligned q8 tables): the index is
+    // read on the host at record time, so submit any producer still pending in
+    // this frame first (no-op for host-resident indices). See
+    // `Ctx.submitPendingIfDeviceDirty`.
+    try ctx.submitPendingIfDeviceDirty(frame, s.indices);
     const idx = try HostI32.acquire(hs, s.indices);
     defer idx.release();
     if (idx.vals.len < b_total * l_total) return error.ExecutionFailed;
@@ -317,6 +368,9 @@ pub fn execKVCacheAppend(ctx: Ctx, frame: *Frame, s: executable.StepKVCacheAppen
     if (row_bytes % 4 != 0) return error.Unsupported;
     if (end_meta.dtype != .i32 or end_meta.shape[0] < batch) return error.Unsupported;
 
+    // end_index is read on the host at record time; submit any pending producer
+    // first (no-op for host-resident offsets). See `Ctx.submitPendingIfDeviceDirty`.
+    try ctx.submitPendingIfDeviceDirty(frame, s.end_index);
     const end_idx = try HostI32.acquire(hs, s.end_index);
     defer end_idx.release();
     if (end_idx.vals.len < batch) return error.ExecutionFailed;
@@ -390,10 +444,11 @@ pub fn execKVCacheAppend(ctx: Ctx, frame: *Frame, s: executable.StepKVCacheAppen
 
 // ---- ScatterRow ----------------------------------------------------------------
 
-/// In-place row write buf[idx] = src (decode token emission). The index is
-/// RECORD-TIME resolved from the host store (same rationale as gather); the row
-/// itself moves with one device buffer copy. v1 mirrors the CPU exec: buf/idx/
-/// src are each a single tile.
+/// In-place row write buf[idx] = src (decode token emission). v1 mirrors the CPU
+/// exec: buf/idx/src are each a single tile. Two paths: a device-side scatter
+/// that reads the destination index ON DEVICE (4-byte scalars) so a GPU-computed
+/// emit index forces no host round-trip, and a record-time host-index fallback
+/// (f16/i8 or non-packed layouts) that submits pending work before its host read.
 pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     const buf_meta = hs.meta(s.buf) catch return error.ExecutionFailed;
@@ -417,12 +472,6 @@ pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) Exe
     const row_bytes = row_size * elem_bytes;
     if (row_bytes % 4 != 0) return error.Unsupported; // device copy granularity
 
-    const idx = try HostI32.acquire(hs, s.idx);
-    defer idx.release();
-    if (idx.vals.len < 1 or idx.vals[0] < 0) return error.ExecutionFailed;
-    const row: usize = @intCast(idx.vals[0]);
-    if (row >= m) return error.ExecutionFailed;
-
     const dsrc = ctx.rstore.acquireTileDeviceConstLinear(s.src, 0) catch return error.ExecutionFailed;
     const dbuf = ctx.rstore.acquireTileDeviceMutLinear(s.buf, 0) catch return error.ExecutionFailed;
     defer {
@@ -435,6 +484,41 @@ pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) Exe
     const src_elems = context.packedElemsSized(dsrc.rank, dsrc.shape_mem[0..src_rank], dsrc.strides_mem[0..src_rank], elem_bytes) orelse return error.Unsupported;
     if (context.packedElemsSized(dbuf.rank, dbuf.shape_mem[0..buf_rank], dbuf.strides_mem[0..buf_rank], elem_bytes) == null) return error.Unsupported;
     if (src_elems < row_size) return error.ExecutionFailed;
+
+    // Fast path: 4-byte scalar → ONE device dispatch with the index read on-device.
+    if (elem_bytes == 4) {
+        const di = ctx.rstore.acquireTileDeviceConstLinear(s.idx, 0) catch return error.ExecutionFailed;
+        defer hs.releaseConst(di.token);
+        if (context.storageBindingFits(ctx, dsrc.len) and context.storageBindingFits(ctx, dbuf.len)) fast: {
+            if (m * row_bytes > dbuf.len) break :fast;
+            const row_words = std.math.cast(u32, row_bytes / 4) orelse break :fast;
+            const params: GatherParams = .{
+                .rows = 1,
+                .d = row_words,
+                .v = @intCast(m),
+                .total = row_words,
+            };
+            const built = try ctx.pipes.get(gather_kernel, "scatter_row_u32");
+            const bufs = [_]c.WGPUBuffer{
+                ctx.devmem.bufferFor(dsrc.handle).?,
+                ctx.devmem.bufferFor(di.handle).?,
+                ctx.devmem.bufferFor(dbuf.handle).?,
+            };
+            const sizes = [_]u64{ dsrc.len, di.len, dbuf.len };
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(row_words), 1, 1 });
+            return;
+        }
+    }
+
+    // Host fallback (f16/i8 or a layout the device path rejected): read the index
+    // on the host at record time — submit any pending producer first (no-op for a
+    // host-resident index). See `Ctx.submitPendingIfDeviceDirty`.
+    try ctx.submitPendingIfDeviceDirty(frame, s.idx);
+    const idx = try HostI32.acquire(hs, s.idx);
+    defer idx.release();
+    if (idx.vals.len < 1 or idx.vals[0] < 0) return error.ExecutionFailed;
+    const row: usize = @intCast(idx.vals[0]);
+    if (row >= m) return error.ExecutionFailed;
     if ((row + 1) * row_bytes > dbuf.len) return error.ExecutionFailed;
 
     frame.recordCopy(

@@ -17,13 +17,13 @@ This subproject is set up to work well with **uv**.
 
 From `bindings/python/`:
 
-- Create/sync the environment (installs `cffi` + test deps, and builds the extension):
-  - Windows (recommended): `uv sync --extra test --no-editable`
-  - Linux: `uv sync --extra test`
+- Create/sync the environment and build the extension. The `dev` dependency
+  group (NumPy, tokenizers, torch, pytest, …) is installed by default:
+  - Windows (recommended): `uv sync --no-editable`
+  - Linux: `uv sync`
 
-If you're developing locally (and want NumPy + tests available), use:
-
-- `uv sync --extra dev --no-editable`
+- For a leaner env with just the test deps: `uv sync --group test`
+- For a runtime-only env (no dev/test tooling): `uv sync --no-default-groups`
 
 - Run tests:
   - `uv run pytest`
@@ -56,12 +56,11 @@ Run it from `bindings/python/`:
 
 ### NumPy interop (optional)
 
-NumPy is an **optional** dependency. If you want fast array interop and better typing for arrays,
-install the extra:
+NumPy is an **optional runtime** dependency (it ships in the default `dev` group, so
+`uv sync` already installs it). For a runtime-only install that still wants NumPy
+interop, use the `numpy` extra: `uv pip install "aion[numpy]"`.
 
-- `uv sync --extra numpy --extra test --no-editable`
-
-Then you can move data between Aion tensors and NumPy efficiently (currently f32 only):
+With NumPy present you can move data between Aion tensors and NumPy efficiently (currently f32 only):
 
 - `Tensor.from_numpy(ctx, array)`
 - `tensor.numpy()`
@@ -92,6 +91,61 @@ If you pass `thread_count`, it creates a dedicated context for that model.
 
 `LoadedModel.run_numpy(...)` is a convenience wrapper that accepts Tensor *or* array-like inputs and
 returns NumPy arrays for outputs.
+
+### GPU support (optional)
+
+GPU is an **opt-in, source-build feature** (it links `wgpu-native` and ships
+`wgpu_native.dll` beside the extension). Enable it with the persistent switch in
+`pyproject.toml`:
+
+```toml
+[tool.aion]
+gpu = true
+```
+
+then rebuild: `uv sync --reinstall-package aion`. Under `uv` this pyproject switch
+is the reliable way to (re)build with GPU — uv's build cache is **env-blind**, so
+`AION_PY_GPU=1` alone won't force a rebuild once a CPU wheel is cached. The
+`AION_PY_GPU` env var still *overrides* the switch (set `AION_PY_GPU=0` to force a
+portable CPU-only build, e.g. for wheels). On a CPU-only build, GPU calls return
+`AION_UNSUPPORTED` (surfaced as `aion.AionError`).
+
+> **GPU status.** Device selection, `tensor.to`, migration round-trips, and GPU
+> model *loading* work. Running *full models* on the GPU is **experimental**: the
+> GPU backend does not yet cover every op real models use, so `model.run()` may
+> raise `AION_UNSUPPORTED`. CPU execution is the supported path today.
+
+Once built with GPU support, and with a discrete GPU present:
+
+```python
+import aion
+
+# Register one GPU as gpu:0 (or Context(gpus=[aion.GpuOptions(power="high")])).
+ctx = aion.Context.gpu()
+
+# Standalone tensors: move onto the GPU (move semantics — the host copy is freed).
+t = aion.Tensor([1.0, 2.0, 3.0], ctx=ctx, device="gpu")
+assert t.device() == "gpu:0"
+t.to("cpu")                     # migrate back before host read/write
+print(t.read_f32())
+
+# Models: load onto the GPU. Keep feeding CPU input tensors — the runtime
+# migrates them on run() and flushes outputs back to host for reading.
+m = aion.LoadedModel.load(ctx, "model.aion", device="gpu")
+```
+
+Notes:
+- `tensor.to("gpu")` frees the host copy; host `read_*`/`write_*` then raise
+  until you `to("cpu")`. Do **not** bind a device-resident tensor as a model
+  input — bind CPU tensors and let the model's runtime migrate them.
+- `aion.load_model(path, device="gpu")` creates a dedicated single-GPU context.
+  The GPU index selects the **physical adapter** (integrated vs discrete):
+  `device="gpu"` picks by power preference (default discrete), `device="gpu:1"`
+  (or `adapter_index=1`) picks adapter 1. For multiple GPUs on one context, build
+  `Context(gpus=[...])` and use `LoadedModel.load(ctx, path, device="gpu:i")`
+  (registry index).
+- Example scripts accept `--device {cpu,gpu,auto}` plus `--gpu-index N` /
+  `--gpu-power {low,high}` (default `cpu`). `low`=integrated, `high`=discrete.
 
 ### Windows note
 

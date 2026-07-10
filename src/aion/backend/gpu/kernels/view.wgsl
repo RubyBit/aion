@@ -59,3 +59,26 @@ fn gather_nd_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
         o[idx] = x[src];
     }
 }
+
+// Strided scatter — the write-side twin of gather_nd. `x` is the contiguous
+// source (a tile's packed elements over `dshape`); each element lands at
+//   o[p.base + sum_d coord_d * p.sstride_d]
+// with `sstride` the DESTINATION (packed) row-major strides. Used to assemble a
+// packed representation from an arbitrarily-tiled tensor for reshape/retile.
+@compute @workgroup_size(64)
+fn scatter_nd_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    for (var idx = gid.x; idx < p.total; idx += stride) {
+        var rem = idx;
+        var dst = p.base;
+        var d = p.rank;
+        while (d > 0u) {
+            d -= 1u;
+            let dim = p.dshape[d / 4u][d % 4u];
+            let coord = rem % dim;
+            rem = rem / dim;
+            dst += coord * p.sstride[d / 4u][d % 4u];
+        }
+        o[dst] = x[idx];
+    }
+}

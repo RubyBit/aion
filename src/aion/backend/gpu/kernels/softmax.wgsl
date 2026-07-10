@@ -47,6 +47,18 @@ fn wg_reduce_sum(lidx: u32, v: f32) -> f32 {
     return r;
 }
 
+// Match the CPU's fast exp approximation (fast_math.expApproxF32) so GPU results
+// track the CPU reference bit-closely — the exact vs approx gap is small per-op
+// but biases downstream argmax/greedy decode (e.g. RNNT). See lstm.wgsl.
+fn expApprox(x_in: f32) -> f32 {
+    let x = clamp(x_in, -80.0, 80.0);
+    let y = x * 1.4426950408889634;
+    let n = i32(floor(y + 0.5));
+    let t = (y - f32(n)) * 0.6931471805599453;
+    let e2 = bitcast<f32>(u32(n + 127) << 23u);
+    return e2 * (1.0 + t * (1.0 + t * (0.5 + t * (0.16666667 + t * 0.041666668))));
+}
+
 @compute @workgroup_size(256)
 fn softmax_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let xb = wid.x * p.x_row;
@@ -58,7 +70,7 @@ fn softmax_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
 
     var s = 0.0;
     for (var c = lidx; c < p.cols; c += WG) {
-        let e = exp(x[xb + c] - row_max);
+        let e = expApprox(clamp(x[xb + c] - row_max, -20.0, 0.0));
         o[ob + c] = e;
         s += e;
     }

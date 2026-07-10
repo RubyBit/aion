@@ -101,6 +101,77 @@ const Geometry = struct {
     pad_mode: types.PadMode,
 };
 
+fn prodU(xs: []const usize) usize {
+    var p: usize = 1;
+    for (xs) |x| p *= x;
+    return p;
+}
+
+/// Whether x has any spatial/channel dim (dims 1..) split into multiple tiles.
+fn xSpatiallyTiled(x_meta: TensorMetaT, rank: usize) bool {
+    var d: usize = 1;
+    while (d < rank) : (d += 1) if (x_meta.tile_counts[d] != 1) return true;
+    return false;
+}
+
+const TensorMetaT = tensor_store_mod.TensorMeta;
+
+/// A conv input materialized into one contiguous scratch tile.
+const MaterializedX = struct { buf: c.WGPUBuffer, len: u64 };
+
+/// Materialize a spatially-tiled x into one contiguous `[batch,H,W,C]` scratch
+/// buffer (the conv kernel needs the whole spatial extent addressable from one
+/// binding). Handles x tiled along a SINGLE dim with the others whole — e.g. a
+/// mel/subsampling input tiled per time-frame. Each tile is a contiguous run in
+/// packed order, so this is `n_tiles * outer` buffer copies. Returns the scratch
+/// buffer + its byte length.
+fn materializeX(ctx: Ctx, frame: *Frame, x_id: executable.TensorId, x_meta: TensorMetaT, rank: usize) ExecuteProgramError!MaterializedX {
+    const hs = ctx.rstore.tensorStore();
+    const elem: usize = 4;
+
+    // Find the single split dim.
+    var sp: ?usize = null;
+    var d: usize = 0;
+    while (d < rank) : (d += 1) {
+        if (x_meta.tile_counts[d] != 1) {
+            if (sp != null) return error.Unsupported; // more than one split dim
+            sp = d;
+        }
+    }
+    const split = sp orelse return error.Unsupported;
+
+    const total_elems = prodU(x_meta.shape[0..rank]);
+    const total_bytes: u64 = @as(u64, total_elems) * elem;
+    if (!context.storageBindingFits(ctx, total_bytes)) return error.Unsupported;
+    const scratch = try ctx.scratch.ensure(ctx.gpu, total_bytes);
+
+    const outer = prodU(x_meta.shape[0..split]);
+    const inner = prodU(x_meta.shape[split + 1 .. rank]);
+    const dim = x_meta.shape[split];
+    const ts = x_meta.tile_shape[split];
+    const n_tiles = x_meta.tile_counts[split];
+    if (ts == 0) return error.Unsupported;
+
+    var t: usize = 0;
+    while (t < n_tiles) : (t += 1) {
+        const lo = t * ts;
+        const this_ts = @min(ts, dim - lo);
+        const xt = ctx.rstore.acquireTileDeviceConstLinear(x_id, t) catch return error.ExecutionFailed;
+        defer hs.releaseConst(xt.token);
+        if (!context.storageBindingFits(ctx, xt.len)) return error.Unsupported;
+        const xt_buf = ctx.devmem.bufferFor(xt.handle).?;
+        const run_bytes: u64 = @as(u64, this_ts) * inner * elem;
+        var o: usize = 0;
+        while (o < outer) : (o += 1) {
+            const src_off: u64 = @as(u64, o * this_ts) * inner * elem;
+            const dst_off: u64 = @as(u64, o * dim + lo) * inner * elem;
+            if (src_off + run_bytes > xt.len) return error.ExecutionFailed;
+            frame.recordCopy(xt_buf, src_off, scratch, dst_off, run_bytes);
+        }
+    }
+    return .{ .buf = scratch, .len = total_bytes };
+}
+
 pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
@@ -181,11 +252,13 @@ fn execConv(
         },
     }
 
-    // x: spatial/channel dims in one tile; tiles (if any) split only the batch.
-    var d: usize = 1;
-    while (d < rank) : (d += 1) {
-        if (x_meta.tile_counts[d] != 1) return error.Unsupported;
-    }
+    // x: the kernel needs the whole spatial/channel extent from one binding. If
+    // the compiler split a spatial/channel dim (e.g. a mel input tiled per
+    // time-frame), materialize x into one contiguous scratch tile first.
+    const x_materialized: ?MaterializedX = if (xSpatiallyTiled(x_meta, rank))
+        try materializeX(ctx, frame, x_id, x_meta, rank)
+    else
+        null;
     // w / bias: single packed tiles.
     if (context.totalTiles(w_meta) != 1) return error.Unsupported;
     var bias_tile: ?resident_mod.TileRefDevice = null;
@@ -226,20 +299,32 @@ fn execConv(
         if (out_meta.tile_shape[0] != 1) return error.Unsupported; // one batch per out tile
         const b = coords[0];
 
-        const x_lin = b / x_meta.tile_shape[0];
-        if (x_cached == null or x_cached.? != x_lin) {
-            if (x_cached != null) hs.releaseConst(x_tile.token);
-            x_cached = null;
-            x_tile = ctx.rstore.acquireTileDeviceConstLinear(x_id, x_lin) catch return error.ExecutionFailed;
-            x_cached = x_lin;
-            if (!context.storageBindingFits(ctx, x_tile.len)) return error.Unsupported;
-            if (context.packedElems(x_tile.rank, x_tile.shape_mem[0..rank], x_tile.strides_mem[0..rank]) == null) return error.Unsupported;
-            var xd: usize = 1;
-            while (xd < rank) : (xd += 1) {
-                if (x_tile.shape_mem[xd] != x_meta.shape[xd]) return error.Unsupported;
+        var x_buf: c.WGPUBuffer = undefined;
+        var x_len: u64 = undefined;
+        var x_base: usize = undefined;
+        if (x_materialized) |xm| {
+            // Whole [batch,H,W,C] contiguous in scratch — index by batch directly.
+            x_buf = xm.buf;
+            x_len = xm.len;
+            x_base = b * x_batch_elems;
+        } else {
+            const x_lin = b / x_meta.tile_shape[0];
+            if (x_cached == null or x_cached.? != x_lin) {
+                if (x_cached != null) hs.releaseConst(x_tile.token);
+                x_cached = null;
+                x_tile = ctx.rstore.acquireTileDeviceConstLinear(x_id, x_lin) catch return error.ExecutionFailed;
+                x_cached = x_lin;
+                if (!context.storageBindingFits(ctx, x_tile.len)) return error.Unsupported;
+                if (context.packedElems(x_tile.rank, x_tile.shape_mem[0..rank], x_tile.strides_mem[0..rank]) == null) return error.Unsupported;
+                var xd: usize = 1;
+                while (xd < rank) : (xd += 1) {
+                    if (x_tile.shape_mem[xd] != x_meta.shape[xd]) return error.Unsupported;
+                }
             }
+            x_buf = ctx.devmem.bufferFor(x_tile.handle).?;
+            x_len = x_tile.len;
+            x_base = (b % x_meta.tile_shape[0]) * x_batch_elems;
         }
-        const x_base = (b % x_meta.tile_shape[0]) * x_batch_elems;
 
         const dout = ctx.rstore.acquireTileDeviceMutLinear(out_id, ti) catch return error.ExecutionFailed;
         defer hs.releaseMut(dout.token);
@@ -281,12 +366,12 @@ fn execConv(
         const bias_buf = if (bias_tile) |bt| ctx.devmem.bufferFor(bt.handle).? else ctx.devmem.bufferFor(dw.handle).?;
         const bias_len = if (bias_tile) |bt| bt.len else dw.len;
         const bufs = [_]c.WGPUBuffer{
-            ctx.devmem.bufferFor(x_tile.handle).?,
+            x_buf,
             ctx.devmem.bufferFor(dw.handle).?,
             bias_buf,
             ctx.devmem.bufferFor(dout.handle).?,
         };
-        const sizes = [_]u64{ x_tile.len, dw.len, bias_len, dout.len };
+        const sizes = [_]u64{ x_len, dw.len, bias_len, dout.len };
 
         // Depthwise: 2D grid (channel-groups x length-blocks); fall back to the
         // grid-strided generic kernel if either grid dim exceeds the per-dim cap.

@@ -46,6 +46,15 @@ var<workgroup> q_s: array<f32, 512>;
 var<workgroup> p_sh: array<f32, 256>;
 var<workgroup> red: array<f32, 256>;
 
+fn expApprox(x_in: f32) -> f32 {
+    let xc = clamp(x_in, -80.0, 80.0);
+    let yy = xc * 1.4426950408889634;
+    let nn = i32(floor(yy + 0.5));
+    let tt = (yy - f32(nn)) * 0.6931471805599453;
+    let e2 = bitcast<f32>(u32(nn + 127) << 23u);
+    return e2 * (1.0 + tt * (1.0 + tt * (0.5 + tt * (0.16666667 + tt * 0.041666668))));
+}
+
 fn wg_max(lidx: u32, x: f32) -> f32 {
     red[lidx] = x;
     workgroupBarrier();
@@ -105,9 +114,9 @@ fn attn_row_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
         // Online softmax update. exp(FMIN - m_new) underflows to 0, which is
         // exactly the "no previous state" rescale.
         let m_new = max(m_state, wg_max(lidx, s));
-        let rescale = exp(m_state - m_new);
+        let rescale = expApprox(m_state - m_new);
         var prob = 0.0;
-        if (j < kmax) { prob = exp(s - m_new); }
+        if (j < kmax) { prob = expApprox(s - m_new); }
         p_sh[lidx] = prob;
         l_state = l_state * rescale + wg_sum(lidx, prob);
         m_state = m_new;

@@ -54,6 +54,7 @@ const lstm_exec = @import("exec/lstm.zig");
 const fft_ops = @import("exec/fft_ops.zig");
 const view_ops = @import("exec/view_ops.zig");
 const matmul_exec = @import("exec/matmul.zig");
+const autotune = @import("autotune.zig");
 const matmul_nt = @import("exec/matmul_nt.zig");
 const frame_mod = @import("frame.zig");
 const backend_mod = @import("../backend.zig");
@@ -104,6 +105,15 @@ pub const GpuBackend = struct {
     /// `devmem.pool` points at it. Null when only one hardware thread is available.
     pool: ?thread_pool_mod.ThreadPool = null,
 
+    /// Reused per-dispatch uniform buffers (see `frame.UniformPool`) — cuts the
+    /// ~700 create/release driver calls a decode step would otherwise pay.
+    uniform_pool: frame_mod.UniformPool,
+
+    /// Reused per-dispatch bind groups + uniforms (see `frame.BindGroupCache`) —
+    /// the decode program is identical each step, so bind groups are built once
+    /// and replayed, removing the dominant CPU record cost. Supersedes the pool.
+    bind_cache: frame_mod.BindGroupCache,
+
     const Self = @This();
 
     /// D2H memcpy is memory-bandwidth bound; a few threads saturate it. Cap low so
@@ -117,6 +127,8 @@ pub const GpuBackend = struct {
             .devmem = wgpu_dm.WgpuDeviceMemory.init(allocator, gpu),
             .pipes = pipelines_mod.Pipelines.init(allocator, gpu),
             .matmul = matmul_exec.Matmul.init(allocator),
+            .uniform_pool = .{ .gpu = gpu, .allocator = allocator },
+            .bind_cache = .{ .gpu = gpu, .allocator = allocator },
         };
         const hw = std.Thread.getCpuCount() catch 1;
         const n = @max(@as(usize, 1), @min(hw, D2H_MAX_THREADS));
@@ -134,6 +146,8 @@ pub const GpuBackend = struct {
         self.scratch.deinit();
         self.pipes.deinit();
         self.devmem.deinit();
+        self.uniform_pool.deinit();
+        self.bind_cache.deinit();
         if (self.pool) |*p| p.deinit();
         self.* = undefined;
     }
@@ -221,24 +235,45 @@ pub const GpuBackend = struct {
     /// device poll (inside the D2H readback), not two. `Frame.records` lets a
     /// fixed-trip Loop record its whole unrolled body into one frame and submit
     /// once, with zero syncs.
+    const STEP_TAGS = @typeInfo(executable.Step).@"union".fields.len;
+
     const Runner = struct {
         gb: *Self,
         op_ctx: context.Ctx,
         prog: *const ExecutableProgram,
         frame: Frame,
 
-        /// Submit the pending frame WITHOUT waiting, then start a fresh frame.
-        /// No-op when nothing is recorded. We deliberately do not poll here:
-        /// queue submissions execute in order, so a later D2H readback (whose own
-        /// poll waits for all prior work) or a later frame sees these results
-        /// without a redundant stall. Callers that need the result on the host
-        /// follow this with `readI32Scalar`, whose `copyD2H` performs the single
-        /// necessary poll.
+        // Diagnostic (AION_GPU_PROFILE_OPS): per-op-kind record-time + count. Zero
+        // cost when off. Note the If/Loop buckets are INCLUSIVE of their nested
+        // body ops (runStep recurses), so a large Loop bucket vs a small sum of
+        // leaf ops = the loop is dominated by per-iteration predicate-poll waits.
+        prof_ops: bool = false,
+        // AION_GPU_TIME_OPS: submit+poll after each top-level op to attribute true
+        // GPU exec time per op-kind (serializes the run — diagnostic only).
+        time_ops: bool = false,
+        op_ns: [STEP_TAGS]u64 = @splat(0),
+        op_count: [STEP_TAGS]u64 = @splat(0),
+        gpu_ns: [STEP_TAGS]u64 = @splat(0),
+        // Loop split: time recording bodies vs waiting on the cond predicate poll.
+        loop_body_ns: u64 = 0,
+        loop_cond_ns: u64 = 0,
+        // Recursion depth (0 = top-level / encoder). Op times are attributed only
+        // at depth 0 so the per-op-kind breakdown is encoder-only (the Loop's own
+        // bucket already totals the loop; its nested body ops would double-count).
+        depth: u32 = 0,
+        // Time spent in chunked (top-level) submitPending flushes — the encoder's
+        // queue-submit cost, distinct from the loop's cond-poll waits.
+        chunk_submit_ns: u64 = 0,
+
+        /// Submit the pending frame WITHOUT waiting, then keep recording into a
+        /// fresh encoder on the same frame (see `Frame.flushInPlace`). No-op when
+        /// nothing is recorded. We deliberately do not poll here: queue
+        /// submissions execute in order, so a later D2H readback (whose own poll
+        /// waits for all prior work) or a later frame sees these results without a
+        /// redundant stall. Callers that need the result on the host follow this
+        /// with `readI32Scalar`, whose `copyD2H` performs the single poll.
         fn submitPending(r: *Runner) ExecuteProgramError!void {
-            if (r.frame.records == 0) return;
-            r.frame.submit();
-            r.frame.deinit();
-            r.frame = Frame.init(r.gb.allocator, r.gb.gpu) catch return error.ExecutionFailed;
+            r.frame.flushInPlace() catch return error.ExecutionFailed;
         }
 
         /// Read an i32 control-flow predicate to the host with the minimum GPU
@@ -314,10 +349,33 @@ pub const GpuBackend = struct {
         fn runBlock(r: *Runner, block_id: executable.BlockId) ExecuteProgramError!void {
             const idx: usize = @intCast(block_id);
             if (idx >= r.prog.blocks.len) return error.ExecutionFailed;
+            r.depth += 1;
+            defer r.depth -= 1;
             for (r.prog.blocks[idx].steps) |step| try r.runStep(step);
         }
 
         fn runStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
+            const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
+            r.dispatchStep(step) catch |e| {
+                if (std.c.getenv("AION_GPU_TRACE") != null)
+                    std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
+                return e;
+            };
+            if (r.prof_ops and r.depth == 0) {
+                const tag = @intFromEnum(std.meta.activeTag(step));
+                const t1 = autotune.nowNs();
+                r.op_ns[tag] += t1 - t0;
+                r.op_count[tag] += 1;
+                if (r.time_ops) {
+                    // Submit this op and wait, isolating its GPU exec (serialized).
+                    try r.submitPending();
+                    _ = wgpu.c.wgpuDevicePoll(r.gb.gpu.device, 1, null);
+                    r.gpu_ns[tag] += autotune.nowNs() - t1;
+                }
+            }
+        }
+
+        fn dispatchStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
             const op_ctx = r.op_ctx;
             const frame = &r.frame;
             switch (step) {
@@ -383,14 +441,22 @@ pub const GpuBackend = struct {
                     while (iter < max_iters) : (iter += 1) {
                         if (s.check_before) {
                             if (s.cond) |cid| {
-                                if ((try r.readPredicate(cid)) == 0) break;
+                                const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
+                                const p = try r.readPredicate(cid);
+                                if (r.prof_ops) r.loop_cond_ns += autotune.nowNs() - t0;
+                                if (p == 0) break;
                             }
                         }
+                        const tb: u64 = if (r.prof_ops) autotune.nowNs() else 0;
                         try r.runBlock(s.body_block);
+                        if (r.prof_ops) r.loop_body_ns += autotune.nowNs() - tb;
                         try r.swapLists(s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
                         if (!s.check_before) {
                             if (s.cond) |cid| {
-                                if ((try r.readPredicate(cid)) == 0) break;
+                                const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
+                                const p = try r.readPredicate(cid);
+                                if (r.prof_ops) r.loop_cond_ns += autotune.nowNs() - t0;
+                                if (p == 0) break;
                             }
                         }
                     }
@@ -415,12 +481,90 @@ pub const GpuBackend = struct {
         };
         defer runner.frame.deinit();
 
-        for (prog.steps) |step| try runner.runStep(step);
+        // Reuse pooled per-dispatch uniforms + cached bind groups this run. Safe:
+        // the prior run ended with a readback poll, so its GPU work (and all its
+        // uniform/bind-group reads) are complete before we replay them.
+        self.uniform_pool.reset();
+        self.bind_cache.reset();
+        runner.frame.uniform_pool = &self.uniform_pool;
+        if (std.c.getenv("AION_GPU_NO_CACHE") == null) runner.frame.bind_cache = &self.bind_cache;
+
+        runner.time_ops = std.c.getenv("AION_GPU_TIME_OPS") != null;
+        runner.prof_ops = std.c.getenv("AION_GPU_PROFILE_OPS") != null or runner.time_ops;
+        const profile = std.c.getenv("AION_GPU_PROFILE") != null or runner.prof_ops;
+        const t_start: u64 = if (profile) autotune.nowNs() else 0;
+
+        // Chunked submit: flush the pending frame every SUBMIT_CHUNK steps
+        // (submit WITHOUT polling — queue ordering + wgpu's cross-submit resource
+        // tracking preserve correctness). The GPU starts executing early chunks
+        // while the CPU is still recording later ones, overlapping the ~10ms of
+        // per-dispatch record cost with the GPU execution instead of paying them
+        // back-to-back. For a program with control flow the inner submitPending
+        // calls already split frames; this just adds periodic flushes.
+        var submit_chunk: usize = 32;
+        if (std.c.getenv("AION_GPU_CHUNK")) |e| {
+            if (std.fmt.parseInt(usize, std.mem.span(e), 10)) |v| {
+                if (v > 0) submit_chunk = v;
+            } else |_| {}
+        }
+        const SUBMIT_CHUNK = submit_chunk;
+        var since_submit: usize = 0;
+        for (prog.steps) |step| {
+            try runner.runStep(step);
+            since_submit += 1;
+            if (since_submit >= SUBMIT_CHUNK) {
+                const ts: u64 = if (runner.prof_ops) autotune.nowNs() else 0;
+                try runner.submitPending();
+                if (runner.prof_ops) runner.chunk_submit_ns += autotune.nowNs() - ts;
+                since_submit = 0;
+            }
+        }
+
+        const t_recorded: u64 = if (profile) autotune.nowNs() else 0;
 
         runner.frame.submit();
 
         if (self.flush_outputs) {
             for (prog.outputs) |oid| try flushToHost(rstore, oid);
+        }
+
+        if (profile) {
+            const now = autotune.nowNs();
+            const total: u64 = now - t_start;
+            const record: u64 = t_recorded - t_start;
+            const exec: u64 = now - t_recorded;
+            var n_matmul: usize = 0;
+            for (prog.steps) |step| switch (step) {
+                .MatMulTiled, .MatMulNTTiled => n_matmul += 1,
+                else => {},
+            };
+            const f = struct {
+                fn ms(x: u64) f64 {
+                    return @as(f64, @floatFromInt(x)) / 1.0e6;
+                }
+            };
+            std.debug.print(
+                "[gpu-prof] run: {d:.3} ms (record {d:.3} + submit/readback {d:.3})  steps={d}  matmuls={d}  submits={d}\n",
+                .{ f.ms(total), f.ms(record), f.ms(exec), prog.steps.len, n_matmul, runner.frame.submits },
+            );
+            if (runner.prof_ops) {
+                inline for (@typeInfo(executable.Step).@"union".fields, 0..) |fld, i| {
+                    if (runner.op_count[i] > 0) {
+                        if (runner.time_ops)
+                            std.debug.print("[gpu-ops] {s:<28} record {d:>8.2} ms  gpu-exec {d:>9.2} ms  x{d}\n", .{ fld.name, f.ms(runner.op_ns[i]), f.ms(runner.gpu_ns[i]), runner.op_count[i] })
+                        else
+                            std.debug.print("[gpu-ops] {s:<28} {d:>9.2} ms  x{d}\n", .{ fld.name, f.ms(runner.op_ns[i]), runner.op_count[i] });
+                    }
+                }
+                std.debug.print(
+                    "[gpu-loop] body-record {d:.2} ms + cond-poll(wait) {d:.2} ms  (overlap ceiling ~= min)\n",
+                    .{ f.ms(runner.loop_body_ns), f.ms(runner.loop_cond_ns) },
+                );
+                std.debug.print(
+                    "[gpu-enc] top-level op-record above is encoder-only; chunked-submit(flush) {d:.2} ms\n",
+                    .{f.ms(runner.chunk_submit_ns)},
+                );
+            }
         }
     }
 

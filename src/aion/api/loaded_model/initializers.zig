@@ -115,6 +115,7 @@ pub fn createTensorForShape(
 pub fn zeroStoreTensor(store: *types_mod.StorageManager, tid: types_mod.TensorId) manager_mod.StorageError!void {
     const t = try store.getMut(tid);
     @memset(t.data, 0);
+    t.host_seq +%= 1; // host mutation: invalidate any device copy
 }
 
 /// Create a tensor sized to `shape` but tiled as a single physical tile (tile_shape == shape).
@@ -177,7 +178,7 @@ pub fn createTensorForShapeWithQuantAxis(
         tile_shape[rank - 2] = tiles[0];
         tile_shape[rank - 1] = tiles[1];
     } else if (is_quant and shape.len == 2 and quant_axis == 1) {
-        const tiles = api_tiling.chooseQuantEmbeddingTableTiles(policy, shape[0], shape[1]);
+        const tiles = api_tiling.chooseQuantEmbeddingTableTiles(policy, dtype, shape[0], shape[1]);
         tile_shape[0] = tiles[0];
         tile_shape[1] = tiles[1];
     } else {

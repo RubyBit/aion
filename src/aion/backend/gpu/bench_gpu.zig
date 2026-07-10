@@ -41,7 +41,7 @@ const nowNs = bk.nowNs;
 
 const out = std.debug;
 
-const Suite = enum { matmul, ops, nt, kernels };
+const Suite = enum { matmul, ops, nt, kernels, decode };
 
 const Args = struct {
     m: usize = 1024,
@@ -77,7 +77,7 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (std.mem.eql(u8, arg, "--gpu-only")) a.gpu_only = true;
     if (valueFor(arg, "--op", it)) |v| a.op_filter = v;
     if (valueFor(arg, "--suite", it)) |v| {
-        a.suite = if (std.mem.eql(u8, v, "ops")) .ops else if (std.mem.eql(u8, v, "nt")) .nt else if (std.mem.eql(u8, v, "kernels")) .kernels else .matmul;
+        a.suite = if (std.mem.eql(u8, v, "ops")) .ops else if (std.mem.eql(u8, v, "nt")) .nt else if (std.mem.eql(u8, v, "kernels")) .kernels else if (std.mem.eql(u8, v, "decode")) .decode else .matmul;
     }
     if (std.mem.eql(u8, arg, "--high")) a.opts.power = .high;
     if (std.mem.eql(u8, arg, "--low")) a.opts.power = .low;
@@ -425,6 +425,102 @@ fn runNt(alloc: std.mem.Allocator, a: Args) !void {
     }
 }
 
+// ---- decode suite (plain MatMul, K-major q8_0 B, M==1 — the Gemma GEMV) -----
+
+/// Pack f32 [k, n] into ggml q8_0 blocks quantized ALONG K (block grid [k/32, n]).
+fn packQ8Kmajor(alloc: std.mem.Allocator, vals: []const f32, k: usize, n: usize) ![]u8 {
+    const bpr = k / 32;
+    const out_bytes = try alloc.alloc(u8, bpr * n * 34);
+    for (0..bpr) |bk_i| {
+        for (0..n) |col| {
+            var absmax: f32 = 0;
+            for (0..32) |kk| absmax = @max(absmax, @abs(vals[(bk_i * 32 + kk) * n + col]));
+            const scale: f32 = if (absmax == 0) 1.0 else absmax / 127.0;
+            const inv: f32 = if (absmax == 0) 0 else 1.0 / scale;
+            const off = (bk_i * n + col) * 34;
+            std.mem.writeInt(u16, out_bytes[off..][0..2], @bitCast(@as(f16, @floatCast(scale))), .little);
+            for (0..32) |kk| {
+                const v = vals[(bk_i * 32 + kk) * n + col];
+                const q: i32 = std.math.clamp(@as(i32, @intFromFloat(@round(v * inv))), -128, 127);
+                out_bytes[off + 2 + kk] = @bitCast(@as(i8, @intCast(q)));
+            }
+        }
+    }
+    return out_bytes;
+}
+
+/// Build `C[1,n] = A[1,k] @ B[k,n]` with B q8_0 quantized along K, single tile.
+fn buildDecode(alloc: std.mem.Allocator, mgr: *StorageManager, n: usize, k: usize) !struct { prog: aion.program.Program, out: TensorId } {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+
+    const a_id = try mgr.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
+    try fillTensor(alloc, mgr, a_id, k, 1);
+    const av = try g.addInput(.f32, &[_]usize{ 1, k });
+    try g.bindExternal(av, a_id);
+
+    const b_vals = try alloc.alloc(f32, k * n);
+    defer alloc.free(b_vals);
+    for (b_vals, 0..) |*v, i| {
+        const p: usize = (i * 2654435761 + 77) % 1000;
+        v.* = (@as(f32, @floatFromInt(p)) - 500.0) * 0.004;
+    }
+    const packed_b = try packQ8Kmajor(alloc, b_vals, k, n);
+    defer alloc.free(packed_b);
+    // Match the tile the GPU policy will choose for a quant B (else the quant
+    // tensor can't be retiled at compile → InvalidArgument).
+    const tiles = plan.chooseMatMulTiles(gpu_policy, @max(@as(usize, 1), gpu_policy.base_square_2d), n, k, .q8_0);
+    const b_id = try mgr.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = 64, .quant_axis = 0 });
+    try mgr.writeFromPackedQuant(b_id, packed_b);
+    const bv = try g.addInput(.q8_0, &[_]usize{ k, n });
+    try g.bindExternal(bv, b_id);
+
+    const cv = try g.addMatMul(av, bv, 1.0, 0.0);
+    try g.setOutputs(&[_]aion.graph.ValueId{cv});
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    return .{ .prog = prog, .out = prog.outputs[0] };
+}
+
+fn benchDecode(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize, k: usize) !void {
+    const b_bytes: f64 = @floatFromInt((k / 32) * n * 34);
+    const flops: f64 = 2.0 * @as(f64, @floatFromInt(n * k));
+
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+    var built = try buildDecode(alloc, &mgr, n, k);
+    defer built.prog.deinit();
+    var session = try gb.backend().createSession(mgr.tensorStore());
+    defer session.deinit();
+    const kernel_ns = try timeGpuKernel(gb, session, &built.prog, a.iters);
+    const gpu_ns = try timeSession(session, &built.prog, a.iters);
+
+    var lbuf: [24]u8 = undefined;
+    const row_label = std.fmt.bufPrint(&lbuf, "gemv-q8 N={d}", .{n}) catch "gemv-q8";
+    bk.report(.{ .label = row_label, .iters = a.iters, .ns = kernel_ns, .bytes = b_bytes, .flops = flops, .e2e_ns = gpu_ns });
+}
+
+fn runDecode(alloc: std.mem.Allocator, a: Args) !void {
+    out.print("decode GEMV (plain MatMul, K-major q8_0 B, M=1): iters={d}\n", .{a.iters});
+    var device = wgpu.Gpu.init(a.opts) catch |e| {
+        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+        return;
+    };
+    defer device.deinit();
+    const d = device.describe();
+    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    // Gemma-4 E2B decode matmul shapes (K, N), M=1: q/k/v & o proj, gate/up, down.
+    const shapes = [_][2]usize{
+        .{ 2048, 2048 }, // o_proj / attn out
+        .{ 2048, 12288 }, // gate+up fused (wide N)
+        .{ 6144, 2048 }, // down_proj (source layers, ffn=6144)
+        .{ 12288, 2048 }, // down_proj (deep layers, ffn=12288)
+    };
+    for (shapes) |s| try benchDecode(alloc, &gb, a, s[1], s[0]);
+}
+
 fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) !void {
     const info = kInfo(op);
 
@@ -572,6 +668,7 @@ fn run(args: std.process.Args) !void {
     if (a.suite == .ops) return runOps(alloc, a);
     if (a.suite == .nt) return runNt(alloc, a);
     if (a.suite == .kernels) return runKernels(alloc, a);
+    if (a.suite == .decode) return runDecode(alloc, a);
 
     const tiles = plan.chooseMatMulTiles(gpu_policy, a.m, a.n, a.k, .f32);
     out.print("matmul f32: M={d} N={d} K={d}, iters={d}\n", .{ a.m, a.n, a.k, a.iters });

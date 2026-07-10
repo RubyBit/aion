@@ -24,6 +24,9 @@ pub const TensorMeta = struct {
     tile_shape: []const usize,
     tile_counts: []const usize,
     tile_strides: []const usize,
+    /// Monotonic host-write counter (see `TiledTensor.host_seq`). A residency
+    /// layer compares this to detect out-of-band host writes and re-upload.
+    host_seq: u64 = 0,
 };
 
 pub const INLINE_RANK: usize = 8;

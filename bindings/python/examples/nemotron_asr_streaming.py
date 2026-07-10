@@ -37,6 +37,8 @@ import numpy as np
 
 import aion
 
+from _common import add_device_args, load_model_with_device
+
 SAMPLE_RATE = 16000
 N_FFT = 512
 WIN = 400
@@ -114,7 +116,7 @@ def _fit_samples(audio: np.ndarray, n: int) -> np.ndarray:
     return audio[:n]
 
 
-def run_single_file(model_path: str, audio: np.ndarray, t_mel: int, max_out: int, threads):
+def run_single_file(model_path: str, audio: np.ndarray, t_mel: int, max_out: int, threads, args):
     """Run the all-in-one .aion (in-graph log-mel + encoder + in-graph RNNT decode).
 
     Takes raw 16 kHz audio — mel is computed inside the graph. Decode state is
@@ -127,7 +129,8 @@ def run_single_file(model_path: str, audio: np.ndarray, t_mel: int, max_out: int
     zero bookkeeping carries (frame/sym/count/toks) are left unbound: the runtime
     auto-initializes any unbound input to zeros (LoadModelOptions.auto_init_inputs).
     """
-    m = aion.load_model(model_path, thread_count=threads)
+    m, dev = load_model_with_device(model_path, args, thread_count=threads)
+    print(f"device: {dev}")
     ctx = m.context
     n = (t_mel - 1) * HOP  # samples whose center-STFT yields t_mel frames
     a = _fit_samples(audio, n).astype(np.float32)
@@ -150,7 +153,7 @@ def _calc_len(length):
     return length
 
 
-def run_streaming(stream_full_path, audio, tokenizer, threads, att_left=70, att_right=6):
+def run_streaming(stream_full_path, audio, tokenizer, threads, args, att_left=70, att_right=6):
     """Cache-aware streaming with ONE self-contained model (in-graph mel + subsample
     + cached conformer + in-graph RNNT decode). Per chunk (= att_right+1 encoder
     frames) it slides a left-context audio window and threads ALL state — per-layer
@@ -179,7 +182,8 @@ def run_streaming(stream_full_path, audio, tokenizer, threads, att_left=70, att_
     step = chunk * 8 * HOP            # new audio samples per chunk
     pad = 16 * HOP                   # front-pad: chunk c window = buf[c*step : +wsamp]
     max_out = 64
-    m = aion.load_model(stream_full_path, thread_count=threads)
+    m, dev = load_model_with_device(stream_full_path, args, thread_count=threads)
+    print(f"device: {dev}")
     ctx = m.context
     fn = lambda a: aion.Tensor.from_numpy(ctx, a)
     sp = spm.SentencePieceProcessor(); sp.Load(tokenizer)
@@ -241,6 +245,7 @@ def main() -> None:
     ap.add_argument("--max-out", type=int, default=512, help="single-file: output token buffer size")
     ap.add_argument("--max-symbols", type=int, default=10)
     ap.add_argument("--threads", type=int, default=None)
+    add_device_args(ap)
     args = ap.parse_args()
 
     import re
@@ -267,27 +272,28 @@ def main() -> None:
 
     if args.stream:
         assert args.stream_full, "streaming needs --stream-full"
-        tokens = run_streaming(args.stream_full, audio, args.tokenizer, args.threads,
+        tokens = run_streaming(args.stream_full, audio, args.tokenizer, args.threads, args,
                                att_right=args.att_right)
         print(f"\n[streaming, {len(tokens)} tokens] done\n")
         return
 
     if args.single is not None:
         t_mel = args.t_mel or infer_t_mel(args.single)
-        tokens = run_single_file(args.single, audio, t_mel, args.max_out, args.threads)
+        tokens = run_single_file(args.single, audio, t_mel, args.max_out, args.threads, args)
         text = sp.DecodeIds([int(t) for t in tokens])
         print(f"\n[single-file, {len(tokens)} tokens] transcript:\n{text}\n")
         return
 
     assert args.encoder and args.decoder, "two-graph mode needs --encoder and --decoder"
-    enc_model = aion.load_model(args.encoder, thread_count=args.threads)
+    enc_model, dev = load_model_with_device(args.encoder, args, thread_count=args.threads)
+    print(f"device: {dev}")
     t_mel = args.t_mel or infer_t_mel(args.encoder)
     n = (t_mel - 1) * HOP
     a = _fit_samples(audio, n).astype(np.float32)
     enc = enc_model.run_numpy({"audio": a.reshape(n, 1)}, outputs=["encoder_out"])["encoder_out"][0]
     print(f"encoder out {enc.shape}")
 
-    decoder = aion.load_model(args.decoder, thread_count=args.threads)
+    decoder, _ = load_model_with_device(args.decoder, args, thread_count=args.threads)
     tokens = greedy_decode(decoder, enc, max_symbols=args.max_symbols)
     text = sp.DecodeIds([int(t) for t in tokens])
     print(f"\n[{len(tokens)} tokens] transcript:\n{text}\n")

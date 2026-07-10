@@ -5,6 +5,7 @@ import os
 import weakref
 from typing import Optional, Sequence
 
+from .device import GpuOptions, build_gpu_options_array
 from .errors import raise_for_status
 from ._ffi import ffi, lib
 
@@ -50,20 +51,52 @@ class Context:
                 closing any still-live children first.
     """
 
-    def __init__(self, thread_count: Optional[int] = None):
+    def __init__(
+        self,
+        thread_count: Optional[int] = None,
+        *,
+        gpus: Optional[Sequence[GpuOptions]] = None,
+    ):
+        """Create a context.
+
+        Registering GPUs via `gpus` makes them selectable as `.gpu = i`
+        (in Python: ``"gpu:i"``) for `tensor.to(...)` and `LoadedModel.load(device=)`.
+        `gpus[i]` becomes device index `i`. On a runtime built without GPU support
+        (`-Dgpu`), a non-empty `gpus` raises `AionError` (`AION_UNSUPPORTED`).
+        """
+
         if thread_count is None:
             thread_count = os.cpu_count() or 1
         thread_count = int(thread_count)
         if thread_count <= 0:
             raise ValueError("thread_count must be > 0")
 
+        gpu_list = list(gpus) if gpus else []
+
         out_ctx = ffi.new("AionContext**")
-        st = lib.aion_context_create_cpu(thread_count, out_ctx)
-        raise_for_status(st, None, what="aion_context_create_cpu")
+        gpus_arr, gpu_count = build_gpu_options_array(ffi, gpu_list)
+        st = lib.aion_context_create(thread_count, gpus_arr, gpu_count, out_ctx)
+        raise_for_status(st, None, what="aion_context_create")
 
         self._ctx = out_ctx[0]
         self._closed = False
         self._children: weakref.WeakSet[object] = weakref.WeakSet()
+
+    @classmethod
+    def gpu(
+        cls,
+        *,
+        thread_count: Optional[int] = None,
+        power="high",
+        backend="any",
+        adapter_index: Optional[int] = None,
+    ) -> "Context":
+        """Convenience: create a context with a single GPU registered as ``gpu:0``."""
+
+        return cls(
+            thread_count=thread_count,
+            gpus=[GpuOptions(power=power, backend=backend, adapter_index=adapter_index)],
+        )
 
     @property
     def ptr(self):

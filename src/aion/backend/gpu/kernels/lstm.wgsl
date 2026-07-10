@@ -33,8 +33,33 @@ struct Params {
 
 const WG: u32 = 64u;
 
+// Match the CPU LSTM's fast transcendental approximations (fast_math.zig) so the
+// autoregressive RNNT greedy decode makes the SAME emit-vs-blank argmax decisions
+// as the CPU reference — exact exp/tanh here diverge just enough to double tokens.
+fn expApprox(x_in: f32) -> f32 {
+    let x = clamp(x_in, -80.0, 80.0);
+    let y = x * 1.4426950408889634;              // x / ln2
+    let n = i32(floor(y + 0.5));
+    let t = (y - f32(n)) * 0.6931471805599453;   // r * ln2, r in [-0.5, 0.5]
+    let exp2i = bitcast<f32>(u32(n + 127) << 23u); // 2^n
+    // 4th-order Taylor of exp(t) on t in [-0.35, 0.35].
+    let poly = 1.0 + t * (1.0 + t * (0.5 + t * (0.16666667 + t * 0.041666668)));
+    return exp2i * poly;
+}
+
 fn sigmoid(v: f32) -> f32 {
-    return 1.0 / (1.0 + exp(-v));
+    var y: f32;
+    if (v >= 0.0) {
+        y = 1.0 / (1.0 + expApprox(-v));
+    } else {
+        let e = expApprox(v);
+        y = e / (1.0 + e);
+    }
+    return clamp(y, 0.0, 1.0);
+}
+
+fn tanhApprox(v: f32) -> f32 {
+    return clamp(2.0 * sigmoid(2.0 * v) - 1.0, -1.0, 1.0);
 }
 
 @compute @workgroup_size(64)
@@ -64,11 +89,11 @@ fn lstm_cell(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
         let i_gate = sigmoid(g[0]);
         let f_gate = sigmoid(g[1]);
-        let g_gate = tanh(g[2]);
+        let g_gate = tanhApprox(g[2]);
         let o_gate = sigmoid(g[3]);
 
         let c_t = f_gate * c_prev[b * p.hidden + j] + i_gate * g_gate;
-        let h_t = o_gate * tanh(c_t);
+        let h_t = o_gate * tanhApprox(c_t);
 
         let ob = b * 2u * p.hidden;
         o[ob + j] = h_t;

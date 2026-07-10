@@ -26,6 +26,13 @@ class ZigBuildArtifacts:
     # Static archive linked into the extension module:
     #   Windows -> aion.lib   ·   Linux/macOS -> libaion.a
     link_lib_path: Path
+    # GPU (`AION_PY_GPU=1`) extras. Empty tuples on a CPU-only build.
+    #   gpu_import_libs: extra objects the consumer must add to its final link
+    #                    (Windows import lib for wgpu_native.dll).
+    #   runtime_dlls:    shared libs to place next to the built extension so it
+    #                    loads at runtime (Windows wgpu_native.dll).
+    gpu_import_libs: tuple[Path, ...] = ()
+    runtime_dlls: tuple[Path, ...] = ()
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -48,6 +55,34 @@ def _run(cmd: list[str], cwd: Path) -> None:
     subprocess.check_call(cmd, cwd=str(cwd))
 
 
+def _truthy(v: str) -> bool:
+    return v.strip() in ("1", "true", "True", "yes", "Yes", "on", "On")
+
+
+def _resolve_gpu() -> bool:
+    """Whether to build the wgpu GPU backend into the extension.
+
+    Precedence: the `AION_PY_GPU` env var (if set, wins — CI can force `0`),
+    else the persistent `[tool.aion] gpu` switch in `pyproject.toml`, else off.
+    The pyproject switch matters under `uv`, whose build cache is env-blind: it
+    keys on the source tree (which includes pyproject), so flipping it there
+    actually triggers a rebuild, whereas an env var alone would be ignored.
+    """
+
+    env = os.environ.get("AION_PY_GPU")
+    if env is not None and env.strip() != "":
+        return _truthy(env)
+
+    try:
+        import tomllib  # py3.11+
+
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        return bool(data.get("tool", {}).get("aion", {}).get("gpu", False))
+    except Exception:
+        return False
+
+
 def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
     """Build and install the Aion static library + header into a dedicated prefix.
 
@@ -66,6 +101,11 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
       - AION_PY_MULTIVERSION: '1' to build the portable multi-ISA kernels with
             runtime CPUID dispatch (x86_64_v3 floor + v3/v3_vnni/v4 tiers). This is
             the portable-wheel build; off by default so local builds stay native.
+      - AION_PY_GPU: '1' to build with GPU support (`-Dgpu`), linking wgpu-native;
+            '0' to force CPU-only. Overrides the persistent `[tool.aion] gpu`
+            switch in pyproject.toml (the recommended way to enable GPU under uv,
+            whose build cache is env-blind). Off by default; GPU device calls
+            return AION_UNSUPPORTED on a CPU-only build.
       - AION_PY_BUILD_PREFIX: install prefix directory (default: a fresh temp dir)
     """
 
@@ -97,6 +137,8 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
         "1", "true", "True", "yes", "Yes",
     )
 
+    enable_gpu = _resolve_gpu()
+
     if prefix is None:
         env_prefix = os.environ.get("AION_PY_BUILD_PREFIX")
         prefix = Path(env_prefix) if env_prefix else Path(tempfile.mkdtemp(prefix="aion-zig-"))
@@ -122,6 +164,9 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
         cmd.append(f"-Dcpu={cpu_opt}")
     if pic:
         cmd.append("-Dpic=true")
+    # Pass -Dgpu explicitly: the Zig default is ON, but the Python package is
+    # CPU-only unless the caller opts in (AION_PY_GPU=1 / `pip install .[gpu]`).
+    cmd.append(f"-Dgpu={'true' if enable_gpu else 'false'}")
 
     # The one artifact the build must produce, computed up front (no searching).
     include_dir = prefix / "include"
@@ -136,6 +181,7 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
         "cpu": cpu_opt,
         "pic": pic,
         "multiversion": multiversion,
+        "gpu": enable_gpu,
         "platform": system,
     }
 
@@ -159,10 +205,27 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
     if not link_lib_path.is_file():
         raise RuntimeError(f"Expected installed static library not found: {link_lib_path}")
 
+    # GPU build extras: the wgpu import lib (link input) + runtime DLL, installed
+    # by build.zig into the prefix. Windows-only for now (Linux/macOS resolve the
+    # shared lib via the module's rpath into the zig cache).
+    gpu_import_libs: list[Path] = []
+    runtime_dlls: list[Path] = []
+    if enable_gpu and is_windows:
+        implib = prefix / "lib" / "wgpu_native.dll.lib"
+        dll = prefix / "bin" / "wgpu_native.dll"
+        if not implib.is_file():
+            raise RuntimeError(f"GPU build expected wgpu import lib not found: {implib}")
+        if not dll.is_file():
+            raise RuntimeError(f"GPU build expected wgpu runtime DLL not found: {dll}")
+        gpu_import_libs.append(implib)
+        runtime_dlls.append(dll)
+
     return ZigBuildArtifacts(
         repo_root=repo_root,
         prefix=prefix,
         include_dir=include_dir,
         header_path=header_path,
         link_lib_path=link_lib_path,
+        gpu_import_libs=tuple(gpu_import_libs),
+        runtime_dlls=tuple(runtime_dlls),
     )

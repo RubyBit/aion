@@ -64,6 +64,22 @@ var<workgroup> p_sh: array<f32, 256>;
 var<workgroup> t_sh: array<u32, 256>; // physical time per scored key
 var<workgroup> red: array<f32, 256>;
 
+fn expApprox(x_in: f32) -> f32 {
+    let xc = clamp(x_in, -80.0, 80.0);
+    let yy = xc * 1.4426950408889634;
+    let nn = i32(floor(yy + 0.5));
+    let tt = (yy - f32(nn)) * 0.6931471805599453;
+    let e2 = bitcast<f32>(u32(nn + 127) << 23u);
+    return e2 * (1.0 + tt * (1.0 + tt * (0.5 + tt * (0.16666667 + tt * 0.041666668))));
+}
+
+fn tanhApprox(v: f32) -> f32 {
+    var y: f32;
+    let x2 = 2.0 * v;
+    if (x2 >= 0.0) { y = 1.0 / (1.0 + expApprox(-x2)); } else { let e = expApprox(x2); y = e / (1.0 + e); }
+    return clamp(2.0 * clamp(y, 0.0, 1.0) - 1.0, -1.0, 1.0);
+}
+
 fn wg_max(lidx: u32, x: f32) -> f32 {
     red[lidx] = x;
     workgroupBarrier();
@@ -145,13 +161,13 @@ fn mha_cached(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
                 for (var i = 0u; i < p.dk; i += 1u) { dot += q_s[i] * bitcast<f32>(kc[kb + i]); }
             }
             s = dot * p.scale;
-            if (p.soft_cap > 0.0) { s = p.soft_cap * tanh(s / p.soft_cap); }
+            if (p.soft_cap > 0.0) { s = p.soft_cap * tanhApprox(s / p.soft_cap); }
         }
 
         let m_new = max(m_state, wg_max(lidx, s));
-        let rescale = exp(m_state - m_new);
+        let rescale = expApprox(m_state - m_new);
         var prob = 0.0;
-        if (ok) { prob = exp(s - m_new); }
+        if (ok) { prob = expApprox(s - m_new); }
         p_sh[lidx] = prob;
         t_sh[lidx] = t_phys;
         l_state = l_state * rescale + wg_sum(lidx, prob);
@@ -265,13 +281,13 @@ fn mha_cached_split(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
                 for (var i = 0u; i < p.dk; i += 1u) { dot += q_s[i] * bitcast<f32>(kc[kb + i]); }
             }
             s = dot * p.scale;
-            if (p.soft_cap > 0.0) { s = p.soft_cap * tanh(s / p.soft_cap); }
+            if (p.soft_cap > 0.0) { s = p.soft_cap * tanhApprox(s / p.soft_cap); }
         }
 
         let m_new = max(m_state, wg_max(lidx, s));
-        let rescale = exp(m_state - m_new);
+        let rescale = expApprox(m_state - m_new);
         var prob = 0.0;
-        if (ok) { prob = exp(s - m_new); }
+        if (ok) { prob = expApprox(s - m_new); }
         p_sh[lidx] = prob;
         t_sh[lidx] = t_phys;
         l_state = l_state * rescale + wg_sum(lidx, prob);

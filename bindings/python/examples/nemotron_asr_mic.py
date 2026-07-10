@@ -36,6 +36,8 @@ import numpy as np
 
 import aion
 
+from _common import add_device_args, load_model_with_device
+
 SR = 16000
 HOP = 160
 BLANK = 1024
@@ -89,11 +91,12 @@ def record_until_enter(seconds=None) -> np.ndarray:
     return np.concatenate(buf).astype(np.float32) if buf else np.zeros(0, np.float32)
 
 
-def transcribe_single(model_path, audio, tokenizer, threads):
+def transcribe_single(model_path, audio, tokenizer, threads, args):
     import sentencepiece as spm
     n = (T_MEL_CAP - 1) * HOP
     a = (np.concatenate([audio, np.zeros(n - len(audio), np.float32)]) if len(audio) < n else audio[:n])
-    m = aion.load_model(model_path, thread_count=threads)
+    m, dev = load_model_with_device(model_path, args, thread_count=threads)
+    print(f"device: {dev}")
     ctx = m.context
     m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
     m.bind_input("frame_in", _i32(ctx, 0, (1,))); m.bind_input("sym_in", _i32(ctx, 0, (1,)))
@@ -131,9 +134,10 @@ class StreamFull:
     active/toks) which are Loop carries that must be re-seeded to their start
     values each chunk."""
 
-    def __init__(self, model_path, tokenizer, threads, att_left=70, att_right=13):
+    def __init__(self, model_path, tokenizer, threads, args, att_left=70, att_right=13):
         import sentencepiece as spm
-        self.m = aion.load_model(model_path, thread_count=threads)
+        self.m, dev = load_model_with_device(model_path, args, thread_count=threads)
+        print(f"device: {dev}")
         self.ctx = self.m.context
         self.sp = spm.SentencePieceProcessor(); self.sp.Load(tokenizer)
         self.att_left = att_left
@@ -190,10 +194,10 @@ class StreamFull:
         return self.sp.DecodeIds([int(t) for t in self.tokens])
 
 
-def run_live(model_path, tokenizer, threads, audio_source, att_left=70, att_right=13):
+def run_live(model_path, tokenizer, threads, audio_source, args, att_left=70, att_right=13):
     """audio_source yields float32 mono 16k blocks. `buf` is front-padded by PAD so
     chunk c's window is buf[c*STEP : c*STEP+WSAMP] (== global mel m_start = chunk*8*c - 16)."""
-    drv = StreamFull(model_path, tokenizer, threads, att_left, att_right)
+    drv = StreamFull(model_path, tokenizer, threads, args, att_left, att_right)
     chunk = att_right + 1
     step = chunk * 8 * HOP   # new audio samples per chunk
     wsamp = drv.wsamp
@@ -254,13 +258,14 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=None, help="record duration (default: until Enter)")
     ap.add_argument("--wav", default=None, help="replay a 16kHz wav instead of the mic")
     ap.add_argument("--threads", type=int, default=None)
+    add_device_args(ap)
     args = ap.parse_args()
 
     if args.live:
         assert args.stream_full, "--live needs --stream-full"
         block = (args.att_right + 1) * 8 * HOP  # feed one chunk's worth of audio at a time
         src = wav_blocks(args.wav, block) if args.wav else mic_blocks(block)
-        run_live(args.stream_full, args.tokenizer, args.threads, src, args.att_left, args.att_right)
+        run_live(args.stream_full, args.tokenizer, args.threads, src, args, args.att_left, args.att_right)
         return
 
     assert args.single, "record-then-transcribe needs --single"
@@ -273,7 +278,7 @@ def main() -> None:
     else:
         audio = record_until_enter(args.seconds)
     print(f"captured {len(audio)/SR:.1f}s")
-    print("\ntranscript:\n" + transcribe_single(args.single, audio, args.tokenizer, args.threads))
+    print("\ntranscript:\n" + transcribe_single(args.single, audio, args.tokenizer, args.threads, args))
 
 
 if __name__ == "__main__":

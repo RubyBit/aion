@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 from typing import Iterable, Sequence, overload
 
+from .device import DeviceLike, _device_to_str, _normalize_device
 from .errors import raise_for_status
 from ._ffi import ffi, lib
 from .enums import AionDType
@@ -93,12 +94,18 @@ class Tensor:
         *,
         ctx=None,
         dtype: AionDType | None = None,
+        device: DeviceLike = None,
     ):
         """Create a tensor from Python data.
 
         Examples:
             Tensor([1, 2, 3])
             Tensor([[1, 2], [3, 4]], dtype=AionDType.AION_DTYPE_F32)
+            Tensor([1, 2, 3], device="gpu")   # built on CPU, then migrated
+
+        `device` migrates the tensor after it is built and written on the CPU
+        (move semantics: the host copy is freed). Host `read_*`/`write_*` then
+        fail until you migrate back with ``.to("cpu")``.
         """
 
         from .context import get_default_context
@@ -149,30 +156,32 @@ class Tensor:
             else:
                 raise NotImplementedError(f"scalar tensor construction not implemented for dtype={dtype}")
             self._adopt(t)
-            return
-
-        rank = len(shp)
-        c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
-
-        if dtype == AionDType.AION_DTYPE_F32:
-            c_vals = ffi.new("float[]", [float(v) for v in vals])
-        elif dtype == AionDType.AION_DTYPE_I32:
-            c_vals = ffi.new("int32_t[]", [int(v) for v in vals])
         else:
-            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
+            rank = len(shp)
+            c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
 
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_tensor_create(
-            ctx.ptr,
-            int(dtype),
-            rank,
-            c_shape,
-            c_vals,
-            n,
-            out_t,
-        )
-        raise_for_status(st, ctx.ptr, what="aion_tensor_create")
-        self._init_from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+            if dtype == AionDType.AION_DTYPE_F32:
+                c_vals = ffi.new("float[]", [float(v) for v in vals])
+            elif dtype == AionDType.AION_DTYPE_I32:
+                c_vals = ffi.new("int32_t[]", [int(v) for v in vals])
+            else:
+                raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
+
+            out_t = ffi.new("AionTensor**")
+            st = lib.aion_tensor_create(
+                ctx.ptr,
+                int(dtype),
+                rank,
+                c_shape,
+                c_vals,
+                n,
+                out_t,
+            )
+            raise_for_status(st, ctx.ptr, what="aion_tensor_create")
+            self._init_from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+
+        if device is not None:
+            self.to(device)
 
     def _init_from_handle(self, ctx, ptr, *, dtype: AionDType | None = None, shape: tuple[int, ...] | None = None) -> None:
         self._ctx_owner = ctx
@@ -204,6 +213,29 @@ class Tensor:
     def ptr(self):
         return self._t
 
+    def to(self, device: DeviceLike) -> "Tensor":
+        """Migrate this tensor to `device` (move semantics; returns self).
+
+        The source-device copy is freed. Migrating off the CPU makes host
+        `read_*`/`write_*` fail until you migrate back with ``.to("cpu")``.
+        Idempotent when already on the target device. Accepts ``"cpu"``,
+        ``"gpu"``, ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind`.
+        """
+
+        kind, index = _normalize_device(device)
+        st = lib.aion_tensor_to(self._t, int(kind), int(index))
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_to")
+        return self
+
+    def device(self) -> str:
+        """The device this tensor is resident on: ``"cpu"`` or ``"gpu:N"``."""
+
+        out_kind = ffi.new("AionDeviceKind*")
+        out_index = ffi.new("uint32_t*")
+        st = lib.aion_tensor_device(self._t, out_kind, out_index)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_device")
+        return _device_to_str(int(out_kind[0]), int(out_index[0]))
+
     def close(self) -> None:
         if self._closed:
             return
@@ -229,7 +261,14 @@ class Tensor:
             pass
 
     @classmethod
-    def empty(cls, ctx, shape: Sequence[int], *, dtype: AionDType | None = None) -> "Tensor":
+    def empty(
+        cls,
+        ctx,
+        shape: Sequence[int],
+        *,
+        dtype: AionDType | None = None,
+        device: DeviceLike = None,
+    ) -> "Tensor":
         shp = _as_shape(shape)
         if dtype is None:
             dtype = AionDType.AION_DTYPE_F32
@@ -239,7 +278,10 @@ class Tensor:
         out_t = ffi.new("AionTensor**")
         st = lib.aion_tensor_create_empty(ctx.ptr, int(dtype), rank, c_shape, out_t)
         raise_for_status(st, ctx.ptr, what="aion_tensor_create_empty")
-        return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        t = cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        if device is not None:
+            t.to(device)
+        return t
 
     @classmethod
     def empty_tiled(
@@ -274,10 +316,18 @@ class Tensor:
         return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
 
     @classmethod
-    def zeros(cls, shape: Sequence[int], *, ctx=None, dtype: AionDType | None = None) -> "Tensor":
+    def zeros(
+        cls,
+        shape: Sequence[int],
+        *,
+        ctx=None,
+        dtype: AionDType | None = None,
+        device: DeviceLike = None,
+    ) -> "Tensor":
         """Create a zero-initialized tensor.
 
-        If `ctx` is omitted, the process-wide default context is used.
+        If `ctx` is omitted, the process-wide default context is used. When
+        `device` is set, the tensor is zeroed on the CPU and then migrated.
         """
 
         from .context import get_default_context
@@ -286,10 +336,19 @@ class Tensor:
             ctx = get_default_context()
         t = cls.empty(ctx, shape, dtype=dtype)
         t.zero()
+        if device is not None:
+            t.to(device)
         return t
 
     @classmethod
-    def from_f32(cls, ctx, shape: Sequence[int], values: Iterable[float]) -> "Tensor":
+    def from_f32(
+        cls,
+        ctx,
+        shape: Sequence[int],
+        values: Iterable[float],
+        *,
+        device: DeviceLike = None,
+    ) -> "Tensor":
         shp = _as_shape(shape)
         n = _elem_count(shp)
         # Fast-path: NumPy array-like.
@@ -304,7 +363,10 @@ class Tensor:
             arr = np.asarray(values, dtype=np.float32)
             if tuple(arr.shape) != tuple(shp):
                 raise ValueError(f"expected values with shape {tuple(shp)}, got {arr.shape}")
-            return tensor_from_numpy(ctx, arr)
+            t = tensor_from_numpy(ctx, arr)
+            if device is not None:
+                t.to(device)
+            return t
 
         vals = list(values)
         if len(vals) != n:
@@ -315,7 +377,10 @@ class Tensor:
         if len(shp) == 0:
             if len(vals) != 1:
                 raise ValueError(f"expected 1 value for scalar tensor, got {len(vals)}")
-            return cls.scalar_f32(ctx, float(vals[0]))
+            t = cls.scalar_f32(ctx, float(vals[0]))
+            if device is not None:
+                t.to(device)
+            return t
 
         rank = len(shp)
         c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
@@ -331,7 +396,10 @@ class Tensor:
             out_t,
         )
         raise_for_status(st, ctx.ptr, what="aion_tensor_create")
-        return cls._from_handle(ctx, out_t[0], dtype=AionDType.AION_DTYPE_F32, shape=tuple(shp))
+        t = cls._from_handle(ctx, out_t[0], dtype=AionDType.AION_DTYPE_F32, shape=tuple(shp))
+        if device is not None:
+            t.to(device)
+        return t
 
     @classmethod
     def scalar_f32(cls, ctx, value: float) -> "Tensor":
@@ -497,10 +565,13 @@ class Tensor:
         return tensor_to_numpy(self)
 
     @classmethod
-    def from_numpy(cls, ctx, array: ArrayLike) -> "Tensor":
+    def from_numpy(cls, ctx, array: ArrayLike, *, device: DeviceLike = None) -> "Tensor":
         from .numpy import tensor_from_numpy
 
-        return tensor_from_numpy(ctx, array)
+        t = tensor_from_numpy(ctx, array)
+        if device is not None:
+            t.to(device)
+        return t
 
     def write_from_numpy(self, array: ArrayLike) -> None:
         from .numpy import tensor_write_from_numpy

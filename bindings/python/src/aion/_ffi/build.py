@@ -41,6 +41,15 @@ _artifacts = _build_zig.build_aion()
 include_dirs = [str(_artifacts.include_dir)]
 extra_objects = [str(_artifacts.link_lib_path)]
 
+# GPU build: the static `aion` archive leaves wgpu symbols unresolved, so add the
+# wgpu import lib to this extension's final link. Also hand the runtime DLL(s) to
+# setup.py (via env) so it can place them next to the built extension.
+for _implib in getattr(_artifacts, "gpu_import_libs", ()):
+    extra_objects.append(str(_implib))
+_runtime_dlls = [str(p) for p in getattr(_artifacts, "runtime_dlls", ())]
+if _runtime_dlls:
+    os.environ["AION_PY_RUNTIME_DLLS"] = os.pathsep.join(_runtime_dlls)
+
 extra_compile_args: list[str] = []
 extra_link_args: list[str] = []
 libraries: list[str] = []

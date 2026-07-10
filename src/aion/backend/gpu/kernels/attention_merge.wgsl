@@ -19,6 +19,15 @@ struct Params { rows: u32, segs: u32, dv: u32, stride: u32 };
 const WG: u32 = 256u;
 const FMIN: f32 = -3.4028235e38;
 
+fn expApprox(x_in: f32) -> f32 {
+    let xc = clamp(x_in, -80.0, 80.0);
+    let yy = xc * 1.4426950408889634;
+    let nn = i32(floor(yy + 0.5));
+    let tt = (yy - f32(nn)) * 0.6931471805599453;
+    let e2 = bitcast<f32>(u32(nn + 127) << 23u);
+    return e2 * (1.0 + tt * (1.0 + tt * (0.5 + tt * (0.16666667 + tt * 0.041666668))));
+}
+
 @compute @workgroup_size(256)
 fn mha_cached_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let r = wid.x;
@@ -34,7 +43,7 @@ fn mha_cached_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
     for (var s = 0u; s < p.segs; s += 1u) {
         let m_s = parts[base + s * p.stride + p.dv];
         let l_s = parts[base + s * p.stride + p.dv + 1u];
-        l_tot += l_s * exp(m_s - m_tot);
+        l_tot += l_s * expApprox(m_s - m_tot);
     }
     var inv = 0.0;
     if (l_tot > 0.0) { inv = 1.0 / l_tot; }
@@ -43,7 +52,7 @@ fn mha_cached_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
         var acc = 0.0;
         for (var s = 0u; s < p.segs; s += 1u) {
             let m_s = parts[base + s * p.stride + p.dv];
-            acc += parts[base + s * p.stride + d] * exp(m_s - m_tot);
+            acc += parts[base + s * p.stride + d] * expApprox(m_s - m_tot);
         }
         o[r * p.dv + d] = acc * inv;
     }

@@ -12,7 +12,25 @@
 
 struct Params { n: u32 };
 
-fn sigmoidf(v: f32) -> f32 { return 1.0 / (1.0 + exp(-v)); }
+// Match the CPU's fast transcendental approximations (fast_math.zig) so activation
+// outputs track the CPU reference — the exact-vs-approx gap is tiny per element but
+// biases downstream argmax / greedy decode. See lstm.wgsl / softmax.wgsl.
+fn expApprox(x_in: f32) -> f32 {
+    let x = clamp(x_in, -80.0, 80.0);
+    let y = x * 1.4426950408889634;
+    let n = i32(floor(y + 0.5));
+    let t = (y - f32(n)) * 0.6931471805599453;
+    let e2 = bitcast<f32>(u32(n + 127) << 23u);
+    return e2 * (1.0 + t * (1.0 + t * (0.5 + t * (0.16666667 + t * 0.041666668))));
+}
+
+fn sigmoidf(v: f32) -> f32 {
+    var y: f32;
+    if (v >= 0.0) { y = 1.0 / (1.0 + expApprox(-v)); } else { let e = expApprox(v); y = e / (1.0 + e); }
+    return clamp(y, 0.0, 1.0);
+}
+
+fn tanhApprox(v: f32) -> f32 { return clamp(2.0 * sigmoidf(2.0 * v) - 1.0, -1.0, 1.0); }
 
 @compute @workgroup_size(64)
 fn relu(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -27,7 +45,7 @@ fn gelu(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
         let v = x[i];
         // tanh approximation (matches the CPU kernel).
         let inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);
-        o[i] = 0.5 * v * (1.0 + tanh(inner));
+        o[i] = 0.5 * v * (1.0 + tanhApprox(inner));
     }
 }
 
@@ -46,7 +64,7 @@ fn sigmoid(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups)
 @compute @workgroup_size(64)
 fn tanh_(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
-    for (var i = g.x; i < p.n; i += step) { o[i] = tanh(x[i]); }
+    for (var i = g.x; i < p.n; i += step) { o[i] = tanhApprox(x[i]); }
 }
 
 @compute @workgroup_size(64)

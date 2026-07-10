@@ -361,6 +361,7 @@ pub const StorageManager = struct {
                     .tile_shape = t.tile_shape,
                     .tile_counts = t.tile_counts,
                     .tile_strides = t.tile_strides,
+                    .host_seq = t.host_seq,
                 };
             }
 
@@ -611,6 +612,10 @@ pub const StorageManager = struct {
                 } else {
                     std.mem.swap([]dm.DeviceHandle, &a.tile_handles, &b.tile_handles);
                 }
+                // The host-write counter travels with the bytes so a residency
+                // layer's per-tile `uploaded_seq` (which the resident store swaps
+                // alongside) stays consistent and avoids a spurious re-upload.
+                std.mem.swap(u64, &a.host_seq, &b.host_seq);
             }
         };
 

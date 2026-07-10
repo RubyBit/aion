@@ -10,6 +10,8 @@ import numpy as np
 
 import aion
 
+from _common import add_device_args, load_model_with_device
+
 
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
@@ -38,6 +40,7 @@ def main() -> None:
     p.add_argument("--context-size", type=int, default=64)
     p.add_argument("--bench-iters", type=int, default=1)
     p.add_argument("--thread-count", type=int, default=1, help="Context thread count (default: 1)")
+    add_device_args(p)
     p.add_argument("--print-probs", action="store_true")
     args = p.parse_args()
 
@@ -48,7 +51,9 @@ def main() -> None:
     signal = build_signal(args.chunks, args.num_samples, args.context_size)
     chunk_input_len = args.context_size + args.num_samples
 
-    with aion.load_model(str(model_path), thread_count=args.thread_count) as model:
+    model, device_str = load_model_with_device(str(model_path), args, thread_count=args.thread_count)
+    print(f"device: {device_str}")
+    with model:
         # Matches the model exported by examples/silero_vad.zig. The LSTM state
         # (h, c) is io-aliased to its outputs (next_h, next_c) in the .aion, so we
         # never bind it: the runtime auto-initializes h/c to zeros on the first run

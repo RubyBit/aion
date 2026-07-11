@@ -444,14 +444,14 @@ pub const Builder = struct {
     ///
     /// Output:
     /// - out: same shape/dtype as cache (mutated in-place semantics)
-    pub fn kvCacheAppend(
+    pub fn sequenceAppend(
         self: *Self,
         cache: TensorRef,
         new_kv: TensorRef,
         end_index: TensorRef,
     ) Error!TensorRef {
-        const out: ValueId = try self.graph.addKVCacheAppend(cache.value, new_kv.value, end_index.value);
-        try self.autoNameIfUnnamed(out, "kv_cache_append");
+        const out: ValueId = try self.graph.addSequenceAppend(cache.value, new_kv.value, end_index.value);
+        try self.autoNameIfUnnamed(out, "sequence_append");
         return .{ .value = out };
     }
 

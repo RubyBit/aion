@@ -312,7 +312,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, f32, rp.scale_factor);
             try appendInt(out, allocator, f32, rp.rope_proportion);
         },
-        .KVCacheAppend => {},
+        .SequenceAppend => {},
         .Cast => |ct| {
             try appendInt(out, allocator, u8, @intFromEnum(ct.to_dtype));
         },

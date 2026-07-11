@@ -770,6 +770,45 @@ pub export fn aion_loaded_model_reset_state(m_opt: ?*AionLoadedModel) callconv(.
     return .AION_OK;
 }
 
+/// Declare a sequence-cache policy for an io-aliased recurrent-state input by
+/// name. `kind`: 0 = none (fixed), 1 = growable, 2 = ring. Growable uses
+/// `initial_capacity_tokens` / `growth_numerator` / `growth_denominator` /
+/// `max_capacity_tokens`; ring uses `ring_window_tokens`. Lets a caller allocate
+/// a small initial cache and have the runtime grow its slot on demand up to the
+/// bound (device-resident growth included). Unused fields are ignored per kind.
+pub export fn aion_loaded_model_set_state_input_policy(
+    m_opt: ?*AionLoadedModel,
+    name: ?[*:0]const u8,
+    kind: u32,
+    initial_capacity_tokens: u64,
+    growth_numerator: u64,
+    growth_denominator: u64,
+    max_capacity_tokens: u64,
+    ring_window_tokens: u64,
+) callconv(.c) AionStatus {
+    const m: *AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = m.owner;
+    ctx.clearLastError();
+    if (name == null) return .AION_INVALID_ARGUMENT;
+    const n: []const u8 = std.mem.span(name.?);
+
+    const policy: api.SequenceCachePolicy = switch (kind) {
+        1 => .{ .growable = .{
+            .initial_capacity_tokens = @intCast(initial_capacity_tokens),
+            .growth_numerator = @intCast(growth_numerator),
+            .growth_denominator = @intCast(growth_denominator),
+            .max_capacity_tokens = @intCast(max_capacity_tokens),
+        } },
+        2 => .{ .ring = .{ .window_tokens = @intCast(ring_window_tokens) } },
+        else => .{ .none = {} },
+    };
+    m.model.setStateInputPolicy(n, policy) catch |e| {
+        ctx.setLastError("set_state_input_policy", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
 pub export fn aion_loaded_model_output_tensor(
     m_opt: ?*AionLoadedModel,
     name: ?[*:0]const u8,

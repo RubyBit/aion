@@ -23,6 +23,8 @@ fn traceEnabled() bool {
 pub const Tensor = types_mod.Tensor;
 pub const StorageManager = types_mod.StorageManager;
 pub const TensorId = types_mod.TensorId;
+pub const DeviceRef = types_mod.DeviceRef;
+pub const SequenceCachePolicy = types_mod.SequenceCachePolicy;
 pub const DType = types_mod.DType;
 pub const TilePolicy = types_mod.TilePolicy;
 pub const Package = types_mod.Package;
@@ -59,6 +61,11 @@ pub const Model = struct {
     /// device-resident across `run` calls. Released in `deinit`.
     session: backend_mod.Session,
     policy: TilePolicy,
+    /// The device this model executes on (`.cpu` or a registered `.gpu`). Drives
+    /// whether recurrent-state slots are migrated to device-exclusive residency
+    /// (discrete GPU only — see `ensureAliasedStateSlot`); `.cpu`/unified leave
+    /// state host-backed.
+    device: DeviceRef,
     /// Where concrete graphs are instantiated from (loaded package vs compiled graph).
     source: GraphSource,
     initializer_tids: []TensorId,
@@ -76,6 +83,12 @@ pub const Model = struct {
     output_aliases: []IoAliasInfo,
     input_alias_output_indices: []u32,
     output_alias_input_indices: []u32,
+    /// Lazily-allocated host mirror tensor id per output (`invalid_tensor_id`
+    /// until first use). A device-exclusive recurrent-state output has no host
+    /// bytes; `resolveOutputTensor` gathers it (D2H) into its mirror and returns
+    /// that, so host reads stay correct while the state lives only on the device.
+    /// Only a device-resident output that is actually read ever allocates one.
+    output_host_mirror_tids: []TensorId,
     bound_inputs: []?Tensor,
     aliased_input_bind_versions: []u64,
     /// Persistent store tensors auto-allocated for inputs the caller never binds
@@ -89,6 +102,10 @@ pub const Model = struct {
     /// across entries with different input shapes (e.g. prefill seq=S -> decode
     /// seq=1). One slot per input; `invalid_tensor_id` for non-aliased / not-yet-built.
     aliased_state_tids: []TensorId,
+    /// Optional per-input sequence-cache policy (grow-on-demand / ring), set via
+    /// `setStateInputPolicy` and applied to the recurrent-state slot when it is
+    /// created. `null` = fixed capacity (the slot never grows). One slot per input.
+    state_input_policies: []?SequenceCachePolicy,
     /// Per-input bind-version that has already been copied into `aliased_state_tids`.
     /// Tracked at model level (not per entry) so the caller's bound tensor is seeded
     /// into the shared slot exactly once per bind, not re-copied when a new-shape
@@ -145,11 +162,13 @@ pub const Model = struct {
         self.allocator.free(self.output_aliases);
         self.allocator.free(self.input_alias_output_indices);
         self.allocator.free(self.output_alias_input_indices);
+        self.allocator.free(self.output_host_mirror_tids);
         self.allocator.free(self.bound_inputs);
         self.allocator.free(self.aliased_input_bind_versions);
         self.allocator.free(self.auto_input_tids);
         self.allocator.free(self.aliased_state_tids);
         self.allocator.free(self.aliased_state_synced_versions);
+        self.allocator.free(self.state_input_policies);
         self.allocator.free(self.run_symbol_bindings);
         self.allocator.free(self.run_symbol_values);
         self.allocator.free(self.run_input_shapes);
@@ -331,6 +350,19 @@ pub const Model = struct {
         return self.cache_entries.items.len;
     }
 
+    /// Introspection (debug/tests): whether the named io-aliased input's recurrent
+    /// state slot currently lives in device-exclusive memory (migrated off the
+    /// host — no staging duplicate) rather than host-backed/staged. False for a
+    /// non-aliased input, before the slot is first allocated (first `run`), and on
+    /// CPU. See `migrateStateSlotToDevice`.
+    pub fn stateInputOnDevice(self: *const Self, name: []const u8) bool {
+        const index = self.findInputIndex(name) orelse return false;
+        const tid = self.aliased_state_tids[index];
+        if (tid == types_mod.invalid_tensor_id) return false;
+        const ref = self.store.tensorDevice(tid) catch return false;
+        return ref.kind != .cpu;
+    }
+
     pub fn bindInput(self: *Self, name: []const u8, tensor: Tensor) api_errors.ApiError!void {
         const index = self.findInputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
         const sig = self.input_signatures[index];
@@ -349,10 +381,36 @@ pub const Model = struct {
     /// so one pass clears the state seen by every entry. Use between independent
     /// sequences (e.g. utterances) without reloading the model. A no-op before the
     /// first `run()` (no slots allocated yet).
+    /// Declare a sequence-cache policy (grow-on-demand or ring) for an io-aliased
+    /// recurrent-state input, by name. Applied to the runtime-owned state slot at
+    /// creation (or immediately if it already exists). Growable state may start
+    /// small and grow on demand up to `GrowablePolicy.max_capacity_tokens` — the
+    /// runtime owns and resizes the slot, device-resident growth included, so the
+    /// caller need not pre-allocate the maximum. Call before the first `run()` for
+    /// the policy to shape the initial slot. Generic across any recurrent state
+    /// (LLM KV, streaming buffers, RNN history), not LLM-specific.
+    pub fn setStateInputPolicy(self: *Self, name: []const u8, policy: SequenceCachePolicy) api_errors.ApiError!void {
+        const index = self.findInputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
+        // Growth/ring bookkeeping lives in the store's cache; ensure one exists.
+        // The RAM budget is a reserved (not-yet-enforced) soft bound, so a sentinel
+        // max is fine — only tensors that carry a policy ever lease against it.
+        if (!self.store.hasCache()) {
+            self.store.configureCache(.{ .ram_budget_bytes = std.math.maxInt(usize) }) catch return api_errors.ApiError.OutOfMemory;
+        }
+        self.state_input_policies[index] = policy;
+        // If the slot already exists (policy set between runs), register it now too.
+        const tid = self.aliased_state_tids[index];
+        if (tid != types_mod.invalid_tensor_id) {
+            self.store.registerSequenceCachePolicy(tid, policy) catch return api_errors.ApiError.InvalidArgument;
+        }
+    }
+
     pub fn resetState(self: *Self) api_errors.ExecuteError!void {
         for (self.aliased_state_tids) |tid| {
             if (tid == types_mod.invalid_tensor_id) continue;
-            initializers.zeroStoreTensor(self.store, tid) catch return error.InvalidArgument;
+            // Residency-aware: zeros the device buffer for a device-exclusive slot,
+            // the host bytes otherwise (see `StorageManager.zeroTensorData`).
+            self.store.zeroTensorData(tid) catch return error.InvalidArgument;
         }
     }
 
@@ -426,10 +484,10 @@ pub const Model = struct {
             if (self.inputAliasOutputIndex(i) != null) {
                 const bind_version = self.aliased_input_bind_versions[i];
                 if (bind_version != 0 and self.aliased_state_synced_versions[i] != bind_version) {
-                    if (src.id != dst.id) dst.copyFrom(self.allocator, src) catch |e| {
+                    if (src.id != dst.id) self.copyIntoStateSlot(dst, src) catch |e| {
                         if (trace) {
                             std.debug.print(
-                                "[aion][run] copyFrom failed for aliased input {s} (src_id={d} dst_id={d}): {s}\n",
+                                "[aion][run] seed copy failed for aliased input {s} (src_id={d} dst_id={d}): {s}\n",
                                 .{ self.input_signatures[i].name, src.id, dst.id, @errorName(e) },
                             );
                         }
@@ -511,9 +569,7 @@ pub const Model = struct {
     pub fn outputTensor(self: *Self, name: []const u8) api_errors.ApiError!Tensor {
         const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
         const output_index = self.findOutputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
-        const tid = self.cache_entries.items[cache_index].program.outputs[output_index];
-        const t = try self.store.getConst(tid);
-        return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+        return self.resolveOutputTensor(cache_index, output_index);
     }
 
     pub fn outputCount(self: *const Self) usize {
@@ -524,9 +580,53 @@ pub const Model = struct {
     pub fn outputTensorAt(self: *Self, index: usize) api_errors.ApiError!Tensor {
         const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
         if (index >= self.output_signatures.len) return api_errors.ApiError.InvalidArgument;
-        const tid = self.cache_entries.items[cache_index].program.outputs[index];
+        return self.resolveOutputTensor(cache_index, index);
+    }
+
+    /// Resolve output `output_index` of cache entry `cache_index` to a Tensor
+    /// handle whose host bytes are current. Recurrent-state outputs `execute`
+    /// leaves device-resident (see `ExecutableProgram.output_device_resident`)
+    /// take one of two on-demand paths so a host read still sees correct data:
+    ///   - staged (host-backed, discrete-GPU cache): flush the device copy to the
+    ///     host store (`syncToHost`) and return the tensor itself;
+    ///   - device-exclusive (migrated via `moveTensor`, no host bytes): gather it
+    ///     (D2H) into a host mirror and return the mirror.
+    /// Decode never reads its own carried state, so both stay off the hot path;
+    /// everything else (genuine outputs, CPU) returns the tensor directly.
+    fn resolveOutputTensor(self: *Self, cache_index: usize, output_index: usize) api_errors.ApiError!Tensor {
+        const entry: *const CacheEntry = &self.cache_entries.items[cache_index];
+        const tid = entry.program.outputs[output_index];
+        if (entry.program.outputStaysResident(output_index)) {
+            const on_device = (self.store.tensorDevice(tid) catch DeviceRef{}).kind != .cpu;
+            if (on_device) return self.mirrorOutputToHost(output_index, tid);
+            try self.session.syncToHost(tid);
+        }
         const t = try self.store.getConst(tid);
         return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+    }
+
+    /// Materialize a device-exclusive output into its host mirror (D2H gather) and
+    /// return a handle to the mirror. The mirror is created lazily on first read
+    /// (matching the source dtype/shape, single-tile host) and reused across
+    /// reads, re-created if the source's shape changed (a grown cache). This keeps
+    /// device-exclusive state host-readable without a permanent host duplicate in
+    /// the hot path — decode never calls this.
+    fn mirrorOutputToHost(self: *Self, output_index: usize, src_tid: TensorId) api_errors.ApiError!Tensor {
+        const src_meta = try self.store.getConst(src_tid);
+        const need_new = blk: {
+            const cur = self.output_host_mirror_tids[output_index];
+            if (cur == types_mod.invalid_tensor_id) break :blk true;
+            const m = self.store.getConst(cur) catch break :blk true;
+            break :blk m.dtype != src_meta.dtype or !signatures.sameUsize(m.shape, src_meta.shape);
+        };
+        if (need_new) {
+            self.output_host_mirror_tids[output_index] =
+                try initializers.createTensorSingleTile(self.store, self.policy, src_meta.dtype, src_meta.shape);
+        }
+        const mirror_tid = self.output_host_mirror_tids[output_index];
+        try self.store.copyTensorData(mirror_tid, src_tid);
+        const m = try self.store.getConst(mirror_tid);
+        return .{ .store = self.store, .id = mirror_tid, .dtype = m.dtype, .shape = m.shape };
     }
 
     /// Execute, then return output `index` as a Tensor handle (tensor-first API).
@@ -571,6 +671,7 @@ pub const Model = struct {
         backend: backend_mod.Backend,
         store: *StorageManager,
         policy: TilePolicy,
+        device: DeviceRef,
         source: GraphSource,
         initializer_tids: []TensorId,
         input_signatures: []SignatureInfo,
@@ -604,6 +705,10 @@ pub const Model = struct {
         const output_alias_input_indices = try allocator.alloc(u32, output_signatures.len);
         errdefer allocator.free(output_alias_input_indices);
         @memset(output_alias_input_indices, types_mod.invalid_alias_index);
+
+        const output_host_mirror_tids = try allocator.alloc(TensorId, output_signatures.len);
+        errdefer allocator.free(output_host_mirror_tids);
+        @memset(output_host_mirror_tids, types_mod.invalid_tensor_id);
 
         var alias_cursor: usize = 0;
         for (io_aliases) |alias| {
@@ -648,6 +753,10 @@ pub const Model = struct {
         errdefer allocator.free(aliased_state_synced_versions);
         @memset(aliased_state_synced_versions, 0);
 
+        const state_input_policies = try allocator.alloc(?SequenceCachePolicy, input_signatures.len);
+        errdefer allocator.free(state_input_policies);
+        @memset(state_input_policies, null);
+
         var total_rank: usize = 0;
         for (input_signatures) |sig| total_rank += sig.rank;
 
@@ -671,6 +780,7 @@ pub const Model = struct {
             .store = store,
             .session = session,
             .policy = policy,
+            .device = device,
             .source = source,
             .initializer_tids = initializer_tids,
             .input_signatures = input_signatures,
@@ -681,12 +791,14 @@ pub const Model = struct {
             .output_aliases = output_aliases,
             .input_alias_output_indices = input_alias_output_indices,
             .output_alias_input_indices = output_alias_input_indices,
+            .output_host_mirror_tids = output_host_mirror_tids,
             .bound_inputs = bound_inputs,
             .aliased_input_bind_versions = aliased_input_bind_versions,
             .auto_input_tids = auto_input_tids,
             .auto_init_inputs = opts.auto_init_inputs,
             .aliased_state_tids = aliased_state_tids,
             .aliased_state_synced_versions = aliased_state_synced_versions,
+            .state_input_policies = state_input_policies,
             .run_symbol_bindings = run_symbol_bindings,
             .run_symbol_values = run_symbol_values,
             .run_input_shapes = run_input_shapes,
@@ -704,6 +816,7 @@ pub const Model = struct {
         backend: backend_mod.Backend,
         store: *StorageManager,
         policy: TilePolicy,
+        device: DeviceRef,
         package: Package,
         initializer_tids: []TensorId,
         package_hash: u64,
@@ -725,6 +838,7 @@ pub const Model = struct {
             backend,
             store,
             policy,
+            device,
             .{ .package = package },
             initializer_tids,
             input_signatures,
@@ -751,6 +865,7 @@ pub const Model = struct {
         backend: backend_mod.Backend,
         store: *StorageManager,
         policy: TilePolicy,
+        device: DeviceRef,
         graph_in: graph_mod.Graph,
         input_value_ids: []const graph_mod.ValueId,
         input_names: []const []const u8,
@@ -813,6 +928,7 @@ pub const Model = struct {
             backend,
             store,
             policy,
+            device,
             source,
             empty_tids,
             input_signatures,
@@ -1108,7 +1224,7 @@ pub const Model = struct {
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
                 // Aliased inputs (KV caches, recurrent state) use a model-level slot
                 // shared by every cache entry, so state carries across entries with
-                // different input shapes (prefill vs decode). Single-tile (KVCacheAppend
+                // different input shapes (prefill vs decode). Single-tile (SequenceAppend
                 // needs a contiguous last axis; the default tiler would split it).
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
             else blk: {
@@ -1125,6 +1241,8 @@ pub const Model = struct {
         var program = try program_mod.compileGraph(self.allocator, graph, self.store, self.policy);
         errdefer program.deinit();
 
+        try self.markDeviceResidentOutputs(&program, input_slots);
+
         return .{
             .symbol_values = try self.allocator.dupe(u64, symbol_values),
             .input_shapes = try self.allocator.dupe(usize, input_shapes),
@@ -1134,22 +1252,120 @@ pub const Model = struct {
         };
     }
 
+    /// Flag the program outputs that are recurrent state aliased *in place* to an
+    /// input, so a device backend keeps them resident instead of flushing them to
+    /// the host each run (see `ExecutableProgram.output_device_resident`). "In
+    /// place" is exactly the condition under which `run()`'s io-alias write-back is
+    /// a no-op: the output's compiled tensor id equals the input slot it feeds back
+    /// into (e.g. SequenceAppend, whose output aliases the cache storage). Non-in-
+    /// place aliases still need the flush — their host write-back reads the output
+    /// bytes — so they are deliberately left flushable. No allocation when nothing
+    /// qualifies, keeping non-recurrent models allocation-free.
+    fn markDeviceResidentOutputs(self: *Self, program: *program_mod.Program, input_slots: []const TensorId) api_errors.ExecuteError!void {
+        var any = false;
+        for (self.output_aliases) |alias| {
+            if (program.outputs[alias.output_index] == input_slots[alias.input_index]) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+
+        const mask = self.allocator.alloc(bool, program.outputs.len) catch return error.OutOfMemory;
+        @memset(mask, false);
+        for (self.output_aliases) |alias| {
+            if (program.outputs[alias.output_index] == input_slots[alias.input_index]) mask[alias.output_index] = true;
+        }
+        program.output_device_resident = mask;
+    }
+
     /// Return the model-level backing slot for io-aliased input `input_index`,
     /// allocating a zeroed single-tile tensor on first use. If a slot already
     /// exists with a different shape (a capacity change), it is replaced and the
     /// seed must be re-copied, so the synced version is reset.
     fn ensureAliasedStateSlot(self: *Self, input_index: usize, shape: []const usize) api_errors.ExecuteError!TensorId {
         const sig = self.input_signatures[input_index];
+        const growable = self.stateInputGrowable(input_index);
         const cur = self.aliased_state_tids[input_index];
         if (cur != types_mod.invalid_tensor_id) {
             const meta = self.store.getConst(cur) catch return error.InvalidArgument;
-            if (signatures.sameUsize(meta.shape, shape)) return cur;
-            // Shape (capacity) changed: re-seed into the new slot on the next run.
+            // Reuse the existing slot when it can still back this shape — including a
+            // growable slot that has grown past the declared capacity (so state built
+            // up in an earlier entry, e.g. prefill, isn't discarded when a later
+            // decode entry re-requests the small initial capacity).
+            if (stateSlotCompatible(meta.shape, shape, growable)) return cur;
+            // Capacity truly changed: re-seed into the new slot on the next run.
             self.aliased_state_synced_versions[input_index] = 0;
         }
         const tid = try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, shape);
+        if (self.state_input_policies[input_index]) |pol| {
+            self.store.registerSequenceCachePolicy(tid, pol) catch return error.InvalidArgument;
+        }
+        self.migrateStateSlotToDevice(tid, sig.dtype, shape);
         self.aliased_state_tids[input_index] = tid;
         return tid;
+    }
+
+    fn stateInputGrowable(self: *const Self, input_index: usize) bool {
+        if (self.state_input_policies[input_index]) |pol| return std.meta.activeTag(pol) == .growable;
+        return false;
+    }
+
+    /// Whether a recurrent-state slot of shape `have` can back a request for
+    /// `want`. Exact match always qualifies; a growable rank-4 cache also qualifies
+    /// when only the sequence axis (axis 2) has grown larger (`have[2] >= want[2]`),
+    /// which is how a slot grown in one cache entry carries into another whose
+    /// declared capacity is still the small initial value.
+    fn stateSlotCompatible(have: []const usize, want: []const usize, growable: bool) bool {
+        if (have.len != want.len) return false;
+        if (growable and have.len == 4) {
+            for (have, want, 0..) |h, w, d| {
+                if (d == 2) {
+                    if (h < w) return false;
+                } else if (h != w) return false;
+            }
+            return true;
+        }
+        return signatures.sameUsize(have, want);
+    }
+
+    /// Migrate a freshly created (host, zeroed) recurrent-state slot to
+    /// device-exclusive residency when the model runs on a discrete GPU and the
+    /// slot fits the device's single-buffer ceiling. This drops the host copy —
+    /// the KV cache then lives ONLY in device memory (`moveTensor`/`deviceTile`),
+    /// so decode kernels hit the residency fast path with no staging duplicate.
+    ///
+    /// A deliberate no-op when: on CPU; on a (future) unified backend that imports
+    /// host memory zero-copy (migration would gain nothing); or the slot exceeds
+    /// the device's per-buffer ceiling. Any of these keeps the staged/host path,
+    /// which stays correct. Growable slots ARE migrated — device-resident growth is
+    /// handled by `StorageManager.ensureTensorAxisCapacity` (round-trip re-migrate).
+    /// Migration failure falls back to staged: `moveTensor` leaves the source
+    /// tensor untouched on error.
+    fn migrateStateSlotToDevice(self: *Self, tid: TensorId, dtype: DType, shape: []const usize) void {
+        if (self.device.kind == .cpu) return;
+        const mem = self.store.deviceMemoryFor(self.device) orelse return;
+        if (mem.model() == .unified) return;
+
+        const info = dtype.info();
+        if (info.is_quantized) return; // createTensorSingleTile already rejects these
+        var elems: u64 = 1;
+        for (shape) |d| elems *= @as(u64, @intCast(d));
+        const bytes: u64 = elems * @as(u64, @intCast(info.block_bytes));
+        if (bytes > mem.maxBindingBytes()) return; // over the device's per-buffer ceiling
+
+        const policy = self.store.policyFor(self.device);
+        // Single-tile target (tile_shape == shape), matching createTensorSingleTile.
+        self.store.moveTensor(tid, self.device, mem, shape, policy.tile_alignment) catch return;
+    }
+
+    /// Seed recurrent-state slot `dst` from a caller-bound source, honoring the
+    /// slot's residency: a device-exclusive slot is written through the store's
+    /// device-aware copy (H2D scatter), a host slot via the fast in-place copy.
+    fn copyIntoStateSlot(self: *Self, dst: Tensor, src: Tensor) api_errors.ExecuteError!void {
+        const on_device = (self.store.tensorDevice(dst.id) catch DeviceRef{}).kind != .cpu;
+        if (on_device) return self.store.copyTensorData(dst.id, src.id);
+        return dst.copyFrom(self.allocator, src);
     }
 
     fn findInputIndex(self: *const Self, name: []const u8) ?usize {

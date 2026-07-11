@@ -29,7 +29,7 @@ const StoreError = tensor_store.StoreError;
 const TileRefConst = tensor_store.TileRefConst;
 const TileRefMut = tensor_store.TileRefMut;
 const TensorMeta = tensor_store.TensorMeta;
-const KVCachePolicyInfo = tensor_store.KVCachePolicyInfo;
+const SequenceCachePolicyInfo = tensor_store.SequenceCachePolicyInfo;
 
 pub const LeaseStats = struct {
     /// Currently-live leases (acquires minus releases). Must be >= 0 always and
@@ -119,14 +119,14 @@ pub const CheckedTensorStore = struct {
         self.inner.releaseMut(token);
     }
 
-    fn kvCachePolicyInfo(ctx: *anyopaque, id: TensorId) KVCachePolicyInfo {
+    fn sequenceCachePolicyInfo(ctx: *anyopaque, id: TensorId) SequenceCachePolicyInfo {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.inner.kvCachePolicyInfo(id);
+        return self.inner.sequenceCachePolicyInfo(id);
     }
 
-    fn mapKVCacheTime(ctx: *anyopaque, id: TensorId, logical_t: usize, physical_capacity_tokens: usize) StoreError!usize {
+    fn mapSequenceStep(ctx: *anyopaque, id: TensorId, logical_t: usize, physical_capacity_tokens: usize) StoreError!usize {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.inner.mapKVCacheTime(id, logical_t, physical_capacity_tokens);
+        return self.inner.mapSequenceStep(id, logical_t, physical_capacity_tokens);
     }
 
     fn prefetch(ctx: *anyopaque, id: TensorId, ti0: usize, ti1: usize) void {
@@ -152,8 +152,8 @@ pub const CheckedTensorStore = struct {
         .acquireTileMutLinear = acquireTileMutLinear,
         .releaseConst = releaseConst,
         .releaseMut = releaseMut,
-        .kvCachePolicyInfo = kvCachePolicyInfo,
-        .mapKVCacheTime = mapKVCacheTime,
+        .sequenceCachePolicyInfo = sequenceCachePolicyInfo,
+        .mapSequenceStep = mapSequenceStep,
         .prefetch = prefetch,
         .prefetchLinear = prefetchLinear,
         .swapTensors = swapTensors,

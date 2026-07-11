@@ -231,6 +231,20 @@ def main() -> None:
         default=2048,
         help="Capacity G for global KV caches (layers 4/9/14) [default: 2048]",
     )
+    p.add_argument(
+        "--growable",
+        action="store_true",
+        help=(
+            "Allocate KV caches small and let the runtime grow them on demand "
+            "(device-resident growth) up to their capacity, instead of pre-allocating."
+        ),
+    )
+    p.add_argument(
+        "--initial-cache-capacity",
+        type=int,
+        default=8,
+        help="Initial KV cache capacity in tokens when --growable [default: 8]",
+    )
     args = p.parse_args()
 
     if args.max_new_tokens <= 0:
@@ -316,12 +330,23 @@ def main() -> None:
         # We still allocate them explicitly (rather than letting auto-init zero them)
         # because the global layers' time axis is a free capacity symbol `G` the
         # caller chooses — no bound input lets the runtime infer it.
+        # With --growable we allocate a cache at a small initial capacity and let the
+        # runtime grow its device-resident slot on demand up to `t_cap`; without it we
+        # pre-allocate the full `t_cap` (the original behavior).
+        #
+        # Only GLOBAL layers have a free (symbolic) capacity axis `G`; local layers are
+        # fixed at 512 in the model, so they must be bound at exactly 512 and cannot
+        # start small. So grow-on-demand applies to the global caches (the large ones).
+        def is_growable_layer(layer: int) -> bool:
+            return bool(args.growable) and is_global_layer(layer)
+
         k_cache = {}
         v_cache = {}
         for layer in source_layers:
             head_dim = 512 if is_global_layer(layer) else 256
             t_cap = args.global_cache_capacity if is_global_layer(layer) else 512
-            shape = (1, 1, int(t_cap), int(head_dim))
+            alloc_cap = min(int(args.initial_cache_capacity), int(t_cap)) if is_growable_layer(layer) else int(t_cap)
+            shape = (1, 1, int(alloc_cap), int(head_dim))
 
             k = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
             v = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
@@ -347,6 +372,11 @@ def main() -> None:
         for layer in source_layers:
             model.bind_input(f"k_cache.layer{layer}", k_cache[layer])
             model.bind_input(f"v_cache.layer{layer}", v_cache[layer])
+            if is_growable_layer(layer):
+                t_cap = args.global_cache_capacity
+                init_cap = min(int(args.initial_cache_capacity), int(t_cap))
+                for nm in (f"k_cache.layer{layer}", f"v_cache.layer{layer}"):
+                    model.set_state_input_growable(nm, initial_capacity=init_cap, max_capacity=int(t_cap))
 
         try:
             # ---- Prefill ----

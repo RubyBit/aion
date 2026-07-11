@@ -212,7 +212,7 @@ test "resident store: growable kv cache flushes and refreshes device residency" 
     defer mgr.deinit();
 
     const cache = try mgr.createTiledTensor(.f32, &[_]usize{ 1, 1, 2, 1 }, &[_]usize{ 1, 1, 2, 1 }, .{});
-    try mgr.registerKVCachePolicy(cache, .{ .growable = .{
+    try mgr.registerSequenceCachePolicy(cache, .{ .growable = .{
         .initial_capacity_tokens = 2,
         .growth_numerator = 2,
         .growth_denominator = 1,
@@ -230,7 +230,7 @@ test "resident store: growable kv cache flushes and refreshes device residency" 
     try mock.device().copyH2D(d0.handle, 0, std.mem.sliceAsBytes(@constCast(&[_]f32{ 10, 20 })));
     store.releaseMut(d0.token);
 
-    _ = try store.mapKVCacheTime(cache, 3, 2);
+    _ = try store.mapSequenceStep(cache, 3, 2);
 
     const meta = try store.meta(cache);
     try std.testing.expectEqual(@as(usize, 4), meta.shape[2]);

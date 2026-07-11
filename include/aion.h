@@ -156,7 +156,7 @@ AION_API AionStatus aion_tensor_create_empty(
 // `tile_shape` must have `rank` entries; each entry must be in `1..=shape[d]` and,
 // where dtype is quantized, must align to the dtype's block granularity on the
 // block axis. Use this when a specific tile layout is required by a graph op
-// (e.g. KV caches consumed by `KVCacheAppend`, which require the full head_dim
+// (e.g. KV caches consumed by `SequenceAppend`, which require the full head_dim
 // contiguous in a single tile).
 AION_API AionStatus aion_tensor_create_empty_tiled(
     AionContext* ctx,
@@ -257,6 +257,12 @@ AION_API AionStatus aion_loaded_model_run(AionLoadedModel* m);
 /* Zero all recurrent (io-aliased) input state, e.g. KV caches and LSTM h/c.
    Use between independent sequences. No-op before the first run. */
 AION_API AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
+/* Declare a sequence-cache policy for an io-aliased recurrent-state input by
+   name, so the runtime can grow (or ring-wrap) its state slot on demand instead
+   of the caller pre-allocating the maximum. kind: 0=none (fixed), 1=growable,
+   2=ring. Growable uses initial/growth_numerator/growth_denominator/max_capacity;
+   ring uses ring_window_tokens. Unused fields are ignored per kind. */
+AION_API AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
 AION_API AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
 
 #ifdef __cplusplus

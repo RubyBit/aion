@@ -4664,7 +4664,7 @@ test "graph: kv cache append mutates cache in-place (f32)" {
     try g.bindExternal(new_in, @intCast(new_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out = try g.addKVCacheAppend(cache_in, new_in, end_in);
+    const out = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
@@ -4736,7 +4736,7 @@ test "graph: kv cache append rejects out-of-bounds end index" {
     try g.bindExternal(new_in, @intCast(new_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out = try g.addKVCacheAppend(cache_in, new_in, end_in);
+    const out = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
@@ -4786,7 +4786,7 @@ test "graph: kv cache append ring policy wraps time index" {
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
-    try sm.registerKVCachePolicy(cache_tid, .{ .ring = .{ .window_tokens = t_cap } });
+    try sm.registerSequenceCachePolicy(cache_tid, .{ .ring = .{ .window_tokens = t_cap } });
 
     var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
     defer g.deinit();
@@ -4798,7 +4798,7 @@ test "graph: kv cache append ring policy wraps time index" {
     try g.bindExternal(new_in, @intCast(new_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addKVCacheAppend(cache_in, new_in, end_in);
+    const out: graph_mod.ValueId = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
@@ -4858,7 +4858,7 @@ test "graph: kv cache append growable policy expands physical capacity" {
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
-    try sm.registerKVCachePolicy(cache_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
+    try sm.registerSequenceCachePolicy(cache_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
 
     var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
     defer g.deinit();
@@ -4870,7 +4870,7 @@ test "graph: kv cache append growable policy expands physical capacity" {
     try g.bindExternal(new_in, @intCast(new_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addKVCacheAppend(cache_in, new_in, end_in);
+    const out: graph_mod.ValueId = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };

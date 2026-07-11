@@ -23,6 +23,13 @@ pub const GrowablePolicy = struct {
     /// Geometric growth factor as a rational number.
     growth_numerator: usize = 3,
     growth_denominator: usize = 2,
+
+    /// Hard ceiling on logical token capacity — the growth bound / "max sequence
+    /// length" knob. `0` means unbounded (grow as far as needed). A step past it
+    /// fails (`CacheLimitExceeded`) rather than growing further, and growth never
+    /// overshoots it. Lets callers allocate a small initial cache and cap how far
+    /// the runtime may grow it.
+    max_capacity_tokens: usize = 0,
 };
 
 pub const RingPolicy = struct {
@@ -32,7 +39,7 @@ pub const RingPolicy = struct {
     window_tokens: usize = 0,
 };
 
-pub const KVCachePolicy = union(CachePolicy) {
+pub const SequenceCachePolicy = union(CachePolicy) {
     none: void,
     growable: GrowablePolicy,
     ring: RingPolicy,
@@ -53,14 +60,14 @@ pub const CacheConfig = struct {
     max_live_leases: usize = 0,
 };
 
-pub const KVCachePolicyKind = enum(u8) {
+pub const SequenceCachePolicyKind = enum(u8) {
     none = 0,
     growable = 1,
     ring = 2,
 };
 
-pub const KVCachePolicyInfo = struct {
-    kind: KVCachePolicyKind = .none,
+pub const SequenceCachePolicyInfo = struct {
+    kind: SequenceCachePolicyKind = .none,
     ring_window_tokens: usize = 0,
 };
 
@@ -91,7 +98,7 @@ pub const Cache = struct {
     };
 
     const TensorPolicyRecord = struct {
-        policy: KVCachePolicy = .{ .none = {} },
+        policy: SequenceCachePolicy = .{ .none = {} },
         state: PolicyState = .{ .none = {} },
     };
 
@@ -101,7 +108,7 @@ pub const Cache = struct {
         is_mut: bool,
     };
 
-    fn makePolicyRecord(policy: KVCachePolicy) CacheError!TensorPolicyRecord {
+    fn makePolicyRecord(policy: SequenceCachePolicy) CacheError!TensorPolicyRecord {
         return switch (policy) {
             .none => .{ .policy = .{ .none = {} }, .state = .{ .none = {} } },
             .growable => |g| blk: {
@@ -155,19 +162,19 @@ pub const Cache = struct {
         return .{ .allocator = allocator, .cfg = cfg };
     }
 
-    pub fn registerTensorPolicy(self: *Self, tensor_id: u32, policy: KVCachePolicy) CacheError!void {
+    pub fn registerTensorPolicy(self: *Self, tensor_id: u32, policy: SequenceCachePolicy) CacheError!void {
         try self.ensureTensorSlots(tensor_id);
         const rec: TensorPolicyRecord = try makePolicyRecord(policy);
         self.tensor_policies.items[@as(usize, @intCast(tensor_id))] = rec;
     }
 
-    pub fn tensorPolicy(self: *const Self, tensor_id: u32) KVCachePolicy {
+    pub fn tensorPolicy(self: *const Self, tensor_id: u32) SequenceCachePolicy {
         const rec_opt: ?*const TensorPolicyRecord = self.policyRecordConst(tensor_id);
         if (rec_opt) |rec| return rec.policy;
         return .{ .none = {} };
     }
 
-    pub fn tensorPolicyInfo(self: *const Self, tensor_id: u32) KVCachePolicyInfo {
+    pub fn tensorPolicyInfo(self: *const Self, tensor_id: u32) SequenceCachePolicyInfo {
         return switch (self.tensorPolicy(tensor_id)) {
             .none => .{ .kind = .none, .ring_window_tokens = 0 },
             .growable => .{ .kind = .growable, .ring_window_tokens = 0 },
@@ -200,11 +207,15 @@ pub const Cache = struct {
                 var st: *GrowableState = &rec.state.growable;
 
                 const need: usize = std.math.add(usize, logical_t, 1) catch return CacheError.CacheLimitExceeded;
+                if (g.max_capacity_tokens != 0 and need > g.max_capacity_tokens) return CacheError.CacheLimitExceeded;
                 if (st.logical_capacity_tokens == 0) {
                     st.logical_capacity_tokens = if (g.initial_capacity_tokens == 0) physical_capacity_tokens else g.initial_capacity_tokens;
                 }
                 while (st.logical_capacity_tokens < need) {
                     st.logical_capacity_tokens = try growCapacity(st.logical_capacity_tokens, g.growth_numerator, g.growth_denominator);
+                }
+                if (g.max_capacity_tokens != 0 and st.logical_capacity_tokens > g.max_capacity_tokens) {
+                    st.logical_capacity_tokens = g.max_capacity_tokens;
                 }
                 if (need > st.max_seen_end_tokens) st.max_seen_end_tokens = need;
                 return logical_t;

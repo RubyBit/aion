@@ -298,7 +298,7 @@ class Tensor:
         one-time retile copy the compiler would otherwise insert when an op needs
         a different tiling. For most cases `Tensor.empty` is sufficient: the graph
         compiler retiles inputs as needed (e.g. KV caches consumed by
-        `KVCacheAppend` are coerced to head-dim-contiguous on first run).
+        `SequenceAppend` are coerced to head-dim-contiguous on first run).
         """
         shp = _as_shape(shape)
         tshp = _as_shape(tile_shape)

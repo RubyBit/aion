@@ -9,10 +9,10 @@ const executable = @import("../../../runtime/executable.zig");
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
-pub fn execKVCacheAppendTiled(
+pub fn execSequenceAppendTiled(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepKVCacheAppendTiled,
+    s: executable.StepSequenceAppendTiled,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     _ = pool;
@@ -68,7 +68,7 @@ pub fn execKVCacheAppendTiled(
         var t_check: usize = 0;
         while (t_check < new_len) : (t_check += 1) {
             const dst_logical_t: usize = std.math.add(usize, idx_u, t_check) catch return BackendError.InvalidArgument;
-            _ = store.mapKVCacheTime(s.cache, dst_logical_t, cache_t) catch return BackendError.InvalidArgument;
+            _ = store.mapSequenceStep(s.cache, dst_logical_t, cache_t) catch return BackendError.InvalidArgument;
         }
     }
 
@@ -111,7 +111,7 @@ pub fn execKVCacheAppendTiled(
             var t: usize = 0;
             while (t < new_len) : (t += 1) {
                 const dst_logical_t: usize = std.math.add(usize, t_start, t) catch return BackendError.InvalidArgument;
-                const dst_t: usize = store.mapKVCacheTime(s.cache, dst_logical_t, cache_t_after_growth) catch return BackendError.InvalidArgument;
+                const dst_t: usize = store.mapSequenceStep(s.cache, dst_logical_t, cache_t_after_growth) catch return BackendError.InvalidArgument;
 
                 src_tile_coords[0] = b / new_kv_meta.tile_shape[0];
                 src_tile_coords[1] = h / new_kv_meta.tile_shape[1];

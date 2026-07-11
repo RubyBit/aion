@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 //! The decode-loop data-movement ops: GatherRows (embedding lookup), RoPE1D,
-//! and KVCacheAppend.
+//! and SequenceAppend.
 //!
 //! Gather and KV-append are RECORD-TIME resolved: their indices (token ids /
 //! end offsets) are read from the HOST store while encoding the frame, and each
@@ -341,12 +341,12 @@ pub fn execRoPE(ctx: Ctx, frame: *Frame, s: executable.StepRoPE1DTiled) ExecuteP
     }
 }
 
-// ---- KVCacheAppend -----------------------------------------------------------
+// ---- SequenceAppend -----------------------------------------------------------
 
 /// cache[b, h, end[b] + t, :] = new_kv[b, h, t, :], in place. Mirrors the CPU
-/// row loop (incl. `mapKVCacheTime` ring/growth mapping) but records one device
+/// row loop (incl. `mapSequenceStep` ring/growth mapping) but records one device
 /// buffer copy per row. end_index is read on the host at record time.
-pub fn execKVCacheAppend(ctx: Ctx, frame: *Frame, s: executable.StepKVCacheAppendTiled) ExecuteProgramError!void {
+pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceAppendTiled) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     var cache_meta = hs.meta(s.cache) catch return error.ExecutionFailed;
     const new_meta = hs.meta(s.new_kv) catch return error.ExecutionFailed;
@@ -383,7 +383,7 @@ pub fn execKVCacheAppend(ctx: Ctx, frame: *Frame, s: executable.StepKVCacheAppen
         const t_start: usize = @intCast(end_idx.vals[b]);
         var t: usize = 0;
         while (t < new_len) : (t += 1) {
-            _ = hs.mapKVCacheTime(s.cache, t_start + t, cache_meta.shape[2]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.cache, t_start + t, cache_meta.shape[2]) catch return error.ExecutionFailed;
         }
     }
     cache_meta = hs.meta(s.cache) catch return error.ExecutionFailed;
@@ -405,7 +405,7 @@ pub fn execKVCacheAppend(ctx: Ctx, frame: *Frame, s: executable.StepKVCacheAppen
         while (h < heads) : (h += 1) {
             var t: usize = 0;
             while (t < new_len) : (t += 1) {
-                const dst_t = hs.mapKVCacheTime(s.cache, t_start + t, cache_t) catch return error.ExecutionFailed;
+                const dst_t = hs.mapSequenceStep(s.cache, t_start + t, cache_t) catch return error.ExecutionFailed;
 
                 const src_coords = [4]usize{ b / new_meta.tile_shape[0], h / new_meta.tile_shape[1], t / new_meta.tile_shape[2], 0 };
                 const dst_coords = [4]usize{ b / cache_meta.tile_shape[0], h / cache_meta.tile_shape[1], dst_t / cache_meta.tile_shape[2], 0 };

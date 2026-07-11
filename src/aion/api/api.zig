@@ -32,7 +32,7 @@ pub const ExportMetadata = @import("context.zig").ExportMetadata;
 pub const OutputAlias = @import("context.zig").OutputAlias;
 pub const CacheConfig = @import("context.zig").CacheConfig;
 pub const CachePolicy = @import("context.zig").CachePolicy;
-pub const KVCachePolicy = @import("context.zig").KVCachePolicy;
+pub const SequenceCachePolicy = @import("context.zig").SequenceCachePolicy;
 pub const GrowablePolicy = @import("context.zig").GrowablePolicy;
 pub const RingPolicy = @import("context.zig").RingPolicy;
 

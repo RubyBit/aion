@@ -29,7 +29,7 @@ Quantization policy:
 
 KV sharing:
 - Layers 0..14 own cache tensors. Layers 15..34 reuse the source-layer cache output
-  (the value id produced by the source layer's KVCacheAppend) — no K/V materialized
+  (the value id produced by the source layer's SequenceAppend) — no K/V materialized
   for those layers, and their k_proj/v_proj/k_norm weights are skipped.
 
 Forward pass (abridged, full detail inline):
@@ -39,7 +39,7 @@ Forward pass (abridged, full detail inline):
     q_proj, [optional] k_proj, v_proj  (regular MatMul; B stored as [1, K, N] q8_0)
        q_norm / k_norm (RMSNorm over head_dim)
        RoPE1D on q, [optional] k
-       [source layers] cast f32->f16 new_k/new_v, KVCacheAppend
+       [source layers] cast f32->f16 new_k/new_v, SequenceAppend
        MultiHeadAttentionCached (selects source cache for KV-sharing layers)
       o_proj, post-attn RMSNorm, residual
       FFW: pre-ffn RMSNorm, gate/up MatMul, gelu_tanh, multiply, down MatMul, post-ffn RMSNorm, residual
@@ -280,7 +280,7 @@ def _emit_forward_one_block(
     k4_t = b.reshape(k4, ("batch", NUM_KV_HEADS, "seq", head_dim))
     if cache_dtype == aw.DType.f16:
         k4_t = b.cast(k4_t, aw.DType.f16)
-    k_next = b.kv_cache_append(k_cache, k4_t, cache_write_index)
+    k_next = b.sequence_append(k_cache, k4_t, cache_write_index)
 
     v_flat = b.matmul(x_norm, lw.v_proj)
     taps["v_flat"] = v_flat
@@ -291,7 +291,7 @@ def _emit_forward_one_block(
     v4_t = b.reshape(v4, ("batch", NUM_KV_HEADS, "seq", head_dim))
     if cache_dtype == aw.DType.f16:
         v4_t = b.cast(v4_t, aw.DType.f16)
-    v_next = b.kv_cache_append(v_cache, v4_t, cache_write_index)
+    v_next = b.sequence_append(v_cache, v4_t, cache_write_index)
 
     # 4) Attention.
     attn_out = b.mha_cached(
@@ -667,15 +667,15 @@ class _PackageBuilder:
             raise ValueError(f"Cast: unsupported cast {x_dt} -> {to_dtype}")
         return self._emit(aw.NodeKind.Cast, [x], aw.attr_cast(to_dtype), out_dtype=to_dtype, out_rank=self._value_rank[x])
 
-    def kv_cache_append(self, cache: int, new_kv: int, end_index: int) -> int:
+    def sequence_append(self, cache: int, new_kv: int, end_index: int) -> int:
         cache_dt = self._dtype_of(cache)
         if self._dtype_of(new_kv) != cache_dt:
-            raise ValueError("KVCacheAppend: cache/new_kv dtype mismatch")
+            raise ValueError("SequenceAppend: cache/new_kv dtype mismatch")
         if cache_dt not in (aw.DType.f16, aw.DType.f32):
-            raise ValueError("KVCacheAppend: unsupported cache dtype")
+            raise ValueError("SequenceAppend: unsupported cache dtype")
         if self._dtype_of(end_index) != aw.DType.i32:
-            raise ValueError("KVCacheAppend: end_index must be i32")
-        return self._emit(aw.NodeKind.KVCacheAppend, [cache, new_kv, end_index], b"", out_dtype=cache_dt, out_rank=self._value_rank[cache])
+            raise ValueError("SequenceAppend: end_index must be i32")
+        return self._emit(aw.NodeKind.SequenceAppend, [cache, new_kv, end_index], b"", out_dtype=cache_dt, out_rank=self._value_rank[cache])
 
     def gather_rows(self, table: int, indices: int) -> int:
         table_dt = self._dtype_of(table)
@@ -944,14 +944,14 @@ def _emit_forward(
             # The runtime append kernel expects shape[0]=B, shape[1]=H_kv, shape[2]=new_len, shape[3]=D_k.
             k4_t = b.reshape(k4, ("batch", NUM_KV_HEADS, "seq", head_dim))
             k_f16 = b.cast(k4_t, aw.DType.f16)
-            k_cache_cur[layer_idx] = b.kv_cache_append(k_cache_cur[layer_idx], k_f16, cache_write_index)
+            k_cache_cur[layer_idx] = b.sequence_append(k_cache_cur[layer_idx], k_f16, cache_write_index)
 
             v4 = b.reshape(v_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
             # Gemma4 uses V-norm, but it is parameterless (gamma is implicitly all-ones).
             v4 = b.rmsnorm(v4, b.scale_broadcast_vec(head_dim, 1.0), b.zero_beta((head_dim,)), (head_dim,))
             v4_t = b.reshape(v4, ("batch", NUM_KV_HEADS, "seq", head_dim))
             v_f16 = b.cast(v4_t, aw.DType.f16)
-            v_cache_cur[layer_idx] = b.kv_cache_append(v_cache_cur[layer_idx], v_f16, cache_write_index)
+            v_cache_cur[layer_idx] = b.sequence_append(v_cache_cur[layer_idx], v_f16, cache_write_index)
 
         # 4) Attention reads the current (post-append) cache of the source layer.
         k_ref = k_cache_cur[src]

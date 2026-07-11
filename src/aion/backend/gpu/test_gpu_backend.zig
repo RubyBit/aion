@@ -801,7 +801,7 @@ fn buildKVAppend(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const cache = try makeInput(&g, mgr, &.{ 1, 2, 8, 16 }, &.{ 1, 2, 8, 16 }, 43);
     const new_kv = try makeInput(&g, mgr, &.{ 1, 2, 3, 16 }, &.{ 1, 2, 3, 16 }, 44);
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{2});
-    const out = try g.addKVCacheAppend(cache, new_kv, end);
+    const out = try g.addSequenceAppend(cache, new_kv, end);
     return finishProg(alloc, &g, mgr, out);
 }
 

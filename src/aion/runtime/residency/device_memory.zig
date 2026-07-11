@@ -47,6 +47,14 @@ pub const DeviceMemory = struct {
         /// on discrete devices. Mirrors Vulkan VK_EXT_external_memory_host /
         /// cudaHostRegister / a host-visible mapped buffer.
         importHost: ?*const fn (ctx: *anyopaque, host: []u8) DeviceError!DeviceHandle = null,
+
+        /// Largest single buffer that can be allocated AND bound as storage
+        /// (bytes) — the device's reported per-allocation ceiling (WebGPU's
+        /// `maxStorageBufferBindingSize`). The residency/model layer uses it as
+        /// the fit-gate before making a tensor device-exclusive. This is a
+        /// per-buffer limit, NOT total capacity (WebGPU exposes no VRAM total; on
+        /// unified hardware device buffers consume RAM). Null → unbounded.
+        maxBindingBytes: ?*const fn (ctx: *anyopaque) u64 = null,
     };
 
     pub fn model(self: DeviceMemory) MemoryModel {
@@ -68,6 +76,10 @@ pub const DeviceMemory = struct {
         if (self.vtable.importHost) |f| return f(self.ctx, host);
         return DeviceError.Unsupported;
     }
+    pub fn maxBindingBytes(self: DeviceMemory) u64 {
+        if (self.vtable.maxBindingBytes) |f| return f(self.ctx);
+        return std.math.maxInt(u64);
+    }
 };
 
 /// Host-backed `DeviceMemory` for tests. Each "device buffer" is either a real
@@ -81,6 +93,10 @@ pub const MockDeviceMemory = struct {
     mem_model: MemoryModel = .discrete,
     buffers: std.ArrayList(Buf) = .empty,
     next_handle: DeviceHandle = 1, // 0 reserved as "none"
+    /// Reported per-buffer ceiling (see `VTable.maxBindingBytes`). Unbounded by
+    /// default; tests set it small to exercise the device-exclusive fit-gate's
+    /// fallback path.
+    max_binding_bytes: u64 = std.math.maxInt(u64),
 
     // Transfer counters for test assertions.
     h2d_count: usize = 0,
@@ -184,6 +200,11 @@ pub const MockDeviceMemory = struct {
         self.bytes_d2h += dst.len;
     }
 
+    fn maxBindingBytes(ctx: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.max_binding_bytes;
+    }
+
     const vtable = DeviceMemory.VTable{
         .model = model,
         .alloc = alloc,
@@ -191,5 +212,6 @@ pub const MockDeviceMemory = struct {
         .copyH2D = copyH2D,
         .copyD2H = copyD2H,
         .importHost = importHost,
+        .maxBindingBytes = maxBindingBytes,
     };
 };

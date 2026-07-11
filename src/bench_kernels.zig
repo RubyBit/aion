@@ -398,7 +398,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const cache = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_H, KA.KV_T, KA.KV_D }, &.{ 1, KA.KV_H, KA.KV_T, KA.KV_D }, 16);
             const new_kv = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_H, 1, KA.KV_D }, &.{ 1, KA.KV_H, 1, KA.KV_D }, 17);
             const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.KV_T / 2});
-            break :blk try g.addKVCacheAppend(cache, new_kv, end);
+            break :blk try g.addSequenceAppend(cache, new_kv, end);
         },
         .argmax => blk: {
             const x = try inputF32(alloc, &g, mgr, &.{ KA.AM_ROWS, KA.AM_COLS }, &.{ KA.AM_ROWS, KA.AM_COLS }, 18);

@@ -159,7 +159,7 @@ class NodeKind:
     ViewSliceND = 20
     GatherRows = 21
     RoPE1D = 22
-    KVCacheAppend = 23
+    SequenceAppend = 23
     MultiHeadAttentionCached = 24
     Cast = 25
     MatMulNT = 26

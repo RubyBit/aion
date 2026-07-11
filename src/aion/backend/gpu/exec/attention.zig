@@ -13,7 +13,7 @@
 //!     (f32 or f16 — bound as u32 words, no shader-f16 extension needed), with
 //!     positions/end_index read ON DEVICE and identity/ring time mapping done
 //!     in-kernel. Only cache GROWTH needs the host: end_index is read at record
-//!     time to pre-touch `mapKVCacheTime` (same protocol as the CPU executor
+//!     time to pre-touch `mapSequenceStep` (same protocol as the CPU executor
 //!     and the GPU KV-append), then metadata is re-fetched.
 //!
 //! v1 scope: f32 q/out (+f32 kernels for plain attention); dk <= 512 (the
@@ -346,8 +346,8 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
             if (vals[b] < 0) return error.ExecutionFailed;
             const valid_end: usize = @intCast(vals[b]);
             if (valid_end == 0) continue;
-            _ = hs.mapKVCacheTime(s.k_cache, valid_end - 1, k_meta.shape[2]) catch return error.ExecutionFailed;
-            _ = hs.mapKVCacheTime(s.v_cache, valid_end - 1, v_meta.shape[2]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.k_cache, valid_end - 1, k_meta.shape[2]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.v_cache, valid_end - 1, v_meta.shape[2]) catch return error.ExecutionFailed;
         }
     }
     k_meta = hs.meta(s.k_cache) catch return error.ExecutionFailed;
@@ -357,7 +357,7 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
 
     // Time mapping: identity for none/growable, modulo for ring — resolved
     // in-kernel (no per-token host round-trips).
-    const policy_info = hs.kvCachePolicyInfo(s.k_cache);
+    const policy_info = hs.sequenceCachePolicyInfo(s.k_cache);
     const is_ring = policy_info.kind == .ring;
     const ring_window: usize = if (is_ring) blk: {
         const configured: usize = policy_info.ring_window_tokens;

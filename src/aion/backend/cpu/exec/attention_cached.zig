@@ -725,11 +725,11 @@ const ExecCtx = struct {
                                         v_t = logical_t % self.ring_window;
                                     },
                                     .callback => {
-                                        k_t = self.store.mapKVCacheTime(self.s.k_cache, logical_t, self.k_cap) catch |e| {
+                                        k_t = self.store.mapSequenceStep(self.s.k_cache, logical_t, self.k_cap) catch |e| {
                                             self.fail(e);
                                             return;
                                         };
-                                        v_t = self.store.mapKVCacheTime(self.s.v_cache, logical_t, self.v_cap) catch |e| {
+                                        v_t = self.store.mapSequenceStep(self.s.v_cache, logical_t, self.v_cap) catch |e| {
                                             self.fail(e);
                                             return;
                                         };
@@ -829,11 +829,11 @@ const ExecCtx = struct {
                                         v_t = logical_t % self.ring_window;
                                     },
                                     .callback => {
-                                        k_t = self.store.mapKVCacheTime(self.s.k_cache, logical_t, self.k_cap) catch |e| {
+                                        k_t = self.store.mapSequenceStep(self.s.k_cache, logical_t, self.k_cap) catch |e| {
                                             self.fail(e);
                                             return;
                                         };
-                                        v_t = self.store.mapKVCacheTime(self.s.v_cache, logical_t, self.v_cap) catch |e| {
+                                        v_t = self.store.mapSequenceStep(self.s.v_cache, logical_t, self.v_cap) catch |e| {
                                             self.fail(e);
                                             return;
                                         };
@@ -990,8 +990,8 @@ pub fn execMultiHeadAttentionCachedTiled(
             const valid_end: usize = @intCast(end_i32);
             if (valid_end == 0) continue;
 
-            _ = store.mapKVCacheTime(s.k_cache, valid_end - 1, k_meta.shape[2]) catch return BackendError.InvalidArgument;
-            _ = store.mapKVCacheTime(s.v_cache, valid_end - 1, v_meta.shape[2]) catch return BackendError.InvalidArgument;
+            _ = store.mapSequenceStep(s.k_cache, valid_end - 1, k_meta.shape[2]) catch return BackendError.InvalidArgument;
+            _ = store.mapSequenceStep(s.v_cache, valid_end - 1, v_meta.shape[2]) catch return BackendError.InvalidArgument;
         }
     }
 
@@ -1010,7 +1010,7 @@ pub fn execMultiHeadAttentionCachedTiled(
     const v_cap: usize = v_meta.shape[2];
     if (k_cap == 0 or v_cap == 0) return BackendError.InvalidArgument;
 
-    const policy_info: tensor_store.KVCachePolicyInfo = store.kvCachePolicyInfo(s.k_cache);
+    const policy_info: tensor_store.SequenceCachePolicyInfo = store.sequenceCachePolicyInfo(s.k_cache);
     const map_mode: TimeMapMode = switch (policy_info.kind) {
         .none => .identity,
         .growable => .identity,

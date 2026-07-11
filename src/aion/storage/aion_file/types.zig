@@ -178,7 +178,7 @@ pub const NodeOp = union(graph_mod.OpTag) {
         rope_proportion: f32,
     },
 
-    KVCacheAppend: void,
+    SequenceAppend: void,
 
     MultiHeadAttentionCached: struct {
         scale: f32,

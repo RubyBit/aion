@@ -135,4 +135,5 @@ AionStatus aion_loaded_model_output_rank(const AionLoadedModel* m, size_t index,
 AionStatus aion_loaded_model_bind_input(AionLoadedModel* m, const char* name, const AionTensor* tensor);
 AionStatus aion_loaded_model_run(AionLoadedModel* m);
 AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
+AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
 AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);

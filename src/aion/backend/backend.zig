@@ -42,6 +42,15 @@ pub const Session = struct {
         execute: *const fn (ctx: *anyopaque, prog: *const executable.ExecutableProgram) ExecuteProgramError!void,
         /// Release the session and any per-store state it owns (device buffers, etc.).
         deinit: *const fn (ctx: *anyopaque) void,
+
+        /// Ensure a tensor's host bytes are current, flushing a device-newer copy
+        /// (D2H) if one exists. Null on a stateless session (CPU: the store is
+        /// always host-coherent) and a no-op for a host-resident tensor. The
+        /// runtime calls this before a host read of an output that `execute`
+        /// intentionally left device-resident (recurrent state — see
+        /// `ExecutableProgram.output_device_resident`), so such reads stay correct
+        /// while the per-run eager flush is skipped.
+        syncToHost: ?*const fn (ctx: *anyopaque, id: tensor_store.TensorId) ExecuteProgramError!void = null,
     };
 
     pub fn execute(self: Session, prog: *const executable.ExecutableProgram) ExecuteProgramError!void {
@@ -50,6 +59,12 @@ pub const Session = struct {
 
     pub fn deinit(self: Session) void {
         self.vtable.deinit(self.ctx);
+    }
+
+    /// Flush `id` to the host if the session tracks device residency; otherwise a
+    /// no-op. See `VTable.syncToHost`.
+    pub fn syncToHost(self: Session, id: tensor_store.TensorId) ExecuteProgramError!void {
+        if (self.vtable.syncToHost) |f| return f(self.ctx, id);
     }
 };
 

@@ -38,7 +38,7 @@ pub const OutputAlias = api_package_export.OutputAlias;
 pub const ExportModelOptions = api_package_export.ExportModelOptions;
 pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
-pub const KVCachePolicy = cache_mod.KVCachePolicy;
+pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
 pub const GrowablePolicy = cache_mod.GrowablePolicy;
 pub const RingPolicy = cache_mod.RingPolicy;
 pub const DeviceSelector = device_mod.DeviceSelector;
@@ -217,9 +217,9 @@ pub const Context = struct {
         try self.store.configureCache(cfg);
     }
 
-    pub fn setTensorKVCachePolicy(self: *Self, t: api_tensor.Tensor, policy: cache_mod.KVCachePolicy) api_errors.ApiError!void {
+    pub fn setTensorSequenceCachePolicy(self: *Self, t: api_tensor.Tensor, policy: cache_mod.SequenceCachePolicy) api_errors.ApiError!void {
         if (t.store != &self.store) return api_errors.ApiError.InvalidArgument;
-        try self.store.registerKVCachePolicy(t.id, policy);
+        try self.store.registerSequenceCachePolicy(t.id, policy);
     }
 
     pub fn tilePolicy(self: *const Self) plan_mod.TilePolicy {
@@ -301,7 +301,7 @@ pub const Context = struct {
         // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
         const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, dev.policy, &pkg, file, bytes);
         errdefer self.allocator.free(initializer_tids);
-        return api_loaded_model.LoadedModel.initLoaded(self.allocator, dev.backend, &self.store, dev.policy, pkg, initializer_tids, hash, opts);
+        return api_loaded_model.LoadedModel.initLoaded(self.allocator, dev.backend, &self.store, dev.policy, dev.ref, pkg, initializer_tids, hash, opts);
     }
 
     /// Load an AION package as a weights-only container.
@@ -630,6 +630,7 @@ pub const Context = struct {
             dev.backend,
             &self.store,
             dev.policy,
+            dev.ref,
             owned_graph,
             input_ids.items,
             input_names.items,

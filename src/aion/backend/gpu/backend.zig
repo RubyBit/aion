@@ -30,7 +30,7 @@
 //! MatMulTiled (rank-2, autotuned register-blocked GEMM), MatMulNTTiled
 //! (q8_0/f32 weights: GEMV for M==1, dequant + f32 GEMM for M>1), SoftmaxTiled /
 //! RMSNormTiled / LayerNormTiled / ReduceAll / ReduceAxis (row-wise, last axis
-//! intra-tile), GatherRows / RoPE1D / KVCacheAppend / Cast (decode data
+//! intra-tile), GatherRows / RoPE1D / SequenceAppend / Cast (decode data
 //! movement), AttentionTiled / MultiHeadAttentionTiled (streaming-softmax
 //! kernel, one workgroup per query row), MultiHeadAttentionCachedTiled (GQA
 //! over f32/f16 KV caches, positions/end read on-device), Conv1DTiled /
@@ -194,6 +194,14 @@ pub const GpuBackend = struct {
             return s.gb.runProgram(&s.resident, prog);
         }
 
+        /// Flush `id` back to the host store (D2H) if the device copy is newer.
+        /// Lets the runtime host-read an output that `execute` kept device-resident
+        /// (recurrent state) without the per-run eager flush; see `flushToHost`.
+        fn syncToHost(ctx: *anyopaque, id: TensorId) ExecuteProgramError!void {
+            const s: *GpuSession = @ptrCast(@alignCast(ctx));
+            return flushToHost(&s.resident, id);
+        }
+
         fn deinitSession(ctx: *anyopaque) void {
             const s: *GpuSession = @ptrCast(@alignCast(ctx));
             s.resident.deinit();
@@ -203,6 +211,7 @@ pub const GpuBackend = struct {
         const session_vtable = Session.VTable{
             .execute = execute,
             .deinit = deinitSession,
+            .syncToHost = syncToHost,
         };
     };
 
@@ -393,7 +402,7 @@ pub const GpuBackend = struct {
                 .ReduceAxis => |s| try rowwise.execReduceAxis(op_ctx, frame, s),
                 .GatherRowsTiled => |s| try decode_ops.execGatherRows(op_ctx, frame, s),
                 .RoPE1DTiled => |s| try decode_ops.execRoPE(op_ctx, frame, s),
-                .KVCacheAppendTiled => |s| try decode_ops.execKVCacheAppend(op_ctx, frame, s),
+                .SequenceAppendTiled => |s| try decode_ops.execSequenceAppend(op_ctx, frame, s),
                 .AttentionTiled => |s| try attention_exec.execAttention(op_ctx, frame, s),
                 .MultiHeadAttentionTiled => |s| try attention_exec.execAttention(op_ctx, frame, s),
                 .MultiHeadAttentionCachedTiled => |s| try attention_exec.execAttentionCached(op_ctx, frame, s),
@@ -525,7 +534,14 @@ pub const GpuBackend = struct {
         runner.frame.submit();
 
         if (self.flush_outputs) {
-            for (prog.outputs) |oid| try flushToHost(rstore, oid);
+            // Recurrent state aliased in place to an input (KV caches, LSTM h/c)
+            // stays device-resident across `execute` calls — the host never reads
+            // it between runs, so skipping its D2H removes a per-step flush that
+            // otherwise scales with context length. See `outputStaysResident`.
+            for (prog.outputs, 0..) |oid, i| {
+                if (prog.outputStaysResident(i)) continue;
+                try flushToHost(rstore, oid);
+            }
         }
 
         if (profile) {

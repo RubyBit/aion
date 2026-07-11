@@ -572,7 +572,7 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .scale_factor = try readIntCursor(bytes, &cursor, f32),
             .rope_proportion = try readIntCursor(bytes, &cursor, f32),
         } },
-        .KVCacheAppend => .KVCacheAppend,
+        .SequenceAppend => .SequenceAppend,
         .Cast => .{ .Cast = .{ .to_dtype = try readEnumCursor(bytes, &cursor, DType) } },
         .MatMulNT => .{ .MatMulNT = .{
             .alpha = try readIntCursor(bytes, &cursor, f32),

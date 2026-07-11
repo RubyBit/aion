@@ -186,6 +186,39 @@ class LoadedModel:
         st = lib.aion_loaded_model_bind_input(self._m, c_name, tensor.ptr)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_bind_input")
 
+    def set_state_input_growable(
+        self,
+        name: str,
+        *,
+        initial_capacity: int,
+        max_capacity: int,
+        growth_numerator: int = 2,
+        growth_denominator: int = 1,
+    ) -> None:
+        """Make an io-aliased recurrent-state input grow on demand.
+
+        The state slot starts at `initial_capacity` tokens and the runtime grows
+        it (device-resident growth included) up to `max_capacity` as writes cross
+        the current size — so callers need not pre-allocate the maximum. `growth_*`
+        is the geometric factor (default 2x).
+        """
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        c_name = self._c_name(name)
+        st = lib.aion_loaded_model_set_state_input_policy(
+            self._m, c_name, 1,
+            int(initial_capacity), int(growth_numerator), int(growth_denominator), int(max_capacity), 0,
+        )
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_state_input_policy")
+
+    def set_state_input_ring(self, name: str, *, window: int) -> None:
+        """Make an io-aliased recurrent-state input a fixed ring buffer of `window` tokens."""
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        c_name = self._c_name(name)
+        st = lib.aion_loaded_model_set_state_input_policy(self._m, c_name, 2, 0, 0, 0, 0, int(window))
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_state_input_policy")
+
     def run_tensors(
         self,
         inputs: Mapping[str, object],

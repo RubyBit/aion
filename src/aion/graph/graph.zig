@@ -69,7 +69,7 @@ pub const OpTag = enum(u8) {
     /// In-place KV cache append (scatter-write into existing cache tensor).
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    KVCacheAppend = 23,
+    SequenceAppend = 23,
 
     /// Cached grouped-query attention over external KV cache tensors.
     ///
@@ -79,7 +79,7 @@ pub const OpTag = enum(u8) {
     /// Elementwise scalar-dtype cast (shape- and layout-preserving).
     ///
     /// Supported pairs: f32<->f16. Primary use case: bridging the f32 output of
-    /// quantized matmul to f16 KV caches before `KVCacheAppend`.
+    /// quantized matmul to f16 KV caches before `SequenceAppend`.
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     Cast = 25,
@@ -267,7 +267,7 @@ pub const Op = union(OpTag) {
     ///
     /// Output:
     /// - out:       [B, H_kv, T, D] (aliased mutation semantics)
-    KVCacheAppend: void,
+    SequenceAppend: void,
 
     /// Cached grouped-query attention (GQA) over KV cache tensors.
     ///
@@ -410,7 +410,7 @@ pub fn opInputArity(op: Op) InputArity {
         .ViewSliceND => .{ .exact = 1 },
         .GatherRows => .{ .exact = 2 },
         .RoPE1D => .{ .exact = 2 },
-        .KVCacheAppend => .{ .exact = 3 },
+        .SequenceAppend => .{ .exact = 3 },
         .Cast => .{ .exact = 1 },
         .MatMulNT => .{ .exact = 2 },
         .If => .{ .exact = 3 },
@@ -857,14 +857,14 @@ pub const Graph = struct {
         );
     }
 
-    pub fn addKVCacheAppend(
+    pub fn addSequenceAppend(
         self: *Self,
         cache: ValueId,
         new_kv: ValueId,
         end_index: ValueId,
     ) GraphError!ValueId {
         return self.addNodeInternal(
-            .KVCacheAppend,
+            .SequenceAppend,
             &[_]ValueId{ cache, new_kv, end_index },
         );
     }

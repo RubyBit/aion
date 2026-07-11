@@ -110,14 +110,6 @@ pub fn createTensorForShape(
     return createTensorForShapeWithQuantAxis(store, policy, dtype, shape, 0);
 }
 
-/// Zero the full backing buffer of an existing store tensor (including any tile
-/// padding). Used to reset recurrent state slots between independent sequences.
-pub fn zeroStoreTensor(store: *types_mod.StorageManager, tid: types_mod.TensorId) manager_mod.StorageError!void {
-    const t = try store.getMut(tid);
-    @memset(t.data, 0);
-    t.host_seq +%= 1; // host mutation: invalidate any device copy
-}
-
 /// Create a tensor sized to `shape` but tiled as a single physical tile (tile_shape == shape).
 ///
 /// Intended for graph inputs whose on-disk semantics require persisting full-shape data

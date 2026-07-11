@@ -115,7 +115,7 @@ pub const StepRoPE1DTiled = struct {
 /// - cache:     [B, H_kv, T, D] (f16/f32), written in-place
 /// - new_kv:    [B, H_kv, new_len, D] (f16/f32), read-only
 /// - end_index: [B] (i32), per-batch append start offsets
-pub const StepKVCacheAppendTiled = struct {
+pub const StepSequenceAppendTiled = struct {
     cache: TensorId,
     new_kv: TensorId,
     end_index: TensorId,
@@ -233,7 +233,7 @@ pub const Step = union(enum) {
 
     RoPE1DTiled: StepRoPE1DTiled,
 
-    KVCacheAppendTiled: StepKVCacheAppendTiled,
+    SequenceAppendTiled: StepSequenceAppendTiled,
 
     LSTMCellFused: StepLSTMCellFused,
 
@@ -268,8 +268,24 @@ pub const ExecutableProgram = struct {
     steps: []Step,
     blocks: []Block = &[_]Block{},
     outputs: []TensorId,
+    /// Per-output flag, parallel to `outputs`: true when the output is recurrent
+    /// state aliased *in place* to a program input (KV caches, LSTM h/c — the
+    /// output's tensor id equals the input slot it feeds back into). A device
+    /// backend keeps such an output resident on-device across `execute` calls
+    /// instead of flushing it to the host: the model's io-alias write-back is a
+    /// no-op for it (source == destination), so the host never reads it between
+    /// runs and a device->host flush would be pure, context-length-scaling waste.
+    /// Empty (the default) means "flush every output" — programs compiled without
+    /// alias annotation, and the CPU backend which has no residency, are unchanged.
+    output_device_resident: []const bool = &[_]bool{},
 
     const Self = @This();
+
+    /// Whether a device backend should keep output `i` resident on-device after
+    /// `execute` instead of flushing it to the host. See `output_device_resident`.
+    pub fn outputStaysResident(self: *const Self, i: usize) bool {
+        return i < self.output_device_resident.len and self.output_device_resident[i];
+    }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.steps);
@@ -278,6 +294,7 @@ pub const ExecutableProgram = struct {
         }
         if (self.blocks.len != 0) self.allocator.free(self.blocks);
         self.allocator.free(self.outputs);
+        if (self.output_device_resident.len != 0) self.allocator.free(self.output_device_resident);
         self.* = undefined;
     }
 };

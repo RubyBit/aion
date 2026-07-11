@@ -34,7 +34,7 @@ const exec_rfft = @import("exec/rfft.zig");
 const exec_stft = @import("exec/stft.zig");
 const exec_gather = @import("exec/gather.zig");
 const exec_rope = @import("exec/rope.zig");
-const exec_kv_cache_append = @import("exec/kv_cache_append.zig");
+const exec_sequence_append = @import("exec/sequence_append.zig");
 const exec_cast = @import("exec/cast.zig");
 const exec_matmul_nt = @import("exec/matmul_nt.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
@@ -594,9 +594,9 @@ pub const CpuBackend = struct {
                 try exec_rope.execRoPE1DTiled(pool_ptr, self.thread_count, s, store);
             },
 
-            .KVCacheAppendTiled => |s| {
+            .SequenceAppendTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_kv_cache_append.execKVCacheAppendTiled(pool_ptr, self.thread_count, s, store);
+                try exec_sequence_append.execSequenceAppendTiled(pool_ptr, self.thread_count, s, store);
             },
 
             .CastTiled => |s| {

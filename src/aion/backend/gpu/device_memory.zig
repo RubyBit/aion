@@ -168,6 +168,13 @@ pub const WgpuDeviceMemory = struct {
         c.wgpuBufferUnmap(staging);
     }
 
+    fn maxBindingBytes(ctx: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        // The state slot is a single storage-bound tile, so the binding-size
+        // limit is what gates whether it can be device-resident at all.
+        return self.gpu.limits.max_storage_binding_bytes;
+    }
+
     const vtable = DeviceMemory.VTable{
         .model = model,
         .alloc = alloc,
@@ -175,5 +182,6 @@ pub const WgpuDeviceMemory = struct {
         .copyH2D = copyH2D,
         .copyD2H = copyD2H,
         // importHost stays null: discrete memory has no host aliasing.
+        .maxBindingBytes = maxBindingBytes,
     };
 };

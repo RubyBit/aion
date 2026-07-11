@@ -4,6 +4,7 @@ const std = @import("std");
 const package_file = @import("aion_file.zig");
 const manager_mod = @import("manager.zig");
 const storage = @import("storage.zig");
+const dm = @import("../runtime/residency/device_memory.zig");
 const tensor_store = @import("../runtime/tensor_store.zig");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
@@ -81,6 +82,45 @@ test "storage: scalar f32 roundtrip pack<->tiles" {
 
     try tt.readToPackedScalar(std.mem.sliceAsBytes(out));
     try std.testing.expectEqualSlices(f32, packed_vals, out);
+}
+
+test "storage: device-aware copy/zero round-trip via mock device memory" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var mock = dm.MockDeviceMemory.init(allocator);
+    defer mock.deinit();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const shape = [_]usize{ 2, 3 };
+    const vals = [_]f32{ 1, 2, 3, 4, 5, 6 };
+
+    // Host source seeded with known values (single tile).
+    const src = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(src, std.mem.sliceAsBytes(&vals));
+
+    // Device-exclusive destination (migrated onto the mock device; host bytes freed).
+    const dst = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+    try sm.moveTensor(dst, .{ .kind = .gpu, .index = 0 }, mock.device(), &shape, 64);
+    try std.testing.expect((try sm.tensorDevice(dst)).kind == .gpu);
+
+    // Seed device dst from host src (H2D scatter), then mirror back to a host
+    // tensor (D2H gather) — the seed + host-read paths a device-exclusive KV slot uses.
+    try sm.copyTensorData(dst, src);
+    const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+    try sm.copyTensorData(mirror, dst);
+
+    var got: [6]f32 = undefined;
+    try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got));
+    try std.testing.expectEqualSlices(f32, &vals, &got);
+    try std.testing.expect(mock.h2d_count > 0 and mock.d2h_count > 0);
+
+    // Device-aware zero (resetState path), then mirror again → all zeros.
+    try sm.zeroTensorData(dst);
+    try sm.copyTensorData(mirror, dst);
+    try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 0, 0 }, &got);
 }
 
 test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
@@ -694,11 +734,11 @@ test "storage cache: lease tokens and policy info" {
         &[_]usize{4},
         .{ .tile_alignment = 64 },
     );
-    try sm.registerKVCachePolicy(tid, .{ .ring = .{ .window_tokens = 4 } });
+    try sm.registerSequenceCachePolicy(tid, .{ .ring = .{ .window_tokens = 4 } });
 
     const store: tensor_store.TensorStore = sm.tensorStore();
-    const info: tensor_store.KVCachePolicyInfo = store.kvCachePolicyInfo(tid);
-    try std.testing.expectEqual(tensor_store.KVCachePolicyKind.ring, info.kind);
+    const info: tensor_store.SequenceCachePolicyInfo = store.sequenceCachePolicyInfo(tid);
+    try std.testing.expectEqual(tensor_store.SequenceCachePolicyKind.ring, info.kind);
     try std.testing.expectEqual(@as(usize, 4), info.ring_window_tokens);
 
     var t0: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
@@ -719,7 +759,7 @@ test "storage cache: lease tokens and policy info" {
     defer store.releaseConst(t2.token);
     try std.testing.expect(t2.token != 0);
 
-    const mapped_ring: usize = try store.mapKVCacheTime(tid, 5, 4);
+    const mapped_ring: usize = try store.mapSequenceStep(tid, 5, 4);
     try std.testing.expectEqual(@as(usize, 1), mapped_ring);
 
     const grow_tid: manager_mod.TensorId = try sm.createTiledTensor(
@@ -728,10 +768,10 @@ test "storage cache: lease tokens and policy info" {
         &[_]usize{ 1, 1, 4, 1 },
         .{ .tile_alignment = 64 },
     );
-    try sm.registerKVCachePolicy(grow_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
-    const mapped_grow: usize = try store.mapKVCacheTime(grow_tid, 3, 8);
+    try sm.registerSequenceCachePolicy(grow_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
+    const mapped_grow: usize = try store.mapSequenceStep(grow_tid, 3, 8);
     try std.testing.expectEqual(@as(usize, 3), mapped_grow);
-    const mapped_grow_expand: usize = try store.mapKVCacheTime(grow_tid, 8, 8);
+    const mapped_grow_expand: usize = try store.mapSequenceStep(grow_tid, 8, 8);
     try std.testing.expectEqual(@as(usize, 8), mapped_grow_expand);
     const grow_meta: *const manager_mod.TiledTensor = try sm.getConst(grow_tid);
     try std.testing.expectEqual(@as(usize, 16), grow_meta.shape[2]);
@@ -742,5 +782,5 @@ test "storage cache: lease tokens and policy info" {
         &[_]usize{4},
         .{ .tile_alignment = 64 },
     );
-    try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.mapKVCacheTime(plain_tid, 9, 8));
+    try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.mapSequenceStep(plain_tid, 9, 8));
 }

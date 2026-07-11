@@ -13,6 +13,8 @@ pub const TensorId = manager_mod.TensorId;
 pub const DType = package_file.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
 pub const Package = package_file.Package;
+pub const DeviceRef = device_mod.DeviceRef;
+pub const SequenceCachePolicy = manager_mod.SequenceCachePolicy;
 
 pub const SignatureInfo = struct {
     name: []const u8,

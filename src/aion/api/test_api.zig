@@ -1153,6 +1153,65 @@ test "api: recurrent state carries across cache entries with different input sha
     }
 }
 
+test "api: growable state input grows on demand up to its bound" {
+    // Grow-on-demand recurrent state: the cache is allocated small and the runtime
+    // grows its slot as appends cross capacity, up to a caller-set ceiling. No
+    // pre-allocation of the maximum.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    // cache [1,1,T,1] starts at T=2; sequenceAppend writes `new` at cache[end].
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");
+    const New = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 1, 1 }), "new");
+    const End = try bld.name(try bld.input(.i32, &[_]usize{1}), "end");
+    const Out = try bld.name(try bld.sequenceAppend(Cache, New, End), "cache_out");
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{
+        .output_aliases = &[_]api.OutputAlias{.{ .input = Cache, .output = Out }},
+    });
+    defer model.deinit();
+
+    // Initial capacity 2, double on demand, hard ceiling 8.
+    try model.setStateInputPolicy("cache", .{ .growable = .{
+        .initial_capacity_tokens = 2,
+        .growth_numerator = 2,
+        .growth_denominator = 1,
+        .max_capacity_tokens = 8,
+    } });
+
+    const cache0 = try ctx.fromArray([1][1][2][1]f32{.{.{ .{0}, .{0} }}});
+    try model.bindInput("cache", cache0);
+
+    // Append 1..5 at positions 0..4; capacity grows 2 -> 4 (at pos 2) -> 8 (at pos 4).
+    var pos: i32 = 0;
+    while (pos < 5) : (pos += 1) {
+        const new_t = try ctx.fromArray([1][1][1][1]f32{.{.{.{@as(f32, @floatFromInt(pos + 1))}}}});
+        const end_t = try ctx.fromArray([1]i32{pos});
+        try model.bindInput("new", new_t);
+        try model.bindInput("end", end_t);
+        try model.run();
+    }
+
+    // The slot grew to capacity 8; the first five entries hold the appended values.
+    const out = try model.outputTensorAt(0);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 8, 1 }, out.getShape());
+    var vals: [8]f32 = undefined;
+    try out.read(&vals);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 4, 5, 0, 0, 0 }, &vals);
+
+    // A step past the ceiling fails rather than growing without bound.
+    const new_t = try ctx.fromArray([1][1][1][1]f32{.{.{.{99.0}}}});
+    const end_over = try ctx.fromArray([1]i32{8});
+    try model.bindInput("new", new_t);
+    try model.bindInput("end", end_over);
+    try std.testing.expectError(error.InvalidArgument, model.run());
+}
+
 test "api: compile io-alias gives auto-init + carry + reset (no export/load)" {
     // The unified Model from ctx.compile must support the same recurrent-state
     // ergonomics as a loaded model: unbound aliased state auto-zeros, carries across
@@ -2218,7 +2277,7 @@ test "api: builder.param auto-generates persisted debug names" {
     try std.testing.expect(found);
 }
 
-test "api: kvCacheAppend mutates cache in-place" {
+test "api: sequenceAppend mutates cache in-place" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -2250,7 +2309,7 @@ test "api: kvCacheAppend mutates cache in-place" {
     const Cache: api.TensorRef = try bld.param(cache_t);
     const New: api.TensorRef = try bld.param(new_t);
     const End: api.TensorRef = try bld.param(end_t);
-    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+    const Out: api.TensorRef = try bld.sequenceAppend(Cache, New, End);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
@@ -2273,7 +2332,7 @@ test "api: kvCacheAppend mutates cache in-place" {
     }, out_vals[0..]);
 }
 
-test "api: kvCacheAppend ring policy wraps" {
+test "api: sequenceAppend ring policy wraps" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{
@@ -2301,7 +2360,7 @@ test "api: kvCacheAppend ring policy wraps" {
         },
     });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{3});
-    try ctx.setTensorKVCachePolicy(cache_t, .{ .ring = .{ .window_tokens = 4 } });
+    try ctx.setTensorSequenceCachePolicy(cache_t, .{ .ring = .{ .window_tokens = 4 } });
 
     var bld = api.Builder.init(allocator);
     defer bld.deinit();
@@ -2309,7 +2368,7 @@ test "api: kvCacheAppend ring policy wraps" {
     const Cache: api.TensorRef = try bld.param(cache_t);
     const New: api.TensorRef = try bld.param(new_t);
     const End: api.TensorRef = try bld.param(end_t);
-    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+    const Out: api.TensorRef = try bld.sequenceAppend(Cache, New, End);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();
@@ -2327,7 +2386,7 @@ test "api: kvCacheAppend ring policy wraps" {
     }, out_vals[0..]);
 }
 
-test "api: kvCacheAppend growable policy expands physical capacity" {
+test "api: sequenceAppend growable policy expands physical capacity" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{
@@ -2356,7 +2415,7 @@ test "api: kvCacheAppend growable policy expands physical capacity" {
     });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{5});
 
-    try ctx.setTensorKVCachePolicy(cache_t, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
+    try ctx.setTensorSequenceCachePolicy(cache_t, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
 
     var bld = api.Builder.init(allocator);
     defer bld.deinit();
@@ -2364,7 +2423,7 @@ test "api: kvCacheAppend growable policy expands physical capacity" {
     const Cache: api.TensorRef = try bld.param(cache_t);
     const New: api.TensorRef = try bld.param(new_t);
     const End: api.TensorRef = try bld.param(end_t);
-    const Out: api.TensorRef = try bld.kvCacheAppend(Cache, New, End);
+    const Out: api.TensorRef = try bld.sequenceAppend(Cache, New, End);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
     defer model.deinit();

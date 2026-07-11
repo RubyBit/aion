@@ -895,7 +895,7 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             try compileRequire(s.rope_proportion >= 0.0 and s.rope_proportion <= 1.0);
         },
 
-        .KVCacheAppendTiled => |s| {
+        .SequenceAppendTiled => |s| {
             const cache: *const TiledTensor = mgr.getConst(s.cache) catch return CompileError.InvalidArgument;
             const new_kv: *const TiledTensor = mgr.getConst(s.new_kv) catch return CompileError.InvalidArgument;
             const end_idx: *const TiledTensor = mgr.getConst(s.end_index) catch return CompileError.InvalidArgument;
@@ -921,7 +921,7 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             //   as one memcpy, so head_dim must not span tile boundaries)
             // - single tile for end_index vector (kernel reads it via tile 0)
             // Batch/heads/time can be arbitrarily tiled — the kernel maps logical
-            // (b, h, t) to tile coords by integer division (kv_cache_append.zig:116-124).
+            // (b, h, t) to tile coords by integer division (sequence_append.zig:116-124).
             try compileRequire(cache.tile_counts[3] == 1 and new_kv.tile_counts[3] == 1);
             try compileRequire(cache.tile_shape[3] == cache.shape[3]);
             try compileRequire(new_kv.tile_shape[3] == new_kv.shape[3]);
@@ -1162,7 +1162,7 @@ fn debugDumpTensorMeta(mgr: *StorageManager, tid: TensorId, label: []const u8) v
 
 fn debugDumpStep(mgr: *StorageManager, step: Step) void {
     switch (step) {
-        .KVCacheAppendTiled => |s| {
+        .SequenceAppendTiled => |s| {
             debugDumpTensorMeta(mgr, s.cache, "cache");
             debugDumpTensorMeta(mgr, s.new_kv, "new_kv");
             debugDumpTensorMeta(mgr, s.end_index, "end_index");
@@ -2375,7 +2375,7 @@ fn lowerNode(
             } });
         },
 
-        .KVCacheAppend => {
+        .SequenceAppend => {
             const cache_id: usize = @intCast(node.inputs[0]);
             const new_kv_id: usize = @intCast(node.inputs[1]);
             const end_idx_id: usize = @intCast(node.inputs[2]);
@@ -2417,7 +2417,7 @@ fn lowerNode(
             ctx.value_tensor[out_idx] = cache_tid;
             ctx.value_has_tensor[out_idx] = true;
 
-            try appendStepChecked(allocator, mgr, policy, steps, .{ .KVCacheAppendTiled = .{
+            try appendStepChecked(allocator, mgr, policy, steps, .{ .SequenceAppendTiled = .{
                 .cache = cache_tid,
                 .new_kv = new_kv_tid,
                 .end_index = end_idx_tid,

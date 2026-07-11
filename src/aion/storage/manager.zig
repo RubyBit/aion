@@ -15,8 +15,8 @@ pub const DType = types.DType;
 pub const Cache = cache_mod.Cache;
 pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
-pub const KVCachePolicy = cache_mod.KVCachePolicy;
-pub const KVCachePolicyInfo = cache_mod.KVCachePolicyInfo;
+pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
+pub const SequenceCachePolicyInfo = cache_mod.SequenceCachePolicyInfo;
 
 /// Opaque handle to a tensor owned by `StorageManager`.
 ///
@@ -134,25 +134,47 @@ pub const StorageManager = struct {
         return self.cache != null;
     }
 
-    pub fn registerKVCachePolicy(self: *Self, id: TensorId, policy: KVCachePolicy) StorageError!void {
+    pub fn registerSequenceCachePolicy(self: *Self, id: TensorId, policy: SequenceCachePolicy) StorageError!void {
         _ = try self.getConst(id);
         var cache_ptr: *Cache = if (self.cache) |*c| c else return StorageError.InvalidArgument;
         cache_ptr.registerTensorPolicy(id, policy) catch |e| return mapCacheError(e);
     }
 
     pub fn ensureTensorAxisCapacity(self: *Self, id: TensorId, axis: usize, min_size: usize) StorageError!void {
-        var t: *TiledTensor = try self.getMut(id);
-        if (axis >= @as(usize, t.rank)) return StorageError.InvalidArgument;
-        if (t.shape[axis] >= min_size) return;
-        try t.growAxisPreserveScalar(axis, min_size);
+        const t0: *const TiledTensor = try self.getConst(id);
+        if (axis >= @as(usize, t0.rank)) return StorageError.InvalidArgument;
+        if (t0.shape[axis] >= min_size) return;
+        if (t0.device.kind == .cpu) {
+            return (try self.getMut(id)).growAxisPreserveScalar(axis, min_size);
+        }
+
+        // Device-exclusive: round-trip through the host (D2H gather -> host grow ->
+        // H2D re-migrate), reusing `moveTensor` — no bespoke device copy. Growth is
+        // geometric, so this amortizes to O(final size) and never touches the
+        // fixed/ring fast path. `moveTensor` frees the old device buffer only after
+        // the re-upload, and the tensor id + single-tile geometry are preserved.
+        const target: DeviceRef = t0.device;
+        const dev: dm.DeviceMemory = t0.dev orelse return StorageError.InvalidArgument;
+        const tile_align: usize = t0.tile_alignment;
+        const rank: usize = @as(usize, t0.rank);
+        var shape_buf: [8]usize = undefined;
+        @memcpy(shape_buf[0..rank], t0.shape);
+
+        try self.moveTensor(id, .{ .kind = .cpu }, null, shape_buf[0..rank], tile_align);
+        try (try self.getMut(id)).growAxisPreserveScalar(axis, min_size);
+
+        const grown: *const TiledTensor = try self.getConst(id);
+        var grown_shape: [8]usize = undefined;
+        @memcpy(grown_shape[0..rank], grown.shape);
+        try self.moveTensor(id, target, dev, grown_shape[0..rank], tile_align);
     }
 
-    pub fn kvCachePolicy(self: *const Self, id: TensorId) KVCachePolicy {
+    pub fn sequenceCachePolicy(self: *const Self, id: TensorId) SequenceCachePolicy {
         if (self.cache) |*c| return c.tensorPolicy(id);
         return .{ .none = {} };
     }
 
-    pub fn kvCachePolicyInfo(self: *const Self, id: TensorId) KVCachePolicyInfo {
+    pub fn sequenceCachePolicyInfo(self: *const Self, id: TensorId) SequenceCachePolicyInfo {
         if (self.cache) |*c| return c.tensorPolicyInfo(id);
         return .{};
     }
@@ -269,6 +291,67 @@ pub const StorageManager = struct {
         return if (t.dtype.info().is_quantized) t.writeFromPackedQuant(packed_bytes) else t.writeFromPackedScalar(packed_bytes);
     }
 
+    /// Scatter device-independent packed bytes into `t`, honoring residency: a
+    /// host tensor writes directly; a device-resident tensor stages into a host
+    /// buffer in `t`'s tiling and uploads each tile (H2D). The device-writing
+    /// counterpart of `gatherPacked` (same identical-geometry `tmp` trick).
+    fn scatterPackedResident(self: *Self, t: *TiledTensor, packed_bytes: []const u8) StorageError!void {
+        if (t.device.kind == .cpu) return scatterPacked(t, packed_bytes);
+        const d = t.dev orelse return StorageError.InvalidArgument;
+        var tmp: TiledTensor = undefined;
+        try tmp.init(self.allocator, t.dtype, t.shape, t.tile_shape, .{ .tile_alignment = t.tile_alignment, .quant_axis = t.quant_axis });
+        defer tmp.deinit();
+        try scatterPacked(&tmp, packed_bytes);
+        for (t.tile_handles, 0..) |h, i| {
+            const off = tmp.tile_offsets[i];
+            const len = tmp.tile_lens[i];
+            d.copyH2D(h, 0, tmp.data[off .. off + len]) catch return StorageError.InvalidArgument;
+        }
+    }
+
+    /// Copy `src_id`'s logical contents into `dst_id`, honoring each tensor's
+    /// residency (any host/device combination). Gathers the source into the
+    /// device-independent packed layout (D2H when the source is on a device),
+    /// then scatters it into the destination (H2D when the destination is). dtype
+    /// and logical shape must match. Used to seed a device-resident recurrent
+    /// state slot from a caller's host tensor, and to mirror device state back to
+    /// a host tensor for reads.
+    pub fn copyTensorData(self: *Self, dst_id: TensorId, src_id: TensorId) StorageError!void {
+        const src: *const TiledTensor = try self.getConst(src_id);
+        const dst: *TiledTensor = try self.getMut(dst_id);
+        if (src.dtype != dst.dtype or src.rank != dst.rank) return StorageError.InvalidArgument;
+        for (src.shape, dst.shape) |a, b| if (a != b) return StorageError.InvalidArgument;
+
+        const plen: usize = try src.packedByteLen();
+        const buf: []u8 = self.allocator.alloc(u8, plen) catch return StorageError.OutOfMemory;
+        defer self.allocator.free(buf);
+        try self.gatherPacked(src, buf);
+        try self.scatterPackedResident(dst, buf);
+    }
+
+    /// Zero a tensor's contents in place, honoring residency: a host tensor is
+    /// memset (bumping `host_seq` so any staged device copy re-uploads); a
+    /// device-resident tensor gets zeros uploaded (H2D) into each tile buffer.
+    /// Used by `Model.resetState` so recurrent state clears correctly whether it
+    /// lives on the host or exclusively on a device.
+    pub fn zeroTensorData(self: *Self, id: TensorId) StorageError!void {
+        const t: *TiledTensor = try self.getMut(id);
+        if (t.device.kind == .cpu) {
+            @memset(t.data, 0);
+            t.host_seq +%= 1;
+            return;
+        }
+        const d = t.dev orelse return StorageError.InvalidArgument;
+        var max_len: usize = 0;
+        for (t.tile_lens) |l| max_len = @max(max_len, l);
+        const zeros: []u8 = self.allocator.alloc(u8, max_len) catch return StorageError.OutOfMemory;
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0);
+        for (t.tile_handles, 0..) |h, i| {
+            d.copyH2D(h, 0, zeros[0..t.tile_lens[i]]) catch return StorageError.InvalidArgument;
+        }
+    }
+
     /// Migrate a tensor to `target` (move semantics: the source-device copy is freed),
     /// re-tiling to `target_tile_shape`. `dev` must be the target device's `DeviceMemory`
     /// when `target.kind != .cpu`. The tensor id and logical shape are preserved.
@@ -335,15 +418,15 @@ pub const StorageManager = struct {
 
     pub fn tensorStore(self: *Self) tensor_store.TensorStore {
         const Vt = struct {
-            fn shouldLease(policy: KVCachePolicy) bool {
+            fn shouldLease(policy: SequenceCachePolicy) bool {
                 return switch (policy) {
                     .none => false,
                     else => true,
                 };
             }
 
-            fn toStorePolicyInfo(info: cache_mod.KVCachePolicyInfo) tensor_store.KVCachePolicyInfo {
-                const kind: tensor_store.KVCachePolicyKind = switch (info.kind) {
+            fn toStorePolicyInfo(info: cache_mod.SequenceCachePolicyInfo) tensor_store.SequenceCachePolicyInfo {
+                const kind: tensor_store.SequenceCachePolicyKind = switch (info.kind) {
                     .none => .none,
                     .growable => .growable,
                     .ring => .ring,
@@ -485,13 +568,13 @@ pub const StorageManager = struct {
                 if (sm.cache) |*cache| cache.releaseLease(token);
             }
 
-            fn kvCachePolicyInfo(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.KVCachePolicyInfo {
+            fn sequenceCachePolicyInfo(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.SequenceCachePolicyInfo {
                 const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const info: cache_mod.KVCachePolicyInfo = sm.kvCachePolicyInfo(@intCast(id));
+                const info: cache_mod.SequenceCachePolicyInfo = sm.sequenceCachePolicyInfo(@intCast(id));
                 return toStorePolicyInfo(info);
             }
 
-            fn mapKVCacheTime(ctx: *anyopaque, id: tensor_store.TensorId, logical_t: usize, physical_capacity_tokens: usize) tensor_store.StoreError!usize {
+            fn mapSequenceStep(ctx: *anyopaque, id: tensor_store.TensorId, logical_t: usize, physical_capacity_tokens: usize) tensor_store.StoreError!usize {
                 const sm: *StorageManager = @ptrCast(@alignCast(ctx));
                 const tid: TensorId = @intCast(id);
 
@@ -501,20 +584,25 @@ pub const StorageManager = struct {
                     return logical_t;
                 }
 
-                const policy: KVCachePolicy = sm.kvCachePolicy(tid);
+                const policy: SequenceCachePolicy = sm.sequenceCachePolicy(tid);
                 switch (policy) {
                     .growable => |g| {
-                        // Grow along T axis for rank-4 KV cache tensors.
+                        // Grow along the sequence axis (axis 2) for rank-4 sequence caches.
                         const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
                         if (t_const.rank != 4) return tensor_store.StoreError.InvalidArgument;
                         const current_cap: usize = t_const.shape[2];
 
                         if (logical_t >= current_cap) {
+                            // Past the growth ceiling (the caller's max bound) is an error,
+                            // not an unbounded grow.
+                            if (g.max_capacity_tokens != 0 and logical_t >= g.max_capacity_tokens) return tensor_store.StoreError.InvalidArgument;
                             var target: usize = current_cap;
                             if (g.initial_capacity_tokens > target) target = g.initial_capacity_tokens;
                             while (target <= logical_t) {
                                 target = growTarget(target, g.growth_numerator, g.growth_denominator) catch return tensor_store.StoreError.InvalidArgument;
                             }
+                            // Never overshoot the ceiling.
+                            if (g.max_capacity_tokens != 0 and target > g.max_capacity_tokens) target = g.max_capacity_tokens;
                             sm.ensureTensorAxisCapacity(tid, 2, target) catch return tensor_store.StoreError.InvalidArgument;
                         }
 
@@ -629,8 +717,8 @@ pub const StorageManager = struct {
                 .acquireTileMutLinear = Vt.acquireTileMutLinear,
                 .releaseConst = Vt.releaseConst,
                 .releaseMut = Vt.releaseMut,
-                .kvCachePolicyInfo = Vt.kvCachePolicyInfo,
-                .mapKVCacheTime = Vt.mapKVCacheTime,
+                .sequenceCachePolicyInfo = Vt.sequenceCachePolicyInfo,
+                .mapSequenceStep = Vt.mapSequenceStep,
                 .prefetch = Vt.prefetch,
                 .prefetchLinear = Vt.prefetchLinear,
                 .swapTensors = Vt.swapTensors,

@@ -942,7 +942,7 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
             try setInferred(graph, node.output, .f32, out_shape);
         },
 
-        .KVCacheAppend => {
+        .SequenceAppend => {
             const cache = try getValue(graph, node.inputs[0]);
             const new_kv = try getValue(graph, node.inputs[1]);
             const end_index = try getValue(graph, node.inputs[2]);

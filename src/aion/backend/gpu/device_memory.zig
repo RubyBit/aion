@@ -23,6 +23,16 @@ const ThreadPool = @import("../../runtime/thread_pool.zig").ThreadPool;
 /// single-core bandwidth, so keep it (also covers the decode logits/argmax case).
 const PARALLEL_MEMCPY_MIN_BYTES: usize = 8 * 1024 * 1024;
 
+/// Flush the queue after this many H2D bytes. Every `wgpuQueueWriteBuffer`
+/// parks its payload in a fresh staging buffer that is only recycled once a
+/// submit completes — with no submit during a bulk upload (model weights are
+/// ~one writeBuffer per tile), wgpu holds staging for EVERY byte uploaded, so
+/// peak memory is ~2x the model and the allocator keeps ~10% of it committed
+/// afterwards (measured: +66 MiB resident on a 635 MiB model). An empty submit
+/// + wait every 32 MiB bounds staging to this threshold; the poll cost is noise
+/// next to the copies themselves.
+const H2D_FLUSH_BYTES: usize = 32 * 1024 * 1024;
+
 const dm = @import("../../runtime/residency/device_memory.zig");
 const DeviceMemory = dm.DeviceMemory;
 const DeviceHandle = dm.DeviceHandle;
@@ -43,6 +53,8 @@ pub const WgpuDeviceMemory = struct {
     // readbacks (the single serial memcpy is ~half the D2H cost). Set by the owner
     // (GpuBackend); null = single-threaded memcpy.
     pool: ?*ThreadPool = null,
+    // H2D bytes written since the last queue flush (see `H2D_FLUSH_BYTES`).
+    h2d_since_flush: usize = 0,
 
     const Self = @This();
 
@@ -144,6 +156,16 @@ pub const WgpuDeviceMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
         c.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, src.len);
+        // Bound wgpu's write-staging: an empty submit flushes the pending
+        // writes, the wait lets wgpu recycle their staging buffers. Ordering is
+        // unaffected (writeBuffer data was already ordered before any later
+        // submit), so this is safe even mid-frame.
+        self.h2d_since_flush += src.len;
+        if (self.h2d_since_flush >= H2D_FLUSH_BYTES) {
+            c.wgpuQueueSubmit(self.gpu.queue, 0, null);
+            _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
+            self.h2d_since_flush = 0;
+        }
     }
 
     fn copyD2H(ctx: *anyopaque, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void {

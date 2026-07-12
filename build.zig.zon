@@ -35,24 +35,27 @@
     // the archive matching the build target is fetched (see `wgpuDependency` in
     // build.zig). Bump the tag + re-run `zig fetch --save=<name> <url>` to update.
     .dependencies = .{
+        // Patched build (trunk + gfx-rs/wgpu-native#619: expose memory_hints) —
+        // cuts ~250 MiB of committed VRAM per device. Restore the official URLs
+        // once upstream ships a release containing the PR.
         .wgpu_windows_x86_64 = .{
-            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-msvc-release.zip",
-            .hash = "N-V-__8AAC46GAQ3sxZqmcxtw9OBe44NYXQyRJ7jp8Jy2bMQ",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-windows-x86_64-msvc-release.zip",
+            .hash = "N-V-__8AADpLGAQH4Pk3SQSRDCuntIY8ivTeHTVb43RlXY-S",
             .lazy = true,
         },
         .wgpu_linux_x86_64 = .{
-            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-x86_64-release.zip",
-            .hash = "N-V-__8AAAVLrgM9jWFLs7n4rHyodpjIYxtBBE1No8nK0pRz",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-linux-x86_64-release.zip",
+            .hash = "N-V-__8AALybrgOJ6ZwQeP_99RjvuyH-ue7AGJKrjWlG8kqn",
             .lazy = true,
         },
         .wgpu_macos_aarch64 = .{
-            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip",
-            .hash = "N-V-__8AAAUNfQJBPHGd3KMhFvl4WLpzHDx9rFkwSf2rFVhr",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-macos-aarch64-release.zip",
+            .hash = "N-V-__8AAPgZfQL75QCbrZoUhXf7SdaHZMpJLDkpje4dJK3R",
             .lazy = true,
         },
         .wgpu_macos_x86_64 = .{
-            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip",
-            .hash = "N-V-__8AAFWheQIu8DV1xiTixrDsCJ0xr7-Ssy-XhEIkgx5u",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-macos-x86_64-release.zip",
+            .hash = "N-V-__8AAPjGeQL4zmwsMqmJE3tZwl1B0NLOIiIT33m4xlYT",
             .lazy = true,
         },
     },

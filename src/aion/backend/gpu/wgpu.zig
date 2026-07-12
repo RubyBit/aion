@@ -239,6 +239,24 @@ pub const Gpu = struct {
     fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits) ?c.WGPUDevice {
         var desc: c.WGPUDeviceDescriptor = std.mem.zeroes(c.WGPUDeviceDescriptor);
         desc.requiredLimits = required;
+        // Shrink the allocator's suballocation blocks. wgpu's default hint
+        // (Performance) commits 128 MiB device + 64 MiB host blocks for the
+        // handful of tiny internal allocations made at device open (~200 MiB
+        // idle on NVIDIA), and rounds all committed memory up to 256 MiB
+        // steps. Manual growth 4->256 MiB keeps the idle footprint ~17 MiB
+        // while steady-state blocks still reach full size, and load-time (not
+        // per-frame) allocation makes the extra block count free. Guarded:
+        // upstream wgpu-native doesn't expose memoryHints yet (PR pending), so
+        // this compiles to a no-op against an unpatched header.
+        var extras: c.WGPUDeviceExtras = std.mem.zeroes(c.WGPUDeviceExtras);
+        if (comptime @hasField(c.WGPUDeviceExtras, "memoryHints")) {
+            const MiB = 1024 * 1024;
+            extras.chain.sType = c.WGPUSType_DeviceExtras;
+            extras.memoryHints = c.WGPUMemoryHints_Manual;
+            extras.suballocatedDeviceMemoryBlockSizeStart = 4 * MiB;
+            extras.suballocatedDeviceMemoryBlockSizeEnd = 256 * MiB;
+            desc.nextInChain = &extras.chain;
+        }
         var dreq: DeviceReq = .{};
         _ = c.wgpuAdapterRequestDevice(adapter, &desc, .{
             .nextInChain = null,

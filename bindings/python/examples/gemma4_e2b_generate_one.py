@@ -32,10 +32,6 @@ def default_sp_model_path() -> Path:
     return repo_root / "models" / "gemma" / "tokenizer.model"
 
 
-def is_global_layer(layer: int) -> bool:
-    return (layer % 5) == 4
-
-
 def _download(url: str, dst: Path) -> None: # TODO: Test download path
     dst.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "aion-gemma-example"})
@@ -314,76 +310,32 @@ def main() -> None:
             f"got {args.global_cache_capacity}."
         )
 
-    # Model interface expects caches for layers 0..14 (15 source layers).
-    source_layers = list(range(15))
-
-    model, device_str = load_model_with_device(str(model_path), args, thread_count=args.thread_count)
+    # The model declares input roles, so loading takes over ALL state plumbing:
+    # KV caches (io-aliased f16, capacity `G` for global layers) are allocated
+    # and zeroed by the runtime — sized by `cache_capacity`, optionally starting
+    # small and growing on demand with `growable` — and the index/position
+    # inputs (cache_write_index / cache_visible_end / positions) are fed from
+    # the runtime-tracked position, which advances by the bound `tokens`
+    # sequence length each run. The only input this example binds is `tokens`.
+    model, device_str = load_model_with_device(
+        str(model_path),
+        args,
+        thread_count=args.thread_count,
+        cache_capacity=args.global_cache_capacity,
+        growable=bool(args.growable),
+        initial_cache_capacity=args.initial_cache_capacity,
+    )
     print(f"device: {device_str}")
     with model:
         ctx = model.context
 
-        # The KV caches are io-aliased to their `next_*_cache.layerN` outputs, and
-        # the runtime backs each aliased input with a model-level state slot shared
-        # across cache entries. So even though prefill (seq=S) and decode (seq=1)
-        # compile to two different entries, the appended K/V carries across them
-        # automatically: we bind the caches ONCE and never swap outputs into inputs.
-        # We still allocate them explicitly (rather than letting auto-init zero them)
-        # because the global layers' time axis is a free capacity symbol `G` the
-        # caller chooses — no bound input lets the runtime infer it.
-        # With --growable we allocate a cache at a small initial capacity and let the
-        # runtime grow its device-resident slot on demand up to `t_cap`; without it we
-        # pre-allocate the full `t_cap` (the original behavior).
-        #
-        # Only GLOBAL layers have a free (symbolic) capacity axis `G`; local layers are
-        # fixed at 512 in the model, so they must be bound at exactly 512 and cannot
-        # start small. So grow-on-demand applies to the global caches (the large ones).
-        def is_growable_layer(layer: int) -> bool:
-            return bool(args.growable) and is_global_layer(layer)
-
-        k_cache = {}
-        v_cache = {}
-        for layer in source_layers:
-            head_dim = 512 if is_global_layer(layer) else 256
-            t_cap = args.global_cache_capacity if is_global_layer(layer) else 512
-            alloc_cap = min(int(args.initial_cache_capacity), int(t_cap)) if is_growable_layer(layer) else int(t_cap)
-            shape = (1, 1, int(alloc_cap), int(head_dim))
-
-            k = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
-            v = aion.Tensor.empty(ctx, shape, dtype=aion.AionDType.AION_DTYPE_F16)
-            k.zero()
-            v.zero()
-            k_cache[layer] = k
-            v_cache[layer] = v
-
-        # Scalars (rank-1, shape [B]).
-        cache_write_index = aion.Tensor([0], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-        cache_visible_end = aion.Tensor([s0], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-
-        # Prefill inputs.
+        # Prefill tokens [1, S]; decode-step tensor [1, 1] rewritten in place.
         tokens_prefill = aion.Tensor([prompt_ids], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-        positions_prefill = aion.Tensor([list(range(s0))], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-
-        # Decode-step tensors (shape [1,1]) reused for each additional token.
         tokens_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-        positions_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-
-        # Bind the KV caches once. The shared aliased state slots carry the appended
-        # K/V across every run (prefill and each decode step) with no rebinding.
-        for layer in source_layers:
-            model.bind_input(f"k_cache.layer{layer}", k_cache[layer])
-            model.bind_input(f"v_cache.layer{layer}", v_cache[layer])
-            if is_growable_layer(layer):
-                t_cap = args.global_cache_capacity
-                init_cap = min(int(args.initial_cache_capacity), int(t_cap))
-                for nm in (f"k_cache.layer{layer}", f"v_cache.layer{layer}"):
-                    model.set_state_input_growable(nm, initial_capacity=init_cap, max_capacity=int(t_cap))
 
         try:
             # ---- Prefill ----
             model.bind_input("tokens", tokens_prefill)
-            model.bind_input("positions", positions_prefill)
-            model.bind_input("cache_write_index", cache_write_index)
-            model.bind_input("cache_visible_end", cache_visible_end)
 
             print(f"prefill: tokens={s0}")
             t0_prefill_run_ns = time.perf_counter_ns()
@@ -430,12 +382,9 @@ def main() -> None:
                     pass
 
             # ---- Decode loop (optional) ----
-            # Switch bindings once: decode step uses [1,1] tokens/positions.
-            cur_pos = s0
+            # Switch bindings once: decode steps use a [1,1] tokens tensor. The
+            # runtime keeps feeding indices/positions from its tracked position.
             model.bind_input("tokens", tokens_step)
-            model.bind_input("positions", positions_step)
-            model.bind_input("cache_write_index", cache_write_index)
-            model.bind_input("cache_visible_end", cache_visible_end)
 
             decode_total_run_ns: int = 0
             decode_total_logits_ns: int = 0
@@ -445,12 +394,7 @@ def main() -> None:
                 if stopped_by is not None:
                     break
 
-                # Update scalar indices.
-                cache_write_index.write_i32([cur_pos])
-                cache_visible_end.write_i32([cur_pos + 1])
-
                 tokens_step.write_i32([next_id])
-                positions_step.write_i32([cur_pos])
 
                 t0_step_run_ns = time.perf_counter_ns()
                 model.run()
@@ -474,7 +418,6 @@ def main() -> None:
                     break
 
                 generated.append(next_id)
-                cur_pos += 1
 
             if tokenizer is not None:
                 print(f"generated_text={_decode_ids(tokenizer, generated)!r}")
@@ -507,18 +450,9 @@ def main() -> None:
                 print(f"total wall:        {_ns_to_ms(t_all_ns):9.3f} ms")
         finally:
             # Close tensors (best-effort).
-            for t in [tokens_prefill, positions_prefill, tokens_step, positions_step, cache_write_index, cache_visible_end]:
+            for t in [tokens_prefill, tokens_step]:
                 try:
                     t.close()
-                except Exception:
-                    pass
-            for layer in source_layers:
-                try:
-                    k_cache[layer].close()
-                except Exception:
-                    pass
-                try:
-                    v_cache[layer].close()
                 except Exception:
                     pass
 

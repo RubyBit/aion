@@ -39,12 +39,14 @@ def add_device_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def load_model_with_device(path: str, args, *, thread_count: int = 1):
+def load_model_with_device(path: str, args, *, thread_count: int = 1, **load_kwargs):
     """Load `path` honoring `--device`/`--gpu-index`/`--gpu-power`.
 
-    Returns ``(model, device_str)``. With `--device auto`, a GPU failure
-    (CPU-only build or no adapter) falls back to CPU with a printed notice;
-    with `--device gpu` the failure propagates.
+    Extra keyword args (e.g. `cache_capacity`, `growable`,
+    `initial_cache_capacity`, `auto_positions`) are forwarded to
+    `aion.load_model`. Returns ``(model, device_str)``. With `--device auto`, a
+    GPU failure (CPU-only build or no adapter) falls back to CPU with a printed
+    notice; with `--device gpu` the failure propagates.
     """
 
     want = getattr(args, "device", "cpu")
@@ -52,7 +54,7 @@ def load_model_with_device(path: str, args, *, thread_count: int = 1):
     gpu_power = getattr(args, "gpu_power", "high")
 
     if want == "cpu":
-        return aion.load_model(path, thread_count=thread_count), "cpu"
+        return aion.load_model(path, thread_count=thread_count, **load_kwargs), "cpu"
 
     try:
         model = aion.load_model(
@@ -61,6 +63,7 @@ def load_model_with_device(path: str, args, *, thread_count: int = 1):
             device="gpu",
             adapter_index=gpu_index,
             power=gpu_power,
+            **load_kwargs,
         )
         dev = f"gpu:{gpu_index}" if gpu_index is not None else "gpu"
         return model, dev
@@ -68,4 +71,4 @@ def load_model_with_device(path: str, args, *, thread_count: int = 1):
         if want == "gpu":
             raise
         print(f"[device] GPU unavailable ({e}); falling back to CPU.")
-        return aion.load_model(path, thread_count=thread_count), "cpu"
+        return aion.load_model(path, thread_count=thread_count, **load_kwargs), "cpu"

@@ -51,7 +51,7 @@ import numpy as np
 # ----------------------------- AION v4 constants -----------------------------
 
 MAGIC: bytes = b"AION"
-VERSION: int = 5
+VERSION: int = 6
 HEADER_SIZE: int = 72
 SECTION_DESC_SIZE: int = 24
 INVALID_INDEX_U32: int = 0xFFFFFFFF
@@ -70,9 +70,27 @@ class SectionType:
     debug_names = 10
     regions = 11
     io_aliases = 12
+    input_roles = 13
 
 
 SECTION_REQUIRED_FLAG: int = 1 << 0
+
+
+class RoleKind:
+    """Mirrors `aion_file/types.zig:InputRoleKind`."""
+
+    sequence_cache = 1  # io-aliased KV-style cache; axis = time/capacity axis
+    cache_write_index = 2  # i32 [B] fed to SequenceAppend
+    cache_visible_end = 3  # i32 [B] fed to attention
+    positions = 4  # i32 [B,S] absolute positions of new tokens
+    tokens = 5  # input whose axis extent defines "new tokens this run"
+    state = 6  # generic io-aliased recurrent state (LSTM h/c); zero-init
+
+
+ROLE_FLAG_ZERO_INIT: int = 1 << 0
+ROLE_FLAG_ALLOW_GROWABLE: int = 1 << 1
+ROLE_FLAG_ALLOW_RING: int = 1 << 2
+ROLE_NO_AXIS: int = 0xFF
 
 
 class DType:
@@ -420,6 +438,17 @@ class IoAlias:
 
 
 @dataclass
+class InputRole:
+    """Semantic role of a public input (mirrors `aion_file/types.zig:InputRole`)."""
+
+    input_index: int
+    kind: int
+    axis: int = ROLE_NO_AXIS
+    flags: int = ROLE_FLAG_ZERO_INIT
+    capacity_symbol: int = INVALID_INDEX_U32
+
+
+@dataclass
 class Package:
     initializers: List[Initializer] = field(default_factory=list)
     values: List[ValueRecord] = field(default_factory=list)
@@ -433,6 +462,7 @@ class Package:
     metadata: List[MetadataEntry] = field(default_factory=list)
     debug_names: List[DebugName] = field(default_factory=list)
     io_aliases: List[IoAlias] = field(default_factory=list)
+    input_roles: List[InputRole] = field(default_factory=list)
     regions: List[RegionRecord] = field(default_factory=list)
 
 
@@ -790,6 +820,16 @@ def _encode_io_aliases(io_aliases: List[IoAlias]) -> bytes:
     return bytes(out)
 
 
+def _encode_input_roles(input_roles: List[InputRole]) -> bytes:
+    out = bytearray()
+    out += u32(len(input_roles))
+    for r in input_roles:
+        out += u32(int(r.input_index))
+        out += bytes([int(r.kind) & 0xFF, int(r.axis) & 0xFF, int(r.flags) & 0xFF, 0])
+        out += u32(int(r.capacity_symbol))
+    return bytes(out)
+
+
 def _encode_graph_meta(pkg: Package) -> bytes:
     out = bytearray()
     out += u32(len(pkg.values))
@@ -848,6 +888,8 @@ def write_aion_v4(path: str, pkg: Package) -> None:
         sections.append((SectionType.regions, 0, _encode_regions(pkg.regions)))
     if pkg.io_aliases:
         sections.append((SectionType.io_aliases, 0, _encode_io_aliases(pkg.io_aliases)))
+    if pkg.input_roles:
+        sections.append((SectionType.input_roles, 0, _encode_input_roles(pkg.input_roles)))
 
     dir_offset = HEADER_SIZE
     dir_size = len(sections) * SECTION_DESC_SIZE

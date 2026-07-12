@@ -689,17 +689,18 @@ pub const StorageManager = struct {
                 if (!sameShape(a.tile_strides, b.tile_strides)) return tensor_store.StoreError.InvalidArgument;
                 if (a.tile_offsets.len != b.tile_offsets.len or a.tile_lens.len != b.tile_lens.len) return tensor_store.StoreError.InvalidArgument;
                 if (a.tile_alignment != b.tile_alignment) return tensor_store.StoreError.InvalidArgument;
-                if (a.owns_data != b.owns_data) return tensor_store.StoreError.InvalidArgument;
-                if (!a.device.eql(b.device)) return tensor_store.StoreError.InvalidArgument;
-
-                // Zero-copy carried-variable swap (Loop control flow). For gpu-resident
-                // tensors the bytes live in device buffers, so swap the handle slices;
-                // in-flight commands hold raw buffer refs, future acquires see the swap.
-                if (a.device.kind == .cpu) {
-                    std.mem.swap([]align(64) u8, &a.data, &b.data);
-                } else {
-                    std.mem.swap([]dm.DeviceHandle, &a.tile_handles, &b.tile_handles);
-                }
+                // Zero-copy carried-variable swap (Loop control flow). Backings may
+                // have different residency: a persistent model state can be
+                // device-exclusive while a fresh loop-body result is host-backed
+                // with residency tracked by ResidentTensorStore. Move the complete
+                // backing record between the logical tensor ids; requiring equal
+                // device/ownership here rejects that valid transition and would
+                // otherwise force a copy on every loop iteration.
+                std.mem.swap([]align(64) u8, &a.data, &b.data);
+                std.mem.swap(bool, &a.owns_data, &b.owns_data);
+                std.mem.swap(DeviceRef, &a.device, &b.device);
+                std.mem.swap([]dm.DeviceHandle, &a.tile_handles, &b.tile_handles);
+                std.mem.swap(?dm.DeviceMemory, &a.dev, &b.dev);
                 // The host-write counter travels with the bytes so a residency
                 // layer's per-tile `uploaded_seq` (which the resident store swaps
                 // alongside) stays consistent and avoids a spurious re-upload.

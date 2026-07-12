@@ -519,6 +519,12 @@ fn exportTinySileroPackage(
             .{ .input = h_ref, .output = out.h },
             .{ .input = c_ref, .output = out.c },
         },
+        // The LSTM state is generic zero-init recurrent state: the runtime
+        // auto-zeros it on first run and carries it across chunks.
+        .input_roles = &[_]api.InputRoleDecl{
+            .{ .input = h_ref, .kind = .state },
+            .{ .input = c_ref, .kind = .state },
+        },
     });
 }
 

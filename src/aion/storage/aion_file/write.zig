@@ -57,6 +57,7 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
     if (pkg.metadata.len != 0) try sections.append(scratch, .{ .section_type = .metadata, .flags = 0, .bytes = try encodeMetadataSection(scratch, &interner, pkg.metadata) });
     if (pkg.debug_names.len != 0) try sections.append(scratch, .{ .section_type = .debug_names, .flags = 0, .bytes = try encodeDebugNamesSection(scratch, &interner, pkg.debug_names) });
     if (pkg.io_aliases.len != 0) try sections.append(scratch, .{ .section_type = .io_aliases, .flags = 0, .bytes = try encodeIoAliasesSection(scratch, pkg.io_aliases) });
+    if (pkg.input_roles.len != 0) try sections.append(scratch, .{ .section_type = .input_roles, .flags = 0, .bytes = try encodeInputRolesSection(scratch, pkg.input_roles) });
 
     const dir_offset: usize = header_size;
     const dir_size: usize = sections.items.len * section_desc_size;
@@ -391,6 +392,21 @@ fn encodeIoAliasesSection(allocator: std.mem.Allocator, io_aliases: []const IoAl
     for (io_aliases) |alias| {
         try appendInt(&out, allocator, u32, alias.input);
         try appendInt(&out, allocator, u32, alias.output);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn encodeInputRolesSection(allocator: std.mem.Allocator, input_roles: []const types.InputRole) PackageError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendInt(&out, allocator, u32, @intCast(input_roles.len));
+    for (input_roles) |role| {
+        try appendInt(&out, allocator, u32, role.input);
+        try appendInt(&out, allocator, u8, @intFromEnum(role.kind));
+        try appendInt(&out, allocator, u8, role.axis);
+        try appendInt(&out, allocator, u8, role.flags);
+        try appendInt(&out, allocator, u8, 0); // reserved
+        try appendInt(&out, allocator, u32, role.capacity_symbol);
     }
     return out.toOwnedSlice(allocator);
 }

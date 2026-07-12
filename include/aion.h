@@ -230,14 +230,39 @@ AION_API AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype
 // Loaded model runtime (.aion packages)
 // -----------------------------------------------------------------------------
 
-AION_API AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, AionLoadedModel** out_model);
-AION_API AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, AionLoadedModel** out_model);
+// Load options. Pass NULL for the defaults: CPU, auto-init inputs, auto
+// positions, no cache auto-sizing. When passing a struct, start from
+// zero-initialized memory and set the fields you need (note the two
+// enabled-by-default flags below).
+// - device_kind/device_index: place the model on a device. The model's backend
+//   and tile policy follow the device; bound CPU inputs are auto-migrated on
+//   run and outputs are flushed back to host for reading.
+// - auto_init_inputs: 1 = auto-allocate + zero unbound inputs (default when
+//   opts == NULL).
+// - auto_positions: 1 = auto-feed role-declared cache_write_index /
+//   cache_visible_end / positions inputs from the tracked sequence position and
+//   advance it per run (default when opts == NULL).
+// - cache_capacity_tokens > 0: size every role-declared sequence cache whose
+//   capacity axis is a free dim symbol to this many tokens.
+// - cache_growable != 0: start those caches at cache_initial_capacity_tokens
+//   (0 = default 8) and grow on demand (factor cache_growth_numerator /
+//   cache_growth_denominator, 0/0 = default 3/2) up to cache_capacity_tokens.
+typedef struct AionLoadModelOptions {
+    uint32_t device_kind;
+    uint32_t device_index;
+    uint8_t auto_init_inputs;
+    uint8_t auto_positions;
+    uint8_t _pad[6];
+    uint64_t cache_capacity_tokens;
+    uint8_t cache_growable;
+    uint8_t _pad1[7];
+    uint64_t cache_initial_capacity_tokens;
+    uint64_t cache_growth_numerator;
+    uint64_t cache_growth_denominator;
+} AionLoadModelOptions;
 
-// Like the loaders above, but place the model on `(kind, index)`. The model's
-// backend and tile policy follow the device; bound CPU inputs are auto-migrated
-// on run and outputs are flushed back to host for reading.
-AION_API AionStatus aion_loaded_model_load_path_on(AionContext* ctx, const char* path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
-AION_API AionStatus aion_loaded_model_load_path_absolute_on(AionContext* ctx, const char* absolute_path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
+AION_API AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, const AionLoadModelOptions* opts, AionLoadedModel** out_model);
+AION_API AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, const AionLoadModelOptions* opts, AionLoadedModel** out_model);
 
 AION_API void aion_loaded_model_destroy(AionLoadedModel* m);
 
@@ -264,6 +289,15 @@ AION_API AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
    ring uses ring_window_tokens. Unused fields are ignored per kind. */
 AION_API AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
 AION_API AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
+
+/* Tokens consumed so far by position auto-management (0 when disabled). */
+AION_API AionStatus aion_loaded_model_position(const AionLoadedModel* m, uint64_t* out_tokens);
+/* Overwrite the auto-tracked position (session restore / rollback). */
+AION_API AionStatus aion_loaded_model_set_position(AionLoadedModel* m, uint64_t tokens);
+/* Whether output `index` is io-aliased recurrent state (a carry the runtime
+   writes back into its input slot each run). Lets callers skip copying such
+   outputs out by default. */
+AION_API AionStatus aion_loaded_model_output_is_state(const AionLoadedModel* m, size_t index, uint8_t* out_is_state);
 
 #ifdef __cplusplus
 }

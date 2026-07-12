@@ -425,6 +425,12 @@ def build_tiny_silero_aion_package(
     # I/O aliases: h -> next_h, c -> next_c (indices within signatures).
     io_aliases = [aw.IoAlias(input_index=1, output_index=1), aw.IoAlias(input_index=2, output_index=2)]
 
+    # The LSTM state is generic zero-init recurrent state (auto-zeroed + carried).
+    input_roles = [
+        aw.InputRole(input_index=1, kind=aw.RoleKind.state),
+        aw.InputRole(input_index=2, kind=aw.RoleKind.state),
+    ]
+
     metadata = [aw.MetadataEntry(key="arch", value="tiny-silero-vad")]
 
     return aw.Package(
@@ -438,6 +444,7 @@ def build_tiny_silero_aion_package(
         metadata=metadata,
         debug_names=debug_names,
         io_aliases=io_aliases,
+        input_roles=input_roles,
     )
 
 

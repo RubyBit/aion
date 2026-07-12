@@ -31,6 +31,8 @@ pub const Package = types_mod.Package;
 pub const SignatureInfo = types_mod.SignatureInfo;
 pub const IoAliasInfo = types_mod.IoAliasInfo;
 pub const LoadModelOptions = types_mod.LoadModelOptions;
+pub const CacheOptions = types_mod.CacheOptions;
+pub const CacheGrowth = types_mod.CacheGrowth;
 
 /// In-process Builder graph source (via `ctx.compile`). The graph is compiled
 /// directly — no serialization round trip. Owns the graph + an arena backing the
@@ -111,6 +113,29 @@ pub const Model = struct {
     /// into the shared slot exactly once per bind, not re-copied when a new-shape
     /// entry first runs (which would clobber carried state).
     aliased_state_synced_versions: []u64,
+    /// Per-input package-declared role (null = none). Records copied at init.
+    input_roles: []?package_file.InputRole,
+    /// Cached input indices of the singleton control roles (null when absent).
+    role_tokens_index: ?usize,
+    role_positions_index: ?usize,
+    role_write_index_index: ?usize,
+    role_visible_end_index: ?usize,
+    /// True when position auto-management is active (roles present + opt-in).
+    auto_positions_enabled: bool,
+    /// Tokens consumed so far by auto position tracking. `resetState` resets to 0.
+    position_tokens: u64 = 0,
+    /// Advance applied to `position_tokens` when the current `run()` succeeds.
+    pending_position_advance: u64 = 0,
+    /// Persistent i32 tensors backing auto-fed control inputs (per input;
+    /// `invalid_tensor_id` until first use).
+    role_input_tids: []TensorId,
+    /// Whether `bound_inputs[i]` is the model's own auto position tensor (vs a
+    /// caller bind, which permanently reclaims the input).
+    role_auto_bound: []bool,
+    /// Per-dim-symbol default used only to size unbound inputs in
+    /// `ensureAutoInputs` (e.g. a free cache-capacity symbol from
+    /// `LoadModelOptions.cache`). null = no default.
+    symbol_defaults: []?u64,
     run_symbol_bindings: []?u64,
     run_symbol_values: []u64,
     run_input_shapes: []usize,
@@ -169,6 +194,10 @@ pub const Model = struct {
         self.allocator.free(self.aliased_state_tids);
         self.allocator.free(self.aliased_state_synced_versions);
         self.allocator.free(self.state_input_policies);
+        self.allocator.free(self.input_roles);
+        self.allocator.free(self.role_input_tids);
+        self.allocator.free(self.role_auto_bound);
+        self.allocator.free(self.symbol_defaults);
         self.allocator.free(self.run_symbol_bindings);
         self.allocator.free(self.run_symbol_values);
         self.allocator.free(self.run_input_shapes);
@@ -370,6 +399,9 @@ pub const Model = struct {
         if (tensor.dtype != sig.dtype) return api_errors.ApiError.InvalidArgument;
         if (tensor.shape.len != sig.rank) return api_errors.ApiError.InvalidArgument;
         self.bound_inputs[index] = tensor;
+        // A manual bind on a role-driven control input permanently reclaims it from
+        // position auto-management (the escape hatch for custom schedules).
+        self.role_auto_bound[index] = false;
         if (self.inputAliasOutputIndex(index) != null) {
             self.aliased_input_bind_versions[index] +%= 1;
             if (self.aliased_input_bind_versions[index] == 0) self.aliased_input_bind_versions[index] = 1;
@@ -412,11 +444,31 @@ pub const Model = struct {
             // the host bytes otherwise (see `StorageManager.zeroTensorData`).
             self.store.zeroTensorData(tid) catch return error.InvalidArgument;
         }
+        self.position_tokens = 0;
+        self.pending_position_advance = 0;
+    }
+
+    /// Tokens consumed so far by position auto-management (0 when disabled or
+    /// before the first run). Advances by the tokens-role sequence length after
+    /// each successful `run()`.
+    pub fn currentPosition(self: *const Self) u64 {
+        return self.position_tokens;
+    }
+
+    /// Overwrite the auto-tracked position (escape hatch: session restore,
+    /// speculative-decode rollback, or re-syncing after manual index binds).
+    pub fn setPosition(self: *Self, tokens: u64) void {
+        self.position_tokens = tokens;
+        self.pending_position_advance = 0;
     }
 
     pub fn run(self: *Self) api_errors.ExecuteError!void {
         const trace: bool = self.trace_runs;
         if (trace) std.debug.print("[aion][run] begin\n", .{});
+
+        // Feed role-declared control inputs (cache write index / visible end /
+        // positions) from the auto-tracked sequence position.
+        try self.ensureAutoPositions(trace);
 
         // Fill any input the caller never bound with a persistent, zero-initialized
         // slot (recurrent/aliased ones carry their contents across runs). After this,
@@ -548,10 +600,14 @@ pub const Model = struct {
             };
             const dst = Tensor{ .store = self.store, .id = dst_tid, .dtype = dst_meta.dtype, .shape = dst_meta.shape };
             const src = Tensor{ .store = self.store, .id = src_tid, .dtype = src_meta.dtype, .shape = src_meta.shape };
-            dst.copyFrom(self.allocator, src) catch |e| {
+            // Non-in-place recurrent outputs (LSTM h/c, convolution state, etc.)
+            // must be copied back into their state slot.  The slot may be
+            // device-exclusive, so use the residency-aware path; in-place aliases
+            // were skipped above and incur no copy at all.
+            self.copyIntoStateSlot(dst, src) catch |e| {
                 if (trace) {
                     std.debug.print(
-                        "[aion][run] output alias copyFrom failed (input={s} output={s}): {s}\n",
+                        "[aion][run] output alias state copy failed (input={s} output={s}): {s}\n",
                         .{ alias.input_name, alias.output_name, @errorName(e) },
                     );
                 }
@@ -561,6 +617,11 @@ pub const Model = struct {
 
         if (trace) {
             std.debug.print("[aion][run] done\n", .{});
+        }
+
+        if (self.auto_positions_enabled) {
+            self.position_tokens += self.pending_position_advance;
+            self.pending_position_advance = 0;
         }
 
         self.last_run_cache_index = cache_index;
@@ -574,6 +635,14 @@ pub const Model = struct {
 
     pub fn outputCount(self: *const Self) usize {
         return self.output_signatures.len;
+    }
+
+    /// Whether output `index` is io-aliased recurrent state (a `next_*` carry the
+    /// runtime already writes back into its input slot). Lets bindings skip
+    /// copying carried state out by default.
+    pub fn outputIsAliasedState(self: *const Self, index: usize) bool {
+        if (index >= self.output_alias_input_indices.len) return false;
+        return self.output_alias_input_indices[index] != types_mod.invalid_alias_index;
     }
 
     /// Fetch the most recent run's output by position (in declared output order).
@@ -680,6 +749,7 @@ pub const Model = struct {
         dim_exprs: []const package_file.DimExpr,
         dim_symbol_count: usize,
         io_aliases: []const package_file.IoAlias,
+        input_roles_src: []const package_file.InputRole,
         package_hash: u64,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
@@ -757,6 +827,75 @@ pub const Model = struct {
         errdefer allocator.free(state_input_policies);
         @memset(state_input_policies, null);
 
+        const input_roles = try allocator.alloc(?package_file.InputRole, input_signatures.len);
+        errdefer allocator.free(input_roles);
+        @memset(input_roles, null);
+        for (input_roles_src) |role| {
+            if (role.input >= input_signatures.len) return error.InvalidArgument;
+            input_roles[role.input] = role;
+        }
+
+        const role_input_tids = try allocator.alloc(TensorId, input_signatures.len);
+        errdefer allocator.free(role_input_tids);
+        @memset(role_input_tids, types_mod.invalid_tensor_id);
+
+        const role_auto_bound = try allocator.alloc(bool, input_signatures.len);
+        errdefer allocator.free(role_auto_bound);
+        @memset(role_auto_bound, false);
+
+        const symbol_defaults = try allocator.alloc(?u64, dim_symbol_count);
+        errdefer allocator.free(symbol_defaults);
+        @memset(symbol_defaults, null);
+
+        // Locate the singleton control roles and apply the load-time cache options
+        // to role-declared sequence caches (policy + capacity-symbol default).
+        var role_tokens_index: ?usize = null;
+        var role_positions_index: ?usize = null;
+        var role_write_index_index: ?usize = null;
+        var role_visible_end_index: ?usize = null;
+        for (input_roles, 0..) |role_opt, i| {
+            const role = role_opt orelse continue;
+            switch (role.kind) {
+                .tokens => role_tokens_index = i,
+                .positions => role_positions_index = i,
+                .cache_write_index => role_write_index_index = i,
+                .cache_visible_end => role_visible_end_index = i,
+                .sequence_cache => {
+                    if (role.capacity_symbol == package_file.invalid_index) continue;
+                    if (role.capacity_symbol >= dim_symbol_count) return error.InvalidArgument;
+                    if (opts.cache.capacity_tokens == 0) continue;
+                    const cap: usize = opts.cache.capacity_tokens;
+                    // Grow-on-demand needs the runtime-supported layout (rank-4,
+                    // sequence axis 2 — see `stateSlotCompatible`/`mapSequenceStep`)
+                    // and the package's blessing; otherwise fall back to a full
+                    // pre-allocation rather than failing the load.
+                    const growable: ?types_mod.CacheGrowth = opts.cache.growable;
+                    if (growable != null and
+                        (role.flags & package_file.InputRoleFlags.allow_growable) != 0 and
+                        input_signatures[i].rank == 4 and role.axis == 2)
+                    {
+                        const g = growable.?;
+                        const initial: usize = @max(1, @min(g.initial_capacity_tokens, cap));
+                        if (!store.hasCache()) {
+                            store.configureCache(.{ .ram_budget_bytes = std.math.maxInt(usize) }) catch return error.OutOfMemory;
+                        }
+                        state_input_policies[i] = .{ .growable = .{
+                            .initial_capacity_tokens = initial,
+                            .growth_numerator = g.growth_numerator,
+                            .growth_denominator = g.growth_denominator,
+                            .max_capacity_tokens = cap,
+                        } };
+                        symbol_defaults[role.capacity_symbol] = initial;
+                    } else {
+                        symbol_defaults[role.capacity_symbol] = cap;
+                    }
+                },
+                .state => {},
+            }
+        }
+        const auto_positions_enabled = opts.auto_positions and role_tokens_index != null and
+            (role_write_index_index != null or role_visible_end_index != null or role_positions_index != null);
+
         var total_rank: usize = 0;
         for (input_signatures) |sig| total_rank += sig.rank;
 
@@ -799,6 +938,15 @@ pub const Model = struct {
             .aliased_state_tids = aliased_state_tids,
             .aliased_state_synced_versions = aliased_state_synced_versions,
             .state_input_policies = state_input_policies,
+            .input_roles = input_roles,
+            .role_tokens_index = role_tokens_index,
+            .role_positions_index = role_positions_index,
+            .role_write_index_index = role_write_index_index,
+            .role_visible_end_index = role_visible_end_index,
+            .auto_positions_enabled = auto_positions_enabled,
+            .role_input_tids = role_input_tids,
+            .role_auto_bound = role_auto_bound,
+            .symbol_defaults = symbol_defaults,
             .run_symbol_bindings = run_symbol_bindings,
             .run_symbol_values = run_symbol_values,
             .run_input_shapes = run_input_shapes,
@@ -847,6 +995,7 @@ pub const Model = struct {
             package.dim_exprs,
             package.dim_symbols.len,
             package.io_aliases,
+            package.input_roles,
             package_hash,
             opts,
         );
@@ -872,6 +1021,7 @@ pub const Model = struct {
         output_value_ids: []const graph_mod.ValueId,
         output_names: []const []const u8,
         io_aliases: []const package_file.IoAlias,
+        input_roles: []const package_file.InputRole,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
         var graph = graph_in;
@@ -912,6 +1062,7 @@ pub const Model = struct {
         const in_ids_dup = try aa.dupe(graph_mod.ValueId, input_value_ids);
         const out_ids_dup = try aa.dupe(graph_mod.ValueId, output_value_ids);
         const aliases_dup = try aa.dupe(package_file.IoAlias, io_aliases);
+        const roles_dup = try aa.dupe(package_file.InputRole, input_roles);
 
         const empty_tids = try allocator.alloc(TensorId, 0);
         errdefer allocator.free(empty_tids);
@@ -937,6 +1088,7 @@ pub const Model = struct {
             &[_]package_file.DimExpr{},
             0,
             aliases_dup,
+            roles_dup,
             0,
             opts,
         );
@@ -991,6 +1143,86 @@ pub const Model = struct {
         return self.run_symbol_values;
     }
 
+    /// Bind one auto-managed i32 control input: (re)allocate its persistent tensor
+    /// on shape change, fill it with `values`, and self-bind it. Skips inputs the
+    /// caller bound manually (`role_auto_bound[i] == false` while bound).
+    fn bindRoleTensor(self: *Self, index: usize, shape: []const usize, values: []const i32) api_errors.ExecuteError!void {
+        if (self.bound_inputs[index] != null and !self.role_auto_bound[index]) return;
+
+        var tid = self.role_input_tids[index];
+        const need_new = blk: {
+            if (tid == types_mod.invalid_tensor_id) break :blk true;
+            const meta = self.store.getConst(tid) catch break :blk true;
+            break :blk !signatures.sameUsize(meta.shape, shape);
+        };
+        if (need_new) {
+            tid = initializers.createTensorForShape(self.store, self.policy, .i32, shape) catch return error.OutOfMemory;
+            self.role_input_tids[index] = tid;
+        }
+        const meta = self.store.getConst(tid) catch return error.InvalidArgument;
+        const t = Tensor{ .store = self.store, .id = tid, .dtype = .i32, .shape = meta.shape };
+        t.write(values) catch return error.InvalidArgument;
+        self.bound_inputs[index] = t;
+        self.role_auto_bound[index] = true;
+    }
+
+    /// Feed role-declared control inputs from the auto-tracked sequence position:
+    /// cache_write_index = position, cache_visible_end = position + new_tokens,
+    /// positions = [position .. position + new_tokens) per batch row. `new_tokens`
+    /// is read from the bound tokens-role input's sequence axis each run, so the
+    /// prefill (seq=S) -> decode (seq=1) switch needs no caller bookkeeping.
+    fn ensureAutoPositions(self: *Self, trace: bool) api_errors.ExecuteError!void {
+        if (!self.auto_positions_enabled) return;
+        const ti = self.role_tokens_index.?;
+        const tokens = self.bound_inputs[ti] orelse return; // nothing to derive from
+        const tokens_role = self.input_roles[ti].?;
+        if (tokens_role.axis == package_file.input_role_no_axis or tokens_role.axis >= tokens.shape.len) return error.InvalidArgument;
+
+        const new_tokens: u64 = @intCast(tokens.shape[tokens_role.axis]);
+        const batch: usize = if (tokens.shape.len >= 2) tokens.shape[0] else 1;
+        if (self.position_tokens + new_tokens > std.math.maxInt(i32)) return error.InvalidArgument;
+        const pos: i32 = @intCast(self.position_tokens);
+        const end: i32 = @intCast(self.position_tokens + new_tokens);
+
+        if (trace) std.debug.print(
+            "[aion][run] auto positions: pos={d} new_tokens={d} batch={d}\n",
+            .{ pos, new_tokens, batch },
+        );
+
+        var small: [8]i32 = undefined;
+        if (self.role_write_index_index) |wi| {
+            if (self.input_signatures[wi].rank != 1) return error.InvalidArgument;
+            const vals = if (batch <= small.len) small[0..batch] else try self.allocator.alloc(i32, batch);
+            defer if (batch > small.len) self.allocator.free(vals);
+            @memset(vals, pos);
+            try self.bindRoleTensor(wi, &[_]usize{batch}, vals);
+        }
+        if (self.role_visible_end_index) |vi| {
+            if (self.input_signatures[vi].rank != 1) return error.InvalidArgument;
+            const vals = if (batch <= small.len) small[0..batch] else try self.allocator.alloc(i32, batch);
+            defer if (batch > small.len) self.allocator.free(vals);
+            @memset(vals, end);
+            try self.bindRoleTensor(vi, &[_]usize{batch}, vals);
+        }
+        if (self.role_positions_index) |pi| {
+            const sig = self.input_signatures[pi];
+            const n: usize = @intCast(new_tokens);
+            const rows: usize = if (sig.rank == 2) batch else if (sig.rank == 1) 1 else return error.InvalidArgument;
+            const vals = try self.allocator.alloc(i32, rows * n);
+            defer self.allocator.free(vals);
+            for (0..rows) |r| {
+                for (0..n) |s| vals[r * n + s] = pos + @as(i32, @intCast(s));
+            }
+            if (sig.rank == 2) {
+                try self.bindRoleTensor(pi, &[_]usize{ rows, n }, vals);
+            } else {
+                try self.bindRoleTensor(pi, &[_]usize{n}, vals);
+            }
+        }
+
+        self.pending_position_advance = new_tokens;
+    }
+
     /// Bind any input the caller left unbound to a persistent, zero-initialized slot
     /// whose shape is inferred from the symbols contributed by the bound inputs.
     ///
@@ -1021,6 +1253,13 @@ pub const Model = struct {
         const symbol_values = try self.resolveSymbolsFromBoundInputs();
         const optional_symbols = instantiate.optionalizeSymbols(self.allocator, symbol_values) catch return error.OutOfMemory;
         defer self.allocator.free(optional_symbols);
+
+        // Symbols no bound input determines fall back to their load-time default
+        // (role-declared cache capacity from `LoadModelOptions.cache`), letting the
+        // runtime auto-allocate caches with a free capacity axis.
+        for (optional_symbols, 0..) |*sym, k| {
+            if (sym.* == null) sym.* = self.symbol_defaults[k];
+        }
 
         for (self.input_signatures, 0..) |sig, i| {
             if (self.bound_inputs[i] != null) continue;

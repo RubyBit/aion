@@ -1212,6 +1212,225 @@ test "api: growable state input grows on demand up to its bound" {
     try std.testing.expectError(error.InvalidArgument, model.run());
 }
 
+test "api: input roles auto-drive cache indices and positions (compile path)" {
+    // Decode-style graph with role-declared control inputs: the caller binds ONLY
+    // `tokens` per step; the runtime feeds cache_write_index / cache_visible_end /
+    // positions from its tracked position and advances it per run.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const table_t: api.Tensor = try ctx.fromArray([4][1]f32{ .{10}, .{20}, .{30}, .{40} });
+    const Table = try bld.param(table_t);
+
+    const Tokens = try bld.name(try bld.input(.i32, &[_]usize{ 1, 1 }), "tokens");
+    const WriteIdx = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_write_index");
+    const VisibleEnd = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_visible_end");
+    const Positions = try bld.name(try bld.input(.i32, &[_]usize{ 1, 1 }), "positions");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 1 }), "cache");
+
+    const Emb = try bld.gatherRows(Table, Tokens); // [1,1,1]
+    const New4 = try bld.reshape(Emb, &[_]usize{ 1, 1, 1, 1 });
+    const CacheOut = try bld.name(try bld.sequenceAppend(Cache, New4, WriteIdx), "next_cache");
+    // `cache_visible_end` is consumed by no node in this toy graph; it is still a
+    // public input the runtime must feed.
+    const PosProbe = try bld.name(try bld.gatherRows(Table, Positions), "pos_probe"); // table[position]
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ CacheOut, PosProbe }, .{
+        .output_aliases = &[_]api.OutputAlias{.{ .input = Cache, .output = CacheOut }},
+        .input_roles = &[_]api.InputRoleDecl{
+            .{ .input = Tokens, .kind = .tokens, .axis = 1 },
+            .{ .input = WriteIdx, .kind = .cache_write_index },
+            .{ .input = VisibleEnd, .kind = .cache_visible_end },
+            .{ .input = Positions, .kind = .positions, .axis = 1 },
+            .{ .input = Cache, .kind = .sequence_cache, .axis = 2 },
+        },
+    });
+    defer model.deinit();
+
+    const step = struct {
+        fn run(m: *api.Model, c: *api.Context, token: i32) ![2]f32 {
+            const tok_t = try c.fromArray([1][1]i32{.{token}});
+            try m.bindInput("tokens", tok_t);
+            try m.run();
+            var out: [2]f32 = undefined;
+            var cache_vals: [4]f32 = undefined;
+            const cache_out = try m.outputTensor("next_cache");
+            try cache_out.read(&cache_vals);
+            const probe = try m.outputTensor("pos_probe");
+            var probe_val: [1]f32 = undefined;
+            try probe.read(&probe_val);
+            out[0] = cache_vals[3]; // untouched tail stays zero until position 3
+            out[1] = probe_val[0];
+            return out;
+        }
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), model.currentPosition());
+
+    // Step 1: position 0 -> cache[0]=table[1]=20, pos_probe=table[0]=10.
+    var r = try step.run(&model, &ctx, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), r[1], 1e-6);
+    try std.testing.expectEqual(@as(u64, 1), model.currentPosition());
+
+    // Step 2: position 1 -> cache[1]=table[3]=40, pos_probe=table[1]=20.
+    r = try step.run(&model, &ctx, 3);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), r[1], 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), model.currentPosition());
+
+    {
+        var cache_vals: [4]f32 = undefined;
+        const cache_out = try model.outputTensor("next_cache");
+        try cache_out.read(&cache_vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 40, 0, 0 }, &cache_vals);
+    }
+
+    // resetState rewinds the position and zeroes the carried cache.
+    try model.resetState();
+    try std.testing.expectEqual(@as(u64, 0), model.currentPosition());
+    r = try step.run(&model, &ctx, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), r[1], 1e-6); // position back to 0
+    {
+        var cache_vals: [4]f32 = undefined;
+        const cache_out = try model.outputTensor("next_cache");
+        try cache_out.read(&cache_vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 30, 0, 0, 0 }, &cache_vals);
+    }
+
+    // A manual bind on a control input overrides its auto value (escape hatch);
+    // the other control inputs stay auto-fed.
+    const manual_idx = try ctx.fromArray([1]i32{3});
+    try model.bindInput("cache_write_index", manual_idx);
+    _ = try step.run(&model, &ctx, 0); // appends at index 3 despite position 1
+    {
+        var cache_vals: [4]f32 = undefined;
+        const cache_out = try model.outputTensor("next_cache");
+        try cache_out.read(&cache_vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 30, 0, 0, 10 }, &cache_vals);
+    }
+    // Position still advanced (documented); setPosition re-syncs.
+    try std.testing.expectEqual(@as(u64, 2), model.currentPosition());
+    model.setPosition(0);
+    try std.testing.expectEqual(@as(u64, 0), model.currentPosition());
+}
+
+test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" {
+    // Export a package whose cache capacity axis is a free symbol `G` with a
+    // sequence_cache role, then load WITHOUT binding the cache: the runtime sizes
+    // it from `cache.capacity_tokens` (fixed) or grows it on demand (growable).
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "roles_cache.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    {
+        const table_t: api.Tensor = try export_ctx.fromArray([4][1]f32{ .{10}, .{20}, .{30}, .{40} });
+
+        var bld = api.Builder.init(allocator);
+        defer bld.deinit();
+
+        const Table = try bld.param(table_t);
+        const Tokens = try bld.name(try bld.input(.i32, &[_]usize{ 1, 1 }), "tokens");
+        const WriteIdx = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_write_index");
+        const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 1 }), "cache");
+
+        const Emb = try bld.gatherRows(Table, Tokens); // [1,1,1]
+        const New4 = try bld.reshape(Emb, &[_]usize{ 1, 1, 1, 1 });
+        const CacheOut = try bld.name(try bld.sequenceAppend(Cache, New4, WriteIdx), "next_cache");
+
+        try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+            .{ .name = "next_cache", .tensor = CacheOut },
+        }, .{
+            .input_symbols = &[_]api.DimensionSymbol{
+                .{ .tensor = Cache, .axis = 2, .name = "G" },
+            },
+            .output_aliases = &[_]api.OutputAlias{.{ .input = Cache, .output = CacheOut }},
+            .input_roles = &[_]api.InputRoleDecl{
+                .{ .input = Tokens, .kind = .tokens, .axis = 1 },
+                .{ .input = WriteIdx, .kind = .cache_write_index },
+                .{ .input = Cache, .kind = .sequence_cache, .axis = 2, .capacity_symbol = "G", .allow_growable = true },
+            },
+        });
+    }
+
+    const drive = struct {
+        fn steps(m: *api.Model, c: *api.Context, tokens: []const i32) !void {
+            for (tokens) |tok| {
+                const tok_t = try c.fromArray([1][1]i32{.{tok}});
+                try m.bindInput("tokens", tok_t);
+                try m.run();
+            }
+        }
+    };
+
+    // (a) Fixed pre-allocation at capacity_tokens.
+    {
+        var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+        defer ctx.deinit();
+        var model = try ctx.loadModel(file, .{ .cache = .{ .capacity_tokens = 6 } });
+        defer model.deinit();
+
+        try drive.steps(&model, &ctx, &[_]i32{ 1, 2, 3 });
+        try std.testing.expectEqual(@as(u64, 3), model.currentPosition());
+
+        const out = try model.outputTensor("next_cache");
+        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 6, 1 }, out.getShape());
+        var vals: [6]f32 = undefined;
+        try out.read(&vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 0, 0, 0 }, &vals);
+    }
+
+    // (b) Growable: starts at 2 tokens, grows on demand, ceiling 6.
+    {
+        var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+        defer ctx.deinit();
+        var model = try ctx.loadModel(file, .{ .cache = .{
+            .capacity_tokens = 6,
+            .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 },
+        } });
+        defer model.deinit();
+
+        try drive.steps(&model, &ctx, &[_]i32{ 1, 2, 3, 1 });
+
+        // Appends at positions 0..3 grow the slot 2 -> 4 (doubling), under the ceiling 6.
+        const out = try model.outputTensor("next_cache");
+        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 4, 1 }, out.getShape());
+        var vals: [4]f32 = undefined;
+        try out.read(&vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 20 }, &vals);
+    }
+
+    // (c) No cache options: the free symbol stays undetermined, matching the old
+    // behavior — run() refuses, and binding the cache explicitly still works.
+    {
+        var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+        defer ctx.deinit();
+        var model = try ctx.loadModel(file, .{});
+        defer model.deinit();
+
+        const tok_t = try ctx.fromArray([1][1]i32{.{1}});
+        try model.bindInput("tokens", tok_t);
+        try std.testing.expectError(error.InvalidArgument, model.run());
+
+        const cache_t = try ctx.fromArray([1][1][3][1]f32{.{.{ .{0}, .{0}, .{0} }}});
+        try model.bindInput("cache", cache_t);
+        try model.run();
+        const out = try model.outputTensor("next_cache");
+        var vals: [3]f32 = undefined;
+        try out.read(&vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 0, 0 }, &vals);
+    }
+}
+
 test "api: compile io-alias gives auto-init + carry + reset (no export/load)" {
     // The unified Model from ctx.compile must support the same recurrent-state
     // ergonomics as a loaded model: unbound aliased state auto-zeros, carries across

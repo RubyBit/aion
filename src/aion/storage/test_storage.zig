@@ -123,6 +123,42 @@ test "storage: device-aware copy/zero round-trip via mock device memory" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 0, 0 }, &got);
 }
 
+test "storage: swap carries heterogeneous host and device backings without copies" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var mock = dm.MockDeviceMemory.init(allocator);
+    defer mock.deinit();
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const shape = [_]usize{4};
+    const host_vals = [_]f32{ 1, 2, 3, 4 };
+    const device_vals = [_]f32{ 5, 6, 7, 8 };
+    const host = try sm.createTiledTensor(.f32, &shape, &shape, .{});
+    const device = try sm.createTiledTensor(.f32, &shape, &shape, .{});
+    try sm.writeFromPackedScalar(host, std.mem.sliceAsBytes(&host_vals));
+    try sm.writeFromPackedScalar(device, std.mem.sliceAsBytes(&device_vals));
+    try sm.moveTensor(device, .{ .kind = .gpu, .index = 0 }, mock.device(), &shape, 64);
+
+    const h2d_before = mock.h2d_count;
+    const d2h_before = mock.d2h_count;
+    try sm.tensorStore().swapTensors(host, device);
+    try std.testing.expectEqual(h2d_before, mock.h2d_count);
+    try std.testing.expectEqual(d2h_before, mock.d2h_count);
+    try std.testing.expect((try sm.tensorDevice(host)).kind == .gpu);
+    try std.testing.expect((try sm.tensorDevice(device)).kind == .cpu);
+
+    var got_host: [4]f32 = undefined;
+    try sm.readToPackedScalar(device, std.mem.sliceAsBytes(&got_host));
+    try std.testing.expectEqualSlices(f32, &host_vals, &got_host);
+
+    const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{});
+    try sm.copyTensorData(mirror, host);
+    var got_device: [4]f32 = undefined;
+    try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got_device));
+    try std.testing.expectEqualSlices(f32, &device_vals, &got_device);
+}
+
 test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -718,6 +754,157 @@ test "storage file: invalid package is rejected" {
     pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "dup"), .value = 0 };
 
     try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+}
+
+fn buildRolesTestPackage(allocator: std.mem.Allocator) !package_file.Package {
+    // Inputs: k_cache (f16 [1,1,G,8], io-aliased to output 0), write_idx (i32 [1]),
+    // tokens (i32 [1,4]). Output 0 references the cache value (alias target).
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 3),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 0),
+        .inputs = try allocator.alloc(package_file.NamedValue, 3),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 1),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 1),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 1),
+        .input_roles = try allocator.alloc(package_file.InputRole, 3),
+    };
+    errdefer pkg.deinit();
+
+    pkg.dim_symbols[0] = .{ .name = try allocator.dupe(u8, "G") };
+    pkg.dim_exprs[0] = .{ .symbol = 0 };
+
+    const cache_terms = try allocator.alloc(package_file.ShapeTerm, 4);
+    cache_terms[0] = .{ .constant = 1 };
+    cache_terms[1] = .{ .constant = 1 };
+    cache_terms[2] = .{ .expr = 0 };
+    cache_terms[3] = .{ .constant = 8 };
+    pkg.values[0] = .{ .dtype = .f16, .rank = 4, .source = .public_input, .shape_terms = cache_terms };
+    pkg.values[1] = .{
+        .dtype = .i32,
+        .rank = 1,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{1}),
+    };
+    pkg.values[2] = .{
+        .dtype = .i32,
+        .rank = 2,
+        .source = .public_input,
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 1, 4 }),
+    };
+
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "k_cache"), .value = 0 };
+    pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "write_idx"), .value = 1 };
+    pkg.inputs[2] = .{ .name = try allocator.dupe(u8, "tokens"), .value = 2 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "next_k_cache"), .value = 0 };
+    pkg.io_aliases[0] = .{ .input = 0, .output = 0 };
+
+    pkg.input_roles[0] = .{
+        .input = 0,
+        .kind = .sequence_cache,
+        .axis = 2,
+        .flags = package_file.InputRoleFlags.zero_init | package_file.InputRoleFlags.allow_growable,
+        .capacity_symbol = 0,
+    };
+    pkg.input_roles[1] = .{ .input = 1, .kind = .cache_write_index };
+    pkg.input_roles[2] = .{ .input = 2, .kind = .tokens, .axis = 1 };
+    return pkg;
+}
+
+test "storage file: input roles roundtrip through write/parse" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = try buildRolesTestPackage(allocator);
+    defer pkg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "roles.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.input_roles.len);
+    try std.testing.expectEqualSlices(package_file.InputRole, pkg.input_roles, parsed.input_roles);
+}
+
+test "storage file: package without input roles parses to empty slice" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = try buildRolesTestPackage(allocator);
+    defer pkg.deinit();
+    allocator.free(pkg.input_roles);
+    pkg.input_roles = &[_]package_file.InputRole{};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "noroles.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.input_roles.len);
+}
+
+test "storage file: invalid input roles are rejected" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = try buildRolesTestPackage(allocator);
+    defer pkg.deinit();
+
+    // Baseline is valid.
+    try package_file.validate(&pkg);
+
+    // Input index out of range.
+    pkg.input_roles[1].input = 99;
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[1].input = 1;
+
+    // Duplicate role on one input.
+    pkg.input_roles[1].input = 0;
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[1].input = 1;
+
+    // sequence_cache must be io-aliased.
+    pkg.input_roles[0].input = 1;
+    pkg.input_roles[1].input = 0;
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[0].input = 0;
+    pkg.input_roles[1].input = 1;
+
+    // capacity_symbol out of range.
+    pkg.input_roles[0].capacity_symbol = 7;
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[0].capacity_symbol = 0;
+
+    // Two `tokens` roles package-wide.
+    pkg.input_roles[1] = .{ .input = 1, .kind = .tokens, .axis = 0 };
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[1] = .{ .input = 1, .kind = .cache_write_index };
+
+    // Control-role input must be i32 (retarget tokens role at the f16 cache... use
+    // write_index on the cache input, which is also a duplicate-free check).
+    pkg.input_roles[2] = .{ .input = 2, .kind = .tokens, .axis = 9 }; // axis out of range
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[2] = .{ .input = 2, .kind = .tokens, .axis = 1 };
+
+    // Unknown flag bits.
+    pkg.input_roles[0].flags = 0x80;
+    try std.testing.expectError(package_file.PackageError.InvalidFormat, package_file.validate(&pkg));
+    pkg.input_roles[0].flags = package_file.InputRoleFlags.zero_init;
+
+    try package_file.validate(&pkg);
 }
 
 test "storage cache: lease tokens and policy info" {

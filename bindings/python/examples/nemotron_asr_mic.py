@@ -98,13 +98,11 @@ def transcribe_single(model_path, audio, tokenizer, threads, args):
     m, dev = load_model_with_device(model_path, args, thread_count=threads)
     print(f"device: {dev}")
     ctx = m.context
+    # Only non-zero-seed inputs need binding: the runtime auto-initializes every
+    # unbound input to zeros (LSTM state, frame/sym/count bookkeeping, toks_in).
     m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
-    m.bind_input("frame_in", _i32(ctx, 0, (1,))); m.bind_input("sym_in", _i32(ctx, 0, (1,)))
-    m.bind_input("count_in", _i32(ctx, 0, (1,))); m.bind_input("active_in", _i32(ctx, 1, (1,)))
+    m.bind_input("active_in", _i32(ctx, 1, (1,)))
     m.bind_input("last_in", _i32(ctx, BLANK, (1,)))
-    for nm in ("h0_in", "c0_in", "h1_in", "c1_in"):
-        m.bind_input(nm, aion.Tensor.from_numpy(ctx, np.zeros((1, PRED_HIDDEN), np.float32)))
-    m.bind_input("toks_in", _i32(ctx, 0, (512, 1)))
     m.run()
     oc = m.output_tensor("out_count"); count = int(oc.read_i32()[0]); oc.close()
     ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.read_i32()][:count]; ot.close()
@@ -119,20 +117,16 @@ class StreamFull:
 
     Streaming state is threaded *inside the runtime*, not in Python. The 24 attn
     + 24 conv caches and the persistent decode state (last token + LSTM h/c) are
-    IoAlias'd output->input in the graph, and the decode Loop leaves each carry's
-    final value in its own input slot. So those inputs are bound ONCE (zeros) and
-    never rebound — the runtime carries them across runs for free.
-
-    This matters for memory: tensor storage is owned by the Context for its whole
-    lifetime (destroying a tensor handle frees only the handle, not the backing
-    store). Creating fresh input tensors every chunk would therefore leak ~15 MB
-    per step (the 24 k/v caches dominate) and climb to multiple GB within a minute.
-    Bind-once + write-in-place keeps per-step allocation at zero.
+    IoAlias'd output->input in the graph and tagged with `state` roles, so they
+    are left UNBOUND: the runtime auto-allocates each once, zeros it, and carries
+    it across runs. Only `last_in` needs an explicit bind (non-zero blank-SOS seed).
 
     Only the per-run inputs change each step: the audio window and chunked mask
     (rewritten in place), and the per-run decode bookkeeping (frame/sym/count/
     active/toks) which are Loop carries that must be re-seeded to their start
-    values each chunk."""
+    values each chunk. Those are bound once and rewritten in place — per-step
+    allocation stays zero (Context-owned tensor storage is never freed by handle
+    close, so fresh per-chunk tensors would leak)."""
 
     def __init__(self, model_path, tokenizer, threads, args, att_left=70, att_right=13):
         import sentencepiece as spm
@@ -161,15 +155,10 @@ class StreamFull:
         m.bind_input("count_in", self.t_count); m.bind_input("active_in", self.t_active)
         m.bind_input("toks_in", self.t_toks)
 
-        # Persistent state (IoAlias'd / self-carried) — bound once to seed values,
-        # then threaded by the runtime across runs. Never rebound or rewritten.
+        # Persistent state (IoAlias'd, zero-init) — the caches and LSTM h/c are
+        # left UNBOUND; the runtime auto-zeros each once and carries it across
+        # runs. Only the non-zero blank-SOS seed needs an explicit bind.
         m.bind_input("last_in", _i32(ctx, BLANK, (1,)))
-        for nm in ("h0_in", "c0_in", "h1_in", "c1_in"):
-            m.bind_input(nm, fn(np.zeros((1, PRED_HIDDEN), np.float32)))
-        for li in range(N_LAYERS):
-            m.bind_input(f"kcache_{li}_in", fn(np.zeros((1, att_left, N_HEADS, HEAD_DIM), np.float32)))
-            m.bind_input(f"vcache_{li}_in", fn(np.zeros((1, att_left, N_HEADS, HEAD_DIM), np.float32)))
-            m.bind_input(f"conv_cache_{li}_in", fn(np.zeros((1, CONV_LEFT, D), np.float32)))
 
     def step(self, window: np.ndarray, real: int):
         """Process one window; `real` = valid new frames (<=chunk)."""

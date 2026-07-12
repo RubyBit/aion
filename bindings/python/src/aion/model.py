@@ -90,7 +90,17 @@ class LoadedModel:
             pass
 
     @classmethod
-    def load(cls, ctx, path: str, *, device: DeviceLike = None) -> "LoadedModel":
+    def load(
+        cls,
+        ctx,
+        path: str,
+        *,
+        device: DeviceLike = None,
+        cache_capacity: int | None = None,
+        growable: bool = False,
+        initial_cache_capacity: int = 8,
+        auto_positions: bool = True,
+    ) -> "LoadedModel":
         """Load a model onto `device` (default CPU).
 
         The GPU it targets must be registered on `ctx` (see `Context(gpus=...)`
@@ -98,6 +108,17 @@ class LoadedModel:
         keep binding CPU input tensors — the runtime migrates them on `run()` and
         flushes outputs back to host for reading. Do NOT bind a device-resident
         tensor (from `tensor.to("gpu")`) as a model input.
+
+        Role-declared state (models converted with input roles):
+        - `cache_capacity`: capacity in tokens for every sequence-cache input
+          whose capacity axis is a free dim symbol; the runtime allocates and
+          zeroes those caches itself (no `bind_input` needed).
+        - `growable=True`: start those caches at `initial_cache_capacity` tokens
+          and grow them on demand up to `cache_capacity`.
+        - `auto_positions`: feed role-declared `cache_write_index` /
+          `cache_visible_end` / `positions` inputs from the runtime-tracked
+          position (advanced per run by the tokens input's sequence length).
+          Binding one of those inputs manually always overrides its auto value.
         """
 
         if not isinstance(path, str):
@@ -109,21 +130,25 @@ class LoadedModel:
         c_path = ffi.new("char[]", b)
         absolute = os.path.isabs(path)
 
-        if device is None or _is_cpu(device):
-            if absolute:
-                st = lib.aion_loaded_model_load_path_absolute(ctx.ptr, c_path, out_m)
-                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute")
-            else:
-                st = lib.aion_loaded_model_load_path(ctx.ptr, c_path, out_m)
-                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path")
-        else:
+        opts = ffi.new("AionLoadModelOptions*")  # zero-initialized
+        opts.auto_init_inputs = 1
+        opts.auto_positions = 1 if auto_positions else 0
+        if device is not None and not _is_cpu(device):
             kind, index = _normalize_device(device)
-            if absolute:
-                st = lib.aion_loaded_model_load_path_absolute_on(ctx.ptr, c_path, int(kind), int(index), out_m)
-                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute_on")
-            else:
-                st = lib.aion_loaded_model_load_path_on(ctx.ptr, c_path, int(kind), int(index), out_m)
-                raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_on")
+            opts.device_kind = int(kind)
+            opts.device_index = int(index)
+        if cache_capacity is not None and int(cache_capacity) > 0:
+            opts.cache_capacity_tokens = int(cache_capacity)
+            if growable:
+                opts.cache_growable = 1
+                opts.cache_initial_capacity_tokens = int(initial_cache_capacity)
+
+        if absolute:
+            st = lib.aion_loaded_model_load_path_absolute(ctx.ptr, c_path, opts, out_m)
+            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute")
+        else:
+            st = lib.aion_loaded_model_load_path(ctx.ptr, c_path, opts, out_m)
+            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path")
 
         return cls(ctx, out_m[0])
 
@@ -219,6 +244,40 @@ class LoadedModel:
         st = lib.aion_loaded_model_set_state_input_policy(self._m, c_name, 2, 0, 0, 0, 0, int(window))
         raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_state_input_policy")
 
+    def output_is_state(self, index: int) -> bool:
+        """Whether output `index` is io-aliased recurrent state (a `next_*` carry
+        the runtime already writes back into its input slot every run)."""
+        out = ffi.new("uint8_t*")
+        st = lib.aion_loaded_model_output_is_state(self._m, int(index), out)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_is_state")
+        return bool(out[0])
+
+    @property
+    def position(self) -> int:
+        """Tokens consumed so far by position auto-management (0 when disabled)."""
+        out = ffi.new("uint64_t*")
+        st = lib.aion_loaded_model_position(self._m, out)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_position")
+        return int(out[0])
+
+    def set_position(self, tokens: int) -> None:
+        """Overwrite the auto-tracked position (session restore / rollback)."""
+        st = lib.aion_loaded_model_set_position(self._m, int(tokens))
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_position")
+
+    def _default_output_names(self) -> List[str]:
+        """All outputs except io-aliased state carries (KV caches etc.), which the
+        runtime already persists — copying them out per run is pure overhead.
+        Falls back to all outputs when every output is a state carry."""
+        cached = getattr(self, "_default_outputs", None)
+        if cached is not None:
+            return cached
+        names = self.output_names()
+        non_state = [n for i, n in enumerate(names) if not self.output_is_state(i)]
+        result = non_state if non_state else names
+        self._default_outputs = result
+        return result
+
     def run_tensors(
         self,
         inputs: Mapping[str, object],
@@ -227,6 +286,9 @@ class LoadedModel:
     ) -> dict[str, object]:
         """Run the model and return output tensors.
 
+        By default only non-state outputs are returned (io-aliased carries like
+        `next_k_cache.*` are skipped — the runtime persists them itself); pass
+        `outputs=[...]` to select any output explicitly.
         Caller owns the returned output tensor *handles* and must `close()` them.
         """
 
@@ -235,7 +297,7 @@ class LoadedModel:
 
         self.run()
 
-        out_names = list(outputs) if outputs is not None else self.output_names()
+        out_names = list(outputs) if outputs is not None else self._default_output_names()
         return {name: self.output_tensor(name) for name in out_names}
 
     def run_numpy(
@@ -246,6 +308,9 @@ class LoadedModel:
     ) -> dict[str, NDArrayF32]:
         """Run the model with Tensor or NumPy inputs and return NumPy outputs.
 
+        By default only non-state outputs are returned (io-aliased carries like
+        `next_k_cache.*` are skipped — the runtime persists them itself); pass
+        `outputs=[...]` to select any output explicitly.
         Output tensor handles are closed internally; returned arrays own their data.
         """
 
@@ -263,7 +328,7 @@ class LoadedModel:
 
             self.run()
 
-            out_names = list(outputs) if outputs is not None else self.output_names()
+            out_names = list(outputs) if outputs is not None else self._default_output_names()
             outs: dict[str, NDArrayF32] = {}
             for name in out_names:
                 t_out = self.output_tensor(name)

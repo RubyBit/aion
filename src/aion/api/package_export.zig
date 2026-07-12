@@ -18,6 +18,7 @@ pub const Package = types_mod.Package;
 pub const Metadata = types_mod.Metadata;
 pub const DimensionSymbol = types_mod.DimensionSymbol;
 pub const OutputAlias = types_mod.OutputAlias;
+pub const InputRoleDecl = types_mod.InputRoleDecl;
 pub const ExportModelOptions = types_mod.ExportModelOptions;
 
 pub fn buildPackage(
@@ -133,6 +134,8 @@ pub fn buildPackage(
     errdefer collect.freeMetadata(allocator, metadata);
     const io_aliases = try collect.collectIoAliases(allocator, inputs, output_values, opts.output_aliases);
     errdefer allocator.free(io_aliases);
+    const input_roles = try collect.collectInputRoles(allocator, inputs, opts.input_roles, &symbol_map);
+    errdefer if (input_roles.len != 0) allocator.free(input_roles);
     const nodes = try collect.collectNodes(allocator, graph);
     errdefer collect.freeNodes(allocator, nodes);
     const regions = try collect.collectRegions(allocator, graph);
@@ -151,5 +154,6 @@ pub fn buildPackage(
         .metadata = metadata,
         .debug_names = debug_names,
         .io_aliases = io_aliases,
+        .input_roles = input_roles,
     };
 }

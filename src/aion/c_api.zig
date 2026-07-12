@@ -605,45 +605,67 @@ fn loadModelImpl(
     return .AION_OK;
 }
 
+/// Load options. Zero-init (or a NULL pointer) means defaults: CPU, auto-init
+/// inputs, auto positions, no cache auto-sizing. `cache_capacity_tokens > 0`
+/// sizes every role-declared sequence cache with a free capacity symbol;
+/// `cache_growable != 0` additionally starts those caches small
+/// (`cache_initial_capacity_tokens`, 0 = default 8) and grows them on demand
+/// (growth factor `cache_growth_numerator/denominator`, 0/0 = default 3/2).
+pub const AionLoadModelOptions = extern struct {
+    device_kind: u32 = 0, // AionDeviceKind
+    device_index: u32 = 0,
+    auto_init_inputs: u8 = 1,
+    auto_positions: u8 = 1,
+    _pad: [6]u8 = @splat(0),
+    cache_capacity_tokens: u64 = 0,
+    cache_growable: u8 = 0,
+    _pad1: [7]u8 = @splat(0),
+    cache_initial_capacity_tokens: u64 = 0,
+    cache_growth_numerator: u64 = 0,
+    cache_growth_denominator: u64 = 0,
+};
+
+fn loadOptionsFromC(c_opts: ?*const AionLoadModelOptions) ?api.LoadModelOptions {
+    const c = c_opts orelse return api.LoadModelOptions{};
+    const kind = std.enums.fromInt(AionDeviceKind, c.device_kind) orelse return null;
+    var opts: api.LoadModelOptions = .{
+        .device = deviceFromC(kind, c.device_index),
+        .auto_init_inputs = c.auto_init_inputs != 0,
+        .auto_positions = c.auto_positions != 0,
+    };
+    if (c.cache_capacity_tokens > 0) {
+        opts.cache.capacity_tokens = @intCast(c.cache_capacity_tokens);
+        if (c.cache_growable != 0) {
+            var growth: api.CacheGrowth = .{};
+            if (c.cache_initial_capacity_tokens > 0) growth.initial_capacity_tokens = @intCast(c.cache_initial_capacity_tokens);
+            if (c.cache_growth_numerator > 0 and c.cache_growth_denominator > 0) {
+                growth.growth_numerator = @intCast(c.cache_growth_numerator);
+                growth.growth_denominator = @intCast(c.cache_growth_denominator);
+            }
+            opts.cache.growable = growth;
+        }
+    }
+    return opts;
+}
+
 pub export fn aion_loaded_model_load_path(
     ctx_opt: ?*AionContext,
     path: ?[*:0]const u8,
+    opts_opt: ?*const AionLoadModelOptions,
     out_model: ?*?*AionLoadedModel,
 ) callconv(.c) AionStatus {
-    return loadModelImpl(ctx_opt, path, false, .{}, out_model, "load_model_path");
+    const opts = loadOptionsFromC(opts_opt) orelse return .AION_INVALID_ARGUMENT;
+    return loadModelImpl(ctx_opt, path, false, opts, out_model, "load_model_path");
 }
 
 pub export fn aion_loaded_model_load_path_absolute(
     ctx_opt: ?*AionContext,
     path: ?[*:0]const u8,
+    opts_opt: ?*const AionLoadModelOptions,
     out_model: ?*?*AionLoadedModel,
 ) callconv(.c) AionStatus {
-    return loadModelImpl(ctx_opt, path, true, .{}, out_model, "load_model_path_absolute");
-}
-
-/// Like `aion_loaded_model_load_path`, but loads the model onto `(kind, index)`.
-/// The model's backend and tile policy follow the device; inputs are auto-migrated
-/// on run and outputs flushed back to host.
-pub export fn aion_loaded_model_load_path_on(
-    ctx_opt: ?*AionContext,
-    path: ?[*:0]const u8,
-    kind: AionDeviceKind,
-    index: u32,
-    out_model: ?*?*AionLoadedModel,
-) callconv(.c) AionStatus {
-    const opts: api.LoadModelOptions = .{ .device = deviceFromC(kind, index) };
-    return loadModelImpl(ctx_opt, path, false, opts, out_model, "load_model_path_on");
-}
-
-pub export fn aion_loaded_model_load_path_absolute_on(
-    ctx_opt: ?*AionContext,
-    path: ?[*:0]const u8,
-    kind: AionDeviceKind,
-    index: u32,
-    out_model: ?*?*AionLoadedModel,
-) callconv(.c) AionStatus {
-    const opts: api.LoadModelOptions = .{ .device = deviceFromC(kind, index) };
-    return loadModelImpl(ctx_opt, path, true, opts, out_model, "load_model_path_absolute_on");
+    const opts = loadOptionsFromC(opts_opt) orelse return .AION_INVALID_ARGUMENT;
+    return loadModelImpl(ctx_opt, path, true, opts, out_model, "load_model_path_absolute");
 }
 
 pub export fn aion_loaded_model_destroy(m_opt: ?*AionLoadedModel) callconv(.c) void {
@@ -755,6 +777,36 @@ pub export fn aion_loaded_model_run(m_opt: ?*AionLoadedModel) callconv(.c) AionS
         ctx.setLastError("loaded_model_run", e);
         return mapError(e);
     };
+    return .AION_OK;
+}
+
+/// Tokens consumed so far by position auto-management (0 when disabled).
+pub export fn aion_loaded_model_position(m_opt: ?*const AionLoadedModel, out_tokens: ?*u64) callconv(.c) AionStatus {
+    const m: *const AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_tokens == null) return .AION_INVALID_ARGUMENT;
+    out_tokens.?.* = m.model.currentPosition();
+    return .AION_OK;
+}
+
+/// Overwrite the auto-tracked position (session restore / rollback).
+pub export fn aion_loaded_model_set_position(m_opt: ?*AionLoadedModel, tokens: u64) callconv(.c) AionStatus {
+    const m: *AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
+    m.model.setPosition(tokens);
+    return .AION_OK;
+}
+
+/// Whether output `index` is io-aliased recurrent state (a carry the runtime
+/// writes back into its input slot on every run). Lets bindings skip copying
+/// such outputs out by default.
+pub export fn aion_loaded_model_output_is_state(
+    m_opt: ?*const AionLoadedModel,
+    index: usize,
+    out_is_state: ?*u8,
+) callconv(.c) AionStatus {
+    const m: *const AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_is_state == null) return .AION_INVALID_ARGUMENT;
+    if (index >= m.model.outputNames().len) return .AION_INVALID_ARGUMENT;
+    out_is_state.?.* = @intFromBool(m.model.outputIsAliasedState(index));
     return .AION_OK;
 }
 

@@ -126,6 +126,54 @@ test "api: gpu kv-cache decode carries device-resident state (matches cpu)" {
     try std.testing.expectEqualSlices(f32, &want, &gpu);
 }
 
+/// Exercise a recurrent alias whose output cannot reuse the input slot. Unlike
+/// SequenceAppend, `state + delta` produces a distinct output tensor, so every
+/// run must copy that result back into the device-resident state slot.
+fn runNonInPlaceStateSteps(ctx: *api.Context, dev: api.DeviceSelector) ![4]f32 {
+    var bld = api.Builder.init(ctx.allocator);
+    defer bld.deinit();
+
+    const State = try bld.name(try bld.input(.f32, &[_]usize{4}), "state");
+    const Delta = try bld.name(try bld.input(.f32, &[_]usize{4}), "delta");
+    const Next = try bld.name(try bld.add(State, Delta), "next_state");
+
+    var model = try ctx.compileOn(dev, &bld, &[_]api.TensorRef{Next}, .{
+        .output_aliases = &[_]api.OutputAlias{.{ .input = State, .output = Next }},
+        .input_roles = &[_]api.InputRoleDecl{.{ .input = State, .kind = .state }},
+    });
+    defer model.deinit();
+
+    // State is deliberately unbound: the runtime allocates and zeroes it once.
+    const delta = try ctx.fromArray([4]f32{ 1, 2, 3, 4 });
+    try model.bindInput("delta", delta);
+    try model.run();
+    try model.run();
+
+    const on_gpu = std.meta.activeTag(dev) != .cpu;
+    try std.testing.expectEqual(on_gpu, model.stateInputOnDevice("state"));
+
+    const out = try model.outputTensorAt(0);
+    var vals: [4]f32 = undefined;
+    try out.read(&vals);
+    return vals;
+}
+
+test "api: non-in-place recurrent state carries on gpu without host-only copy" {
+    const alloc = std.testing.allocator;
+
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    const cpu = try runNonInPlaceStateSteps(&ctx, .cpu);
+    const gpu = try runNonInPlaceStateSteps(&ctx, .{ .gpu = 0 });
+    const want = [4]f32{ 2, 4, 6, 8 };
+    try std.testing.expectEqualSlices(f32, &want, &cpu);
+    try std.testing.expectEqualSlices(f32, &want, &gpu);
+}
+
 /// Grow-on-demand decode on `dev`: cache starts at capacity 2 and the runtime
 /// grows its slot as appends cross capacity (up to 8). Returns the final cache.
 fn runGrowableDecode(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {

@@ -12,7 +12,7 @@ pub const PadMode = backend_types.PadMode;
 pub const ValueId = graph_mod.ValueId;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-pub const current_version: u32 = 5;
+pub const current_version: u32 = 6;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -40,6 +40,7 @@ pub const SectionType = enum(u32) {
     debug_names = 10,
     regions = 11,
     io_aliases = 12,
+    input_roles = 13,
 };
 
 pub const section_slot_count = @typeInfo(SectionType).@"enum".fields.len;
@@ -122,6 +123,43 @@ pub const DebugName = struct {
 pub const IoAlias = struct {
     input: u32,
     output: u32,
+};
+
+/// Semantic role of a public input, declared by the package author. Roles let the
+/// runtime auto-allocate caches (including ones with a free capacity symbol) and
+/// auto-drive position/index inputs, instead of every caller re-deriving them.
+pub const InputRoleKind = enum(u8) {
+    /// io-aliased KV-style sequence cache; `axis` is the time/capacity axis.
+    sequence_cache = 1,
+    /// i32 [B]: physical write position fed to SequenceAppend.
+    cache_write_index = 2,
+    /// i32 [B]: visible end (write position + new tokens) fed to attention.
+    cache_visible_end = 3,
+    /// i32 [B,S]: absolute positions of the new tokens; `axis` is the sequence axis.
+    positions = 4,
+    /// The input whose `axis` extent defines "new tokens this run" (token ids).
+    tokens = 5,
+    /// Generic io-aliased recurrent state (LSTM h/c etc.); zero-initialized.
+    state = 6,
+};
+
+pub const InputRoleFlags = struct {
+    pub const zero_init: u8 = 1 << 0;
+    pub const allow_growable: u8 = 1 << 1;
+    pub const allow_ring: u8 = 1 << 2;
+    pub const all: u8 = zero_init | allow_growable | allow_ring;
+};
+
+pub const input_role_no_axis: u8 = 0xFF;
+
+pub const InputRole = struct {
+    /// Index into the signatures section's input list.
+    input: u32,
+    kind: InputRoleKind,
+    axis: u8 = input_role_no_axis,
+    flags: u8 = InputRoleFlags.zero_init,
+    /// dim_symbols index of the free capacity symbol, or `invalid_index` (fixed shape).
+    capacity_symbol: u32 = invalid_index,
 };
 
 pub const NodeOp = union(graph_mod.OpTag) {
@@ -263,6 +301,7 @@ pub const Package = struct {
     metadata: []MetadataEntry,
     debug_names: []DebugName,
     io_aliases: []IoAlias,
+    input_roles: []InputRole = &[_]InputRole{},
 
     /// When non-null, this Package owns the raw file-byte buffer and some of its
     /// internal slices (notably `Initializer.data`, the largest by far) are borrows
@@ -325,6 +364,7 @@ pub const Package = struct {
         freeMetadata(self.allocator, self.metadata);
         freeDebugNames(self.allocator, self.debug_names);
         self.allocator.free(self.io_aliases);
+        if (self.input_roles.len != 0) self.allocator.free(self.input_roles);
         if (self.source_bytes) |buf| self.allocator.free(buf);
         self.* = undefined;
     }
@@ -352,6 +392,7 @@ pub const Package = struct {
 
         try validateUniqueSignatureNames(self.inputs, self.outputs);
         try validateIoAliases(self);
+        try validateInputRoles(self);
 
         var producer_counts = self.allocator.alloc(u8, self.values.len) catch return PackageError.OutOfMemory;
         defer self.allocator.free(producer_counts);
@@ -476,6 +517,62 @@ fn validateIoAliases(pkg: *const Package) PackageError!void {
         if (used_inputs[input_idx] or used_outputs[output_idx]) return PackageError.InvalidFormat;
         used_inputs[input_idx] = true;
         used_outputs[output_idx] = true;
+    }
+}
+
+fn validateInputRoles(pkg: *const Package) PackageError!void {
+    var role_seen = pkg.allocator.alloc(bool, pkg.inputs.len) catch return PackageError.OutOfMemory;
+    defer pkg.allocator.free(role_seen);
+    @memset(role_seen, false);
+
+    var aliased = pkg.allocator.alloc(bool, pkg.inputs.len) catch return PackageError.OutOfMemory;
+    defer pkg.allocator.free(aliased);
+    @memset(aliased, false);
+    for (pkg.io_aliases) |alias| {
+        if (alias.input < pkg.inputs.len) aliased[alias.input] = true;
+    }
+
+    var singleton_seen = [_]bool{false} ** 4; // write_index, visible_end, positions, tokens
+
+    for (pkg.input_roles) |role| {
+        const input_idx: usize = role.input;
+        if (input_idx >= pkg.inputs.len) return PackageError.InvalidFormat;
+        if (role_seen[input_idx]) return PackageError.InvalidFormat;
+        role_seen[input_idx] = true;
+        if ((role.flags & ~InputRoleFlags.all) != 0) return PackageError.InvalidFormat;
+
+        const value_idx: usize = pkg.inputs[input_idx].value;
+        if (value_idx >= pkg.values.len) return PackageError.InvalidFormat;
+        const value = pkg.values[value_idx];
+
+        switch (role.kind) {
+            .sequence_cache, .state => {
+                if (!aliased[input_idx]) return PackageError.InvalidFormat;
+                if (role.kind == .sequence_cache) {
+                    if (role.axis == input_role_no_axis or role.axis >= value.rank) return PackageError.InvalidFormat;
+                    if (role.capacity_symbol != invalid_index) {
+                        if (role.capacity_symbol >= pkg.dim_symbols.len) return PackageError.InvalidFormat;
+                        if (value.shape_terms[role.axis] != .expr) return PackageError.InvalidFormat;
+                    }
+                }
+            },
+            .cache_write_index, .cache_visible_end, .positions, .tokens => {
+                const slot: usize = switch (role.kind) {
+                    .cache_write_index => 0,
+                    .cache_visible_end => 1,
+                    .positions => 2,
+                    .tokens => 3,
+                    else => unreachable,
+                };
+                if (singleton_seen[slot]) return PackageError.InvalidFormat;
+                singleton_seen[slot] = true;
+                if (value.dtype != .i32) return PackageError.InvalidFormat;
+                if (role.kind == .positions or role.kind == .tokens) {
+                    if (role.axis == input_role_no_axis or role.axis >= value.rank) return PackageError.InvalidFormat;
+                }
+                if (role.capacity_symbol != invalid_index) return PackageError.InvalidFormat;
+            },
+        }
     }
 }
 

@@ -1021,6 +1021,39 @@ def _emit_forward(
     return logits, source_append_outputs
 
 
+def _add_input_roles(b: _PackageBuilder) -> None:
+    """Declare input roles so the runtime can auto-allocate the KV caches (capacity
+    `G` supplied at load time, optionally growable) and auto-feed the index/position
+    inputs from its tracked sequence position. Applies to whatever inputs exist, so
+    it works for both the full-forward and single-block debug packages."""
+    name_to_idx = {nv.name: i for i, nv in enumerate(b.pkg.inputs)}
+
+    def role(nm: str, **kw) -> None:
+        if nm in name_to_idx:
+            b.pkg.input_roles.append(aw.InputRole(input_index=name_to_idx[nm], **kw))
+
+    role("tokens", kind=aw.RoleKind.tokens, axis=1)
+    role("positions", kind=aw.RoleKind.positions, axis=1)
+    role("cache_write_index", kind=aw.RoleKind.cache_write_index)
+    role("cache_visible_end", kind=aw.RoleKind.cache_visible_end)
+
+    g_sym = b._sym_idx["G"]
+    for nv in b.pkg.inputs:
+        is_k = nv.name.startswith("k_cache")
+        is_v = nv.name.startswith("v_cache")
+        if not (is_k or is_v):
+            continue
+        # Global layers have the free capacity symbol `G` (growable); local layers
+        # are fixed at the 512-token sliding window.
+        layer_txt = nv.name.rsplit("layer", 1)[-1]
+        is_glob = layer_txt.isdigit() and is_global_layer(int(layer_txt))
+        kw = dict(kind=aw.RoleKind.sequence_cache, axis=2)
+        if is_glob:
+            kw["capacity_symbol"] = g_sym
+            kw["flags"] = aw.ROLE_FLAG_ZERO_INIT | aw.ROLE_FLAG_ALLOW_GROWABLE
+        role(nv.name, **kw)
+
+
 def _write_metadata(b: _PackageBuilder) -> None:
     b.pkg.metadata.extend([
         aw.MetadataEntry(key="arch", value="gemma4-e2b-text"),
@@ -1086,6 +1119,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         b.add_io_alias(name_to_in_idx["k_cache"], k_out_idx)
         b.add_io_alias(name_to_in_idx["v_cache"], v_out_idx)
 
+        _add_input_roles(b)
+
         if args.debug_block_taps:
             # Keep names stable so downstream scripts can compare step-by-step.
             for k in sorted(taps.keys()):
@@ -1108,6 +1143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         b.add_output("logits", logits)
         # next_*_cache outputs + io_aliases.
         _alias_cache_outputs(b, source_append_outputs)
+        _add_input_roles(b)
 
         _write_metadata(b)
 

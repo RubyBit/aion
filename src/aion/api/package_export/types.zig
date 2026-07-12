@@ -33,8 +33,24 @@ pub const OutputAlias = struct {
     output: TensorRef,
 };
 
+/// Declares the semantic role of a graph input (see `package_file.InputRoleKind`).
+/// Roles are persisted in the package and let the runtime auto-allocate caches and
+/// auto-drive position/index inputs on load.
+pub const InputRoleDecl = struct {
+    input: TensorRef,
+    kind: package_file.InputRoleKind,
+    /// Capacity axis (sequence_cache) or sequence axis (tokens/positions).
+    axis: ?u8 = null,
+    /// Dim symbol NAME of a free capacity axis; must also appear in `input_symbols`.
+    capacity_symbol: ?[]const u8 = null,
+    zero_init: bool = true,
+    allow_growable: bool = false,
+    allow_ring: bool = false,
+};
+
 pub const ExportModelOptions = struct {
     input_symbols: []const DimensionSymbol = &.{},
     metadata: []const Metadata = &.{},
     output_aliases: []const OutputAlias = &.{},
+    input_roles: []const InputRoleDecl = &.{},
 };

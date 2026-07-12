@@ -706,6 +706,13 @@ def _ingraph_decode(loader: _Loader, b: _Builder, enc: int, t_out: int, max_out:
     for nm in ("last", "h0", "c0", "h1", "c1"):  # persistent decode state
         alias(f"{nm}_in", f"{nm}_out")
 
+    # Roles: the LSTM state is generic zero-init recurrent state, so the runtime
+    # auto-zeros + carries it. `last_in` is deliberately NOT tagged — it seeds at
+    # the (non-zero) blank SOS token and stays caller-bound.
+    for nm in ("h0", "c0", "h1", "c1"):
+        ii = next(i for i, nv in enumerate(b.pkg.inputs) if nv.name == f"{nm}_in")
+        b.pkg.input_roles.append(aw.InputRole(input_index=ii, kind=aw.RoleKind.state))
+
 
 def build_single(loader: _Loader, b: _Builder, t_mel: int, max_out: int,
                  att_left: Optional[int] = None, att_right: int = 0) -> int:
@@ -829,6 +836,14 @@ def _stream_cache_alias(b, k_out, v_out, conv_out):
         alias(f"kcache_{li}_in", f"kcache_{li}_out")
         alias(f"vcache_{li}_in", f"vcache_{li}_out")
         alias(f"conv_cache_{li}_in", f"conv_cache_{li}_out")
+
+    # Roles: these are fixed-shape shift-window buffers (not append-style
+    # sequence caches), i.e. plain zero-init recurrent state the runtime can
+    # auto-allocate and carry. `cache_mask` stays caller-bound (per-chunk values).
+    for li in range(N_LAYERS):
+        for nm in (f"kcache_{li}_in", f"vcache_{li}_in", f"conv_cache_{li}_in"):
+            ii = next(i for i, nv in enumerate(b.pkg.inputs) if nv.name == nm)
+            b.pkg.input_roles.append(aw.InputRole(input_index=ii, kind=aw.RoleKind.state))
 
 
 def build_stream_conformer(loader: _Loader, b: _Builder, att_left: int = 70, att_right: int = 13):

@@ -137,6 +137,12 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
             try allocator.alloc(IoAlias, 0);
         errdefer allocator.free(io_aliases);
 
+        const input_roles = if (refs[sectionSlot(.input_roles)]) |ref|
+            try parseInputRolesSection(allocator, sectionBytes(bytes, ref))
+        else
+            try allocator.alloc(types.InputRole, 0);
+        errdefer allocator.free(input_roles);
+
         graph_meta = try parseGraphMetaSection(sectionBytes(bytes, refs[sectionSlot(.graph_meta)].?));
 
         pkg = Package{
@@ -152,6 +158,7 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
             .metadata = metadata,
             .debug_names = debug_names,
             .io_aliases = io_aliases,
+            .input_roles = input_roles,
             .source_bytes = source_bytes,
         };
 
@@ -242,6 +249,7 @@ fn sectionSlot(section_type: SectionType) usize {
         .debug_names => 9,
         .regions => 10,
         .io_aliases => 11,
+        .input_roles => 12,
     };
 }
 
@@ -665,6 +673,32 @@ fn parseIoAliasesSection(allocator: std.mem.Allocator, bytes: []const u8) Packag
         slot.* = .{
             .input = try readIntCursor(bytes, &cursor, u32),
             .output = try readIntCursor(bytes, &cursor, u32),
+        };
+    }
+    if (cursor != bytes.len) return PackageError.InvalidFormat;
+    return out;
+}
+
+fn parseInputRolesSection(allocator: std.mem.Allocator, bytes: []const u8) PackageError![]types.InputRole {
+    var cursor: usize = 0;
+    const count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+    const out = allocator.alloc(types.InputRole, count) catch return PackageError.OutOfMemory;
+    errdefer allocator.free(out);
+    for (out) |*slot| {
+        const input = try readIntCursor(bytes, &cursor, u32);
+        const kind_raw = try readIntCursor(bytes, &cursor, u8);
+        const axis = try readIntCursor(bytes, &cursor, u8);
+        const flags = try readIntCursor(bytes, &cursor, u8);
+        const reserved = try readIntCursor(bytes, &cursor, u8);
+        const capacity_symbol = try readIntCursor(bytes, &cursor, u32);
+        if (reserved != 0) return PackageError.InvalidFormat;
+        const kind = std.enums.fromInt(types.InputRoleKind, kind_raw) orelse return PackageError.InvalidFormat;
+        slot.* = .{
+            .input = input,
+            .kind = kind,
+            .axis = axis,
+            .flags = flags,
+            .capacity_symbol = capacity_symbol,
         };
     }
     if (cursor != bytes.len) return PackageError.InvalidFormat;

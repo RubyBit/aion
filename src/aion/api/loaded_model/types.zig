@@ -30,6 +30,29 @@ pub const IoAliasInfo = struct {
     output_index: usize,
 };
 
+/// Growth schedule for growable role-declared caches (see `CacheOptions.growable`).
+pub const CacheGrowth = struct {
+    /// Tokens allocated up front; the runtime grows the slot on demand from here.
+    initial_capacity_tokens: usize = 8,
+    /// Geometric growth factor (matches the storage `GrowablePolicy` defaults).
+    growth_numerator: usize = 3,
+    growth_denominator: usize = 2,
+};
+
+/// One-shot sizing/policy for sequence-cache inputs declared via package input
+/// roles. Applies to every cache whose capacity axis is a free dim symbol; caches
+/// with fixed shapes need nothing (auto-init covers them).
+pub const CacheOptions = struct {
+    /// Capacity in tokens for role-declared caches with a free capacity symbol.
+    /// 0 = don't auto-size them (the caller binds those caches explicitly).
+    capacity_tokens: usize = 0,
+    /// Non-null: allocate the caches small and grow on demand up to
+    /// `capacity_tokens`. Honored only for roles flagged `allow_growable` with the
+    /// runtime-supported rank-4/axis-2 layout; otherwise the cache is pre-allocated
+    /// at full capacity (never a load error).
+    growable: ?CacheGrowth = null,
+};
+
 pub const LoadModelOptions = struct {
     /// When true (the default), any graph input the caller does not bind before
     /// `run()` is auto-allocated and zero-initialized, with its shape inferred from
@@ -47,6 +70,15 @@ pub const LoadModelOptions = struct {
     /// to the pre-device behavior). `.gpu = i` requires that GPU to have been
     /// registered on the `Context` via `Options.gpus`; weights are tiled for it.
     device: device_mod.DeviceSelector = .cpu,
+
+    /// One-shot sizing/policy for role-declared sequence caches.
+    cache: CacheOptions = .{},
+
+    /// Auto-feed and advance role-declared position/index inputs
+    /// (cache_write_index, cache_visible_end, positions) from the bound
+    /// tokens-role input. Ignored when the package declares no such roles.
+    /// A manual `bindInput` on a role input always overrides its auto value.
+    auto_positions: bool = true,
 };
 
 pub const invalid_alias_index: u32 = std.math.maxInt(u32);

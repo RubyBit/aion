@@ -68,6 +68,34 @@ pub fn collectIoAliases(
     return out;
 }
 
+pub fn collectInputRoles(
+    allocator: std.mem.Allocator,
+    inputs: []const package_file.NamedValue,
+    decls: []const types_mod.InputRoleDecl,
+    symbol_map: *const std.StringHashMapUnmanaged(u32),
+) ![]package_file.InputRole {
+    if (decls.len == 0) return &[_]package_file.InputRole{};
+    const out = try allocator.alloc(package_file.InputRole, decls.len);
+    errdefer allocator.free(out);
+    for (decls, 0..) |decl, idx| {
+        var flags: u8 = 0;
+        if (decl.zero_init) flags |= package_file.InputRoleFlags.zero_init;
+        if (decl.allow_growable) flags |= package_file.InputRoleFlags.allow_growable;
+        if (decl.allow_ring) flags |= package_file.InputRoleFlags.allow_ring;
+        out[idx] = .{
+            .input = try findNamedValueByValueId(inputs, decl.input.value),
+            .kind = decl.kind,
+            .axis = decl.axis orelse package_file.input_role_no_axis,
+            .flags = flags,
+            .capacity_symbol = if (decl.capacity_symbol) |name|
+                symbol_map.get(name) orelse return error.InvalidArgument
+            else
+                package_file.invalid_index,
+        };
+    }
+    return out;
+}
+
 fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node) ![]package_file.NodeRecord {
     const out = try allocator.alloc(package_file.NodeRecord, nodes.len);
     errdefer allocator.free(out);

@@ -31,10 +31,14 @@ pub const Model = api_loaded_model.Model;
 pub const LoadedModel = api_loaded_model.LoadedModel;
 pub const Weights = api_weights.Weights;
 pub const LoadModelOptions = api_loaded_model.LoadModelOptions;
+pub const CacheOptions = api_loaded_model.CacheOptions;
+pub const CacheGrowth = api_loaded_model.CacheGrowth;
 pub const NamedTensorRef = api_builder.NamedTensorRef;
 pub const DimensionSymbol = api_package_export.DimensionSymbol;
 pub const ExportMetadata = api_package_export.Metadata;
 pub const OutputAlias = api_package_export.OutputAlias;
+pub const InputRoleDecl = api_package_export.InputRoleDecl;
+pub const InputRoleKind = package_file.InputRoleKind;
 pub const ExportModelOptions = api_package_export.ExportModelOptions;
 pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
@@ -623,6 +627,25 @@ pub const Context = struct {
             try aliases.append(self.allocator, .{ .input = @intCast(in_idx), .output = @intCast(out_idx) });
         }
 
+        // Input roles (by tensor -> input index). Compiled graphs are concrete-only,
+        // so a free capacity symbol has nothing to refer to.
+        var roles: std.ArrayList(package_file.InputRole) = .empty;
+        defer roles.deinit(self.allocator);
+        for (opts.input_roles) |decl| {
+            if (decl.capacity_symbol != null) return api_errors.ApiError.InvalidArgument;
+            const in_idx = findValueIdIndex(input_ids.items, decl.input.value) orelse return api_errors.ApiError.InvalidArgument;
+            var flags: u8 = 0;
+            if (decl.zero_init) flags |= package_file.InputRoleFlags.zero_init;
+            if (decl.allow_growable) flags |= package_file.InputRoleFlags.allow_growable;
+            if (decl.allow_ring) flags |= package_file.InputRoleFlags.allow_ring;
+            try roles.append(self.allocator, .{
+                .input = @intCast(in_idx),
+                .kind = decl.kind,
+                .axis = decl.axis orelse package_file.input_role_no_axis,
+                .flags = flags,
+            });
+        }
+
         // Transfer graph ownership to the model; the builder keeps a fresh empty graph.
         const owned_graph = b.takeGraph();
         return api_loaded_model.Model.initCompiled(
@@ -637,6 +660,7 @@ pub const Context = struct {
             out_ids,
             out_names,
             aliases.items,
+            roles.items,
             .{},
         );
     }

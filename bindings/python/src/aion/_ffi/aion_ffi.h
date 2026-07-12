@@ -115,10 +115,22 @@ AionStatus aion_tensor_read(const AionTensor* t, AionDType dtype, void* out_valu
 AionStatus aion_tensor_write(AionTensor* t, AionDType dtype, const void* values, size_t values_len);
 AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype, void* out_value);
 
-AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, AionLoadedModel** out_model);
-AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, AionLoadedModel** out_model);
-AionStatus aion_loaded_model_load_path_on(AionContext* ctx, const char* path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
-AionStatus aion_loaded_model_load_path_absolute_on(AionContext* ctx, const char* absolute_path, AionDeviceKind kind, uint32_t index, AionLoadedModel** out_model);
+typedef struct AionLoadModelOptions {
+    uint32_t device_kind;
+    uint32_t device_index;
+    uint8_t auto_init_inputs;
+    uint8_t auto_positions;
+    uint8_t _pad[6];
+    uint64_t cache_capacity_tokens;
+    uint8_t cache_growable;
+    uint8_t _pad1[7];
+    uint64_t cache_initial_capacity_tokens;
+    uint64_t cache_growth_numerator;
+    uint64_t cache_growth_denominator;
+} AionLoadModelOptions;
+
+AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, const AionLoadModelOptions* opts, AionLoadedModel** out_model);
+AionStatus aion_loaded_model_load_path_absolute(AionContext* ctx, const char* absolute_path, const AionLoadModelOptions* opts, AionLoadedModel** out_model);
 void aion_loaded_model_destroy(AionLoadedModel* m);
 
 size_t aion_loaded_model_input_count(const AionLoadedModel* m);
@@ -137,3 +149,6 @@ AionStatus aion_loaded_model_run(AionLoadedModel* m);
 AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
 AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
 AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
+AionStatus aion_loaded_model_position(const AionLoadedModel* m, uint64_t* out_tokens);
+AionStatus aion_loaded_model_set_position(AionLoadedModel* m, uint64_t tokens);
+AionStatus aion_loaded_model_output_is_state(const AionLoadedModel* m, size_t index, uint8_t* out_is_state);

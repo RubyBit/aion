@@ -1,81 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transcribe from the microphone with the Nemotron FastConformer on Aion.
 
-Two modes:
+Takes ONE self-contained .aion (built by scripts/convert_nemotron_asr_to_aion.py);
+the mode follows the model kind, auto-detected from package metadata:
 
-  (default) record-then-transcribe: capture audio until you press Enter (or for
-            --seconds), then run the self-contained single model once.
-
-  --live    cache-aware streaming with ONE self-contained model
-            (nemotron_stream_full.aion): in-graph log-mel + subsampling + cached
-            conformer + in-graph RNNT decode. The driver just slices an overlapping
-            audio window per ~1.1 s step and threads all state via IoAlias, so it
-            streams indefinitely (no length cap).
+  offline   (default converter build): record until Enter (or --seconds), then
+            transcribe the clip in one run.
+  streaming (converter --streaming build): live transcription — one run per
+            chunk (~1.1 s at the default [70,13] attention config), threading
+            all state inside the runtime via IoAlias, so it streams
+            indefinitely (no length cap).
 
 `--wav PATH` replays a 16 kHz wav through the same path instead of the mic.
+`--tokenizer` defaults to `nemotron_tokenizer.model` next to the model.
 
 Examples:
-  # record 10s then transcribe:
-  uv run --project bindings/python --extra dev python \
+  # record 10s then transcribe (offline model):
+  uv run --project bindings/python python \
     bindings/python/examples/nemotron_asr_mic.py \
-      --single models/nemotron-asr/nemotron_single_2885.aion \
-      --tokenizer models/nemotron-asr/nemotron_tokenizer.model --seconds 10
+      models/nemotron-asr/nemotron.aion --seconds 10
 
-  # live (one model):
-  uv run --project bindings/python --extra dev python \
-    bindings/python/examples/nemotron_asr_mic.py --live \
-      --stream-full models/nemotron-asr/nemotron_stream_full.aion \
-      --tokenizer models/nemotron-asr/nemotron_tokenizer.model
+  # live (streaming model):
+  uv run --project bindings/python python \
+    bindings/python/examples/nemotron_asr_mic.py \
+      models/nemotron-asr/nemotron_stream.aion
 """
 from __future__ import annotations
 
 import argparse
-import threading
+import os
 
 import numpy as np
 
 import aion
 
-from _common import add_device_args, load_model_with_device
+from _common import add_device_args, load_model_with_device, read_aion_metadata
 
 SR = 16000
 HOP = 160
-BLANK = 1024
-PRED_HIDDEN = 640
-CONV_LEFT = 8
-N_LAYERS = 24
-D = 1024
-N_HEADS = 8
-HEAD_DIM = 128
-PAD = 16 * HOP                   # front-pad: chunk c window = buf[c*step : c*step+wsamp] (sub-drop=2 frames)
-T_MEL_CAP = 2885                 # for record-then-transcribe single model only
-# chunk size / left context are read from --att-right/--att-left (must match the built model).
-
-
-def calc_length(length: int) -> int:
-    for _ in range(3):
-        length = length // 2 + 1
-    return length
-
-
-SUB_DROP = 2
-
-
-def window_mel(chunk: int) -> int:
-    """Mel-window size the stream_full model uses for `chunk` (must match the
-    converter's stream_window_mel)."""
-    need = SUB_DROP + chunk + 1
-    w = 40
-    while calc_length(w) < need:
-        w += 8
-    return w
 
 
 def _i32(ctx, v, shape):
     return aion.Tensor(np.full(shape, v, np.int32).tolist(), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
 
 
-# ---------------- record-then-transcribe (single model) ----------------
+# ---------------- record-then-transcribe (offline model) ----------------
 
 def record_until_enter(seconds=None) -> np.ndarray:
     import sounddevice as sd
@@ -91,9 +60,10 @@ def record_until_enter(seconds=None) -> np.ndarray:
     return np.concatenate(buf).astype(np.float32) if buf else np.zeros(0, np.float32)
 
 
-def transcribe_single(model_path, audio, tokenizer, threads, args):
-    import sentencepiece as spm
-    n = (T_MEL_CAP - 1) * HOP
+def transcribe_offline(model_path, md, audio, sp, threads, args):
+    t_mel = int(md["t_mel"])  # fixed audio window baked into the model
+    blank = int(md["blank_id"])
+    n = (t_mel - 1) * HOP
     a = (np.concatenate([audio, np.zeros(n - len(audio), np.float32)]) if len(audio) < n else audio[:n])
     m, dev = load_model_with_device(model_path, args, thread_count=threads)
     print(f"device: {dev}")
@@ -102,18 +72,17 @@ def transcribe_single(model_path, audio, tokenizer, threads, args):
     # unbound input to zeros (LSTM state, frame/sym/count bookkeeping, toks_in).
     m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
     m.bind_input("active_in", _i32(ctx, 1, (1,)))
-    m.bind_input("last_in", _i32(ctx, BLANK, (1,)))
+    m.bind_input("last_in", _i32(ctx, blank, (1,)))
     m.run()
     oc = m.output_tensor("out_count"); count = int(oc.read_i32()[0]); oc.close()
     ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.read_i32()][:count]; ot.close()
-    sp = spm.SentencePieceProcessor(); sp.Load(tokenizer)
     return sp.DecodeIds(toks)
 
 
 # ---------------- live streaming (one self-contained model) ----------------
 
 class StreamFull:
-    """Drives nemotron_stream_full.aion: one .aion run per ~1.1s window.
+    """Drives the streaming .aion: one run per audio window (chunk).
 
     Streaming state is threaded *inside the runtime*, not in Python. The 24 attn
     + 24 conv caches and the persistent decode state (last token + LSTM h/c) are
@@ -128,17 +97,17 @@ class StreamFull:
     allocation stays zero (Context-owned tensor storage is never freed by handle
     close, so fresh per-chunk tensors would leak)."""
 
-    def __init__(self, model_path, tokenizer, threads, args, att_left=70, att_right=13):
-        import sentencepiece as spm
+    def __init__(self, model_path, md, sp, threads, args):
         self.m, dev = load_model_with_device(model_path, args, thread_count=threads)
         print(f"device: {dev}")
         self.ctx = self.m.context
-        self.sp = spm.SentencePieceProcessor(); self.sp.Load(tokenizer)
-        self.att_left = att_left
-        self.chunk = att_right + 1
-        self.t_kv = att_left + self.chunk
-        self.wsamp = (window_mel(self.chunk) - 1) * HOP
-        self.max_out = 64
+        self.sp = sp
+        self.att_left = int(md["att_left"])
+        self.chunk = int(md["chunk"])
+        self.t_kv = int(md["t_kv"])
+        self.wsamp = (int(md["window_mel"]) - 1) * HOP
+        self.max_out = int(md["max_out"])
+        blank = int(md["blank_id"])
         self.tokens = []
         self.c = 0  # chunk index
         ctx, m = self.ctx, self.m
@@ -158,7 +127,7 @@ class StreamFull:
         # Persistent state (IoAlias'd, zero-init) — the caches and LSTM h/c are
         # left UNBOUND; the runtime auto-zeros each once and carries it across
         # runs. Only the non-zero blank-SOS seed needs an explicit bind.
-        m.bind_input("last_in", _i32(ctx, BLANK, (1,)))
+        m.bind_input("last_in", _i32(ctx, blank, (1,)))
 
     def step(self, window: np.ndarray, real: int):
         """Process one window; `real` = valid new frames (<=chunk)."""
@@ -183,14 +152,21 @@ class StreamFull:
         return self.sp.DecodeIds([int(t) for t in self.tokens])
 
 
-def run_live(model_path, tokenizer, threads, audio_source, args, att_left=70, att_right=13):
-    """audio_source yields float32 mono 16k blocks. `buf` is front-padded by PAD so
-    chunk c's window is buf[c*STEP : c*STEP+WSAMP] (== global mel m_start = chunk*8*c - 16)."""
-    drv = StreamFull(model_path, tokenizer, threads, args, att_left, att_right)
-    chunk = att_right + 1
-    step = chunk * 8 * HOP   # new audio samples per chunk
+def calc_length(length: int) -> int:
+    for _ in range(3):
+        length = length // 2 + 1
+    return length
+
+
+def run_live(model_path, md, sp, threads, audio_source, args):
+    """audio_source yields float32 mono 16k blocks. `buf` is front-padded by `pad`
+    so chunk c's window is buf[c*step : c*step+wsamp]."""
+    drv = StreamFull(model_path, md, sp, threads, args)
+    chunk = drv.chunk
+    step = chunk * 8 * HOP                # new audio samples per chunk
+    pad = int(md["sub_drop"]) * 8 * HOP   # front-pad matching the model's window layout
     wsamp = drv.wsamp
-    buf = np.zeros(PAD, np.float32)
+    buf = np.zeros(pad, np.float32)
     done = 0  # chunks processed
     for block in audio_source:
         buf = np.concatenate([buf, block])
@@ -200,7 +176,7 @@ def run_live(model_path, tokenizer, threads, audio_source, args, att_left=70, at
             done += 1
             print("\r" + drv.text()[-110:], end="", flush=True)
     # Final flush: process remaining frames (partial last chunk), zero-padding the window.
-    t_out = calc_length((len(buf) - PAD) // HOP + 1)
+    t_out = calc_length((len(buf) - pad) // HOP + 1)
     while done * chunk < t_out:
         w = buf[done * step: done * step + wsamp]
         if len(w) < wsamp:
@@ -237,27 +213,34 @@ def wav_blocks(path, block):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--single", default=None, help="single model (record-then-transcribe mode)")
-    ap.add_argument("--live", action="store_true", help="live streaming mode (needs --stream-full)")
-    ap.add_argument("--stream-full", default=None, help="self-contained streaming .aion")
-    ap.add_argument("--att-left", type=int, default=70, help="left context the model was built with")
-    ap.add_argument("--att-right", type=int, default=13, help="right context the model was built with (chunk=att_right+1)")
-    ap.add_argument("--seconds", type=float, default=None, help="record duration (default: until Enter)")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", help="self-contained .aion from convert_nemotron_asr_to_aion.py")
+    ap.add_argument("--tokenizer", default=None,
+                    help="sentencepiece model (default: nemotron_tokenizer.model next to the model)")
+    ap.add_argument("--seconds", type=float, default=None,
+                    help="offline model: record duration (default: until Enter)")
     ap.add_argument("--wav", default=None, help="replay a 16kHz wav instead of the mic")
     ap.add_argument("--threads", type=int, default=None)
     add_device_args(ap)
     args = ap.parse_args()
 
-    if args.live:
-        assert args.stream_full, "--live needs --stream-full"
-        block = (args.att_right + 1) * 8 * HOP  # feed one chunk's worth of audio at a time
+    import sentencepiece as spm
+    tok_path = args.tokenizer or os.path.join(os.path.dirname(os.path.abspath(args.model)),
+                                              "nemotron_tokenizer.model")
+    sp = spm.SentencePieceProcessor()
+    sp.Load(tok_path)
+
+    md = read_aion_metadata(args.model)
+    arch = md.get("arch", "")
+    if arch == "nemotron-fastconformer-rnnt-stream-full":
+        block = int(md["chunk"]) * 8 * HOP  # feed one chunk's worth of audio at a time
         src = wav_blocks(args.wav, block) if args.wav else mic_blocks(block)
-        run_live(args.stream_full, args.tokenizer, args.threads, src, args, args.att_left, args.att_right)
+        run_live(args.model, md, sp, args.threads, src, args)
         return
 
-    assert args.single, "record-then-transcribe needs --single"
+    if arch != "nemotron-fastconformer-rnnt-single":
+        raise SystemExit(f"{args.model}: unrecognized arch {arch!r} — rebuild with "
+                         "scripts/convert_nemotron_asr_to_aion.py")
     if args.wav:
         import soundfile as sf
         audio, sr = sf.read(args.wav)
@@ -267,7 +250,7 @@ def main() -> None:
     else:
         audio = record_until_enter(args.seconds)
     print(f"captured {len(audio)/SR:.1f}s")
-    print("\ntranscript:\n" + transcribe_single(args.single, audio, args.tokenizer, args.threads, args))
+    print("\ntranscript:\n" + transcribe_offline(args.model, md, audio, sp, args.threads, args))
 
 
 if __name__ == "__main__":

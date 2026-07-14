@@ -7,8 +7,57 @@ Run as scripts (`python examples/foo.py`), so the examples directory is on
 from __future__ import annotations
 
 import argparse
+import struct
 
 import aion
+
+
+def read_aion_metadata(path: str) -> dict:
+    """Read a `.aion` package's key/value metadata section without loading it.
+
+    Converters record model parameters here (arch, chunk size, window sizes,
+    ...), so examples can auto-configure from the model file alone. Layout per
+    aion._writer.format: 72-byte header (magic, version, section count,
+    reserved, directory offset), a directory of (type u32, flags u32, offset
+    u64, size u64) entries, then section payloads. Strings section (type 1) is
+    a u32 count + length-prefixed strings; metadata section (type 9) is a u32
+    count + (key, value) string-table index pairs.
+    """
+    with open(path, "rb") as fh:
+        header = fh.read(72)
+        if len(header) < 72 or header[:4] != b"AION":
+            raise ValueError(f"{path}: not a .aion package")
+        section_count = struct.unpack_from("<I", header, 8)[0]
+        dir_offset = struct.unpack_from("<Q", header, 16)[0]
+        fh.seek(dir_offset)
+        directory = fh.read(section_count * 24)
+        sections = {}
+        for i in range(section_count):
+            stype, _flags, off, size = struct.unpack_from("<IIQQ", directory, i * 24)
+            sections[stype] = (off, size)
+        if 9 not in sections or 1 not in sections:  # metadata / strings
+            return {}
+
+        def section_bytes(stype: int) -> bytes:
+            off, size = sections[stype]
+            fh.seek(off)
+            return fh.read(size)
+
+        sb = section_bytes(1)
+        (n_str,) = struct.unpack_from("<I", sb, 0)
+        pos, strings = 4, []
+        for _ in range(n_str):
+            (ln,) = struct.unpack_from("<I", sb, pos)
+            pos += 4
+            strings.append(sb[pos:pos + ln].decode("utf-8"))
+            pos += ln
+        mb = section_bytes(9)
+        (n_md,) = struct.unpack_from("<I", mb, 0)
+        return {
+            strings[struct.unpack_from("<I", mb, 4 + i * 8)[0]]:
+            strings[struct.unpack_from("<I", mb, 8 + i * 8)[0]]
+            for i in range(n_md)
+        }
 
 
 def add_device_args(p: argparse.ArgumentParser) -> None:

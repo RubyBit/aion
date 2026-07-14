@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+
+//! CPU backend conformance: compile graphs into executable programs and run
+//! them through `CpuBackend`, checking numeric results against explicit math
+//! references (incl. control-flow regions). Compile-time validation lives in
+//! `graph/test_compile.zig`; lowered-structure golden snapshots live in
+//! `graph/test_program_golden.zig`; leaf kernels in `test_cpu_kernels.zig`.
+
 const std = @import("std");
 
-const backend_mod = @import("../backend/backend.zig");
-const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
-const types = @import("../backend/types.zig");
-const manager_mod = @import("../storage/manager.zig");
-const graph_mod = @import("graph.zig");
-const infer_mod = @import("infer.zig");
-const plan_mod = @import("plan.zig");
-const program = @import("program.zig");
+const backend_mod = @import("../backend.zig");
+const cpu_backend_mod = @import("cpu_backend.zig");
+const types = @import("../types.zig");
+const manager_mod = @import("../../storage/manager.zig");
+const graph_mod = @import("../../graph/graph.zig");
+const infer_mod = @import("../../graph/infer.zig");
+const plan_mod = @import("../../graph/plan.zig");
+const program = @import("../../graph/program.zig");
 const Backend = backend_mod.Backend;
 
 fn asF32Slice(buf: []u8) []align(1) f32 {
@@ -47,7 +54,7 @@ fn readScalarI32(mgr: *manager_mod.StorageManager, id: manager_mod.TensorId) !i3
     return std.mem.readInt(i32, buf[0..@sizeOf(i32)], .little);
 }
 
-test "graph: if selects region output" {
+test "cpu backend: if selects region output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var mgr = manager_mod.StorageManager.init(allocator);
@@ -89,7 +96,7 @@ test "graph: if selects region output" {
     try std.testing.expectEqual(@as(f32, 7.0), try readScalarF32(&mgr, prog.outputs[0]));
 }
 
-test "graph: loop carries state with tensor-id alias swap" {
+test "cpu backend: loop carries state with tensor-id alias swap" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var mgr = manager_mod.StorageManager.init(allocator);
@@ -122,7 +129,7 @@ test "graph: loop carries state with tensor-id alias swap" {
     try std.testing.expectEqual(@as(f32, 9.0), try readScalarF32(&mgr, prog.outputs[0]));
 }
 
-test "graph: multi-carry loop with early-exit condition" {
+test "cpu backend: multi-carry loop with early-exit condition" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var mgr = manager_mod.StorageManager.init(allocator);
@@ -183,21 +190,7 @@ test "graph: multi-carry loop with early-exit condition" {
     try std.testing.expectEqual(@as(i32, 3), try readScalarI32(&mgr, prog.outputs[1]));
 }
 
-test "plan: chooseTileShape2DSquare handles skinny matrices" {
-    const policy: plan_mod.TilePolicy = .{};
-
-    const t0: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 1, 128);
-    try std.testing.expectEqual(@as(usize, 1), t0[0]);
-    try std.testing.expectEqual(@min(@as(usize, 128), policy.base_1d), t0[1]);
-    try std.testing.expect(t0[1] > 1);
-
-    const t1: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 256, 1);
-    try std.testing.expectEqual(@min(@as(usize, 256), policy.base_1d), t1[0]);
-    try std.testing.expectEqual(@as(usize, 1), t1[1]);
-    try std.testing.expect(t1[0] > 1);
-}
-
-test "graph: rmsnorm supports row tiles >256" {
+test "cpu backend: rmsnorm supports row tiles >256" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 1;
@@ -328,7 +321,7 @@ const PackedLayout2 = struct {
     }
 };
 
-test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
+test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 2;
@@ -467,7 +460,7 @@ test "graph: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce" {
     try std.testing.expectApproxEqAbs(out_ref[0], out_val, 1e-5);
 }
 
-test "graph: batched matmul rank-3 matches reference (f32)" {
+test "cpu backend: batched matmul rank-3 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 2;
@@ -557,7 +550,7 @@ test "graph: batched matmul rank-3 matches reference (f32)" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: batched matmul broadcast B rank-3 matches reference (f32)" {
+test "cpu backend: batched matmul broadcast B rank-3 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 3;
@@ -646,7 +639,7 @@ test "graph: batched matmul broadcast B rank-3 matches reference (f32)" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: batched matmul broadcast A rank-3 matches reference (f32)" {
+test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 3;
@@ -735,7 +728,7 @@ test "graph: batched matmul broadcast A rank-3 matches reference (f32)" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: batch retile guard accepts small, rejects large" {
+test "cpu backend: batch retile guard accepts small, rejects large" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 4;
@@ -829,7 +822,7 @@ test "graph: batch retile guard accepts small, rejects large" {
     try std.testing.expectError(program.CompileError.InvalidArgument, program.compileGraph(allocator, &g, &sm, policy_bad));
 }
 
-test "graph: unary ops match reference (f32)" {
+test "cpu backend: unary ops match reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     // Moderate-sized 1D input to exercise vector loops + tails.
@@ -1166,7 +1159,7 @@ fn attentionRefBatchedMultiHeadF32(
     }
 }
 
-test "graph: softmax rank-1 matches reference (f32)" {
+test "cpu backend: softmax rank-1 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const n: usize = 257;
@@ -1231,7 +1224,7 @@ test "graph: softmax rank-1 matches reference (f32)" {
     try std.testing.expect(max_abs <= 3e-2);
 }
 
-test "graph: softmax rank-2 matches reference (f32)" {
+test "cpu backend: softmax rank-2 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 5;
@@ -1310,7 +1303,7 @@ test "graph: softmax rank-2 matches reference (f32)" {
     }
 }
 
-test "graph: softmax rank-2 axis-0 matches reference (f32)" {
+test "cpu backend: softmax rank-2 axis-0 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 6;
@@ -1379,7 +1372,7 @@ test "graph: softmax rank-2 axis-0 matches reference (f32)" {
     try std.testing.expect(max_abs <= 4e-2);
 }
 
-test "graph: softmax rank-3 axis-last matches reference (f32)" {
+test "cpu backend: softmax rank-3 axis-last matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const b: usize = 2;
@@ -1453,7 +1446,7 @@ test "graph: softmax rank-3 axis-last matches reference (f32)" {
     }
 }
 
-test "graph: layernorm and rmsnorm rank-2 match reference (f32)" {
+test "cpu backend: layernorm and rmsnorm rank-2 match reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 6;
@@ -1556,7 +1549,7 @@ test "graph: layernorm and rmsnorm rank-2 match reference (f32)" {
     }
 }
 
-test "graph: layernorm rank-3 normalized-shape matches reference (f32)" {
+test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const b: usize = 2;
@@ -1651,7 +1644,7 @@ test "graph: layernorm rank-3 normalized-shape matches reference (f32)" {
     }
 }
 
-test "graph: attention rank-2 matches reference (f32)" {
+test "cpu backend: attention rank-2 matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 7;
@@ -1741,7 +1734,7 @@ test "graph: attention rank-2 matches reference (f32)" {
     }
 }
 
-test "graph: attention rank-3 batched matches reference (f32)" {
+test "cpu backend: attention rank-3 batched matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 2;
@@ -1826,7 +1819,7 @@ test "graph: attention rank-3 batched matches reference (f32)" {
     }
 }
 
-test "graph: multi-head attention rank-4 batched matches reference (f32)" {
+test "cpu backend: multi-head attention rank-4 batched matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 2;
@@ -1977,7 +1970,7 @@ fn relPosMHARefF32(
     }
 }
 
-test "graph: rel-pos multi-head attention matches reference (f32)" {
+test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 2;
@@ -2081,7 +2074,7 @@ test "graph: rel-pos multi-head attention matches reference (f32)" {
     }
 }
 
-test "graph: argmax over last axis returns i32 indices" {
+test "cpu backend: argmax over last axis returns i32 indices" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const rows: usize = 3;
@@ -2129,7 +2122,7 @@ test "graph: argmax over last axis returns i32 indices" {
     }
 }
 
-test "graph: packed-state loop (slice/cast/i32-add/scatter/concat) — in-graph decode pattern" {
+test "cpu backend: packed-state loop (slice/cast/i32-add/scatter/concat) — in-graph decode pattern" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const M: usize = 3; // buffer length
     const L: usize = 2 + M; // [count, last, buf...]
@@ -2180,7 +2173,7 @@ test "graph: packed-state loop (slice/cast/i32-add/scatter/concat) — in-graph 
     }
 }
 
-test "graph: scatter row writes value at dynamic index" {
+test "cpu backend: scatter row writes value at dynamic index" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const N: usize = 4;
     var mgr = manager_mod.StorageManager.init(allocator);
@@ -2219,7 +2212,7 @@ test "graph: scatter row writes value at dynamic index" {
     for (0..N) |i| try std.testing.expectEqual(expect[i], std.mem.readInt(i32, obuf[i * 4 ..][0..4], .little));
 }
 
-test "graph: i32 elementwise add and eq comparison" {
+test "cpu backend: i32 elementwise add and eq comparison" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const N: usize = 4;
     var mgr = manager_mod.StorageManager.init(allocator);
@@ -2257,7 +2250,7 @@ test "graph: i32 elementwise add and eq comparison" {
     for (0..N) |i| try std.testing.expectEqual(expect_eq[i], std.mem.readInt(i32, buf[i * 4 ..][0..4], .little));
 }
 
-test "graph: loop body lowers matmul + relu (region full-op lowering)" {
+test "cpu backend: loop body lowers matmul + relu (region full-op lowering)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const N: usize = 4;
@@ -2308,7 +2301,7 @@ test "graph: loop body lowers matmul + relu (region full-op lowering)" {
     }
 }
 
-test "graph: matmul f16 allows promoted f32 output" {
+test "cpu backend: matmul f16 allows promoted f32 output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 2;
@@ -2385,44 +2378,7 @@ test "graph: matmul f16 allows promoted f32 output" {
     try std.testing.expectApproxEqAbs(expected_sum, out_val, 5e-3);
 }
 
-test "graph: matmul rejects mismatched non-quant dtypes" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const m: usize = 2;
-    const k: usize = 3;
-    const n: usize = 4;
-
-    const a_bytes_len: usize = m * k * 2;
-    const b_bytes_len: usize = k * n * 4;
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const a_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
-
-    // Contents are irrelevant; compilation should fail before execution.
-    var a_zero: [a_bytes_len]u8 = [_]u8{0} ** a_bytes_len;
-    var b_zero: [b_bytes_len]u8 = [_]u8{0} ** b_bytes_len;
-    try sm.writeFromPackedScalar(a_tid, a_zero[0..]);
-    try sm.writeFromPackedScalar(b_tid, b_zero[0..]);
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const a_in = try g.addInput(.f16, &[_]usize{ m, k });
-    const b_in = try g.addInput(.f32, &[_]usize{ k, n });
-    try g.bindExternal(a_in, @intCast(a_tid));
-    try g.bindExternal(b_in, @intCast(b_tid));
-
-    const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{c});
-
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, policy));
-}
-
-test "graph: view ops lower to materialization (transpose/slice/reshape)" {
+test "cpu backend: view ops lower to materialization (transpose/slice/reshape)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const rows: usize = 3;
@@ -2490,7 +2446,7 @@ test "graph: view ops lower to materialization (transpose/slice/reshape)" {
     try std.testing.expect(@abs(out_val - expected_sum) <= 1e-5);
 }
 
-test "graph: reshape supports rank-3 materialization" {
+test "cpu backend: reshape supports rank-3 materialization" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const rows: usize = 2;
@@ -2543,7 +2499,7 @@ test "graph: reshape supports rank-3 materialization" {
     try std.testing.expectApproxEqAbs(expected_sum, out_val, 1e-6);
 }
 
-test "graph: view slice nd materialization rank-3" {
+test "cpu backend: view slice nd materialization rank-3" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const d0: usize = 2;
@@ -2599,7 +2555,7 @@ test "graph: view slice nd materialization rank-3" {
     try std.testing.expectApproxEqAbs(expected_sum, out_val, 1e-5);
 }
 
-test "graph: concat axis-1 materialization" {
+test "cpu backend: concat axis-1 materialization" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const rows: usize = 2;
@@ -2656,7 +2612,7 @@ test "graph: concat axis-1 materialization" {
     }
 }
 
-test "graph: gather rows matches reference (f32)" {
+test "cpu backend: gather rows matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const v: usize = 8;
@@ -2729,7 +2685,7 @@ test "graph: gather rows matches reference (f32)" {
     }
 }
 
-test "graph: gather rows matches reference (f16)" {
+test "cpu backend: gather rows matches reference (f16)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const v: usize = 5;
@@ -2800,7 +2756,7 @@ test "graph: gather rows matches reference (f16)" {
     }
 }
 
-test "graph: gather rows matches reference (q8_0 table, f32 output)" {
+test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     // One q8_0 block per row keeps the packing/dequant trivial to audit.
@@ -2916,7 +2872,7 @@ test "graph: gather rows matches reference (q8_0 table, f32 output)" {
     }
 }
 
-test "graph: cast f32 -> f16 roundtrip matches reference" {
+test "cpu backend: cast f32 -> f16 roundtrip matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const m: usize = 3;
@@ -2958,7 +2914,7 @@ test "graph: cast f32 -> f16 roundtrip matches reference" {
     }
 }
 
-test "graph: cast f16 -> f32 matches reference" {
+test "cpu backend: cast f16 -> f32 matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const n: usize = 6;
@@ -2999,7 +2955,7 @@ test "graph: cast f16 -> f32 matches reference" {
     }
 }
 
-test "graph: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" {
+test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     // C[m, n] = sum_k A[m, k] * B[n, k] — B stored as [N, K] q8_0 with per-row blocks.
@@ -3116,7 +3072,7 @@ test "graph: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" {
     }
 }
 
-test "graph: gather rows out-of-bounds returns InvalidArgument" {
+test "cpu backend: gather rows out-of-bounds returns InvalidArgument" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const v: usize = 4;
@@ -3165,7 +3121,7 @@ test "graph: gather rows out-of-bounds returns InvalidArgument" {
     try std.testing.expectError(types.BackendError.InvalidArgument, cpu.backend().executeProgram(&prog, sm.tensorStore()));
 }
 
-test "graph: rope1d matches chunked-halves reference (f32)" {
+test "cpu backend: rope1d matches chunked-halves reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const b: usize = 2;
@@ -3270,7 +3226,7 @@ test "graph: rope1d matches chunked-halves reference (f32)" {
     }
 }
 
-test "graph: rope1d matches chunked-halves reference (f16)" {
+test "cpu backend: rope1d matches chunked-halves reference (f16)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const b: usize = 1;
@@ -3376,7 +3332,7 @@ test "graph: rope1d matches chunked-halves reference (f16)" {
     }
 }
 
-test "graph: conv1d depthwise (NLC) matches reference" {
+test "cpu backend: conv1d depthwise (NLC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 2;
@@ -3487,7 +3443,7 @@ test "graph: conv1d depthwise (NLC) matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv1d depthwise reflect padding matches reference" {
+test "cpu backend: conv1d depthwise reflect padding matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -3599,7 +3555,7 @@ test "graph: conv1d depthwise reflect padding matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv1d reflect padding matches reference" {
+test "cpu backend: conv1d reflect padding matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -3702,7 +3658,7 @@ test "graph: conv1d reflect padding matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv2d reflect padding matches reference" {
+test "cpu backend: conv2d reflect padding matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -3819,7 +3775,7 @@ test "graph: conv2d reflect padding matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv1d pointwise (NLC) matches reference" {
+test "cpu backend: conv1d pointwise (NLC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 2;
@@ -3919,7 +3875,7 @@ test "graph: conv1d pointwise (NLC) matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: reduce axis sum/mean matches reference" {
+test "cpu backend: reduce axis sum/mean matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const rows: usize = 2;
@@ -3976,7 +3932,7 @@ test "graph: reduce axis sum/mean matches reference" {
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), out1[1], 1e-6);
 }
 
-test "graph: conv1d general (NLC) supports large c_out" {
+test "cpu backend: conv1d general (NLC) supports large c_out" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4083,7 +4039,7 @@ test "graph: conv1d general (NLC) supports large c_out" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv2d pointwise (NHWC) matches reference" {
+test "cpu backend: conv2d pointwise (NHWC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4193,7 +4149,7 @@ test "graph: conv2d pointwise (NHWC) matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv2d depthwise (NHWC) matches reference" {
+test "cpu backend: conv2d depthwise (NHWC) matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 2;
@@ -4313,7 +4269,7 @@ test "graph: conv2d depthwise (NHWC) matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv2d depthwise reflect padding matches reference" {
+test "cpu backend: conv2d depthwise reflect padding matches reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4441,7 +4397,7 @@ test "graph: conv2d depthwise reflect padding matches reference" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: conv2d general (NHWC) supports large c_out" {
+test "cpu backend: conv2d general (NHWC) supports large c_out" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4564,7 +4520,7 @@ test "graph: conv2d general (NHWC) supports large c_out" {
     try std.testing.expect(max_abs <= 1e-5);
 }
 
-test "graph: kv cache append mutates cache in-place (f32)" {
+test "cpu backend: kv cache append mutates cache in-place (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 2;
@@ -4689,7 +4645,7 @@ test "graph: kv cache append mutates cache in-place (f32)" {
     }
 }
 
-test "graph: kv cache append rejects out-of-bounds end index" {
+test "cpu backend: kv cache append rejects out-of-bounds end index" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4748,7 +4704,7 @@ test "graph: kv cache append rejects out-of-bounds end index" {
     try std.testing.expectError(types.BackendError.InvalidArgument, cpu.backend().executeProgram(&prog, sm.tensorStore()));
 }
 
-test "graph: kv cache append ring policy wraps time index" {
+test "cpu backend: kv cache append ring policy wraps time index" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4820,7 +4776,7 @@ test "graph: kv cache append ring policy wraps time index" {
     try std.testing.expectEqual(@as(f32, 90.0), out_vals[3]);
 }
 
-test "graph: kv cache append growable policy expands physical capacity" {
+test "cpu backend: kv cache append growable policy expands physical capacity" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -5008,7 +4964,7 @@ fn cachedGqaRefF32(
     }
 }
 
-test "graph: cached grouped-query attention matches reference (f32)" {
+test "cpu backend: cached grouped-query attention matches reference (f32)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -5138,7 +5094,7 @@ test "graph: cached grouped-query attention matches reference (f32)" {
     try std.testing.expect(max_abs <= 8e-2);
 }
 
-test "graph: cached grouped-query attention supports q=f32, kv=f16 with f32 output" {
+test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f32 output" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -5282,50 +5238,4 @@ test "graph: cached grouped-query attention supports q=f32, kv=f16 with f32 outp
         max_abs = @max(max_abs, @abs(got - want));
     }
     try std.testing.expect(max_abs <= 1.5e-1);
-}
-
-test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, 3, 2 }, &[_]usize{ 1, 1, 1, 2 }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
-    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, 1 }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{ .tile_alignment = 64 });
-
-    var q_init: [1 * 1 * 3 * 2]f32 = .{0.0} ** (1 * 1 * 3 * 2);
-    var k_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
-    var v_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
-    var pos_init: [1]i32 = .{0};
-    var end_init: [1]i32 = .{1};
-
-    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q_init[0..]));
-    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k_init[0..]));
-    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v_init[0..]));
-    try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(pos_init[0..]));
-    try sm.writeFromPackedScalar(end_tid, std.mem.sliceAsBytes(end_init[0..]));
-
-    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 1, 3, 2 });
-    const k_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 2, 4, 2 });
-    const v_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, 2, 4, 2 });
-    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ 1, 1 });
-    const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{1});
-
-    try g.bindExternal(q_in, @intCast(q_tid));
-    try g.bindExternal(k_in, @intCast(k_tid));
-    try g.bindExternal(v_in, @intCast(v_tid));
-    try g.bindExternal(pos_in, @intCast(pos_tid));
-    try g.bindExternal(end_in, @intCast(end_tid));
-
-    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(q_in, k_in, v_in, pos_in, end_in, 1.0, true, 0, 0.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{out});
-
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, policy));
 }

@@ -1,0 +1,50 @@
+# CPU correctness across platforms: Zig test suite + Python bindings build + pytest.
+# GPU stays out of CI for now (no adapters on hosted runners; wgpu prebuilts do not
+# cover linux-aarch64) — GPU tests self-skip locally via BackendUnavailable.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with the version the repo is developed against
+  # (build.zig.zon minimum_zig_version is a floor, not the pin).
+  ZIG_VERSION: 0.16.0-dev.2984+cb7d2b056
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Zig test suite (CPU-only)
+        run: zig build test-fast -Dgpu=false
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build bindings + run pytest (CPU-only wheelless build)
+        working-directory: bindings/python
+        env:
+          AION_PY_GPU: "0"
+        run: |
+          uv sync --no-default-groups --group test
+          uv run --no-sync pytest tests -q
+
+      - name: ABI header drift check (aion.h vs aion_ffi.h)
+        working-directory: bindings/python
+        run: uv run --no-sync python tools/check_ffi_header.py

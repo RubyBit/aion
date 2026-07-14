@@ -35,12 +35,14 @@ gpu = []
 # `uv sync` installs the `dev` group by default; use `--group test` for just the
 # test deps, or `--no-default-groups` for a runtime-only environment.
 [dependency-groups]
-test = ["pytest>=9"]
+# numpy: the test fixtures build synthetic .aion packages via aion._writer.
+test = ["pytest>=9", "numpy>=1.26"]
 dev = [
   "tokenizers>=0.23.1",
   "pytest>=9",
   "numpy>=1.26",
   "torch>=2.2",
+  "safetensors>=0.4",  # gemma/silero converters read safetensors checkpoints
   "sentencepiece>=0.2",
   "pyyaml>=6",
   "soundfile>=0.12",

@@ -41,9 +41,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 # Reuse the writer's constants to avoid drift between reader and writer.
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _aion_writer as aw  # type: ignore  # noqa: E402
+from aion._writer import format as aw
 
 
 _DTYPE_NAMES: Dict[int, str] = {

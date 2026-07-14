@@ -8,10 +8,6 @@
    includes the real `include/aion.h` via `set_source()`.
 */
 
-typedef unsigned long long size_t;
-typedef unsigned int uint32_t;
-typedef int int32_t;
-
 typedef struct AionContext AionContext;
 typedef struct AionTensor AionTensor;
 typedef struct AionLoadedModel AionLoadedModel;

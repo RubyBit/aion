@@ -47,8 +47,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _aion_writer as aw  # type: ignore  # noqa: E402
+from aion._writer import format as aw
 
 
 def _load_safetensors_numpy(path: str) -> Dict[str, np.ndarray]:

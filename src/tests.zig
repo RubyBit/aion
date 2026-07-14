@@ -21,13 +21,13 @@ comptime {
     _ = @import("aion/storage/storage.zig");
     _ = @import("aion/storage/test_storage.zig");
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
+    _ = @import("aion/backend/cpu/test_cpu_backend.zig");
     _ = @import("aion/backend/cpu/kernels/fft.zig");
     _ = @import("aion/backend/cpu/kernels/matmul_q_i8.zig");
 
-    _ = @import("aion/graph/test_program.zig");
+    _ = @import("aion/graph/test_compile.zig");
     _ = @import("aion/graph/test_program_golden.zig");
     _ = @import("aion/graph/opt/test_optimize.zig");
-
     _ = @import("aion/api/test_api.zig");
 }
 

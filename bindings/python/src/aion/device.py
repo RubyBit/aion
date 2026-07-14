@@ -14,9 +14,10 @@ from typing import Optional, Sequence, Tuple, Union
 from .enums import AionDeviceKind, AionGpuBackend, AionGpuPower
 
 
-# A device may be spelled as None (cpu), a string, an (kind, index) tuple, or an
-# AionDeviceKind. See `_normalize_device`.
-DeviceLike = Union[None, str, AionDeviceKind, Tuple[object, ...]]
+# A device may be spelled as None (cpu), a string, a (kind,) / (kind, index)
+# tuple, or an AionDeviceKind. See `_normalize_device`.
+DeviceKindLike = Union[None, str, AionDeviceKind]
+DeviceLike = Union[DeviceKindLike, Tuple[DeviceKindLike], Tuple[DeviceKindLike, int]]
 
 
 @dataclass(frozen=True)
@@ -101,9 +102,9 @@ def _normalize_device(device: DeviceLike) -> Tuple[int, int]:
 
     if isinstance(device, (tuple, list)):
         if len(device) == 1:
-            return _normalize_device(device[0])  # type: ignore[arg-type]
+            return _normalize_device(device[0])
         if len(device) == 2:
-            base_kind, _ = _normalize_device(device[0])  # type: ignore[arg-type]
+            base_kind, _ = _normalize_device(device[0])
             idx = int(device[1])
             if idx < 0:
                 raise ValueError("device index must be >= 0")
@@ -155,9 +156,9 @@ def _gpu_adapter_from_device(device: DeviceLike) -> Tuple[bool, Optional[int]]:
         raise ValueError(f"invalid device string: {device!r} (expected 'cpu', 'gpu', or 'gpu:N')")
     if isinstance(device, (tuple, list)):
         if len(device) == 1:
-            return _gpu_adapter_from_device(device[0])  # type: ignore[arg-type]
+            return _gpu_adapter_from_device(device[0])
         if len(device) == 2:
-            is_gpu, _ = _gpu_adapter_from_device(device[0])  # type: ignore[arg-type]
+            is_gpu, _ = _gpu_adapter_from_device(device[0])
             if not is_gpu:
                 return (False, None)
             idx = int(device[1])

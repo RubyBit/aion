@@ -13,21 +13,31 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Shared AION v4 package writer + quantization helpers.
+"""INTERNAL `.aion` package writer + quantization helpers. No stability guarantees.
 
-This module contains the canonical python-side encoder for the on-disk `.aion`
-package format described by `src/aion/storage/aion_file/{types,parse,write}.zig`.
-It is used by `convert_silero_vad_to_aion.py` and `convert_gemma4_e2b_to_aion.py`.
+Python-side encoder for the on-disk `.aion` container (currently VERSION = 6).
+The **source of truth for the format is the Zig implementation** in
+`src/aion/storage/aion_file/{types,parse,write}.zig`; this module mirrors it and
+must be kept in lockstep. The test-suite fixtures (packages written here, loaded
+and executed by the Zig runtime) act as the drift guard.
+
+It exists so the model converters under `scripts/` and the test fixtures can
+build packages without a Zig toolchain. It is NOT a public API: the long-term
+model-building API is the core-lib Zig `Builder` exposed through the C ABI, at
+which point this module is slated for retirement.
 
 What's here:
 
 - `Package`: a dataclass holding everything an `.aion` file contains (initializers,
   values, nodes, signatures, dim symbols/exprs, metadata, debug names, IO aliases).
-- `write_aion_v4(path, pkg)`: serializes a `Package` to the v4 container format.
+- `write_aion_v4(path, pkg)`: serializes a `Package` to the container format
+  (name is historical; it writes the current `VERSION`).
 - `pack_q8_0(arr, axis)`: quantizes an fp32 numpy array to the ggml-compatible q8_0
   block layout that Aion's tiled storage consumes (see below).
 - `Initializer.plain(...)` / `Initializer.quantized(...)` constructors and node/attr
   helpers.
+
+See `aion._writer.builder.Builder` for the ergonomic graph-construction layer.
 
 Packed-quant convention (must match Aion's `TiledTensor` layout):
 - `quant_axis` selects the block axis. Along that axis every 32 elements form one

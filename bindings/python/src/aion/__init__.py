@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .context import Context, get_default_context, reset_default_context
-from .device import GpuOptions
+from .device import DeviceLike, GpuOptions, _gpu_adapter_from_device
 from .errors import AionError
 from .model import LoadedModel, TensorSpec
 from .tensor import Tensor
@@ -32,7 +32,7 @@ def load_model(
     path: str,
     *,
     thread_count: int | None = None,
-    device=None,
+    device: DeviceLike = None,
     adapter_index: int | None = None,
     power: str = "high",
     backend: str = "any",
@@ -60,22 +60,24 @@ def load_model(
       position inputs, so a stateful model needs only its real inputs bound.
     """
 
-    from .device import _gpu_adapter_from_device
-
-    state_kwargs = dict(
-        cache_capacity=cache_capacity,
-        growable=growable,
-        initial_cache_capacity=initial_cache_capacity,
-        auto_positions=auto_positions,
-    )
+    def _load(ctx: Context, dev: DeviceLike = None) -> LoadedModel:
+        return LoadedModel.load(
+            ctx,
+            path,
+            device=dev,
+            cache_capacity=cache_capacity,
+            growable=growable,
+            initial_cache_capacity=initial_cache_capacity,
+            auto_positions=auto_positions,
+        )
 
     is_gpu, dev_idx = _gpu_adapter_from_device(device)
     if not is_gpu:
         if thread_count is None:
-            return LoadedModel.load(get_default_context(), path, **state_kwargs)
+            return _load(get_default_context())
         ctx = Context(thread_count=thread_count)
         try:
-            return LoadedModel.load(ctx, path, **state_kwargs)
+            return _load(ctx)
         except Exception:
             ctx.close()
             raise
@@ -89,7 +91,7 @@ def load_model(
 
     ctx = Context.gpu(thread_count=thread_count, adapter_index=resolved_adapter, power=power, backend=backend)
     try:
-        return LoadedModel.load(ctx, path, device="gpu:0", **state_kwargs)
+        return _load(ctx, "gpu:0")
     except Exception:
         ctx.close()
         raise

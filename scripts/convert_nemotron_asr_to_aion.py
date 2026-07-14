@@ -13,22 +13,32 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Convert NVIDIA Nemotron streaming ASR (.nemo) to a q8_0 `.aion` package.
+"""Convert NVIDIA Nemotron streaming ASR (.nemo) to a self-contained q8_0 `.aion`.
 
-This first stage emits the **FastConformer encoder** as a fixed-window graph:
-input log-mel `[1, T_mel, 128]` -> encoder features `[1, T_out, 1024]`, where
-`T_out = calc_length(T_mel)` (3x stride-2 subsampling, factor 8).
+Both build modes emit ONE full model — in-graph log-mel front-end + FastConformer
+encoder + in-graph greedy RNNT decode — that takes raw 16 kHz audio and returns
+token ids. They differ only in how audio is fed:
 
-The Conformer self-attention uses the native `RelPosMHA` op (head-third layout
-`[B, T, H, D]`). Positional embeddings are precomputed per layer (sinusoidal,
-projected by `linear_pos`) and baked in as f32 initializers for the fixed window.
+  (default)    offline whole-clip model: one fixed audio window (--frames mel
+               frames) per run. Full attention unless an attention config is set.
+  --streaming  cache-aware streaming model: one small audio window per chunk;
+               all state (per-layer K/V + conv caches, RNNT decode state) is
+               threaded inside the runtime via IoAlias, so a trivial driver
+               streams indefinitely.
+
+The attention config is [--att-left, --att-right] (chunk = att_right + 1); the
+checkpoint was trained on right contexts 13/6/1/0 with left context 70.
+
+The tokenizer (`nemotron_tokenizer.model`) is extracted next to the output, and
+all runtime parameters (chunk, window/buffer sizes, ...) are recorded in package
+metadata — the example scripts auto-configure from it.
 
 Weight/quant policy (mirrors convert_gemma4_e2b_to_aion.py):
 - dense matmul weights (FF, q/k/v/out proj, subsampling `out`) -> q8_0 (B `[1,K,N]`).
 - LayerNorm gamma/beta, conv weights/biases, pos_bias_u/_v, pos_emb -> f32.
 
-Run:  uv run --project bindings/python --extra dev \
-        python scripts/convert_nemotron_asr_to_aion.py <model.nemo> <out.aion> [--frames N]
+Run:  uv run --project bindings/python \
+        python scripts/convert_nemotron_asr_to_aion.py <model.nemo> <out.aion> [--streaming]
 """
 
 from __future__ import annotations
@@ -39,12 +49,11 @@ import os
 import sys
 import tarfile
 import tempfile
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import IO, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _aion_writer as aw  # noqa: E402
+from aion._writer import Builder, format as aw
 
 # ------------------------------- architecture --------------------------------
 
@@ -69,11 +78,6 @@ PREEMPH = 0.97
 LOG_GUARD = 2.0 ** -24
 
 
-def num_mel_frames(n_samples: int) -> int:
-    """torch.stft(center=True) frame count = 1 + n_samples // hop."""
-    return 1 + n_samples // HOP_LEN
-
-
 def mel_samples(t_mel: int) -> int:
     """Audio sample count whose center-STFT yields exactly t_mel frames."""
     return (t_mel - 1) * HOP_LEN
@@ -91,6 +95,14 @@ def calc_length(length: int) -> int:
 # ------------------------------- weight loader -------------------------------
 
 
+def _tar_member(tf: tarfile.TarFile, member: str) -> IO[bytes]:
+    """`extractfile` returns None for non-regular members; we only ask for files."""
+    f = tf.extractfile(member)
+    if f is None:
+        raise FileNotFoundError(f"{member}: not a regular file in the archive")
+    return f
+
+
 class _Loader:
     def __init__(self, nemo_path: str) -> None:
         self._tmp = tempfile.mkdtemp(prefix="nemotron_")
@@ -98,17 +110,17 @@ class _Loader:
             names = tf.getnames()
             ck = next(m for m in names if m.endswith("model_weights.ckpt"))
             ckpt_path = os.path.join(self._tmp, "model_weights.ckpt")
-            with tf.extractfile(ck) as src, open(ckpt_path, "wb") as dst:
+            with _tar_member(tf, ck) as src, open(ckpt_path, "wb") as dst:
                 while True:
                     chunk = src.read(1 << 24)
                     if not chunk:
                         break
                     dst.write(chunk)
-            self.tokenizer_path = None
+            self.tokenizer_path: Optional[str] = None
             for m in names:
                 if os.path.basename(m).endswith("tokenizer.model"):
                     self.tokenizer_path = os.path.join(self._tmp, "tokenizer.model")
-                    with tf.extractfile(m) as src, open(self.tokenizer_path, "wb") as dst:
+                    with _tar_member(tf, m) as src, open(self.tokenizer_path, "wb") as dst:
                         dst.write(src.read())
         import torch  # lazy: only needed for conversion
 
@@ -119,223 +131,12 @@ class _Loader:
         return self._sd[name].float().numpy().astype(np.float32, copy=False)
 
 
-# ------------------------------- package builder -----------------------------
+# The graph-builder layer lives in `aion._writer.builder.Builder`; this
+# converter only parameterizes it (LayerNorm epsilon).
 
 
-class _Builder:
-    def __init__(self) -> None:
-        self.pkg = aw.Package()
-        self._rank: Dict[int, int] = {}
-        self._dtype: Dict[int, int] = {}
-        # Stack of in-progress control-flow region node lists. While non-empty,
-        # `_emit` appends nodes to the top region instead of the main graph.
-        self._region_stack: List[List[aw.NodeRecord]] = []
-
-    # ---- io / initializers ----
-
-    def add_input(self, name: str, dtype: int, shape: Shape) -> int:
-        vid = len(self.pkg.values)
-        st = bytearray(aw.u32(len(shape)))
-        for d in shape:
-            st += aw.shape_term_constant(int(d))
-        self.pkg.values.append(aw.ValueRecord(dtype=dtype, rank=len(shape),
-                                              source=aw.ValueSource.public_input, shape_terms=bytes(st)))
-        self.pkg.inputs.append(aw.NamedValue(name=name, value=vid))
-        self.pkg.debug_names.append(aw.DebugName(value=vid, name=name))
-        self._rank[vid] = len(shape)
-        self._dtype[vid] = dtype
-        return vid
-
-    def add_output(self, name: str, value_id: int) -> None:
-        self.pkg.outputs.append(aw.NamedValue(name=name, value=value_id))
-
-    def add_io_alias(self, input_index: int, output_index: int) -> None:
-        self.pkg.io_aliases.append(aw.IoAlias(input_index, output_index))
-
-    def _add_init(self, name: str, init: aw.Initializer, dtype: int, shape: Shape) -> int:
-        idx = len(self.pkg.initializers)
-        self.pkg.initializers.append(init)
-        vid = len(self.pkg.values)
-        st = bytearray(aw.u32(len(shape)))
-        for d in shape:
-            st += aw.shape_term_constant(int(d))
-        self.pkg.values.append(aw.ValueRecord(dtype=dtype, rank=len(shape),
-                                              source=aw.ValueSource.initializer,
-                                              shape_terms=bytes(st), initializer_index=idx))
-        self.pkg.debug_names.append(aw.DebugName(value=vid, name=name))
-        self._rank[vid] = len(shape)
-        self._dtype[vid] = dtype
-        return vid
-
-    def f32(self, name: str, arr: np.ndarray) -> int:
-        arr = np.ascontiguousarray(arr.astype(np.float32))
-        return self._add_init(name, aw.Initializer.plain(aw.DType.f32, arr.tobytes(order="C")),
-                              aw.DType.f32, tuple(int(x) for x in arr.shape))
-
-    def q8_matmul_b(self, name: str, w_torch: np.ndarray) -> int:
-        """w_torch is [out, in] (torch Linear layout); pack to Aion B `[1, in, out]`."""
-        w_t = np.ascontiguousarray(w_torch.T)  # [in, out]
-        if w_t.shape[0] % aw.Q8_0_BLOCK_ELEMS != 0:
-            raise ValueError(f"{name}: K={w_t.shape[0]} not a multiple of 32")
-        packed = aw.pack_q8_0(w_t.reshape(1, w_t.shape[0], w_t.shape[1]), axis=1)
-        init = aw.Initializer.quantized_q8_0(logical_dtype=aw.DType.f16, quant_axis=1, data=packed)
-        return self._add_init(name, init, aw.DType.q8_0, (1, int(w_t.shape[0]), int(w_t.shape[1])))
-
-    # ---- node emitters ----
-
-    def _produced(self, dtype: int, rank: int) -> int:
-        vid = len(self.pkg.values)
-        self.pkg.values.append(aw.ValueRecord(dtype=dtype, rank=rank,
-                                              source=aw.ValueSource.produced, shape_terms=aw.u32(0)))
-        self._rank[vid] = rank
-        self._dtype[vid] = dtype
-        return vid
-
-    def _emit(self, kind: int, inputs: List[int], attr: bytes, *, dtype: int, rank: int) -> int:
-        out = self._produced(dtype, rank)
-        rec = aw.NodeRecord(kind=kind, output=out, inputs=inputs, attr=attr)
-        if self._region_stack:
-            self._region_stack[-1].append(rec)
-        else:
-            self.pkg.nodes.append(rec)
-        return out
-
-    # ---- control-flow region API ----
-
-    def begin_region(self) -> None:
-        self._region_stack.append([])
-
-    def end_region(self, outputs: List[int]) -> int:
-        nodes = self._region_stack.pop()
-        rid = len(self.pkg.regions)
-        self.pkg.regions.append(aw.RegionRecord(nodes=nodes, outputs=list(outputs)))
-        return rid
-
-    def loop(self, carried: List[int], body_region: int, trip: int, *,
-             cond_carry: Optional[int] = None, check_before: bool = True) -> List[int]:
-        """Multi-carry loop. `carried[i]` pairs with body-region output i; returns
-        the N final carried value ids. `cond_carry`, if set, names the carry index
-        (an i32 [1] value) used as the continue predicate for early exit."""
-        outs = [self._produced(self._dtype[c], self._rank[c]) for c in carried]
-        attr = aw.attr_loop(body_region, trip, cond_carry=cond_carry,
-                            check_before=check_before, extra_outputs=outs[1:])
-        rec = aw.NodeRecord(kind=aw.NodeKind.Loop, output=outs[0], inputs=list(carried), attr=attr)
-        if self._region_stack:
-            self._region_stack[-1].append(rec)
-        else:
-            self.pkg.nodes.append(rec)
-        return outs
-
-    # ---- i32 constant initializer ----
-
-    def i32_const(self, name: str, arr: np.ndarray) -> int:
-        arr = np.ascontiguousarray(arr.astype(np.int32))
-        return self._add_init(name, aw.Initializer.plain(aw.DType.i32, arr.tobytes(order="C")),
-                              aw.DType.i32, tuple(int(x) for x in arr.shape))
-
-    def matmul(self, a: int, b: int) -> int:
-        out_dt = aw.DType.f32  # A f32 @ (f32|q8_0) B -> f32
-        return self._emit(aw.NodeKind.MatMul, [a, b], aw.attr_matmul(), dtype=out_dt, rank=self._rank[a])
-
-    def add(self, a: int, b: int) -> int:
-        return self._emit(aw.NodeKind.ElemwiseBinary, [a, b], aw.attr_binary(aw.ElemwiseBinaryOp.add),
-                          dtype=self._dtype[a], rank=self._rank[a])
-
-    def mul(self, a: int, b: int) -> int:
-        return self._emit(aw.NodeKind.ElemwiseBinary, [a, b], aw.attr_binary(aw.ElemwiseBinaryOp.mul),
-                          dtype=self._dtype[a], rank=self._rank[a])
-
-    def bcast_add(self, a: int, vec: int) -> int:
-        return self._emit(aw.NodeKind.BroadcastLastDimBinary, [a, vec],
-                          aw.attr_binary(aw.ElemwiseBinaryOp.add), dtype=self._dtype[a], rank=self._rank[a])
-
-    def bcast_mul(self, a: int, vec: int) -> int:
-        return self._emit(aw.NodeKind.BroadcastLastDimBinary, [a, vec],
-                          aw.attr_binary(aw.ElemwiseBinaryOp.mul), dtype=self._dtype[a], rank=self._rank[a])
-
-    def unary(self, op: int, a: int) -> int:
-        return self._emit(aw.NodeKind.Unary, [a], aw.attr_unary(op), dtype=self._dtype[a], rank=self._rank[a])
-
-    def layernorm(self, x: int, gamma: int, beta: int, normalized_shape: Shape) -> int:
-        terms = [aw.shape_term_constant(int(d)) for d in normalized_shape]
-        return self._emit(aw.NodeKind.LayerNorm, [x, gamma, beta], aw.attr_layernorm(LN_EPS, terms),
-                          dtype=self._dtype[x], rank=self._rank[x])
-
-    def conv1d(self, x: int, w: int, bias: Optional[int], *, stride: int, dilation: int,
-               pad_left: int, pad_right: int, groups: int) -> int:
-        attr = aw.attr_conv1d(stride, dilation, pad_left, pad_right, aw.PadMode.zero, groups)
-        ins = [x, w] if bias is None else [x, w, bias]
-        return self._emit(aw.NodeKind.Conv1D, ins, attr, dtype=aw.DType.f32, rank=3)
-
-    def conv2d(self, x: int, w: int, bias: Optional[int], *, stride: int,
-               pad_top: int, pad_bottom: int, pad_left: int, pad_right: int, groups: int) -> int:
-        attr = aw.attr_conv2d(stride, stride, 1, 1, pad_top, pad_bottom, pad_left, pad_right,
-                              aw.PadMode.zero, groups)
-        ins = [x, w] if bias is None else [x, w, bias]
-        return self._emit(aw.NodeKind.Conv2D, ins, attr, dtype=aw.DType.f32, rank=4)
-
-    def reshape(self, x: int, new_shape: Shape) -> int:
-        terms = [aw.shape_term_constant(int(d)) for d in new_shape]
-        return self._emit(aw.NodeKind.ViewReshape, [x], aw.attr_view_reshape(terms),
-                          dtype=self._dtype[x], rank=len(new_shape))
-
-    def slice_nd(self, x: int, starts: Sequence[int], lens: Shape) -> int:
-        lens_terms = [aw.shape_term_constant(int(d)) for d in lens]
-        return self._emit(aw.NodeKind.ViewSliceND, [x], aw.attr_view_slice_nd(list(starts), lens_terms),
-                          dtype=self._dtype[x], rank=len(lens))
-
-    def stft(self, signal: int, window: int, n_fft: int, hop: int, center: bool) -> int:
-        # signal [1, samples], window [n_fft] -> [1, frames, n_fft+2] (packed real,imag).
-        return self._emit(aw.NodeKind.STFT, [signal, window], aw.attr_stft(n_fft, hop, center),
-                          dtype=aw.DType.f32, rank=3)
-
-    def relpos_mha(self, q: int, k: int, v: int, pos_emb: int, bu: int, bv: int,
-                   mask: Optional[int], scale: float, heads: int) -> int:
-        ins = [q, k, v, pos_emb, bu, bv] + ([mask] if mask is not None else [])
-        attr = aw.attr_relpos_mha(scale, heads, mask is not None)
-        return self._emit(aw.NodeKind.RelPosMHA, ins, attr, dtype=aw.DType.f32, rank=4)
-
-    def q8_embedding(self, name: str, table: np.ndarray) -> int:
-        if table.shape[1] % aw.Q8_0_BLOCK_ELEMS != 0:
-            raise ValueError(f"{name}: embed dim {table.shape[1]} not a multiple of 32")
-        packed = aw.pack_q8_0(np.ascontiguousarray(table.astype(np.float32)), axis=1)
-        init = aw.Initializer.quantized_q8_0(logical_dtype=aw.DType.f16, quant_axis=1, data=packed)
-        return self._add_init(name, init, aw.DType.q8_0, (int(table.shape[0]), int(table.shape[1])))
-
-    def gather_rows(self, table: int, indices: int) -> int:
-        return self._emit(aw.NodeKind.GatherRows, [table, indices], b"", dtype=aw.DType.f32, rank=3)
-
-    def lstm_cell(self, x: int, h: int, c: int, w_ih: int, w_hh: int, b_ih: int, b_hh: int) -> int:
-        # out [batch, 2*hidden] = (h_t | c_t)
-        return self._emit(aw.NodeKind.LSTMCell, [x, h, c, w_ih, w_hh, b_ih, b_hh],
-                          aw.attr_lstm(True), dtype=aw.DType.f32, rank=2)
-
-    def cast(self, x: int, to_dtype: int) -> int:
-        return self._emit(aw.NodeKind.Cast, [x], aw.attr_cast(to_dtype), dtype=to_dtype, rank=self._rank[x])
-
-    def concat(self, inputs: List[int], axis: int, out_rank: int) -> int:
-        return self._emit(aw.NodeKind.Concat, list(inputs), aw.attr_concat(axis),
-                          dtype=self._dtype[inputs[0]], rank=out_rank)
-
-    def argmax(self, x: int, axis: int, out_rank: int) -> int:
-        return self._emit(aw.NodeKind.ArgMax, [x], aw.attr_argmax(axis), dtype=aw.DType.i32, rank=out_rank)
-
-    def scatter_row(self, buf: int, idx: int, src: int) -> int:
-        return self._emit(aw.NodeKind.ScatterRow, [buf, idx, src], b"",
-                          dtype=self._dtype[buf], rank=self._rank[buf])
-
-    def compare(self, op: int, a: int, b: int) -> int:
-        # i32 comparison -> i32 {0,1}
-        return self._emit(aw.NodeKind.ElemwiseBinary, [a, b], aw.attr_binary(op),
-                          dtype=aw.DType.i32, rank=self._rank[a])
-
-    def ew(self, op: int, a: int, b: int) -> int:
-        # Generic elementwise binary (arithmetic); output dtype follows input a.
-        return self._emit(aw.NodeKind.ElemwiseBinary, [a, b], aw.attr_binary(op),
-                          dtype=self._dtype[a], rank=self._rank[a])
-
-    def write(self, path: str) -> None:
-        aw.write_aion_v4(path, self.pkg)
+def _make_builder() -> Builder:
+    return Builder(ln_eps=LN_EPS)
 
 
 # ------------------------------ positional emb -------------------------------
@@ -354,7 +155,7 @@ def sinusoidal_pe(length: int, d_model: int) -> np.ndarray:
 # --------------------------------- encoder -----------------------------------
 
 
-def build_logmel(loader: _Loader, b: _Builder, t_mel: int) -> int:
+def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> int:
     """In-graph NeMo log-mel: audio [n,1] -> feat [1, t_mel, 128].
 
     Matches AudioToMelSpectrogramPreprocessor (normalize="NA"=none): preemphasis
@@ -391,7 +192,7 @@ def build_logmel(loader: _Loader, b: _Builder, t_mel: int) -> int:
     return b.unary(aw.UnaryOp.log, b.bcast_add(mel, guard))  # [1,t_mel,128]
 
 
-def build_att_mask(b: _Builder, t_out: int, att_left: int, att_right: int) -> int:
+def build_att_mask(b: Builder, t_out: int, att_left: int, att_right: int) -> int:
     """Additive [t_out, t_out] chunked_limited mask (0 allowed, -1e9 masked)."""
     chunk = att_right + 1
     m = np.full((t_out, t_out), -1e9, np.float32)
@@ -403,7 +204,7 @@ def build_att_mask(b: _Builder, t_out: int, att_left: int, att_right: int) -> in
     return b.f32("encoder.att_mask", m)
 
 
-def build_subsample(loader: _Loader, b: _Builder, feat: int, t_mel: int) -> int:
+def build_subsample(loader: _Loader, b: Builder, feat: int, t_mel: int) -> int:
     """dw_striding ×8 subsampling: feat [1, t_mel, 128] -> h [1, t_out, 1024]."""
     t_out = calc_length(t_mel)
 
@@ -439,7 +240,7 @@ def build_subsample(loader: _Loader, b: _Builder, feat: int, t_mel: int) -> int:
     return b.bcast_add(b.matmul(x, out_wq), out_b)   # [1, t_out, 1024]
 
 
-def build_encoder(loader: _Loader, b: _Builder, t_mel: int,
+def build_encoder(loader: _Loader, b: Builder, t_mel: int,
                   att_left: Optional[int] = None, att_right: int = 0) -> int:
     t_out = calc_length(t_mel)
     p_len = 2 * t_out - 1
@@ -530,67 +331,12 @@ def build_encoder(loader: _Loader, b: _Builder, t_mel: int,
 
 
 PRED_HIDDEN = 640
-JOINT_HIDDEN = 640
 VOCAB = 1024
-NUM_CLASSES = VOCAB + 1  # + blank
-
-
-def build_decoder(loader: _Loader, b: _Builder) -> None:
-    """Per-step RNNT prediction-net + joint graph (Python drives the greedy loop)."""
-    dp = "decoder.prediction"
-
-    enc_t = b.add_input("enc_frame", aw.DType.f32, (1, 1, D_MODEL))
-    token = b.add_input("token", aw.DType.i32, (1, 1))
-    h0i = b.add_input("h0_in", aw.DType.f32, (1, PRED_HIDDEN))
-    c0i = b.add_input("c0_in", aw.DType.f32, (1, PRED_HIDDEN))
-    h1i = b.add_input("h1_in", aw.DType.f32, (1, PRED_HIDDEN))
-    c1i = b.add_input("c1_in", aw.DType.f32, (1, PRED_HIDDEN))
-
-    embed = b.q8_embedding(f"{dp}.embed.weight", loader.get(f"{dp}.embed.weight"))  # [1025,640]
-    emb = b.reshape(b.gather_rows(embed, token), (1, PRED_HIDDEN))  # [1,640]
-
-    def lstm_layer(x, hin, cin, li):
-        wih = b.f32(f"{dp}.dec_rnn.lstm.weight_ih_l{li}",
-                    loader.get(f"{dp}.dec_rnn.lstm.weight_ih_l{li}").T)  # [640, 2560]
-        whh = b.f32(f"{dp}.dec_rnn.lstm.weight_hh_l{li}",
-                    loader.get(f"{dp}.dec_rnn.lstm.weight_hh_l{li}").T)  # [640, 2560]
-        bih = b.f32(f"{dp}.dec_rnn.lstm.bias_ih_l{li}", loader.get(f"{dp}.dec_rnn.lstm.bias_ih_l{li}"))
-        bhh = b.f32(f"{dp}.dec_rnn.lstm.bias_hh_l{li}", loader.get(f"{dp}.dec_rnn.lstm.bias_hh_l{li}"))
-        st = b.lstm_cell(x, hin, cin, wih, whh, bih, bhh)  # [1, 1280]
-        hout = b.slice_nd(st, (0, 0), (1, PRED_HIDDEN))
-        cout = b.slice_nd(st, (0, PRED_HIDDEN), (1, PRED_HIDDEN))
-        return hout, cout
-
-    h0o, c0o = lstm_layer(emb, h0i, c0i, 0)
-    h1o, c1o = lstm_layer(h0o, h1i, c1i, 1)  # pred output g = h1o
-
-    # Joint: relu(enc(f) + pred(g)) -> joint_net.2
-    enc_w = b.q8_matmul_b("joint.enc.weight", loader.get("joint.enc.weight"))   # [640,1024]
-    enc_b = b.f32("joint.enc.bias", loader.get("joint.enc.bias"))
-    fproj = b.bcast_add(b.matmul(enc_t, enc_w), enc_b)  # [1,1,640]
-
-    pred_w = b.q8_matmul_b("joint.pred.weight", loader.get("joint.pred.weight"))  # [640,640]
-    pred_b = b.f32("joint.pred.bias", loader.get("joint.pred.bias"))
-    g3 = b.reshape(h1o, (1, 1, PRED_HIDDEN))
-    gproj = b.bcast_add(b.matmul(g3, pred_w), pred_b)  # [1,1,640]
-
-    s = b.unary(aw.UnaryOp.relu, b.add(fproj, gproj))  # [1,1,640]
-    jn_w = b.q8_matmul_b("joint.joint_net.2.weight", loader.get("joint.joint_net.2.weight"))  # [1025,640]
-    jn_b = b.f32("joint.joint_net.2.bias", loader.get("joint.joint_net.2.bias"))
-    logits = b.bcast_add(b.matmul(s, jn_w), jn_b)  # [1,1,1025]
-
-    b.add_output("logits", logits)
-    b.add_output("h0_out", h0o)
-    b.add_output("c0_out", c0o)
-    b.add_output("h1_out", h1o)
-    b.add_output("c1_out", c1o)
-
-
 MAX_SYMBOLS = 10
 BLANK = VOCAB  # 1024
 
 
-def _ingraph_decode(loader: _Loader, b: _Builder, enc: int, t_out: int, max_out: int) -> None:
+def _ingraph_decode(loader: _Loader, b: Builder, enc: int, t_out: int, max_out: int) -> None:
     """In-graph greedy RNNT decode over `enc [1, t_out, 1024]`. Adds outputs
     out_count/out_tokens + persistent decode state (last/h0/c0/h1/c1) with their
     IoAliases. Named multi-carry Loop, early-exit via `active = frame < t_out`.
@@ -714,7 +460,7 @@ def _ingraph_decode(loader: _Loader, b: _Builder, enc: int, t_out: int, max_out:
         b.pkg.input_roles.append(aw.InputRole(input_index=ii, kind=aw.RoleKind.state))
 
 
-def build_single(loader: _Loader, b: _Builder, t_mel: int, max_out: int,
+def build_single(loader: _Loader, b: Builder, t_mel: int, max_out: int,
                  att_left: Optional[int] = None, att_right: int = 0) -> int:
     """Encoder + in-graph greedy RNNT decode in one graph. Returns max_out.
 
@@ -846,20 +592,6 @@ def _stream_cache_alias(b, k_out, v_out, conv_out):
             b.pkg.input_roles.append(aw.InputRole(input_index=ii, kind=aw.RoleKind.state))
 
 
-def build_stream_conformer(loader: _Loader, b: _Builder, att_left: int = 70, att_right: int = 13):
-    """Streaming conformer that takes pre-subsampled `h_in [1,chunk,1024]` (for
-    verification vs the offline encoder). See build_stream_full for the self-
-    contained version."""
-    chunk = att_right + 1
-    t_kv = att_left + chunk
-    h = b.add_input("h_in", aw.DType.f32, (1, chunk, D_MODEL))
-    cache_mask, k_in, v_in, conv_in = _stream_cache_io(b, att_left, chunk)
-    enc, k_out, v_out, conv_out = _stream_conformer_layers(loader, b, h, att_left, chunk, t_kv, cache_mask, k_in, v_in, conv_in)
-    b.add_output("enc_out", enc)
-    _stream_cache_alias(b, k_out, v_out, conv_out)
-    return chunk, t_kv
-
-
 # Window (mel frames) fed per streaming step: in-graph log-mel + subsampling of the
 # window yields calc_length(WMEL) encoder frames; window frame j maps to global encoder
 # frame (m_start//8 + j) for j>=STREAM_SUB_DROP, so win[DROP:DROP+chunk] are the `chunk`
@@ -879,7 +611,7 @@ def stream_window_mel(chunk: int) -> int:
     return w
 
 
-def build_stream_full(loader: _Loader, b: _Builder, att_left: int = 70, att_right: int = 13,
+def build_stream_full(loader: _Loader, b: Builder, att_left: int = 70, att_right: int = 13,
                       max_out: int = 64):
     """Self-contained cache-aware streaming model: one audio window per chunk ->
     in-graph log-mel + subsampling -> cached conformer -> in-graph RNNT decode.
@@ -899,102 +631,65 @@ def build_stream_full(loader: _Loader, b: _Builder, att_left: int = 70, att_righ
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("nemo_path")
     ap.add_argument("out_aion")
-    ap.add_argument("--component", choices=["encoder", "decoder", "assets", "single", "subsample", "stream", "stream_full"], default="encoder")
-    ap.add_argument("--frames", type=int, default=200, help="encoder/single: fixed input mel frame count (T_mel)")
-    ap.add_argument("--max-out", type=int, default=512, help="single: max emitted tokens (output buffer size)")
+    ap.add_argument("--streaming", action="store_true",
+                    help="build the cache-aware streaming model (default: offline whole-clip)")
     ap.add_argument("--att-left", type=int, default=None,
-                    help="limited left-context attention (chunked_limited streaming); omit for full attention")
-    ap.add_argument("--att-right", type=int, default=0,
-                    help="chunked_limited right context (chunk size = att_right+1); model trained on 13/6/1/0")
+                    help="left attention context in encoder frames (streaming default 70; "
+                         "offline default: full attention)")
+    ap.add_argument("--att-right", type=int, default=None,
+                    help="right attention context; chunk = att_right+1; the checkpoint was "
+                         "trained on 13/6/1/0 (streaming default 13; offline default: full attention)")
+    ap.add_argument("--frames", type=int, default=2885,
+                    help="offline only: fixed audio window as mel frame count (T_mel); "
+                         "default 2885 (~28.8 s)")
+    ap.add_argument("--max-out", type=int, default=512,
+                    help="output token buffer size (max emitted tokens per run)")
     args = ap.parse_args()
 
     loader = _Loader(args.nemo_path)
-    b = _Builder()
-    if args.component == "encoder":
-        enc = build_encoder(loader, b, args.frames)
-        b.add_output("encoder_out", enc)
-        b.pkg.metadata.extend([
-            aw.MetadataEntry(key="arch", value="nemotron-fastconformer-encoder"),
-            aw.MetadataEntry(key="quant", value="q8_0-weights"),
-            aw.MetadataEntry(key="d_model", value=str(D_MODEL)),
-            aw.MetadataEntry(key="n_layers", value=str(N_LAYERS)),
-            aw.MetadataEntry(key="t_mel", value=str(args.frames)),
-            aw.MetadataEntry(key="t_out", value=str(calc_length(args.frames))),
-        ])
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (encoder; T_mel={args.frames} -> T_out={calc_length(args.frames)})")
-    elif args.component == "subsample":
-        feat = build_logmel(loader, b, args.frames)
-        h = build_subsample(loader, b, feat, args.frames)
-        b.add_output("h_out", h)
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (subsample; T_mel={args.frames} -> T_out={calc_length(args.frames)})")
-    elif args.component == "stream":
-        chunk, t_kv = build_stream_conformer(loader, b,
-                                             att_left=(args.att_left or 70), att_right=args.att_right or 13)
-        b.pkg.metadata.extend([
-            aw.MetadataEntry(key="arch", value="nemotron-fastconformer-stream-conformer"),
-            aw.MetadataEntry(key="quant", value="q8_0-weights"),
-            aw.MetadataEntry(key="chunk", value=str(chunk)),
-            aw.MetadataEntry(key="att_left", value=str(args.att_left or 70)),
-            aw.MetadataEntry(key="t_kv", value=str(t_kv)),
-        ])
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (stream conformer; chunk={chunk}, t_kv={t_kv})")
-    elif args.component == "assets":
-        import shutil
-        window = loader.get("preprocessor.featurizer.window")  # [400] hann
-        fb = loader.get("preprocessor.featurizer.fb")          # [1, 128, 257] mel filterbank
-        np.savez(args.out_aion, window=window, fb=fb[0])       # -> <out>.npz
-        out_dir = os.path.dirname(os.path.abspath(args.out_aion)) or "."
-        if loader.tokenizer_path:
-            shutil.copyfile(loader.tokenizer_path, os.path.join(out_dir, "nemotron_tokenizer.model"))
-        print(f"wrote {args.out_aion}(.npz) + nemotron_tokenizer.model  (window {window.shape}, fb {fb.shape})")
-    elif args.component == "single":
-        build_single(loader, b, args.frames, args.max_out, att_left=args.att_left, att_right=args.att_right)
-        b.pkg.metadata.extend([
-            aw.MetadataEntry(key="arch", value="nemotron-fastconformer-rnnt-single"),
-            aw.MetadataEntry(key="quant", value="q8_0-weights"),
-            aw.MetadataEntry(key="t_mel", value=str(args.frames)),
-            aw.MetadataEntry(key="t_out", value=str(calc_length(args.frames))),
-            aw.MetadataEntry(key="max_out", value=str(args.max_out)),
-            aw.MetadataEntry(key="decode_state", value="named-carries"),
-            aw.MetadataEntry(key="blank_id", value=str(VOCAB)),
-            aw.MetadataEntry(key="max_symbols", value=str(MAX_SYMBOLS)),
-        ])
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (single; T_mel={args.frames} -> T_out={calc_length(args.frames)}, max_out={args.max_out})")
-    elif args.component == "stream_full":
-        al = args.att_left or 70
-        ar = args.att_right or 13
+    b = _make_builder()
+    common_md = [
+        aw.MetadataEntry(key="quant", value="q8_0-weights"),
+        aw.MetadataEntry(key="max_out", value=str(args.max_out)),
+        aw.MetadataEntry(key="blank_id", value=str(VOCAB)),
+        aw.MetadataEntry(key="max_symbols", value=str(MAX_SYMBOLS)),
+    ]
+    if args.streaming:
+        al = 70 if args.att_left is None else args.att_left
+        ar = 13 if args.att_right is None else args.att_right
         chunk, t_kv = build_stream_full(loader, b, att_left=al, att_right=ar, max_out=args.max_out)
-        b.pkg.metadata.extend([
+        b.pkg.metadata.extend(common_md + [
             aw.MetadataEntry(key="arch", value="nemotron-fastconformer-rnnt-stream-full"),
-            aw.MetadataEntry(key="quant", value="q8_0-weights"),
             aw.MetadataEntry(key="chunk", value=str(chunk)),
             aw.MetadataEntry(key="att_left", value=str(al)),
             aw.MetadataEntry(key="t_kv", value=str(t_kv)),
             aw.MetadataEntry(key="window_mel", value=str(stream_window_mel(chunk))),
             aw.MetadataEntry(key="sub_drop", value=str(STREAM_SUB_DROP)),
-            aw.MetadataEntry(key="max_out", value=str(args.max_out)),
-            aw.MetadataEntry(key="blank_id", value=str(VOCAB)),
         ])
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (stream_full; chunk={chunk}, t_kv={t_kv}, window_mel={stream_window_mel(chunk)})")
+        desc = f"streaming; chunk={chunk}, att=[{al},{ar}], window_mel={stream_window_mel(chunk)}"
     else:
-        build_decoder(loader, b)
-        b.pkg.metadata.extend([
-            aw.MetadataEntry(key="arch", value="nemotron-rnnt-decoder-joint"),
-            aw.MetadataEntry(key="quant", value="q8_0-weights"),
-            aw.MetadataEntry(key="pred_hidden", value=str(PRED_HIDDEN)),
-            aw.MetadataEntry(key="num_classes", value=str(NUM_CLASSES)),
-            aw.MetadataEntry(key="blank_id", value=str(VOCAB)),
+        ar = 0 if args.att_right is None else args.att_right
+        build_single(loader, b, args.frames, args.max_out, att_left=args.att_left, att_right=ar)
+        b.pkg.metadata.extend(common_md + [
+            aw.MetadataEntry(key="arch", value="nemotron-fastconformer-rnnt-single"),
+            aw.MetadataEntry(key="t_mel", value=str(args.frames)),
+            aw.MetadataEntry(key="t_out", value=str(calc_length(args.frames))),
+            aw.MetadataEntry(key="att_left", value="full" if args.att_left is None else str(args.att_left)),
+            aw.MetadataEntry(key="decode_state", value="named-carries"),
         ])
-        b.write(args.out_aion)
-        print(f"wrote {args.out_aion}  (decoder+joint; num_classes={NUM_CLASSES})")
+        att = "full" if args.att_left is None else f"[{args.att_left},{ar}]"
+        desc = f"offline; T_mel={args.frames} -> T_out={calc_length(args.frames)}, att={att}"
+    b.write(args.out_aion)
+    print(f"wrote {args.out_aion}  ({desc}, max_out={args.max_out})")
+
+    if loader.tokenizer_path:
+        import shutil
+        tok = os.path.join(os.path.dirname(os.path.abspath(args.out_aion)) or ".", "nemotron_tokenizer.model")
+        shutil.copyfile(loader.tokenizer_path, tok)
+        print(f"wrote {tok}")
 
 
 if __name__ == "__main__":

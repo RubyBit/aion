@@ -1,21 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 import aion
 from aion.device import _device_to_str, _normalize_device
 from aion.enums import AionDeviceKind
-
-
-def _find_repo_root(start: Path) -> Path:
-    cur = start.resolve()
-    for p in (cur, *cur.parents):
-        if (p / "build.zig").is_file():
-            return p
-    raise RuntimeError("could not locate repo root")
 
 
 def _gpu_ctx_or_skip() -> aion.Context:
@@ -108,12 +98,8 @@ def test_tensor_construct_on_gpu():
             assert t.read_f32() == pytest.approx([1.0, 2.0, 3.0, 4.0])
 
 
-def test_model_load_on_gpu_matches_cpu_introspection():
-    repo_root = _find_repo_root(Path(__file__))
-    model_path = repo_root / "models" / "silero" / "silero_vad_16k.aion"
-    if not model_path.is_file():
-        pytest.skip(f"missing test model: {model_path}")
-
+def test_model_load_on_gpu_matches_cpu_introspection(tiny_model_path):
+    model_path = tiny_model_path
     with aion.Context(thread_count=1) as cpu_ctx:
         with aion.LoadedModel.load(cpu_ctx, str(model_path)) as m_cpu:
             cpu_ins = m_cpu.input_names()

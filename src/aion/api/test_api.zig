@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
-const env_util = @import("../env.zig");
 
 const api = @import("api.zig");
 const manager_mod = @import("../storage/manager.zig");
@@ -2772,94 +2771,111 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}, .{}));
 }
 
-// Opt-in load test: loads a pre-built `.aion` package from `AION_GEMMA_VERIFY_PATH`
-// and asserts every materialized weight tensor is either `q8_0` or `f16`, with total
-// bytes below a caller-supplied budget (`AION_GEMMA_MAX_GB`, default 6).
-//
-// Skipped unless the env var is set; used for manual validation of a real Gemma 4 E2B
-// conversion without dragging multi-GB files into CI.
-test "api: loaded package keeps weights quantized (opt-in via AION_GEMMA_VERIFY_PATH)" {
-    // Use the OS page allocator rather than `std.testing.allocator` here: loading a
-    // multi-GB package via the debug allocator pulls in bookkeeping that, combined
-    // with the transient peak during initializer import, trips the process's address
-    // space reservations on Windows. Page_allocator serves requests directly from the
-    // OS which is the right fit for this one-shot big-file load.
-    const allocator: std.mem.Allocator = std.heap.page_allocator;
-
-    const path: []u8 = env_util.getOwned(allocator, "AION_GEMMA_VERIFY_PATH") orelse
-        return error.SkipZigTest;
-    defer allocator.free(path);
-    if (path.len == 0) return error.SkipZigTest;
-
-    const max_gb_raw: ?[]u8 = env_util.getOwned(allocator, "AION_GEMMA_MAX_GB");
-    defer if (max_gb_raw) |p| allocator.free(p);
-    const max_gb: f64 = if (max_gb_raw) |raw|
-        std.fmt.parseFloat(f64, raw) catch 6.0
-    else
-        6.0;
-
-    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer ctx.deinit();
-
-    // Narrow the failing step.
-    {
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        const io = io_backend.io();
-        const pf = try std.Io.Dir.openFileAbsolute(io, path, .{});
-        defer pf.close(io);
-        const raw = try package_file.readAlloc(allocator, pf);
-        std.debug.print("[gemma-verify] readAlloc ok ({d} bytes)\n", .{raw.len});
-        var parsed = try package_file.parseTakeOwned(allocator, raw);
-        std.debug.print("[gemma-verify] parseTakeOwned ok (initializers={d} nodes={d})\n", .{ parsed.initializers.len, parsed.nodes.len });
-        parsed.deinit();
-        std.debug.print("[gemma-verify] parsed.deinit ok\n", .{});
+/// Dequantize a `[K, N]` q8_0 weight packed by `packQ8WeightKN` back to f32.
+fn dequantQ8KN(allocator: std.mem.Allocator, packed_bytes: []const u8, k: usize, n: usize) ![]f32 {
+    const kb = k / 32;
+    const out = try allocator.alloc(f32, k * n);
+    for (0..kb) |b| {
+        for (0..n) |j| {
+            const off = (b * n + j) * 34;
+            const scale_bits = std.mem.readInt(u16, packed_bytes[off .. off + 2][0..2], .little);
+            const scale: f32 = @floatCast(@as(f16, @bitCast(scale_bits)));
+            for (0..32) |t| {
+                const q: i8 = @bitCast(packed_bytes[off + 2 + t]);
+                out[(b * 32 + t) * n + j] = @as(f32, @floatFromInt(q)) * scale;
+            }
+        }
     }
+    return out;
+}
 
-    var model = try ctx.loadModelPathAbsolute(path, .{});
+// Synthetic replacement for the old opt-in real-checkpoint (Gemma) verification:
+// a q8_0 weight exported + loaded must stay q8_0 at its packed byte size (not be
+// silently dequantized/inflated), and the loaded model must execute to the same
+// result as a reference dequant matmul.
+test "api: export/load keeps q8_0 weights packed (dtype + byte size) and runs" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 64;
+    const N: usize = 32;
+    const M: usize = 2;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+
+    const wv = try allocator.alloc(f32, K * N);
+    defer allocator.free(wv);
+    for (wv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.07;
+    const w_packed = try packQ8WeightKN(allocator, wv, K, N);
+    defer allocator.free(w_packed);
+
+    var bias: [M * N]f32 = undefined;
+    for (&bias, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.5;
+
+    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, w_packed);
+    const bf = try export_ctx.fromF32(&[_]usize{ M, N }, &bias);
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ M, K }), "x");
+    const W = try bld.name(try bld.param(wq), "w");
+    const B = try bld.name(try bld.param(bf), "bias");
+    const Y = try bld.add(try bld.matmul(X, W, 1.0, 0.0), B);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "q8_keep.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+    var model = try load_ctx.loadModel(file, .{});
     defer model.deinit();
 
-    var total_bytes: usize = 0;
-    var weights_bytes: usize = 0;
-    var weights_q8_count: usize = 0;
-    var weights_f16_count: usize = 0;
-    var weights_f32_count: usize = 0;
-    var weights_other_count: usize = 0;
-
-    // Count only initializer-backed tensors for the "weights remain quantized" claim.
-    // The store also contains many produced/intermediate tensors allocated during
-    // compilation, and those are not expected to be quantized.
+    // Initializer-backed weights must keep their dtype AND their exact stored
+    // byte size: q8_0 stays packed (34 B per 32-element block), f32 stays scalar.
+    var q8_count: usize = 0;
+    var f32_count: usize = 0;
     for (model.source.package.values, 0..) |value, idx| {
         if (value.source != .initializer) continue;
         const wt = try model.initializerTensorByValue(@intCast(idx));
-        const meta = try ctx.store.getConst(wt.tensorId());
-        weights_bytes += meta.data.len;
+        const meta = try load_ctx.store.getConst(wt.tensorId());
         switch (meta.dtype) {
-            .q8_0 => weights_q8_count += 1,
-            .f16 => weights_f16_count += 1,
-            .f32 => weights_f32_count += 1,
-            else => weights_other_count += 1,
+            .q8_0 => {
+                q8_count += 1;
+                try std.testing.expectEqual((K / 32) * N * 34, meta.data.len);
+            },
+            .f32 => {
+                f32_count += 1;
+                try std.testing.expectEqual(M * N * @sizeOf(f32), meta.data.len);
+            },
+            else => return error.TestUnexpectedResult,
         }
     }
+    try std.testing.expectEqual(@as(usize, 1), q8_count);
+    try std.testing.expectEqual(@as(usize, 1), f32_count);
 
-    for (ctx.store.tensors.items) |t| {
-        total_bytes += t.data.len;
+    // Execute and compare against a reference matmul over the dequantized weight.
+    var xv: [M * K]f32 = undefined;
+    for (&xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+    const x_t = try load_ctx.fromF32(&[_]usize{ M, K }, &xv);
+    try model.bindInput("x", x_t);
+    try model.run();
+
+    var got: [M * N]f32 = undefined;
+    {
+        const t = try model.outputTensor("y");
+        try t.read(&got);
     }
-
-    std.debug.print(
-        "[gemma-verify] weights: q8_0={d} f16={d} f32={d} other={d} ({d:.3} GB) | total={d:.3} GB (budget {d:.3} GB)\n",
-        .{
-            weights_q8_count,
-            weights_f16_count,
-            weights_f32_count,
-            weights_other_count,
-            @as(f64, @floatFromInt(weights_bytes)) / 1e9,
-            @as(f64, @floatFromInt(total_bytes)) / 1e9,
-            max_gb,
-        },
-    );
-
-    try std.testing.expect(weights_other_count == 0);
-    try std.testing.expect(@as(f64, @floatFromInt(total_bytes)) / 1e9 <= max_gb);
+    const w_deq = try dequantQ8KN(allocator, w_packed, K, N);
+    defer allocator.free(w_deq);
+    for (0..M) |m| {
+        for (0..N) |j| {
+            var acc: f32 = bias[m * N + j];
+            for (0..K) |kk| acc += xv[m * K + kk] * w_deq[kk * N + j];
+            try std.testing.expectApproxEqAbs(acc, got[m * N + j], 1e-3);
+        }
+    }
 }
 
 test "api: exportModel + loadModel roundtrip for If control-flow model" {

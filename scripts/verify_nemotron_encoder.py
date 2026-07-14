@@ -33,7 +33,7 @@ def load_sd(nemo_path):
     with tarfile.open(nemo_path, "r") as tf:
         ck = next(m for m in tf.getnames() if m.endswith("model_weights.ckpt"))
         p = os.path.join(tmp, "w.ckpt")
-        with tf.extractfile(ck) as s, open(p, "wb") as d:
+        with conv._tar_member(tf, ck) as s, open(p, "wb") as d:
             while True:
                 c = s.read(1 << 24)
                 if not c:

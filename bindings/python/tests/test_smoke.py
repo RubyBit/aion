@@ -1,19 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from pathlib import Path
-
+import numpy as np
 import pytest
 
 import aion
-
-
-def _find_repo_root(start: Path) -> Path:
-    cur = start.resolve()
-    for p in (cur, *cur.parents):
-        if (p / "build.zig").is_file():
-            return p
-    raise RuntimeError("could not locate repo root")
 
 
 def test_context_create_destroy():
@@ -37,19 +28,31 @@ def test_tensor_write_read_f32():
             assert out == pytest.approx(vals)
 
 
-def test_load_model_introspection():
-    repo_root = _find_repo_root(Path(__file__))
-    model_path = repo_root / "models" / "silero" / "silero_vad_16k.aion"
-    assert model_path.is_file(), f"missing test model: {model_path}"
-
+def test_load_model_introspection_and_run(tiny_model):
     with aion.Context(thread_count=1) as ctx:
-        with aion.LoadedModel.load(ctx, str(model_path)) as m:
+        with aion.LoadedModel.load(ctx, str(tiny_model.path)) as m:
             in_names = m.input_names()
             out_names = m.output_names()
             assert len(in_names) == m.input_count()
             assert len(out_names) == m.output_count()
-            assert all(isinstance(x, str) and x for x in in_names)
-            assert all(isinstance(x, str) and x for x in out_names)
+            assert in_names == ["x"]
+            assert out_names == ["y"]
+            # Execute: a python-written package must run through the Zig runtime
+            # and produce the reference result (format-lockstep guard).
+            out = m.run_numpy({"x": tiny_model.x})["y"]
+            expected = tiny_model.x @ tiny_model.w
+            assert out.shape == expected.shape
+            np.testing.assert_allclose(out, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_load_model_q8_weights_run(tiny_q8_model):
+    # q8_0-quantized weights written by the python packer must load and execute;
+    # quantization error bounds the comparison.
+    with aion.Context(thread_count=1) as ctx:
+        with aion.LoadedModel.load(ctx, str(tiny_q8_model.path)) as m:
+            out = m.run_numpy({"x": tiny_q8_model.x})["y"]
+            expected = tiny_q8_model.x @ tiny_q8_model.w
+            np.testing.assert_allclose(out, expected, rtol=5e-2, atol=5e-2)
 
 
 def test_context_close_auto_closes_live_children():
@@ -90,11 +93,8 @@ def test_tensor_zero_and_fill_aliases_api():
         assert t.read_f32() == pytest.approx([0.0, 0.0, 0.0])
 
 
-def test_load_model_uses_default_context_when_thread_count_omitted():
-    repo_root = _find_repo_root(Path(__file__))
-    model_path = repo_root / "models" / "silero" / "silero_vad_16k.aion"
-    assert model_path.is_file(), f"missing test model: {model_path}"
-
+def test_load_model_uses_default_context_when_thread_count_omitted(tiny_model_path):
+    model_path = tiny_model_path
     aion.reset_default_context()
     try:
         with aion.load_model(str(model_path)) as m:

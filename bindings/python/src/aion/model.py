@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping
+from typing import Any, Iterable, List, Mapping
 
 from .device import DeviceLike, _is_cpu, _normalize_device
 from .errors import raise_for_status
@@ -130,7 +130,8 @@ class LoadedModel:
         c_path = ffi.new("char[]", b)
         absolute = os.path.isabs(path)
 
-        opts = ffi.new("AionLoadModelOptions*")  # zero-initialized
+        # cffi structs are dynamically fielded; Any silences per-field access checks.
+        opts: Any = ffi.new("AionLoadModelOptions*")  # zero-initialized
         opts.auto_init_inputs = 1
         opts.auto_positions = 1 if auto_positions else 0
         if device is not None and not _is_cpu(device):

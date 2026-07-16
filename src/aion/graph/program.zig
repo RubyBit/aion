@@ -210,6 +210,16 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             try requireSameTileCounts(out, b);
             _ = s.op;
         },
+        .GeluMulTiled => |s| {
+            const out = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
+            const a = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
+            const b = mgr.getConst(s.b) catch return CompileError.InvalidArgument;
+            try compileRequire(out.dtype == .f32 and a.dtype == .f32 and b.dtype == .f32);
+            try compileRequire(out.rank == a.rank and out.rank == b.rank);
+            try requireSameShape(out.shape, a.shape); try requireSameShape(out.shape, b.shape);
+            try requireSameTileShape(out, a); try requireSameTileShape(out, b);
+            try requireSameTileCounts(out, a); try requireSameTileCounts(out, b);
+        },
 
         .BroadcastLastDimBinaryTiled => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
@@ -1501,6 +1511,22 @@ fn lowerNode(
             const b_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, b_id, b_v.dtype.?, b_v.shape, tile);
 
             try appendStepChecked(allocator, mgr, policy, steps, .{ .ElemwiseBinaryTiled = .{ .op = eb.op, .out = out_tid, .a = a_tid, .b = b_tid } });
+        },
+        .GeluMul => {
+            const a_id: usize = @intCast(node.inputs[0]);
+            const b_id: usize = @intCast(node.inputs[1]);
+            const a_v = graph.values.items[a_id];
+            const b_v = graph.values.items[b_id];
+            var tile_buf: [MAX_RANK]usize = undefined;
+            const tile = tile_buf[0..out_shape.len];
+            if (ctx.value_has_tensor[a_id]) {
+                const a_t = try mgr.getConst(ctx.value_tensor[a_id]);
+                @memcpy(tile, a_t.tile_shape);
+            } else try fillTileShapeDefault(policy, out_dt, out_shape, tile);
+            const out_tid = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
+            const a_tid = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, a_id, a_v.dtype.?, a_v.shape, tile);
+            const b_tid = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, b_id, b_v.dtype.?, b_v.shape, tile);
+            try appendStepChecked(allocator, mgr, policy, steps, .{ .GeluMulTiled = .{ .out = out_tid, .a = a_tid, .b = b_tid } });
         },
 
         .BroadcastLastDimBinary => |bb| {

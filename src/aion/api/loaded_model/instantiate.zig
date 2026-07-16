@@ -29,6 +29,7 @@ pub fn instantiateNode(
     const optional_symbols: []?u64 = optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory;
 
     return switch (node.op) {
+        .GeluMul => try graph.addGeluMul(mapped_inputs[0], mapped_inputs[1]),
         .MatMul => |mm| try graph.addMatMul(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
         .ElemwiseBinary => |eb| try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
         .BroadcastLastDimBinary => |eb| try graph.addBroadcastLastDimBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),

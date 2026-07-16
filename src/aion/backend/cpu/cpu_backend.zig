@@ -414,6 +414,10 @@ pub const CpuBackend = struct {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try ElemwiseExec.execElemwiseBinaryTiled(pool_ptr, self.thread_count, s, store);
             },
+            .GeluMulTiled => |s| {
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                try ElemwiseExec.execGeluMulTiled(pool_ptr, self.thread_count, s, store);
+            },
 
             .BroadcastLastDimBinaryTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;

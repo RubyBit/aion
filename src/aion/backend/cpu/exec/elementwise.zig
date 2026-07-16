@@ -3,6 +3,7 @@ const std = @import("std");
 const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
 const elemwise = @import("../kernels/elemwise.zig");
+const gelu_k = @import("../kernels/gelu.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const exec_utils = @import("utils.zig");
@@ -136,6 +137,94 @@ pub fn execElemwiseBinaryTiled(
             else => return BackendError.InvalidArgument,
         }
     }
+}
+
+/// out = gelu(a) * b (f32, identical tiling). Computed as gelu into `out`
+/// followed by an in-place multiply with `b`, so the result is bit-identical
+/// to the unfused `UnaryTiled(gelu)` + `ElemwiseBinaryTiled(mul)` pair.
+pub fn execGeluMulTiled(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    s: executable.StepGeluMulTiled,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    const out_meta = try store.meta(s.out);
+    var tile_total: usize = 1;
+    var d: usize = 0;
+    while (d < @as(usize, out_meta.rank)) : (d += 1) {
+        tile_total *= out_meta.tile_counts[d];
+    }
+    const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
+    const min_total_bytes: usize = 256 * 1024;
+
+    if (pool) |p| {
+        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
+            const Task = struct {
+                store: tensor_store.TensorStore,
+                out: tensor_store.TensorId,
+                a: tensor_store.TensorId,
+                b: tensor_store.TensorId,
+
+                stop: std.atomic.Value(bool) = .init(false),
+                err_mutex: std.Io.Mutex = .init,
+                err_any: ?anyerror = null,
+
+                fn fail(t: *@This(), err: anyerror) void {
+                    if (t.stop.swap(true, .acq_rel)) return;
+                    std.Io.Threaded.mutexLock(&t.err_mutex);
+                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
+                    if (t.err_any == null) t.err_any = err;
+                }
+
+                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+                    _ = tid;
+                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
+                    var i: usize = start;
+                    while (i < end) : (i += 1) {
+                        if (t.stop.load(.acquire)) return;
+                        if (i + 1 < end) {
+                            t.store.prefetchLinear(t.a, i + 1);
+                            t.store.prefetchLinear(t.b, i + 1);
+                        }
+                        geluMulOneTile(t.store, t.out, t.a, t.b, i) catch |e| {
+                            t.fail(e);
+                            return;
+                        };
+                    }
+                }
+            };
+
+            var task: Task = .{ .store = store, .out = s.out, .a = s.a, .b = s.b };
+            var grain: usize = if (tile_bytes == 0) 32 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
+            if (grain > tile_total) grain = tile_total;
+            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
+            if (task.err_any) |e| return @errorCast(e);
+            return;
+        }
+    }
+
+    // Sequential fallback.
+    var tile_index: usize = 0;
+    while (tile_index < tile_total) : (tile_index += 1) {
+        geluMulOneTile(store, s.out, s.a, s.b, tile_index) catch |e| return @errorCast(e);
+    }
+}
+
+fn geluMulOneTile(store: tensor_store.TensorStore, out: tensor_store.TensorId, a: tensor_store.TensorId, b: tensor_store.TensorId, tile_index: usize) anyerror!void {
+    const out_tile = try store.acquireTileMutLinear(out, tile_index);
+    defer store.releaseMut(out_tile.token);
+    const a_tile = try store.acquireTileConstLinear(a, tile_index);
+    defer store.releaseConst(a_tile.token);
+    const b_tile = try store.acquireTileConstLinear(b, tile_index);
+    defer store.releaseConst(b_tile.token);
+
+    const out_view = out_tile.bufferView();
+    const a_view = a_tile.bufferView();
+    const b_view = b_tile.bufferView();
+    const n: usize = exec_utils.elemCountFromTileView(out_view);
+    if (out_view.dtype != .f32) return BackendError.InvalidArgument;
+    try gelu_k.geluF32(out_view.bytes, a_view.bytes, n);
+    try elemwise.elemwiseBinaryF32(.mul, out_view.bytes, out_view.bytes, b_view.bytes, n);
 }
 
 pub fn execBroadcastLastDimBinaryTiled(

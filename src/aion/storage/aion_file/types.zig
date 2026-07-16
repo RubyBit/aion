@@ -249,6 +249,7 @@ pub const NodeOp = union(graph_mod.OpTag) {
     ArgMax: struct { axis: i32 },
 
     ScatterRow: void,
+    GeluMul: void,
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and

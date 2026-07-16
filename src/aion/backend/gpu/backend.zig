@@ -389,6 +389,7 @@ pub const GpuBackend = struct {
             const frame = &r.frame;
             switch (step) {
                 .ElemwiseBinaryTiled => |s| try simple_ops.execElemwiseBinary(op_ctx, frame, s),
+                .GeluMulTiled => |s| try simple_ops.execGeluMul(op_ctx, frame, s),
                 .BroadcastLastDimBinaryTiled => |s| try simple_ops.execBroadcastLastDim(op_ctx, frame, s),
                 .UnaryTiled => |s| try simple_ops.execUnary(op_ctx, frame, s),
                 .CopyTiled => |s| try simple_ops.execCopy(op_ctx, frame, s),

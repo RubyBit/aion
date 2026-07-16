@@ -102,6 +102,28 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
     }
 }
 
+pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) ExecuteProgramError!void {
+    const hs = ctx.rstore.tensorStore();
+    const meta = hs.meta(s.out) catch return error.ExecutionFailed;
+    try requireF32(meta.dtype);
+    const built = try ctx.pipes.get(elementwise_kernel, "mul_gelu_a");
+    const total = context.totalTiles(meta);
+    var ti: usize = 0;
+    while (ti < total) : (ti += 1) {
+        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
+        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, ti) catch return error.ExecutionFailed;
+        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        defer hs.releaseConst(da.token);
+        defer hs.releaseConst(db.token);
+        defer hs.releaseMut(dout.token);
+        const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(da.handle).?, ctx.devmem.bufferFor(db.handle).?, ctx.devmem.bufferFor(dout.handle).? };
+        const sizes = [_]u64{ da.len, db.len, dout.len };
+        const n: u32 = @intCast(dout.len / @sizeOf(f32));
+        const params: ScalarParams = .{ .n = n };
+        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
+    }
+}
+
 /// `out[.., j] = a[.., j] op b[j]` — b is a rank-1 vector broadcast across each
 /// row. b's 1-D tiling matches out's last-dim tiling (compile-validated), so out
 /// tile (.., ti_last) pairs with b tile ti_last. Tiles must be fully packed (the

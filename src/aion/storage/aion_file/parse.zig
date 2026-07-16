@@ -493,6 +493,7 @@ fn parseRegionsSection(allocator: std.mem.Allocator, bytes: []const u8) PackageE
 fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8) PackageError!NodeOp {
     var cursor: usize = 0;
     const op: NodeOp = switch (kind) {
+        .GeluMul => .GeluMul,
         .MatMul => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
         .ElemwiseBinary => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
         .BroadcastLastDimBinary => .{ .BroadcastLastDimBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },

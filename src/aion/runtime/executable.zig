@@ -11,6 +11,7 @@ pub const MAX_LOOP_CARRIED: usize = 16;
 
 pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
 pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
+pub const StepGeluMulTiled = struct { out: TensorId, a: TensorId, b: TensorId };
 pub const StepBroadcastLastDimBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
 pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
 pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId, axis: i32 };
@@ -211,6 +212,7 @@ pub const StepSliceNDScalar = struct { dst: TensorId, src: TensorId, rank: u8, s
 pub const Step = union(enum) {
     MatMulTiled: StepMatMulTiled,
     ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
+    GeluMulTiled: StepGeluMulTiled,
     BroadcastLastDimBinaryTiled: StepBroadcastLastDimBinaryTiled,
     UnaryTiled: StepUnaryTiled,
     SoftmaxTiled: StepSoftmaxTiled,

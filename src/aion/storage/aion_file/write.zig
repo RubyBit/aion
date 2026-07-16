@@ -221,6 +221,7 @@ fn encodeRegionsSection(allocator: std.mem.Allocator, regions: []const RegionRec
 fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeOp) PackageError!NodeOpKind {
     const kind: NodeOpKind = types.nodeOpKind(op);
     switch (op) {
+        .GeluMul => {},
         .MatMul => |mm| {
             try appendInt(out, allocator, f32, mm.alpha);
             try appendInt(out, allocator, f32, mm.beta);

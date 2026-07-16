@@ -125,6 +125,7 @@ pub const OpTag = enum(u8) {
     ///
     /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
     ScatterRow = 33,
+    GeluMul = 34,
 };
 
 pub const Op = union(OpTag) {
@@ -366,6 +367,7 @@ pub const Op = union(OpTag) {
     /// In-place row scatter: buf[idx] = src. Inputs (buf, idx[1] i32, src). The
     /// "row" is buf[1:] flattened (scalar for rank-1 buf). Output aliases buf.
     ScatterRow: void,
+    GeluMul: void,
 };
 
 pub const InputArity = union(enum) {
@@ -421,6 +423,7 @@ pub fn opInputArity(op: Op) InputArity {
         .RelPosMHA => |r| .{ .exact = if (r.has_mask) 7 else 6 },
         .ArgMax => .{ .exact = 1 },
         .ScatterRow => .{ .exact = 3 },
+        .GeluMul => .{ .exact = 2 },
     };
 }
 
@@ -641,6 +644,9 @@ pub const Graph = struct {
 
     pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
+    }
+    pub fn addGeluMul(self: *Self, a: ValueId, b: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.GeluMul, &[_]ValueId{ a, b });
     }
 
     /// Softmax over the specified axis (negative axes are allowed).

@@ -127,6 +127,15 @@ fn inferNode(graph: *Graph, node: Node) InferError!void {
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
 
     switch (node.op) {
+        .GeluMul => {
+            const a = try getValue(graph, node.inputs[0]);
+            const b = try getValue(graph, node.inputs[1]);
+            try require(a.dtype != null and b.dtype != null);
+            if (a.dtype.? != .f32 or b.dtype.? != .f32) return InferError.Unsupported;
+            if (a.shape.len != b.shape.len) return InferError.ShapeMismatch;
+            for (a.shape, 0..) |d, i| if (d != b.shape[i]) return InferError.ShapeMismatch;
+            try setInferred(graph, node.output, .f32, a.shape);
+        },
         .MatMul => |mm| {
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);

@@ -9,6 +9,13 @@ const pipelines = @import("pipelines.zig");
 const profile = @import("../../profile.zig");
 const c = wgpu.c;
 
+pub const Mode = enum {
+    /// One timestamp pair per compute pass; preserves normal dispatch batching.
+    pass,
+    /// One timestamp pair per dispatch; precise attribution, but isolates passes.
+    dispatch,
+};
+
 pub const Sample = struct {
     first_query: u32,
     category: profile.Category,
@@ -26,11 +33,12 @@ pub const TimestampProfiler = struct {
     query_capacity: u32,
     session: *profile.Session,
     track: profile.TrackId,
+    mode: Mode,
     query_count: u32 = 0,
     dropped: u64 = 0,
     samples: std.ArrayList(Sample) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu, query_capacity: u32, session: *profile.Session, track: profile.TrackId) !TimestampProfiler {
+    pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu, query_capacity: u32, session: *profile.Session, track: profile.TrackId, mode: Mode) !TimestampProfiler {
         // WebGPU caps a timestamp QuerySet at 4096 entries.
         const cap = @min(@as(u32, 4096), @max(@as(u32, 2), query_capacity & ~@as(u32, 1)));
         var qd: c.WGPUQuerySetDescriptor = std.mem.zeroes(c.WGPUQuerySetDescriptor);
@@ -43,7 +51,7 @@ pub const TimestampProfiler = struct {
         errdefer c.wgpuBufferRelease(resolve);
         const read = wgpu.createBuffer(gpu.device, bytes, c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst) catch return error.ExecutionFailed;
         errdefer c.wgpuBufferRelease(read);
-        var out: TimestampProfiler = .{ .allocator = allocator, .gpu = gpu, .query_set = qs, .resolve_buffer = resolve, .read_buffer = read, .query_capacity = cap, .session = session, .track = track };
+        var out: TimestampProfiler = .{ .allocator = allocator, .gpu = gpu, .query_set = qs, .resolve_buffer = resolve, .read_buffer = read, .query_capacity = cap, .session = session, .track = track, .mode = mode };
         try out.samples.ensureTotalCapacity(allocator, cap / 2);
         return out;
     }
@@ -77,6 +85,27 @@ pub const TimestampProfiler = struct {
                 .signature = std.hash.Wyhash.hash(0, uniform_bytes),
                 .bound_bytes = bound_bytes,
             } },
+        }) catch {
+            self.dropped += 1;
+            return null;
+        };
+        self.query_count += 2;
+        return first;
+    }
+
+    /// Reserve one begin/end pair for a normally batched compute pass.
+    pub fn reservePass(self: *TimestampProfiler, op: []const u8) ?u32 {
+        if (self.query_count + 2 > self.query_capacity) {
+            self.dropped += 1;
+            return null;
+        }
+        const first = self.query_count;
+        self.samples.append(self.allocator, .{
+            .first_query = first,
+            .category = .phase,
+            .name = "compute pass",
+            .operation = op,
+            .detail = .none,
         }) catch {
             self.dropped += 1;
             return null;

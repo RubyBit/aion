@@ -48,6 +48,8 @@ const Args = struct {
     n: usize = 1024,
     k: usize = 1024,
     iters: usize = 50,
+    /// Number of distinct K-major GEMVs in the sustained decode-chain case.
+    chain: usize = 0,
     gpu_only: bool = false,
     /// Optional label filter for the kernels suite (--op <label>).
     op_filter: ?[]const u8 = null,
@@ -74,6 +76,7 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (valueFor(arg, "--n", it)) |v| a.n = std.fmt.parseInt(usize, v, 10) catch a.n;
     if (valueFor(arg, "--k", it)) |v| a.k = std.fmt.parseInt(usize, v, 10) catch a.k;
     if (valueFor(arg, "--iters", it)) |v| a.iters = std.fmt.parseInt(usize, v, 10) catch a.iters;
+    if (valueFor(arg, "--chain", it)) |v| a.chain = std.fmt.parseInt(usize, v, 10) catch a.chain;
     if (std.mem.eql(u8, arg, "--gpu-only")) a.gpu_only = true;
     if (valueFor(arg, "--op", it)) |v| a.op_filter = v;
     if (valueFor(arg, "--suite", it)) |v| {
@@ -494,9 +497,57 @@ fn benchDecode(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize,
     const kernel_ns = try timeGpuKernel(gb, session, &built.prog, a.iters);
     const gpu_ns = try timeSession(session, &built.prog, a.iters);
 
-    var lbuf: [24]u8 = undefined;
-    const row_label = std.fmt.bufPrint(&lbuf, "gemv-q8 N={d}", .{n}) catch "gemv-q8";
+    var lbuf: [40]u8 = undefined;
+    const row_label = std.fmt.bufPrint(&lbuf, "gemv-q8 K={d} N={d}", .{ k, n }) catch "gemv-q8";
     bk.report(.{ .label = row_label, .iters = a.iters, .ns = kernel_ns, .bytes = b_bytes, .flops = flops, .e2e_ns = gpu_ns });
+}
+
+/// Build a model-like command stream of distinct GEMVs. Each weight has its own
+/// storage so the working set exceeds cache; horizontal fusion is disabled so
+/// the benchmark measures the existing kernel rather than a rewritten graph.
+fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize, k: usize, count: usize) !void {
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const a_id = try mgr.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
+    try fillTensor(alloc, &mgr, a_id, k, 1);
+    const av = try g.addInput(.f32, &[_]usize{ 1, k });
+    try g.bindExternal(av, a_id);
+
+    const b_vals = try alloc.alloc(f32, k * n);
+    defer alloc.free(b_vals);
+    for (b_vals, 0..) |*v, i| {
+        const p: usize = (i * 2654435761 + 77) % 1000;
+        v.* = (@as(f32, @floatFromInt(p)) - 500.0) * 0.004;
+    }
+    const packed_b = try packQ8Kmajor(alloc, b_vals, k, n);
+    defer alloc.free(packed_b);
+    const tiles = plan.chooseMatMulTiles(gpu_policy, @max(@as(usize, 1), gpu_policy.base_square_2d), n, k, .q8_0);
+
+    var outputs: std.ArrayList(aion.graph.ValueId) = .empty;
+    defer outputs.deinit(alloc);
+    try outputs.ensureTotalCapacity(alloc, count);
+    for (0..count) |_| {
+        const b_id = try mgr.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = 64, .quant_axis = 0 });
+        try mgr.writeFromPackedQuant(b_id, packed_b);
+        const bv = try g.addInput(.q8_0, &[_]usize{ k, n });
+        try g.bindExternal(bv, b_id);
+        try outputs.append(alloc, try g.addMatMul(av, bv, 1.0, 0.0));
+    }
+    try g.setOutputs(outputs.items);
+
+    var prog = try aion.program.compileGraphOpt(alloc, &g, &mgr, gpu_policy, .{ .fuse_horizontal_matmul = false });
+    defer prog.deinit();
+    var session = try gb.backend().createSession(mgr.tensorStore());
+    defer session.deinit();
+    const ns = try timeGpuKernel(gb, session, &prog, a.iters);
+    const b_bytes = @as(f64, @floatFromInt((k / 32) * n * 34 * count));
+    const flops = 2.0 * @as(f64, @floatFromInt(n * k * count));
+    var lbuf: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&lbuf, "gemv-chain x{d} K={d} N={d}", .{ count, k, n }) catch "gemv-chain";
+    bk.report(.{ .label = label, .iters = a.iters, .ns = ns, .bytes = b_bytes, .flops = flops });
 }
 
 fn runDecode(alloc: std.mem.Allocator, a: Args) !void {
@@ -511,14 +562,21 @@ fn runDecode(alloc: std.mem.Allocator, a: Args) !void {
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
 
-    // Gemma-4 E2B decode matmul shapes (K, N), M=1: q/k/v & o proj, gate/up, down.
+    // Gemma-4 E2B decode tile shapes (K, N), M=1. Large logical
+    // projections are split by the storage policy, so benchmark the tiles the
+    // kernel actually sees rather than only the untiled tensor shapes.
     const shapes = [_][2]usize{
-        .{ 2048, 2048 }, // o_proj / attn out
-        .{ 2048, 12288 }, // gate+up fused (wide N)
-        .{ 6144, 2048 }, // down_proj (source layers, ffn=6144)
-        .{ 12288, 2048 }, // down_proj (deep layers, ffn=12288)
+        .{ 1536, 4096 },
+        .{ 4096, 1536 },
+        .{ 6144, 1536 },
+        .{ 12288, 1536 },
+        .{ 1536, 2048 },
+        .{ 2048, 1536 },
+        .{ 1536, 256 },
+        .{ 256, 1536 },
     };
     for (shapes) |s| try benchDecode(alloc, &gb, a, s[1], s[0]);
+    if (a.chain > 0) try benchDecodeChain(alloc, &gb, a, 4096, 1536, a.chain);
 }
 
 fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) !void {

@@ -18,7 +18,7 @@ struct Params {
     total: u32,
     rank: u32,
     base: u32,
-    _pad: u32,
+    src_base: u32,
     dshape: array<vec4<u32>, 2>, // dst shape, dims [0..rank)
     sstride: array<vec4<u32>, 2>, // src strides in elements
 };
@@ -38,7 +38,7 @@ fn strided_copy_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
     for (var idx = gid.x; idx < p.total; idx += stride) {
         let r = idx / run_len;
         let off = idx % run_len;
-        o[p.base + r * run_stride + off] = x[idx];
+        o[p.base + r * run_stride + off] = x[p.src_base + idx];
     }
 }
 

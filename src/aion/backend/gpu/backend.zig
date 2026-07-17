@@ -56,7 +56,8 @@ const view_ops = @import("exec/view_ops.zig");
 const matmul_exec = @import("exec/matmul.zig");
 const matmul_nt = @import("exec/matmul_nt.zig");
 const frame_mod = @import("frame.zig");
-const TimestampProfiler = @import("timestamp_profile.zig").TimestampProfiler;
+const timestamp_profile = @import("timestamp_profile.zig");
+const TimestampProfiler = timestamp_profile.TimestampProfiler;
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
 const executable = @import("../../runtime/executable.zig");
@@ -465,7 +466,11 @@ pub const GpuBackend = struct {
         if (generic_profile and gpu_track != null) {
             if (self.gpu.timestamp_query) {
                 const query_capacity: u32 = @intCast(@min(@as(usize, 4096), profile_config.event_capacity *| 2));
-                timestamp_profiler = TimestampProfiler.init(self.allocator, self.gpu, query_capacity, &profile_session.?, gpu_track.?) catch null;
+                const timestamp_mode: timestamp_profile.Mode = if (std.c.getenv("AION_PROFILE_GPU")) |raw|
+                    if (std.mem.eql(u8, std.mem.span(raw), "pass")) .pass else .dispatch
+                else
+                    .dispatch;
+                timestamp_profiler = TimestampProfiler.init(self.allocator, self.gpu, query_capacity, &profile_session.?, gpu_track.?, timestamp_mode) catch null;
             } else {
                 std.debug.print("[aion-profile] GPU track unavailable: adapter does not support timestamp-query\n", .{});
             }
@@ -519,7 +524,11 @@ pub const GpuBackend = struct {
             try runner.runStep(step);
             since_submit += 1;
             if (since_submit >= SUBMIT_CHUNK) {
+                const t_chunk_submit: u64 = if (generic_profile) profile_mod.nowNs() else 0;
                 try runner.submitPending();
+                if (generic_profile) {
+                    if (cpu_track) |track| profile_session.?.recordSpan(track, .phase, "chunk submit", t_chunk_submit, profile_mod.nowNs());
+                }
                 since_submit = 0;
             }
         }
@@ -527,6 +536,7 @@ pub const GpuBackend = struct {
         const t_recorded: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         runner.frame.submit();
+        const t_final_submitted: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         if (self.flush_outputs) {
             // Recurrent state aliased in place to an input (KV caches, LSTM h/c)
@@ -538,21 +548,23 @@ pub const GpuBackend = struct {
                 try flushToHost(rstore, oid);
             }
         }
+        const t_outputs_finished: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         if (timestamp_profiler) |*p| {
             p.readResults() catch |e| std.debug.print("[aion-profile] GPU timestamp read failed: {s}\n", .{@errorName(e)});
         }
 
-        const t_finished = if (generic_profile) profile_mod.nowNs() else 0;
+        const t_profile_finished = if (generic_profile) profile_mod.nowNs() else 0;
         if (profile_session) |*p| {
             if (cpu_track) |track| {
                 p.recordSpan(track, .phase, "record", t_start, t_recorded);
-                p.recordSpan(track, .wait, "submit/readback", t_recorded, t_finished);
-                p.recordSpan(track, .phase, "program", t_start, t_finished);
+                p.recordSpan(track, .phase, "final submit", t_recorded, t_final_submitted);
+                p.recordSpan(track, .wait, "output readback", t_final_submitted, t_outputs_finished);
+                p.recordSpan(track, .phase, "profiler readback", t_outputs_finished, t_profile_finished);
+                p.recordSpan(track, .phase, "program", t_start, t_outputs_finished);
             }
             p.report();
         }
-
     }
 
     fn kindImpl(_: *anyopaque) BackendKind {

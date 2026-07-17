@@ -4,10 +4,11 @@
 //! submits it ONCE.
 //!
 //! The v0 backend created an encoder, a bind group, and a queue submit per
-//! dispatch. Instead, a `Frame` opens a single encoder, each step records a
-//! compute pass into it (WebGPU inserts barriers between passes, so dependent
-//! dispatches stay correctly ordered), and `submit()` finishes + submits exactly
-//! once. Per-dispatch transients (uniform buffers carrying kernel params, and the
+//! dispatch. Instead, a `Frame` opens a single encoder and keeps one compute pass
+//! open across adjacent dispatches. Copies and host-visible flushes close it
+//! because they are encoder-level operations. Timestamp attribution isolates
+//! dispatches because portable WebGPU only exposes pass-boundary timestamps.
+//! Per-dispatch transients (uniform buffers carrying kernel params, and the
 //! bind groups) are owned by the frame and released after submit — the queue keeps
 //! its own references alive until the GPU is done.
 //!
@@ -197,6 +198,9 @@ pub const Frame = struct {
     gpu: *wgpu.Gpu,
     allocator: std.mem.Allocator,
     encoder: c.WGPUCommandEncoder,
+    /// Open across adjacent unprofiled dispatches to avoid a pass boundary per
+    /// kernel. Null while recording copies and in timestamp-attribution mode.
+    compute_pass: c.WGPUComputePassEncoder = null,
     transient_buffers: std.ArrayList(c.WGPUBuffer),
     transient_groups: std.ArrayList(c.WGPUBindGroup),
     /// Optional backend-owned uniform pool. When set, per-dispatch uniforms are
@@ -240,7 +244,10 @@ pub const Frame = struct {
     /// Release transient resources (call after `submit`). Also releases the
     /// encoder if the frame was never submitted (error path).
     pub fn deinit(self: *Self) void {
-        if (self.encoder != null) c.wgpuCommandEncoderRelease(self.encoder);
+        if (self.encoder != null) {
+            self.endComputePass();
+            c.wgpuCommandEncoderRelease(self.encoder);
+        }
         for (self.transient_groups.items) |g| c.wgpuBindGroupRelease(g);
         for (self.transient_buffers.items) |b| c.wgpuBufferRelease(b);
         self.transient_groups.deinit(self.allocator);
@@ -270,12 +277,7 @@ pub const Frame = struct {
         if (self.bind_cache) |cache| {
             std.debug.assert(ub_size <= UniformPool.SLOT_BYTES);
             const bg = try cache.acquire(built, buffers, buf_sizes, uniform_bytes, ub_size);
-            const pass = self.beginComputePass(built, groups, uniform_bytes, buf_sizes);
-            c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
-            c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
-            c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
-            c.wgpuComputePassEncoderEnd(pass);
-            c.wgpuComputePassEncoderRelease(pass);
+            self.recordDispatch(built, bg, groups, uniform_bytes, buf_sizes);
             self.records += 1;
             return;
         }
@@ -318,16 +320,56 @@ pub const Frame = struct {
             return error.ExecutionFailed;
         };
 
-        const pass = self.beginComputePass(built, groups, uniform_bytes, buf_sizes);
-        c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
-        c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
-        c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
-        c.wgpuComputePassEncoderEnd(pass);
-        c.wgpuComputePassEncoderRelease(pass);
+        self.recordDispatch(built, bg, groups, uniform_bytes, buf_sizes);
         self.records += 1;
     }
 
-    fn beginComputePass(self: *Self, built: Built, groups: [3]u32, uniform_bytes: []const u8, buffer_sizes: []const u64) c.WGPUComputePassEncoder {
+    fn recordDispatch(self: *Self, built: Built, bg: c.WGPUBindGroup, groups: [3]u32, uniform_bytes: []const u8, buffer_sizes: []const u64) void {
+        // Portable timestamp attribution only exposes pass-boundary writes, so
+        // attributed dispatches stay isolated. Normal execution batches them.
+        const attributed = if (self.timestamps) |prof| prof.mode == .dispatch else false;
+        const pass = if (attributed)
+            self.beginAttributedPass(built, groups, uniform_bytes, buffer_sizes)
+        else
+            self.getComputePass();
+        c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
+        c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
+        c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
+        if (attributed) {
+            c.wgpuComputePassEncoderEnd(pass);
+            c.wgpuComputePassEncoderRelease(pass);
+        }
+    }
+
+    fn getComputePass(self: *Self) c.WGPUComputePassEncoder {
+        if (self.compute_pass == null) {
+            if (self.timestamps) |prof| {
+                if (prof.mode == .pass) {
+                    if (prof.reservePass(self.profile_op)) |first| {
+                        var writes: c.WGPUPassTimestampWrites = std.mem.zeroes(c.WGPUPassTimestampWrites);
+                        writes.querySet = prof.query_set;
+                        writes.beginningOfPassWriteIndex = first;
+                        writes.endOfPassWriteIndex = first + 1;
+                        var desc: c.WGPUComputePassDescriptor = std.mem.zeroes(c.WGPUComputePassDescriptor);
+                        desc.timestampWrites = &writes;
+                        self.compute_pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
+                    }
+                }
+            }
+            if (self.compute_pass == null)
+                self.compute_pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+        }
+        return self.compute_pass;
+    }
+
+    fn endComputePass(self: *Self) void {
+        const pass = self.compute_pass orelse return;
+        c.wgpuComputePassEncoderEnd(pass);
+        c.wgpuComputePassEncoderRelease(pass);
+        self.compute_pass = null;
+    }
+
+    fn beginAttributedPass(self: *Self, built: Built, groups: [3]u32, uniform_bytes: []const u8, buffer_sizes: []const u64) c.WGPUComputePassEncoder {
         if (self.timestamps) |prof| {
             if (prof.reserveDispatch(built, self.profile_op, groups, uniform_bytes, buffer_sizes)) |first| {
                 var writes: c.WGPUPassTimestampWrites = std.mem.zeroes(c.WGPUPassTimestampWrites);
@@ -346,6 +388,7 @@ pub const Frame = struct {
     /// with the surrounding compute passes. WebGPU requires `bytes` and both
     /// offsets be multiples of 4 (callers check).
     pub fn recordCopy(self: *Self, src: c.WGPUBuffer, src_off: u64, dst: c.WGPUBuffer, dst_off: u64, bytes: u64) void {
+        self.endComputePass();
         c.wgpuCommandEncoderCopyBufferToBuffer(self.encoder, src, src_off, dst, dst_off, bytes);
         self.records += 1;
     }
@@ -374,12 +417,14 @@ pub const Frame = struct {
         self.transient_groups.clearRetainingCapacity();
         self.transient_buffers.clearRetainingCapacity();
         self.encoder = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, null) orelse return error.ExecutionFailed;
+        self.compute_pass = null;
         self.records = 0;
         self.submits += 1;
     }
 
     /// Finish the encoder and submit the whole batch once.
     pub fn submit(self: *Self) void {
+        self.endComputePass();
         if (self.timestamps) |prof| prof.resolvePending(self.encoder);
         const cmd = c.wgpuCommandEncoderFinish(self.encoder, null);
         c.wgpuCommandEncoderRelease(self.encoder);

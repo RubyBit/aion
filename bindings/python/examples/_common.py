@@ -86,6 +86,12 @@ def add_device_args(p: argparse.ArgumentParser) -> None:
         default="high",
         help="GPU power preference when --gpu-index is unset (high=discrete, low=integrated).",
     )
+    p.add_argument(
+        "--gpu-backend",
+        choices=["any", "vulkan", "d3d12", "metal", "gl"],
+        default="any",
+        help="WebGPU native backend (default: any).",
+    )
 
 
 def load_model_with_device(path: str, args, *, thread_count: int = 1, **load_kwargs):
@@ -101,6 +107,7 @@ def load_model_with_device(path: str, args, *, thread_count: int = 1, **load_kwa
     want = getattr(args, "device", "cpu")
     gpu_index = getattr(args, "gpu_index", None)
     gpu_power = getattr(args, "gpu_power", "high")
+    gpu_backend = getattr(args, "gpu_backend", "any")
 
     if want == "cpu":
         return aion.load_model(path, thread_count=thread_count, **load_kwargs), "cpu"
@@ -112,6 +119,7 @@ def load_model_with_device(path: str, args, *, thread_count: int = 1, **load_kwa
             device="gpu",
             adapter_index=gpu_index,
             power=gpu_power,
+            backend=gpu_backend,
             **load_kwargs,
         )
         dev = f"gpu:{gpu_index}" if gpu_index is not None else "gpu"

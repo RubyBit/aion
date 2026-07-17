@@ -2,7 +2,7 @@
 //
 //! View materializations + concat for the GPU backend. Under the GPU tile
 //! policy these tensors are single packed tiles, which collapses most of the
-//! CPU's scalar re-tiling machinery into buffer copies:
+//! CPU's scalar re-tiling machinery into contiguous copies:
 //!   - ReshapeScalar / ReTileCopyScalar: packed row-major order is invariant
 //!     under reshape, and a single-tile -> single-tile retile is the identity
 //!     layout — both are ONE whole-buffer `CopyBufferToBuffer`.
@@ -40,13 +40,40 @@ const GatherParams = extern struct {
     total: u32,
     rank: u32,
     base: u32,
-    _pad: u32 = 0,
+    src_base: u32 = 0,
     dshape: [8]u32,
     sstride: [8]u32,
 };
 
 fn groups1D(n: u32) u32 {
     return @max(1, @min(context.ceilDiv(n, WG_1D), context.MAX_GROUPS_1D));
+}
+
+/// Small contiguous copies stay in the open compute pass. Ending a pass for a
+/// few KiB activation copy costs more than moving the data; large transfers keep
+/// using the hardware copy path.
+fn recordContiguousCopy(ctx: Ctx, frame: *Frame, src: c.WGPUBuffer, src_off: u64, dst: c.WGPUBuffer, dst_off: u64, bytes: u64) ExecuteProgramError!void {
+    const COMPUTE_COPY_MAX_BYTES: u64 = 1024 * 1024;
+    if (bytes > COMPUTE_COPY_MAX_BYTES) {
+        frame.recordCopy(src, src_off, dst, dst_off, bytes);
+        return;
+    }
+    if (bytes % 4 != 0 or src_off % 4 != 0 or dst_off % 4 != 0) return error.Unsupported;
+    const words = std.math.cast(u32, bytes / 4) orelse return error.Unsupported;
+    var params: GatherParams = .{
+        .total = words,
+        .rank = 1,
+        .base = std.math.cast(u32, dst_off / 4) orelse return error.Unsupported,
+        .src_base = std.math.cast(u32, src_off / 4) orelse return error.Unsupported,
+        .dshape = @splat(1),
+        .sstride = @splat(0),
+    };
+    params.dshape[0] = words;
+    params.sstride[0] = words;
+    const built = try ctx.pipes.get(view_kernel, "strided_copy_u32");
+    const bufs = [_]c.WGPUBuffer{ src, dst };
+    const sizes = [_]u64{ src_off + bytes, dst_off + bytes };
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(words), 1, 1 });
 }
 
 fn scalarBytes(dt: types.DType) ?usize {
@@ -138,7 +165,9 @@ pub fn execPackedCopy(ctx: Ctx, frame: *Frame, dst: executable.TensorId, src: ex
         if (bytes % 4 != 0) return error.Unsupported; // copy granularity
         if (bytes > dsrc.tile.len or bytes > ddst.tile.len) return error.ExecutionFailed;
 
-        frame.recordCopy(
+        try recordContiguousCopy(
+            ctx,
+            frame,
             ctx.devmem.bufferFor(dsrc.tile.handle).?,
             0,
             ctx.devmem.bufferFor(ddst.tile.handle).?,
@@ -260,12 +289,18 @@ fn gatherScatterTiles(
         while (d < rank) : (d += 1) {
             const full = extents[d] == meta.shape[d];
             if (saw_partial) {
-                if (!full) { contiguous = false; break; }
+                if (!full) {
+                    contiguous = false;
+                    break;
+                }
             } else if (!full) {
                 // d is the outermost partial dim; all dims above it must be extent 1.
                 var e: usize = 0;
                 while (e < d) : (e += 1) {
-                    if (extents[e] != 1) { contiguous = false; break; }
+                    if (extents[e] != 1) {
+                        contiguous = false;
+                        break;
+                    }
                 }
                 saw_partial = true;
             }
@@ -285,9 +320,9 @@ fn gatherScatterTiles(
             const off: u64 = @as(u64, base) * 4;
             if (bytes > dt.len or off + bytes > packed_len) return error.ExecutionFailed;
             if (gather)
-                frame.recordCopy(packed_buf, off, tile_buf, 0, bytes) // packed -> tile
+                try recordContiguousCopy(ctx, frame, packed_buf, off, tile_buf, 0, bytes) // packed -> tile
             else
-                frame.recordCopy(tile_buf, 0, packed_buf, off, bytes); // tile -> packed
+                try recordContiguousCopy(ctx, frame, tile_buf, 0, packed_buf, off, bytes); // tile -> packed
             continue;
         }
 
@@ -372,7 +407,7 @@ pub fn execConcat(ctx: Ctx, frame: *Frame, s: executable.StepConcatScalar) Execu
                 const src_off = o * block_bytes;
                 const dst_off = (o * out_axis + prefix) * inner * elem;
                 if (dst_off + block_bytes > ddst.tile.len) return error.ExecutionFailed;
-                frame.recordCopy(src_buf, src_off, dst_buf, dst_off, block_bytes);
+                try recordContiguousCopy(ctx, frame, src_buf, src_off, dst_buf, dst_off, block_bytes);
             }
         }
         prefix += ax_i;
@@ -481,7 +516,7 @@ fn execSliceNDMultiTile(ctx: Ctx, frame: *Frame, s: executable.StepSliceNDScalar
             const src_off: u64 = @as(u64, o * this_tw + (ov_lo - tile_lo)) * inner * elem;
             const dst_off: u64 = @as(u64, o * extent + (ov_lo - start)) * inner * elem;
             if (src_off + run_bytes > dt.len or dst_off + run_bytes > ddst.tile.len) return error.ExecutionFailed;
-            frame.recordCopy(src_buf, src_off, dst_buf, dst_off, run_bytes);
+            try recordContiguousCopy(ctx, frame, src_buf, src_off, dst_buf, dst_off, run_bytes);
         }
     }
 }

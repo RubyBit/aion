@@ -203,6 +203,8 @@ pub const Gpu = struct {
     queue: c.WGPUQueue,
     /// Granted device limits (used to gate kernel configs per GPU).
     limits: Limits = .{},
+    /// True when the device was opened with the standard timestamp-query feature.
+    timestamp_query: bool = false,
 
     pub fn init(opts: Options) Error!Gpu {
         const instance = c.wgpuCreateInstance(null) orelse return Error.NoInstance;
@@ -219,8 +221,16 @@ pub const Gpu = struct {
         var adapter_limits: c.WGPULimits = std.mem.zeroes(c.WGPULimits);
         const have_adapter_limits = c.wgpuAdapterGetLimits(adapter, &adapter_limits) == c.WGPUStatus_Success;
 
-        const device = requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null) orelse
-            (requestDevice(instance, adapter, null) orelse return Error.NoDevice);
+        const want_timestamps = c.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0;
+        var timestamp_query = want_timestamps;
+        const device = requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, timestamp_query) orelse
+            requestDevice(instance, adapter, null, timestamp_query) orelse fallback: {
+                // A buggy adapter may advertise TimestampQuery but reject it at
+                // device creation. Profiling is optional; device execution is not.
+                timestamp_query = false;
+                break :fallback requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, false) orelse
+                    (requestDevice(instance, adapter, null, false) orelse return Error.NoDevice);
+            };
         errdefer c.wgpuDeviceRelease(device);
 
         // Re-query the GRANTED limits (may be the requested ones, or defaults).
@@ -231,14 +241,19 @@ pub const Gpu = struct {
         }
 
         const queue = c.wgpuDeviceGetQueue(device);
-        return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted };
+        return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted, .timestamp_query = timestamp_query };
     }
 
     /// Request a device from `adapter` with optional `required` limits. Returns null
     /// on timeout/failure (caller decides whether to retry with relaxed limits).
-    fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits) ?c.WGPUDevice {
+    fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits, timestamps: bool) ?c.WGPUDevice {
         var desc: c.WGPUDeviceDescriptor = std.mem.zeroes(c.WGPUDeviceDescriptor);
         desc.requiredLimits = required;
+        var required_features = [_]c.WGPUFeatureName{c.WGPUFeatureName_TimestampQuery};
+        if (timestamps) {
+            desc.requiredFeatureCount = required_features.len;
+            desc.requiredFeatures = &required_features;
+        }
         // Shrink the allocator's suballocation blocks. wgpu's default hint
         // (Performance) commits 128 MiB device + 64 MiB host blocks for the
         // handful of tiny internal allocations made at device open (~200 MiB

@@ -32,7 +32,6 @@ const ExampleOptions = struct {
     bench_iters: usize = 1,
     pad_mode: types.PadMode = .reflect,
     profile: bool = false,
-    profile_steps: bool = false,
     print_probs: bool = false,
     viz: bool = false,
     viz_threshold: f32 = 0.5,
@@ -346,8 +345,6 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !ExampleOptio
             out.viz_threshold = try std.fmt.parseFloat(f32, v);
         } else if (std.mem.eql(u8, arg, "--profile")) {
             out.profile = true;
-        } else if (std.mem.eql(u8, arg, "--profile-steps")) {
-            out.profile_steps = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return error.HelpRequested;
@@ -387,7 +384,6 @@ fn printUsage() void {
         \\  --viz                  Print a per-second speech/silence visualization
         \\  --viz-threshold <f>     Threshold for --viz (default: 0.5)
         \\  --profile              Print a rough per-chunk time breakdown (adds overhead)
-        \\  --profile-steps        Print per-step timings for the first model.run() (adds overhead)
         \\  -h, --help             Show this help
         \\
         \\Weights workflow:
@@ -765,7 +761,7 @@ fn mainImpl(args: std.process.Args) !void {
     defer opts.deinit(allocator);
 
     const chunk_input_len: usize = opts.context_size + opts.num_samples;
-    var ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1, .profile_steps = opts.profile_steps });
+    var ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
     const tiny_weights: TinySileroWeights = if (opts.weights_path) |p| blk: {

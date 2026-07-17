@@ -74,10 +74,6 @@ pub const Context = struct {
         /// Total threads including the calling thread.
         thread_count: usize = 1,
 
-        /// Print CPU backend per-step timing during `model.run()`.
-        /// Intended for debugging/profiling; adds overhead.
-        profile_steps: bool = false,
-
         /// Optional tiling policy override.
         ///
         /// If null, a default policy is used and users don't need to think about tiling.
@@ -190,14 +186,7 @@ pub const Context = struct {
     }
 
     fn initCpuBackend(allocator: std.mem.Allocator, opts: Options) api_errors.InitError!cpu_backend_mod.CpuBackend {
-        var cpu: cpu_backend_mod.CpuBackend = if (opts.thread_count <= 1)
-            cpu_backend_mod.CpuBackend.init(allocator)
-        else
-            try cpu_backend_mod.CpuBackend.initWithOptions(allocator, .{ .thread_count = opts.thread_count, .profile_steps = opts.profile_steps });
-
-        // Ensure the flag is applied for both init paths.
-        cpu.profile_steps = opts.profile_steps;
-        return cpu;
+        return try cpu_backend_mod.CpuBackend.initWithOptions(allocator, .{ .thread_count = opts.thread_count });
     }
 
     pub fn deinit(self: *Self) void {

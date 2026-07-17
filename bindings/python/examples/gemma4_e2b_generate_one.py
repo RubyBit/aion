@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import time
@@ -211,10 +212,11 @@ def main() -> None:
     p.add_argument("--thread-count", type=int, default=1, help="Context thread count (default: 1)")
     add_device_args(p)
     p.add_argument("--timing", action="store_true", help="Print per-stage timing and throughput")
+    p.add_argument("--timing-json", action="store_true", help="Emit one structured aion.model_timing.v1 JSON line")
     p.add_argument(
         "--profile-backend",
         action="store_true",
-        help="Enable backend per-op-kind profiling (sets AION_PROFILE_STEPS=1)",
+        help="Enable the backend-neutral text profiler (sets AION_PROFILE=summary)",
     )
     p.add_argument(
         "--trace-backend",
@@ -255,7 +257,7 @@ def main() -> None:
     if args.trace_backend:
         os.environ["AION_TRACE"] = "1"
     if args.profile_backend:
-        os.environ["AION_PROFILE_STEPS"] = "1"
+        os.environ["AION_PROFILE"] = "summary"
 
     tokenizer = None
     tok_src: Optional[str] = args.tokenizer
@@ -424,30 +426,58 @@ def main() -> None:
             else:
                 print(f"generated_ids={generated}")
 
-            if args.timing:
+            if args.timing or args.timing_json:
                 t_all_ns = time.perf_counter_ns() - t0_all_ns
                 prefill_new: int = 1
                 decode_new: int = int(decode_steps_executed)
                 total_new: int = int(prefill_new + decode_new)
                 kept_new: int = int(len(generated))
 
-                print("\n--- timing ---")
-                print(f"tokenize:          {_ns_to_ms(tok_ns):9.3f} ms  (prompt_tokens={s0})")
-                print(f"prefill.run:       {_ns_to_ms(prefill_run_ns):9.3f} ms")
-                print(f"prefill.logits:    {_ns_to_ms(logits_copy_ns):9.3f} ms  (numpy copy)")
-                print(f"prefill.argmax:    {_ns_to_ms(argmax_ns):9.3f} ms")
-                print(f"generated kept:    {kept_new:9d} tok")
-                if stopped_by is not None:
-                    print(f"stopped by token:  {stopped_by:9d}")
+                decode_tps = 0.0
+                if decode_steps_executed > 0 and decode_total_run_ns > 0:
+                    decode_tps = decode_steps_executed / (float(decode_total_run_ns) / 1.0e9)
 
-                if decode_steps_executed > 0:
-                    print(f"decode.run total:  {_ns_to_ms(decode_total_run_ns):9.3f} ms  ({decode_steps_executed} steps)")
-                    print(f"decode.logits tot: {_ns_to_ms(decode_total_logits_ns):9.3f} ms")
-                    print(f"decode.argmax tot: {_ns_to_ms(decode_total_argmax_ns):9.3f} ms")
-                    dt_s = float(decode_total_run_ns) / 1.0e9
-                    if dt_s > 0:
-                        print(f"decode throughput: {decode_steps_executed / dt_s:9.2f} tok/s (model.run only)")
-                print(f"total wall:        {_ns_to_ms(t_all_ns):9.3f} ms")
+                if args.timing:
+                    print("\n--- timing ---")
+                    print(f"tokenize:          {_ns_to_ms(tok_ns):9.3f} ms  (prompt_tokens={s0})")
+                    print(f"prefill.run:       {_ns_to_ms(prefill_run_ns):9.3f} ms")
+                    print(f"prefill.logits:    {_ns_to_ms(logits_copy_ns):9.3f} ms  (numpy copy)")
+                    print(f"prefill.argmax:    {_ns_to_ms(argmax_ns):9.3f} ms")
+                    print(f"generated kept:    {kept_new:9d} tok")
+                    if stopped_by is not None:
+                        print(f"stopped by token:  {stopped_by:9d}")
+
+                    if decode_steps_executed > 0:
+                        print(f"decode.run total:  {_ns_to_ms(decode_total_run_ns):9.3f} ms  ({decode_steps_executed} steps)")
+                        print(f"decode.logits tot: {_ns_to_ms(decode_total_logits_ns):9.3f} ms")
+                        print(f"decode.argmax tot: {_ns_to_ms(decode_total_argmax_ns):9.3f} ms")
+                        print(f"decode throughput: {decode_tps:9.2f} tok/s (model.run only)")
+                    print(f"total wall:        {_ns_to_ms(t_all_ns):9.3f} ms")
+
+                if args.timing_json:
+                    timing_record = {
+                        "schema": "aion.model_timing.v1",
+                        "model": str(model_path),
+                        "device": device_str,
+                        "prompt_tokens": s0,
+                        "generated_tokens": kept_new,
+                        "decode_steps": decode_steps_executed,
+                        "tokenize_ns": tok_ns,
+                        "prefill_run_ns": prefill_run_ns,
+                        "prefill_logits_ns": logits_copy_ns,
+                        "prefill_argmax_ns": argmax_ns,
+                        "decode_run_ns": decode_total_run_ns,
+                        "decode_logits_ns": decode_total_logits_ns,
+                        "decode_argmax_ns": decode_total_argmax_ns,
+                        "decode_tokens_per_second": decode_tps,
+                        "total_wall_ns": t_all_ns,
+                        "instrumentation": [
+                            name
+                            for name in ("AION_PROFILE",)
+                            if os.environ.get(name)
+                        ],
+                    }
+                    print(f"[aion-perf-json] {json.dumps(timing_record, separators=(',', ':'))}")
         finally:
             # Close tensors (best-effort).
             for t in [tokens_prefill, tokens_step]:

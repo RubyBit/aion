@@ -41,6 +41,7 @@ const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
 const cpuid = @import("tuning/cpuid.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
+const profile = @import("../../profile.zig");
 
 const Backend = backend_mod.Backend;
 const Session = backend_mod.Session;
@@ -70,13 +71,12 @@ pub const CpuBackend = struct {
     pool: ?thread_pool.ThreadPool = null,
     thread_count: usize = 1,
 
-    /// When enabled, print per-step execution timing from `executeProgram`.
-    /// Intended for coarse profiling/debugging; adds overhead.
-    profile_steps: bool = false,
-
-    /// Cached env-controlled tracing/profile toggles (read once at init).
+    /// Cached environment-controlled diagnostics (read once at init).
     trace_exec: bool = false,
-    profile_steps_env: bool = false,
+    profile_config: profile.Config = .{},
+
+    /// Internal counter used only to apply the profiler's skip/count window.
+    profile_invocations: u64 = 0,
 
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
@@ -116,10 +116,6 @@ pub const CpuBackend = struct {
         return envFlagEnabled("AION_TRACE");
     }
 
-    fn profileStepsEnabled() bool {
-        return envFlagEnabled("AION_PROFILE_STEPS");
-    }
-
     fn envFlagEnabled(name: [:0]const u8) bool {
         return env.flagEnabled(name);
     }
@@ -129,12 +125,10 @@ pub const CpuBackend = struct {
         /// Set to 1 to disable parallelism (default).
         thread_count: usize = 1,
 
-        /// Print per-step timing from `executeProgram`.
-        profile_steps: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return initWithOptions(allocator, .{ .thread_count = 1, .profile_steps = false }) catch |e| {
+        return initWithOptions(allocator, .{ .thread_count = 1 }) catch |e| {
             std.debug.panic("CpuBackend.init failed: {s}", .{@errorName(e)});
         };
     }
@@ -154,9 +148,8 @@ pub const CpuBackend = struct {
             .allocator = allocator,
             .pool = null,
             .thread_count = 1,
-            .profile_steps = opts.profile_steps,
             .trace_exec = traceEnabled(),
-            .profile_steps_env = profileStepsEnabled(),
+            .profile_config = profile.Config.fromEnv(),
             .reduce_scratch_f32 = &[_]f32{},
             .softmax_scratch_f32 = &[_]f32{},
             .matmul_scratch_f32 = &[_][]align(32) u8{},
@@ -619,31 +612,18 @@ pub const CpuBackend = struct {
     }
 
     fn runProgram(self: *Self, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore) ExecuteProgramError!void {
-        const do_profile: bool = self.profile_steps or self.profile_steps_env;
-
-        const nowNs = struct {
-            fn f() u64 {
-                const ts: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);
-                const ns: i96 = ts.toNanoseconds();
-                if (ns <= 0) return 0;
-                const max_u64_i96: i96 = @as(i96, std.math.maxInt(u64));
-                return @intCast(@min(ns, max_u64_i96));
-            }
-        }.f;
-
-        // Per-step-kind aggregation: when profiling is on, we track cumulative time +
-        // call count for each op kind across this one executeProgram call. That surfaces
-        // the real cost drivers (e.g. a 400-call MatMul total) rather than drowning the
-        // user in 1600 individual per-step printouts.
-        const Step = executable.Step;
-        const kind_count: usize = @typeInfo(Step).@"union".fields.len;
-        var totals_ns: [kind_count]u64 = .{0} ** kind_count;
-        var counts: [kind_count]u64 = .{0} ** kind_count;
+        const invocation = self.profile_invocations;
+        self.profile_invocations +|= 1;
+        const config = self.profile_config;
+        const do_profile = config.captures(invocation);
+        var profiler: ?profile.Session = if (do_profile) profile.Session.init(self.allocator, config, "CPU program") else null;
+        defer if (profiler) |*p| p.deinit();
+        const cpu_track = if (profiler) |*p| p.addTrack("CPU", .host) else null;
         const trace_exec: bool = self.trace_exec;
 
-        const run_t0: u64 = if (do_profile) nowNs() else 0;
+        const run_t0: u64 = if (do_profile) profile.nowNs() else 0;
         for (prog.steps, 0..) |step, step_i| {
-            const t0: u64 = if (do_profile) nowNs() else 0;
+            const t0: u64 = if (do_profile) profile.nowNs() else 0;
             if (trace_exec) {
                 std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step) });
             }
@@ -655,52 +635,16 @@ pub const CpuBackend = struct {
             };
 
             if (do_profile) {
-                const t1: u64 = nowNs();
-                const dt_ns: u64 = t1 - t0;
-                const idx: usize = @intFromEnum(std.meta.activeTag(step));
-                if (idx < kind_count) {
-                    totals_ns[idx] += dt_ns;
-                    counts[idx] += 1;
-                }
+                const t1 = profile.nowNs();
+                if (cpu_track) |track| profiler.?.recordSpan(track, .operation, @tagName(step), t0, t1);
             }
         }
 
-        if (do_profile) {
-            const run_total_ns: u64 = nowNs() - run_t0;
-            std.debug.print("\n[aion][profile] program steps={d}  total={d:.3} ms\n", .{ prog.steps.len, @as(f64, @floatFromInt(run_total_ns)) / 1.0e6 });
-            std.debug.print("[aion][profile] per-op-kind (sorted by cumulative ms):\n", .{});
-
-            // Sort indices by descending cumulative ns so the worst offenders print first.
-            var order: [kind_count]usize = undefined;
-            for (&order, 0..) |*o, i| o.* = i;
-            // Simple insertion sort (kind_count is tiny).
-            var i: usize = 1;
-            while (i < kind_count) : (i += 1) {
-                var j: usize = i;
-                while (j > 0 and totals_ns[order[j]] > totals_ns[order[j - 1]]) : (j -= 1) {
-                    const tmp = order[j];
-                    order[j] = order[j - 1];
-                    order[j - 1] = tmp;
-                }
-            }
-
-            const field_names = comptime blk: {
-                const fields = @typeInfo(Step).@"union".fields;
-                var names: [fields.len][]const u8 = undefined;
-                for (fields, 0..) |f, fi| names[fi] = f.name;
-                break :blk names;
-            };
-
-            for (order) |idx| {
-                if (counts[idx] == 0) continue;
-                const ms: f64 = @as(f64, @floatFromInt(totals_ns[idx])) / 1.0e6;
-                const avg_us: f64 = (@as(f64, @floatFromInt(totals_ns[idx])) / 1.0e3) / @as(f64, @floatFromInt(counts[idx]));
-                std.debug.print("  {s:<32} {d:>8.3} ms  ({d:>6} calls, avg {d:>8.1} us)\n", .{ field_names[idx], ms, counts[idx], avg_us });
-            }
+        if (profiler) |*p| {
+            if (cpu_track) |track| p.recordSpan(track, .phase, "program", run_t0, profile.nowNs());
+            p.report();
         }
 
-        // Avoid spamming across many runs: profile only the first execution per backend.
-        if (self.profile_steps) self.profile_steps = false;
     }
 
     fn kindImpl(_: *anyopaque) BackendKind {

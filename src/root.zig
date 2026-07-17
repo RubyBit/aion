@@ -23,6 +23,7 @@ pub const api = @import("aion/api/api.zig");
 
 pub const runtime = @import("aion/runtime/executable.zig");
 pub const tensor_store = @import("aion/runtime/tensor_store.zig");
+pub const profile = @import("aion/profile.zig");
 
 /// WebGPU GPU backend — feature-gated (`-Dgpu` → `build_options.enable_gpu`).
 /// When disabled the backend source is never analyzed, so wgpu is not fetched

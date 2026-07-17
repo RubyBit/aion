@@ -54,15 +54,16 @@ const lstm_exec = @import("exec/lstm.zig");
 const fft_ops = @import("exec/fft_ops.zig");
 const view_ops = @import("exec/view_ops.zig");
 const matmul_exec = @import("exec/matmul.zig");
-const autotune = @import("autotune.zig");
 const matmul_nt = @import("exec/matmul_nt.zig");
 const frame_mod = @import("frame.zig");
+const TimestampProfiler = @import("timestamp_profile.zig").TimestampProfiler;
 const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
 const executable = @import("../../runtime/executable.zig");
 const tensor_store_mod = @import("../../runtime/tensor_store.zig");
 const resident_mod = @import("../../runtime/residency/resident_store.zig");
 const thread_pool_mod = @import("../../runtime/thread_pool.zig");
+const profile_mod = @import("../../profile.zig");
 
 const c = wgpu.c;
 
@@ -114,6 +115,10 @@ pub const GpuBackend = struct {
     /// and replayed, removing the dominant CPU record cost. Supersedes the pool.
     bind_cache: frame_mod.BindGroupCache,
 
+    /// Internal counter used only to apply the profiler's skip/count window.
+    profile_invocations: u64 = 0,
+    profile_config: profile_mod.Config,
+
     const Self = @This();
 
     /// D2H memcpy is memory-bandwidth bound; a few threads saturate it. Cap low so
@@ -129,6 +134,7 @@ pub const GpuBackend = struct {
             .matmul = matmul_exec.Matmul.init(allocator),
             .uniform_pool = .{ .gpu = gpu, .allocator = allocator },
             .bind_cache = .{ .gpu = gpu, .allocator = allocator },
+            .profile_config = profile_mod.Config.fromEnv(),
         };
         const hw = std.Thread.getCpuCount() catch 1;
         const n = @max(@as(usize, 1), @min(hw, D2H_MAX_THREADS));
@@ -244,35 +250,16 @@ pub const GpuBackend = struct {
     /// device poll (inside the D2H readback), not two. `Frame.records` lets a
     /// fixed-trip Loop record its whole unrolled body into one frame and submit
     /// once, with zero syncs.
-    const STEP_TAGS = @typeInfo(executable.Step).@"union".fields.len;
-
     const Runner = struct {
         gb: *Self,
         op_ctx: context.Ctx,
         prog: *const ExecutableProgram,
         frame: Frame,
 
-        // Diagnostic (AION_GPU_PROFILE_OPS): per-op-kind record-time + count. Zero
-        // cost when off. Note the If/Loop buckets are INCLUSIVE of their nested
-        // body ops (runStep recurses), so a large Loop bucket vs a small sum of
-        // leaf ops = the loop is dominated by per-iteration predicate-poll waits.
-        prof_ops: bool = false,
-        // AION_GPU_TIME_OPS: submit+poll after each top-level op to attribute true
-        // GPU exec time per op-kind (serializes the run — diagnostic only).
-        time_ops: bool = false,
-        op_ns: [STEP_TAGS]u64 = @splat(0),
-        op_count: [STEP_TAGS]u64 = @splat(0),
-        gpu_ns: [STEP_TAGS]u64 = @splat(0),
-        // Loop split: time recording bodies vs waiting on the cond predicate poll.
-        loop_body_ns: u64 = 0,
-        loop_cond_ns: u64 = 0,
-        // Recursion depth (0 = top-level / encoder). Op times are attributed only
-        // at depth 0 so the per-op-kind breakdown is encoder-only (the Loop's own
-        // bucket already totals the loop; its nested body ops would double-count).
+        // Top-level operation scopes avoid double-counting nested If/Loop bodies.
         depth: u32 = 0,
-        // Time spent in chunked (top-level) submitPending flushes — the encoder's
-        // queue-submit cost, distinct from the loop's cond-poll waits.
-        chunk_submit_ns: u64 = 0,
+        profiler: ?*profile_mod.Session = null,
+        cpu_track: ?profile_mod.TrackId = null,
 
         /// Submit the pending frame WITHOUT waiting, then keep recording into a
         /// fresh encoder on the same frame (see `Frame.flushInPlace`). No-op when
@@ -364,23 +351,18 @@ pub const GpuBackend = struct {
         }
 
         fn runStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
-            const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
+            const previous_op = r.frame.profile_op;
+            r.frame.profile_op = @tagName(std.meta.activeTag(step));
+            defer r.frame.profile_op = previous_op;
+            const generic_profile = r.profiler != null and r.depth == 0;
+            const t0: u64 = if (generic_profile) profile_mod.nowNs() else 0;
             r.dispatchStep(step) catch |e| {
                 if (std.c.getenv("AION_GPU_TRACE") != null)
                     std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
                 return e;
             };
-            if (r.prof_ops and r.depth == 0) {
-                const tag = @intFromEnum(std.meta.activeTag(step));
-                const t1 = autotune.nowNs();
-                r.op_ns[tag] += t1 - t0;
-                r.op_count[tag] += 1;
-                if (r.time_ops) {
-                    // Submit this op and wait, isolating its GPU exec (serialized).
-                    try r.submitPending();
-                    _ = wgpu.c.wgpuDevicePoll(r.gb.gpu.device, 1, null);
-                    r.gpu_ns[tag] += autotune.nowNs() - t1;
-                }
+            if (generic_profile) {
+                if (r.cpu_track) |track| r.profiler.?.recordSpan(track, .operation, @tagName(step), t0, profile_mod.nowNs());
             }
         }
 
@@ -451,21 +433,15 @@ pub const GpuBackend = struct {
                     while (iter < max_iters) : (iter += 1) {
                         if (s.check_before) {
                             if (s.cond) |cid| {
-                                const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
                                 const p = try r.readPredicate(cid);
-                                if (r.prof_ops) r.loop_cond_ns += autotune.nowNs() - t0;
                                 if (p == 0) break;
                             }
                         }
-                        const tb: u64 = if (r.prof_ops) autotune.nowNs() else 0;
                         try r.runBlock(s.body_block);
-                        if (r.prof_ops) r.loop_body_ns += autotune.nowNs() - tb;
                         try r.swapLists(s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
                         if (!s.check_before) {
                             if (s.cond) |cid| {
-                                const t0: u64 = if (r.prof_ops) autotune.nowNs() else 0;
                                 const p = try r.readPredicate(cid);
-                                if (r.prof_ops) r.loop_cond_ns += autotune.nowNs() - t0;
                                 if (p == 0) break;
                             }
                         }
@@ -476,6 +452,26 @@ pub const GpuBackend = struct {
     };
 
     fn runProgram(self: *Self, rstore: *ResidentTensorStore, prog: *const ExecutableProgram) ExecuteProgramError!void {
+        const invocation = self.profile_invocations;
+        self.profile_invocations +|= 1;
+        const profile_config = self.profile_config;
+        const generic_profile = profile_config.captures(invocation);
+        var profile_session: ?profile_mod.Session = if (generic_profile) profile_mod.Session.init(self.allocator, profile_config, "WebGPU program") else null;
+        defer if (profile_session) |*p| p.deinit();
+        const cpu_track = if (profile_session) |*p| p.addTrack("CPU", .host) else null;
+        const gpu_track = if (profile_session) |*p| p.addTrack("GPU", .device) else null;
+
+        var timestamp_profiler: ?TimestampProfiler = null;
+        if (generic_profile and gpu_track != null) {
+            if (self.gpu.timestamp_query) {
+                const query_capacity: u32 = @intCast(@min(@as(usize, 4096), profile_config.event_capacity *| 2));
+                timestamp_profiler = TimestampProfiler.init(self.allocator, self.gpu, query_capacity, &profile_session.?, gpu_track.?) catch null;
+            } else {
+                std.debug.print("[aion-profile] GPU track unavailable: adapter does not support timestamp-query\n", .{});
+            }
+        }
+        defer if (timestamp_profiler) |*p| p.deinit();
+
         var runner: Runner = .{
             .gb = self,
             .op_ctx = .{
@@ -490,6 +486,9 @@ pub const GpuBackend = struct {
             .frame = try Frame.init(self.allocator, self.gpu),
         };
         defer runner.frame.deinit();
+        runner.profiler = if (profile_session) |*p| p else null;
+        runner.cpu_track = cpu_track;
+        if (timestamp_profiler) |*p| runner.frame.timestamps = p;
 
         // Reuse pooled per-dispatch uniforms + cached bind groups this run. Safe:
         // the prior run ended with a readback poll, so its GPU work (and all its
@@ -499,10 +498,7 @@ pub const GpuBackend = struct {
         runner.frame.uniform_pool = &self.uniform_pool;
         if (std.c.getenv("AION_GPU_NO_CACHE") == null) runner.frame.bind_cache = &self.bind_cache;
 
-        runner.time_ops = std.c.getenv("AION_GPU_TIME_OPS") != null;
-        runner.prof_ops = std.c.getenv("AION_GPU_PROFILE_OPS") != null or runner.time_ops;
-        const profile = std.c.getenv("AION_GPU_PROFILE") != null or runner.prof_ops;
-        const t_start: u64 = if (profile) autotune.nowNs() else 0;
+        const t_start: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         // Chunked submit: flush the pending frame every SUBMIT_CHUNK steps
         // (submit WITHOUT polling — queue ordering + wgpu's cross-submit resource
@@ -523,14 +519,12 @@ pub const GpuBackend = struct {
             try runner.runStep(step);
             since_submit += 1;
             if (since_submit >= SUBMIT_CHUNK) {
-                const ts: u64 = if (runner.prof_ops) autotune.nowNs() else 0;
                 try runner.submitPending();
-                if (runner.prof_ops) runner.chunk_submit_ns += autotune.nowNs() - ts;
                 since_submit = 0;
             }
         }
 
-        const t_recorded: u64 = if (profile) autotune.nowNs() else 0;
+        const t_recorded: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         runner.frame.submit();
 
@@ -545,44 +539,20 @@ pub const GpuBackend = struct {
             }
         }
 
-        if (profile) {
-            const now = autotune.nowNs();
-            const total: u64 = now - t_start;
-            const record: u64 = t_recorded - t_start;
-            const exec: u64 = now - t_recorded;
-            var n_matmul: usize = 0;
-            for (prog.steps) |step| switch (step) {
-                .MatMulTiled, .MatMulNTTiled => n_matmul += 1,
-                else => {},
-            };
-            const f = struct {
-                fn ms(x: u64) f64 {
-                    return @as(f64, @floatFromInt(x)) / 1.0e6;
-                }
-            };
-            std.debug.print(
-                "[gpu-prof] run: {d:.3} ms (record {d:.3} + submit/readback {d:.3})  steps={d}  matmuls={d}  submits={d}\n",
-                .{ f.ms(total), f.ms(record), f.ms(exec), prog.steps.len, n_matmul, runner.frame.submits },
-            );
-            if (runner.prof_ops) {
-                inline for (@typeInfo(executable.Step).@"union".fields, 0..) |fld, i| {
-                    if (runner.op_count[i] > 0) {
-                        if (runner.time_ops)
-                            std.debug.print("[gpu-ops] {s:<28} record {d:>8.2} ms  gpu-exec {d:>9.2} ms  x{d}\n", .{ fld.name, f.ms(runner.op_ns[i]), f.ms(runner.gpu_ns[i]), runner.op_count[i] })
-                        else
-                            std.debug.print("[gpu-ops] {s:<28} {d:>9.2} ms  x{d}\n", .{ fld.name, f.ms(runner.op_ns[i]), runner.op_count[i] });
-                    }
-                }
-                std.debug.print(
-                    "[gpu-loop] body-record {d:.2} ms + cond-poll(wait) {d:.2} ms  (overlap ceiling ~= min)\n",
-                    .{ f.ms(runner.loop_body_ns), f.ms(runner.loop_cond_ns) },
-                );
-                std.debug.print(
-                    "[gpu-enc] top-level op-record above is encoder-only; chunked-submit(flush) {d:.2} ms\n",
-                    .{f.ms(runner.chunk_submit_ns)},
-                );
-            }
+        if (timestamp_profiler) |*p| {
+            p.readResults() catch |e| std.debug.print("[aion-profile] GPU timestamp read failed: {s}\n", .{@errorName(e)});
         }
+
+        const t_finished = if (generic_profile) profile_mod.nowNs() else 0;
+        if (profile_session) |*p| {
+            if (cpu_track) |track| {
+                p.recordSpan(track, .phase, "record", t_start, t_recorded);
+                p.recordSpan(track, .wait, "submit/readback", t_recorded, t_finished);
+                p.recordSpan(track, .phase, "program", t_start, t_finished);
+            }
+            p.report();
+        }
+
     }
 
     fn kindImpl(_: *anyopaque) BackendKind {

@@ -29,6 +29,10 @@ pub const KernelDesc = struct {
 pub const Built = struct {
     pipeline: c.WGPUComputePipeline,
     bgl: c.WGPUBindGroupLayout,
+    /// Stable profiler identity. Both slices outlive the pipeline cache: kernel
+    /// names are static, and generated entry names live in the executor arena.
+    kernel_name: []const u8,
+    entry_name: []const u8,
 };
 
 pub const Pipelines = struct {
@@ -91,7 +95,7 @@ pub const Pipelines = struct {
             c.wgpuComputePipelineRelease(pipeline);
             return error.ExecutionFailed;
         };
-        const built: Built = .{ .pipeline = pipeline, .bgl = bgl };
+        const built: Built = .{ .pipeline = pipeline, .bgl = bgl, .kernel_name = kernel.name, .entry_name = entry };
         const owned_key = self.allocator.dupe(u8, key) catch {
             c.wgpuBindGroupLayoutRelease(bgl);
             c.wgpuComputePipelineRelease(pipeline);

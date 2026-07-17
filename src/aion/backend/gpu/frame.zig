@@ -20,6 +20,7 @@
 const std = @import("std");
 const wgpu = @import("wgpu.zig");
 const pipelines = @import("pipelines.zig");
+const TimestampProfiler = @import("timestamp_profile.zig").TimestampProfiler;
 
 const c = wgpu.c;
 const Built = pipelines.Built;
@@ -206,6 +207,11 @@ pub const Frame = struct {
     /// AND bind groups are reused across runs (see `BindGroupCache`). Takes
     /// precedence over `uniform_pool`. Null for standalone frames.
     bind_cache: ?*BindGroupCache = null,
+    /// Optional timestamp collector. It only inserts query writes into the
+    /// existing passes; resolution follows normal frame submissions.
+    timestamps: ?*TimestampProfiler = null,
+    /// Leaf executable step currently recording dispatches.
+    profile_op: []const u8 = "unknown",
     /// Commands recorded since init — lets the backend skip a submit/sync when
     /// a control-flow host read finds nothing pending.
     records: usize = 0,
@@ -264,7 +270,7 @@ pub const Frame = struct {
         if (self.bind_cache) |cache| {
             std.debug.assert(ub_size <= UniformPool.SLOT_BYTES);
             const bg = try cache.acquire(built, buffers, buf_sizes, uniform_bytes, ub_size);
-            const pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+            const pass = self.beginComputePass(built, groups, uniform_bytes, buf_sizes);
             c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
             c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
             c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
@@ -312,13 +318,28 @@ pub const Frame = struct {
             return error.ExecutionFailed;
         };
 
-        const pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+        const pass = self.beginComputePass(built, groups, uniform_bytes, buf_sizes);
         c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
         c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
         c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
         c.wgpuComputePassEncoderEnd(pass);
         c.wgpuComputePassEncoderRelease(pass);
         self.records += 1;
+    }
+
+    fn beginComputePass(self: *Self, built: Built, groups: [3]u32, uniform_bytes: []const u8, buffer_sizes: []const u64) c.WGPUComputePassEncoder {
+        if (self.timestamps) |prof| {
+            if (prof.reserveDispatch(built, self.profile_op, groups, uniform_bytes, buffer_sizes)) |first| {
+                var writes: c.WGPUPassTimestampWrites = std.mem.zeroes(c.WGPUPassTimestampWrites);
+                writes.querySet = prof.query_set;
+                writes.beginningOfPassWriteIndex = first;
+                writes.endOfPassWriteIndex = first + 1;
+                var desc: c.WGPUComputePassDescriptor = std.mem.zeroes(c.WGPUComputePassDescriptor);
+                desc.timestampWrites = &writes;
+                return c.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
+            }
+        }
+        return c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
     }
 
     /// Record a device buffer copy. Copies are encoder-level commands, ordered
@@ -339,7 +360,13 @@ pub const Frame = struct {
     /// overlap all funnel through here.
     pub fn flushInPlace(self: *Self) FrameError!void {
         if (self.records == 0) return;
+        // Timestamp queries survive queue submissions. Resolve them only in the
+        // final encoder: partial resolve destinations require 256-byte alignment
+        // and resolving once also minimizes profiler command overhead.
+        const timestamps = self.timestamps;
+        self.timestamps = null;
         self.submit(); // finishes + releases the encoder, sets encoder = null
+        self.timestamps = timestamps;
         // The queue holds its own references to the submitted bind groups /
         // uniforms until the GPU is done, so releasing our handles now is safe.
         for (self.transient_groups.items) |g| c.wgpuBindGroupRelease(g);
@@ -353,6 +380,7 @@ pub const Frame = struct {
 
     /// Finish the encoder and submit the whole batch once.
     pub fn submit(self: *Self) void {
+        if (self.timestamps) |prof| prof.resolvePending(self.encoder);
         const cmd = c.wgpuCommandEncoderFinish(self.encoder, null);
         c.wgpuCommandEncoderRelease(self.encoder);
         self.encoder = null; // deinit() must not double-release.

@@ -289,6 +289,19 @@ pub fn build(b: *std.Build) void {
         lib_mod.addImport("wgpu", translate_lib.createModule());
     }
 
+    // Foreign hosts (a Python process, a C program) use this library without
+    // running Zig's startup code. Without libc, `std.Thread.spawn` on Linux
+    // takes the raw-clone path that depends on startup-initialized TLS state
+    // (`std.os.linux.tls.area_desc`) and crashes in any non-Zig host process.
+    // Debug asserts, ReleaseFast segfaults. Link libc so thread creation goes
+    // through pthread_create (and not raw syscall), FFI consumers final links always pull in libc
+    // anyway. (Windows needs no libc here: threads go through kernel32, and
+    // the MSVC-consumer link is configured separately below.)
+    // Maybe changed in future zig versions? Need to potentially come back tot hsi in the future.
+    if (target.result.os.tag != .windows) {
+        lib_mod.link_libc = true;
+    }
+
     const lib = b.addLibrary(.{
         .name = "aion",
         .root_module = lib_mod,

@@ -299,6 +299,12 @@ pub fn Kernel(comptime t: Tuning) type {
             @setRuntimeSafety(false);
             const lanes = LANES;
             const Vec = @Vector(lanes, f32);
+            // Packed-B rows (and the alignment-checked C rows in the fast
+            // variants) are 32-byte aligned, but the second half-vector sits
+            // `@sizeOf(Vec)` past that — for 4-lane kernels that is 16 bytes,
+            // so claiming align(32) there would be UB. This is the strongest
+            // alignment provably true for the `+ lanes` accesses.
+            const half_align: comptime_int = @min(32, @sizeOf(Vec));
 
             var acc: [MR][2]Vec = undefined;
             inline for (0..MR) |r| {
@@ -319,7 +325,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                     const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -335,7 +341,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                 const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -397,6 +403,12 @@ pub fn Kernel(comptime t: Tuning) type {
             @setRuntimeSafety(false);
             const lanes = LANES;
             const Vec = @Vector(lanes, f32);
+            // Packed-B rows (and the alignment-checked C rows in the fast
+            // variants) are 32-byte aligned, but the second half-vector sits
+            // `@sizeOf(Vec)` past that — for 4-lane kernels that is 16 bytes,
+            // so claiming align(32) there would be UB. This is the strongest
+            // alignment provably true for the `+ lanes` accesses.
+            const half_align: comptime_int = @min(32, @sizeOf(Vec));
 
             var acc: [MR][2]Vec = undefined;
             inline for (0..MR) |r| {
@@ -414,7 +426,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                 const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                 inline for (0..MR) |r| {
                     if (r < mr) {
@@ -497,8 +509,14 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = 8;
+            const lanes = LANES;
             const Vec = @Vector(lanes, f32);
+            // Packed-B rows (and the alignment-checked C rows below) are 32-byte
+            // aligned, but the second half-vector sits `@sizeOf(Vec)` past that —
+            // for 4-lane kernels that is 16 bytes, so claiming align(32) there
+            // would be UB. This is the strongest alignment provably true for the
+            // `+ lanes` accesses.
+            const half_align: comptime_int = @min(32, @sizeOf(Vec));
 
             const c_ptr_aligned32: bool = (@intFromPtr(c.ptr) & 31) == 0;
             const c_stride_aligned32: bool = (((c_stride * @sizeOf(f32)) & 31) == 0);
@@ -521,7 +539,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                     const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -536,7 +554,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                 const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -551,7 +569,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
                     @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr))).* = acc[r][0];
-                    @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1];
+                    @as(*align(half_align) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1];
                 }
             } else {
                 inline for (0..MR) |r| {
@@ -573,8 +591,14 @@ pub fn Kernel(comptime t: Tuning) type {
             idx_n: usize,
         ) void {
             @setRuntimeSafety(false);
-            const lanes = 8;
+            const lanes = LANES;
             const Vec = @Vector(lanes, f32);
+            // Packed-B rows (and the alignment-checked C rows below) are 32-byte
+            // aligned, but the second half-vector sits `@sizeOf(Vec)` past that —
+            // for 4-lane kernels that is 16 bytes, so claiming align(32) there
+            // would be UB. This is the strongest alignment provably true for the
+            // `+ lanes` accesses.
+            const half_align: comptime_int = @min(32, @sizeOf(Vec));
 
             const c_ptr_aligned32: bool = (@intFromPtr(c.ptr) & 31) == 0;
             const c_stride_aligned32: bool = (((c_stride * @sizeOf(f32)) & 31) == 0);
@@ -597,7 +621,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                     const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -612,7 +636,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
                 const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -627,9 +651,9 @@ pub fn Kernel(comptime t: Tuning) type {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
                     const c_old0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(c_row_ptr))).*;
-                    const c_old1: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).*;
+                    const c_old1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).*;
                     @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr))).* = acc[r][0] + c_old0;
-                    @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1] + c_old1;
+                    @as(*align(half_align) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1] + c_old1;
                 }
             } else {
                 inline for (0..MR) |r| {
@@ -681,4 +705,105 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// alpha*A·B + beta*C with an f64 accumulator: the lane-width-independent reference.
+fn refGemm(c: []f32, a: []const f32, b: []const f32, m: usize, n: usize, k: usize, alpha: f32, beta: f32) void {
+    var i: usize = 0;
+    while (i < m) : (i += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var s: f64 = 0.0;
+            var kk: usize = 0;
+            while (kk < k) : (kk += 1) s += @as(f64, a[i * k + kk]) * @as(f64, b[kk * n + j]);
+            c[i * n + j] = @floatCast(@as(f64, alpha) * s + @as(f64, beta) * @as(f64, c[i * n + j]));
+        }
+    }
+}
+
+/// Runs one GEMM through both packed entry points at the given lane width and
+/// checks it against the scalar reference. A canary region directly after C
+/// catches stores that run past the buffer — the failure mode of the
+/// hardcoded-8-lane microkernel bug this test regresses: non-8-lane variants
+/// are only ever *selected* on aarch64 / AVX-512 / SSE-only hosts, but they are
+/// plain generic Zig, so instantiating them directly keeps every width covered
+/// no matter what CPU the test host has.
+fn runLaneWidthCase(comptime lanes: usize, m: usize, n: usize, k: usize, alpha: f32, beta: f32) !void {
+    const allocator = testing.allocator;
+    const K = Kernel(.{ .mr = 6, .nr = 2 * lanes, .lanes = lanes, .kc = 128, .mc = 144, .nc = 128 });
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE +% m *% 31 +% n *% 7 +% k *% 3);
+    const rnd = prng.random();
+
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, k * n);
+    defer allocator.free(b);
+    for (a) |*x| x.* = rnd.float(f32) * 2.0 - 1.0;
+    for (b) |*x| x.* = rnd.float(f32) * 2.0 - 1.0;
+
+    // Deterministic non-zero initial C so beta != 0 paths are exercised.
+    const canary: f32 = 12345.5;
+    const canary_len: usize = 64;
+    const c_ref = try allocator.alloc(f32, m * n);
+    defer allocator.free(c_ref);
+    for (c_ref, 0..) |*x, idx| x.* = @as(f32, @floatFromInt(idx % 13)) * 0.05 - 0.3;
+
+    const scratch = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
+    defer allocator.free(scratch);
+    try K.packBTileF32(scratch, k, n, std.mem.sliceAsBytes(b));
+    const pb_bytes: usize = K.KC * K.NC * @sizeOf(f32);
+    const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
+
+    const panel_count: usize = (m + K.MR - 1) / K.MR;
+    const packed_a = try allocator.alignedAlloc(f32, std.mem.Alignment.fromByteUnits(32), panel_count * K.MR * K.KC);
+    defer allocator.free(packed_a);
+    try K.packATileF32(k, m, std.mem.sliceAsBytes(a), packed_a);
+
+    const params: MatMulParams = .{ .m = m, .n = n, .k = k, .alpha = alpha, .beta = beta };
+
+    const c_buf = try allocator.alloc(f32, m * n + canary_len);
+    defer allocator.free(c_buf);
+
+    const entry_points = [_]enum { packed_b, packed_ab }{ .packed_b, .packed_ab };
+    for (entry_points) |ep| {
+        for (c_buf[0 .. m * n], c_ref) |*x, init| x.* = init;
+        @memset(c_buf[m * n ..], canary);
+
+        switch (ep) {
+            .packed_b => try K.matmulF32PackedB(scratch, packed_b_view, params, std.mem.sliceAsBytes(c_buf[0 .. m * n]), std.mem.sliceAsBytes(a)),
+            .packed_ab => try K.matmulF32PackedAB(packed_a, packed_b_view, params, std.mem.sliceAsBytes(c_buf[0 .. m * n])),
+        }
+
+        for (c_buf[m * n ..]) |x| try testing.expect(x == canary);
+
+        const want = try allocator.dupe(f32, c_ref);
+        defer allocator.free(want);
+        refGemm(want, a, b, m, n, k, alpha, beta);
+        for (c_buf[0 .. m * n], want) |got, w| {
+            const tol: f32 = 2e-4 * (@abs(w) + 1.0);
+            try testing.expect(@abs(got - w) <= tol);
+        }
+    }
+}
+
+test "matmul f32: lane-width variants (4/8/16) match reference across panel/tail shapes" {
+    // Shapes chosen to hit: full 6-row blocks plus row tails, full-NR panels
+    // (where the hardcoded-lane bug overflowed into the next C row), partial
+    // column panels down to sub-lane scalar tails, and k both below and at the
+    // k-unroll boundary — for every lane width and all three fast variants
+    // (A1B0, A1B1, general alpha/beta) plus the generic tail kernel.
+    inline for (.{ 4, 8, 16 }) |lanes| {
+        try runLaneWidthCase(lanes, 16, 128, 18, 1.0, 0.0);
+        try runLaneWidthCase(lanes, 16, 128, 18, 1.0, 1.0);
+        try runLaneWidthCase(lanes, 16, 128, 18, 0.5, 2.0);
+        try runLaneWidthCase(lanes, 9, 100, 37, 1.0, 0.0);
+        try runLaneWidthCase(lanes, 3, 8, 128, 1.0, 1.0);
+    }
 }

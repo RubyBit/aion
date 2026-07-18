@@ -699,6 +699,16 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
 const testing = std.testing;
 const builtin = @import("builtin");
 
+/// Whether the `.vex` encoding can be compiled *and* executed in this build:
+/// x86_64 with the AVX-VNNI CPUID bit (the VEX-encoded `vpdpbusd` #UDs without
+/// it, even on CPUs that have AVX-512-VNNI), and a backend whose assembler
+/// knows the LLVM-only `{vex}` prefix (the self-hosted x86 backend does not).
+/// Comptime-known so that gated test bodies are fully eliminated — a runtime
+/// skip would still codegen the asm and break non-LLVM builds.
+const vex_testable: bool = builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni) and
+    builtin.zig_backend != .stage2_x86_64;
+
 fn f32ToF16Bits(x: f32) u16 {
     return @bitCast(@as(f16, @floatCast(x)));
 }
@@ -745,7 +755,7 @@ fn dequantQ8_0(allocator: std.mem.Allocator, b: []const u8, k: usize, n: usize) 
 }
 
 test "vnni dotI8: vex (unsigned×signed, +128 bias) matches portable signed after de-bias" {
-    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (comptime !vex_testable) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xABCDEF);
     const rnd = prng.random();
     var iter: usize = 0;
@@ -785,7 +795,9 @@ fn refMatmul(c: []f32, a: []const f32, w: []const f32, m: usize, n: usize, k: us
 }
 
 fn runKernelTest(comptime enc: DotEnc, m: usize, n: usize, k: usize) !void {
-    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // `.portable` runs everywhere (it already backs the i8mm reference on
+    // aarch64); only the x86 asm encodings need capability gating.
+    if (comptime enc == .vex and !vex_testable) return error.SkipZigTest;
     const allocator = testing.allocator;
     const K = Kernel(.{ .kc = 256, .nc = 256, .enc = enc });
 

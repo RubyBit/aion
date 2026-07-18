@@ -209,6 +209,11 @@ pub fn build(b: *std.Build) void {
             const tier_obj = bld.addObject(.{
                 .name = bld.fmt("aion_kernels_{s}", .{name}),
                 .root_module = tier_mod,
+                // The VNNI tiers carry inline asm using the LLVM-only `{vex}`
+                // encoding prefix, which the self-hosted x86 backend (the Debug
+                // default on Linux) cannot assemble. Tier objects are release-perf
+                // code anyway, so pin them to LLVM in every build mode.
+                .use_llvm = true,
             });
             if (want_pic) tier_obj.root_module.pic = true;
 

@@ -889,6 +889,906 @@ pub export fn aion_loaded_model_output_tensor(
     return .AION_OK;
 }
 
+// ============================================================================
+// Model authoring (Builder → compile/export)
+//
+// Mirrors the Zig `api.Builder` + `Context.compile`/`exportModel`. Values are
+// plain `AionValueId` (u32) scoped to a builder — not heap handles. All ~32 ops
+// go through ONE entry point, `aion_builder_op`, taking an `AionOpSpec` whose
+// attribute union mirrors the core `graph.zig` `Op` union field-for-field.
+// ============================================================================
+
+/// Opaque id of a value produced/consumed inside a builder. Mirrors
+/// `api.TensorRef` (which is just a `u32`).
+pub const AionValueId = u32;
+
+pub const AionUnaryOp = enum(c_int) {
+    AION_UNARY_RELU = 0,
+    AION_UNARY_GELU = 1,
+    AION_UNARY_SILU = 2,
+    AION_UNARY_SIGMOID = 3,
+    AION_UNARY_TANH = 4,
+    AION_UNARY_SQRT = 5,
+    AION_UNARY_LOG = 6,
+};
+
+pub const AionBinaryOp = enum(c_int) {
+    AION_BINARY_ADD = 0,
+    AION_BINARY_SUB = 1,
+    AION_BINARY_MUL = 2,
+    AION_BINARY_DIV = 3,
+    AION_BINARY_EQ = 4,
+    AION_BINARY_NE = 5,
+    AION_BINARY_LT = 6,
+    AION_BINARY_GT = 7,
+    AION_BINARY_LE = 8,
+    AION_BINARY_GE = 9,
+};
+
+pub const AionReduceOp = enum(c_int) {
+    AION_REDUCE_SUM = 0,
+    AION_REDUCE_MEAN = 1,
+};
+
+pub const AionPadMode = enum(c_int) {
+    AION_PAD_ZERO = 0,
+    AION_PAD_REFLECT = 1,
+};
+
+pub const AionInputRoleKind = enum(c_int) {
+    AION_ROLE_SEQUENCE_CACHE = 1,
+    AION_ROLE_CACHE_WRITE_INDEX = 2,
+    AION_ROLE_CACHE_VISIBLE_END = 3,
+    AION_ROLE_POSITIONS = 4,
+    AION_ROLE_TOKENS = 5,
+    AION_ROLE_STATE = 6,
+};
+
+/// Op selector for `aion_builder_op`. Each value pairs with the like-named
+/// member of `AionOpAttr` (ops with no attributes ignore `attr`).
+pub const AionOp = enum(c_int) {
+    AION_OP_MATMUL = 0,
+    AION_OP_MATMUL_NT = 1,
+    AION_OP_ELEMWISE = 2,
+    AION_OP_BROADCAST_LAST_DIM = 3,
+    AION_OP_UNARY = 4,
+    AION_OP_SOFTMAX = 5,
+    AION_OP_LAYERNORM = 6,
+    AION_OP_RMSNORM = 7,
+    AION_OP_ATTENTION = 8,
+    AION_OP_MHA = 9,
+    AION_OP_MHA_CACHED = 10,
+    AION_OP_RELPOS_MHA = 11,
+    AION_OP_CONV1D = 12,
+    AION_OP_CONV2D = 13,
+    AION_OP_COPY = 14,
+    AION_OP_GATHER_ROWS = 15,
+    AION_OP_ROPE1D = 16,
+    AION_OP_SEQUENCE_APPEND = 17,
+    AION_OP_REDUCE = 18,
+    AION_OP_CONCAT = 19,
+    AION_OP_RESHAPE = 20,
+    AION_OP_SQUEEZE = 21,
+    AION_OP_UNSQUEEZE = 22,
+    AION_OP_TRANSPOSE2D = 23,
+    AION_OP_SLICE = 24,
+    AION_OP_LSTM_CELL = 25,
+    AION_OP_RFFT = 26,
+    AION_OP_STFT = 27,
+    AION_OP_CAST = 28,
+    AION_OP_ARGMAX = 29,
+    AION_OP_SCATTER_ROW = 30,
+    AION_OP_GELU_MUL = 31,
+};
+
+/// Per-op attributes. Only the member matching `AionOpSpec.op` is read.
+pub const AionOpAttr = extern union {
+    matmul: extern struct { alpha: f32, beta: f32 },
+    elemwise: extern struct { op: AionBinaryOp },
+    unary: extern struct { op: AionUnaryOp },
+    softmax: extern struct { axis: i32 },
+    norm: extern struct { eps: f32, normalized_shape: [*c]const usize, normalized_shape_len: usize },
+    attention: extern struct { scale: f32, causal: u8, heads: usize },
+    mha_cached: extern struct { scale: f32, causal: u8, sliding_window: usize, attn_logits_soft_cap: f32 },
+    relpos_mha: extern struct { scale: f32, heads: usize },
+    conv1d: extern struct {
+        stride: usize,
+        dilation: usize,
+        pad_left: usize,
+        pad_right: usize,
+        groups: usize,
+        pad_mode: AionPadMode,
+    },
+    conv2d: extern struct {
+        stride_h: usize,
+        stride_w: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        pad_top: usize,
+        pad_bottom: usize,
+        pad_left: usize,
+        pad_right: usize,
+        groups: usize,
+        pad_mode: AionPadMode,
+    },
+    rope1d: extern struct { base_frequency: f32, scale_factor: f32, rope_proportion: f32 },
+    reduce: extern struct { op: AionReduceOp, axis: i32, has_axis: u8 },
+    concat: extern struct { axis: i32 },
+    reshape: extern struct { shape: [*c]const usize, shape_len: usize, shape_symbols: [*c]const [*c]const u8 },
+    squeeze: extern struct { axis: i32, has_axis: u8 },
+    unsqueeze: extern struct { axis: i32 },
+    slice: extern struct { starts: [*c]const usize, lens: [*c]const usize, len: usize, len_symbols: [*c]const [*c]const u8 },
+    stft: extern struct { n_fft: usize, hop_length: usize, center: u8 },
+    cast: extern struct { to_dtype: AionDType },
+    argmax: extern struct { axis: i32 },
+};
+
+/// A single op to append to a builder: which op, its input value ids (like a
+/// graph `Node`'s inputs), and its attributes.
+pub const AionOpSpec = extern struct {
+    op: AionOp,
+    inputs: [*c]const AionValueId,
+    inputs_len: usize,
+    attr: AionOpAttr,
+};
+
+pub const AionBuilder = struct {
+    owner: *AionContext,
+    builder: api.Builder,
+
+    outputs: std.ArrayList(api.NamedTensorRef) = .empty,
+    aliases: std.ArrayList(api.OutputAlias) = .empty,
+    roles: std.ArrayList(api.InputRoleDecl) = .empty,
+    metadata: std.ArrayList(api.ExportMetadata) = .empty,
+
+    /// Stable storage for strings duped out of caller-owned C strings that must
+    /// outlive the accumulate call (metadata, dim-symbol names, role symbols).
+    str_arena: std.heap.ArenaAllocator,
+
+    fn alloc(self: *AionBuilder) std.mem.Allocator {
+        return self.owner.allocator;
+    }
+
+    fn dupeStr(self: *AionBuilder, s: []const u8) ![]const u8 {
+        const buf = try self.str_arena.allocator().alloc(u8, s.len);
+        @memcpy(buf, s);
+        return buf;
+    }
+};
+
+fn unaryFromC(op: AionUnaryOp) types.UnaryOp {
+    return switch (op) {
+        .AION_UNARY_RELU => .relu,
+        .AION_UNARY_GELU => .gelu,
+        .AION_UNARY_SILU => .silu,
+        .AION_UNARY_SIGMOID => .sigmoid,
+        .AION_UNARY_TANH => .tanh,
+        .AION_UNARY_SQRT => .sqrt,
+        .AION_UNARY_LOG => .log,
+    };
+}
+
+fn binaryFromC(op: AionBinaryOp) types.ElemwiseBinaryOp {
+    return switch (op) {
+        .AION_BINARY_ADD => .add,
+        .AION_BINARY_SUB => .sub,
+        .AION_BINARY_MUL => .mul,
+        .AION_BINARY_DIV => .div,
+        .AION_BINARY_EQ => .eq,
+        .AION_BINARY_NE => .ne,
+        .AION_BINARY_LT => .lt,
+        .AION_BINARY_GT => .gt,
+        .AION_BINARY_LE => .le,
+        .AION_BINARY_GE => .ge,
+    };
+}
+
+fn reduceFromC(op: AionReduceOp) types.ReduceOp {
+    return switch (op) {
+        .AION_REDUCE_SUM => .sum,
+        .AION_REDUCE_MEAN => .mean,
+    };
+}
+
+fn padModeFromC(m: AionPadMode) types.PadMode {
+    return switch (m) {
+        .AION_PAD_ZERO => .zero,
+        .AION_PAD_REFLECT => .reflect,
+    };
+}
+
+/// A C string pointer (possibly null) from a symbol array -> optional slice.
+fn cStrOrNull(s: [*c]const u8) ?[]const u8 {
+    if (s == null) return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(s)));
+}
+
+fn roleKindFromC(k: AionInputRoleKind) pkg_types.InputRoleKind {
+    return switch (k) {
+        .AION_ROLE_SEQUENCE_CACHE => .sequence_cache,
+        .AION_ROLE_CACHE_WRITE_INDEX => .cache_write_index,
+        .AION_ROLE_CACHE_VISIBLE_END => .cache_visible_end,
+        .AION_ROLE_POSITIONS => .positions,
+        .AION_ROLE_TOKENS => .tokens,
+        .AION_ROLE_STATE => .state,
+    };
+}
+
+fn vref(id: AionValueId) api.TensorRef {
+    return .{ .value = id };
+}
+
+pub export fn aion_builder_create(ctx_opt: ?*AionContext, out_builder: ?*?*AionBuilder) callconv(.c) AionStatus {
+    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    ctx.clearLastError();
+    if (out_builder == null) return .AION_INVALID_ARGUMENT;
+    out_builder.?.* = null;
+
+    const b: *AionBuilder = std.heap.page_allocator.create(AionBuilder) catch {
+        ctx.setLastError("builder_alloc", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    b.* = .{
+        .owner = ctx,
+        .builder = api.Builder.init(ctx.allocator),
+        .str_arena = std.heap.ArenaAllocator.init(ctx.allocator),
+    };
+    out_builder.?.* = b;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_destroy(b_opt: ?*AionBuilder) callconv(.c) void {
+    const b: *AionBuilder = b_opt orelse return;
+    const a = b.owner.allocator;
+    b.outputs.deinit(a);
+    b.aliases.deinit(a);
+    b.roles.deinit(a);
+    b.metadata.deinit(a);
+    b.str_arena.deinit();
+    b.builder.deinit();
+    std.heap.page_allocator.destroy(b);
+}
+
+pub export fn aion_builder_input(
+    b_opt: ?*AionBuilder,
+    dtype_c: AionDType,
+    rank: usize,
+    shape_ptr: [*c]const usize,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
+    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
+    const ref = b.builder.input(dt, shape) catch |e| {
+        b.owner.setLastError("builder_input", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_param(
+    b_opt: ?*AionBuilder,
+    t_opt: ?*const AionTensor,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+    const t: *const AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
+    const ref = b.builder.param(t.tensor) catch |e| {
+        b.owner.setLastError("builder_param", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_name(b_opt: ?*AionBuilder, value: AionValueId, name: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (name == null) return .AION_INVALID_ARGUMENT;
+    _ = b.builder.name(vref(value), std.mem.span(name.?)) catch |e| {
+        b.owner.setLastError("builder_name", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+/// Authoring-time shape introspection (available thanks to eager per-op
+/// inference). Shapes reflect the authoring *placeholder* sizes: an axis declared
+/// dynamic reports the size it was declared with, propagated through derived
+/// values. Mirrors the tensor rank/shape/dtype readers.
+pub export fn aion_builder_value_rank(b_opt: ?*const AionBuilder, value: AionValueId, out_rank: ?*usize) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_rank == null) return .AION_INVALID_ARGUMENT;
+    const shape = b.builder.knownShape(vref(value)) orelse return .AION_INVALID_ARGUMENT;
+    out_rank.?.* = shape.len;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_value_shape(b_opt: ?*const AionBuilder, value: AionValueId, out_dims: [*c]usize, out_rank: usize) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_dims == null) return .AION_INVALID_ARGUMENT;
+    const shape = b.builder.knownShape(vref(value)) orelse return .AION_INVALID_ARGUMENT;
+    if (out_rank != shape.len) return .AION_INVALID_ARGUMENT;
+    @memcpy(out_dims[0..out_rank], shape);
+    return .AION_OK;
+}
+
+pub export fn aion_builder_value_dtype(b_opt: ?*const AionBuilder, value: AionValueId, out_dtype: ?*AionDType) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_dtype == null) return .AION_INVALID_ARGUMENT;
+    const dt = b.builder.dtypeOf(vref(value)) orelse return .AION_INVALID_ARGUMENT;
+    out_dtype.?.* = dtypeToC(dt);
+    return .AION_OK;
+}
+
+fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!AionValueId {
+    const bld = &b.builder;
+    const n = spec.inputs_len;
+    // Bounds helper: require at least `k` inputs.
+    const need = struct {
+        fn f(cnt: usize, k: usize, ptr: [*c]const AionValueId) api.Builder.Error!void {
+            if (cnt < k or (k > 0 and ptr == null)) return api.Builder.Error.InvalidArgument;
+        }
+    }.f;
+    const in = struct {
+        fn f(s: *const AionOpSpec, i: usize) api.TensorRef {
+            return .{ .value = s.inputs[i] };
+        }
+    }.f;
+
+    const out: api.TensorRef = switch (spec.op) {
+        .AION_OP_MATMUL => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.matmul(in(spec, 0), in(spec, 1), spec.attr.matmul.alpha, spec.attr.matmul.beta);
+        },
+        .AION_OP_MATMUL_NT => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.matmulNT(in(spec, 0), in(spec, 1), spec.attr.matmul.alpha, spec.attr.matmul.beta);
+        },
+        .AION_OP_ELEMWISE => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.elemwiseBinary(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
+        },
+        .AION_OP_BROADCAST_LAST_DIM => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.broadcastLastDim(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
+        },
+        .AION_OP_UNARY => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.unary(unaryFromC(spec.attr.unary.op), in(spec, 0));
+        },
+        .AION_OP_SOFTMAX => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.softmax(in(spec, 0), spec.attr.softmax.axis);
+        },
+        .AION_OP_LAYERNORM, .AION_OP_RMSNORM => blk: {
+            try need(n, 3, spec.inputs);
+            if (spec.attr.norm.normalized_shape == null) return api.Builder.Error.InvalidArgument;
+            const ns = spec.attr.norm.normalized_shape[0..spec.attr.norm.normalized_shape_len];
+            break :blk if (spec.op == .AION_OP_LAYERNORM)
+                try bld.layernorm(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.norm.eps, ns)
+            else
+                try bld.rmsnorm(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.norm.eps, ns);
+        },
+        .AION_OP_ATTENTION => blk: {
+            try need(n, 3, spec.inputs);
+            break :blk try bld.attention(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.attention.scale, spec.attr.attention.causal != 0);
+        },
+        .AION_OP_MHA => blk: {
+            try need(n, 3, spec.inputs);
+            break :blk try bld.mha(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.attention.scale, spec.attr.attention.causal != 0, spec.attr.attention.heads);
+        },
+        .AION_OP_MHA_CACHED => blk: {
+            try need(n, 5, spec.inputs);
+            break :blk try bld.multiHeadAttentionCached(
+                in(spec, 0),
+                in(spec, 1),
+                in(spec, 2),
+                in(spec, 3),
+                in(spec, 4),
+                spec.attr.mha_cached.scale,
+                spec.attr.mha_cached.causal != 0,
+                spec.attr.mha_cached.sliding_window,
+                spec.attr.mha_cached.attn_logits_soft_cap,
+            );
+        },
+        .AION_OP_RELPOS_MHA => blk: {
+            try need(n, 6, spec.inputs);
+            const mask: ?api.TensorRef = if (n >= 7) in(spec, 6) else null;
+            break :blk try bld.relPosMHA(
+                in(spec, 0),
+                in(spec, 1),
+                in(spec, 2),
+                in(spec, 3),
+                in(spec, 4),
+                in(spec, 5),
+                mask,
+                spec.attr.relpos_mha.scale,
+                spec.attr.relpos_mha.heads,
+            );
+        },
+        .AION_OP_CONV1D => blk: {
+            try need(n, 2, spec.inputs);
+            const bias: ?api.TensorRef = if (n >= 3) in(spec, 2) else null;
+            break :blk try bld.conv1dPadMode(
+                in(spec, 0),
+                in(spec, 1),
+                bias,
+                spec.attr.conv1d.stride,
+                spec.attr.conv1d.dilation,
+                spec.attr.conv1d.pad_left,
+                spec.attr.conv1d.pad_right,
+                padModeFromC(spec.attr.conv1d.pad_mode),
+                spec.attr.conv1d.groups,
+            );
+        },
+        .AION_OP_CONV2D => blk: {
+            try need(n, 2, spec.inputs);
+            const bias: ?api.TensorRef = if (n >= 3) in(spec, 2) else null;
+            const c = spec.attr.conv2d;
+            break :blk try bld.conv2dPadMode(
+                in(spec, 0),
+                in(spec, 1),
+                bias,
+                c.stride_h,
+                c.stride_w,
+                c.dilation_h,
+                c.dilation_w,
+                c.pad_top,
+                c.pad_bottom,
+                c.pad_left,
+                c.pad_right,
+                padModeFromC(c.pad_mode),
+                c.groups,
+            );
+        },
+        .AION_OP_COPY => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.copy(in(spec, 0));
+        },
+        .AION_OP_GATHER_ROWS => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.gatherRows(in(spec, 0), in(spec, 1));
+        },
+        .AION_OP_ROPE1D => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.rope1d(in(spec, 0), in(spec, 1), spec.attr.rope1d.base_frequency, spec.attr.rope1d.scale_factor, spec.attr.rope1d.rope_proportion);
+        },
+        .AION_OP_SEQUENCE_APPEND => blk: {
+            try need(n, 3, spec.inputs);
+            break :blk try bld.sequenceAppend(in(spec, 0), in(spec, 1), in(spec, 2));
+        },
+        .AION_OP_REDUCE => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk if (spec.attr.reduce.has_axis != 0)
+                try bld.reduceAxis(reduceFromC(spec.attr.reduce.op), in(spec, 0), spec.attr.reduce.axis)
+            else
+                try bld.reduce(reduceFromC(spec.attr.reduce.op), in(spec, 0));
+        },
+        .AION_OP_CONCAT => blk: {
+            try need(n, 1, spec.inputs);
+            if (n > 16) return api.Builder.Error.InvalidArgument;
+            var refs: [16]api.TensorRef = undefined;
+            var i: usize = 0;
+            while (i < n) : (i += 1) refs[i] = in(spec, i);
+            break :blk try bld.concat(refs[0..n], spec.attr.concat.axis);
+        },
+        .AION_OP_RESHAPE => blk: {
+            try need(n, 1, spec.inputs);
+            if (spec.attr.reshape.shape == null) return api.Builder.Error.InvalidArgument;
+            const shp = spec.attr.reshape.shape[0..spec.attr.reshape.shape_len];
+            const syms = spec.attr.reshape.shape_symbols;
+            if (syms != null) {
+                if (shp.len > 8) return api.Builder.Error.InvalidArgument;
+                var buf: [8]?[]const u8 = undefined;
+                for (0..shp.len) |i| buf[i] = cStrOrNull(syms[i]);
+                break :blk try bld.reshapeSym(in(spec, 0), shp, buf[0..shp.len]);
+            }
+            break :blk try bld.reshape(in(spec, 0), shp);
+        },
+        .AION_OP_SQUEEZE => blk: {
+            try need(n, 1, spec.inputs);
+            const axis: ?i32 = if (spec.attr.squeeze.has_axis != 0) spec.attr.squeeze.axis else null;
+            break :blk try bld.squeeze(in(spec, 0), axis);
+        },
+        .AION_OP_UNSQUEEZE => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.unsqueeze(in(spec, 0), spec.attr.unsqueeze.axis);
+        },
+        .AION_OP_TRANSPOSE2D => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.transpose2d(in(spec, 0));
+        },
+        .AION_OP_SLICE => blk: {
+            try need(n, 1, spec.inputs);
+            if (spec.attr.slice.starts == null or spec.attr.slice.lens == null) return api.Builder.Error.InvalidArgument;
+            const len = spec.attr.slice.len;
+            const starts = spec.attr.slice.starts[0..len];
+            const lens = spec.attr.slice.lens[0..len];
+            const syms = spec.attr.slice.len_symbols;
+            if (syms != null) {
+                if (len > 8) return api.Builder.Error.InvalidArgument;
+                var buf: [8]?[]const u8 = undefined;
+                for (0..len) |i| buf[i] = cStrOrNull(syms[i]);
+                break :blk try bld.sliceSym(in(spec, 0), starts, lens, buf[0..len]);
+            }
+            break :blk try bld.slice(in(spec, 0), starts, lens);
+        },
+        .AION_OP_LSTM_CELL => blk: {
+            try need(n, 5, spec.inputs);
+            const b_ih: ?api.TensorRef = if (n >= 7) in(spec, 5) else null;
+            const b_hh: ?api.TensorRef = if (n >= 7) in(spec, 6) else null;
+            break :blk try bld.lstmCell(in(spec, 0), in(spec, 1), in(spec, 2), in(spec, 3), in(spec, 4), b_ih, b_hh);
+        },
+        .AION_OP_RFFT => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.rfft(in(spec, 0));
+        },
+        .AION_OP_STFT => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.stft(in(spec, 0), in(spec, 1), spec.attr.stft.n_fft, spec.attr.stft.hop_length, spec.attr.stft.center != 0);
+        },
+        .AION_OP_CAST => blk: {
+            try need(n, 1, spec.inputs);
+            const to = dtypeFromC(spec.attr.cast.to_dtype) orelse return api.Builder.Error.InvalidArgument;
+            break :blk try bld.cast(in(spec, 0), to);
+        },
+        .AION_OP_ARGMAX => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.argmax(in(spec, 0), spec.attr.argmax.axis);
+        },
+        .AION_OP_SCATTER_ROW => blk: {
+            try need(n, 3, spec.inputs);
+            break :blk try bld.scatterRow(in(spec, 0), in(spec, 1), in(spec, 2));
+        },
+        .AION_OP_GELU_MUL => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.geluMul(in(spec, 0), in(spec, 1));
+        },
+    };
+    return out.value;
+}
+
+pub export fn aion_builder_op(b_opt: ?*AionBuilder, spec_opt: ?*const AionOpSpec, out_value: ?*AionValueId) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+    const spec: *const AionOpSpec = spec_opt orelse return .AION_INVALID_ARGUMENT;
+    const vid = builderOpImpl(b, spec) catch |e| {
+        b.owner.setLastError("builder_op", e);
+        return mapError(e);
+    };
+    out_value.?.* = vid;
+    return .AION_OK;
+}
+
+/// Region id returned by `aion_builder_end_region`, consumed by if/loop.
+pub const AionRegionId = u32;
+
+pub export fn aion_builder_begin_region(b_opt: ?*AionBuilder) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    b.builder.beginRegion() catch |e| {
+        b.owner.setLastError("begin_region", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_end_region(
+    b_opt: ?*AionBuilder,
+    outputs_ptr: [*c]const AionValueId,
+    outputs_len: usize,
+    out_region: ?*AionRegionId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_region == null) return .AION_INVALID_ARGUMENT;
+    if (outputs_len == 0 or outputs_len > 16 or outputs_ptr == null) return .AION_INVALID_ARGUMENT;
+
+    var refs: [16]api.TensorRef = undefined;
+    var i: usize = 0;
+    while (i < outputs_len) : (i += 1) refs[i] = vref(outputs_ptr[i]);
+    const rid = b.builder.endRegion(refs[0..outputs_len]) catch |e| {
+        b.owner.setLastError("end_region", e);
+        return mapError(e);
+    };
+    out_region.?.* = rid;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_if(
+    b_opt: ?*AionBuilder,
+    cond: AionValueId,
+    then_region: AionRegionId,
+    else_region: AionRegionId,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+    const ref = b.builder.ifThenElse(vref(cond), then_region, else_region) catch |e| {
+        b.owner.setLastError("builder_if", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+/// Loop. `out_values` must hold `carried_len` ids (the final carried values);
+/// single-carry loops pass `carried_len == 1`. `has_cond_carry == 0` means no
+/// continue-predicate carry.
+pub export fn aion_builder_loop(
+    b_opt: ?*AionBuilder,
+    carried_ptr: [*c]const AionValueId,
+    carried_len: usize,
+    body_region: AionRegionId,
+    trip: usize,
+    cond_carry: usize,
+    has_cond_carry: u8,
+    check_before: u8,
+    out_values: [*c]AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (carried_ptr == null or out_values == null) return .AION_INVALID_ARGUMENT;
+    if (carried_len == 0 or carried_len > 16) return .AION_INVALID_ARGUMENT;
+
+    var inits: [16]api.TensorRef = undefined;
+    var outs: [16]api.TensorRef = undefined;
+    var i: usize = 0;
+    while (i < carried_len) : (i += 1) inits[i] = vref(carried_ptr[i]);
+
+    const cc: ?usize = if (has_cond_carry != 0) cond_carry else null;
+    b.builder.loopMulti(inits[0..carried_len], body_region, trip, cc, check_before != 0, outs[0..carried_len]) catch |e| {
+        b.owner.setLastError("builder_loop", e);
+        return mapError(e);
+    };
+    i = 0;
+    while (i < carried_len) : (i += 1) out_values[i] = outs[i].value;
+    return .AION_OK;
+}
+
+pub export fn aion_builder_mark_output(b_opt: ?*AionBuilder, value: AionValueId, name: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (name == null) return .AION_INVALID_ARGUMENT;
+    // Attach the name so `compile` (which reads names off the builder) sees it,
+    // and record a NamedTensorRef (reusing the builder's duped name) for export.
+    _ = b.builder.name(vref(value), std.mem.span(name.?)) catch |e| {
+        b.owner.setLastError("mark_output", e);
+        return mapError(e);
+    };
+    const stored = b.builder.valueName(vref(value)) orelse {
+        b.owner.setLastError("mark_output", error.InvalidArgument);
+        return .AION_INTERNAL_ERROR;
+    };
+    b.outputs.append(b.alloc(), .{ .name = stored, .tensor = vref(value) }) catch {
+        b.owner.setLastError("mark_output", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_add_output_alias(b_opt: ?*AionBuilder, input_value: AionValueId, output_value: AionValueId) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    b.aliases.append(b.alloc(), .{ .input = vref(input_value), .output = vref(output_value) }) catch {
+        b.owner.setLastError("add_output_alias", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_add_input_role(
+    b_opt: ?*AionBuilder,
+    value: AionValueId,
+    kind: AionInputRoleKind,
+    axis: i32,
+    has_axis: u8,
+    capacity_symbol: ?[*:0]const u8,
+    zero_init: u8,
+    allow_growable: u8,
+    allow_ring: u8,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    const sym: ?[]const u8 = if (capacity_symbol) |s| (b.dupeStr(std.mem.span(s)) catch {
+        b.owner.setLastError("add_input_role", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    }) else null;
+    b.roles.append(b.alloc(), .{
+        .input = vref(value),
+        .kind = roleKindFromC(kind),
+        .axis = if (has_axis != 0) @as(u8, @intCast(axis)) else null,
+        .capacity_symbol = sym,
+        .zero_init = zero_init != 0,
+        .allow_growable = allow_growable != 0,
+        .allow_ring = allow_ring != 0,
+    }) catch {
+        b.owner.setLastError("add_input_role", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_add_dim_symbol(b_opt: ?*AionBuilder, value: AionValueId, axis: usize, name: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (name == null) return .AION_INVALID_ARGUMENT;
+    // The builder owns the declaration (and dupes the name into its graph arena).
+    b.builder.symbolicDim(vref(value), axis, std.mem.span(name.?)) catch |e| {
+        b.owner.setLastError("add_dim_symbol", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_add_metadata(b_opt: ?*AionBuilder, key: ?[*:0]const u8, value: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (key == null or value == null) return .AION_INVALID_ARGUMENT;
+    const k = b.dupeStr(std.mem.span(key.?)) catch return .AION_OUT_OF_MEMORY;
+    const v = b.dupeStr(std.mem.span(value.?)) catch return .AION_OUT_OF_MEMORY;
+    b.metadata.append(b.alloc(), .{ .key = k, .value = v }) catch {
+        b.owner.setLastError("add_metadata", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    return .AION_OK;
+}
+
+/// Collect the accumulated bare output refs (for `compile`). Caller frees.
+fn collectOutputRefs(b: *AionBuilder) ![]api.TensorRef {
+    const refs = try b.alloc().alloc(api.TensorRef, b.outputs.items.len);
+    for (b.outputs.items, 0..) |o, i| refs[i] = o.tensor;
+    return refs;
+}
+
+pub export fn aion_builder_compile(
+    b_opt: ?*AionBuilder,
+    device_kind: AionDeviceKind,
+    device_index: u32,
+    out_model: ?*?*AionLoadedModel,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx = b.owner;
+    ctx.clearLastError();
+    if (out_model == null) return .AION_INVALID_ARGUMENT;
+    out_model.?.* = null;
+    if (b.outputs.items.len == 0) return .AION_INVALID_ARGUMENT;
+
+    const refs = collectOutputRefs(b) catch {
+        ctx.setLastError("builder_compile", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    defer b.alloc().free(refs);
+
+    // Symbolic dims are declared on the builder (`symbolicDim`) and read there.
+    const opts: api.ExportModelOptions = .{
+        .metadata = b.metadata.items,
+        .output_aliases = b.aliases.items,
+        .input_roles = b.roles.items,
+    };
+    const model = ctx.ctx.compileOn(deviceFromC(device_kind, device_index), &b.builder, refs, opts) catch |e| {
+        ctx.setLastError("builder_compile", e);
+        return mapError(e);
+    };
+
+    const handle: *AionLoadedModel = std.heap.page_allocator.create(AionLoadedModel) catch {
+        ctx.setLastError("loaded_model_handle_alloc", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    handle.* = .{ .owner = ctx, .model = model };
+    out_model.?.* = handle;
+    return .AION_OK;
+}
+
+fn builderExportImpl(b: *AionBuilder, path: ?[*:0]const u8, absolute: bool) AionStatus {
+    const ctx = b.owner;
+    ctx.clearLastError();
+    if (path == null) return .AION_INVALID_ARGUMENT;
+    if (b.outputs.items.len == 0) return .AION_INVALID_ARGUMENT;
+
+    const opts: api.ExportModelOptions = .{
+        .metadata = b.metadata.items,
+        .output_aliases = b.aliases.items,
+        .input_roles = b.roles.items,
+    };
+    const p: []const u8 = std.mem.span(path.?);
+    (if (absolute)
+        ctx.ctx.exportModelPathAbsolute(p, &b.builder, b.outputs.items, opts)
+    else
+        ctx.ctx.exportModelPath(p, &b.builder, b.outputs.items, opts)) catch |e| {
+        ctx.setLastError("builder_export", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+pub export fn aion_builder_export_path(b_opt: ?*AionBuilder, path: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    return builderExportImpl(b, path, false);
+}
+
+pub export fn aion_builder_export_path_absolute(b_opt: ?*AionBuilder, path: ?[*:0]const u8) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    return builderExportImpl(b, path, true);
+}
+
+/// Quantize row-major f32 values into a packed-quant tensor (q8_0 today).
+pub export fn aion_tensor_quantize(
+    ctx_opt: ?*AionContext,
+    dtype_c: AionDType,
+    rank: usize,
+    shape_ptr: [*c]const usize,
+    quant_axis: usize,
+    values_ptr: [*c]const f32,
+    values_len: usize,
+    out_tensor: ?*?*AionTensor,
+) callconv(.c) AionStatus {
+    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    ctx.clearLastError();
+    if (out_tensor == null) return .AION_INVALID_ARGUMENT;
+    out_tensor.?.* = null;
+    if (values_ptr == null) return .AION_INVALID_ARGUMENT;
+
+    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
+    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
+    const values: []const f32 = values_ptr[0..values_len];
+
+    const t: api.Tensor = ctx.ctx.fromF32Quantized(dt, shape, quant_axis, values) catch |e| {
+        ctx.setLastError("tensor_quantize", e);
+        return mapError(e);
+    };
+    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+        ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    handle.* = .{ .owner = ctx, .tensor = t };
+    out_tensor.?.* = handle;
+    return .AION_OK;
+}
+
+/// Create a quantized tensor directly from pre-packed quant bytes.
+pub export fn aion_tensor_create_quant(
+    ctx_opt: ?*AionContext,
+    dtype_c: AionDType,
+    rank: usize,
+    shape_ptr: [*c]const usize,
+    quant_axis: usize,
+    packed_ptr: [*c]const u8,
+    packed_len: usize,
+    out_tensor: ?*?*AionTensor,
+) callconv(.c) AionStatus {
+    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    ctx.clearLastError();
+    if (out_tensor == null) return .AION_INVALID_ARGUMENT;
+    out_tensor.?.* = null;
+    if (packed_ptr == null) return .AION_INVALID_ARGUMENT;
+
+    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
+    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
+    if (!dt.info().is_quantized) return .AION_INVALID_ARGUMENT;
+    const packed_bytes: []const u8 = packed_ptr[0..packed_len];
+
+    const t: api.Tensor = ctx.ctx.fromPackedQuant(dt, shape, quant_axis, packed_bytes) catch |e| {
+        ctx.setLastError("tensor_create_quant", e);
+        return mapError(e);
+    };
+    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+        ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
+        return .AION_OUT_OF_MEMORY;
+    };
+    handle.* = .{ .owner = ctx, .tensor = t };
+    out_tensor.?.* = handle;
+    return .AION_OK;
+}
+
 comptime {
     // Ensure these names stay in sync with the package errors we map.
     _ = pkg_types.PackageError;

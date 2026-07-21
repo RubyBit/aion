@@ -4,6 +4,7 @@ const std = @import("std");
 const api = @import("api.zig");
 const manager_mod = @import("../storage/manager.zig");
 const package_file = @import("../storage/aion_file.zig");
+const quantize = @import("../storage/quantize.zig");
 const types = @import("../backend/types.zig");
 const fast = @import("../backend/cpu/kernels/fast_math.zig");
 
@@ -264,13 +265,13 @@ test "api: squeeze and unsqueeze roundtrip" {
     const out_s: api.Tensor = try model.outputTensorAt(1);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 3 }, out_s.getShape());
 
-    // Invalid squeeze axis (dimension != 1) is validated during infer/compile.
+    // Invalid squeeze axis (dimension != 1): with eager per-op inference this now
+    // fails at the offending op call, not at compile.
     var bld_bad = api.Builder.init(allocator);
     defer bld_bad.deinit();
     const X_bad: api.TensorRef = try bld_bad.param(x_t);
     const S_bad: api.TensorRef = try bld_bad.squeeze(X_bad, null);
-    const Bad: api.TensorRef = try bld_bad.squeeze(S_bad, 1);
-    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld_bad, &[_]api.TensorRef{Bad}, .{}));
+    try std.testing.expectError(error.ShapeMismatch, bld_bad.squeeze(S_bad, 1));
 }
 
 test "api.nn: Conv1D bind+forward" {
@@ -450,7 +451,7 @@ test "api: fromPackedQuant rejects non-quant dtype" {
     defer ctx.deinit();
 
     const dummy: [1]u8 = .{0};
-    try std.testing.expectError(error.InvalidArgument, ctx.fromPackedQuant(.f32, &[_]usize{ 1, 1 }, dummy[0..]));
+    try std.testing.expectError(error.InvalidArgument, ctx.fromPackedQuant(.f32, &[_]usize{ 1, 1 }, 0, dummy[0..]));
 }
 
 test "api.nn: mini resnet (conv/residual/linear/softmax)" {
@@ -1091,12 +1092,10 @@ test "api: recurrent state carries across cache entries with different input sha
     const Summed: api.TensorRef = try bld.reduceAxis(.sum, X, 1); // [1, 2]
     const StateOut: api.TensorRef = try bld.add(Summed, StateIn);
 
+    try bld.symbolicDim(X, 1, "S");
     try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
         .{ .name = "state_out", .tensor = StateOut },
     }, .{
-        .input_symbols = &[_]api.DimensionSymbol{
-            .{ .tensor = X, .axis = 1, .name = "S" },
-        },
         .output_aliases = &[_]api.OutputAlias{
             .{ .input = StateIn, .output = StateOut },
         },
@@ -1346,12 +1345,10 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
         const New4 = try bld.reshape(Emb, &[_]usize{ 1, 1, 1, 1 });
         const CacheOut = try bld.name(try bld.sequenceAppend(Cache, New4, WriteIdx), "next_cache");
 
+        try bld.symbolicDim(Cache, 2, "G");
         try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
             .{ .name = "next_cache", .tensor = CacheOut },
         }, .{
-            .input_symbols = &[_]api.DimensionSymbol{
-                .{ .tensor = Cache, .axis = 2, .name = "G" },
-            },
             .output_aliases = &[_]api.OutputAlias{.{ .input = Cache, .output = CacheOut }},
             .input_roles = &[_]api.InputRoleDecl{
                 .{ .input = Tokens, .kind = .tokens, .axis = 1 },
@@ -1643,8 +1640,8 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     const k_packed = try packQ8WeightKN(allocator, kv, K, Nk);
     defer allocator.free(k_packed);
 
-    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, q_packed);
-    const wk = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nk }, k_packed);
+    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, 0, q_packed);
+    const wk = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nk }, 0, k_packed);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1703,7 +1700,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     const q_back = try allocator.alloc(u8, (K / 32) * Nq * 34);
     defer allocator.free(q_back);
 
-    var scratch_q = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, zero_packed);
+    var scratch_q = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, 0, zero_packed);
     try model.readInitializerByDebugName("q", scratch_q);
     try scratch_q.readPackedQuant(q_back);
     var q_back_nonzero = false;
@@ -1713,7 +1710,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     try std.testing.expect(q_back_nonzero);
 
     // Swap "q" for an all-zero weight via write-through, then re-run.
-    const zero_w = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, zero_packed);
+    const zero_w = try load_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, Nq }, 0, zero_packed);
     try model.overwriteInitializerByDebugName("q", zero_w);
     try model.run();
 
@@ -2064,13 +2061,10 @@ test "api: exportModelPathAbsolute + loadModelPathAbsolute support symbolic shap
     const W: api.TensorRef = try bld.param(w_t);
     const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
 
+    try bld.symbolicDim(X, 0, "batch");
     try export_ctx.exportModelPathAbsolute(absolute_file_path, &bld, &[_]api.NamedTensorRef{
         .{ .name = "y", .tensor = Y },
-    }, .{
-        .input_symbols = &[_]api.DimensionSymbol{
-            .{ .tensor = X, .axis = 0, .name = "batch" },
-        },
-    });
+    }, .{});
 
     var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer load_ctx.deinit();
@@ -2767,8 +2761,8 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     const Pos: api.TensorRef = try bld.param(pos_t);
     const End: api.TensorRef = try bld.param(end_t);
 
-    const Out: api.TensorRef = try bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0);
-    try std.testing.expectError(error.ShapeMismatch, ctx.compile(&bld, &[_]api.TensorRef{Out}, .{}));
+    // H_q (3) % H_kv (2) != 0: eager per-op inference rejects this at the op call.
+    try std.testing.expectError(error.ShapeMismatch, bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0));
 }
 
 /// Dequantize a `[K, N]` q8_0 weight packed by `packQ8WeightKN` back to f32.
@@ -2811,7 +2805,7 @@ test "api: export/load keeps q8_0 weights packed (dtype + byte size) and runs" {
     var bias: [M * N]f32 = undefined;
     for (&bias, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.5;
 
-    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, w_packed);
+    const wq = try export_ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, w_packed);
     const bf = try export_ctx.fromF32(&[_]usize{ M, N }, &bias);
 
     var bld = api.Builder.init(allocator);
@@ -2978,4 +2972,300 @@ test "api: exportModel + loadModel roundtrip for Loop control-flow model" {
     }
     // 1.0 + 2.0 * 4 trips = 9.0 (matches graph-level loop test).
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), vals[0], 1e-6);
+}
+
+test "api: fromF32Quantized authors a q8_0 matmul matching the dequant reference" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 64;
+    const N: usize = 32;
+    const M: usize = 2;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // Float weight authored the idiomatic way: pass f32, the core quantizes.
+    const wv = try allocator.alloc(f32, K * N);
+    defer allocator.free(wv);
+    for (wv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.07;
+
+    const wq = try ctx.fromF32Quantized(.q8_0, &[_]usize{ K, N }, 0, wv);
+    try std.testing.expectEqual(types.DType.q8_0, wq.getDType());
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ M, K }), "x");
+    const W = try bld.param(wq);
+    const Y = try bld.matmul(X, W, 1.0, 0.0);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
+    defer model.deinit();
+
+    var xv: [M * K]f32 = undefined;
+    for (&xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+    const x_t = try ctx.fromF32(&[_]usize{ M, K }, &xv);
+    try model.bindInput("x", x_t);
+    try model.run();
+
+    var got: [M * N]f32 = undefined;
+    {
+        const t = try model.runOutputTensor(0);
+        try t.read(&got);
+    }
+
+    // Reference: dequantize the SAME packed bytes the core produced and matmul.
+    const w_packed = try quantize.quantizeF32(allocator, .q8_0, &[_]usize{ K, N }, 0, wv);
+    defer allocator.free(w_packed);
+    const w_deq = try dequantQ8KN(allocator, w_packed, K, N);
+    defer allocator.free(w_deq);
+    for (0..M) |m| {
+        for (0..N) |j| {
+            var acc: f32 = 0;
+            for (0..K) |kk| acc += xv[m * K + kk] * w_deq[kk * N + j];
+            try std.testing.expectApproxEqAbs(acc, got[m * N + j], 1e-3);
+        }
+    }
+}
+
+test "api: builder op-parity wrappers compile and run (cast / geluMul / elemwiseBinary)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const N: usize = 4;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    // a (f16 input, cast to f32), b, c: y = (a_f32 - b) * c, then gelu(y)*c.
+    const A = try bld.name(try bld.input(.f16, &[_]usize{ 1, N }), "a");
+    const B = try bld.name(try bld.input(.f32, &[_]usize{ 1, N }), "b");
+    const C = try bld.name(try bld.input(.f32, &[_]usize{ 1, N }), "c");
+    const a_f32 = try bld.cast(A, .f32);
+    const diff = try bld.elemwiseBinary(.sub, a_f32, B);
+    const scaled = try bld.mul(diff, C);
+    const Y = try bld.geluMul(scaled, C);
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
+    defer model.deinit();
+
+    var av: [N]f16 = undefined;
+    for (&av, 0..) |*v, i| v.* = @floatFromInt(i + 2);
+    var bv: [N]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+    var cv: [N]f32 = .{ 0.5, 0.5, 0.5, 0.5 };
+    const a_t = try ctx.fromF16(&[_]usize{ 1, N }, &av);
+    const b_t = try ctx.fromF32(&[_]usize{ 1, N }, &bv);
+    const c_t = try ctx.fromF32(&[_]usize{ 1, N }, &cv);
+    try model.bindInput("a", a_t);
+    try model.bindInput("b", b_t);
+    try model.bindInput("c", c_t);
+    try model.run();
+
+    var got: [N]f32 = undefined;
+    {
+        const t = try model.runOutputTensor(0);
+        try t.read(&got);
+    }
+    for (0..N) |i| {
+        const scaled_v: f32 = (@as(f32, @floatCast(av[i])) - bv[i]) * cv[i];
+        const gelu: f32 = 0.5 * scaled_v * (1.0 + std.math.tanh(0.7978845608 * (scaled_v + 0.044715 * scaled_v * scaled_v * scaled_v)));
+        try std.testing.expectApproxEqAbs(gelu * cv[i], got[i], 2e-2);
+    }
+}
+
+test "api: builder control-flow wrappers compile and run (If + Loop, in-process)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // If: select then/else by an i32 cond, all via Builder region wrappers.
+    {
+        var bld = api.Builder.init(allocator);
+        defer bld.deinit();
+        const cond = try bld.name(try bld.input(.i32, &[_]usize{1}), "cond");
+        const then_v = try bld.name(try bld.input(.f32, &[_]usize{1}), "then_v");
+        const else_v = try bld.name(try bld.input(.f32, &[_]usize{1}), "else_v");
+        try bld.beginRegion();
+        const tr = try bld.endRegion(&[_]api.TensorRef{then_v});
+        try bld.beginRegion();
+        const er = try bld.endRegion(&[_]api.TensorRef{else_v});
+        const out = try bld.name(try bld.ifThenElse(cond, tr, er), "out");
+
+        var model = try ctx.compile(&bld, &[_]api.TensorRef{out}, .{});
+        defer model.deinit();
+        try model.bindInput("cond", try ctx.vector([_]i32{1}));
+        try model.bindInput("then_v", try ctx.vector([_]f32{42.0}));
+        try model.bindInput("else_v", try ctx.vector([_]f32{7.0}));
+        try model.run();
+        var v: [1]f32 = undefined;
+        try (try model.outputTensor("out")).read(&v);
+        try std.testing.expectApproxEqAbs(@as(f32, 42.0), v[0], 1e-6);
+    }
+
+    // Loop: carried += inc, 4 trips → 1 + 2*4 = 9.
+    {
+        var bld = api.Builder.init(allocator);
+        defer bld.deinit();
+        const carried = try bld.name(try bld.input(.f32, &[_]usize{1}), "carried");
+        const inc = try bld.name(try bld.input(.f32, &[_]usize{1}), "inc");
+        try bld.beginRegion();
+        const next = try bld.add(carried, inc);
+        const body = try bld.endRegion(&[_]api.TensorRef{next});
+        const out = try bld.name(try bld.loop(carried, body, 4), "out");
+
+        var model = try ctx.compile(&bld, &[_]api.TensorRef{out}, .{});
+        defer model.deinit();
+        try model.bindInput("carried", try ctx.vector([_]f32{1.0}));
+        try model.bindInput("inc", try ctx.vector([_]f32{2.0}));
+        try model.run();
+        var v: [1]f32 = undefined;
+        try (try model.outputTensor("out")).read(&v);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.0), v[0], 1e-6);
+    }
+}
+
+test "api: symbolic input dim lets one compiled model serve multiple shapes" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 4;
+    const N: usize = 3;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    // `x` has a symbolic row count ("seq"). WHY THIS MATTERS: the model is compiled
+    // ONCE, yet runs for any number of rows — e.g. a transformer prefill (many
+    // tokens) followed by decode (one token at a time) reuse the same compiled
+    // model (and its state), instead of recompiling per sequence length. The
+    // declared row count (1) is just a placeholder for the free axis.
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, K }), "x");
+    var wv: [K * N]f32 = undefined;
+    for (&wv, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+    const W = try bld.param(try ctx.fromF32(&[_]usize{ K, N }, &wv));
+    const Y = try bld.name(try bld.matmul(X, W, 1.0, 0.0), "y");
+
+    try bld.symbolicDim(X, 0, "seq");
+    var model = try ctx.compileOn(.cpu, &bld, &[_]api.TensorRef{Y}, .{});
+    defer model.deinit();
+
+    const runFor = struct {
+        fn go(c: *api.Context, m: *api.Model, comptime M: usize, w: []const f32) !void {
+            var xv: [M * K]f32 = undefined;
+            for (&xv, 0..) |*v, i| v.* = @floatFromInt(@as(i32, @intCast(i % 7)) - 3);
+            try m.bindInput("x", try c.fromF32(&[_]usize{ M, K }, &xv));
+            try m.run();
+            var got: [M * N]f32 = undefined;
+            try (try m.outputTensor("y")).read(&got);
+            for (0..M) |mm| {
+                for (0..N) |n| {
+                    var acc: f32 = 0;
+                    for (0..K) |k| acc += xv[mm * K + k] * w[k * N + n];
+                    try std.testing.expectApproxEqAbs(acc, got[mm * N + n], 1e-4);
+                }
+            }
+        }
+    }.go;
+
+    // Same compiled model, three different row counts — no recompile from scratch.
+    try runFor(&ctx, &model, 2, &wv);
+    try runFor(&ctx, &model, 5, &wv);
+    try runFor(&ctx, &model, 1, &wv);
+}
+
+test "api: symbolic compile still optimizes (parallel projections fuse) across shapes" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 8;
+    const Nq: usize = 4;
+    const Nk: usize = 4;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    // Two projections off a SHARED input with a symbolic row count. The
+    // horizontal-matmul fusion pass runs during each per-shape compile (it is NOT
+    // disabled for symbolic models); outputs must stay correct at every shape.
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, K }), "x");
+    var wqv: [K * Nq]f32 = undefined;
+    for (&wqv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.1;
+    var wkv: [K * Nk]f32 = undefined;
+    for (&wkv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    const Wq = try bld.param(try ctx.fromF32(&[_]usize{ K, Nq }, &wqv));
+    const Wk = try bld.param(try ctx.fromF32(&[_]usize{ K, Nk }, &wkv));
+    const Q = try bld.matmul(X, Wq, 1.0, 0.0);
+    const Kp = try bld.matmul(X, Wk, 1.0, 0.0);
+    const Y = try bld.name(try bld.concat(&[_]api.TensorRef{ Q, Kp }, 1), "y");
+
+    try bld.symbolicDim(X, 0, "seq");
+    var model = try ctx.compileOn(.cpu, &bld, &[_]api.TensorRef{Y}, .{});
+    defer model.deinit();
+
+    const check = struct {
+        fn go(c: *api.Context, m: *api.Model, comptime M: usize, wq: []const f32, wk: []const f32) !void {
+            var xv: [M * K]f32 = undefined;
+            for (&xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.1;
+            try m.bindInput("x", try c.fromF32(&[_]usize{ M, K }, &xv));
+            try m.run();
+            var got: [M * (Nq + Nk)]f32 = undefined;
+            try (try m.outputTensor("y")).read(&got);
+            for (0..M) |mm| {
+                for (0..Nq) |n| {
+                    var acc: f32 = 0;
+                    for (0..K) |k| acc += xv[mm * K + k] * wq[k * Nq + n];
+                    try std.testing.expectApproxEqAbs(acc, got[mm * (Nq + Nk) + n], 1e-4);
+                }
+                for (0..Nk) |n| {
+                    var acc: f32 = 0;
+                    for (0..K) |k| acc += xv[mm * K + k] * wk[k * Nk + n];
+                    try std.testing.expectApproxEqAbs(acc, got[mm * (Nq + Nk) + Nq + n], 1e-4);
+                }
+            }
+        }
+    }.go;
+
+    try check(&ctx, &model, 2, &wqv, &wkv);
+    try check(&ctx, &model, 3, &wqv, &wkv);
+}
+
+test "api: eager inference exposes shapes during authoring (placeholder propagates)" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    // Declare a dynamic row axis with placeholder 8. Eager inference resolves the
+    // whole graph at the placeholder, so shapes are queryable while authoring and
+    // the placeholder propagates deterministically to derived values.
+    const X = try bld.input(.f32, &[_]usize{ 8, 4 });
+    try bld.symbolicDim(X, 0, "seq");
+    var wv: [4 * 3]f32 = undefined;
+    for (&wv, 0..) |*v, i| v.* = @floatFromInt(i);
+    const W = try bld.param(try ctx.fromF32(&[_]usize{ 4, 3 }, &wv));
+    const Y = try bld.matmul(X, W, 1.0, 0.0);
+
+    // Input shape = placeholder.
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 8, 4 }, bld.knownShape(X).?);
+    // Derived shape is known immediately (no compile needed) and carries the
+    // placeholder on the dynamic axis.
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 8, 3 }, bld.knownShape(Y).?);
+    try std.testing.expectEqual(types.DType.f32, bld.dtypeOf(Y).?);
+}
+
+test "api: eager inference reports a shape error at the offending op" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(allocator);
+    defer bld.deinit();
+
+    const A = try bld.input(.f32, &[_]usize{ 2, 4 });
+    var wv: [3 * 3]f32 = undefined; // K=3 mismatches A's K=4
+    for (&wv, 0..) |*v, i| v.* = @floatFromInt(i);
+    const W = try bld.param(try ctx.fromF32(&[_]usize{ 3, 3 }, &wv));
+    // The error is raised right here, not deferred to compile.
+    try std.testing.expectError(error.ShapeMismatch, bld.matmul(A, W, 1.0, 0.0));
 }

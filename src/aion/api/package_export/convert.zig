@@ -76,7 +76,15 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .Cast => |ct| .{ .Cast = .{ .to_dtype = ct.to_dtype } },
         .MatMulNT => |mm| .{ .MatMulNT = .{ .alpha = mm.alpha, .beta = mm.beta } },
         .If => |iff| .{ .If = .{ .then_region = iff.then_region, .else_region = iff.else_region } },
-        .Loop => |lp| .{ .Loop = .{ .body_region = lp.body_region, .static_max_trip_count = lp.static_max_trip_count } },
+        // `extra_outputs` (outputs 1..N) is filled from the node's extra outputs
+        // by the caller (collectNodeSlice), which has the Node; here we carry the
+        // op's scalar loop attributes.
+        .Loop => |lp| .{ .Loop = .{
+            .body_region = lp.body_region,
+            .static_max_trip_count = lp.static_max_trip_count,
+            .cond_carry = if (lp.cond_carry) |c| @intCast(c) else null,
+            .check_before = lp.check_before,
+        } },
     };
     return out;
 }

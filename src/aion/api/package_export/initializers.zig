@@ -27,7 +27,7 @@ pub fn exportInitializer(
                 .logical_dtype = .f32,
                 .block_elems = @intCast(tensor.dtype.info().block_elems),
                 .block_bytes = @intCast(tensor.dtype.info().block_bytes),
-                .quant_axis = 0,
+                .quant_axis = @intCast(tensor.quant_axis),
                 .params = params,
             } },
             .data = data,

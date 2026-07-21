@@ -34,7 +34,8 @@ Dependencies:
 Notes:
 - The exported package supports a symbolic batch dimension named "batch".
 - Weight dtypes are exported as f32.
-- Serialization is delegated to `scripts/_aion_writer.py` (shared with Gemma).
+- Authored via the C-ABI `aion.Builder`; serialization is done by the Zig core
+  through `Builder.export()` (no pure-Python writer).
 """
 
 from __future__ import annotations
@@ -47,7 +48,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from aion._writer import format as aw
+import aion
+from aion import Builder
+from aion.enums import AionInputRoleKind
 
 
 def _load_safetensors_numpy(path: str) -> Dict[str, np.ndarray]:
@@ -208,14 +211,18 @@ def extract_weights(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
 # ----------------------------- Graph construction ----------------------------
 
 
-def build_tiny_silero_aion_package(
+def build_silero(
+    b: Builder,
     weights: Dict[str, np.ndarray],
     num_samples: int,
     context_size: int,
-    pad_mode: int,
+    pad_mode: str,
     stft_pad_right: int,
-) -> aw.Package:
-    # Model constants (match examples/silero_vad.zig)
+) -> None:
+    """Author the Silero VAD graph on `b` and mark its outputs/roles/aliases.
+
+    Matches examples/silero_vad.zig: NLC Conv1D (weight [k, cin, cout]), a symbolic
+    batch axis, and io-aliased zero-init LSTM state (h/c)."""
     n_fft = 256
     stride = 128
     cutoff = (n_fft // 2) + 1
@@ -223,228 +230,69 @@ def build_tiny_silero_aion_package(
     chunk_input_len = int(num_samples + context_size)
     if chunk_input_len < n_fft:
         raise ValueError("chunk_input_len must be >= 256")
-
     if stft_pad_right < 0:
         raise ValueError("stft_pad_right must be >= 0")
 
     padded_len = chunk_input_len + int(stft_pad_right)
-    numer = padded_len - n_fft
-    t_steps = (numer // stride) + 1
+    t_steps = ((padded_len - n_fft) // stride) + 1
     if t_steps <= 0:
         raise ValueError("invalid t_steps")
 
-    # Symbolic batch.
-    dim_symbols = ["batch"]
-    # dim_exprs: one expr 0 = symbol 0.
-    dim_exprs_symbol_indices = [0]
-    batch_expr_index = 0
+    # Inputs (axis 0 is the symbolic batch; placeholder size 1).
+    x = b.input((1, chunk_input_len), dynamic={0: "batch"}).rename("x")
+    h = b.input((1, 128), dynamic={0: "batch"}).rename("h")
+    c = b.input((1, 128), dynamic={0: "batch"}).rename("c")
 
-    initializers: List[aw.Initializer] = []
-    values: List[aw.ValueRecord] = []
-    nodes: List[aw.NodeRecord] = []
-    debug_names: List[aw.DebugName] = []
+    # Weights (f32 params).
+    p = {name: b.param(weights[name]) for name in WEIGHT_ORDER}
 
-    # Keep rank bookkeeping just for sanity / signature correctness.
-    ranks: Dict[int, int] = {}
+    # Forward graph.
+    x3 = b.unsqueeze(x, 2)
+    stft = b.conv1d(x3, p["stft_w"], stride=128, dilation=1,
+                    pad_left=0, pad_right=int(stft_pad_right), pad_mode=pad_mode, groups=1)
 
-    def add_public_input(name: str, shape: Tuple[int, ...], batch_symbol: bool) -> int:
-        vid = len(values)
-        st = aw.shape_terms_for(shape, batch_expr_index if batch_symbol else None)
-        values.append(
-            aw.ValueRecord(
-                dtype=aw.DType.f32,
-                rank=len(shape),
-                source=aw.ValueSource.public_input,
-                shape_terms=st,
-                initializer_index=None,
-            )
-        )
-        ranks[vid] = len(shape)
-        debug_names.append(aw.DebugName(value=vid, name=name))
-        return vid
+    # real/imag halves; the batch axis length is symbolic.
+    real = b.slice(stft, (0, 0, 0), ("batch", t_steps, cutoff))
+    imag = b.slice(stft, (0, 0, cutoff), ("batch", t_steps, cutoff))
+    mag = b.mul(real, real)
+    mag = b.add(mag, b.mul(imag, imag))
+    mag = b.unary("sqrt", mag)
 
-    def add_initializer_value(name: str, array: np.ndarray) -> int:
-        nonlocal initializers
-        arr = np.ascontiguousarray(array.astype(np.float32, copy=False))
-        data = arr.astype("<f4", copy=False).tobytes(order="C")
-        init_idx = len(initializers)
-        initializers.append(aw.Initializer.plain(aw.DType.f32, data))
+    def conv_relu(inp, w, bias, *, stride, pad):
+        out = b.conv1d(inp, p[w], p[bias], stride=stride, dilation=1,
+                       pad_left=pad, pad_right=pad, pad_mode="zero", groups=1)
+        return b.unary("relu", out)
 
-        vid = len(values)
-        st = aw.shape_terms_for(tuple(int(x) for x in arr.shape))
-        values.append(
-            aw.ValueRecord(
-                dtype=aw.DType.f32,
-                rank=arr.ndim,
-                source=aw.ValueSource.initializer,
-                shape_terms=st,
-                initializer_index=init_idx,
-            )
-        )
-        ranks[vid] = arr.ndim
-        debug_names.append(aw.DebugName(value=vid, name=name))
-        return vid
+    c1 = conv_relu(mag, "conv1_w", "conv1_b", stride=1, pad=1)
+    c2 = conv_relu(c1, "conv2_w", "conv2_b", stride=2, pad=1)
+    c3 = conv_relu(c2, "conv3_w", "conv3_b", stride=2, pad=1)
+    c4 = conv_relu(c3, "conv4_w", "conv4_b", stride=1, pad=1)
 
-    def add_produced_value(rank: int) -> int:
-        vid = len(values)
-        values.append(
-            aw.ValueRecord(
-                dtype=aw.DType.f32,
-                rank=rank,
-                source=aw.ValueSource.produced,
-                shape_terms=aw.u32(0),
-                initializer_index=None,
-            )
-        )
-        ranks[vid] = rank
-        return vid
+    features = b.squeeze(c4, 1)  # [batch, 128]
 
-    def emit(kind: int, inputs: List[int], attr: bytes, out_rank: int) -> int:
-        out_vid = add_produced_value(out_rank)
-        nodes.append(aw.NodeRecord(kind=kind, output=out_vid, inputs=inputs, attr=attr))
-        return out_vid
+    packed = b.lstm_cell(features, h, c, p["lstm_w_ih"], p["lstm_w_hh"], p["lstm_b_ih"], p["lstm_b_hh"])
+    h_t = b.slice(packed, (0, 0), ("batch", 128)).rename("next_h")
+    c_t = b.slice(packed, (0, 128), ("batch", 128)).rename("next_c")
 
-    # Inputs
-    x = add_public_input("x", (1, chunk_input_len), batch_symbol=True)
-    h = add_public_input("h", (1, 128), batch_symbol=True)
-    c = add_public_input("c", (1, 128), batch_symbol=True)
+    act = b.unary("relu", b.unsqueeze(h_t, 1))
+    logits = b.conv1d(act, p["final_w"], p["final_b"], stride=1, dilation=1,
+                      pad_left=0, pad_right=0, pad_mode="zero", groups=1)
+    probs = b.unary("sigmoid", logits)
+    probs = b.squeeze(probs, 2)               # [batch, 1]
+    probs = b.reduce("mean", probs, axis=1)   # [batch]
+    probs = b.unsqueeze(probs, 1).rename("prob")  # [batch, 1]
 
-    # Weights (as initializer-backed values)
-    stft_w = add_initializer_value("stft_w", weights["stft_w"])
+    b.mark_output(probs, "prob")
+    b.mark_output(h_t, "next_h")
+    b.mark_output(c_t, "next_c")
 
-    conv1_w = add_initializer_value("conv1_w", weights["conv1_w"])
-    conv1_b = add_initializer_value("conv1_b", weights["conv1_b"])
-    conv2_w = add_initializer_value("conv2_w", weights["conv2_w"])
-    conv2_b = add_initializer_value("conv2_b", weights["conv2_b"])
-    conv3_w = add_initializer_value("conv3_w", weights["conv3_w"])
-    conv3_b = add_initializer_value("conv3_b", weights["conv3_b"])
-    conv4_w = add_initializer_value("conv4_w", weights["conv4_w"])
-    conv4_b = add_initializer_value("conv4_b", weights["conv4_b"])
+    # io-aliased zero-init recurrent LSTM state.
+    b.add_input_role(h, AionInputRoleKind.AION_ROLE_STATE, zero_init=True)
+    b.add_input_role(c, AionInputRoleKind.AION_ROLE_STATE, zero_init=True)
+    b.add_output_alias(h, h_t)
+    b.add_output_alias(c, c_t)
 
-    lstm_w_ih = add_initializer_value("lstm_w_ih", weights["lstm_w_ih"])
-    lstm_w_hh = add_initializer_value("lstm_w_hh", weights["lstm_w_hh"])
-    lstm_b_ih = add_initializer_value("lstm_b_ih", weights["lstm_b_ih"])
-    lstm_b_hh = add_initializer_value("lstm_b_hh", weights["lstm_b_hh"])
-
-    final_w = add_initializer_value("final_w", weights["final_w"])
-    final_b = add_initializer_value("final_b", weights["final_b"])
-
-    # Forward graph (matches examples/silero_vad.zig)
-    x3 = emit(aw.NodeKind.ViewUnsqueeze, [x], aw.attr_view_unsqueeze(2), out_rank=3)
-
-    stft = emit(
-        aw.NodeKind.Conv1D,
-        [x3, stft_w],
-        aw.attr_conv1d(
-            stride=128,
-            dilation=1,
-            pad_left=0,
-            pad_right=int(stft_pad_right),
-            pad_mode=pad_mode,
-            groups=1,
-        ),
-        out_rank=3,
-    )
-
-    # real/imag slices with dynamic batch lens via shape terms.
-    lens3 = [aw.shape_term_expr(batch_expr_index), aw.shape_term_constant(t_steps), aw.shape_term_constant(cutoff)]
-    real = emit(aw.NodeKind.ViewSliceND, [stft], aw.attr_view_slice_nd([0, 0, 0], lens3), out_rank=3)
-    imag = emit(aw.NodeKind.ViewSliceND, [stft], aw.attr_view_slice_nd([0, 0, cutoff], lens3), out_rank=3)
-
-    r2 = emit(aw.NodeKind.ElemwiseBinary, [real, real], aw.attr_binary(aw.ElemwiseBinaryOp.mul), out_rank=3)
-    im2 = emit(aw.NodeKind.ElemwiseBinary, [imag, imag], aw.attr_binary(aw.ElemwiseBinaryOp.mul), out_rank=3)
-    mag2 = emit(aw.NodeKind.ElemwiseBinary, [r2, im2], aw.attr_binary(aw.ElemwiseBinaryOp.add), out_rank=3)
-    mag = emit(aw.NodeKind.Unary, [mag2], aw.attr_unary(aw.UnaryOp.sqrt), out_rank=3)
-
-    conv1_out = emit(
-        aw.NodeKind.Conv1D,
-        [mag, conv1_w, conv1_b],
-        aw.attr_conv1d(stride=1, dilation=1, pad_left=1, pad_right=1, pad_mode=aw.PadMode.zero, groups=1),
-        out_rank=3,
-    )
-    c1 = emit(aw.NodeKind.Unary, [conv1_out], aw.attr_unary(aw.UnaryOp.relu), out_rank=3)
-
-    conv2_out = emit(
-        aw.NodeKind.Conv1D,
-        [c1, conv2_w, conv2_b],
-        aw.attr_conv1d(stride=2, dilation=1, pad_left=1, pad_right=1, pad_mode=aw.PadMode.zero, groups=1),
-        out_rank=3,
-    )
-    c2 = emit(aw.NodeKind.Unary, [conv2_out], aw.attr_unary(aw.UnaryOp.relu), out_rank=3)
-
-    conv3_out = emit(
-        aw.NodeKind.Conv1D,
-        [c2, conv3_w, conv3_b],
-        aw.attr_conv1d(stride=2, dilation=1, pad_left=1, pad_right=1, pad_mode=aw.PadMode.zero, groups=1),
-        out_rank=3,
-    )
-    c3 = emit(aw.NodeKind.Unary, [conv3_out], aw.attr_unary(aw.UnaryOp.relu), out_rank=3)
-
-    conv4_out = emit(
-        aw.NodeKind.Conv1D,
-        [c3, conv4_w, conv4_b],
-        aw.attr_conv1d(stride=1, dilation=1, pad_left=1, pad_right=1, pad_mode=aw.PadMode.zero, groups=1),
-        out_rank=3,
-    )
-    c4 = emit(aw.NodeKind.Unary, [conv4_out], aw.attr_unary(aw.UnaryOp.relu), out_rank=3)
-
-    features = emit(aw.NodeKind.ViewSqueeze, [c4], aw.attr_view_squeeze(1), out_rank=2)
-
-    packed_state = emit(
-        aw.NodeKind.LSTMCell,
-        [features, h, c, lstm_w_ih, lstm_w_hh, lstm_b_ih, lstm_b_hh],
-        aw.attr_lstm(True),
-        out_rank=2,
-    )
-
-    # Slice packed state [batch, 2*hidden] into h and c.
-    lens2_h = [aw.shape_term_expr(batch_expr_index), aw.shape_term_constant(128)]
-    h_t = emit(aw.NodeKind.ViewSliceND, [packed_state], aw.attr_view_slice_nd([0, 0], lens2_h), out_rank=2)
-    c_t = emit(aw.NodeKind.ViewSliceND, [packed_state], aw.attr_view_slice_nd([0, 128], lens2_h), out_rank=2)
-
-    h3 = emit(aw.NodeKind.ViewUnsqueeze, [h_t], aw.attr_view_unsqueeze(1), out_rank=3)
-    act = emit(aw.NodeKind.Unary, [h3], aw.attr_unary(aw.UnaryOp.relu), out_rank=3)
-
-    logits3 = emit(
-        aw.NodeKind.Conv1D,
-        [act, final_w, final_b],
-        aw.attr_conv1d(stride=1, dilation=1, pad_left=0, pad_right=0, pad_mode=aw.PadMode.zero, groups=1),
-        out_rank=3,
-    )
-
-    probs3 = emit(aw.NodeKind.Unary, [logits3], aw.attr_unary(aw.UnaryOp.sigmoid), out_rank=3)
-    probs2 = emit(aw.NodeKind.ViewSqueeze, [probs3], aw.attr_view_squeeze(2), out_rank=2)
-    probs1 = emit(aw.NodeKind.Reduce, [probs2], aw.attr_reduce(aw.ReduceOp.mean, axis=1), out_rank=1)
-    probs = emit(aw.NodeKind.ViewUnsqueeze, [probs1], aw.attr_view_unsqueeze(1), out_rank=2)
-
-    # Signatures.
-    inputs = [aw.NamedValue("x", x), aw.NamedValue("h", h), aw.NamedValue("c", c)]
-    outputs = [aw.NamedValue("prob", probs), aw.NamedValue("next_h", h_t), aw.NamedValue("next_c", c_t)]
-
-    # I/O aliases: h -> next_h, c -> next_c (indices within signatures).
-    io_aliases = [aw.IoAlias(input_index=1, output_index=1), aw.IoAlias(input_index=2, output_index=2)]
-
-    # The LSTM state is generic zero-init recurrent state (auto-zeroed + carried).
-    input_roles = [
-        aw.InputRole(input_index=1, kind=aw.RoleKind.state),
-        aw.InputRole(input_index=2, kind=aw.RoleKind.state),
-    ]
-
-    metadata = [aw.MetadataEntry(key="arch", value="tiny-silero-vad")]
-
-    return aw.Package(
-        initializers=initializers,
-        values=values,
-        nodes=nodes,
-        inputs=inputs,
-        outputs=outputs,
-        dim_symbols=dim_symbols,
-        dim_exprs_symbol_indices=dim_exprs_symbol_indices,
-        metadata=metadata,
-        debug_names=debug_names,
-        io_aliases=io_aliases,
-        input_roles=input_roles,
-    )
+    b.add_metadata("arch", "tiny-silero-vad")
 
 
 def main(argv: Sequence[str]) -> int:
@@ -473,16 +321,18 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     w = extract_weights(state)
-    pad_mode = aw.PadMode.reflect if args.pad_mode == "reflect" else aw.PadMode.zero
 
-    pkg = build_tiny_silero_aion_package(
-        w,
-        num_samples=args.num_samples,
-        context_size=args.context,
-        pad_mode=pad_mode,
-        stft_pad_right=args.stft_pad_right,
-    )
-    aw.write_aion_v4(args.out_aion, pkg)
+    with aion.Context(thread_count=1) as ctx:
+        with Builder(ctx) as b:
+            build_silero(
+                b,
+                w,
+                num_samples=args.num_samples,
+                context_size=args.context,
+                pad_mode=args.pad_mode,
+                stft_pad_right=args.stft_pad_right,
+            )
+            b.export(os.path.abspath(args.out_aion), None)
 
     print("done")
     return 0

@@ -2,11 +2,13 @@
 const std = @import("std");
 
 const graph_mod = @import("../graph/graph.zig");
+const infer_mod = @import("../graph/infer.zig");
 const types = @import("../backend/types.zig");
 
 const api_tensor = @import("tensor.zig");
 
 pub const ValueId = graph_mod.ValueId;
+pub const RegionId = graph_mod.RegionId;
 
 /// Lightweight handle to a value produced/consumed by the builder.
 ///
@@ -18,6 +20,15 @@ pub const TensorRef = struct {
 pub const NamedTensorRef = struct {
     name: []const u8,
     tensor: TensorRef,
+};
+
+/// Declares that an input tensor's axis is a free (variable) dimension named
+/// `name`. Reusing a name across axes/inputs constrains them to the same runtime
+/// size. Declared on the builder via `symbolicDim`; read by `compile`/`export`.
+pub const DimSymbol = struct {
+    tensor: TensorRef,
+    axis: usize,
+    name: []const u8,
 };
 
 /// Graph-hidden model builder.
@@ -33,9 +44,20 @@ pub const Builder = struct {
     active_scope_counter: usize = 0,
     auto_scope_counts: std.StringHashMapUnmanaged(usize) = .{},
 
+    // Symbolic (variable) input dimensions declared via `symbolicDim`.
+    dim_symbols: std.ArrayList(DimSymbol) = .empty,
+
+    // Symbolic dims used in view-op attributes (reshape new_shape / slice lens).
+    // `tensor` is the view op's *output* value; `axis` indexes the attr dim; the
+    // concrete attr value at that axis is the authoring placeholder. Emitted as a
+    // dim-symbol expr term at export (the symbol must also be an input dim symbol).
+    view_dim_symbols: std.ArrayList(DimSymbol) = .empty,
+
     const Self = @This();
 
-    pub const Error = graph_mod.GraphError;
+    /// Includes `InferError` because ops infer their output shape eagerly as they
+    /// are added, so a shape/dtype error surfaces at the offending op call.
+    pub const Error = graph_mod.GraphError || infer_mod.InferError;
 
     pub const Scope = struct {
         name: []const u8,
@@ -49,14 +71,46 @@ pub const Builder = struct {
             .active_scope_name = null,
             .active_scope_counter = 0,
             .auto_scope_counts = .{},
+            .dim_symbols = .empty,
+            .view_dim_symbols = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.auto_scope_counts.deinit(self.allocator);
         self.value_names.deinit(self.allocator);
+        self.dim_symbols.deinit(self.allocator);
+        self.view_dim_symbols.deinit(self.allocator);
         self.graph.deinit();
         self.* = undefined;
+    }
+
+    /// Declare input `t`'s axis `axis` as a free (variable) dimension named
+    /// `sym_name`. One `compile`/`export` then serves any size on that axis;
+    /// reuse a name to tie axes to the same runtime size.
+    pub fn symbolicDim(self: *Self, t: TensorRef, axis: usize, sym_name: []const u8) Error!void {
+        const name_copy: []u8 = self.graph.arenaAlloc().alloc(u8, sym_name.len) catch return Error.OutOfMemory;
+        @memcpy(name_copy, sym_name);
+        self.dim_symbols.append(self.allocator, .{ .tensor = t, .axis = axis, .name = name_copy }) catch return Error.OutOfMemory;
+    }
+
+    /// The symbolic input dimensions declared so far (read by `compile`/`export`).
+    pub fn dimSymbols(self: *const Self) []const DimSymbol {
+        return self.dim_symbols.items;
+    }
+
+    /// Symbolic dims used in view-op attributes (read by `export`).
+    pub fn viewDimSymbols(self: *const Self) []const DimSymbol {
+        return self.view_dim_symbols.items;
+    }
+
+    fn recordViewSymbols(self: *Self, out: TensorRef, symbols: []const ?[]const u8) Error!void {
+        for (symbols, 0..) |maybe_name, axis| {
+            const sym_name = maybe_name orelse continue;
+            const name_copy: []u8 = self.graph.arenaAlloc().alloc(u8, sym_name.len) catch return Error.OutOfMemory;
+            @memcpy(name_copy, sym_name);
+            self.view_dim_symbols.append(self.allocator, .{ .tensor = out, .axis = axis, .name = name_copy }) catch return Error.OutOfMemory;
+        }
     }
 
     pub fn hasActiveScope(self: *const Self) bool {
@@ -114,14 +168,23 @@ pub const Builder = struct {
 
     /// Return the known shape for a value, if available.
     ///
-    /// Note: many intermediate values only become known after inference at
-    /// compile time. Parameters and explicit inputs will have shapes.
-    pub fn knownShape(self: *Self, t: TensorRef) ?[]const usize {
+    /// With eager per-op inference, every value produced so far (inputs, params,
+    /// and op outputs) has a shape. For a value on a declared-symbolic axis the
+    /// reported size is the authoring *placeholder* (the size the axis was
+    /// declared with), which propagates deterministically through derived values.
+    pub fn knownShape(self: *const Self, t: TensorRef) ?[]const usize {
         const idx: usize = @intCast(t.value);
         if (idx >= self.graph.values.items.len) return null;
         const v = self.graph.values.items[idx];
         if (v.shape.len == 0) return null;
         return v.shape;
+    }
+
+    /// The dtype of a value, if known (null for an out-of-range id).
+    pub fn dtypeOf(self: *const Self, t: TensorRef) ?types.DType {
+        const idx: usize = @intCast(t.value);
+        if (idx >= self.graph.values.items.len) return null;
+        return self.graph.values.items[idx].dtype;
     }
 
     /// Like `knownShape`, but returns `error.InvalidArgument` if shape is unknown.
@@ -555,6 +618,15 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Reshape where some target dims are symbolic. `new_shape[i]` is the concrete
+    /// authoring placeholder; `symbols[i]`, if non-null, names a dim symbol that
+    /// axis takes at runtime (emitted as a symbolic term at export).
+    pub fn reshapeSym(self: *Self, a: TensorRef, new_shape: []const usize, symbols: []const ?[]const u8) Error!TensorRef {
+        const ref = try self.reshape(a, new_shape);
+        try self.recordViewSymbols(ref, symbols);
+        return ref;
+    }
+
     pub fn squeeze(self: *Self, a: TensorRef, axis: ?i32) Error!TensorRef {
         const out: ValueId = try self.graph.addViewSqueeze(a.value, axis);
         try self.autoNameIfUnnamed(out, "squeeze");
@@ -579,11 +651,166 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Slice where some lengths are symbolic. `lens[i]` is the concrete authoring
+    /// placeholder; `symbols[i]`, if non-null, names a dim symbol that length
+    /// takes at runtime (emitted as a symbolic term at export).
+    pub fn sliceSym(self: *Self, a: TensorRef, starts: []const usize, lens: []const usize, symbols: []const ?[]const u8) Error!TensorRef {
+        const ref = try self.slice(a, starts, lens);
+        try self.recordViewSymbols(ref, symbols);
+        return ref;
+    }
+
     pub fn slice2d(self: *Self, a: TensorRef, start0: usize, len0: usize, start1: usize, len1: usize) Error!TensorRef {
         return self.slice(a, &[_]usize{ start0, start1 }, &[_]usize{ len0, len1 });
     }
 
+    /// Generic elementwise binary op (`add`/`sub`/`mul`/`div` and the comparison
+    /// ops `eq`/`ne`/`lt`/`gt`/`le`/`ge`). `add`/`mul` also have named shortcuts.
+    pub fn elemwiseBinary(self: *Self, op: types.ElemwiseBinaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addElemwiseBinary(op, a.value, b.value);
+        try self.autoNameIfUnnamed(out, @tagName(op));
+        return .{ .value = out };
+    }
+
+    /// Generic last-dim-broadcast binary op (`b` broadcasts along the last dim of
+    /// `a`). `broadcastAddLastDim` is the named `add` shortcut.
+    pub fn broadcastLastDim(self: *Self, op: types.ElemwiseBinaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addBroadcastLastDimBinary(op, a.value, b.value);
+        try self.autoNameIfUnnamed(out, "broadcast_last_dim");
+        return .{ .value = out };
+    }
+
+    /// Matmul with a transposed / per-row-quantized B: `C[m,n] = Σ A[m,k]·B[n,k]`
+    /// (B is `[N, K]`). Used for tied-embedding logits.
+    pub fn matmulNT(self: *Self, a: TensorRef, b: TensorRef, alpha: f32, beta: f32) Error!TensorRef {
+        const out: ValueId = try self.graph.addMatMulNT(a.value, b.value, alpha, beta);
+        try self.autoNameIfUnnamed(out, "matmul_nt");
+        return .{ .value = out };
+    }
+
+    /// Scalar dtype cast (e.g. f32 <-> f16).
+    pub fn cast(self: *Self, a: TensorRef, to_dtype: types.DType) Error!TensorRef {
+        const out: ValueId = try self.graph.addCast(a.value, to_dtype);
+        try self.autoNameIfUnnamed(out, "cast");
+        return .{ .value = out };
+    }
+
+    /// Index of the max value along `axis` (i32 output).
+    pub fn argmax(self: *Self, a: TensorRef, axis: i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addArgMax(a.value, axis);
+        try self.autoNameIfUnnamed(out, "argmax");
+        return .{ .value = out };
+    }
+
+    /// In-place row scatter: `buf[idx] = src`. Output aliases `buf`.
+    pub fn scatterRow(self: *Self, buf: TensorRef, idx: TensorRef, src: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addScatterRow(buf.value, idx.value, src.value);
+        try self.autoNameIfUnnamed(out, "scatter_row");
+        return .{ .value = out };
+    }
+
+    /// Fused gate: `gelu(a) * b`.
+    pub fn geluMul(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addGeluMul(a.value, b.value);
+        try self.autoNameIfUnnamed(out, "gelu_mul");
+        return .{ .value = out };
+    }
+
+    /// Relative-position multi-head self-attention (Transformer-XL / Conformer).
+    /// `mask` is optional.
+    pub fn relPosMHA(
+        self: *Self,
+        q: TensorRef,
+        k: TensorRef,
+        v: TensorRef,
+        pos_emb: TensorRef,
+        pos_bias_u: TensorRef,
+        pos_bias_v: TensorRef,
+        mask: ?TensorRef,
+        scale: f32,
+        heads: usize,
+    ) Error!TensorRef {
+        const out: ValueId = try self.graph.addRelPosMHA(
+            q.value,
+            k.value,
+            v.value,
+            pos_emb.value,
+            pos_bias_u.value,
+            pos_bias_v.value,
+            if (mask) |m| m.value else null,
+            scale,
+            heads,
+        );
+        try self.autoNameIfUnnamed(out, "relpos_mha");
+        return .{ .value = out };
+    }
+
+    // --- Control flow (regions) --------------------------------------------
+
+    /// Begin a sub-region. Ops added until `endRegion` become the region body
+    /// (used for `If` branches and `Loop` bodies). Regions do not nest.
+    pub fn beginRegion(self: *Self) Error!void {
+        return self.graph.beginRegion();
+    }
+
+    /// Close the active region, declaring its outputs. Returns a region id for
+    /// use with `ifThenElse` / `loop`.
+    pub fn endRegion(self: *Self, outputs: []const TensorRef) Error!RegionId {
+        var ids: [16]ValueId = undefined;
+        if (outputs.len == 0 or outputs.len > ids.len) return Error.InvalidArgument;
+        for (outputs, 0..) |o, i| ids[i] = o.value;
+        return self.graph.endRegion(ids[0..outputs.len]);
+    }
+
+    /// Single-output conditional: evaluate `then_region` or `else_region` based
+    /// on the i32 `[1]` `cond`. Both regions must have exactly one output.
+    pub fn ifThenElse(self: *Self, cond: TensorRef, then_region: RegionId, else_region: RegionId) Error!TensorRef {
+        const out: ValueId = try self.graph.addIf(cond.value, then_region, else_region);
+        try self.autoNameIfUnnamed(out, "if");
+        return .{ .value = out };
+    }
+
+    /// Single-carry loop: runs `body_region` up to `static_max_trip_count` times,
+    /// threading the carry. `body_region` must have exactly one output.
+    pub fn loop(self: *Self, carried_init: TensorRef, body_region: RegionId, static_max_trip_count: usize) Error!TensorRef {
+        const out: ValueId = try self.graph.addLoop(carried_init.value, body_region, static_max_trip_count);
+        try self.autoNameIfUnnamed(out, "loop");
+        return .{ .value = out };
+    }
+
+    /// Multi-carry loop. `carried_inits[i]` pairs with body-region output `i`;
+    /// the final carried values are written to `out_refs` (same length). If
+    /// `cond_carry` is set, that carry index is the i32 `[1]` continue predicate.
+    pub fn loopMulti(
+        self: *Self,
+        carried_inits: []const TensorRef,
+        body_region: RegionId,
+        static_max_trip_count: usize,
+        cond_carry: ?usize,
+        check_before: bool,
+        out_refs: []TensorRef,
+    ) Error!void {
+        var ids: [16]ValueId = undefined;
+        const n = carried_inits.len;
+        if (n == 0 or n > ids.len or out_refs.len != n) return Error.InvalidArgument;
+        for (carried_inits, 0..) |c, i| ids[i] = c.value;
+        const outs = try self.graph.addLoopMulti(ids[0..n], body_region, static_max_trip_count, cond_carry, check_before);
+        for (outs, 0..) |o, i| {
+            try self.autoNameIfUnnamed(o, "loop");
+            out_refs[i] = .{ .value = o };
+        }
+    }
+
     fn autoNameIfUnnamed(self: *Self, vid: ValueId, tag: []const u8) Error!void {
+        // Eager per-op inference: infer the node just added (it produced `vid`).
+        // Every op funnels through here exactly once after appending its node, so
+        // this keeps the whole graph inferred as it is built — `knownShape` is
+        // always current and shape/dtype errors surface at the offending op.
+        // Runs before the naming early-return so a pre-named output still infers.
+        if (self.graph.lastNode()) |node| {
+            try infer_mod.inferNode(&self.graph, node);
+        }
+
         try self.ensureNameSlot(vid);
 
         const idx: usize = @intCast(vid);

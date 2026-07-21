@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026 Angelos-Ermis Mangos
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,45 +13,21 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Convert Gemma 4 E2B text-only safetensors -> AION v4 package (full forward pass).
+"""Convert Gemma 4 E2B (text-only) safetensors -> a self-contained q8_0 `.aion`.
 
-REFERENCE: https://github.com/rwightman/gemma4_pytorch_claude
-SPEC:      docs/GEMMA4_E2B_TEXT_PLAN.md
+Emits ONE full-forward model: token embedding + per-layer-input encoder + 35
+transformer blocks (KV-cache attention with local/global rope, elastic FFN, PLI)
++ tied-embedding logits with final softcap. Authored via the C-ABI `aion.Builder`;
+the Zig core serializes through `Builder.export()` (no pure-Python writer).
 
-Quantization policy:
-- Dense matmul weights  : q8_0, quant_axis=1 (matmul-B layout `[1, K, N]`; blocks along K).
-- Embedding tables      : q8_0, quant_axis=1 (per-row blocks; tied-logits-friendly).
-- RMSNorm γ vectors     : f32 (required by RMSNorm op's dtype contract on f32 residuals).
-- RMSNorm β (zeros)     : f32 shared per-shape (Gemma has no β; satisfies op signature).
-- Scaling / softcap vec : f32 broadcast vectors (sized to match the last axis they multiply).
-- KV caches             : f16 public inputs; new_k/new_v are cast f32->f16 before append.
+Weight/quant policy:
+- dense matmul weights -> q8_0 stored matmul-B `[1, K, N]` (blocked on K).
+- embedding tables -> q8_0 blocked along the feature dim.
+- LayerNorm/RMSNorm gammas, per-layer scalars -> f32.
+- KV caches are f16; global-layer caches use the growable capacity symbol `G`.
 
-KV sharing:
-- Layers 0..14 own cache tensors. Layers 15..34 reuse the source-layer cache output
-  (the value id produced by the source layer's SequenceAppend) — no K/V materialized
-  for those layers, and their k_proj/v_proj/k_norm weights are skipped.
-
-Forward pass (abridged, full detail inline):
-  embeddings + PLI encoder
-  -> 35x per-block:
-       pre-attn RMSNorm
-    q_proj, [optional] k_proj, v_proj  (regular MatMul; B stored as [1, K, N] q8_0)
-       q_norm / k_norm (RMSNorm over head_dim)
-       RoPE1D on q, [optional] k
-       [source layers] cast f32->f16 new_k/new_v, SequenceAppend
-       MultiHeadAttentionCached (selects source cache for KV-sharing layers)
-      o_proj, post-attn RMSNorm, residual
-      FFW: pre-ffn RMSNorm, gate/up MatMul, gelu_tanh, multiply, down MatMul, post-ffn RMSNorm, residual
-       PLI mapping: gate MatMul, gelu_tanh, multiply with per-layer pli slice, proj MatMul, RMSNorm, residual
-      skip_scale: scalar multiplier at end of block
-  tail:
-       final RMSNorm
-       tied logits via MatMulNT on the token embedding (no duplication)
-       softcap: tanh(x/30)*30 via BroadcastLastDimBinary divide then tanh then mul
-
-Usage:
-  uv run --project bindings/python scripts/convert_gemma4_e2b_to_aion.py \\
-      models/gemma/model.safetensors models/gemma/gemma4_e2b_q8.aion
+Run:  uv run --project bindings/python \
+        python scripts/convert_gemma4_e2b_to_aion.py <in.safetensors> <out.aion>
 """
 
 from __future__ import annotations
@@ -61,12 +36,14 @@ import argparse
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from aion._writer import Builder, format as aw
+import aion
+from aion import Builder, Value
+from aion.enums import AionInputRoleKind as RK
 
 
 # ------------------------------ Model constants ------------------------------
@@ -84,8 +61,6 @@ PLI_DIM: int = 256
 PLI_TOTAL: int = NUM_LAYERS * PLI_DIM  # 8960
 FFN_DIM: int = 6144
 RMS_EPS: float = 1e-6
-# Rotary base frequencies. Gemma's upstream spec uses different bases for local vs global
-# attention; values here mirror the PyTorch reference.
 ROPE_LOCAL_BASE: float = 10_000.0
 ROPE_GLOBAL_BASE: float = 1_000_000.0
 ROPE_LOCAL_PROPORTION: float = 1.0
@@ -107,240 +82,26 @@ def kv_source_of(layer: int) -> int:
     return GLOBAL_SOURCE_LAYER if is_global_layer(layer) else LOCAL_SOURCE_LAYER
 
 
+# Authoring placeholder sizes for the symbolic axes (eager inference only; the
+# exported model serves any runtime size on them).
+_PLACEHOLDER = {"batch": 1, "seq": 1, "G": LOCAL_SLIDING_WINDOW}
+
+Shape = Tuple[Union[int, str], ...]
+
+
 # ------------------------------- CLI + loading -------------------------------
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Convert Gemma 4 E2B text-only to AION v4")
+    ap = argparse.ArgumentParser(description="Convert Gemma 4 E2B text-only to a q8_0 .aion")
     ap.add_argument("in_safetensors", type=str)
     ap.add_argument("out_aion", type=str)
-    ap.add_argument(
-        "--debug-block-layer",
-        type=int,
-        default=None,
-        help=(
-            "Emit a minimal package for a single transformer block (source layers 0..14 only). "
-            "Inputs: x (f32), positions (i32), cache_write_index (i32), cache_visible_end (i32), "
-            "k_cache (f32/f16), v_cache (f32/f16), per_layer_input (f32). "
-            "Outputs: x_out, next_k_cache, next_v_cache."
-        ),
-    )
-    ap.add_argument(
-        "--debug-block-weights",
-        type=str,
-        choices=["q8", "f32"],
-        default="q8",
-        help="Weight storage for --debug-block-layer (default: q8).",
-    )
-    ap.add_argument(
-        "--debug-block-cache-dtype",
-        type=str,
-        choices=["f16", "f32"],
-        default="f32",
-        help="KV cache dtype for --debug-block-layer (default: f32).",
-    )
-    ap.add_argument(
-        "--debug-block-taps",
-        action="store_true",
-        help="When set, the debug single-block package will also output intermediate tensors for parity debugging.",
-    )
     ap.add_argument(
         "--allow-multimodal",
         action="store_true",
         help="Ignore audio/vision tensors in a multimodal checkpoint (they are not included).",
     )
     return ap.parse_args(argv)
-
-
-def _add_f32_matmul_b(b: Builder, name: str, w_torch_layout: np.ndarray) -> int:
-    """Store a PyTorch linear weight `[out, in]` as an f32 MatMul-B tensor `[1, in, out]`."""
-    w_t: np.ndarray = np.ascontiguousarray(w_torch_layout.astype(np.float32, copy=False).T)
-    w_t3: np.ndarray = w_t.reshape((1, int(w_t.shape[0]), int(w_t.shape[1])))
-    return b.add_f32_initializer(name, w_t3)
-
-
-def _emit_one_layer_weights(
-    loader: _WeightLoader,
-    b: Builder,
-    layer_idx: int,
-    *,
-    weight_mode: str,
-) -> _LayerWeights:
-    """Load and emit initializers for a single transformer layer (for debug packages)."""
-    if layer_idx < 0 or layer_idx >= NUM_LAYERS:
-        raise ValueError(f"layer_idx out of range: {layer_idx}")
-    if weight_mode not in {"q8", "f32"}:
-        raise ValueError(f"unknown weight_mode: {weight_mode}")
-
-    pfx = f"model.language_model.layers.{layer_idx}"
-
-    def name(s: str) -> str:
-        return f"layers.{layer_idx}.{s}"
-
-    def f32v(nm: str, arr: np.ndarray) -> int:
-        return b.add_f32_initializer(nm, arr)
-
-    def dense(nm: str, w: np.ndarray) -> int:
-        if weight_mode == "q8":
-            return b.add_q8_0_matmul_b(nm, w)
-        return _add_f32_matmul_b(b, nm, w)
-
-    skip_scale_arr: np.ndarray = loader.get_f32(f"{pfx}.layer_scalar")
-    if skip_scale_arr.size != 1:
-        raise ValueError(f"unexpected layer_scalar shape for layer {layer_idx}: {skip_scale_arr.shape}")
-    skip_scale: float = float(skip_scale_arr.reshape(()))
-
-    lw = _LayerWeights(
-        input_ln=f32v(name("input_layernorm.weight"), loader.get_f32(f"{pfx}.input_layernorm.weight")),
-        post_attn_ln=f32v(name("post_attention_layernorm.weight"), loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
-        pre_ffn_ln=f32v(name("pre_feedforward_layernorm.weight"), loader.get_f32(f"{pfx}.pre_feedforward_layernorm.weight")),
-        post_ffn_ln=f32v(name("post_feedforward_layernorm.weight"), loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
-        post_pli_ln=f32v(
-            name("post_per_layer_input_norm.weight"),
-            loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight"),
-        ),
-        skip_scale=skip_scale,
-
-        q_proj=dense(name("self_attn.q_proj.weight"), loader.get_f32(f"{pfx}.self_attn.q_proj.weight")),
-        o_proj=dense(name("self_attn.o_proj.weight"), loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
-        q_norm=f32v(name("self_attn.q_norm.weight"), loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
-
-        k_proj=dense(name("self_attn.k_proj.weight"), loader.get_f32(f"{pfx}.self_attn.k_proj.weight")),
-        v_proj=dense(name("self_attn.v_proj.weight"), loader.get_f32(f"{pfx}.self_attn.v_proj.weight")),
-        k_norm=f32v(name("self_attn.k_norm.weight"), loader.get_f32(f"{pfx}.self_attn.k_norm.weight")),
-
-        gate_proj=dense(name("mlp.gate_proj.weight"), loader.get_f32(f"{pfx}.mlp.gate_proj.weight")),
-        up_proj=dense(name("mlp.up_proj.weight"), loader.get_f32(f"{pfx}.mlp.up_proj.weight")),
-        down_proj=dense(name("mlp.down_proj.weight"), loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
-
-        pli_gate=dense(name("per_layer_input_gate.weight"), loader.get_f32(f"{pfx}.per_layer_input_gate.weight")),
-        pli_proj=dense(name("per_layer_projection.weight"), loader.get_f32(f"{pfx}.per_layer_projection.weight")),
-    )
-    return lw
-
-
-def _emit_forward_one_block(
-    b: Builder,
-    *,
-    layer_idx: int,
-    lw: _LayerWeights,
-    cache_dtype: int,
-) -> Tuple[int, int, int, Dict[str, int]]:
-    """Emit a minimal forward graph for a single source-layer transformer block."""
-    if layer_idx not in SOURCE_LAYERS:
-        raise ValueError(
-            "debug single-block mode currently supports only source layers 0..14 "
-            f"(got layer={layer_idx})"
-        )
-
-    is_glob: bool = is_global_layer(layer_idx)
-    head_dim: int = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
-    sliding: int = 0 if is_glob else LOCAL_SLIDING_WINDOW
-    rope_base: float = ROPE_GLOBAL_BASE if is_glob else ROPE_LOCAL_BASE
-    rope_prop: float = ROPE_GLOBAL_PROPORTION if is_glob else ROPE_LOCAL_PROPORTION
-    t_dim: Union[int, str] = "G" if is_glob else LOCAL_SLIDING_WINDOW
-
-    # Public runtime inputs.
-    x = b.add_input("x", aw.DType.f32, ("batch", "seq", EMBED_DIM))
-    positions = b.add_input("positions", aw.DType.i32, ("batch", "seq"))
-    cache_write_index = b.add_input("cache_write_index", aw.DType.i32, ("batch",))
-    cache_visible_end = b.add_input("cache_visible_end", aw.DType.i32, ("batch",))
-    per_layer_input = b.add_input("per_layer_input", aw.DType.f32, ("batch", "seq", PLI_DIM))
-
-    k_cache = b.add_input("k_cache", cache_dtype, ("batch", NUM_KV_HEADS, t_dim, head_dim))
-    v_cache = b.add_input("v_cache", cache_dtype, ("batch", NUM_KV_HEADS, t_dim, head_dim))
-
-    taps: Dict[str, int] = {}
-
-    # 1) Pre-attn norm on x.
-    x_norm = b.rmsnorm(x, lw.input_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-    taps["x_norm"] = x_norm
-
-    # 2) Q projection, reshape to [B, S, H, D_k], norm, rope.
-    assert lw.q_proj is not None  # debug path emits unfused Q
-    q_flat = b.matmul(x_norm, lw.q_proj)  # [B, S, H*D_k]
-    taps["q_flat"] = q_flat
-    q = b.reshape(q_flat, ("batch", "seq", NUM_HEADS, head_dim))
-    taps["q_reshape"] = q
-    q = b.rmsnorm(q, lw.q_norm, b.zero_beta((head_dim,)), (head_dim,))
-    taps["q_norm"] = q
-    q = b.rope1d(q, positions, rope_base, rope_proportion=rope_prop)
-    taps["q_rope"] = q
-
-    # 3) K/V projection, norm, rope, append.
-    assert lw.k_proj is not None and lw.v_proj is not None and lw.k_norm is not None
-    k_flat = b.matmul(x_norm, lw.k_proj)
-    taps["k_flat"] = k_flat
-    k4 = b.reshape(k_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
-    taps["k_reshape"] = k4
-    k4 = b.rmsnorm(k4, lw.k_norm, b.zero_beta((head_dim,)), (head_dim,))
-    taps["k_norm"] = k4
-    k4 = b.rope1d(k4, positions, rope_base, rope_proportion=rope_prop)
-    taps["k_rope"] = k4
-    k4_t = b.reshape(k4, ("batch", NUM_KV_HEADS, "seq", head_dim))
-    if cache_dtype == aw.DType.f16:
-        k4_t = b.cast(k4_t, aw.DType.f16)
-    k_next = b.sequence_append(k_cache, k4_t, cache_write_index)
-
-    v_flat = b.matmul(x_norm, lw.v_proj)
-    taps["v_flat"] = v_flat
-    v4 = b.reshape(v_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
-    taps["v_reshape"] = v4
-    v4 = b.rmsnorm(v4, b.scale_broadcast_vec(head_dim, 1.0), b.zero_beta((head_dim,)), (head_dim,))
-    taps["v_norm"] = v4
-    v4_t = b.reshape(v4, ("batch", NUM_KV_HEADS, "seq", head_dim))
-    if cache_dtype == aw.DType.f16:
-        v4_t = b.cast(v4_t, aw.DType.f16)
-    v_next = b.sequence_append(v_cache, v4_t, cache_write_index)
-
-    # 4) Attention.
-    attn_out = b.mha_cached(
-        q=q,
-        k=k_next,
-        v=v_next,
-        positions=positions,
-        end_index=cache_visible_end,
-        scale=1.0,
-        sliding_window=sliding,
-        softcap=0.0,
-    )
-    taps["attn_out"] = attn_out
-
-    # 5) o_proj + residual + post-attn norm.
-    attn_flat = b.reshape(attn_out, ("batch", "seq", NUM_HEADS * head_dim))
-    o_out = b.matmul(attn_flat, lw.o_proj)
-    o_out = b.rmsnorm(o_out, lw.post_attn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-    taps["post_attn"] = o_out
-    x2 = b.elemwise(aw.ElemwiseBinaryOp.add, x, o_out)
-    taps["x_post_attn"] = x2
-
-    # 6) FFN.
-    assert lw.gate_proj is not None and lw.up_proj is not None  # debug path emits unfused gate/up
-    ff_in = b.rmsnorm(x2, lw.pre_ffn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-    gate = b.matmul(ff_in, lw.gate_proj)
-    up = b.matmul(ff_in, lw.up_proj)
-    gate_act = b.unary(aw.UnaryOp.gelu, gate)
-    ff = b.elemwise(aw.ElemwiseBinaryOp.mul, gate_act, up)
-    ff = b.matmul(ff, lw.down_proj)
-    ff = b.rmsnorm(ff, lw.post_ffn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-    taps["post_ffn"] = ff
-    x3 = b.elemwise(aw.ElemwiseBinaryOp.add, x2, ff)
-    taps["x_post_ffn"] = x3
-
-    # 7) PLI mapping (per-layer input is a public input in this debug graph).
-    pli_gate_in = b.matmul(x3, lw.pli_gate)
-    pli_gate_act = b.unary(aw.UnaryOp.gelu, pli_gate_in)
-    pli_combined = b.elemwise(aw.ElemwiseBinaryOp.mul, pli_gate_act, per_layer_input)
-    pli_out = b.matmul(pli_combined, lw.pli_proj)
-    pli_out = b.rmsnorm(pli_out, lw.post_pli_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-    taps["post_pli"] = pli_out
-    x4 = b.elemwise(aw.ElemwiseBinaryOp.add, x3, pli_out)
-    taps["x_post_pli"] = x4
-
-    # 8) Skip scale.
-    x_out = b.scalar_last_dim_mul(x4, EMBED_DIM, lw.skip_scale)
-    taps["x_out"] = x_out
-    return x_out, k_next, v_next, taps
 
 
 def _reject_if_unexpected_multimodal(keys: List[str], allow: bool) -> None:
@@ -378,205 +139,195 @@ class _WeightLoader:
         return self._file.get_tensor(name).float().numpy()
 
 
-# ------------------------------ Package builder ------------------------------
-# The graph-builder layer lives in `aion._writer.builder.Builder`; this converter
-# parameterizes it with Gemma's dim symbols and RMSNorm epsilon.
+# --------------------- C-ABI Builder authoring helpers -----------------------
 
 
-Shape = Tuple[Union[int, str], ...]
+def _q8b(b: Builder, w_torch: np.ndarray) -> Value:
+    """PyTorch linear `[out, in]` -> q8_0 matmul-B `[1, in, out]` (blocked on K=in)."""
+    w_t = np.ascontiguousarray(w_torch.astype(np.float32, copy=False).T)  # [K, N]
+    k, n = int(w_t.shape[0]), int(w_t.shape[1])
+    return b.param(w_t.reshape(1, k, n), dtype="q8_0", shape=(1, k, n))
 
 
-def _make_builder() -> Builder:
-    return Builder(dim_symbols=("batch", "seq", "G"), rms_eps=RMS_EPS)
+def _q8_embed(b: Builder, table: np.ndarray) -> Value:
+    """Embedding table `[V, D]` -> q8_0 blocked along the feature dim D (axis 1)."""
+    t = np.ascontiguousarray(table.astype(np.float32, copy=False))
+    v, d = int(t.shape[0]), int(t.shape[1])
+    return b.param(t, dtype="q8_0", shape=(v, d), quant_axis=1)
 
 
+def _f32(b: Builder, arr: np.ndarray) -> Value:
+    return b.param(np.ascontiguousarray(arr.astype(np.float32, copy=False)))
 
-# ------------------------------- Forward pass --------------------------------
+
+def _input(b: Builder, name: str, dtype: str, shape: Shape) -> Value:
+    """Declare a public input; string dims are symbolic (dynamic) axes."""
+    dims = [_PLACEHOLDER[d] if isinstance(d, str) else int(d) for d in shape]
+    dyn = {i: d for i, d in enumerate(shape) if isinstance(d, str)} or None
+    return b.input(dims, dtype=dtype, dynamic=dyn).rename(name)
+
+
+class _Consts:
+    """Per-conversion cache of tiny constant params (zero betas, scalar vectors)."""
+
+    def __init__(self, b: Builder) -> None:
+        self.b = b
+        self._zero: Dict[int, Value] = {}
+        self._vec: Dict[Tuple[int, float], Value] = {}
+
+    def zero_beta(self, dim: int) -> Value:
+        v = self._zero.get(dim)
+        if v is None:
+            v = self.b.param(np.zeros((dim,), np.float32))
+            self._zero[dim] = v
+        return v
+
+    def scale_vec(self, dim: int, value: float) -> Value:
+        key = (dim, float(value))
+        v = self._vec.get(key)
+        if v is None:
+            v = self.b.param(np.full((dim,), value, np.float32))
+            self._vec[key] = v
+        return v
+
+
+def _rmsnorm(b: Builder, c: _Consts, x: Value, gamma: Value, dim: int) -> Value:
+    return b.rmsnorm(x, gamma, c.zero_beta(dim), eps=RMS_EPS, normalized_shape=(dim,))
+
+
+def _scalar_mul(b: Builder, c: _Consts, x: Value, dim: int, value: float) -> Value:
+    return b.broadcast_mul(x, c.scale_vec(dim, value))
+
+
+def _scalar_div(b: Builder, c: _Consts, x: Value, dim: int, value: float) -> Value:
+    return b.broadcast_div(x, c.scale_vec(dim, value))
+
+
+# ------------------------------- weight structs ------------------------------
 
 
 @dataclass
 class _LayerWeights:
-    input_ln: int
-    post_attn_ln: int
-    pre_ffn_ln: int
-    post_ffn_ln: int
-    post_pli_ln: int
+    input_ln: Value
+    post_attn_ln: Value
+    pre_ffn_ln: Value
+    post_ffn_ln: Value
+    post_pli_ln: Value
     skip_scale: float
-
-    o_proj: int
-    q_norm: int
-
-    k_proj: Optional[int]
-    v_proj: Optional[int]
-    k_norm: Optional[int]
-
-    down_proj: int
-
-    pli_gate: int
-    pli_proj: int
-
-    # Per-layer FFN width. Gemma 4 E2B is elastic: layers 0..14 use FFN=6144, layers
-    # 15..34 use FFN=12288. The fused gate/up split point must therefore be per-layer,
-    # NOT the FFN_DIM constant.
+    o_proj: Value
+    q_norm: Value
+    down_proj: Value
+    pli_gate: Value
+    pli_proj: Value
     ffn_dim: int = FFN_DIM
-
-    # Attention Q projection: non-source layers use a standalone `q_proj`; source layers
-    # (0..14, which also compute K/V) fuse Q+K+V into one matmul-B split by slices, same
-    # rationale as the gate/up fusion below.
-    q_proj: Optional[int] = None
-    qkv_proj: Optional[int] = None
-
-    # FFN gate/up: either stored separately (debug single-block path) or fused into a
-    # single [in, 2*ffn_dim] matmul-B (main path) and split with two slices in the graph.
-    # Fusing halves the decode op count for the FFN's biggest matmul and lets the GEMV
-    # amortize per-op overhead (~1.9x faster on the gate/up step; see `zig build bench
-    # -- --suite decode`). Defaulted so each emit path sets only what it uses.
-    gate_proj: Optional[int] = None
-    up_proj: Optional[int] = None
-    gateup_proj: Optional[int] = None
+    q_proj: Optional[Value] = None
+    qkv_proj: Optional[Value] = None
+    k_norm: Optional[Value] = None
+    gateup_proj: Optional[Value] = None
 
 
 @dataclass
 class _SharedWeights:
-    embed_tokens: int
-    embed_tokens_per_layer: int
-    per_layer_model_projection: int
-    per_layer_projection_norm: int
-    final_norm: int
+    embed_tokens: Value
+    embed_tokens_per_layer: Value
+    per_layer_model_projection: Value
+    per_layer_projection_norm: Value
+    final_norm: Value
 
 
 def _emit_weights(loader: _WeightLoader, b: Builder) -> Tuple[_SharedWeights, List[_LayerWeights]]:
     ln = "model.language_model"
 
-    def f32v(name: str, arr: np.ndarray) -> int:
-        return b.add_f32_initializer(name, arr)
-
     shared = _SharedWeights(
-        embed_tokens=b.add_q8_0_embedding("embed_tokens.weight", loader.get_f32(f"{ln}.embed_tokens.weight")),
-        embed_tokens_per_layer=b.add_q8_0_embedding(
-            "embed_tokens_per_layer.weight", loader.get_f32(f"{ln}.embed_tokens_per_layer.weight")
-        ),
-        per_layer_model_projection=b.add_q8_0_matmul_b(
-            "per_layer_model_projection.weight", loader.get_f32(f"{ln}.per_layer_model_projection.weight")
-        ),
-        per_layer_projection_norm=f32v(
-            "per_layer_projection_norm.weight", loader.get_f32(f"{ln}.per_layer_projection_norm.weight")
-        ),
-        final_norm=f32v("norm.weight", loader.get_f32(f"{ln}.norm.weight")),
+        embed_tokens=_q8_embed(b, loader.get_f32(f"{ln}.embed_tokens.weight")),
+        embed_tokens_per_layer=_q8_embed(b, loader.get_f32(f"{ln}.embed_tokens_per_layer.weight")),
+        per_layer_model_projection=_q8b(b, loader.get_f32(f"{ln}.per_layer_model_projection.weight")),
+        per_layer_projection_norm=_f32(b, loader.get_f32(f"{ln}.per_layer_projection_norm.weight")),
+        final_norm=_f32(b, loader.get_f32(f"{ln}.norm.weight")),
     )
 
     layers: List[_LayerWeights] = []
     for layer in range(NUM_LAYERS):
         pfx = f"{ln}.layers.{layer}"
-        name = lambda leaf: f"layers.{layer}.{leaf}"
-
         is_source = layer in SOURCE_LAYERS
 
-        # Elastic FFN: per-layer width is the gate_proj output dim (6144 or 12288).
         gate_w = loader.get_f32(f"{pfx}.mlp.gate_proj.weight")
         up_w = loader.get_f32(f"{pfx}.mlp.up_proj.weight")
         layer_ffn = int(gate_w.shape[0])
 
         lw = _LayerWeights(
-            input_ln=f32v(name("input_layernorm.weight"), loader.get_f32(f"{pfx}.input_layernorm.weight")),
-            post_attn_ln=f32v(name("post_attention_layernorm.weight"), loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
-            pre_ffn_ln=f32v(name("pre_feedforward_layernorm.weight"), loader.get_f32(f"{pfx}.pre_feedforward_layernorm.weight")),
-            post_ffn_ln=f32v(name("post_feedforward_layernorm.weight"), loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
-            post_pli_ln=f32v(name("post_per_layer_input_norm.weight"), loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
+            input_ln=_f32(b, loader.get_f32(f"{pfx}.input_layernorm.weight")),
+            post_attn_ln=_f32(b, loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
+            pre_ffn_ln=_f32(b, loader.get_f32(f"{pfx}.pre_feedforward_layernorm.weight")),
+            post_ffn_ln=_f32(b, loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
+            post_pli_ln=_f32(b, loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
             skip_scale=float(loader.get_f32(f"{pfx}.layer_scalar").reshape(-1)[0]),
-            o_proj=b.add_q8_0_matmul_b(name("self_attn.o_proj.weight"), loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
-            q_norm=f32v(name("self_attn.q_norm.weight"), loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
-            k_proj=None, v_proj=None, k_norm=None,
-            # Fuse gate_proj+up_proj into one [2*ffn, in] weight (PyTorch [out, in]),
-            # concatenated along the output axis: rows [0:ffn]=gate, [ffn:]=up.
+            o_proj=_q8b(b, loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
+            q_norm=_f32(b, loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
             ffn_dim=layer_ffn,
-            gateup_proj=b.add_q8_0_matmul_b(
-                name("mlp.gateup_proj.weight"),
-                np.concatenate([gate_w, up_w], axis=0),
-            ),
-            down_proj=b.add_q8_0_matmul_b(name("mlp.down_proj.weight"), loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
-            pli_gate=b.add_q8_0_matmul_b(name("per_layer_input_gate.weight"), loader.get_f32(f"{pfx}.per_layer_input_gate.weight")),
-            pli_proj=b.add_q8_0_matmul_b(name("per_layer_projection.weight"), loader.get_f32(f"{pfx}.per_layer_projection.weight")),
+            gateup_proj=_q8b(b, np.concatenate([gate_w, up_w], axis=0)),
+            down_proj=_q8b(b, loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
+            pli_gate=_q8b(b, loader.get_f32(f"{pfx}.per_layer_input_gate.weight")),
+            pli_proj=_q8b(b, loader.get_f32(f"{pfx}.per_layer_projection.weight")),
         )
         if is_source:
-            # Source layers fuse Q+K+V into one matmul-B (rows: Q, then K, then V),
-            # split back with slices in the forward graph.
-            lw.qkv_proj = b.add_q8_0_matmul_b(
-                name("self_attn.qkv_proj.weight"),
-                np.concatenate(
-                    [
-                        loader.get_f32(f"{pfx}.self_attn.q_proj.weight"),
-                        loader.get_f32(f"{pfx}.self_attn.k_proj.weight"),
-                        loader.get_f32(f"{pfx}.self_attn.v_proj.weight"),
-                    ],
-                    axis=0,
-                ),
-            )
-            lw.k_norm = f32v(name("self_attn.k_norm.weight"), loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
+            lw.qkv_proj = _q8b(b, np.concatenate([
+                loader.get_f32(f"{pfx}.self_attn.q_proj.weight"),
+                loader.get_f32(f"{pfx}.self_attn.k_proj.weight"),
+                loader.get_f32(f"{pfx}.self_attn.v_proj.weight"),
+            ], axis=0))
+            lw.k_norm = _f32(b, loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
         else:
-            lw.q_proj = b.add_q8_0_matmul_b(name("self_attn.q_proj.weight"), loader.get_f32(f"{pfx}.self_attn.q_proj.weight"))
+            lw.q_proj = _q8b(b, loader.get_f32(f"{pfx}.self_attn.q_proj.weight"))
         layers.append(lw)
 
     return shared, layers
 
 
-def _emit_forward(
-    b: Builder,
-    loader_keys_log: List[str],
-    shared: _SharedWeights,
-    layers: List[_LayerWeights],
-) -> Tuple[int, Dict[int, Tuple[int, int]]]:
-    """Emit the full forward graph. Returns (logits_vid, per-source-layer (K,V) append outputs)."""
+# --------------------------------- forward -----------------------------------
+
+
+def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights]):
+    """Emit the full forward graph. Returns (logits, {src: (k_in, k_out, v_in, v_out)})."""
+    c = _Consts(b)
 
     # Public runtime inputs.
-    tokens = b.add_input("tokens", aw.DType.i32, ("batch", "seq"))
-    positions = b.add_input("positions", aw.DType.i32, ("batch", "seq"))
-    cache_write_index = b.add_input("cache_write_index", aw.DType.i32, ("batch",))
-    cache_visible_end = b.add_input("cache_visible_end", aw.DType.i32, ("batch",))
-    loader_keys_log.extend(["tokens", "positions", "cache_write_index", "cache_visible_end"])
+    tokens = _input(b, "tokens", "i32", ("batch", "seq"))
+    positions = _input(b, "positions", "i32", ("batch", "seq"))
+    cache_write_index = _input(b, "cache_write_index", "i32", ("batch",))
+    cache_visible_end = _input(b, "cache_visible_end", "i32", ("batch",))
 
     # KV cache public inputs — f16, one pair per source layer.
-    k_cache_in: Dict[int, int] = {}
-    v_cache_in: Dict[int, int] = {}
+    k_cache_in: Dict[int, Value] = {}
+    v_cache_in: Dict[int, Value] = {}
     for src in SOURCE_LAYERS:
         is_glob = is_global_layer(src)
         head_dim = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
         t_dim: Union[int, str] = "G" if is_glob else LOCAL_SLIDING_WINDOW
-        k_cache_in[src] = b.add_input(f"k_cache.layer{src}", aw.DType.f16, ("batch", NUM_KV_HEADS, t_dim, head_dim))
-        v_cache_in[src] = b.add_input(f"v_cache.layer{src}", aw.DType.f16, ("batch", NUM_KV_HEADS, t_dim, head_dim))
+        k_cache_in[src] = _input(b, f"k_cache.layer{src}", "f16", ("batch", NUM_KV_HEADS, t_dim, head_dim))
+        v_cache_in[src] = _input(b, f"v_cache.layer{src}", "f16", ("batch", NUM_KV_HEADS, t_dim, head_dim))
 
     # ---- Embedding + PLI encoder ----
+    emb = b.gather_rows(shared.embed_tokens, tokens)                    # [B,S,1536] f32
+    emb_scaled = _scalar_mul(b, c, emb, EMBED_DIM, math.sqrt(EMBED_DIM))
 
-    # 1) Token embedding lookup; output is f32 [B, S, 1536].
-    emb = b.gather_rows(shared.embed_tokens, tokens)
-    # 2) Scale by sqrt(D).
-    emb_scaled = b.scalar_last_dim_mul(emb, EMBED_DIM, math.sqrt(EMBED_DIM))
-
-    # 3) PLI projection path: proj = emb_scaled @ per_layer_model_projection.T, scale, reshape, RMSNorm.
-    #    The PyTorch weight is [8960, 1536]; stored as matmul-B [1, 1536, 8960] quant_axis=1.
-    pli_proj_flat = b.matmul(emb_scaled, shared.per_layer_model_projection)  # [B, S, 8960]
-    pli_proj_scaled = b.scalar_last_dim_mul(pli_proj_flat, PLI_TOTAL, 1.0 / math.sqrt(EMBED_DIM))
+    pli_proj_flat = b.matmul(emb_scaled, shared.per_layer_model_projection)  # [B,S,8960]
+    pli_proj_scaled = _scalar_mul(b, c, pli_proj_flat, PLI_TOTAL, 1.0 / math.sqrt(EMBED_DIM))
     pli_proj_r = b.reshape(pli_proj_scaled, ("batch", "seq", NUM_LAYERS, PLI_DIM))
-    pli_proj_norm = b.rmsnorm(pli_proj_r, shared.per_layer_projection_norm, b.zero_beta((PLI_DIM,)), (PLI_DIM,))
+    pli_proj_norm = _rmsnorm(b, c, pli_proj_r, shared.per_layer_projection_norm, PLI_DIM)
 
-    # 4) PLI embedding path: gather pli_table, scale by sqrt(D_pli), reshape.
     pli_emb_flat = b.gather_rows(shared.embed_tokens_per_layer, tokens)  # [B,S,8960]
-    pli_emb_scaled = b.scalar_last_dim_mul(pli_emb_flat, PLI_TOTAL, math.sqrt(PLI_DIM))
+    pli_emb_scaled = _scalar_mul(b, c, pli_emb_flat, PLI_TOTAL, math.sqrt(PLI_DIM))
     pli_emb_r = b.reshape(pli_emb_scaled, ("batch", "seq", NUM_LAYERS, PLI_DIM))
 
-    # 5) Sum-then-scale.
-    pli_sum = b.elemwise(aw.ElemwiseBinaryOp.add, pli_proj_norm, pli_emb_r)
-    pli = b.scalar_last_dim_mul(pli_sum, PLI_DIM, 1.0 / math.sqrt(2.0))  # [B,S,35,256]
+    pli_sum = b.add(pli_proj_norm, pli_emb_r)
+    pli = _scalar_mul(b, c, pli_sum, PLI_DIM, 1.0 / math.sqrt(2.0))      # [B,S,35,256]
 
-    # Residual stream.
     x = emb_scaled
-
-    # Track the latest cache-post-append value id per source layer.
-    k_cache_cur: Dict[int, int] = dict(k_cache_in)
-    v_cache_cur: Dict[int, int] = dict(v_cache_in)
+    k_cache_cur: Dict[int, Value] = dict(k_cache_in)
+    v_cache_cur: Dict[int, Value] = dict(v_cache_in)
 
     # ---- Per-layer transformer blocks ----
-
     for layer_idx, lw in enumerate(layers):
         is_glob = is_global_layer(layer_idx)
         head_dim = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
@@ -586,278 +337,143 @@ def _emit_forward(
         src = kv_source_of(layer_idx)
         is_source = layer_idx in SOURCE_LAYERS
 
-        # 1) Pre-attn norm on x.
-        x_norm = b.rmsnorm(x, lw.input_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
+        x_norm = _rmsnorm(b, c, x, lw.input_ln, EMBED_DIM)
 
-        # 2) Q projection (non-source) or fused QKV projection split by slices (source).
         q_out = NUM_HEADS * head_dim
         kv_out = NUM_KV_HEADS * head_dim
-        k_flat: Optional[int] = None
-        v_flat: Optional[int] = None
+        k_flat: Optional[Value] = None
+        v_flat: Optional[Value] = None
         if is_source:
             assert lw.qkv_proj is not None
-            qkv = b.matmul(x_norm, lw.qkv_proj)  # [B, S, q_out + 2*kv_out]
-            q_flat = b.slice_nd(qkv, (0, 0, 0), ("batch", "seq", q_out))
-            k_flat = b.slice_nd(qkv, (0, 0, q_out), ("batch", "seq", kv_out))
-            v_flat = b.slice_nd(qkv, (0, 0, q_out + kv_out), ("batch", "seq", kv_out))
+            qkv = b.matmul(x_norm, lw.qkv_proj)
+            q_flat = b.slice(qkv, (0, 0, 0), ("batch", "seq", q_out))
+            k_flat = b.slice(qkv, (0, 0, q_out), ("batch", "seq", kv_out))
+            v_flat = b.slice(qkv, (0, 0, q_out + kv_out), ("batch", "seq", kv_out))
         else:
-            assert lw.q_proj is not None  # non-source layers emit unfused Q
-            q_flat = b.matmul(x_norm, lw.q_proj)  # [B, S, H*D_k]
+            assert lw.q_proj is not None
+            q_flat = b.matmul(x_norm, lw.q_proj)
 
         q = b.reshape(q_flat, ("batch", "seq", NUM_HEADS, head_dim))
-        q = b.rmsnorm(q, lw.q_norm, b.zero_beta((head_dim,)), (head_dim,))
-        q = b.rope1d(q, positions, rope_base, rope_proportion=rope_prop)
+        q = _rmsnorm(b, c, q, lw.q_norm, head_dim)
+        q = b.rope1d(q, positions, base_frequency=rope_base, rope_proportion=rope_prop)
 
-        # 3) For source layers: norm/rope/append the K/V slices (after cast to f16).
         if is_source:
             assert lw.k_norm is not None and k_flat is not None and v_flat is not None
             k4 = b.reshape(k_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
-            k4 = b.rmsnorm(k4, lw.k_norm, b.zero_beta((head_dim,)), (head_dim,))
-            k4 = b.rope1d(k4, positions, rope_base, rope_proportion=rope_prop)
-            # Append semantics want [B, H_kv, new_len, D_k]; we have [B, seq, H_kv, D_k].
-            # The runtime append kernel expects shape[0]=B, shape[1]=H_kv, shape[2]=new_len, shape[3]=D_k.
+            k4 = _rmsnorm(b, c, k4, lw.k_norm, head_dim)
+            k4 = b.rope1d(k4, positions, base_frequency=rope_base, rope_proportion=rope_prop)
             k4_t = b.reshape(k4, ("batch", NUM_KV_HEADS, "seq", head_dim))
-            k_f16 = b.cast(k4_t, aw.DType.f16)
+            k_f16 = b.cast(k4_t, "f16")
             k_cache_cur[layer_idx] = b.sequence_append(k_cache_cur[layer_idx], k_f16, cache_write_index)
 
             v4 = b.reshape(v_flat, ("batch", "seq", NUM_KV_HEADS, head_dim))
-            # Gemma4 uses V-norm, but it is parameterless (gamma is implicitly all-ones).
-            v4 = b.rmsnorm(v4, b.scale_broadcast_vec(head_dim, 1.0), b.zero_beta((head_dim,)), (head_dim,))
+            # Parameterless V-norm (gamma implicitly all-ones).
+            v4 = _rmsnorm(b, c, v4, c.scale_vec(head_dim, 1.0), head_dim)
             v4_t = b.reshape(v4, ("batch", NUM_KV_HEADS, "seq", head_dim))
-            v_f16 = b.cast(v4_t, aw.DType.f16)
+            v_f16 = b.cast(v4_t, "f16")
             v_cache_cur[layer_idx] = b.sequence_append(v_cache_cur[layer_idx], v_f16, cache_write_index)
 
-        # 4) Attention reads the current (post-append) cache of the source layer.
-        k_ref = k_cache_cur[src]
-        v_ref = v_cache_cur[src]
         attn_out = b.mha_cached(
-            q=q,
-            k=k_ref,
-            v=v_ref,
-            positions=positions,
-            end_index=cache_visible_end,
-            # QK-norm replaces 1/sqrt(d) scaling in Gemma4; attention scale is 1.0.
-            scale=1.0,
-            sliding_window=sliding,
-            softcap=0.0,  # attn-logit softcap; Gemma E2B uses 0 per plan's defaults.
+            q, k_cache_cur[src], v_cache_cur[src], positions, cache_visible_end,
+            scale=1.0, sliding_window=sliding, attn_logits_soft_cap=0.0,
         )
 
-        # 5) Reshape + o_proj + residual + post-attn norm.
         attn_flat = b.reshape(attn_out, ("batch", "seq", NUM_HEADS * head_dim))
         o_out = b.matmul(attn_flat, lw.o_proj)
-        o_out = b.rmsnorm(o_out, lw.post_attn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-        x = b.elemwise(aw.ElemwiseBinaryOp.add, x, o_out)
+        o_out = _rmsnorm(b, c, o_out, lw.post_attn_ln, EMBED_DIM)
+        x = b.add(x, o_out)
 
-        # 6) FFN: pre-ffn norm, fused gate/up matmul (split via slices), gelu, multiply,
-        #    down, residual, post-ffn norm.
-        ff_in = b.rmsnorm(x, lw.pre_ffn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-        ffn = lw.ffn_dim                               # per-layer (elastic): 6144 or 12288
-        assert lw.gateup_proj is not None              # main path emits fused gate/up
-        gate_up = b.matmul(ff_in, lw.gateup_proj)      # [B, S, 2*ffn]
-        gate = b.slice_nd(gate_up, (0, 0, 0), ("batch", "seq", ffn))    # rows [0:ffn]
-        up = b.slice_nd(gate_up, (0, 0, ffn), ("batch", "seq", ffn))    # rows [ffn:]
-        gate_act = b.unary(aw.UnaryOp.gelu, gate)
-        ff = b.elemwise(aw.ElemwiseBinaryOp.mul, gate_act, up)
-        ff = b.matmul(ff, lw.down_proj)                # [B, S, EMBED_DIM]
-        ff = b.rmsnorm(ff, lw.post_ffn_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-        x = b.elemwise(aw.ElemwiseBinaryOp.add, x, ff)
+        ff_in = _rmsnorm(b, c, x, lw.pre_ffn_ln, EMBED_DIM)
+        ffn = lw.ffn_dim
+        assert lw.gateup_proj is not None
+        gate_up = b.matmul(ff_in, lw.gateup_proj)
+        gate = b.slice(gate_up, (0, 0, 0), ("batch", "seq", ffn))
+        up = b.slice(gate_up, (0, 0, ffn), ("batch", "seq", ffn))
+        gate_act = b.unary("gelu", gate)
+        ff = b.mul(gate_act, up)
+        ff = b.matmul(ff, lw.down_proj)
+        ff = _rmsnorm(b, c, ff, lw.post_ffn_ln, EMBED_DIM)
+        x = b.add(x, ff)
 
-        # 7) PLI mapping.
-        pli_gate_in = b.matmul(x, lw.pli_gate)                   # [B, S, PLI_DIM]
-        pli_gate_act = b.unary(aw.UnaryOp.gelu, pli_gate_in)
-        pli_slice = b.slice_nd(pli, (0, 0, layer_idx, 0), ("batch", "seq", 1, PLI_DIM))
+        pli_gate_in = b.matmul(x, lw.pli_gate)
+        pli_gate_act = b.unary("gelu", pli_gate_in)
+        pli_slice = b.slice(pli, (0, 0, layer_idx, 0), ("batch", "seq", 1, PLI_DIM))
         pli_slice2 = b.reshape(pli_slice, ("batch", "seq", PLI_DIM))
-        pli_combined = b.elemwise(aw.ElemwiseBinaryOp.mul, pli_gate_act, pli_slice2)
-        pli_out = b.matmul(pli_combined, lw.pli_proj)            # [B, S, EMBED_DIM]
-        pli_out = b.rmsnorm(pli_out, lw.post_pli_ln, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-        x = b.elemwise(aw.ElemwiseBinaryOp.add, x, pli_out)
+        pli_combined = b.mul(pli_gate_act, pli_slice2)
+        pli_out = b.matmul(pli_combined, lw.pli_proj)
+        pli_out = _rmsnorm(b, c, pli_out, lw.post_pli_ln, EMBED_DIM)
+        x = b.add(x, pli_out)
 
-        # 8) Skip scale.
-        x = b.scalar_last_dim_mul(x, EMBED_DIM, lw.skip_scale)
+        x = _scalar_mul(b, c, x, EMBED_DIM, lw.skip_scale)
 
     # ---- Tail ----
+    x = _rmsnorm(b, c, x, shared.final_norm, EMBED_DIM)
+    logits = b.matmul_nt(x, shared.embed_tokens)        # tied-embedding logits
+    logits = _scalar_div(b, c, logits, VOCAB_SIZE, FINAL_LOGIT_SOFTCAP)
+    logits = b.unary("tanh", logits)
+    logits = _scalar_mul(b, c, logits, VOCAB_SIZE, FINAL_LOGIT_SOFTCAP)
 
-    # Final RMSNorm.
-    x = b.rmsnorm(x, shared.final_norm, b.zero_beta((EMBED_DIM,)), (EMBED_DIM,))
-
-    # Tied logits via MatMulNT: [B, S, V] = x[B, S, EMBED_DIM] @ embed_tokens[V, EMBED_DIM]^T
-    logits = b.matmul_nt(x, shared.embed_tokens)
-
-    # Softcap: tanh(x / 30) * 30 using last-dim broadcast vectors of size V.
-    logits = b.scalar_last_dim_div(logits, VOCAB_SIZE, FINAL_LOGIT_SOFTCAP)
-    logits = b.unary(aw.UnaryOp.tanh, logits)
-    logits = b.scalar_last_dim_mul(logits, VOCAB_SIZE, FINAL_LOGIT_SOFTCAP)
-
-    # Record (k_append, v_append) per source layer for output aliasing.
-    source_append_outputs: Dict[int, Tuple[int, int]] = {
-        src: (k_cache_cur[src], v_cache_cur[src]) for src in SOURCE_LAYERS
-    }
-
-    return logits, source_append_outputs
+    caches = {src: (k_cache_in[src], k_cache_cur[src], v_cache_in[src], v_cache_cur[src])
+              for src in SOURCE_LAYERS}
+    return logits, tokens, positions, cache_write_index, cache_visible_end, k_cache_in, v_cache_in, caches
 
 
-def _add_input_roles(b: Builder) -> None:
-    """Declare input roles so the runtime can auto-allocate the KV caches (capacity
-    `G` supplied at load time, optionally growable) and auto-feed the index/position
-    inputs from its tracked sequence position. Applies to whatever inputs exist, so
-    it works for both the full-forward and single-block debug packages."""
-    name_to_idx = {nv.name: i for i, nv in enumerate(b.pkg.inputs)}
+def _finalize(b: Builder, logits: Value, tokens: Value, positions: Value,
+              cache_write_index: Value, cache_visible_end: Value,
+              k_cache_in: Dict[int, Value], v_cache_in: Dict[int, Value], caches) -> None:
+    b.mark_output(logits, "logits")
 
-    def role(nm: str, **kw) -> None:
-        if nm in name_to_idx:
-            b.pkg.input_roles.append(aw.InputRole(input_index=name_to_idx[nm], **kw))
+    # next_*_cache outputs io-aliased back to the cache inputs.
+    for src, (k_in, k_out, v_in, v_out) in caches.items():
+        b.mark_output(k_out, f"next_k_cache.layer{src}")
+        b.mark_output(v_out, f"next_v_cache.layer{src}")
+        b.add_output_alias(k_in, k_out)
+        b.add_output_alias(v_in, v_out)
 
-    role("tokens", kind=aw.RoleKind.tokens, axis=1)
-    role("positions", kind=aw.RoleKind.positions, axis=1)
-    role("cache_write_index", kind=aw.RoleKind.cache_write_index)
-    role("cache_visible_end", kind=aw.RoleKind.cache_visible_end)
+    # Input roles: auto-fed indices/positions + auto-managed KV caches.
+    b.add_input_role(tokens, RK.AION_ROLE_TOKENS, axis=1)
+    b.add_input_role(positions, RK.AION_ROLE_POSITIONS, axis=1)
+    b.add_input_role(cache_write_index, RK.AION_ROLE_CACHE_WRITE_INDEX)
+    b.add_input_role(cache_visible_end, RK.AION_ROLE_CACHE_VISIBLE_END)
+    for src in SOURCE_LAYERS:
+        is_glob = is_global_layer(src)
+        for v in (k_cache_in[src], v_cache_in[src]):
+            if is_glob:
+                # Global caches: free capacity symbol `G`, growable.
+                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=2,
+                                 capacity_symbol="G", zero_init=True, growable=True)
+            else:
+                # Local caches: fixed sliding-window size.
+                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=2, zero_init=True)
 
-    g_sym = b._sym_idx["G"]
-    for nv in b.pkg.inputs:
-        is_k = nv.name.startswith("k_cache")
-        is_v = nv.name.startswith("v_cache")
-        if not (is_k or is_v):
-            continue
-        # Global layers have the free capacity symbol `G` (growable); local layers
-        # are fixed at the 512-token sliding window.
-        layer_txt = nv.name.rsplit("layer", 1)[-1]
-        is_glob = layer_txt.isdigit() and is_global_layer(int(layer_txt))
-        kw = dict(kind=aw.RoleKind.sequence_cache, axis=2)
-        if is_glob:
-            kw["capacity_symbol"] = g_sym
-            kw["flags"] = aw.ROLE_FLAG_ZERO_INIT | aw.ROLE_FLAG_ALLOW_GROWABLE
-        role(nv.name, **kw)
-
-
-def _write_metadata(b: Builder) -> None:
-    b.pkg.metadata.extend([
-        aw.MetadataEntry(key="arch", value="gemma4-e2b-text"),
-        aw.MetadataEntry(key="quant", value="q8_0-weights-f16-cache"),
-        aw.MetadataEntry(key="num_layers", value=str(NUM_LAYERS)),
-        aw.MetadataEntry(key="embed_dim", value=str(EMBED_DIM)),
-        aw.MetadataEntry(key="local_head_dim", value=str(LOCAL_HEAD_DIM)),
-        aw.MetadataEntry(key="global_head_dim", value=str(GLOBAL_HEAD_DIM)),
-        aw.MetadataEntry(key="local_sliding_window", value=str(LOCAL_SLIDING_WINDOW)),
-        aw.MetadataEntry(key="final_logit_softcap", value=str(FINAL_LOGIT_SOFTCAP)),
-        aw.MetadataEntry(key="kv_sharing.local_source_layer", value=str(LOCAL_SOURCE_LAYER)),
-        aw.MetadataEntry(key="kv_sharing.global_source_layer", value=str(GLOBAL_SOURCE_LAYER)),
-        aw.MetadataEntry(key="graph_phase", value="2-full-forward"),
-    ])
-
-
-def _alias_cache_outputs(
-    b: Builder,
-    source_append_outputs: Dict[int, Tuple[int, int]],
-) -> None:
-    """Add `next_k_cache.layerX` / `next_v_cache.layerX` outputs and alias them back to the
-    corresponding K/V cache inputs. The runtime relies on this to write back cache state."""
-    name_to_in_idx = {nv.name: idx for idx, nv in enumerate(b.pkg.inputs)}
-    for src, (k_out_vid, v_out_vid) in source_append_outputs.items():
-        out_k_name = f"next_k_cache.layer{src}"
-        out_v_name = f"next_v_cache.layer{src}"
-        k_out_idx = len(b.pkg.outputs)
-        b.add_output(out_k_name, k_out_vid)
-        v_out_idx = len(b.pkg.outputs)
-        b.add_output(out_v_name, v_out_vid)
-        b.add_io_alias(name_to_in_idx[f"k_cache.layer{src}"], k_out_idx)
-        b.add_io_alias(name_to_in_idx[f"v_cache.layer{src}"], v_out_idx)
+    for key, value in [
+        ("arch", "gemma4-e2b-text"),
+        ("quant", "q8_0-weights-f16-cache"),
+        ("num_layers", str(NUM_LAYERS)),
+        ("embed_dim", str(EMBED_DIM)),
+        ("local_head_dim", str(LOCAL_HEAD_DIM)),
+        ("global_head_dim", str(GLOBAL_HEAD_DIM)),
+        ("local_sliding_window", str(LOCAL_SLIDING_WINDOW)),
+        ("final_logit_softcap", str(FINAL_LOGIT_SOFTCAP)),
+        ("kv_sharing.local_source_layer", str(LOCAL_SOURCE_LAYER)),
+        ("kv_sharing.global_source_layer", str(GLOBAL_SOURCE_LAYER)),
+        ("graph_phase", "2-full-forward"),
+    ]:
+        b.add_metadata(key, value)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    b = _make_builder()
-    log: List[str] = []
+    with aion.Context(thread_count=1) as ctx:
+        with Builder(ctx) as b:
+            with _WeightLoader(args.in_safetensors) as loader:
+                _reject_if_unexpected_multimodal(loader.keys(), args.allow_multimodal)
+                shared, layers = _emit_weights(loader, b)
+            out = _emit_forward(b, shared, layers)
+            _finalize(b, *out)
+            b.export(os.path.abspath(args.out_aion), None)
 
-    # Populated by exactly one of the two branches below (pyright can't link the
-    # repeated `debug_block_layer` conditionals, so bind them up front).
-    lw: Optional[_LayerWeights] = None
-    cache_dtype: int = aw.DType.f32
-    shared: Optional[_SharedWeights] = None
-    layers: List[_LayerWeights] = []
-
-    with _WeightLoader(args.in_safetensors) as loader:
-        _reject_if_unexpected_multimodal(loader.keys(), args.allow_multimodal)
-        if args.debug_block_layer is not None:
-            cache_dtype = aw.DType.f16 if args.debug_block_cache_dtype == "f16" else aw.DType.f32
-            lw = _emit_one_layer_weights(loader, b, args.debug_block_layer, weight_mode=args.debug_block_weights)
-        else:
-            shared, layers = _emit_weights(loader, b)
-
-    if args.debug_block_layer is not None:
-        assert lw is not None
-        x_out, k_next, v_next, taps = _emit_forward_one_block(
-            b,
-            layer_idx=args.debug_block_layer,
-            lw=lw,
-            cache_dtype=cache_dtype,
-        )
-        b.add_output("x_out", x_out)
-        k_out_idx = len(b.pkg.outputs)
-        b.add_output("next_k_cache", k_next)
-        v_out_idx = len(b.pkg.outputs)
-        b.add_output("next_v_cache", v_next)
-
-        name_to_in_idx = {nv.name: idx for idx, nv in enumerate(b.pkg.inputs)}
-        b.add_io_alias(name_to_in_idx["k_cache"], k_out_idx)
-        b.add_io_alias(name_to_in_idx["v_cache"], v_out_idx)
-
-        _add_input_roles(b)
-
-        if args.debug_block_taps:
-            # Keep names stable so downstream scripts can compare step-by-step.
-            for k in sorted(taps.keys()):
-                if k in {"x_out"}:
-                    continue
-                b.add_output(f"tap.{k}", taps[k])
-
-        b.pkg.metadata.extend([
-            aw.MetadataEntry(key="arch", value="gemma4-e2b-text"),
-            aw.MetadataEntry(key="graph_phase", value="debug-single-block"),
-            aw.MetadataEntry(key="debug.layer", value=str(args.debug_block_layer)),
-            aw.MetadataEntry(key="debug.weights", value=str(args.debug_block_weights)),
-            aw.MetadataEntry(key="debug.cache_dtype", value=str(args.debug_block_cache_dtype)),
-            aw.MetadataEntry(key="debug.taps", value=str(bool(args.debug_block_taps))),
-        ])
-    else:
-        assert shared is not None
-        logits, source_append_outputs = _emit_forward(b, log, shared, layers)
-
-        # Primary model output.
-        b.add_output("logits", logits)
-        # next_*_cache outputs + io_aliases.
-        _alias_cache_outputs(b, source_append_outputs)
-        _add_input_roles(b)
-
-        _write_metadata(b)
-
-    total = sum(len(init.data) for init in b.pkg.initializers)
-    print(
-        f"[gemma4-e2b] initializers: {len(b.pkg.initializers)}   "
-        f"nodes: {len(b.pkg.nodes)}   "
-        f"total initializer bytes: {total/1e9:.3f} GB"
-    )
-
-    # Sanity: `io_aliases` must always be compatible. If they are not, the runtime has
-    # to ignore them (or error), and we lose the intended cache write-back behavior.
-    for alias in b.pkg.io_aliases:
-        if not (0 <= alias.input_index < len(b.pkg.inputs)):
-            raise AssertionError(f"io_alias input_index out of range: {alias}")
-        if not (0 <= alias.output_index < len(b.pkg.outputs)):
-            raise AssertionError(f"io_alias output_index out of range: {alias}")
-
-        in_nv = b.pkg.inputs[alias.input_index]
-        out_nv = b.pkg.outputs[alias.output_index]
-        in_v = b.pkg.values[in_nv.value]
-        out_v = b.pkg.values[out_nv.value]
-        if in_v.dtype != out_v.dtype or in_v.rank != out_v.rank:
-            raise AssertionError(
-                "io_alias incompatible: "
-                f"input[{alias.input_index}]={in_nv.name} (vid={in_nv.value} dtype={in_v.dtype} rank={in_v.rank}) "
-                f"-> output[{alias.output_index}]={out_nv.name} (vid={out_nv.value} dtype={out_v.dtype} rank={out_v.rank})"
-            )
-
-    aw.write_aion_v4(args.out_aion, b.pkg)
     print(f"[gemma4-e2b] wrote {args.out_aion}")
     return 0
 

@@ -123,7 +123,12 @@ fn inferRegion(graph: *Graph, region_id: graph_mod.RegionId) InferError!graph_mo
     return region;
 }
 
-fn inferNode(graph: *Graph, node: Node) InferError!void {
+/// Infer dtype + shape for a single node's output(s), reading its already-inferred
+/// inputs. Public so the authoring `Builder` can infer each op as it is added
+/// (eager, per-op) rather than only in the whole-graph `infer` sweep — the two
+/// share this exact rule set. Safe to call repeatedly (`setInferred` validates a
+/// pre-set shape rather than overwriting it).
+pub fn inferNode(graph: *Graph, node: Node) InferError!void {
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
 
     switch (node.op) {

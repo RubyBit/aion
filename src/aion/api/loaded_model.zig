@@ -54,6 +54,16 @@ pub const GraphSource = union(enum) {
     builder: BuilderSource,
 };
 
+/// Declares that input `input_index`'s axis `axis` is the free (variable) dim
+/// bound to dim symbol `symbol_index`. Used to give an in-process compiled model
+/// symbolic shapes so one model serves multiple input sizes (e.g. prefill then
+/// decode) without recompiling from scratch.
+pub const SymbolicAxis = struct {
+    input_index: u32,
+    axis: u32,
+    symbol_index: u32,
+};
+
 pub const Model = struct {
     allocator: std.mem.Allocator,
     backend: backend_mod.Backend,
@@ -1022,6 +1032,8 @@ pub const Model = struct {
         output_names: []const []const u8,
         io_aliases: []const package_file.IoAlias,
         input_roles: []const package_file.InputRole,
+        dim_symbol_count: usize,
+        symbolic_axes: []const SymbolicAxis,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
         var graph = graph_in;
@@ -1046,9 +1058,22 @@ pub const Model = struct {
             const dtype = v.dtype orelse return error.InvalidArgument;
             const terms = try aa.alloc(package_file.ShapeTerm, v.shape.len);
             for (v.shape, 0..) |d, i| terms[i] = .{ .constant = @intCast(d) };
+            // Mark declared-symbolic axes as expressions so a differently-sized
+            // bound input resolves the symbol instead of being rejected.
+            for (symbolic_axes) |sa| {
+                if (sa.input_index == k) {
+                    if (sa.axis >= terms.len or sa.symbol_index >= dim_symbol_count) return error.InvalidArgument;
+                    terms[sa.axis] = .{ .expr = sa.symbol_index };
+                }
+            }
             input_signatures[k] = .{ .name = try aa.dupe(u8, input_names[k]), .value = vid, .dtype = dtype, .rank = @intCast(v.shape.len) };
             input_shape_terms[k] = terms;
         }
+
+        // One dim-expr per symbol (`expr_index == symbol_index`), mirroring the
+        // package-export encoding so `bindInputDimExprs` resolves them uniformly.
+        const dim_exprs = try aa.alloc(package_file.DimExpr, dim_symbol_count);
+        for (0..dim_symbol_count) |i| dim_exprs[i] = .{ .symbol = @intCast(i) };
         for (output_value_ids, 0..) |vid, j| {
             const v = graph.values.items[@intCast(vid)];
             const dtype = v.dtype orelse return error.InvalidArgument;
@@ -1085,8 +1110,8 @@ pub const Model = struct {
             input_signatures,
             output_signatures,
             input_shape_terms,
-            &[_]package_file.DimExpr{},
-            0,
+            dim_exprs,
+            dim_symbol_count,
             aliases_dup,
             roles_dup,
             0,
@@ -1357,9 +1382,26 @@ pub const Model = struct {
         direct_input_ids: []const TensorId,
     ) api_errors.ExecuteError!CacheEntry {
         switch (self.source) {
-            // Compiled model: the graph already exists (nodes + bound params). Bind
-            // public inputs + compile in place — no graph reconstruction.
-            .builder => |*b| return self.finishCacheEntry(&b.graph, b.input_value_ids, b.output_value_ids, symbol_values, input_shapes, direct_input_ids),
+            // Compiled model: clone the pristine authored template into a fresh
+            // concrete graph for this run's shapes, then compile it (infer +
+            // optimize + lower) — mirroring the loaded path below. The template is
+            // never mutated; the clone shares weight tensors (external ids copied
+            // by value) and is discarded once its program is built.
+            .builder => |*b| {
+                var g = b.graph.clone(self.allocator) catch return error.OutOfMemory;
+                defer g.deinit();
+                // A freshly-materialized graph: produced shapes are (re)inferred, so
+                // clear them and set each public input to this run's concrete shape.
+                for (g.values.items) |*v| {
+                    if (v.producer != null) v.shape = &[_]usize{};
+                }
+                var cursor: usize = 0;
+                for (self.input_signatures, 0..) |_, si| {
+                    const cshape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, si, &cursor);
+                    g.values.items[@intCast(b.input_value_ids[si])].shape = g.dupeShape(cshape) catch return error.OutOfMemory;
+                }
+                return self.finishCacheEntry(&g, b.input_value_ids, b.output_value_ids, symbol_values, input_shapes, direct_input_ids);
+            },
             // Loaded model: walk the package node records to build a fresh concrete
             // graph specialized to these shapes/symbols.
             .package => |*pkg| {

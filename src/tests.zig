@@ -20,6 +20,7 @@ comptime {
     _ = @import("aion/runtime/residency/test_resident_store.zig");
     _ = @import("aion/storage/storage.zig");
     _ = @import("aion/storage/test_storage.zig");
+    _ = @import("aion/storage/quantize.zig");
     _ = @import("aion/backend/cpu/test_cpu_kernels.zig");
     _ = @import("aion/backend/cpu/test_cpu_backend.zig");
     _ = @import("aion/backend/cpu/kernels/fft.zig");

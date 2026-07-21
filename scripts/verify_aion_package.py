@@ -40,8 +40,27 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-# Reuse the writer's constants to avoid drift between reader and writer.
-from aion._writer import format as aw
+# Self-contained `.aion` v6 container constants (source of truth: the Zig
+# implementation in src/aion/storage/aion_file/{types,write}.zig). Inlined so this
+# read-only verifier has no dependency on any pure-Python writer.
+class aw:  # noqa: N801 - kept lowercase as a drop-in constants namespace
+    MAGIC = b"AION"
+    VERSION = 6
+    HEADER_SIZE = 72
+    SECTION_DESC_SIZE = 24
+    INVALID_INDEX_U32 = 0xFFFFFFFF
+
+    class SectionType:
+        strings = 1
+        tensors = 2
+
+    class DType:
+        f32 = 0
+        f16 = 1
+        i8 = 2
+        q4_0 = 3
+        q8_0 = 4
+        i32 = 5
 
 
 _DTYPE_NAMES: Dict[int, str] = {

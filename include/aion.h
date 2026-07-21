@@ -299,6 +299,190 @@ AION_API AionStatus aion_loaded_model_set_position(AionLoadedModel* m, uint64_t 
    outputs out by default. */
 AION_API AionStatus aion_loaded_model_output_is_state(const AionLoadedModel* m, size_t index, uint8_t* out_is_state);
 
+// -----------------------------------------------------------------------------
+// Model authoring (Builder -> compile / export)
+//
+// Build a computation graph in code, then either compile it to a runnable model
+// in-process (`aion_builder_compile`, reusing the AionLoadedModel run surface)
+// or serialize it to a `.aion` file (`aion_builder_export_path`). Values are
+// plain AionValueId (a u32 scoped to the builder), not heap handles. Every op
+// goes through the single `aion_builder_op` entry, whose AionOpSpec attribute
+// union mirrors the core graph op set.
+// -----------------------------------------------------------------------------
+
+typedef struct AionBuilder AionBuilder;
+
+// Opaque id of a value inside a builder (mirrors the Zig TensorRef, a u32).
+typedef uint32_t AionValueId;
+
+typedef enum AionUnaryOp {
+    AION_UNARY_RELU = 0,
+    AION_UNARY_GELU = 1,
+    AION_UNARY_SILU = 2,
+    AION_UNARY_SIGMOID = 3,
+    AION_UNARY_TANH = 4,
+    AION_UNARY_SQRT = 5,
+    AION_UNARY_LOG = 6,
+} AionUnaryOp;
+
+typedef enum AionBinaryOp {
+    AION_BINARY_ADD = 0,
+    AION_BINARY_SUB = 1,
+    AION_BINARY_MUL = 2,
+    AION_BINARY_DIV = 3,
+    AION_BINARY_EQ = 4,
+    AION_BINARY_NE = 5,
+    AION_BINARY_LT = 6,
+    AION_BINARY_GT = 7,
+    AION_BINARY_LE = 8,
+    AION_BINARY_GE = 9,
+} AionBinaryOp;
+
+typedef enum AionReduceOp {
+    AION_REDUCE_SUM = 0,
+    AION_REDUCE_MEAN = 1,
+} AionReduceOp;
+
+typedef enum AionPadMode {
+    AION_PAD_ZERO = 0,
+    AION_PAD_REFLECT = 1,
+} AionPadMode;
+
+typedef enum AionInputRoleKind {
+    AION_ROLE_SEQUENCE_CACHE = 1,
+    AION_ROLE_CACHE_WRITE_INDEX = 2,
+    AION_ROLE_CACHE_VISIBLE_END = 3,
+    AION_ROLE_POSITIONS = 4,
+    AION_ROLE_TOKENS = 5,
+    AION_ROLE_STATE = 6,
+} AionInputRoleKind;
+
+typedef enum AionOp {
+    AION_OP_MATMUL = 0,
+    AION_OP_MATMUL_NT = 1,
+    AION_OP_ELEMWISE = 2,
+    AION_OP_BROADCAST_LAST_DIM = 3,
+    AION_OP_UNARY = 4,
+    AION_OP_SOFTMAX = 5,
+    AION_OP_LAYERNORM = 6,
+    AION_OP_RMSNORM = 7,
+    AION_OP_ATTENTION = 8,
+    AION_OP_MHA = 9,
+    AION_OP_MHA_CACHED = 10,
+    AION_OP_RELPOS_MHA = 11,
+    AION_OP_CONV1D = 12,
+    AION_OP_CONV2D = 13,
+    AION_OP_COPY = 14,
+    AION_OP_GATHER_ROWS = 15,
+    AION_OP_ROPE1D = 16,
+    AION_OP_SEQUENCE_APPEND = 17,
+    AION_OP_REDUCE = 18,
+    AION_OP_CONCAT = 19,
+    AION_OP_RESHAPE = 20,
+    AION_OP_SQUEEZE = 21,
+    AION_OP_UNSQUEEZE = 22,
+    AION_OP_TRANSPOSE2D = 23,
+    AION_OP_SLICE = 24,
+    AION_OP_LSTM_CELL = 25,
+    AION_OP_RFFT = 26,
+    AION_OP_STFT = 27,
+    AION_OP_CAST = 28,
+    AION_OP_ARGMAX = 29,
+    AION_OP_SCATTER_ROW = 30,
+    AION_OP_GELU_MUL = 31,
+} AionOp;
+
+// Per-op attributes. Only the member matching AionOpSpec.op is read.
+typedef union AionOpAttr {
+    struct { float alpha; float beta; } matmul;
+    struct { AionBinaryOp op; } elemwise;
+    struct { AionUnaryOp op; } unary;
+    struct { int32_t axis; } softmax;
+    struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;
+    struct { float scale; uint8_t causal; size_t heads; } attention;
+    struct { float scale; uint8_t causal; size_t sliding_window; float attn_logits_soft_cap; } mha_cached;
+    struct { float scale; size_t heads; } relpos_mha;
+    struct { size_t stride; size_t dilation; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv1d;
+    struct { size_t stride_h; size_t stride_w; size_t dilation_h; size_t dilation_w; size_t pad_top; size_t pad_bottom; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv2d;
+    struct { float base_frequency; float scale_factor; float rope_proportion; } rope1d;
+    struct { AionReduceOp op; int32_t axis; uint8_t has_axis; } reduce;
+    struct { int32_t axis; } concat;
+    // reshape/slice dims may be symbolic: `*_symbols`, when non-NULL, is an array
+    // (length shape_len/len) whose entry is a NUL-terminated dim-symbol name for a
+    // symbolic axis or NULL for a constant axis (whose size is shape[i]/lens[i],
+    // the authoring placeholder). NULL for the whole array means all-constant.
+    struct { const size_t* shape; size_t shape_len; const char* const* shape_symbols; } reshape;
+    struct { int32_t axis; uint8_t has_axis; } squeeze;
+    struct { int32_t axis; } unsqueeze;
+    struct { const size_t* starts; const size_t* lens; size_t len; const char* const* len_symbols; } slice;
+    struct { size_t n_fft; size_t hop_length; uint8_t center; } stft;
+    struct { AionDType to_dtype; } cast;
+    struct { int32_t axis; } argmax;
+} AionOpAttr;
+
+// A single op to append: which op, its input value ids (like a graph node's
+// inputs), and its attributes.
+typedef struct AionOpSpec {
+    AionOp op;
+    const AionValueId* inputs;
+    size_t inputs_len;
+    AionOpAttr attr;
+} AionOpSpec;
+
+AION_API AionStatus aion_builder_create(AionContext* ctx, AionBuilder** out_builder);
+AION_API void aion_builder_destroy(AionBuilder* b);
+
+AION_API AionStatus aion_builder_input(AionBuilder* b, AionDType dtype, size_t rank, const size_t* shape, AionValueId* out_value);
+// Bind an already-created owned tensor (float or quantized) as a graph weight.
+AION_API AionStatus aion_builder_param(AionBuilder* b, const AionTensor* tensor, AionValueId* out_value);
+AION_API AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name);
+
+// Authoring-time shape/dtype introspection (eager per-op inference keeps every
+// value's shape current). Shapes reflect authoring placeholder sizes: an axis
+// declared dynamic reports the size it was declared with, propagated to derived
+// values. Mirrors the tensor rank/shape/dtype readers.
+AION_API AionStatus aion_builder_value_rank(const AionBuilder* b, AionValueId value, size_t* out_rank);
+AION_API AionStatus aion_builder_value_shape(const AionBuilder* b, AionValueId value, size_t* out_dims, size_t out_rank);
+AION_API AionStatus aion_builder_value_dtype(const AionBuilder* b, AionValueId value, AionDType* out_dtype);
+
+// Append one op. Reads only the AionOpAttr member matching `spec->op`; variable
+// arity (concat, optional bias/mask) is carried by `spec->inputs`.
+AION_API AionStatus aion_builder_op(AionBuilder* b, const AionOpSpec* spec, AionValueId* out_value);
+
+// Control flow. Build a region (a branch body or loop body) between
+// begin/end_region, then reference it from `if`/`loop`. `end_region` returns a
+// region id. `loop` writes `carried_len` final carried values into `out_values`
+// (single-carry loops pass carried_len == 1); `has_cond_carry == 0` means no
+// continue-predicate carry.
+typedef uint32_t AionRegionId;
+AION_API AionStatus aion_builder_begin_region(AionBuilder* b);
+AION_API AionStatus aion_builder_end_region(AionBuilder* b, const AionValueId* outputs, size_t outputs_len, AionRegionId* out_region);
+AION_API AionStatus aion_builder_if(AionBuilder* b, AionValueId cond, AionRegionId then_region, AionRegionId else_region, AionValueId* out_value);
+AION_API AionStatus aion_builder_loop(AionBuilder* b, const AionValueId* carried, size_t carried_len, AionRegionId body_region, size_t trip, size_t cond_carry, uint8_t has_cond_carry, uint8_t check_before, AionValueId* out_values);
+
+// Declarations consumed by compile/export. Marking an output also names it.
+AION_API AionStatus aion_builder_mark_output(AionBuilder* b, AionValueId value, const char* name);
+AION_API AionStatus aion_builder_add_output_alias(AionBuilder* b, AionValueId input_value, AionValueId output_value);
+AION_API AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint8_t allow_ring);
+AION_API AionStatus aion_builder_add_dim_symbol(AionBuilder* b, AionValueId value, size_t axis, const char* name);
+AION_API AionStatus aion_builder_add_metadata(AionBuilder* b, const char* key, const char* value);
+
+// Terminals. `compile` builds an in-process runnable model (concrete shapes
+// only). `export_path` serializes a `.aion` (supports dim symbols). Both consume
+// the marked outputs + accumulated aliases/roles/metadata.
+AION_API AionStatus aion_builder_compile(AionBuilder* b, AionDeviceKind device_kind, uint32_t device_index, AionLoadedModel** out_model);
+AION_API AionStatus aion_builder_export_path(AionBuilder* b, const char* path);
+AION_API AionStatus aion_builder_export_path_absolute(AionBuilder* b, const char* path);
+
+// Quantized-tensor creation. `aion_tensor_quantize` packs row-major f32 values
+// into a quantized tensor (q8_0 today); `aion_tensor_create_quant` ingests
+// pre-packed quant bytes.
+// `quant_axis` selects the block axis (every block_elems along it forms one
+// block). For a matmul-B weight this is the K reduction axis (rank-2); for an
+// embedding table blocked along the feature dim it is the last axis.
+AION_API AionStatus aion_tensor_quantize(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const float* values, size_t values_len, AionTensor** out_tensor);
+AION_API AionStatus aion_tensor_create_quant(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const uint8_t* packed, size_t packed_len, AionTensor** out_tensor);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,7 +16,6 @@ pub const TensorId = types_mod.TensorId;
 pub const Package = types_mod.Package;
 
 pub const Metadata = types_mod.Metadata;
-pub const DimensionSymbol = types_mod.DimensionSymbol;
 pub const OutputAlias = types_mod.OutputAlias;
 pub const InputRoleDecl = types_mod.InputRoleDecl;
 pub const ExportModelOptions = types_mod.ExportModelOptions;
@@ -45,7 +44,7 @@ pub fn buildPackage(
     defer allocator.free(input_symbol_expr);
     @memset(input_symbol_expr, null);
 
-    for (opts.input_symbols) |spec| {
+    for (builder.dimSymbols()) |spec| {
         const value_idx: usize = @intCast(spec.tensor.value);
         if (value_idx >= graph.values.items.len) return error.InvalidArgument;
         const value = graph.values.items[value_idx];
@@ -66,6 +65,20 @@ pub fn buildPackage(
 
         const expr_index: u32 = symbol_index;
         input_symbol_expr[value_idx * types_mod.max_rank + spec.axis] = expr_index;
+    }
+
+    // Symbolic dims used in view-op attrs (reshape/slice), keyed by the view op's
+    // output value + attr axis. The symbol must be a declared input dim symbol.
+    const view_symbol_expr = try allocator.alloc(?u32, graph.values.items.len * types_mod.max_rank);
+    defer allocator.free(view_symbol_expr);
+    @memset(view_symbol_expr, null);
+
+    for (builder.viewDimSymbols()) |spec| {
+        const value_idx: usize = @intCast(spec.tensor.value);
+        if (value_idx >= graph.values.items.len) return error.InvalidArgument;
+        if (spec.axis >= types_mod.max_rank) return error.InvalidArgument;
+        const expr_idx: u32 = symbol_map.get(spec.name) orelse return error.InvalidArgument;
+        view_symbol_expr[value_idx * types_mod.max_rank + spec.axis] = expr_idx;
     }
 
     var initializers_list: std.ArrayList(package_file.Initializer) = .empty;
@@ -136,9 +149,9 @@ pub fn buildPackage(
     errdefer allocator.free(io_aliases);
     const input_roles = try collect.collectInputRoles(allocator, inputs, opts.input_roles, &symbol_map);
     errdefer if (input_roles.len != 0) allocator.free(input_roles);
-    const nodes = try collect.collectNodes(allocator, graph);
+    const nodes = try collect.collectNodes(allocator, graph, view_symbol_expr);
     errdefer collect.freeNodes(allocator, nodes);
-    const regions = try collect.collectRegions(allocator, graph);
+    const regions = try collect.collectRegions(allocator, graph, view_symbol_expr);
     errdefer collect.freeRegions(allocator, regions);
 
     return .{

@@ -18,12 +18,6 @@ pub const Metadata = struct {
     value: []const u8,
 };
 
-pub const DimensionSymbol = struct {
-    tensor: TensorRef,
-    axis: usize,
-    name: []const u8,
-};
-
 /// Declares that `output`'s value should be written back into `input`'s slot after
 /// each run (recurrent-state carry — KV caches, LSTM h/c). Referenced by tensor, not
 /// by name: `input` must be a graph input and `output` must be one of the compiled/
@@ -41,7 +35,8 @@ pub const InputRoleDecl = struct {
     kind: package_file.InputRoleKind,
     /// Capacity axis (sequence_cache) or sequence axis (tokens/positions).
     axis: ?u8 = null,
-    /// Dim symbol NAME of a free capacity axis; must also appear in `input_symbols`.
+    /// Dim symbol NAME of a free capacity axis; must also be declared on the
+    /// builder via `symbolicDim`.
     capacity_symbol: ?[]const u8 = null,
     zero_init: bool = true,
     allow_growable: bool = false,
@@ -49,7 +44,6 @@ pub const InputRoleDecl = struct {
 };
 
 pub const ExportModelOptions = struct {
-    input_symbols: []const DimensionSymbol = &.{},
     metadata: []const Metadata = &.{},
     output_aliases: []const OutputAlias = &.{},
     input_roles: []const InputRoleDecl = &.{},

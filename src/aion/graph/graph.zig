@@ -503,6 +503,66 @@ pub const Graph = struct {
         return out;
     }
 
+    /// Deep-copy this graph into a fresh, independent `Graph` owned by `allocator`.
+    ///
+    /// Structure (values, nodes, regions, shapes, op attributes) is duplicated into
+    /// the clone's own arena; external bindings (weight `TensorId`s) are copied by
+    /// value, so the clone shares the source's weights rather than duplicating them.
+    /// Value ids are preserved (same indices), so a caller's retained value ids stay
+    /// valid against the clone. Used to compile a pristine authored template for a
+    /// concrete shape without mutating the template.
+    pub fn clone(self: *const Self, allocator: std.mem.Allocator) GraphError!Self {
+        var out = Self.init(allocator);
+        errdefer out.deinit();
+        const aa = out.arenaAlloc();
+
+        for (self.values.items) |v| {
+            const sh: []const usize = if (v.shape.len == 0) &[_]usize{} else try out.dupeShape(v.shape);
+            out.values.append(allocator, .{ .dtype = v.dtype, .shape = sh, .producer = v.producer, .external = v.external }) catch return GraphError.OutOfMemory;
+        }
+        for (self.nodes.items) |n| {
+            out.nodes.append(allocator, try cloneNode(aa, n)) catch return GraphError.OutOfMemory;
+        }
+        out.outputs.appendSlice(allocator, self.outputs.items) catch return GraphError.OutOfMemory;
+        for (self.regions.items) |r| {
+            const nodes = allocator.alloc(Node, r.nodes.len) catch return GraphError.OutOfMemory;
+            errdefer allocator.free(nodes);
+            for (r.nodes, 0..) |rn, i| nodes[i] = try cloneNode(aa, rn);
+            const outs = allocator.dupe(ValueId, r.outputs) catch return GraphError.OutOfMemory;
+            errdefer allocator.free(outs);
+            out.regions.append(allocator, .{ .nodes = nodes, .outputs = outs }) catch return GraphError.OutOfMemory;
+        }
+        return out;
+    }
+
+    fn cloneNode(aa: std.mem.Allocator, n: Node) GraphError!Node {
+        return .{
+            .op = try cloneOp(aa, n.op),
+            .inputs = aa.dupe(ValueId, n.inputs) catch return GraphError.OutOfMemory,
+            .output = n.output,
+            .extra_outputs = aa.dupe(ValueId, n.extra_outputs) catch return GraphError.OutOfMemory,
+        };
+    }
+
+    /// Copy an op, deep-copying the only attribute fields that hold slices
+    /// (everything else is POD and copies by value).
+    fn cloneOp(aa: std.mem.Allocator, op: Op) GraphError!Op {
+        const dup = struct {
+            fn f(a: std.mem.Allocator, s: []const usize) GraphError![]const usize {
+                const d = a.alloc(usize, s.len) catch return GraphError.OutOfMemory;
+                @memcpy(d, s);
+                return d;
+            }
+        }.f;
+        return switch (op) {
+            .LayerNorm => |x| .{ .LayerNorm = .{ .eps = x.eps, .normalized_shape = try dup(aa, x.normalized_shape) } },
+            .RMSNorm => |x| .{ .RMSNorm = .{ .eps = x.eps, .normalized_shape = try dup(aa, x.normalized_shape) } },
+            .ViewReshape => |x| .{ .ViewReshape = .{ .new_shape = try dup(aa, x.new_shape) } },
+            .ViewSliceND => |x| .{ .ViewSliceND = .{ .starts = try dup(aa, x.starts), .lens = try dup(aa, x.lens) } },
+            else => op,
+        };
+    }
+
     pub fn addValue(self: *Self) GraphError!ValueId {
         const id: ValueId = @intCast(self.values.items.len);
         self.values.append(self.allocator, .{}) catch return GraphError.OutOfMemory;
@@ -565,6 +625,18 @@ pub const Graph = struct {
             for (outs) |o| self.values.items[@intCast(o)].producer = node_id;
         }
         return outs;
+    }
+
+    /// The most recently appended node — the active region's last node while a
+    /// region is open, otherwise the graph's last node. Lets the authoring
+    /// `Builder` infer the node it just added. Null if none exists in scope.
+    pub fn lastNode(self: *const Self) ?Node {
+        if (self.active_region) {
+            if (self.active_region_nodes.items.len == 0) return null;
+            return self.active_region_nodes.items[self.active_region_nodes.items.len - 1];
+        }
+        if (self.nodes.items.len == 0) return null;
+        return self.nodes.items[self.nodes.items.len - 1];
     }
 
     pub fn beginRegion(self: *Self) GraphError!void {

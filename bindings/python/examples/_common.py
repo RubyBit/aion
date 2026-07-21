@@ -17,7 +17,7 @@ def read_aion_metadata(path: str) -> dict:
 
     Converters record model parameters here (arch, chunk size, window sizes,
     ...), so examples can auto-configure from the model file alone. Layout per
-    aion._writer.format: 72-byte header (magic, version, section count,
+    src/aion/storage/aion_file: 72-byte header (magic, version, section count,
     reserved, directory offset), a directory of (type u32, flags u32, offset
     u64, size u64) entries, then section payloads. Strings section (type 1) is
     a u32 count + length-prefixed strings; metadata section (type 9) is a u32

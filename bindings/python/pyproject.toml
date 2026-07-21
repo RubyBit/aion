@@ -35,7 +35,7 @@ gpu = []
 # `uv sync` installs the `dev` group by default; use `--group test` for just the
 # test deps, or `--no-default-groups` for a runtime-only environment.
 [dependency-groups]
-# numpy: the test fixtures build synthetic .aion packages via aion._writer.
+# numpy: the test fixtures build synthetic .aion packages via the C-ABI Builder.
 test = ["pytest>=9", "numpy>=1.26"]
 dev = [
   "tokenizers>=0.23.1",

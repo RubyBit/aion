@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from . import nn
+from .builder import Builder, Value
 from .context import Context, get_default_context, reset_default_context
 from .device import DeviceLike, GpuOptions, _gpu_adapter_from_device
+from .dtype import float16, float32, int8, int32, normalize_dtype, q4_0, q8_0
 from .errors import AionError
 from .model import LoadedModel, TensorSpec
 from .tensor import Tensor
+from ._trace import InputSpec, compile, export, spec
 from .enums import AionDeviceKind, AionDType, AionGpuBackend, AionGpuPower, AionStatus
 
 __all__ = [
@@ -15,13 +19,27 @@ __all__ = [
     "AionGpuBackend",
     "AionGpuPower",
     "AionStatus",
+    "Builder",
     "Context",
     "GpuOptions",
+    "InputSpec",
     "LoadedModel",
     "TensorSpec",
     "Tensor",
+    "Value",
+    "compile",
+    "export",
+    "float16",
+    "float32",
+    "int8",
+    "int32",
     "load_model",
+    "nn",
+    "normalize_dtype",
+    "q4_0",
+    "q8_0",
     "reset_default_context",
+    "spec",
 ]
 
 # Python package version (may be independent of the core runtime version).

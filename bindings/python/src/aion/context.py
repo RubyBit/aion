@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import atexit
 import os
 import weakref
 from typing import Optional, Sequence
@@ -188,3 +189,18 @@ def reset_default_context() -> None:
     if _DEFAULT_CONTEXT is not None and not getattr(_DEFAULT_CONTEXT, "_closed", True):
         _DEFAULT_CONTEXT.close()
     _DEFAULT_CONTEXT = None
+
+
+@atexit.register
+def _close_default_context_atexit() -> None:
+    """Tear down the default context deterministically at interpreter exit.
+
+    atexit runs while the interpreter is still healthy, so `Context.close()`
+    frees all children (tensors/builders/models) in a controlled order before
+    the C ABI/cffi module is finalized — avoiding the arbitrary-order handle
+    teardown that can crash a not-explicitly-closed session at shutdown.
+    """
+    try:
+        reset_default_context()
+    except Exception:
+        pass

@@ -38,3 +38,83 @@ class AionGpuBackend(IntEnum):
     AION_GPU_BACKEND_D3D12 = 2
     AION_GPU_BACKEND_METAL = 3
     AION_GPU_BACKEND_GL = 4
+
+
+# --- Model authoring (Builder) enums -----------------------------------------
+
+
+class AionUnaryOp(IntEnum):
+    AION_UNARY_RELU = 0
+    AION_UNARY_GELU = 1
+    AION_UNARY_SILU = 2
+    AION_UNARY_SIGMOID = 3
+    AION_UNARY_TANH = 4
+    AION_UNARY_SQRT = 5
+    AION_UNARY_LOG = 6
+
+
+class AionBinaryOp(IntEnum):
+    AION_BINARY_ADD = 0
+    AION_BINARY_SUB = 1
+    AION_BINARY_MUL = 2
+    AION_BINARY_DIV = 3
+    AION_BINARY_EQ = 4
+    AION_BINARY_NE = 5
+    AION_BINARY_LT = 6
+    AION_BINARY_GT = 7
+    AION_BINARY_LE = 8
+    AION_BINARY_GE = 9
+
+
+class AionReduceOp(IntEnum):
+    AION_REDUCE_SUM = 0
+    AION_REDUCE_MEAN = 1
+
+
+class AionPadMode(IntEnum):
+    AION_PAD_ZERO = 0
+    AION_PAD_REFLECT = 1
+
+
+class AionInputRoleKind(IntEnum):
+    AION_ROLE_SEQUENCE_CACHE = 1
+    AION_ROLE_CACHE_WRITE_INDEX = 2
+    AION_ROLE_CACHE_VISIBLE_END = 3
+    AION_ROLE_POSITIONS = 4
+    AION_ROLE_TOKENS = 5
+    AION_ROLE_STATE = 6
+
+
+class AionOp(IntEnum):
+    AION_OP_MATMUL = 0
+    AION_OP_MATMUL_NT = 1
+    AION_OP_ELEMWISE = 2
+    AION_OP_BROADCAST_LAST_DIM = 3
+    AION_OP_UNARY = 4
+    AION_OP_SOFTMAX = 5
+    AION_OP_LAYERNORM = 6
+    AION_OP_RMSNORM = 7
+    AION_OP_ATTENTION = 8
+    AION_OP_MHA = 9
+    AION_OP_MHA_CACHED = 10
+    AION_OP_RELPOS_MHA = 11
+    AION_OP_CONV1D = 12
+    AION_OP_CONV2D = 13
+    AION_OP_COPY = 14
+    AION_OP_GATHER_ROWS = 15
+    AION_OP_ROPE1D = 16
+    AION_OP_SEQUENCE_APPEND = 17
+    AION_OP_REDUCE = 18
+    AION_OP_CONCAT = 19
+    AION_OP_RESHAPE = 20
+    AION_OP_SQUEEZE = 21
+    AION_OP_UNSQUEEZE = 22
+    AION_OP_TRANSPOSE2D = 23
+    AION_OP_SLICE = 24
+    AION_OP_LSTM_CELL = 25
+    AION_OP_RFFT = 26
+    AION_OP_STFT = 27
+    AION_OP_CAST = 28
+    AION_OP_ARGMAX = 29
+    AION_OP_SCATTER_ROW = 30
+    AION_OP_GELU_MUL = 31

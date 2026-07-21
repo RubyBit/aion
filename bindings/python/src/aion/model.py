@@ -3,13 +3,20 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional, Union, overload
 
 from .device import DeviceLike, _is_cpu, _normalize_device
 from .errors import raise_for_status
 from ._ffi import ffi, lib
 from .enums import AionDType
-from .types import ArrayLike, NDArrayF32
+from .types import ArrayLike, NDArray
+
+if TYPE_CHECKING:
+    from .context import Context
+    from .tensor import Tensor
+
+# What model I/O accepts: a numpy array (or array-like) or an existing Tensor.
+InputValue = Union["Tensor", ArrayLike]
 
 
 @dataclass(frozen=True)
@@ -38,13 +45,25 @@ def _get_indexed_name(ctx_ptr, fn, m_ptr, index: int) -> str:
 class LoadedModel:
     """Owns an `AionLoadedModel*` handle; keeps the owning Context alive."""
 
-    def __init__(self, ctx, ptr):
+    def __init__(self, ctx: "Context", ptr: Any) -> None:
         # Strong ref: model must keep its Context alive.
         self._ctx_owner = ctx
         self._ctx_owner._register_child(self)
         self._m = ptr
         self._closed = False
         self._name_cache = {}
+        # A model produced by tracing/Builder.compile shares (does not copy) the
+        # builder's weight tensors, so the builder must outlive the model. When
+        # set, it is closed together with the model.
+        self._authoring_builder = None
+
+    def _attach_authoring_builder(self, builder) -> None:
+        # A traced/compiled model shares the builder's weight tensor *handles*, but
+        # the underlying storage is Context-owned and freed only at context
+        # destroy, so child teardown order is safe. The builder stays a context
+        # child (torn down in the context's controlled sequence like any other);
+        # this strong ref lets an explicit model.close() also close it promptly.
+        self._authoring_builder = builder
 
     @property
     def ptr(self):
@@ -60,7 +79,7 @@ class LoadedModel:
         return c_name
 
     @property
-    def context(self):
+    def context(self) -> "Context":
         """Owning context for this loaded model."""
 
         return self._ctx_owner
@@ -75,6 +94,11 @@ class LoadedModel:
             pass
         self._m = ffi.NULL
         self._closed = True
+        # Drop the strong ref to the traced builder. Do NOT close it here: it is a
+        # context child torn down in the context's controlled sequence, and closing
+        # it mid-teardown races the context finalizer. Dropping the ref lets it be
+        # collected once nothing else references it.
+        self._authoring_builder = None
 
     def __enter__(self) -> "LoadedModel":
         return self
@@ -83,6 +107,9 @@ class LoadedModel:
         self.close()
 
     def __del__(self):  # pragma: no cover
+        # Best-effort only; the attached builder (if any) is a context child and
+        # is torn down in the context's controlled sequence — don't close it here
+        # (finalizer order vs the context is unspecified).
         try:
             if not getattr(self, "_closed", True):
                 lib.aion_loaded_model_destroy(getattr(self, "_m", ffi.NULL))
@@ -205,7 +232,7 @@ class LoadedModel:
         raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_rank")
         return int(out[0])
 
-    def bind_input(self, name: str, tensor) -> None:
+    def bind_input(self, name: str, tensor: "Tensor") -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a str")
         c_name = self._c_name(name)
@@ -281,10 +308,10 @@ class LoadedModel:
 
     def run_tensors(
         self,
-        inputs: Mapping[str, object],
+        inputs: Mapping[str, "Tensor"],
         *,
         outputs: Iterable[str] | None = None,
-    ) -> dict[str, object]:
+    ) -> "dict[str, Tensor]":
         """Run the model and return output tensors.
 
         By default only non-state outputs are returned (io-aliased carries like
@@ -303,10 +330,10 @@ class LoadedModel:
 
     def run_numpy(
         self,
-        inputs: Mapping[str, object],
+        inputs: Mapping[str, InputValue],
         *,
         outputs: Iterable[str] | None = None,
-    ) -> dict[str, NDArrayF32]:
+    ) -> dict[str, NDArray]:
         """Run the model with Tensor or NumPy inputs and return NumPy outputs.
 
         By default only non-state outputs are returned (io-aliased carries like
@@ -330,7 +357,7 @@ class LoadedModel:
             self.run()
 
             out_names = list(outputs) if outputs is not None else self._default_output_names()
-            outs: dict[str, NDArrayF32] = {}
+            outs: dict[str, NDArray] = {}
             for name in out_names:
                 t_out = self.output_tensor(name)
                 try:
@@ -345,9 +372,29 @@ class LoadedModel:
                 except Exception:
                     pass
 
-    def run(self) -> None:
-        st = lib.aion_loaded_model_run(self._m)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_run")
+    @overload
+    def run(self) -> None: ...
+    @overload
+    def run(self, inputs: Mapping[str, InputValue], *, outputs: Iterable[str] | None = None) -> dict[str, NDArray]: ...
+
+    def run(
+        self,
+        inputs: Optional[Mapping[str, InputValue]] = None,
+        *,
+        outputs: Iterable[str] | None = None,
+    ) -> Optional[dict[str, NDArray]]:
+        """Run the model.
+
+        - `run()` (no args): execute using already-bound input tensors and return
+          `None` (the low-level fast path).
+        - `run({"x": arr})`: bind numpy/Tensor inputs, execute, and return a
+          `{name: numpy}` dict (sugar over `run_numpy`).
+        """
+        if inputs is None:
+            st = lib.aion_loaded_model_run(self._m)
+            raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_run")
+            return None
+        return self.run_numpy(inputs, outputs=outputs)
 
     def reset_state(self) -> None:
         """Zero all recurrent (io-aliased) input state — KV caches, LSTM h/c, etc.
@@ -358,7 +405,7 @@ class LoadedModel:
         st = lib.aion_loaded_model_reset_state(self._m)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_reset_state")
 
-    def output_tensor(self, name: str):
+    def output_tensor(self, name: str) -> "Tensor":
         if not isinstance(name, str):
             raise TypeError("name must be a str")
         c_name = self._c_name(name)

@@ -96,24 +96,57 @@ pub fn collectInputRoles(
     return out;
 }
 
-fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node) ![]package_file.NodeRecord {
+const max_rank: usize = 8;
+
+/// Overwrite constant shape terms with symbolic (dim-expr) terms for view-op
+/// attr axes flagged in `view_symbol_expr` (keyed by output value * max_rank + axis).
+fn applyViewSymbols(op: *package_file.NodeOp, output: u32, view_symbol_expr: []const ?u32) void {
+    const base = @as(usize, output) * max_rank;
+    switch (op.*) {
+        .ViewSliceND => |*sl| {
+            const lens = @constCast(sl.lens);
+            for (0..lens.len) |axis| {
+                if (view_symbol_expr[base + axis]) |e| lens[axis] = .{ .expr = e };
+            }
+        },
+        .ViewReshape => |*vr| {
+            const new_shape = @constCast(vr.new_shape);
+            for (0..new_shape.len) |axis| {
+                if (view_symbol_expr[base + axis]) |e| new_shape[axis] = .{ .expr = e };
+            }
+        },
+        else => {},
+    }
+}
+
+fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node, view_symbol_expr: []const ?u32) ![]package_file.NodeRecord {
     const out = try allocator.alloc(package_file.NodeRecord, nodes.len);
     errdefer allocator.free(out);
     for (nodes, 0..) |node, idx| {
+        var op = try convert.convertOp(allocator, node.op);
+        applyViewSymbols(&op, node.output, view_symbol_expr);
+        // A multi-carry Loop's outputs 1..N live on `node.extra_outputs`; the op
+        // record carries them for serialization (output 0 is `node.output`).
+        switch (op) {
+            .Loop => |*lp| {
+                if (node.extra_outputs.len > 0) lp.extra_outputs = try allocator.dupe(u32, node.extra_outputs);
+            },
+            else => {},
+        }
         out[idx] = .{
             .inputs = try allocator.dupe(u32, node.inputs),
             .output = node.output,
-            .op = try convert.convertOp(allocator, node.op),
+            .op = op,
         };
     }
     return out;
 }
 
-pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.NodeRecord {
-    return collectNodeSlice(allocator, graph.nodes.items);
+pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph, view_symbol_expr: []const ?u32) ![]package_file.NodeRecord {
+    return collectNodeSlice(allocator, graph.nodes.items, view_symbol_expr);
 }
 
-pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.RegionRecord {
+pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph, view_symbol_expr: []const ?u32) ![]package_file.RegionRecord {
     const out = try allocator.alloc(package_file.RegionRecord, graph.regions.items.len);
     errdefer allocator.free(out);
     var initialized: usize = 0;
@@ -125,7 +158,7 @@ pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]
     }
     for (graph.regions.items, 0..) |region, idx| {
         out[idx] = .{
-            .nodes = try collectNodeSlice(allocator, region.nodes),
+            .nodes = try collectNodeSlice(allocator, region.nodes, view_symbol_expr),
             .outputs = try allocator.dupe(u32, region.outputs),
         };
         initialized += 1;

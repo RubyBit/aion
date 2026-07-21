@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Sequence, overload
+from typing import Iterable, Sequence
 
 from .device import DeviceLike, _device_to_str, _normalize_device
+from .dtype import c_elem as _c_elem, is_quantized as _is_quant, normalize_dtype
 from .errors import raise_for_status
 from ._ffi import ffi, lib
 from .enums import AionDType
-from .types import ArrayLike, F32ArrayLike, NDArrayF32
+from .types import ArrayLike, NDArray
 
 
 def _as_shape(shape: Sequence[int]) -> list[int]:
@@ -316,6 +317,58 @@ class Tensor:
         return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
 
     @classmethod
+    def quantize(
+        cls,
+        ctx,
+        shape: Sequence[int],
+        values,
+        *,
+        dtype: AionDType | None = None,
+        quant_axis: int | None = None,
+    ) -> "Tensor":
+        """Quantize row-major f32 `values` into a packed-quant tensor.
+
+        The core does the packing (q8_0 today), blocking along `quant_axis`.
+        `quant_axis` defaults to the matmul-B reduction axis (rank-2, i.e. the
+        `K` of a `[…, K, N]` weight); pass the last axis for an embedding table
+        blocked along its feature dim. `values` may be a numpy array or a
+        (possibly nested) Python sequence.
+        """
+        dtype = AionDType.AION_DTYPE_Q8_0 if dtype is None else normalize_dtype(dtype)
+        if dtype not in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
+            raise ValueError(f"quantize expects a quantized dtype, got {dtype}")
+
+        shp = _as_shape(shape)
+        if quant_axis is None:
+            quant_axis = len(shp) - 2 if len(shp) >= 2 else 0
+        if not (0 <= quant_axis < len(shp)):
+            raise ValueError(f"quant_axis {quant_axis} out of range for rank {len(shp)}")
+        n = _elem_count(shp)
+
+        try:
+            import numpy as np  # type: ignore
+        except ImportError:
+            np = None  # type: ignore
+
+        if np is not None and isinstance(values, np.ndarray):
+            arr = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
+            if arr.size != n:
+                raise ValueError(f"expected {n} values for shape {shp}, got {arr.size}")
+            c_vals = ffi.from_buffer("float[]", arr)
+        else:
+            _, flat = _flatten_nested(values)
+            if len(flat) != n:
+                raise ValueError(f"expected {n} values for shape {shp}, got {len(flat)}")
+            c_vals = ffi.new("float[]", [float(v) for v in flat])
+
+        rank = len(shp)
+        c_shape = ffi.new("size_t[]", [int(x) for x in shp])
+        out_t = ffi.new("AionTensor**")
+        st = lib.aion_tensor_quantize(ctx.ptr, int(dtype), rank, c_shape, int(quant_axis), c_vals, n, out_t)
+        raise_for_status(st, ctx.ptr, what="aion_tensor_quantize")
+        return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+
+    @classmethod
     def zeros(
         cls,
         shape: Sequence[int],
@@ -415,13 +468,15 @@ class Tensor:
         return t
 
     def numel(self) -> int:
-        return _elem_count(self.shape())
+        return _elem_count(self.shape)
 
+    @property
     def dtype(self) -> AionDType:
         if self._dtype_cache is None:
             self._dtype_cache = AionDType(int(lib.aion_tensor_dtype(self._t)))
         return self._dtype_cache
 
+    @property
     def shape(self) -> tuple[int, ...]:
         if self._shape_cache is not None:
             return self._shape_cache
@@ -437,143 +492,129 @@ class Tensor:
         self._shape_cache = tuple(int(dims[i]) for i in range(rank))
         return self._shape_cache
 
-    def read_f32(self) -> list[float]:
-        if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("dtype mismatch: expected f32")
+    # --- dtype-generic I/O (numpy is the primary interop) -----------------
+    def _resolve_read_dtype(self, dtype) -> AionDType:
+        dt = normalize_dtype(dtype) if dtype is not None else self.dtype
+        if dt != self.dtype:
+            raise ValueError(f"dtype mismatch: tensor is {self.dtype.name}, requested {dt.name}")
+        if _is_quant(dt):
+            raise NotImplementedError(f"{dt.name}: quantized tensors have no scalar read path")
+        return dt
 
-        shp = self.shape()
-        n = _elem_count(shp)
-        buf = ffi.new("float[]", n)
-        st = lib.aion_tensor_read(self._t, int(AionDType.AION_DTYPE_F32), buf, n)
+    def read(self, dtype=None) -> list:
+        """Read the tensor into a flat Python list (scalar dtypes only).
+
+        `dtype`, if given, must match the tensor's dtype. Prefer `.numpy()`; for
+        f16 the returned values are the raw uint16 bit patterns (use `.numpy()`
+        for decoded floats).
+        """
+        dt = self._resolve_read_dtype(dtype)
+        n = _elem_count(self.shape)
+        buf = ffi.new(_c_elem(dt) + "[]", n)
+        st = lib.aion_tensor_read(self._t, int(dt), buf, n)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read")
-        return [float(buf[i]) for i in range(n)]
+        cast = float if dt == AionDType.AION_DTYPE_F32 else int
+        return [cast(buf[i]) for i in range(n)]
 
-    def read_i32(self) -> list[int]:
-        if self.dtype() != AionDType.AION_DTYPE_I32:
-            raise NotImplementedError("dtype mismatch: expected i32")
+    def read_scalar(self, dtype=None):
+        """Read a 1-element tensor as a single Python scalar (scalar dtypes only)."""
+        dt = self._resolve_read_dtype(dtype)
+        out = ffi.new(_c_elem(dt) + "*")
+        st = lib.aion_tensor_read_scalar(self._t, int(dt), out)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
+        return (float if dt == AionDType.AION_DTYPE_F32 else int)(out[0])
 
-        shp = self.shape()
-        n = _elem_count(shp)
-        buf = ffi.new("int32_t[]", n)
-        st = lib.aion_tensor_read(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read")
-        return [int(buf[i]) for i in range(n)]
+    def write(self, values, dtype=None) -> "Tensor":
+        """Write a numpy array or flat sequence into this tensor. Returns self.
 
-    @overload
-    def write_f32(self, values: Iterable[float]) -> None: ...
+        A numpy array routes through `copy_from`; a flat sequence is written
+        element-wise. `dtype`, if given, must match the tensor's dtype.
+        """
+        dt = normalize_dtype(dtype) if dtype is not None else self.dtype
+        if dt != self.dtype:
+            raise ValueError(f"dtype mismatch: tensor is {self.dtype.name}, requested {dt.name}")
+        if _is_quant(dt):
+            raise NotImplementedError(f"{dt.name}: quantized tensors have no scalar write path")
 
-    @overload
-    def write_f32(self, values: F32ArrayLike) -> None: ...
-
-    def write_f32(self, values) -> None:
-        if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("dtype mismatch: expected f32")
-
-        # Fast-path: NumPy array-like.
         try:
             import numpy as np  # type: ignore
         except ImportError:
             np = None  # type: ignore
-
         if np is not None and isinstance(values, np.ndarray):
-            from .numpy import tensor_write_from_numpy
+            return self.copy_from(values)
 
-            tensor_write_from_numpy(self, values)
-            return
-
-        shp = self.shape()
-        n = _elem_count(shp)
+        n = _elem_count(self.shape)
         vals = list(values)
         if len(vals) != n:
-            raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
-
-        buf = ffi.new("float[]", [float(v) for v in vals])
-        st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_F32), buf, n)
+            raise ValueError(f"expected {n} values for shape {self.shape}, got {len(vals)}")
+        py = float if dt == AionDType.AION_DTYPE_F32 else int
+        buf = ffi.new(_c_elem(dt) + "[]", [py(v) for v in vals])
+        st = lib.aion_tensor_write(self._t, int(dt), buf, n)
         raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
-
-    def write_i32(self, values: Iterable[int]) -> None:
-        if self.dtype() != AionDType.AION_DTYPE_I32:
-            raise NotImplementedError("dtype mismatch: expected i32")
-
-        shp = self.shape()
-        n = _elem_count(shp)
-        vals = list(values)
-        if len(vals) != n:
-            raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
-
-        buf = ffi.new("int32_t[]", [int(v) for v in vals])
-        st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
-
-    def read_scalar_f32(self) -> float:
-        if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("dtype mismatch: expected f32")
-
-        out = ffi.new("float*")
-        st = lib.aion_tensor_read_scalar(self._t, int(AionDType.AION_DTYPE_F32), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
-        return float(out[0])
-
-    def read_scalar_i32(self) -> int:
-        if self.dtype() != AionDType.AION_DTYPE_I32:
-            raise NotImplementedError("dtype mismatch: expected i32")
-
-        out = ffi.new("int32_t*")
-        st = lib.aion_tensor_read_scalar(self._t, int(AionDType.AION_DTYPE_I32), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
-        return int(out[0])
-
-    def item_f32(self) -> float:
-        """Convenience: return the only element as a Python float (f32 only)."""
-        return self.read_scalar_f32()
+        return self
 
     def fill(self, value: float) -> "Tensor":
         """In-place fill (f32 only). Returns self."""
-
-        if self.dtype() != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("only f32 tensor I/O is supported by the current C ABI")
-        n = self.numel()
-        self.write_f32([float(value)] * n)
-        return self
+        if self.dtype != AionDType.AION_DTYPE_F32:
+            raise NotImplementedError("fill() is f32 only")
+        return self.write([float(value)] * self.numel())
 
     def zero(self) -> "Tensor":
-        """In-place zero fill. Returns self."""
-
-        dt = self.dtype()
-        if dt == AionDType.AION_DTYPE_F32:
-            return self.fill(0.0)
-
+        """In-place zero fill (scalar dtypes). Returns self."""
+        dt = self.dtype
+        if _is_quant(dt):
+            raise NotImplementedError(f"zero() not implemented for dtype={dt.name}")
         n = self.numel()
-        if dt == AionDType.AION_DTYPE_F16:
-            # `aion_tensor_write` expects element-count, not byte-count.
-            buf = ffi.new("uint16_t[]", n)  # zero-initialized; IEEE-754 half 0.0.
-            st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_F16), buf, n)
-            raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
-            return self
-        if dt == AionDType.AION_DTYPE_I32:
-            buf = ffi.new("int32_t[]", n)
-            st = lib.aion_tensor_write(self._t, int(AionDType.AION_DTYPE_I32), buf, n)
-            raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
-            return self
+        # ffi.new zero-initializes; for f16 the uint16 zeros are IEEE-754 +0.0.
+        buf = ffi.new(_c_elem(dt) + "[]", n)
+        st = lib.aion_tensor_write(self._t, int(dt), buf, n)
+        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+        return self
 
-        raise NotImplementedError(f"zero() not implemented for dtype={dt}")
-
-    # Optional numpy interop (enabled when numpy is installed).
-    def numpy(self) -> NDArrayF32:
+    # numpy interop (requires numpy; scalar dtypes only).
+    def numpy(self) -> NDArray:
         from .numpy import tensor_to_numpy
 
         return tensor_to_numpy(self)
 
     @classmethod
-    def from_numpy(cls, ctx, array: ArrayLike, *, device: DeviceLike = None) -> "Tensor":
+    def from_numpy(cls, ctx, array: ArrayLike, *, dtype=None, device: DeviceLike = None) -> "Tensor":
         from .numpy import tensor_from_numpy
 
-        t = tensor_from_numpy(ctx, array)
+        t = tensor_from_numpy(ctx, array, dtype=dtype)
         if device is not None:
             t.to(device)
         return t
 
-    def write_from_numpy(self, array: ArrayLike) -> None:
+    def copy_from(self, array: ArrayLike) -> "Tensor":
+        """Write into this tensor's storage from a numpy array (dtype = this
+        tensor's; shape must match). Returns self."""
         from .numpy import tensor_write_from_numpy
 
         tensor_write_from_numpy(self, array)
+        return self
+
+    # --- back-compat aliases (deprecated; prefer .numpy()/.read()/.copy_from()) ---
+    def read_f32(self) -> list[float]:
+        return self.read(AionDType.AION_DTYPE_F32)
+
+    def read_i32(self) -> list[int]:
+        return self.read(AionDType.AION_DTYPE_I32)
+
+    def write_f32(self, values) -> None:
+        self.write(values, AionDType.AION_DTYPE_F32)
+
+    def write_i32(self, values: Iterable[int]) -> None:
+        self.write(values, AionDType.AION_DTYPE_I32)
+
+    def read_scalar_f32(self) -> float:
+        return self.read_scalar(AionDType.AION_DTYPE_F32)
+
+    def read_scalar_i32(self) -> int:
+        return int(self.read_scalar(AionDType.AION_DTYPE_I32))
+
+    def item_f32(self) -> float:
+        return self.read_scalar(AionDType.AION_DTYPE_F32)
+
+    def write_from_numpy(self, array: ArrayLike) -> None:
+        self.copy_from(array)

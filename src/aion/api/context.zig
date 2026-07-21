@@ -7,6 +7,7 @@ const types = @import("../backend/types.zig");
 const package_file = @import("../storage/aion_file.zig");
 const cache_mod = @import("../storage/cache.zig");
 const manager_mod = @import("../storage/manager.zig");
+const quantize_mod = @import("../storage/quantize.zig");
 const plan_mod = @import("../graph/plan.zig");
 const graph_mod = @import("../graph/graph.zig");
 const program_mod = @import("../graph/program.zig");
@@ -34,7 +35,7 @@ pub const LoadModelOptions = api_loaded_model.LoadModelOptions;
 pub const CacheOptions = api_loaded_model.CacheOptions;
 pub const CacheGrowth = api_loaded_model.CacheGrowth;
 pub const NamedTensorRef = api_builder.NamedTensorRef;
-pub const DimensionSymbol = api_package_export.DimensionSymbol;
+pub const DimSymbol = api_builder.DimSymbol;
 pub const ExportMetadata = api_package_export.Metadata;
 pub const OutputAlias = api_package_export.OutputAlias;
 pub const InputRoleDecl = api_package_export.InputRoleDecl;
@@ -371,24 +372,46 @@ pub const Context = struct {
         return t;
     }
 
-    /// Convenience: allocate and initialize from packed quant bytes.
-    pub fn fromPackedQuant(self: *Self, dtype: DType, shape: []const usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
-        // For quant tensors, avoid retile surprises: pick a tile shape that respects quant block alignment.
+    /// Convenience: allocate and initialize from packed quant bytes, blocking
+    /// along `quant_axis`. Picks a tile shape that respects quant block alignment
+    /// on that axis (the canonical 2-D matmul-B `[K, N]` case, `quant_axis = 0`,
+    /// uses the tuned matmul-B tiling; other cases use a single full-tensor tile,
+    /// which the graph compiler retiles as ops require).
+    pub fn fromPackedQuant(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
         if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
+        if (quant_axis >= shape.len) return api_errors.ApiError.InvalidArgument;
 
-        if (shape.len == 2) {
-            const k: usize = shape[0];
-            const n: usize = shape[1];
-            const tn: [2]usize = api_tiling.chooseQuantMatMulBTiles(self.policy, k, n, dtype);
+        if (shape.len == 2 and quant_axis == 0) {
+            const tn: [2]usize = api_tiling.chooseQuantMatMulBTiles(self.policy, shape[0], shape[1], dtype);
             var t: api_tensor.Tensor = try self.tensorTiled(dtype, shape, tn[0..2]);
             try t.writePackedQuant(packed_bytes);
             return t;
         }
 
-        // Fallback for non-2D quant tensors.
-        var t0: api_tensor.Tensor = try self.tensor(dtype, shape);
+        // General case: a single full-tensor tile is trivially block-aligned on
+        // `quant_axis` (tile == shape); the compiler retiles on first use.
+        const tid: manager_mod.TensorId = try self.store.createTiledTensor(
+            dtype, shape, shape,
+            .{ .tile_alignment = self.policy.tile_alignment, .quant_axis = @intCast(quant_axis) },
+        );
+        const ct = try self.store.getConst(tid);
+        var t0: api_tensor.Tensor = .{ .store = &self.store, .id = tid, .dtype = ct.dtype, .shape = ct.shape };
         try t0.writePackedQuant(packed_bytes);
         return t0;
+    }
+
+    /// Author a block-quantized tensor from row-major f32 `values`, blocking
+    /// along `quant_axis` (the matmul-B K axis is rank-2; an embedding table
+    /// blocked along its feature dim uses the last axis).
+    pub fn fromF32Quantized(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, values: []const f32) api_errors.ApiError!api_tensor.Tensor {
+        if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
+        const packed_bytes: []u8 = quantize_mod.quantizeF32(self.allocator, dtype, shape, quant_axis, values) catch |e| return switch (e) {
+            error.OutOfMemory => api_errors.ApiError.OutOfMemory,
+            error.Unsupported => api_errors.ApiError.UnsupportedFeature,
+            error.InvalidArgument => api_errors.ApiError.InvalidArgument,
+        };
+        defer self.allocator.free(packed_bytes);
+        return self.fromPackedQuant(dtype, shape, quant_axis, packed_bytes);
     }
 
     /// Convenience: allocate and initialize an f32 tensor from typed values.
@@ -543,9 +566,10 @@ pub const Context = struct {
     /// `outputTensor` or by position via `outputTensorAt`/`runOutputTensor`. Name an
     /// output explicitly when you need to reference it (e.g. in `opts.output_aliases`).
     ///
-    /// `opts.output_aliases` declares io-alias recurrent-state carry (by name);
-    /// `opts.input_symbols` (variable shapes) is not yet supported on the compile path
-    /// — use `exportModel`+`loadModel` for that.
+    /// `opts.output_aliases` declares io-alias recurrent-state carry (by name).
+    /// Variable (symbolic) input dims declared on the builder via `symbolicDim`
+    /// are honored: the compiled model serves any size on those axes (re-lowering
+    /// per distinct shape), so one compile covers e.g. prefill then decode.
     /// Compile a builder graph into an in-process model on the CPU (default device).
     pub fn compile(
         self: *Self,
@@ -567,7 +591,6 @@ pub const Context = struct {
         opts: ExportModelOptions,
     ) api_errors.ApiError!Model {
         if (outputs.len == 0) return api_errors.ApiError.InvalidArgument;
-        if (opts.input_symbols.len != 0) return api_errors.ApiError.InvalidArgument; // concrete-only for now
 
         const dev = try self.resolveDevice(dev_sel);
 
@@ -593,6 +616,33 @@ pub const Context = struct {
                 (std.fmt.allocPrint(sa, "input{d}", .{input_ids.items.len}) catch return error.OutOfMemory);
             try input_ids.append(self.allocator, vid);
             try input_names.append(self.allocator, nm);
+        }
+
+        // Symbolic input dims (variable shapes): map each declaration to (input
+        // index, axis, symbol index), deduplicating symbols by name so two axes
+        // sharing a name are constrained to the same runtime size.
+        var symbol_names: std.ArrayList([]const u8) = .empty;
+        defer symbol_names.deinit(self.allocator);
+        var symbolic_axes: std.ArrayList(api_loaded_model.SymbolicAxis) = .empty;
+        defer symbolic_axes.deinit(self.allocator);
+        for (b.dimSymbols()) |spec| {
+            const in_idx = findValueIdIndex(input_ids.items, spec.tensor.value) orelse return api_errors.ApiError.InvalidArgument;
+            const v = g.values.items[@intCast(spec.tensor.value)];
+            if (spec.axis >= v.shape.len) return api_errors.ApiError.InvalidArgument;
+            var sym_idx: u32 = @intCast(symbol_names.items.len);
+            for (symbol_names.items, 0..) |nm, si| {
+                if (std.mem.eql(u8, nm, spec.name)) {
+                    sym_idx = @intCast(si);
+                    break;
+                }
+            } else {
+                try symbol_names.append(self.allocator, spec.name);
+            }
+            try symbolic_axes.append(self.allocator, .{
+                .input_index = @intCast(in_idx),
+                .axis = @intCast(spec.axis),
+                .symbol_index = sym_idx,
+            });
         }
 
         const out_ids = try self.allocator.alloc(graph_mod.ValueId, outputs.len);
@@ -650,6 +700,8 @@ pub const Context = struct {
             out_names,
             aliases.items,
             roles.items,
+            symbol_names.items.len,
+            symbolic_axes.items,
             .{},
         );
     }

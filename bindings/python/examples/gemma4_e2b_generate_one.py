@@ -396,7 +396,7 @@ def main() -> None:
                 if stopped_by is not None:
                     break
 
-                tokens_step.write_i32([next_id])
+                tokens_step.copy_from([next_id])
 
                 t0_step_run_ns = time.perf_counter_ns()
                 model.run()

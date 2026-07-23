@@ -70,12 +70,12 @@ def transcribe_offline(model_path, md, audio, sp, threads, args):
     ctx = m.context
     # Only non-zero-seed inputs need binding: the runtime auto-initializes every
     # unbound input to zeros (LSTM state, frame/sym/count bookkeeping, toks_in).
-    m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
+    m.bind_input("audio", aion.Tensor(a.reshape(n, 1), ctx=ctx))
     m.bind_input("active_in", _i32(ctx, 1, (1,)))
     m.bind_input("last_in", _i32(ctx, blank, (1,)))
     m.run()
-    oc = m.output_tensor("out_count"); count = int(oc.read_i32()[0]); oc.close()
-    ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.read_i32()][:count]; ot.close()
+    oc = m.output_tensor("out_count"); count = int(oc.item()); oc.close()
+    ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.tolist()][:count]; ot.close()
     return sp.DecodeIds(toks)
 
 
@@ -111,7 +111,7 @@ class StreamFull:
         self.tokens = []
         self.c = 0  # chunk index
         ctx, m = self.ctx, self.m
-        fn = lambda a: aion.Tensor.from_numpy(ctx, a)
+        fn = lambda a: aion.Tensor(a, ctx=ctx)
 
         # Per-run inputs (rewritten in place each step) — bound once.
         self.t_audio = fn(np.zeros((self.wsamp, 1), np.float32))
@@ -137,15 +137,15 @@ class StreamFull:
         mask = np.full((chunk, t_kv), -1e9, np.float32)
         mask[:, [j for j in range(t_kv) if thr <= j < att_left + real]] = 0.0
         # Rewrite the per-run inputs in place (no new tensors -> no leak).
-        self.t_audio.write_from_numpy(window.reshape(self.wsamp, 1))
-        self.t_mask.write_from_numpy(mask)
+        self.t_audio.copy_from(window.reshape(self.wsamp, 1))
+        self.t_mask.copy_from(mask)
         # Re-seed the per-run decode carries (the Loop leaves final values here).
-        self.t_frame.write_i32([0]); self.t_sym.write_i32([0])
-        self.t_count.write_i32([0]); self.t_active.write_i32([1])
-        self.t_toks.write_i32([0] * self.max_out)
+        self.t_frame.copy_from([0]); self.t_sym.copy_from([0])
+        self.t_count.copy_from([0]); self.t_active.copy_from([1])
+        self.t_toks.copy_from([0] * self.max_out)
         m.run()
-        oc = m.output_tensor("out_count"); cnt = int(oc.read_i32()[0]); oc.close()
-        ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.read_i32()][:cnt]; ot.close()
+        oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
+        ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.tolist()][:cnt]; ot.close()
         self.c += 1
 
     def text(self):

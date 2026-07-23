@@ -9,7 +9,7 @@ The helpers here normalize ergonomic Python spellings (``"gpu"``, ``"gpu:1"``,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple, Union
 
 from .enums import AionDeviceKind, AionGpuBackend, AionGpuPower
 
@@ -49,7 +49,7 @@ _BACKEND_ALIASES = {
 }
 
 
-def _normalize_power(power: Union[AionGpuPower, str]) -> int:
+def normalize_gpu_power(power: Union[AionGpuPower, str]) -> int:
     if isinstance(power, AionGpuPower):
         return int(power)
     if isinstance(power, str):
@@ -60,7 +60,7 @@ def _normalize_power(power: Union[AionGpuPower, str]) -> int:
     return int(power)
 
 
-def _normalize_backend(backend: Union[AionGpuBackend, str]) -> int:
+def normalize_gpu_backend(backend: Union[AionGpuBackend, str]) -> int:
     if isinstance(backend, AionGpuBackend):
         return int(backend)
     if isinstance(backend, str):
@@ -167,23 +167,3 @@ def _gpu_adapter_from_device(device: DeviceLike) -> Tuple[bool, Optional[int]]:
             return (True, idx)
         raise ValueError(f"invalid device tuple: {device!r}")
     raise TypeError(f"unsupported device spec: {device!r}")
-
-
-def build_gpu_options_array(ffi, gpus: Sequence[GpuOptions]):
-    """Build a C `AionGpuOptions[]` array for `aion_context_create`.
-
-    Returns ``(cdata_or_NULL, count)``. An empty sequence yields ``(ffi.NULL, 0)``.
-    """
-
-    n = len(gpus)
-    if n == 0:
-        return ffi.NULL, 0
-
-    arr = ffi.new("AionGpuOptions[]", n)
-    for i, g in enumerate(gpus):
-        if not isinstance(g, GpuOptions):
-            raise TypeError(f"gpus[{i}] must be a GpuOptions, got {type(g).__name__}")
-        arr[i].power = _normalize_power(g.power)
-        arr[i].backend = _normalize_backend(g.backend)
-        arr[i].adapter_index = -1 if g.adapter_index is None else int(g.adapter_index)
-    return arr, n

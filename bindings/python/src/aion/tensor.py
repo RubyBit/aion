@@ -2,15 +2,35 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Sequence
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence, cast
 
 from .device import DeviceLike, _device_to_str, _normalize_device
-from .dtype import c_elem as _c_elem, is_quantized as _is_quant, normalize_dtype
-from .errors import raise_for_status
-from ._ffi import ffi, lib
+from .dtype import is_quantized as _is_quant, normalize_dtype
+from .context import Context
+from ._ffi.handles import TensorHandle
+from ._ffi.runtime import (
+    create_empty_tensor,
+    create_empty_tiled_tensor,
+    create_tensor,
+    destroy_tensor,
+    move_tensor,
+    quantize_tensor,
+    read_tensor,
+    tensor_device,
+    tensor_dtype,
+    tensor_shape,
+    write_tensor,
+    zero_tensor,
+)
 from .enums import AionDType
-from .types import ArrayLike, NDArray
+from .types import NDArray
 
+type TensorData = int | float | list[TensorData]
+
+if TYPE_CHECKING:
+    from .builder import Builder, Value
+    from .model import LoadedModel
 
 def _as_shape(shape: Sequence[int]) -> list[int]:
     if isinstance(shape, (list, tuple)):
@@ -86,17 +106,252 @@ def _flatten_nested_i32(data) -> tuple[tuple[int, ...], list[int]]:
     return _flatten_nested_i32(seq)
 
 
+def _try_numpy():
+    try:
+        import numpy as np
+
+        return np
+    except ImportError:
+        return None
+
+
+def _is_py_scalar(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _infer_construct_dtype(data) -> AionDType:
+    """Default construction dtype: I32 for integer data, otherwise F32."""
+    np = _try_numpy()
+    if np is not None:
+        try:
+            array_dtype = np.asarray(data).dtype
+        except (TypeError, ValueError):
+            pass
+        else:
+            if np.issubdtype(array_dtype, np.integer):
+                return AionDType.AION_DTYPE_I32
+    if isinstance(data, int) and not isinstance(data, bool):
+        return AionDType.AION_DTYPE_I32
+    if isinstance(data, (list, tuple)) and data:
+        if all(_infer_construct_dtype(item) == AionDType.AION_DTYPE_I32 for item in data):
+            return AionDType.AION_DTYPE_I32
+    return AionDType.AION_DTYPE_F32
+
+
+def _is_ndarray(x) -> bool:
+    np = _try_numpy()
+    return np is not None and isinstance(x, np.ndarray)
+
+
+# --- lazy DAG lowering ----------------------------------------------------
+# A lazy `Tensor` is an immutable node `(op, inputs, attrs)`; concrete tensors
+# and free inputs are its leaves. Nothing touches the core until we *lower* the
+# reachable DAG into a throwaway `Builder` (walked once, memoized), which the
+# core validates + shape-infers. Shape/dtype, realize, and compile/export all go
+# through `_lower`. Because each lowering builds a fresh builder from the
+# immutable DAG, there is no shared/destructible graph state — tensors combine
+# freely, realize any time, re-realize at will.
+
+def _walk(outputs):
+    """Yield every distinct Tensor reachable from `outputs` (self + inputs)."""
+    seen: set[int] = set()
+    stack = list(outputs)
+    while stack:
+        t = stack.pop()
+        if not isinstance(t, Tensor) or id(t) in seen:
+            continue
+        seen.add(id(t))
+        yield t
+        if t._lazy:
+            stack.extend(i for i in t._inputs if isinstance(i, Tensor))
+
+
+def _resolve_ctx(outputs):
+    ctx = None
+    for t in _walk(outputs):
+        c = t._ctx_owner
+        if ctx is None:
+            ctx = c
+        elif c is not ctx:
+            raise ValueError("tensors belong to different contexts")
+    if ctx is None:
+        raise ValueError("no context found for lazy tensor(s)")
+    return ctx
+
+
+def _has_free_input(outputs) -> bool:
+    return any(t._lazy and t._op == "input" for t in _walk(outputs))
+
+
+def _scalar_const_value(value, sibling, b):
+    """A scalar `Value` broadcast to `sibling`'s shape (elemwise won't broadcast
+    a `(1,)`), dtype following `sibling`."""
+    dt = sibling.dtype
+    shape = sibling.shape
+    if dt == AionDType.AION_DTYPE_I32:
+        if isinstance(value, float) and not float(value).is_integer():
+            raise TypeError("cannot combine a non-integer scalar with an i32 tensor; cast explicitly")
+        np_dtype, val = "int32", int(value)
+    elif dt == AionDType.AION_DTYPE_F32:
+        np_dtype, val = "float32", float(value)
+    else:
+        raise TypeError(f"scalar arithmetic is not supported for dtype {dt.name}; cast explicitly")
+
+    np = _try_numpy()
+    if np is not None:
+        const = Tensor(np.full(shape, val, dtype=np_dtype), ctx=b.context)
+    else:
+        const = Tensor._from_flat(
+            b.context,
+            shape,
+            [float(val)] * _elem_count(shape),
+            AionDType.AION_DTYPE_F32,
+        )
+    return b.param(const)
+
+
+def _lower(outputs) -> "tuple[Builder, list[Value]]":
+    """Emit the DAG reachable from `outputs` into a fresh `Builder`.
+
+    Returns `(builder, [Value per output])`. Each node is emitted once
+    (memoized); a lazy node caches its inferred shape/dtype so later `.shape`
+    queries are free.
+    """
+    from .builder import Builder, Value
+
+    ctx = _resolve_ctx(outputs)
+    b = Builder(ctx=ctx)
+    memo: dict[int, "Value"] = {}
+
+    def operand(x):
+        # A raw scalar has no Value on its own; the caller (elemwise) handles it.
+        if isinstance(x, Tensor):
+            return emit(x)
+        if _is_ndarray(x):
+            return b.param(Tensor(x, ctx=ctx))
+        raise TypeError(f"unsupported operand for a tensor op: {type(x).__name__}")
+
+    def emit(t):
+        k = id(t)
+        cached = memo.get(k)
+        if cached is not None:
+            return cached
+        if not t._lazy:
+            v = b.param(t)  # concrete leaf -> baked param
+        else:
+            v = _emit_node(t, b, emit, operand)
+            if t._shape_cache is None:
+                t._shape_cache = tuple(v.shape)
+                t._dtype_cache = v.dtype
+            if t._name:
+                b.name(v, t._name)
+        memo[k] = v
+        return v
+
+    out_values = [emit(t) for t in outputs]
+    return b, out_values
+
+
+def _emit_node(t, b, emit, operand):
+    op, ins, at = t._op, t._inputs, t._attrs
+    if op == "input":
+        return b.input(at["shape"], dtype=at["dtype"], dynamic=at.get("dynamic"))
+    if op == "matmul":
+        return b.matmul(operand(ins[0]), operand(ins[1]), at.get("alpha", 1.0), at.get("beta", 0.0))
+    if op == "unary":
+        return b.unary(at["op"], operand(ins[0]))
+    if op == "softmax":
+        return b.softmax(operand(ins[0]), at["axis"])
+    if op == "reshape":
+        return b.reshape(operand(ins[0]), at["shape"])
+    if op == "transpose2d":
+        return b.transpose2d(operand(ins[0]))
+    if op == "cast":
+        return b.cast(operand(ins[0]), at["dtype"])
+    if op in ("add", "sub", "mul", "div"):
+        xv, yv = _emit_pair(ins[0], ins[1], b, emit, operand)
+        return getattr(b, op)(xv, yv)
+    raise ValueError(f"unknown lazy op {op!r}")
+
+
+def _emit_pair(x, y, b, emit, operand):
+    xv = None if _is_py_scalar(x) else operand(x)
+    yv = None if _is_py_scalar(y) else operand(y)
+    if xv is None and yv is None:
+        raise TypeError("a binary op needs at least one tensor operand")
+    if xv is None:
+        xv = _scalar_const_value(x, yv, b)
+    if yv is None:
+        yv = _scalar_const_value(y, xv, b)
+    return xv, yv
+
+
+def _realize_many(tensors, *, device: DeviceLike = None):
+    """Lower + compile + run one throwaway graph, materializing each lazy tensor.
+
+    Lazy tensors are flipped to CONCRETE in place, each keeping the `LoadedModel`
+    (and its baked params) alive. Shared subgraphs are emitted once, so passing
+    several tensors realizes them in a single compile + run.
+    """
+    lazies = [t for t in tensors if t._lazy]
+    if not lazies:
+        return list(tensors)
+    if _has_free_input(lazies):
+        raise RuntimeError(
+            "cannot realize a graph with unbound inputs; build a runnable model "
+            "with aion.compile(outputs, inputs=[...]) and bind them at run time"
+        )
+
+    b, out_values = _lower(lazies)
+    names = []
+    for i, (t, v) in enumerate(zip(lazies, out_values)):
+        nm = t._name or f"__out{i}"
+        b.mark_output(v, nm)
+        names.append(nm)
+    model = b.compile(device=device)
+    model._attach_authoring_builder(b)  # keep baked params alive
+    model.run()
+    for t, nm in zip(lazies, names):
+        h = model.output_tensor(nm)
+        t._adopt(h)               # flip LAZY -> CONCRETE in place
+        t._realize_model = model  # keep output storage alive
+        t._op = None
+        t._inputs = []            # release the DAG for GC
+    return list(tensors)
+
+
 class Tensor:
-    """Owns an `AionTensor*` handle; underlying storage is owned by the Context."""
+    """The high-level value: either CONCRETE data or a LAZY DAG node.
+
+    - CONCRETE: owns an `AionTensor*` handle (`_t`); underlying storage is owned
+      by the Context. Produced by `aion.tensor(data)` and the factories.
+    - LAZY: an immutable graph node `(_op, _inputs, _attrs)`; owns no C storage.
+      Produced by operators and `aion.tensor(shape=...)`. Materialized to
+      CONCRETE (in place) by `.realize()` / `.numpy()` / `aion.realize`.
+    """
+
+    # Instance attributes (assigned in `_init_from_handle` / `_from_node`;
+    # declared here so type checkers see them). `_lazy` selects the mode.
+    _lazy: bool
+    _ctx_owner: "Context"
+    _closed: bool
+    _dtype_cache: Optional[AionDType]
+    _shape_cache: Optional[tuple[int, ...]]
+    _t: TensorHandle | None          # CONCRETE: typed opaque native handle
+    _op: Optional[str]               # LAZY: op name ("matmul", "add", "input", ...)
+    _inputs: list[Any]               # LAZY: operands (Tensor | scalar | ndarray)
+    _attrs: dict[str, Any]           # LAZY: op-specific attributes
+    _name: Optional[str]             # LAZY: `.rename()` — default input/output name
+    _realize_model: Optional["LoadedModel"]  # kept alive after realize (output storage)
 
     def __init__(
         self,
-        data,
+        data: object,
         *,
-        ctx=None,
-        dtype: AionDType | None = None,
+        ctx: "Context | None" = None,
+        dtype: object | None = None,
         device: DeviceLike = None,
-    ):
+    ) -> None:
         """Create a tensor from Python data.
 
         Examples:
@@ -105,8 +360,8 @@ class Tensor:
             Tensor([1, 2, 3], device="gpu")   # built on CPU, then migrated
 
         `device` migrates the tensor after it is built and written on the CPU
-        (move semantics: the host copy is freed). Host `read_*`/`write_*` then
-        fail until you migrate back with ``.to("cpu")``.
+        (move semantics: the host copy is freed). Host conversion and mutation
+        then fail until you migrate back with ``.to("cpu")``.
         """
 
         from .context import get_default_context
@@ -114,30 +369,35 @@ class Tensor:
         if ctx is None:
             ctx = get_default_context()
         if dtype is None:
-            dtype = AionDType.AION_DTYPE_F32
+            dtype = _infer_construct_dtype(data)
+        else:
+            dtype = normalize_dtype(dtype)
         if dtype in (AionDType.AION_DTYPE_Q4_0, AionDType.AION_DTYPE_Q8_0):
             raise NotImplementedError("quantized tensor construction is not supported by the current C ABI")
 
-        # NumPy fast-path when available.
-        try:
-            import numpy as np  # type: ignore
-        except ImportError:
-            np = None  # type: ignore
+        np = _try_numpy()
+        if np is not None and isinstance(data, np.ndarray):
+            from .numpy import _tensor_from_numpy
+
+            self._adopt(_tensor_from_numpy(ctx, data, dtype=dtype))
+            if device is not None:
+                self.to(device)
+            return
+        if np is not None and dtype not in (
+            AionDType.AION_DTYPE_F32,
+            AionDType.AION_DTYPE_I32,
+        ):
+            from .numpy import _tensor_from_numpy
+
+            self._adopt(_tensor_from_numpy(ctx, data, dtype=dtype))
+            if device is not None:
+                self.to(device)
+            return
 
         if dtype == AionDType.AION_DTYPE_F32:
-            if np is not None and isinstance(data, np.ndarray):
-                arr = np.asarray(data, dtype=np.float32)
-                shape = tuple(int(x) for x in arr.shape)
-                vals = [float(v) for v in arr.reshape(-1)]
-            else:
-                shape, vals = _flatten_nested(data)
+            shape, vals = _flatten_nested(data)
         elif dtype == AionDType.AION_DTYPE_I32:
-            if np is not None and isinstance(data, np.ndarray):
-                arr = np.asarray(data, dtype=np.int32)
-                shape = tuple(int(x) for x in arr.shape)
-                vals = [int(v) for v in arr.reshape(-1)]
-            else:
-                shape, vals = _flatten_nested_i32(data)
+            shape, vals = _flatten_nested_i32(data)
         else:
             raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
 
@@ -146,62 +406,55 @@ class Tensor:
         if len(vals) != n:
             raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
 
-        # Aion currently represents scalars as shape (1,), not rank-0 tensors.
+        # The native runtime currently represents a scalar as shape (1,).
         if len(shp) == 0:
-            if len(vals) != 1:
-                raise ValueError(f"expected 1 value for scalar tensor, got {len(vals)}")
-            if dtype == AionDType.AION_DTYPE_F32:
-                t = self.scalar_f32(ctx, float(vals[0]))
-            elif dtype == AionDType.AION_DTYPE_I32:
-                t = self.scalar_i32(ctx, int(vals[0]))
-            else:
-                raise NotImplementedError(f"scalar tensor construction not implemented for dtype={dtype}")
-            self._adopt(t)
+            shp = [1]
+        if dtype == AionDType.AION_DTYPE_F32:
+            native_values: list[int | float] = [float(v) for v in vals]
+        elif dtype == AionDType.AION_DTYPE_I32:
+            native_values = [int(v) for v in vals]
         else:
-            rank = len(shp)
-            c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
+            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
 
-            if dtype == AionDType.AION_DTYPE_F32:
-                c_vals = ffi.new("float[]", [float(v) for v in vals])
-            elif dtype == AionDType.AION_DTYPE_I32:
-                c_vals = ffi.new("int32_t[]", [int(v) for v in vals])
-            else:
-                raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
-
-            out_t = ffi.new("AionTensor**")
-            st = lib.aion_tensor_create(
-                ctx.ptr,
-                int(dtype),
-                rank,
-                c_shape,
-                c_vals,
-                n,
-                out_t,
-            )
-            raise_for_status(st, ctx.ptr, what="aion_tensor_create")
-            self._init_from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        handle = create_tensor(ctx.ptr, dtype, shp, native_values)
+        self._init_from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
         if device is not None:
             self.to(device)
 
-    def _init_from_handle(self, ctx, ptr, *, dtype: AionDType | None = None, shape: tuple[int, ...] | None = None) -> None:
+    def _init_from_handle(
+        self,
+        ctx: "Context",
+        ptr: TensorHandle,
+        *,
+        dtype: AionDType | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> None:
         self._ctx_owner = ctx
         self._ctx_owner._register_child(self)
         self._t = ptr
         self._closed = False
         self._dtype_cache = dtype
         self._shape_cache = shape
+        # CONCRETE mode: owns C storage, not a lazy DAG node.
+        self._lazy = False
 
     def _adopt(self, other: "Tensor") -> None:
-        self._init_from_handle(other._ctx_owner, other._t, dtype=other._dtype_cache, shape=other._shape_cache)
-        other._t = ffi.NULL
+        handle = other._require_handle()
+        self._init_from_handle(
+            other._ctx_owner,
+            handle,
+            dtype=other._dtype_cache,
+            shape=other._shape_cache,
+        )
+        other._t = None
         other._closed = True
 
     @classmethod
     def _from_handle(
         cls,
-        ctx,
-        ptr,
+        ctx: "Context",
+        ptr: TensorHandle,
         *,
         dtype: AionDType | None = None,
         shape: tuple[int, ...] | None = None,
@@ -210,9 +463,132 @@ class Tensor:
         self._init_from_handle(ctx, ptr, dtype=dtype, shape=shape)
         return self
 
+    @classmethod
+    def _from_node(
+        cls,
+        op: str,
+        inputs: list[Any],
+        attrs: dict[str, Any],
+        ctx: "Context",
+        name: str | None = None,
+    ) -> "Tensor":
+        """Create a LAZY tensor: an immutable DAG node `(op, inputs, attrs)`.
+
+        `inputs` may hold Tensors, Python scalars, or numpy arrays; leaves are
+        resolved at lowering time. Owns no C storage — teardown is inert
+        (`close`/`__del__` are no-ops). `realize()` flips it to CONCRETE in place.
+        """
+        self = cls.__new__(cls)
+        self._lazy = True
+        self._op = op
+        self._inputs = list(inputs)
+        self._attrs = attrs
+        self._ctx_owner = ctx
+        self._name = name
+        self._t = None
+        self._closed = True  # inert: no handle to free, not a context child
+        self._dtype_cache = None
+        self._shape_cache = None
+        self._realize_model = None
+        return self
+
     @property
-    def ptr(self):
+    def ptr(self) -> TensorHandle:
+        return self._require_handle()
+
+    def _require_handle(self) -> TensorHandle:
+        if self._t is None:
+            raise RuntimeError("Tensor has no concrete native handle")
         return self._t
+
+    # --- lazy op surface (build an immutable DAG; nothing runs yet) --------
+    def _mk(self, kind: str, inputs: list, **attrs) -> "Tensor":
+        return Tensor._from_node(kind, inputs, attrs, ctx=self._ctx_owner)
+
+    def __matmul__(self, other: object) -> "Tensor":
+        return self._mk("matmul", [self, other])
+
+    def __rmatmul__(self, other: object) -> "Tensor":
+        return self._mk("matmul", [other, self])
+
+    def __add__(self, other: object) -> "Tensor":
+        return self._mk("add", [self, other])
+
+    def __radd__(self, other: object) -> "Tensor":
+        return self._mk("add", [other, self])
+
+    def __sub__(self, other: object) -> "Tensor":
+        return self._mk("sub", [self, other])
+
+    def __rsub__(self, other: object) -> "Tensor":
+        return self._mk("sub", [other, self])
+
+    def __mul__(self, other: object) -> "Tensor":
+        return self._mk("mul", [self, other])
+
+    def __rmul__(self, other: object) -> "Tensor":
+        return self._mk("mul", [other, self])
+
+    def __truediv__(self, other: object) -> "Tensor":
+        return self._mk("div", [self, other])
+
+    def __rtruediv__(self, other: object) -> "Tensor":
+        return self._mk("div", [other, self])
+
+    def __neg__(self) -> "Tensor":
+        return self._mk("mul", [self, -1])
+
+    def relu(self) -> "Tensor":
+        return self._mk("unary", [self], op="relu")
+
+    def gelu(self) -> "Tensor":
+        return self._mk("unary", [self], op="gelu")
+
+    def silu(self) -> "Tensor":
+        return self._mk("unary", [self], op="silu")
+
+    def sigmoid(self) -> "Tensor":
+        return self._mk("unary", [self], op="sigmoid")
+
+    def tanh(self) -> "Tensor":
+        return self._mk("unary", [self], op="tanh")
+
+    def softmax(self, axis: int = -1) -> "Tensor":
+        return self._mk("softmax", [self], axis=axis)
+
+    def reshape(self, shape: Sequence[int]) -> "Tensor":
+        return self._mk("reshape", [self], shape=tuple(int(d) for d in shape))
+
+    def transpose2d(self) -> "Tensor":
+        return self._mk("transpose2d", [self])
+
+    def cast(self, dtype: object) -> "Tensor":
+        return self._mk("cast", [self], dtype=dtype)
+
+    def rename(self, name: str) -> "Tensor":
+        if not self._lazy:
+            raise TypeError("rename() is only valid on a lazy tensor (input/op result)")
+        self._name = name  # the default input/output name at lower/compile/export
+        return self
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    # --- materialization ---------------------------------------------------
+    def realize(self, *, device: DeviceLike = None) -> "Tensor":
+        """Compile + run this lazy graph, becoming a CONCRETE tensor (returns self).
+
+        A no-op on an already-CONCRETE tensor. To materialize several results
+        from one graph in a single compile + run, use `aion.realize([...])`.
+        """
+        if self._lazy:
+            _realize_many([self], device=device)
+        return self
+
+    def _ensure_realized(self) -> None:
+        if self._lazy:
+            _realize_many([self], device=None)
 
     def to(self, device: DeviceLike) -> "Tensor":
         """Migrate this tensor to `device` (move semantics; returns self).
@@ -220,66 +596,71 @@ class Tensor:
         The source-device copy is freed. Migrating off the CPU makes host
         `read_*`/`write_*` fail until you migrate back with ``.to("cpu")``.
         Idempotent when already on the target device. Accepts ``"cpu"``,
-        ``"gpu"``, ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind`.
+        ``"gpu"``, ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind``.
+        A GRAPH (lazy) tensor is realized first (on the default device).
         """
 
+        self._ensure_realized()
         kind, index = _normalize_device(device)
-        st = lib.aion_tensor_to(self._t, int(kind), int(index))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_to")
+        move_tensor(
+            self._ctx_owner.ptr, self._require_handle(), int(kind), int(index)
+        )
         return self
 
     def device(self) -> str:
         """The device this tensor is resident on: ``"cpu"`` or ``"gpu:N"``."""
 
-        out_kind = ffi.new("AionDeviceKind*")
-        out_index = ffi.new("uint32_t*")
-        st = lib.aion_tensor_device(self._t, out_kind, out_index)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_device")
-        return _device_to_str(int(out_kind[0]), int(out_index[0]))
+        self._ensure_realized()
+        kind, index = tensor_device(self._ctx_owner.ptr, self._require_handle())
+        return _device_to_str(kind, index)
 
     def close(self) -> None:
         if self._closed:
             return
-        lib.aion_tensor_destroy(self._t)
+        handle = self._t
+        if handle is not None:
+            destroy_tensor(handle)
         try:
             self._ctx_owner._unregister_child(self)
         except Exception:
             pass
-        self._t = ffi.NULL
+        self._t = None
         self._closed = True
 
     def __enter__(self) -> "Tensor":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
-    def __del__(self):  # pragma: no cover
+    def __del__(self) -> None:  # pragma: no cover
         try:
             if not getattr(self, "_closed", True):
-                lib.aion_tensor_destroy(getattr(self, "_t", ffi.NULL))
+                handle = getattr(self, "_t", None)
+                if handle is not None:
+                    destroy_tensor(handle)
         except Exception:
             pass
 
     @classmethod
     def empty(
         cls,
-        ctx,
+        ctx: "Context",
         shape: Sequence[int],
         *,
-        dtype: AionDType | None = None,
+        dtype: object | None = None,
         device: DeviceLike = None,
     ) -> "Tensor":
         shp = _as_shape(shape)
-        if dtype is None:
-            dtype = AionDType.AION_DTYPE_F32
+        dtype = AionDType.AION_DTYPE_F32 if dtype is None else normalize_dtype(dtype)
 
-        rank = len(shp)
-        c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_tensor_create_empty(ctx.ptr, int(dtype), rank, c_shape, out_t)
-        raise_for_status(st, ctx.ptr, what="aion_tensor_create_empty")
-        t = cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        handle = create_empty_tensor(ctx.ptr, dtype, shp)
+        t = cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
         if device is not None:
             t.to(device)
         return t
@@ -287,11 +668,11 @@ class Tensor:
     @classmethod
     def empty_tiled(
         cls,
-        ctx,
+        ctx: "Context",
         shape: Sequence[int],
         tile_shape: Sequence[int],
         *,
-        dtype: AionDType | None = None,
+        dtype: object | None = None,
     ) -> "Tensor":
         """Create an empty tensor with an explicit per-axis tile shape.
 
@@ -305,25 +686,19 @@ class Tensor:
         tshp = _as_shape(tile_shape)
         if len(tshp) != len(shp):
             raise ValueError(f"tile_shape rank {len(tshp)} != shape rank {len(shp)}")
-        if dtype is None:
-            dtype = AionDType.AION_DTYPE_F32
+        dtype = AionDType.AION_DTYPE_F32 if dtype is None else normalize_dtype(dtype)
 
-        rank = len(shp)
-        c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
-        c_tile = ffi.new("size_t[]", [int(x) for x in tshp]) if rank != 0 else ffi.NULL
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_tensor_create_empty_tiled(ctx.ptr, int(dtype), rank, c_shape, c_tile, out_t)
-        raise_for_status(st, ctx.ptr, what="aion_tensor_create_empty_tiled")
-        return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        handle = create_empty_tiled_tensor(ctx.ptr, dtype, shp, tshp)
+        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     @classmethod
     def quantize(
         cls,
-        ctx,
+        ctx: "Context",
         shape: Sequence[int],
-        values,
+        values: object,
         *,
-        dtype: AionDType | None = None,
+        dtype: object | None = None,
         quant_axis: int | None = None,
     ) -> "Tensor":
         """Quantize row-major f32 `values` into a packed-quant tensor.
@@ -346,35 +721,41 @@ class Tensor:
         n = _elem_count(shp)
 
         try:
-            import numpy as np  # type: ignore
+            import numpy as np
         except ImportError:
-            np = None  # type: ignore
+            np = None
 
         if np is not None and isinstance(values, np.ndarray):
             arr = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
             if arr.size != n:
                 raise ValueError(f"expected {n} values for shape {shp}, got {arr.size}")
-            c_vals = ffi.from_buffer("float[]", arr)
+            native_values: object = arr
+            from_buffer = True
         else:
             _, flat = _flatten_nested(values)
             if len(flat) != n:
                 raise ValueError(f"expected {n} values for shape {shp}, got {len(flat)}")
-            c_vals = ffi.new("float[]", [float(v) for v in flat])
+            native_values = [float(v) for v in flat]
+            from_buffer = False
 
-        rank = len(shp)
-        c_shape = ffi.new("size_t[]", [int(x) for x in shp])
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_tensor_quantize(ctx.ptr, int(dtype), rank, c_shape, int(quant_axis), c_vals, n, out_t)
-        raise_for_status(st, ctx.ptr, what="aion_tensor_quantize")
-        return cls._from_handle(ctx, out_t[0], dtype=dtype, shape=tuple(shp))
+        handle = quantize_tensor(
+            ctx.ptr,
+            dtype,
+            shp,
+            quant_axis,
+            native_values,
+            n,
+            from_buffer=from_buffer,
+        )
+        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     @classmethod
     def zeros(
         cls,
         shape: Sequence[int],
         *,
-        ctx=None,
-        dtype: AionDType | None = None,
+        ctx: "Context | None" = None,
+        dtype: object | None = None,
         device: DeviceLike = None,
     ) -> "Tensor":
         """Create a zero-initialized tensor.
@@ -394,170 +775,146 @@ class Tensor:
         return t
 
     @classmethod
-    def from_f32(
+    def _from_flat(
         cls,
-        ctx,
+        ctx: "Context",
         shape: Sequence[int],
-        values: Iterable[float],
-        *,
-        device: DeviceLike = None,
+        values: Iterable[int | float],
+        dtype: AionDType,
     ) -> "Tensor":
         shp = _as_shape(shape)
         n = _elem_count(shp)
-        # Fast-path: NumPy array-like.
-        try:
-            import numpy as np  # type: ignore
-        except ImportError:
-            np = None  # type: ignore
-
-        if np is not None and isinstance(values, np.ndarray):
-            from .numpy import tensor_from_numpy
-
-            arr = np.asarray(values, dtype=np.float32)
-            if tuple(arr.shape) != tuple(shp):
-                raise ValueError(f"expected values with shape {tuple(shp)}, got {arr.shape}")
-            t = tensor_from_numpy(ctx, arr)
-            if device is not None:
-                t.to(device)
-            return t
-
         vals = list(values)
         if len(vals) != n:
             raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
-
-        # Aion currently represents scalars as shape (1,), not rank-0 tensors.
-        # Keep Python ergonomic by accepting shape=() as a scalar convenience.
         if len(shp) == 0:
-            if len(vals) != 1:
-                raise ValueError(f"expected 1 value for scalar tensor, got {len(vals)}")
-            t = cls.scalar_f32(ctx, float(vals[0]))
-            if device is not None:
-                t.to(device)
-            return t
-
-        rank = len(shp)
-        c_shape = ffi.new("size_t[]", [int(x) for x in shp]) if rank != 0 else ffi.NULL
-        c_vals = ffi.new("float[]", [float(v) for v in vals])
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_tensor_create(
-            ctx.ptr,
-            int(AionDType.AION_DTYPE_F32),
-            rank,
-            c_shape,
-            c_vals,
-            n,
-            out_t,
-        )
-        raise_for_status(st, ctx.ptr, what="aion_tensor_create")
-        t = cls._from_handle(ctx, out_t[0], dtype=AionDType.AION_DTYPE_F32, shape=tuple(shp))
-        if device is not None:
-            t.to(device)
-        return t
-
-    @classmethod
-    def scalar_f32(cls, ctx, value: float) -> "Tensor":
-        # Scalars are encoded as shape (1,) in the current Aion runtime.
-        t = cls.empty(ctx, (1,), dtype=AionDType.AION_DTYPE_F32)
-        t.write_f32([float(value)])
-        return t
-
-    @classmethod
-    def scalar_i32(cls, ctx, value: int) -> "Tensor":
-        t = cls.empty(ctx, (1,), dtype=AionDType.AION_DTYPE_I32)
-        t.write_i32([int(value)])
-        return t
+            shp = [1]
+        converter = float if dtype == AionDType.AION_DTYPE_F32 else int
+        handle = create_tensor(ctx.ptr, dtype, shp, [converter(value) for value in vals])
+        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     def numel(self) -> int:
         return _elem_count(self.shape)
 
+    def __repr__(self) -> str:
+        if getattr(self, "_lazy", False):
+            return f"Tensor(lazy, op={self._op!r})"
+        if getattr(self, "_closed", True):
+            return "Tensor(<closed>)"
+        try:
+            return f"Tensor(shape={self.shape}, dtype={self.dtype.name})"
+        except Exception:
+            return "Tensor(<uninitialized>)"
+
     @property
     def dtype(self) -> AionDType:
+        if self._lazy:
+            if self._dtype_cache is None:
+                self._infer_meta()
+            assert self._dtype_cache is not None  # populated by _infer_meta
+            return self._dtype_cache
         if self._dtype_cache is None:
-            self._dtype_cache = AionDType(int(lib.aion_tensor_dtype(self._t)))
+            self._dtype_cache = tensor_dtype(self._require_handle())
         return self._dtype_cache
+
+    def _infer_meta(self) -> None:
+        """Lower this lazy node once to cache its shape + dtype (core inference)."""
+        b, _ = _lower([self])
+        b.close()  # throwaway; shapes were cached on the nodes during emit
 
     @property
     def shape(self) -> tuple[int, ...]:
+        if self._lazy:
+            if self._shape_cache is None:
+                self._infer_meta()
+            assert self._shape_cache is not None  # populated by _infer_meta
+            return self._shape_cache
+
         if self._shape_cache is not None:
             return self._shape_cache
 
-        rank = int(lib.aion_tensor_rank(self._t))
-        if rank == 0:
-            self._shape_cache = ()
-            return self._shape_cache
-
-        dims = ffi.new("size_t[]", rank)
-        st = lib.aion_tensor_shape(self._t, dims, rank)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_shape")
-        self._shape_cache = tuple(int(dims[i]) for i in range(rank))
+        self._shape_cache = tensor_shape(
+            self._ctx_owner.ptr, self._require_handle()
+        )
         return self._shape_cache
 
-    # --- dtype-generic I/O (numpy is the primary interop) -----------------
-    def _resolve_read_dtype(self, dtype) -> AionDType:
-        dt = normalize_dtype(dtype) if dtype is not None else self.dtype
-        if dt != self.dtype:
-            raise ValueError(f"dtype mismatch: tensor is {self.dtype.name}, requested {dt.name}")
-        if _is_quant(dt):
-            raise NotImplementedError(f"{dt.name}: quantized tensors have no scalar read path")
-        return dt
-
-    def read(self, dtype=None) -> list:
-        """Read the tensor into a flat Python list (scalar dtypes only).
-
-        `dtype`, if given, must match the tensor's dtype. Prefer `.numpy()`; for
-        f16 the returned values are the raw uint16 bit patterns (use `.numpy()`
-        for decoded floats).
-        """
-        dt = self._resolve_read_dtype(dtype)
+    # --- host conversion and mutation ------------------------------------
+    def _flat_values(self) -> list[int | float]:
+        self._ensure_realized()
+        if _is_quant(self.dtype):
+            raise NotImplementedError(
+                f"{self.dtype.name}: quantized tensors cannot be converted to Python values"
+            )
         n = _elem_count(self.shape)
-        buf = ffi.new(_c_elem(dt) + "[]", n)
-        st = lib.aion_tensor_read(self._t, int(dt), buf, n)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read")
-        cast = float if dt == AionDType.AION_DTYPE_F32 else int
-        return [cast(buf[i]) for i in range(n)]
+        return read_tensor(self._ctx_owner.ptr, self._require_handle(), n)
 
-    def read_scalar(self, dtype=None):
-        """Read a 1-element tensor as a single Python scalar (scalar dtypes only)."""
-        dt = self._resolve_read_dtype(dtype)
-        out = ffi.new(_c_elem(dt) + "*")
-        st = lib.aion_tensor_read_scalar(self._t, int(dt), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_read_scalar")
-        return (float if dt == AionDType.AION_DTYPE_F32 else int)(out[0])
+    def tolist(self) -> TensorData:
+        """Return the tensor as nested Python lists."""
+        values = self._flat_values()
 
-    def write(self, values, dtype=None) -> "Tensor":
-        """Write a numpy array or flat sequence into this tensor. Returns self.
+        def build(shape: tuple[int, ...], offset: int = 0) -> tuple[object, int]:
+            if not shape:
+                return values[offset], offset + 1
+            items: list[object] = []
+            for _ in range(shape[0]):
+                item, offset = build(shape[1:], offset)
+                items.append(item)
+            return items, offset
 
-        A numpy array routes through `copy_from`; a flat sequence is written
-        element-wise. `dtype`, if given, must match the tensor's dtype.
-        """
-        dt = normalize_dtype(dtype) if dtype is not None else self.dtype
-        if dt != self.dtype:
-            raise ValueError(f"dtype mismatch: tensor is {self.dtype.name}, requested {dt.name}")
+        result, _ = build(self.shape)
+        return cast(TensorData, result)
+
+    def item(self) -> int | float:
+        """Return the value of a one-element tensor as a Python scalar."""
+        if self.numel() != 1:
+            raise ValueError(f"item() requires one element, got {self.numel()}")
+        return self._flat_values()[0]
+
+    def copy_from(self, values: object) -> "Tensor":
+        """Copy array-like data into this tensor and return ``self``."""
+        if self._lazy:
+            raise TypeError("cannot mutate a lazy tensor; it is a computed value")
+        dt = self.dtype
         if _is_quant(dt):
-            raise NotImplementedError(f"{dt.name}: quantized tensors have no scalar write path")
+            raise NotImplementedError(f"{dt.name}: quantized tensors cannot be mutated")
 
-        try:
-            import numpy as np  # type: ignore
-        except ImportError:
-            np = None  # type: ignore
-        if np is not None and isinstance(values, np.ndarray):
-            return self.copy_from(values)
+        np = _try_numpy()
+        if np is not None:
+            from .numpy import _copy_numpy_into_tensor
 
-        n = _elem_count(self.shape)
-        vals = list(values)
-        if len(vals) != n:
-            raise ValueError(f"expected {n} values for shape {self.shape}, got {len(vals)}")
+            _copy_numpy_into_tensor(self, values)
+            return self
+
+        if dt == AionDType.AION_DTYPE_F32:
+            shape, vals = _flatten_nested(values)
+        elif dt == AionDType.AION_DTYPE_I32:
+            shape, vals = _flatten_nested_i32(values)
+        else:
+            raise NotImplementedError(
+                f"copy_from without NumPy is not implemented for {dt.name}"
+            )
+        if shape == () and self.shape == (1,):
+            shape = (1,)
+        if shape != self.shape:
+            raise ValueError(f"shape mismatch: tensor {self.shape} vs data {shape}")
         py = float if dt == AionDType.AION_DTYPE_F32 else int
-        buf = ffi.new(_c_elem(dt) + "[]", [py(v) for v in vals])
-        st = lib.aion_tensor_write(self._t, int(dt), buf, n)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+        write_tensor(
+            self._ctx_owner.ptr,
+            self._require_handle(),
+            [py(cast(Any, value)) for value in vals],
+        )
         return self
 
     def fill(self, value: float) -> "Tensor":
         """In-place fill (f32 only). Returns self."""
         if self.dtype != AionDType.AION_DTYPE_F32:
             raise NotImplementedError("fill() is f32 only")
-        return self.write([float(value)] * self.numel())
+        write_tensor(
+            self._ctx_owner.ptr,
+            self._require_handle(),
+            [float(value)] * self.numel(),
+        )
+        return self
 
     def zero(self) -> "Tensor":
         """In-place zero fill (scalar dtypes). Returns self."""
@@ -565,56 +922,14 @@ class Tensor:
         if _is_quant(dt):
             raise NotImplementedError(f"zero() not implemented for dtype={dt.name}")
         n = self.numel()
-        # ffi.new zero-initializes; for f16 the uint16 zeros are IEEE-754 +0.0.
-        buf = ffi.new(_c_elem(dt) + "[]", n)
-        st = lib.aion_tensor_write(self._t, int(dt), buf, n)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_tensor_write")
+        # The native façade zero-initializes the temporary C buffer; for f16,
+        # uint16 zero is IEEE-754 +0.0.
+        zero_tensor(self._ctx_owner.ptr, self._require_handle(), n)
         return self
 
     # numpy interop (requires numpy; scalar dtypes only).
     def numpy(self) -> NDArray:
-        from .numpy import tensor_to_numpy
+        from .numpy import _tensor_to_numpy
 
-        return tensor_to_numpy(self)
-
-    @classmethod
-    def from_numpy(cls, ctx, array: ArrayLike, *, dtype=None, device: DeviceLike = None) -> "Tensor":
-        from .numpy import tensor_from_numpy
-
-        t = tensor_from_numpy(ctx, array, dtype=dtype)
-        if device is not None:
-            t.to(device)
-        return t
-
-    def copy_from(self, array: ArrayLike) -> "Tensor":
-        """Write into this tensor's storage from a numpy array (dtype = this
-        tensor's; shape must match). Returns self."""
-        from .numpy import tensor_write_from_numpy
-
-        tensor_write_from_numpy(self, array)
-        return self
-
-    # --- back-compat aliases (deprecated; prefer .numpy()/.read()/.copy_from()) ---
-    def read_f32(self) -> list[float]:
-        return self.read(AionDType.AION_DTYPE_F32)
-
-    def read_i32(self) -> list[int]:
-        return self.read(AionDType.AION_DTYPE_I32)
-
-    def write_f32(self, values) -> None:
-        self.write(values, AionDType.AION_DTYPE_F32)
-
-    def write_i32(self, values: Iterable[int]) -> None:
-        self.write(values, AionDType.AION_DTYPE_I32)
-
-    def read_scalar_f32(self) -> float:
-        return self.read_scalar(AionDType.AION_DTYPE_F32)
-
-    def read_scalar_i32(self) -> int:
-        return int(self.read_scalar(AionDType.AION_DTYPE_I32))
-
-    def item_f32(self) -> float:
-        return self.read_scalar(AionDType.AION_DTYPE_F32)
-
-    def write_from_numpy(self, array: ArrayLike) -> None:
-        self.copy_from(array)
+        self._ensure_realized()
+        return _tensor_to_numpy(self)

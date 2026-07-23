@@ -36,7 +36,7 @@ def test_default_context_thread_count_from_env(monkeypatch):
     try:
         with aion.Tensor([1.0, 2.0, 3.0]) as t:
             assert t.shape == (3,)
-            assert t.read_f32() == pytest.approx([1.0, 2.0, 3.0])
+            assert t.tolist() == pytest.approx([1.0, 2.0, 3.0])
     finally:
         aion.reset_default_context()
 

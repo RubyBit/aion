@@ -7,13 +7,16 @@ scalar dtype (f32/f16/i8/i32). Quantized dtypes have no host array form and rais
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from .dtype import c_elem, is_quantized, normalize_dtype, numpy_dtype
-from .errors import raise_for_status
-from ._ffi import ffi, lib
+from .dtype import is_quantized, normalize_dtype, numpy_dtype
+from ._ffi.runtime import (
+    create_tensor_from_buffer,
+    read_tensor_into_buffer,
+    write_tensor_from_buffer,
+)
 from .enums import AionDType
-from .types import ArrayLike, NDArray
+from .types import NDArray
 
 if TYPE_CHECKING:
     from .context import Context
@@ -22,19 +25,19 @@ if TYPE_CHECKING:
 
 def _require_numpy():
     try:
-        import numpy as np  # type: ignore
+        import numpy as np
     except Exception as e:  # pragma: no cover
         raise ImportError("NumPy is required; install aion[numpy]") from e
     return np
 
 
-def _as_contiguous(array: ArrayLike, dt: AionDType):
+def _as_contiguous(array: object, dt: AionDType):
     """Coerce `array` to a C-contiguous, writable, itemsize-aligned buffer of the
     numpy dtype matching `dt`. Returns the (possibly copied) numpy array."""
     np = _require_numpy()
     np_dt = numpy_dtype(dt)
 
-    arr = np.asarray(array)
+    arr = np.asarray(cast(Any, array))
     if arr.dtype != np_dt:
         arr = arr.astype(np_dt, copy=False)
     if not arr.flags["C_CONTIGUOUS"]:
@@ -48,7 +51,7 @@ def _as_contiguous(array: ArrayLike, dt: AionDType):
     return arr
 
 
-def tensor_to_numpy(tensor: "Tensor") -> NDArray:
+def _tensor_to_numpy(tensor: "Tensor") -> NDArray:
     """Copy a tensor into a new NumPy array (scalar dtypes only)."""
     np = _require_numpy()
 
@@ -60,42 +63,42 @@ def tensor_to_numpy(tensor: "Tensor") -> NDArray:
     out = np.empty(shape, dtype=numpy_dtype(dt))
     n = int(out.size)
 
-    buf = ffi.from_buffer(c_elem(dt) + "[]", out)
-    st = lib.aion_tensor_read(tensor.ptr, int(dt), buf, n)
-    raise_for_status(st, tensor._ctx_owner.ptr, what="aion_tensor_read")
+    read_tensor_into_buffer(
+        tensor._ctx_owner.ptr, tensor.ptr, out, n
+    )
     return out
 
 
-def tensor_from_numpy(ctx: "Context", array: ArrayLike, *, dtype=None) -> "Tensor":
+def _tensor_from_numpy(
+    ctx: "Context", array: object, *, dtype: object | None = None
+) -> "Tensor":
     """Create a tensor from a NumPy array. `dtype` defaults to the array's dtype
     (mapped to the nearest Aion scalar dtype)."""
     np = _require_numpy()
     if dtype is not None:
         dt = normalize_dtype(dtype)
     else:
-        dt = normalize_dtype(np.asarray(array).dtype)
+        dt = normalize_dtype(np.asarray(cast(Any, array)).dtype)
     if is_quantized(dt):
         raise NotImplementedError(f"{dt.name}: use Tensor.quantize for quantized tensors")
 
     arr = _as_contiguous(array, dt)
+    if arr.ndim == 0:
+        # Aion currently represents scalars as one-element vectors.
+        arr = arr.reshape(1)
 
     shape = list(arr.shape)
-    rank = len(shape)
-    c_shape = ffi.new("size_t[]", [int(x) for x in shape]) if rank != 0 else ffi.NULL
-
     n = int(arr.size)
-    buf = ffi.from_buffer(c_elem(dt) + "[]", arr)
-
-    out_t = ffi.new("AionTensor**")
-    st = lib.aion_tensor_create(ctx.ptr, int(dt), rank, c_shape, buf, n, out_t)
-    raise_for_status(st, ctx.ptr, what="aion_tensor_create")
+    handle = create_tensor_from_buffer(
+        ctx.ptr, dt, shape, arr, n
+    )
 
     from .tensor import Tensor
 
-    return Tensor._from_handle(ctx, out_t[0], dtype=dt, shape=tuple(shape))
+    return Tensor._from_handle(ctx, handle, dtype=dt, shape=tuple(shape))
 
 
-def tensor_write_from_numpy(tensor: "Tensor", array: ArrayLike) -> None:
+def _copy_numpy_into_tensor(tensor: "Tensor", array: object) -> None:
     """Write into an existing tensor from a NumPy array (dtype = tensor's;
     shape must match)."""
     dt = tensor.dtype
@@ -109,6 +112,6 @@ def tensor_write_from_numpy(tensor: "Tensor", array: ArrayLike) -> None:
         raise ValueError(f"shape mismatch: tensor {expected_shape} vs array {arr.shape}")
 
     n = int(arr.size)
-    buf = ffi.from_buffer(c_elem(dt) + "[]", arr)
-    st = lib.aion_tensor_write(tensor.ptr, int(dt), buf, n)
-    raise_for_status(st, tensor._ctx_owner.ptr, what="aion_tensor_write")
+    write_tensor_from_buffer(
+        tensor._ctx_owner.ptr, tensor.ptr, arr, n
+    )

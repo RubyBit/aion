@@ -12,7 +12,7 @@ from __future__ import annotations
 import enum
 
 import aion.enums as aion_enums
-from aion._ffi import lib
+from aion._ffi._raw import lib
 
 
 def _enum_classes():

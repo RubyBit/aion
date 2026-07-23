@@ -79,14 +79,14 @@ def main() -> None:
                     end = start + chunk_input_len
                     x = signal[start:end].reshape(1, chunk_input_len)
 
-                    x_t.write_from_numpy(x)
+                    x_t.copy_from(x)
                     model.bind_input(x_name, x_t)
                     model.run()
 
                     if prob_t is None:
                         prob_t = model.output_tensor(prob_name)
 
-                    probs[chunk_idx] = prob_t.read_f32()[0]
+                    probs[chunk_idx] = prob_t.item()
 
                     if args.print_probs:
                         t_ms = (chunk_idx * args.num_samples * 1000.0) / 16_000.0

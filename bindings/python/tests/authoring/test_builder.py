@@ -163,7 +163,7 @@ def test_if_control_flow(ctx):
     model.bind_input("then_v", aion.Tensor([42.0], ctx=ctx))
     model.bind_input("else_v", aion.Tensor([7.0], ctx=ctx))
     model.run()
-    assert model.output_tensor("out").read_f32()[0] == 42.0
+    assert model.output_tensor("out").item() == 42.0
 
 
 def test_loop_control_flow(ctx):
@@ -181,7 +181,7 @@ def test_loop_control_flow(ctx):
     model.bind_input("inc", aion.Tensor([2.0], ctx=ctx))
     model.run()
     # 1 + 2*4 = 9
-    assert abs(model.output_tensor("out").read_f32()[0] - 9.0) < 1e-6
+    assert abs(model.output_tensor("out").item() - 9.0) < 1e-6
 
 
 def test_rmsnorm_forward(ctx):

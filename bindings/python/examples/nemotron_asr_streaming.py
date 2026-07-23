@@ -35,7 +35,7 @@ HOP = 160
 
 
 def _i32(ctx, arr) -> "aion.Tensor":
-    """Bind an i32 tensor (from_numpy defaults to f32, so build i32 explicitly)."""
+    """Bind an i32 tensor."""
     return aion.Tensor(np.asarray(arr, np.int32).tolist(), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
 
 
@@ -61,15 +61,15 @@ def run_offline(model_path: str, md: dict, audio: np.ndarray, threads, args):
     ctx = m.context
     n = (t_mel - 1) * HOP  # samples whose center-STFT yields t_mel frames
     a = _fit_samples(audio, n).astype(np.float32)
-    m.bind_input("audio", aion.Tensor.from_numpy(ctx, a.reshape(n, 1)))
+    m.bind_input("audio", aion.Tensor(a.reshape(n, 1), ctx=ctx))
     m.bind_input("active_in", _i32(ctx, [1]))
     m.bind_input("last_in", _i32(ctx, [blank]))
     m.run()
     oc = m.output_tensor("out_count")
-    count = int(oc.read_i32()[0])
+    count = int(oc.item())
     oc.close()
     ot = m.output_tensor("out_tokens")
-    toks = [int(x) for x in ot.read_i32()]
+    toks = [int(x) for x in ot.tolist()]
     ot.close()
     return toks[:count]
 
@@ -106,7 +106,7 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
     m, dev = load_model_with_device(model_path, args, thread_count=threads)
     print(f"device: {dev}")
     ctx = m.context
-    fn = lambda a: aion.Tensor.from_numpy(ctx, a)
+    fn = lambda a: aion.Tensor(a, ctx=ctx)
 
     # Per-run inputs (rewritten in place each chunk) — bound once.
     t_audio = fn(np.zeros((wsamp, 1), np.float32))
@@ -132,14 +132,14 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
         thr = max(0, att_left - c * chunk)
         mask = np.full((chunk, t_kv), -1e9, np.float32)
         mask[:, [j for j in range(t_kv) if thr <= j < att_left + real]] = 0.0
-        t_audio.write_from_numpy(w.reshape(wsamp, 1))
-        t_mask.write_from_numpy(mask)
-        t_frame.write_i32([0]); t_sym.write_i32([0])
-        t_count.write_i32([0]); t_active.write_i32([1])
-        t_toks.write_i32([0] * max_out)
+        t_audio.copy_from(w.reshape(wsamp, 1))
+        t_mask.copy_from(mask)
+        t_frame.copy_from([0]); t_sym.copy_from([0])
+        t_count.copy_from([0]); t_active.copy_from([1])
+        t_toks.copy_from([0] * max_out)
         m.run()
-        oc = m.output_tensor("out_count"); cnt = int(oc.read_i32()[0]); oc.close()
-        ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.read_i32()][:cnt]; ot.close()
+        oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
+        ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.tolist()][:cnt]; ot.close()
         t_ms = (c + 1) * step * 1000 // SAMPLE_RATE
         print(f"[{t_ms:6d}ms] {sp.DecodeIds([int(t) for t in tokens])}")
     return tokens

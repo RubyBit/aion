@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import atexit
 import os
+from types import TracebackType
 import weakref
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
-from .device import GpuOptions, build_gpu_options_array
-from .errors import raise_for_status
-from ._ffi import ffi, lib
+from .device import GpuOptions
+from ._ffi.handles import ContextHandle
+from ._ffi.runtime import create_context, destroy_context
+
+if TYPE_CHECKING:
+    from .model import LoadedModel
+    from .tensor import Tensor
 
 _DEFAULT_CONTEXT = None
 
@@ -57,7 +62,7 @@ class Context:
         thread_count: Optional[int] = None,
         *,
         gpus: Optional[Sequence[GpuOptions]] = None,
-    ):
+    ) -> None:
         """Create a context.
 
         Registering GPUs via `gpus` makes them selectable as `.gpu = i`
@@ -74,12 +79,7 @@ class Context:
 
         gpu_list = list(gpus) if gpus else []
 
-        out_ctx = ffi.new("AionContext**")
-        gpus_arr, gpu_count = build_gpu_options_array(ffi, gpu_list)
-        st = lib.aion_context_create(thread_count, gpus_arr, gpu_count, out_ctx)
-        raise_for_status(st, None, what="aion_context_create")
-
-        self._ctx = out_ctx[0]
+        self._ctx: ContextHandle | None = create_context(thread_count, gpu_list)
         self._closed = False
         self._children: weakref.WeakSet[object] = weakref.WeakSet()
 
@@ -88,8 +88,8 @@ class Context:
         cls,
         *,
         thread_count: Optional[int] = None,
-        power="high",
-        backend="any",
+        power: str = "high",
+        backend: str = "any",
         adapter_index: Optional[int] = None,
     ) -> "Context":
         """Convenience: create a context with a single GPU registered as ``gpu:0``."""
@@ -100,7 +100,9 @@ class Context:
         )
 
     @property
-    def ptr(self):
+    def ptr(self) -> ContextHandle:
+        if self._ctx is None:
+            raise RuntimeError("Context is closed")
         return self._ctx
 
     def _register_child(self, obj: object) -> None:
@@ -124,17 +126,24 @@ class Context:
                 # Keep cleanup resilient: try closing remaining children.
                 pass
 
-        lib.aion_context_destroy(self._ctx)
-        self._ctx = ffi.NULL
+        handle = self._ctx
+        if handle is not None:
+            destroy_context(handle)
+        self._ctx = None
         self._closed = True
 
     def __enter__(self) -> "Context":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
-    def __del__(self):  # pragma: no cover
+    def __del__(self) -> None:  # pragma: no cover
         try:
             if not getattr(self, "_closed", True):
                 # Best-effort cleanup: do not raise from finalizer.
@@ -142,23 +151,7 @@ class Context:
         except Exception:
             pass
 
-    # Convenience factories.
-    def tensor_empty(self, shape: Sequence[int], *, dtype=None):
-        from .tensor import Tensor
-
-        return Tensor.empty(self, shape, dtype=dtype)
-
-    def tensor_from_f32(self, shape: Sequence[int], values):
-        from .tensor import Tensor
-
-        return Tensor.from_f32(self, shape, values)
-
-    def scalar_f32(self, value: float):
-        from .tensor import Tensor
-
-        return Tensor.scalar_f32(self, value)
-
-    def load_model(self, path: str):
+    def load_model(self, path: str) -> "LoadedModel":
         from .model import LoadedModel
 
         return LoadedModel.load(self, path)

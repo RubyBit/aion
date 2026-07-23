@@ -16,12 +16,55 @@ validation, and serialization all come from one source of truth.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence, Union, overload
+from types import TracebackType
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Union, overload
 
+from .context import Context
 from .device import DeviceLike, _normalize_device
 from .dtype import normalize_dtype as _as_dtype
-from .errors import raise_for_status
-from ._ffi import ffi, lib
+from ._ffi.authoring import (
+    AttentionAttrs,
+    AxisAttrs,
+    CastAttrs,
+    Conv1DAttrs,
+    Conv2DAttrs,
+    ElemwiseAttrs,
+    MatmulAttrs,
+    MhaCachedAttrs,
+    NormAttrs,
+    OpAttrs,
+    OptionalAxisAttrs,
+    ReduceAttrs,
+    RegionId,
+    RelposMhaAttrs,
+    ReshapeAttrs,
+    Rope1DAttrs,
+    SliceAttrs,
+    StftAttrs,
+    UnaryAttrs,
+    ValueId,
+    ViewDims,
+    builder_add_dim_symbol,
+    builder_add_input_role,
+    builder_add_metadata,
+    builder_add_output_alias,
+    builder_begin_region,
+    builder_end_region,
+    builder_if,
+    builder_input,
+    builder_loop,
+    builder_mark_output,
+    builder_name,
+    builder_param,
+    builder_value_dtype,
+    builder_value_shape,
+    compile_builder,
+    create_builder,
+    destroy_builder,
+    emit_op,
+    export_builder,
+)
+from ._ffi.handles import BuilderHandle
 from .enums import (
     AionBinaryOp,
     AionDType,
@@ -32,13 +75,13 @@ from .enums import (
     AionUnaryOp,
 )
 from .tensor import Tensor
-from .types import ArrayLike, Shape
+from .types import Shape
 
 if TYPE_CHECKING:
     from .model import LoadedModel
 
 # A weight source: an existing Tensor, a numpy array, or a nested Python list.
-WeightData = Union["Tensor", ArrayLike]
+WeightData = object
 # Which input axes are dynamic (vary at runtime): a sequence of axis indices
 # (auto-named symbols) or a {axis: symbol_name} mapping (reuse a name to tie axes
 # across inputs to the same runtime size). The declared int at each axis is the
@@ -46,22 +89,27 @@ WeightData = Union["Tensor", ArrayLike]
 DynamicAxes = Union[None, Sequence[int], Mapping[int, str]]
 # What `compile`/`export` accept as outputs: one value, a list, or {name: value}.
 OutputsLike = Union["Value", Sequence["Value"], Mapping[str, "Value"]]
-# Per-op attribute configurator invoked with the spec's `attr` union.
-AttrConfigure = Callable[[Any], None]
-
 _PAD_MODES = {
     "zero": AionPadMode.AION_PAD_ZERO,
     "reflect": AionPadMode.AION_PAD_REFLECT,
 }
 
 class Value:
-    """A graph value produced/consumed inside a `Builder` (an opaque u32 id)."""
+    """A builder-bound graph value (an opaque u32 id in one `Builder`).
 
-    __slots__ = ("_b", "id")
+    This is the **low-level** authoring handle returned by `Builder` ops and by
+    `nn` layers. It supports the graph operators/fluent forms and authoring-time
+    `shape`/`dtype` introspection (eager per-op inference). The seamless
+    high-level lazy value users reach for is `aion.Tensor` (see `tensor.py`),
+    which lowers to this at compile time. `Builder` is the explicit escape hatch.
+    """
 
-    def __init__(self, builder: "Builder", vid: int):
+    __slots__ = ("_b", "id", "_name")
+
+    def __init__(self, builder: "Builder", vid: ValueId | int):
         self._b = builder
-        self.id = int(vid)
+        self.id: ValueId = ValueId(int(vid))
+        self._name = None
 
     # --- operators ---------------------------------------------------------
     def __matmul__(self, other: "Value") -> "Value":
@@ -104,11 +152,12 @@ class Value:
     def transpose2d(self) -> "Value":
         return self._b.transpose2d(self)
 
-    def cast(self, dtype) -> "Value":
+    def cast(self, dtype: object) -> "Value":
         return self._b.cast(self, dtype)
 
     def rename(self, name: str) -> "Value":
         self._b.name(self, name)
+        self._name = name
         return self
 
     # --- authoring-time introspection -------------------------------------
@@ -120,21 +169,15 @@ class Value:
         declared with, propagated to derived values. The compiled/exported model
         still serves any size on dynamic axes.
         """
-        rank = ffi.new("size_t*")
-        st = lib.aion_builder_value_rank(self._b.ptr, self.id, rank)
-        raise_for_status(st, self._b._ctx_owner.ptr, what="aion_builder_value_rank")
-        n = int(rank[0])
-        dims = ffi.new("size_t[]", n) if n > 0 else ffi.NULL
-        st = lib.aion_builder_value_shape(self._b.ptr, self.id, dims, n)
-        raise_for_status(st, self._b._ctx_owner.ptr, what="aion_builder_value_shape")
-        return tuple(int(dims[i]) for i in range(n))
+        return builder_value_shape(
+            self._b._ctx_owner.ptr, self._b.ptr, self.id
+        )
 
     @property
     def dtype(self) -> AionDType:
-        out = ffi.new("AionDType*")
-        st = lib.aion_builder_value_dtype(self._b.ptr, self.id, out)
-        raise_for_status(st, self._b._ctx_owner.ptr, what="aion_builder_value_dtype")
-        return AionDType(int(out[0]))
+        return builder_value_dtype(
+            self._b._ctx_owner.ptr, self._b.ptr, self.id
+        )
 
     @property
     def ndim(self) -> int:
@@ -147,16 +190,13 @@ class Value:
 class Builder:
     """Authors a graph, then compiles or exports it."""
 
-    def __init__(self, ctx=None):
+    def __init__(self, ctx: "Context | None" = None) -> None:
         from .context import get_default_context
 
         if ctx is None:
             ctx = get_default_context()
         self._ctx_owner = ctx
-        out = ffi.new("AionBuilder**")
-        st = lib.aion_builder_create(ctx.ptr, out)
-        raise_for_status(st, ctx.ptr, what="aion_builder_create")
-        self._b = out[0]
+        self._b: BuilderHandle | None = create_builder(ctx.ptr)
         self._closed = False
         # Keep param tensors alive for the builder's lifetime.
         self._params: list[Tensor] = []
@@ -167,35 +207,49 @@ class Builder:
         ctx._register_child(self)
 
     @property
-    def ptr(self):
+    def ptr(self) -> BuilderHandle:
+        return self._require_handle()
+
+    def _require_handle(self) -> BuilderHandle:
+        if self._b is None:
+            raise RuntimeError("Builder is closed")
         return self._b
 
     @property
-    def context(self):
+    def context(self) -> "Context":
         return self._ctx_owner
 
     def close(self) -> None:
         if self._closed:
             return
-        lib.aion_builder_destroy(self._b)
+        handle = self._b
+        if handle is not None:
+            destroy_builder(handle)
         try:
             self._ctx_owner._unregister_child(self)
         except Exception:
             pass
-        self._b = ffi.NULL
+        self._b = None
         self._closed = True
         self._params.clear()
 
     def __enter__(self) -> "Builder":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
-    def __del__(self):  # pragma: no cover
+    def __del__(self) -> None:  # pragma: no cover
         try:
             if not getattr(self, "_closed", True):
-                lib.aion_builder_destroy(getattr(self, "_b", ffi.NULL))
+                handle = getattr(self, "_b", None)
+                if handle is not None:
+                    destroy_builder(handle)
         except Exception:
             pass
 
@@ -220,11 +274,8 @@ class Builder:
         dims = [int(d) for d in shape]
         symbolic = _resolve_dynamic(dynamic, len(dims), self)
 
-        c_shape = ffi.new("size_t[]", dims)
-        out = ffi.new("AionValueId*")
-        st = lib.aion_builder_input(self._b, int(dt), len(dims), c_shape, out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_input")
-        v = Value(self, out[0])
+        value_id = builder_input(self._ctx_owner.ptr, self.ptr, dt, dims)
+        v = Value(self, value_id)
         for axis, name in symbolic:
             self._add_dim_symbol(v, axis, name)
             # Record the declared placeholder so symbolic view dims can resolve it.
@@ -237,8 +288,9 @@ class Builder:
         return name
 
     def _add_dim_symbol(self, value: Value, axis: int, name: str) -> None:
-        st = lib.aion_builder_add_dim_symbol(self._b, value.id, int(axis), _c_str(name))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_add_dim_symbol")
+        builder_add_dim_symbol(
+            self._ctx_owner.ptr, self.ptr, value.id, axis, name
+        )
 
     def param(
         self,
@@ -268,47 +320,44 @@ class Builder:
                 t = Tensor(data, ctx=self._ctx_owner, dtype=dt)
         self._params.append(t)
 
-        out = ffi.new("AionValueId*")
-        st = lib.aion_builder_param(self._b, t.ptr, out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_param")
-        return Value(self, out[0])
+        value_id = builder_param(self._ctx_owner.ptr, self.ptr, t.ptr)
+        return Value(self, value_id)
 
     def name(self, value: Value, name: str) -> Value:
-        st = lib.aion_builder_name(self._b, value.id, _c_str(name))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_name")
+        builder_name(self._ctx_owner.ptr, self.ptr, value.id, name)
         return value
 
     # --- op emit -----------------------------------------------------------
-    def _emit(self, op: AionOp, inputs: Sequence[Value], configure: Optional[AttrConfigure] = None) -> Value:
-        spec = ffi.new("AionOpSpec*")
-        spec.op = int(op)
-        ids = ffi.new("AionValueId[]", [int(v.id) for v in inputs])
-        spec.inputs = ids
-        spec.inputs_len = len(inputs)
-        if configure is not None:
-            configure(spec.attr)
-        out = ffi.new("AionValueId*")
-        st = lib.aion_builder_op(self._b, spec, out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_op")
-        return Value(self, out[0])
+    def _emit(
+        self,
+        op: AionOp,
+        inputs: Sequence[Value],
+        attrs: OpAttrs = None,
+    ) -> Value:
+        value_id = emit_op(
+            self._ctx_owner.ptr,
+            self.ptr,
+            op,
+            [value.id for value in inputs],
+            attrs,
+        )
+        return Value(self, value_id)
 
     # Structured ops.
     def matmul(self, a: Value, b: Value, alpha: float = 1.0, beta: float = 0.0) -> Value:
-        def cfg(attr):
-            attr.matmul.alpha = float(alpha)
-            attr.matmul.beta = float(beta)
-
-        return self._emit(AionOp.AION_OP_MATMUL, (a, b), cfg)
+        return self._emit(
+            AionOp.AION_OP_MATMUL, (a, b), MatmulAttrs(alpha, beta)
+        )
 
     def matmul_nt(self, a: Value, b: Value, alpha: float = 1.0, beta: float = 0.0) -> Value:
-        def cfg(attr):
-            attr.matmul.alpha = float(alpha)
-            attr.matmul.beta = float(beta)
-
-        return self._emit(AionOp.AION_OP_MATMUL_NT, (a, b), cfg)
+        return self._emit(
+            AionOp.AION_OP_MATMUL_NT, (a, b), MatmulAttrs(alpha, beta)
+        )
 
     def _elemwise(self, op: AionBinaryOp, a: Value, b: Value) -> Value:
-        return self._emit(AionOp.AION_OP_ELEMWISE, (a, b), lambda attr: setattr(attr.elemwise, "op", int(op)))
+        return self._emit(
+            AionOp.AION_OP_ELEMWISE, (a, b), ElemwiseAttrs(int(op))
+        )
 
     def add(self, a: Value, b: Value) -> Value:
         return self._elemwise(AionBinaryOp.AION_BINARY_ADD, a, b)
@@ -326,7 +375,7 @@ class Builder:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM,
             (a, b),
-            lambda attr: setattr(attr.elemwise, "op", int(AionBinaryOp.AION_BINARY_ADD)),
+            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_ADD)),
         )
 
     def gelu_mul(self, a: Value, b: Value) -> Value:
@@ -344,10 +393,10 @@ class Builder:
 
     def unary(self, op: str, a: Value) -> Value:
         u = self._UNARY[op]
-        return self._emit(AionOp.AION_OP_UNARY, (a,), lambda attr: setattr(attr.unary, "op", int(u)))
+        return self._emit(AionOp.AION_OP_UNARY, (a,), UnaryAttrs(int(u)))
 
     def softmax(self, a: Value, axis: int = -1) -> Value:
-        return self._emit(AionOp.AION_OP_SOFTMAX, (a,), lambda attr: setattr(attr.softmax, "axis", int(axis)))
+        return self._emit(AionOp.AION_OP_SOFTMAX, (a,), AxisAttrs(axis))
 
     def rmsnorm(self, x: Value, gamma: Value, beta: Value, *, eps: float = 1e-6, normalized_shape: Sequence[int]) -> Value:
         return self._norm(AionOp.AION_OP_RMSNORM, x, gamma, beta, eps, normalized_shape)
@@ -355,40 +404,41 @@ class Builder:
     def layernorm(self, x: Value, gamma: Value, beta: Value, *, eps: float = 1e-5, normalized_shape: Sequence[int]) -> Value:
         return self._norm(AionOp.AION_OP_LAYERNORM, x, gamma, beta, eps, normalized_shape)
 
-    def _norm(self, op, x, gamma, beta, eps, normalized_shape) -> Value:
-        ns = ffi.new("size_t[]", [int(d) for d in normalized_shape])
-
-        def cfg(attr):
-            attr.norm.eps = float(eps)
-            attr.norm.normalized_shape = ns
-            attr.norm.normalized_shape_len = len(normalized_shape)
-
-        # `ns` must outlive the call; _emit runs synchronously so the closure
-        # (and thus `ns`) is alive throughout.
-        return self._emit(op, (x, gamma, beta), cfg)
+    def _norm(
+        self,
+        op: AionOp,
+        x: Value,
+        gamma: Value,
+        beta: Value,
+        eps: float,
+        normalized_shape: Sequence[int],
+    ) -> Value:
+        attrs = NormAttrs(
+            float(eps), tuple(int(dim) for dim in normalized_shape)
+        )
+        return self._emit(op, (x, gamma, beta), attrs)
 
     def gather_rows(self, table: Value, indices: Value) -> Value:
         return self._emit(AionOp.AION_OP_GATHER_ROWS, (table, indices))
 
     def rope1d(self, x: Value, positions: Value, *, base_frequency: float, scale_factor: float = 1.0, rope_proportion: float = 1.0) -> Value:
-        def cfg(attr):
-            attr.rope1d.base_frequency = float(base_frequency)
-            attr.rope1d.scale_factor = float(scale_factor)
-            attr.rope1d.rope_proportion = float(rope_proportion)
-
-        return self._emit(AionOp.AION_OP_ROPE1D, (x, positions), cfg)
+        attrs = Rope1DAttrs(base_frequency, scale_factor, rope_proportion)
+        return self._emit(AionOp.AION_OP_ROPE1D, (x, positions), attrs)
 
     def concat(self, values: Sequence[Value], axis: int) -> Value:
-        return self._emit(AionOp.AION_OP_CONCAT, tuple(values), lambda attr: setattr(attr.concat, "axis", int(axis)))
+        return self._emit(
+            AionOp.AION_OP_CONCAT, tuple(values), AxisAttrs(axis)
+        )
 
-    def _resolve_view_dims(self, dims: Sequence[Union[int, str]]):
+    def _resolve_view_dims(
+        self, dims: Sequence[Union[int, str]]
+    ) -> ViewDims:
         """Resolve a view-op dim list (ints and dim-symbol names) to a concrete
         placeholder `size_t[]` plus an optional `char*[]` of per-axis symbol names
         (NULL where constant). Returns (concrete_cdata, symbols_cdata_or_NULL,
         keepalive) — the keepalive holds the individual C strings alive."""
         concrete: list[int] = []
         names: list[Optional[str]] = []
-        any_sym = False
         for d in dims:
             if isinstance(d, str):
                 if d not in self._symbol_placeholders:
@@ -397,56 +447,34 @@ class Builder:
                         f"input(..., dynamic={{axis: {d!r}}})")
                 concrete.append(int(self._symbol_placeholders[d]))
                 names.append(d)
-                any_sym = True
             else:
                 concrete.append(int(d))
                 names.append(None)
-        c_concrete = ffi.new("size_t[]", concrete)
-        if not any_sym:
-            return c_concrete, ffi.NULL, [c_concrete]
-        keep: list[Any] = [c_concrete]
-        ptrs = []
-        for nm in names:
-            if nm is None:
-                ptrs.append(ffi.NULL)
-            else:
-                cs = _c_str(nm)
-                keep.append(cs)
-                ptrs.append(cs)
-        c_syms = ffi.new("char*[]", ptrs)
-        keep.append(c_syms)
-        return c_concrete, c_syms, keep
+        return ViewDims(tuple(concrete), tuple(names))
 
     def reshape(self, a: Value, shape: Sequence[Union[int, str]]) -> Value:
-        c_shape, c_syms, _keep = self._resolve_view_dims(shape)
-
-        def cfg(attr):
-            attr.reshape.shape = c_shape
-            attr.reshape.shape_len = len(shape)
-            attr.reshape.shape_symbols = c_syms
-
-        # `_keep` holds the cdata alive across the synchronous _emit call.
-        return self._emit(AionOp.AION_OP_RESHAPE, (a,), cfg)
+        return self._emit(
+            AionOp.AION_OP_RESHAPE,
+            (a,),
+            ReshapeAttrs(self._resolve_view_dims(shape)),
+        )
 
     def transpose2d(self, a: Value) -> Value:
         return self._emit(AionOp.AION_OP_TRANSPOSE2D, (a,))
 
-    def cast(self, a: Value, dtype) -> Value:
+    def cast(self, a: Value, dtype: object) -> Value:
         dt = _as_dtype(dtype)
-        return self._emit(AionOp.AION_OP_CAST, (a,), lambda attr: setattr(attr.cast, "to_dtype", int(dt)))
+        return self._emit(AionOp.AION_OP_CAST, (a,), CastAttrs(dt))
 
     def argmax(self, a: Value, axis: int = -1) -> Value:
-        return self._emit(AionOp.AION_OP_ARGMAX, (a,), lambda attr: setattr(attr.argmax, "axis", int(axis)))
+        return self._emit(AionOp.AION_OP_ARGMAX, (a,), AxisAttrs(axis))
 
     def reduce(self, op: str, a: Value, axis: Optional[int] = None) -> Value:
         r = AionReduceOp.AION_REDUCE_SUM if op == "sum" else AionReduceOp.AION_REDUCE_MEAN
 
-        def cfg(attr):
-            attr.reduce.op = int(r)
-            attr.reduce.axis = int(axis) if axis is not None else 0
-            attr.reduce.has_axis = 1 if axis is not None else 0
-
-        return self._emit(AionOp.AION_OP_REDUCE, (a,), cfg)
+        return self._emit(
+            AionOp.AION_OP_REDUCE, (a,), ReduceAttrs(int(r), axis)
+        )
 
     # --- comparisons (i32 {0,1} output) -----------------------------------
     _COMPARE = {
@@ -466,17 +494,17 @@ class Builder:
     def broadcast_mul(self, a: Value, vec: Value) -> Value:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            lambda attr: setattr(attr.elemwise, "op", int(AionBinaryOp.AION_BINARY_MUL)))
+            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_MUL)))
 
     def broadcast_sub(self, a: Value, vec: Value) -> Value:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            lambda attr: setattr(attr.elemwise, "op", int(AionBinaryOp.AION_BINARY_SUB)))
+            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_SUB)))
 
     def broadcast_div(self, a: Value, vec: Value) -> Value:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            lambda attr: setattr(attr.elemwise, "op", int(AionBinaryOp.AION_BINARY_DIV)))
+            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_DIV)))
 
     # --- convolutions -----------------------------------------------------
     def conv1d(self, x: Value, weight: Value, bias: Optional[Value] = None, *,
@@ -484,15 +512,15 @@ class Builder:
                groups: int = 1, pad_mode: str = "zero") -> Value:
         inputs = (x, weight) if bias is None else (x, weight, bias)
 
-        def cfg(attr):
-            attr.conv1d.stride = int(stride)
-            attr.conv1d.dilation = int(dilation)
-            attr.conv1d.pad_left = int(pad_left)
-            attr.conv1d.pad_right = int(pad_right)
-            attr.conv1d.groups = int(groups)
-            attr.conv1d.pad_mode = int(_PAD_MODES[pad_mode])
-
-        return self._emit(AionOp.AION_OP_CONV1D, inputs, cfg)
+        attrs = Conv1DAttrs(
+            stride,
+            dilation,
+            pad_left,
+            pad_right,
+            groups,
+            int(_PAD_MODES[pad_mode]),
+        )
+        return self._emit(AionOp.AION_OP_CONV1D, inputs, attrs)
 
     def conv2d(self, x: Value, weight: Value, bias: Optional[Value] = None, *,
                stride_h: int = 1, stride_w: int = 1, dilation_h: int = 1, dilation_w: int = 1,
@@ -500,44 +528,42 @@ class Builder:
                groups: int = 1, pad_mode: str = "zero") -> Value:
         inputs = (x, weight) if bias is None else (x, weight, bias)
 
-        def cfg(attr):
-            attr.conv2d.stride_h = int(stride_h)
-            attr.conv2d.stride_w = int(stride_w)
-            attr.conv2d.dilation_h = int(dilation_h)
-            attr.conv2d.dilation_w = int(dilation_w)
-            attr.conv2d.pad_top = int(pad_top)
-            attr.conv2d.pad_bottom = int(pad_bottom)
-            attr.conv2d.pad_left = int(pad_left)
-            attr.conv2d.pad_right = int(pad_right)
-            attr.conv2d.groups = int(groups)
-            attr.conv2d.pad_mode = int(_PAD_MODES[pad_mode])
-
-        return self._emit(AionOp.AION_OP_CONV2D, inputs, cfg)
+        attrs = Conv2DAttrs(
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            groups,
+            int(_PAD_MODES[pad_mode]),
+        )
+        return self._emit(AionOp.AION_OP_CONV2D, inputs, attrs)
 
     # --- signal (FFT) -----------------------------------------------------
     def stft(self, signal: Value, window: Value, *, n_fft: int, hop_length: int,
              center: bool = False) -> Value:
-        def cfg(attr):
-            attr.stft.n_fft = int(n_fft)
-            attr.stft.hop_length = int(hop_length)
-            attr.stft.center = 1 if center else 0
-
-        return self._emit(AionOp.AION_OP_STFT, (signal, window), cfg)
+        return self._emit(
+            AionOp.AION_OP_STFT,
+            (signal, window),
+            StftAttrs(n_fft, hop_length, center),
+        )
 
     def rfft(self, x: Value) -> Value:
         return self._emit(AionOp.AION_OP_RFFT, (x,))
 
     # --- views ------------------------------------------------------------
     def squeeze(self, a: Value, axis: Optional[int] = None) -> Value:
-        def cfg(attr):
-            attr.squeeze.axis = int(axis) if axis is not None else 0
-            attr.squeeze.has_axis = 1 if axis is not None else 0
-
-        return self._emit(AionOp.AION_OP_SQUEEZE, (a,), cfg)
+        return self._emit(
+            AionOp.AION_OP_SQUEEZE, (a,), OptionalAxisAttrs(axis)
+        )
 
     def unsqueeze(self, a: Value, axis: int) -> Value:
-        return self._emit(AionOp.AION_OP_UNSQUEEZE, (a,),
-                          lambda attr: setattr(attr.unsqueeze, "axis", int(axis)))
+        return self._emit(
+            AionOp.AION_OP_UNSQUEEZE, (a,), AxisAttrs(axis)
+        )
 
     def slice(self, a: Value, starts: Sequence[int], lens: Sequence[Union[int, str]]) -> Value:
         """N-D slice (one `start`/`len` per axis). A `len` may be an int (constant)
@@ -545,56 +571,49 @@ class Builder:
         starts_l = [int(s) for s in starts]
         if len(starts_l) != len(lens):
             raise ValueError("slice starts and lens must have equal length")
-        c_starts = ffi.new("size_t[]", starts_l)
-        c_lens, c_syms, _keep = self._resolve_view_dims(lens)
-
-        def cfg(attr):
-            attr.slice.starts = c_starts
-            attr.slice.lens = c_lens
-            attr.slice.len = len(starts_l)
-            attr.slice.len_symbols = c_syms
-
-        # c_starts/c_lens/_keep must outlive the call; kept via locals + closure.
-        return self._emit(AionOp.AION_OP_SLICE, (a,), cfg)
+        attrs = SliceAttrs(
+            tuple(starts_l), self._resolve_view_dims(lens)
+        )
+        return self._emit(AionOp.AION_OP_SLICE, (a,), attrs)
 
     # --- attention --------------------------------------------------------
     def attention(self, q: Value, k: Value, v: Value, *, scale: float, causal: bool = False) -> Value:
-        def cfg(attr):
-            attr.attention.scale = float(scale)
-            attr.attention.causal = 1 if causal else 0
-
-        return self._emit(AionOp.AION_OP_ATTENTION, (q, k, v), cfg)
+        return self._emit(
+            AionOp.AION_OP_ATTENTION,
+            (q, k, v),
+            AttentionAttrs(scale, causal),
+        )
 
     def mha(self, q: Value, k: Value, v: Value, *, scale: float, causal: bool, heads: int) -> Value:
-        def cfg(attr):
-            attr.attention.scale = float(scale)
-            attr.attention.causal = 1 if causal else 0
-            attr.attention.heads = int(heads)
-
-        return self._emit(AionOp.AION_OP_MHA, (q, k, v), cfg)
+        return self._emit(
+            AionOp.AION_OP_MHA,
+            (q, k, v),
+            AttentionAttrs(scale, causal, heads),
+        )
 
     def mha_cached(self, q: Value, k: Value, v: Value, positions: Value, end_index: Value, *,
                    scale: float, causal: bool = True, sliding_window: int = 0,
                    attn_logits_soft_cap: float = 0.0) -> Value:
-        def cfg(attr):
-            attr.mha_cached.scale = float(scale)
-            attr.mha_cached.causal = 1 if causal else 0
-            attr.mha_cached.sliding_window = int(sliding_window)
-            attr.mha_cached.attn_logits_soft_cap = float(attn_logits_soft_cap)
-
-        return self._emit(AionOp.AION_OP_MHA_CACHED, (q, k, v, positions, end_index), cfg)
+        attrs = MhaCachedAttrs(
+            scale, causal, sliding_window, attn_logits_soft_cap
+        )
+        return self._emit(
+            AionOp.AION_OP_MHA_CACHED,
+            (q, k, v, positions, end_index),
+            attrs,
+        )
 
     def relpos_mha(self, q: Value, k: Value, v: Value, pos_emb: Value, bu: Value, bv: Value,
                    mask: Optional[Value] = None, *, scale: float, heads: int) -> Value:
-        inputs: List[Value] = [q, k, v, pos_emb, bu, bv]
+        inputs: list[Value] = [q, k, v, pos_emb, bu, bv]
         if mask is not None:
             inputs.append(mask)
 
-        def cfg(attr):
-            attr.relpos_mha.scale = float(scale)
-            attr.relpos_mha.heads = int(heads)
-
-        return self._emit(AionOp.AION_OP_RELPOS_MHA, inputs, cfg)
+        return self._emit(
+            AionOp.AION_OP_RELPOS_MHA,
+            inputs,
+            RelposMhaAttrs(scale, heads),
+        )
 
     # --- recurrent / indexed / misc ---------------------------------------
     def lstm_cell(self, x: Value, h: Value, c: Value, w_ih: Value, w_hh: Value,
@@ -602,7 +621,7 @@ class Builder:
         """One LSTM step -> `[batch, 2*hidden]` = (h_t | c_t). Biases are both-or-neither."""
         if (b_ih is None) != (b_hh is None):
             raise ValueError("lstm_cell requires both b_ih and b_hh or neither")
-        inputs: List[Value] = [x, h, c, w_ih, w_hh]
+        inputs: list[Value] = [x, h, c, w_ih, w_hh]
         if b_ih is not None and b_hh is not None:
             inputs.extend((b_ih, b_hh))
         return self._emit(AionOp.AION_OP_LSTM_CELL, inputs)
@@ -621,8 +640,12 @@ class Builder:
         """Alias a graph input to an output (io-aliased recurrent state write-back).
 
         The output must already be marked (see `mark_output`)."""
-        st = lib.aion_builder_add_output_alias(self._b, input_value.id, output_value.id)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_add_output_alias")
+        builder_add_output_alias(
+            self._ctx_owner.ptr,
+            self.ptr,
+            input_value.id,
+            output_value.id,
+        )
 
     def add_input_role(self, value: Value, kind: AionInputRoleKind, *,
                        axis: Optional[int] = None, capacity_symbol: Optional[str] = None,
@@ -631,51 +654,60 @@ class Builder:
 
         `capacity_symbol` names a dim symbol declared on `value` (via
         `input(dynamic={axis: name})`) whose size the runtime supplies at load."""
-        cap = _c_str(capacity_symbol) if capacity_symbol is not None else ffi.NULL
-        st = lib.aion_builder_add_input_role(
-            self._b, value.id, int(kind),
-            int(axis) if axis is not None else 0, 1 if axis is not None else 0,
-            cap, 1 if zero_init else 0, 1 if growable else 0, 1 if ring else 0)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_add_input_role")
+        builder_add_input_role(
+            self._ctx_owner.ptr,
+            self.ptr,
+            value.id,
+            int(kind),
+            axis=axis,
+            capacity_symbol=capacity_symbol,
+            zero_init=zero_init,
+            growable=growable,
+            ring=ring,
+        )
 
     # --- control flow (regions) -------------------------------------------
     def begin_region(self) -> None:
         """Start a region (an `if` branch body or `loop` body). No nesting."""
-        st = lib.aion_builder_begin_region(self._b)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_begin_region")
+        builder_begin_region(self._ctx_owner.ptr, self.ptr)
 
-    def end_region(self, outputs: Sequence[Value]) -> int:
+    def end_region(self, outputs: Sequence[Value]) -> RegionId:
         """Close the active region; returns a region id for `if_`/`loop`."""
-        outs = list(outputs)
-        ids = ffi.new("AionValueId[]", [int(v.id) for v in outs])
-        out_region = ffi.new("AionRegionId*")
-        st = lib.aion_builder_end_region(self._b, ids, len(outs), out_region)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_end_region")
-        return int(out_region[0])
+        return builder_end_region(
+            self._ctx_owner.ptr,
+            self.ptr,
+            [value.id for value in outputs],
+        )
 
-    def if_(self, cond: Value, then_region: int, else_region: int) -> Value:
+    def if_(
+        self, cond: Value, then_region: RegionId, else_region: RegionId
+    ) -> Value:
         """Single-output conditional over an i32 `[1]` predicate `cond`."""
-        out = ffi.new("AionValueId*")
-        st = lib.aion_builder_if(self._b, cond.id, int(then_region), int(else_region), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_if")
-        return Value(self, out[0])
+        value_id = builder_if(
+            self._ctx_owner.ptr,
+            self.ptr,
+            cond.id,
+            then_region,
+            else_region,
+        )
+        return Value(self, value_id)
 
     @overload
-    def loop(self, carried: Value, body_region: int, trip: int, *,
+    def loop(self, carried: Value, body_region: RegionId, trip: int, *,
              cond_carry: Optional[int] = None, check_before: bool = True) -> Value: ...
     @overload
-    def loop(self, carried: Sequence[Value], body_region: int, trip: int, *,
-             cond_carry: Optional[int] = None, check_before: bool = True) -> List[Value]: ...
+    def loop(self, carried: Sequence[Value], body_region: RegionId, trip: int, *,
+             cond_carry: Optional[int] = None, check_before: bool = True) -> list[Value]: ...
 
     def loop(
         self,
         carried: Union[Value, Sequence[Value]],
-        body_region: int,
+        body_region: RegionId,
         trip: int,
         *,
         cond_carry: Optional[int] = None,
         check_before: bool = True,
-    ) -> Union[Value, List[Value]]:
+    ) -> Union[Value, list[Value]]:
         """Run `body_region` up to `trip` times, threading the carried value(s).
 
         Pass a single `Value` (returns a `Value`) or a sequence for a multi-carry
@@ -684,42 +716,39 @@ class Builder:
         """
         single = isinstance(carried, Value)
         inits = [carried] if single else list(carried)
-        n = len(inits)
-        ids = ffi.new("AionValueId[]", [int(v.id) for v in inits])
-        outs = ffi.new("AionValueId[]", n)
-        st = lib.aion_builder_loop(
-            self._b,
-            ids,
-            n,
-            int(body_region),
-            int(trip),
-            int(cond_carry) if cond_carry is not None else 0,
-            1 if cond_carry is not None else 0,
-            1 if check_before else 0,
-            outs,
+        output_ids = builder_loop(
+            self._ctx_owner.ptr,
+            self.ptr,
+            [value.id for value in inits],
+            body_region,
+            trip,
+            cond_carry=cond_carry,
+            check_before=check_before,
         )
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_loop")
-        values = [Value(self, outs[i]) for i in range(n)]
+        values = [Value(self, value_id) for value_id in output_ids]
         return values[0] if single else values
 
     # --- declarations & terminals -----------------------------------------
     def mark_output(self, value: Value, name: str) -> None:
-        st = lib.aion_builder_mark_output(self._b, value.id, _c_str(name))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_mark_output")
+        builder_mark_output(
+            self._ctx_owner.ptr, self.ptr, value.id, name
+        )
 
     def add_metadata(self, key: str, value: str) -> None:
-        st = lib.aion_builder_add_metadata(self._b, _c_str(key), _c_str(value))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_add_metadata")
+        builder_add_metadata(self._ctx_owner.ptr, self.ptr, key, value)
 
     def _mark_outputs(self, outputs: OutputsLike) -> None:
+        # A `{name: value}` mapping names outputs explicitly; otherwise a value's
+        # own `.rename(...)` (its `_name`) is the default, falling back to the
+        # positional `output{i}`.
         if isinstance(outputs, Value):
-            self.mark_output(outputs, "output0")
+            self.mark_output(outputs, getattr(outputs, "_name", None) or "output0")
         elif isinstance(outputs, Mapping):
             for name, v in outputs.items():
                 self.mark_output(v, str(name))
         else:
             for i, v in enumerate(outputs):
-                self.mark_output(v, f"output{i}")
+                self.mark_output(v, getattr(v, "_name", None) or f"output{i}")
 
     def compile(self, outputs: Optional[OutputsLike] = None, *, device: DeviceLike = None) -> "LoadedModel":
         """Compile to an in-process `LoadedModel` (concrete shapes only)."""
@@ -728,17 +757,16 @@ class Builder:
         if outputs is not None:
             self._mark_outputs(outputs)
         kind, index = _normalize_device(device)
-        out_m = ffi.new("AionLoadedModel**")
-        st = lib.aion_builder_compile(self._b, int(kind), int(index), out_m)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_compile")
-        return LoadedModel(self._ctx_owner, out_m[0])
+        handle = compile_builder(
+            self._ctx_owner.ptr, self.ptr, int(kind), int(index)
+        )
+        return LoadedModel(self._ctx_owner, handle)
 
     def export(self, path: str, outputs: Optional[OutputsLike] = None) -> None:
         """Serialize the graph to a `.aion` file at `path`."""
         if outputs is not None:
             self._mark_outputs(outputs)
-        st = lib.aion_builder_export_path(self._b, _c_str(str(path)))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_builder_export_path")
+        export_builder(self._ctx_owner.ptr, self.ptr, str(path))
 
 
 def _resolve_dynamic(dynamic: DynamicAxes, rank: int, b: "Builder") -> list[tuple[int, str]]:
@@ -758,15 +786,11 @@ def _resolve_dynamic(dynamic: DynamicAxes, rank: int, b: "Builder") -> list[tupl
     return out
 
 
-def _c_str(s: str) -> Any:
-    return ffi.new("char[]", s.encode("utf-8"))
-
-
 def _infer_shape(data: WeightData) -> tuple[int, ...]:
     try:
-        import numpy as np  # type: ignore
+        import numpy as np
     except ImportError:
-        np = None  # type: ignore
+        np = None
     if np is not None and isinstance(data, np.ndarray):
         return tuple(int(x) for x in data.shape)
     from .tensor import _flatten_nested

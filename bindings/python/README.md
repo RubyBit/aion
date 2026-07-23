@@ -60,16 +60,16 @@ NumPy is an **optional runtime** dependency (it ships in the default `dev` group
 `uv sync` already installs it). For a runtime-only install that still wants NumPy
 interop, use the `numpy` extra: `uv pip install "aion[numpy]"`.
 
-With NumPy present you can move data between Aion tensors and NumPy efficiently (currently f32 only):
-
-- `Tensor.from_numpy(ctx, array)`
-- `tensor.numpy()`
-- `tensor.write_from_numpy(array)`
-
-You can also use the simple constructor style (PyTorch-like):
+With NumPy present you can move data between Aion tensors and NumPy efficiently:
 
 - `t = aion.Tensor([1.0, 2.0, 3.0])`
 - `t2 = aion.Tensor([[1.0, 2.0], [3.0, 4.0]])`
+- `t3 = aion.Tensor(numpy_array, ctx=ctx)`
+- `numpy_array = t.numpy()`
+- `t.copy_from(numpy_array)`
+
+Without NumPy, use `tensor.tolist()` for nested Python data or
+`tensor.item()` for a one-element tensor.
 
 Tensor helpers for common initialization/update patterns:
 
@@ -91,6 +91,51 @@ If you pass `thread_count`, it creates a dedicated context for that model.
 
 `LoadedModel.run_numpy(...)` is a convenience wrapper that accepts Tensor *or* array-like inputs and
 returns NumPy arrays for outputs.
+
+### Building models (Tensor-first)
+
+`aion.Tensor` — created with `aion.tensor(...)` — is the one high-level value you
+use. It is an **immutable lazy value**: operators (`@`, `+`, `-`, `*`, `/`,
+`.relu()`, `.softmax()`, …) build a small graph, and `.numpy()` / `.realize()`
+compiles and runs it. There are no builder lifecycles to manage — tensors
+combine freely, materialize any time, and re-materialize at will.
+
+Compute on concrete data reads like NumPy — no explicit `Builder` needed:
+
+```python
+import aion, numpy as np
+
+a = aion.tensor(np.random.randn(2, 4).astype("f4"))   # concrete
+w = aion.tensor(np.random.randn(4, 3).astype("f4"))   # concrete
+y = (a @ w).relu()                                     # lazy
+print(y.shape)                                         # (2, 3) — inferred, no run
+print(y.numpy())                                       # compiles + runs
+```
+
+`aion.realize([y1, y2])` materializes several results in a single compile + run
+(a shared subgraph is emitted once); it is an efficiency tool, never required.
+
+Author a reusable model from symbolic **free inputs**, then compile or export it:
+
+```python
+x = aion.tensor(shape=(1, 4), name="x")               # symbolic free input
+w = aion.tensor(np.random.randn(4, 3).astype("f4"))
+model = aion.compile({"y": (x @ w).relu()}, inputs=[x])
+out = model.run_numpy({"x": np.ones((1, 4), "f4")})["y"]
+
+aion.export({"y": x @ w}, "mlp.aion", inputs=[x])      # or serialize
+```
+
+`dtype` accepts a single vocabulary everywhere — `"f32"`, `"i32"`, `aion.float32`,
+a NumPy dtype, or the `AionDType` enum — and `aion.tensor(np.array(..., np.int32))`
+infers `i32`. For the higher-level PyTorch-style module API, see `aion.nn` with
+`aion.compile(module, aion.spec(...))`.
+
+**Low-level escape hatch.** `aion.Builder` is the imperative graph-construction
+API (control flow, in-place ops, KV-cache roles/aliases) used by the model
+converters; its ops return `aion.Value`, a builder-bound handle. The high-level
+`Tensor` lowers to it at compile time. Reach for `Builder`/`Value` only when you
+need that low-level control; otherwise `Tensor` is the front door.
 
 ### GPU support (optional)
 
@@ -127,7 +172,7 @@ ctx = aion.Context.gpu()
 t = aion.Tensor([1.0, 2.0, 3.0], ctx=ctx, device="gpu")
 assert t.device() == "gpu:0"
 t.to("cpu")                     # migrate back before host read/write
-print(t.read_f32())
+print(t.tolist())
 
 # Models: load onto the GPU. Keep feeding CPU input tensors — the runtime
 # migrates them on run() and flushes outputs back to host for reading.
@@ -135,7 +180,7 @@ m = aion.LoadedModel.load(ctx, "model.aion", device="gpu")
 ```
 
 Notes:
-- `tensor.to("gpu")` frees the host copy; host `read_*`/`write_*` then raise
+- `tensor.to("gpu")` frees the host copy; host conversion/mutation then raises
   until you `to("cpu")`. Do **not** bind a device-resident tensor as a model
   input — bind CPU tensors and let the model's runtime migrate them.
 - `aion.load_model(path, device="gpu")` creates a dedicated single-GPU context.

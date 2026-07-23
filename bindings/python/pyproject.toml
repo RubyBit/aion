@@ -38,6 +38,7 @@ gpu = []
 # numpy: the test fixtures build synthetic .aion packages via the C-ABI Builder.
 test = ["pytest>=9", "numpy>=1.26"]
 dev = [
+  "pyright>=1.1",
   "tokenizers>=0.23.1",
   "pytest>=9",
   "numpy>=1.26",
@@ -72,3 +73,12 @@ where = ["src"]
 # Native artifact(s) and typing/stub metadata. `*.dll` covers the wgpu runtime
 # shipped beside the extension in GPU builds.
 aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "*.dll", "_ffi/*.h"]
+
+[tool.pyright]
+include = ["src/aion", "type_tests"]
+exclude = ["src/aion/_ffi/build.py"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+strict = ["src/aion/_ffi", "type_tests"]
+reportMissingTypeStubs = false
+reportUnnecessaryTypeIgnoreComment = "warning"

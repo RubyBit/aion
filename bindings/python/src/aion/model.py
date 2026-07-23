@@ -3,20 +3,36 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional, Union, overload
+from types import TracebackType
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, overload
 
 from .device import DeviceLike, _is_cpu, _normalize_device
-from .errors import raise_for_status
-from ._ffi import ffi, lib
+from ._ffi.handles import ModelHandle
+from ._ffi.runtime import (
+    bind_model_input,
+    destroy_model,
+    load_model,
+    model_count,
+    model_dtype,
+    model_name,
+    model_output_is_state,
+    model_output_tensor,
+    model_position,
+    model_rank,
+    reset_model_state,
+    run_model,
+    set_model_position,
+    set_state_input_policy,
+)
 from .enums import AionDType
-from .types import ArrayLike, NDArray
+from .types import NDArray
 
 if TYPE_CHECKING:
     from .context import Context
     from .tensor import Tensor
 
 # What model I/O accepts: a numpy array (or array-like) or an existing Tensor.
-InputValue = Union["Tensor", ArrayLike]
+InputValue = object
 
 
 @dataclass(frozen=True)
@@ -26,38 +42,21 @@ class TensorSpec:
     rank: int
 
 
-def _get_indexed_name(ctx_ptr, fn, m_ptr, index: int) -> str:
-    out_len = ffi.new("size_t*")
-    st = fn(m_ptr, index, ffi.NULL, 0, out_len)
-    # Even if this fails, propagate via raise_for_status for a useful message.
-    raise_for_status(st, ctx_ptr, what="get_name")
-
-    n = int(out_len[0])
-    if n <= 0:
-        return ""
-    buf = ffi.new("char[]", n + 1)
-    st = fn(m_ptr, index, buf, n + 1, out_len)
-    raise_for_status(st, ctx_ptr, what="get_name")
-    raw: bytes = ffi.string(buf)
-    return raw.decode("utf-8", errors="replace")
-
-
 class LoadedModel:
     """Owns an `AionLoadedModel*` handle; keeps the owning Context alive."""
 
-    def __init__(self, ctx: "Context", ptr: Any) -> None:
+    def __init__(self, ctx: "Context", ptr: ModelHandle) -> None:
         # Strong ref: model must keep its Context alive.
         self._ctx_owner = ctx
         self._ctx_owner._register_child(self)
-        self._m = ptr
+        self._m: ModelHandle | None = ptr
         self._closed = False
-        self._name_cache = {}
         # A model produced by tracing/Builder.compile shares (does not copy) the
         # builder's weight tensors, so the builder must outlive the model. When
         # set, it is closed together with the model.
         self._authoring_builder = None
 
-    def _attach_authoring_builder(self, builder) -> None:
+    def _attach_authoring_builder(self, builder: object) -> None:
         # A traced/compiled model shares the builder's weight tensor *handles*, but
         # the underlying storage is Context-owned and freed only at context
         # destroy, so child teardown order is safe. The builder stays a context
@@ -66,17 +65,13 @@ class LoadedModel:
         self._authoring_builder = builder
 
     @property
-    def ptr(self):
-        return self._m
+    def ptr(self) -> ModelHandle:
+        return self._require_handle()
 
-    def _c_name(self, name: str):
-        cached = self._name_cache.get(name)
-        if cached is not None:
-            return cached
-        b = name.encode("utf-8")
-        c_name = ffi.new("char[]", b)
-        self._name_cache[name] = c_name
-        return c_name
+    def _require_handle(self) -> ModelHandle:
+        if self._m is None:
+            raise RuntimeError("LoadedModel is closed")
+        return self._m
 
     @property
     def context(self) -> "Context":
@@ -87,12 +82,14 @@ class LoadedModel:
     def close(self) -> None:
         if self._closed:
             return
-        lib.aion_loaded_model_destroy(self._m)
+        handle = self._m
+        if handle is not None:
+            destroy_model(handle)
         try:
             self._ctx_owner._unregister_child(self)
         except Exception:
             pass
-        self._m = ffi.NULL
+        self._m = None
         self._closed = True
         # Drop the strong ref to the traced builder. Do NOT close it here: it is a
         # context child torn down in the context's controlled sequence, and closing
@@ -103,23 +100,30 @@ class LoadedModel:
     def __enter__(self) -> "LoadedModel":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
-    def __del__(self):  # pragma: no cover
+    def __del__(self) -> None:  # pragma: no cover
         # Best-effort only; the attached builder (if any) is a context child and
         # is torn down in the context's controlled sequence — don't close it here
         # (finalizer order vs the context is unspecified).
         try:
             if not getattr(self, "_closed", True):
-                lib.aion_loaded_model_destroy(getattr(self, "_m", ffi.NULL))
+                handle = getattr(self, "_m", None)
+                if handle is not None:
+                    destroy_model(handle)
         except Exception:
             pass
 
     @classmethod
     def load(
         cls,
-        ctx,
+        ctx: "Context",
         path: str,
         *,
         device: DeviceLike = None,
@@ -151,93 +155,71 @@ class LoadedModel:
         if not isinstance(path, str):
             raise TypeError("path must be a str")
 
-        out_m = ffi.new("AionLoadedModel**")
-        # The Zig side expects NUL-terminated C strings.
-        b = path.encode("utf-8")
-        c_path = ffi.new("char[]", b)
         absolute = os.path.isabs(path)
-
-        # cffi structs are dynamically fielded; Any silences per-field access checks.
-        opts: Any = ffi.new("AionLoadModelOptions*")  # zero-initialized
-        opts.auto_init_inputs = 1
-        opts.auto_positions = 1 if auto_positions else 0
+        device_kind: int | None = None
+        device_index = 0
         if device is not None and not _is_cpu(device):
-            kind, index = _normalize_device(device)
-            opts.device_kind = int(kind)
-            opts.device_index = int(index)
-        if cache_capacity is not None and int(cache_capacity) > 0:
-            opts.cache_capacity_tokens = int(cache_capacity)
-            if growable:
-                opts.cache_growable = 1
-                opts.cache_initial_capacity_tokens = int(initial_cache_capacity)
+            device_kind, device_index = _normalize_device(device)
 
-        if absolute:
-            st = lib.aion_loaded_model_load_path_absolute(ctx.ptr, c_path, opts, out_m)
-            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path_absolute")
-        else:
-            st = lib.aion_loaded_model_load_path(ctx.ptr, c_path, opts, out_m)
-            raise_for_status(st, ctx.ptr, what="aion_loaded_model_load_path")
-
-        return cls(ctx, out_m[0])
+        handle = load_model(
+            ctx.ptr,
+            path,
+            absolute=absolute,
+            device_kind=device_kind,
+            device_index=device_index,
+            cache_capacity=cache_capacity,
+            growable=growable,
+            initial_cache_capacity=initial_cache_capacity,
+            auto_positions=auto_positions,
+        )
+        return cls(ctx, handle)
 
     def input_count(self) -> int:
-        return int(lib.aion_loaded_model_input_count(self._m))
+        return model_count(self._require_handle(), "input")
 
     def output_count(self) -> int:
-        return int(lib.aion_loaded_model_output_count(self._m))
+        return model_count(self._require_handle(), "output")
 
-    def input_names(self) -> List[str]:
+    def input_names(self) -> list[str]:
         n = self.input_count()
-        return [_get_indexed_name(self._ctx_owner.ptr, lib.aion_loaded_model_input_name, self._m, i) for i in range(n)]
+        return [model_name(self._ctx_owner.ptr, self._require_handle(), "input", i) for i in range(n)]
 
-    def output_names(self) -> List[str]:
+    def output_names(self) -> list[str]:
         n = self.output_count()
-        return [_get_indexed_name(self._ctx_owner.ptr, lib.aion_loaded_model_output_name, self._m, i) for i in range(n)]
+        return [model_name(self._ctx_owner.ptr, self._require_handle(), "output", i) for i in range(n)]
 
-    def input_specs(self) -> List[TensorSpec]:
+    def input_specs(self) -> list[TensorSpec]:
         names = self.input_names()
-        out: List[TensorSpec] = []
+        out: list[TensorSpec] = []
         for i, name in enumerate(names):
             out.append(TensorSpec(name=name, dtype=self.input_dtype(i), rank=self.input_rank(i)))
         return out
 
-    def output_specs(self) -> List[TensorSpec]:
+    def output_specs(self) -> list[TensorSpec]:
         names = self.output_names()
-        out: List[TensorSpec] = []
+        out: list[TensorSpec] = []
         for i, name in enumerate(names):
             out.append(TensorSpec(name=name, dtype=self.output_dtype(i), rank=self.output_rank(i)))
         return out
 
     def input_dtype(self, index: int) -> AionDType:
-        out = ffi.new("AionDType*")
-        st = lib.aion_loaded_model_input_dtype(self._m, int(index), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_input_dtype")
-        return AionDType(int(out[0]))
+        return model_dtype(self._ctx_owner.ptr, self._require_handle(), "input", index)
 
     def input_rank(self, index: int) -> int:
-        out = ffi.new("size_t*")
-        st = lib.aion_loaded_model_input_rank(self._m, int(index), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_input_rank")
-        return int(out[0])
+        return model_rank(self._ctx_owner.ptr, self._require_handle(), "input", index)
 
     def output_dtype(self, index: int) -> AionDType:
-        out = ffi.new("AionDType*")
-        st = lib.aion_loaded_model_output_dtype(self._m, int(index), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_dtype")
-        return AionDType(int(out[0]))
+        return model_dtype(self._ctx_owner.ptr, self._require_handle(), "output", index)
 
     def output_rank(self, index: int) -> int:
-        out = ffi.new("size_t*")
-        st = lib.aion_loaded_model_output_rank(self._m, int(index), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_rank")
-        return int(out[0])
+        return model_rank(self._ctx_owner.ptr, self._require_handle(), "output", index)
 
     def bind_input(self, name: str, tensor: "Tensor") -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a str")
-        c_name = self._c_name(name)
-        st = lib.aion_loaded_model_bind_input(self._m, c_name, tensor.ptr)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_bind_input")
+        bind_model_input(
+            self._ctx_owner.ptr, self._require_handle(), name, tensor.ptr
+        )
 
     def set_state_input_growable(
         self,
@@ -257,43 +239,46 @@ class LoadedModel:
         """
         if not isinstance(name, str):
             raise TypeError("name must be a str")
-        c_name = self._c_name(name)
-        st = lib.aion_loaded_model_set_state_input_policy(
-            self._m, c_name, 1,
-            int(initial_capacity), int(growth_numerator), int(growth_denominator), int(max_capacity), 0,
+        set_state_input_policy(
+            self._ctx_owner.ptr,
+            self._require_handle(),
+            name,
+            kind="growable",
+            initial_capacity=initial_capacity,
+            max_capacity=max_capacity,
+            growth_numerator=growth_numerator,
+            growth_denominator=growth_denominator,
         )
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_state_input_policy")
 
     def set_state_input_ring(self, name: str, *, window: int) -> None:
         """Make an io-aliased recurrent-state input a fixed ring buffer of `window` tokens."""
         if not isinstance(name, str):
             raise TypeError("name must be a str")
-        c_name = self._c_name(name)
-        st = lib.aion_loaded_model_set_state_input_policy(self._m, c_name, 2, 0, 0, 0, 0, int(window))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_state_input_policy")
+        set_state_input_policy(
+            self._ctx_owner.ptr,
+            self._require_handle(),
+            name,
+            kind="ring",
+            window=window,
+        )
 
     def output_is_state(self, index: int) -> bool:
         """Whether output `index` is io-aliased recurrent state (a `next_*` carry
         the runtime already writes back into its input slot every run)."""
-        out = ffi.new("uint8_t*")
-        st = lib.aion_loaded_model_output_is_state(self._m, int(index), out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_is_state")
-        return bool(out[0])
+        return model_output_is_state(
+            self._ctx_owner.ptr, self._require_handle(), index
+        )
 
     @property
     def position(self) -> int:
         """Tokens consumed so far by position auto-management (0 when disabled)."""
-        out = ffi.new("uint64_t*")
-        st = lib.aion_loaded_model_position(self._m, out)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_position")
-        return int(out[0])
+        return model_position(self._ctx_owner.ptr, self._require_handle())
 
     def set_position(self, tokens: int) -> None:
         """Overwrite the auto-tracked position (session restore / rollback)."""
-        st = lib.aion_loaded_model_set_position(self._m, int(tokens))
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_set_position")
+        set_model_position(self._ctx_owner.ptr, self._require_handle(), tokens)
 
-    def _default_output_names(self) -> List[str]:
+    def _default_output_names(self) -> list[str]:
         """All outputs except io-aliased state carries (KV caches etc.), which the
         runtime already persists — copying them out per run is pure overhead.
         Falls back to all outputs when every output is a state carry."""
@@ -350,7 +335,7 @@ class LoadedModel:
                 if isinstance(v, Tensor):
                     t = v
                 else:
-                    t = Tensor.from_numpy(self._ctx_owner, v)
+                    t = Tensor(v, ctx=self._ctx_owner)
                     temps.append(t)
                 self.bind_input(name, t)
 
@@ -391,8 +376,7 @@ class LoadedModel:
           `{name: numpy}` dict (sugar over `run_numpy`).
         """
         if inputs is None:
-            st = lib.aion_loaded_model_run(self._m)
-            raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_run")
+            run_model(self._ctx_owner.ptr, self._require_handle())
             return None
         return self.run_numpy(inputs, outputs=outputs)
 
@@ -402,16 +386,14 @@ class LoadedModel:
         Call this between independent sequences (e.g. utterances) instead of
         reloading the model. No-op before the first ``run()``.
         """
-        st = lib.aion_loaded_model_reset_state(self._m)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_reset_state")
+        reset_model_state(self._ctx_owner.ptr, self._require_handle())
 
     def output_tensor(self, name: str) -> "Tensor":
         if not isinstance(name, str):
             raise TypeError("name must be a str")
-        c_name = self._c_name(name)
-        out_t = ffi.new("AionTensor**")
-        st = lib.aion_loaded_model_output_tensor(self._m, c_name, out_t)
-        raise_for_status(st, self._ctx_owner.ptr, what="aion_loaded_model_output_tensor")
         from .tensor import Tensor
 
-        return Tensor._from_handle(self._ctx_owner, out_t[0])
+        handle = model_output_tensor(
+            self._ctx_owner.ptr, self._require_handle(), name
+        )
+        return Tensor._from_handle(self._ctx_owner, handle)

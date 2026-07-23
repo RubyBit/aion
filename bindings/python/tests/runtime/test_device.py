@@ -61,7 +61,7 @@ def test_to_gpu_without_registered_gpu_raises():
                 t.to("gpu")
             # Tensor stays host-resident and readable.
             assert t.device() == "cpu"
-            assert t.read_f32() == pytest.approx([1.0, 2.0])
+            assert t.tolist() == pytest.approx([1.0, 2.0])
 
 
 def test_to_cpu_is_idempotent_noop():
@@ -82,11 +82,11 @@ def test_tensor_to_roundtrip_gpu():
             assert t.device() == "gpu:0"
             # Host reads are blocked while device-resident.
             with pytest.raises(aion.AionError):
-                t.read_f32()
+                t.tolist()
             # Migrate back; bytes must survive the H2D + D2H round-trip.
             t.to("cpu")
             assert t.device() == "cpu"
-            assert t.read_f32() == pytest.approx(vals)
+            assert t.tolist() == pytest.approx(vals)
 
 
 def test_tensor_construct_on_gpu():
@@ -95,7 +95,7 @@ def test_tensor_construct_on_gpu():
         with aion.Tensor([1.0, 2.0, 3.0, 4.0], ctx=ctx, device="gpu") as t:
             assert t.device() == "gpu:0"
             t.to("cpu")
-            assert t.read_f32() == pytest.approx([1.0, 2.0, 3.0, 4.0])
+            assert t.tolist() == pytest.approx([1.0, 2.0, 3.0, 4.0])
 
 
 def test_model_load_on_gpu_matches_cpu_introspection(tiny_model_path):

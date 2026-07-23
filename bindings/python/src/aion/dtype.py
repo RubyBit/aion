@@ -9,7 +9,10 @@ members re-exported under short names, so they work anywhere an `AionDType` does
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from .enums import AionDType
 
@@ -62,19 +65,19 @@ _NP_TO_ENUM: dict[str, AionDType] = {
 }
 
 
-def _np_name(x) -> Optional[str]:
+def _np_name(x: object) -> Optional[str]:
     """`np.dtype(x).name` if numpy is present and `x` names a dtype, else None."""
     try:
-        import numpy as np  # type: ignore
+        import numpy as np
     except ImportError:
         return None
     try:
-        return np.dtype(x).name
+        return np.dtype(cast(Any, x)).name
     except TypeError:
         return None
 
 
-def normalize_dtype(x) -> AionDType:
+def normalize_dtype(x: object) -> AionDType:
     """Map an `AionDType` | dtype string | numpy dtype | int to `AionDType`."""
     if isinstance(x, AionDType):
         return x
@@ -96,22 +99,22 @@ def normalize_dtype(x) -> AionDType:
     raise ValueError(f"cannot interpret {x!r} as a dtype")
 
 
-def info(dtype) -> DTypeInfo:
+def info(dtype: object) -> DTypeInfo:
     """Metadata record for a dtype (accepts any `normalize_dtype` input)."""
     return _TABLE[normalize_dtype(dtype)]
 
 
-def numpy_dtype(dtype):
+def numpy_dtype(dtype: object) -> "np.dtype[Any]":
     """numpy dtype for a scalar Aion dtype; raises for quantized dtypes."""
     di = info(dtype)
     if di.np_name is None:
         raise NotImplementedError(f"{di.enum.name} has no host numpy representation")
-    import numpy as np  # type: ignore
+    import numpy as np
 
     return np.dtype(di.np_name)
 
 
-def c_elem(dtype) -> str:
+def c_elem(dtype: object) -> str:
     """cffi element type name for a scalar Aion dtype; raises for quantized."""
     di = info(dtype)
     if di.c_elem is None:
@@ -119,7 +122,7 @@ def c_elem(dtype) -> str:
     return di.c_elem
 
 
-def is_quantized(dtype) -> bool:
+def is_quantized(dtype: object) -> bool:
     return info(dtype).is_quantized
 
 

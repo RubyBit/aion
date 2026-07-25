@@ -1,0 +1,123 @@
+# Build and publish the `aion` and `aion-wgpu` wheels to PyPI via Trusted
+# Publishing (OIDC — no stored tokens). See bindings/python/README.md,
+# "Releasing", for the exact release steps and the one-time PyPI setup.
+#
+#   push tag v*        -> build everything, publish to PyPI
+#   workflow_dispatch  -> choose testpypi (default) or pypi
+#
+# Two distributions are published, both built natively on each host (no
+# cross-compiling):
+#   - aion        : the runtime wheels (per OS/arch/Python), GPU seam included.
+#   - aion-wgpu   : the wgpu-native runtime, one py3-none-<platform> wheel per
+#                   host. `aion[gpu]` pulls it in.
+# Both must have a Trusted Publisher registered on PyPI for this repo, this
+# workflow file, and the selected environment (`pypi` / `testpypi`).
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Index to publish to"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Keep in sync with .github/workflows/ci.yml and build.zig.zon's dev pin.
+  ZIG_VERSION: 0.16.0-dev.2984+cb7d2b056
+
+jobs:
+  build-aion:
+    name: aion wheels · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # Linux wheels build inside a manylinux container that sees the host FS at
+      # /host; expose the *resolved* host zig path (a symlink's target would be an
+      # absolute path that breaks inside the container) so the build can use it.
+      - name: Export host zig path (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: echo "HOST_ZIG=$(readlink -f "$(command -v zig)")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pin: bump to the latest cibuildwheel release as needed (config keys used
+      # here — build/skip/environment/environment-pass/test-command — are stable).
+      - uses: pypa/cibuildwheel@v2.23.3
+        with:
+          package-dir: bindings/python
+        env:
+          CIBW_BUILD_VERBOSITY: "1"
+
+      # The GPU-runtime companion, built natively for this host and dropped into
+      # the same wheelhouse. Skipped on linux/aarch64 (no wgpu-native prebuilt).
+      - name: Build aion-wgpu companion wheel
+        if: matrix.os != 'ubuntu-24.04-arm'
+        shell: bash
+        run: |
+          python -m pip install --upgrade build
+          if [ "$RUNNER_OS" = "Linux" ]; then python -m pip install --upgrade auditwheel patchelf; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if [ "$(uname -m)" = "arm64" ]; then export MACOSX_DEPLOYMENT_TARGET=11.0; else export MACOSX_DEPLOYMENT_TARGET=10.13; fi
+          fi
+          python bindings/python/aion-wgpu/tools/build_wheel.py --output-dir "$PWD/wheelhouse"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    needs: [build-aion]
+    runs-on: ubuntu-24.04
+    # A tag push always targets PyPI; manual runs choose. The environment name
+    # must match the Trusted Publisher registered on PyPI for each project.
+    environment: ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    permissions:
+      id-token: write # OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: List collected distributions
+        run: ls -l dist
+
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: github.event_name == 'push' || inputs.repository == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # `aion-wgpu` rarely changes version; skip re-uploading it on aion-only
+          # releases rather than failing on a duplicate.
+          skip-existing: true

@@ -67,6 +67,7 @@ const thread_pool_mod = @import("../../runtime/thread_pool.zig");
 const profile_mod = @import("../../profile.zig");
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 
 const Backend = backend_mod.Backend;
 const Session = backend_mod.Session;
@@ -166,7 +167,7 @@ pub const GpuBackend = struct {
     /// Block until all submitted GPU work has completed. Benchmarks call this once
     /// after a batch of `flush_outputs == false` runs to time pure compute.
     pub fn sync(self: *Self) void {
-        _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
+        _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
     }
 
     /// Build a `Session` bound to `store`: a `GpuSession` owning a fresh

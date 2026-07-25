@@ -69,7 +69,7 @@ def run_offline(model_path: str, md: dict, audio: np.ndarray, threads, args):
     count = int(oc.item())
     oc.close()
     ot = m.output_tensor("out_tokens")
-    toks = [int(x) for x in ot.tolist()]
+    toks = [int(x) for x in ot.numpy().reshape(-1)]
     ot.close()
     return toks[:count]
 
@@ -139,7 +139,7 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
         t_toks.copy_from([0] * max_out)
         m.run()
         oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
-        ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.tolist()][:cnt]; ot.close()
+        ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()
         t_ms = (c + 1) * step * 1000 // SAMPLE_RATE
         print(f"[{t_ms:6d}ms] {sp.DecodeIds([int(t) for t in tokens])}")
     return tokens

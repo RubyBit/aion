@@ -157,9 +157,12 @@ pub fn build(b: *std.Build) void {
     aion_build_options.addOption(bool, "enable_gpu", enable_gpu);
     aion_mod.addImport("build_options", aion_build_options.createModule());
 
-    // When the GPU feature is on, the `aion` module carries both the translate-c'd
-    // `wgpu` bindings and the native wgpu link inputs. Importers inherit those
-    // link inputs transitively; `-Dgpu=false` keeps consumers CPU-only.
+    // When the GPU feature is on, the `aion` module carries the translate-c'd
+    // `wgpu` bindings (types/enums/constants only — header-level, no link inputs).
+    // wgpu-native is NOT linked: its functions are resolved at runtime via dlopen
+    // (see `backend/gpu/wgpu.zig`), so consumers never carry a hard dependency on
+    // the shared library and load fine when it is absent. `-Dgpu=false` keeps
+    // consumers fully CPU-only (the `wgpu` import is never created).
     if (wgpu_dep) |wd| {
         const translate = b.addTranslateC(.{
             .root_source_file = wd.dep.path("include/webgpu/wgpu.h"),
@@ -168,7 +171,6 @@ pub fn build(b: *std.Build) void {
         });
         translate.addIncludePath(wd.dep.path("include/webgpu"));
         aion_mod.addImport("wgpu", translate.createModule());
-        wd.link(aion_mod);
     }
 
     // Portable multiversioning: compile `kernels_export.zig` once per ISA tier.
@@ -271,11 +273,10 @@ pub fn build(b: *std.Build) void {
         const bo = b.addOptions();
         bo.addOption(bool, "multiversion", want_multiversion);
         // The C-ABI library follows the GPU feature flag so C/FFI consumers (the
-        // Python bindings) can create GPU devices when built with `-Dgpu`. The
-        // static archive only needs the `wgpu` *import* to compile; wgpu symbols
-        // stay undefined and are resolved at the consumer's final link (e.g. the
-        // Python extension adds `wgpu_native.dll.lib`). So we import wgpu below
-        // but do NOT `wd.link(lib_mod)` (you can't link into a static archive).
+        // Python bindings) can create GPU devices when built with `-Dgpu`. Only
+        // the `wgpu` *import* (types/enums) is needed to compile — wgpu functions
+        // are resolved at runtime via dlopen (see backend/gpu/wgpu.zig), so the
+        // archive references NO wgpu symbols and consumers link nothing wgpu.
         bo.addOption(bool, "enable_gpu", enable_gpu);
         lib_mod.addOptions("build_options", bo);
     }
@@ -329,18 +330,17 @@ pub fn build(b: *std.Build) void {
     const install_header = b.addInstallFile(b.path("include/aion.h"), "include/aion.h");
     b.getInstallStep().dependOn(&install_header.step);
 
-    // When the GPU backend is linked, a consumer that *statically* links `aion`
-    // (e.g. the Python cffi extension) must resolve the wgpu symbols at its own
-    // final link and load `wgpu_native.dll` at runtime. Install both so the
-    // downstream build can find them in the prefix. On Windows the import lib +
-    // DLL both live in the dep's `lib/` (see `WgpuDep.prepareRun`).
+    // wgpu-native is resolved at runtime (dlopen), never linked, so nothing wgpu
+    // is bundled into the `aion` static library or its install prefix. The runtime
+    // library instead ships in the optional `aion-wgpu` Python package; this
+    // dedicated step stages just that dynamic library into the prefix so the
+    // packaging build can pick it up:
+    //   zig build wgpu-runtime -Dtarget=<triple> --prefix <out>
     if (wgpu_dep) |wd| {
-        if (target.result.os.tag == .windows) {
-            const inst_implib = b.addInstallLibFile(wd.dep.path("lib/wgpu_native.dll.lib"), "wgpu_native.dll.lib");
-            b.getInstallStep().dependOn(&inst_implib.step);
-            const inst_dll = b.addInstallBinFile(wd.dep.path("lib/wgpu_native.dll"), "wgpu_native.dll");
-            b.getInstallStep().dependOn(&inst_dll.step);
-        }
+        const name = wd.runtimeLibName();
+        const inst = b.addInstallFileWithDir(wd.dep.path(b.fmt("lib/{s}", .{name})), .prefix, name);
+        const step = b.step("wgpu-runtime", "Stage the wgpu-native runtime library into the prefix (for the aion-wgpu package)");
+        step.dependOn(&inst.step);
     }
 
     // Unit tests.
@@ -543,21 +543,21 @@ const WgpuDep = struct {
     dep: *std.Build.Dependency,
     os: std.Target.Os.Tag,
 
-    fn link(self: WgpuDep, mod: *std.Build.Module) void {
-        mod.addLibraryPath(self.dep.path("lib"));
-        switch (self.os) {
-            .windows => mod.addObjectFile(self.dep.path("lib/wgpu_native.dll.lib")),
-            else => {
-                mod.linkSystemLibrary("wgpu_native", .{ .use_pkg_config = .no });
-                mod.addRPath(self.dep.path("lib"));
-            },
-        }
+    /// Platform filename of the wgpu-native dynamic library within the dep's `lib/`.
+    fn runtimeLibName(self: WgpuDep) []const u8 {
+        return switch (self.os) {
+            .windows => "wgpu_native.dll",
+            .macos => "libwgpu_native.dylib",
+            else => "libwgpu_native.so",
+        };
     }
 
+    /// Point an in-tree GPU test/bench run at the fetched wgpu-native prebuilt.
+    /// The library is loaded at runtime (not linked), so its full path is handed
+    /// over via `AION_WGPU_LIB` — the same env var the Python `aion` package sets.
     fn prepareRun(self: WgpuDep, b: *std.Build, run: *std.Build.Step.Run) void {
-        if (self.os == .windows) {
-            run.addPathDir(self.dep.path("lib").getPath(b));
-        }
+        const path = self.dep.path(b.fmt("lib/{s}", .{self.runtimeLibName()})).getPath(b);
+        run.setEnvironmentVariable("AION_WGPU_LIB", path);
     }
 };
 

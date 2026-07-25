@@ -70,7 +70,7 @@ def run_aion(model_path: Path, *, chunks: int, num_samples: int, context_size: i
                 end = start + chunk_input_len
                 x = signal[start:end].reshape(1, chunk_input_len)
 
-                x_t.write_from_numpy(x)
+                x_t.copy_from(x)
                 model.bind_input("x", x_t)
                 model.bind_input("h", h_in)
                 model.bind_input("c", c_in)
@@ -81,7 +81,8 @@ def run_aion(model_path: Path, *, chunks: int, num_samples: int, context_size: i
                     next_h_t = model.output_tensor("next_h")
                     next_c_t = model.output_tensor("next_c")
 
-                probs[chunk_idx] = prob_t.read_f32()[0]
+                assert next_h_t is not None and next_c_t is not None  # fetched with prob_t above
+                probs[chunk_idx] = float(prob_t.numpy().reshape(-1)[0])
                 h_in = next_h_t
                 c_in = next_c_t
 

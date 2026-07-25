@@ -75,7 +75,7 @@ def transcribe_offline(model_path, md, audio, sp, threads, args):
     m.bind_input("last_in", _i32(ctx, blank, (1,)))
     m.run()
     oc = m.output_tensor("out_count"); count = int(oc.item()); oc.close()
-    ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.tolist()][:count]; ot.close()
+    ot = m.output_tensor("out_tokens"); toks = [int(x) for x in ot.numpy().reshape(-1)][:count]; ot.close()
     return sp.DecodeIds(toks)
 
 
@@ -145,7 +145,7 @@ class StreamFull:
         self.t_toks.copy_from([0] * self.max_out)
         m.run()
         oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
-        ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.tolist()][:cnt]; ot.close()
+        ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()
         self.c += 1
 
     def text(self):

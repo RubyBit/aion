@@ -10,6 +10,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+gpu = [
+    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+]
 numpy = [
     { name = "numpy" },
 ]
@@ -34,6 +37,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aion-wgpu", marker = "(platform_machine != 'aarch64' and extra == 'gpu') or (sys_platform != 'linux' and extra == 'gpu')", directory = "aion-wgpu" },
     { name = "cffi", specifier = ">=2.0" },
     { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.26" },
 ]
@@ -56,6 +60,11 @@ test = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=9" },
 ]
+
+[[package]]
+name = "aion-wgpu"
+version = "29.0.4"
+source = { directory = "aion-wgpu" }
 
 [[package]]
 name = "anyio"

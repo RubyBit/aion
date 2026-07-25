@@ -48,7 +48,7 @@ pub const ScratchPool = struct {
     cap: u64 = 0,
 
     pub fn deinit(self: *ScratchPool) void {
-        if (self.buf) |b| wgpu.c.wgpuBufferRelease(b);
+        if (self.buf) |b| wgpu.fns.wgpuBufferRelease(b);
         self.* = undefined;
     }
 
@@ -58,7 +58,7 @@ pub const ScratchPool = struct {
     pub fn ensure(self: *ScratchPool, gpu: *wgpu.Gpu, bytes: u64) error{ExecutionFailed}!wgpu.c.WGPUBuffer {
         if (self.buf) |b| {
             if (self.cap >= bytes) return b;
-            wgpu.c.wgpuBufferRelease(b);
+            wgpu.fns.wgpuBufferRelease(b);
             self.buf = null;
             self.cap = 0;
         }

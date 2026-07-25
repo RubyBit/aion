@@ -14,6 +14,7 @@ const std = @import("std");
 const wgpu = @import("wgpu.zig");
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 const ThreadPool = @import("../../runtime/thread_pool.zig").ThreadPool;
 
 /// D2H readbacks smaller than this stay single-threaded. The pool's wake+join
@@ -82,9 +83,9 @@ pub const WgpuDeviceMemory = struct {
 
     pub fn deinit(self: *Self) void {
         for (self.buffers.items) |maybe| {
-            if (maybe) |buf| c.wgpuBufferRelease(buf);
+            if (maybe) |buf| fns.wgpuBufferRelease(buf);
         }
-        if (self.staging) |s| c.wgpuBufferRelease(s);
+        if (self.staging) |s| fns.wgpuBufferRelease(s);
         self.buffers.deinit(self.allocator);
         self.* = undefined;
     }
@@ -94,7 +95,7 @@ pub const WgpuDeviceMemory = struct {
     fn ensureStaging(self: *Self, bytes: usize) DeviceError!c.WGPUBuffer {
         if (self.staging) |s| {
             if (self.staging_cap >= bytes) return s;
-            c.wgpuBufferRelease(s);
+            fns.wgpuBufferRelease(s);
             self.staging = null;
             self.staging_cap = 0;
         }
@@ -135,7 +136,7 @@ pub const WgpuDeviceMemory = struct {
         const usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc | c.WGPUBufferUsage_CopyDst;
         const buf = wgpu.createBuffer(self.gpu.device, @intCast(bytes), usage) catch return DeviceError.OutOfDeviceMemory;
         self.buffers.append(self.allocator, buf) catch {
-            c.wgpuBufferRelease(buf);
+            fns.wgpuBufferRelease(buf);
             return DeviceError.OutOfDeviceMemory;
         };
         return @intCast(self.buffers.items.len); // index+1
@@ -147,7 +148,7 @@ pub const WgpuDeviceMemory = struct {
         const slot: usize = @intCast(handle - 1);
         if (slot >= self.buffers.items.len) return;
         if (self.buffers.items[slot]) |buf| {
-            c.wgpuBufferRelease(buf);
+            fns.wgpuBufferRelease(buf);
             self.buffers.items[slot] = null;
         }
     }
@@ -155,15 +156,15 @@ pub const WgpuDeviceMemory = struct {
     fn copyH2D(ctx: *anyopaque, handle: DeviceHandle, dst_offset: usize, src: []const u8) DeviceError!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
-        c.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, src.len);
+        fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, src.len);
         // Bound wgpu's write-staging: an empty submit flushes the pending
         // writes, the wait lets wgpu recycle their staging buffers. Ordering is
         // unaffected (writeBuffer data was already ordered before any later
         // submit), so this is safe even mid-frame.
         self.h2d_since_flush += src.len;
         if (self.h2d_since_flush >= H2D_FLUSH_BYTES) {
-            c.wgpuQueueSubmit(self.gpu.queue, 0, null);
-            _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
+            fns.wgpuQueueSubmit(self.gpu.queue, 0, null);
+            _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
             self.h2d_since_flush = 0;
         }
     }
@@ -176,18 +177,18 @@ pub const WgpuDeviceMemory = struct {
 
         // Copy device->staging on the queue, then block until all prior submits
         // (the compute that produced `buf`) and this copy have completed.
-        const enc = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
-        c.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, dst.len);
-        const cmd = c.wgpuCommandEncoderFinish(enc, null);
-        c.wgpuCommandEncoderRelease(enc);
-        c.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
-        c.wgpuCommandBufferRelease(cmd);
-        _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
+        const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, dst.len);
+        const cmd = fns.wgpuCommandEncoderFinish(enc, null);
+        fns.wgpuCommandEncoderRelease(enc);
+        fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
+        fns.wgpuCommandBufferRelease(cmd);
+        _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
 
         self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, dst.len) catch return DeviceError.InvalidArgument;
-        const mapped = c.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return DeviceError.InvalidArgument;
+        const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return DeviceError.InvalidArgument;
         self.copyHostBytes(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);
-        c.wgpuBufferUnmap(staging);
+        fns.wgpuBufferUnmap(staging);
     }
 
     fn maxBindingBytes(ctx: *anyopaque) u64 {

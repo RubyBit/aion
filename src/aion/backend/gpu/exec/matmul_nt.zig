@@ -28,6 +28,7 @@ const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 const Ctx = context.Ctx;
 const Frame = @import("../frame.zig").Frame;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -55,14 +56,14 @@ pub const MatmulNt = struct {
     scratch_cap: u64 = 0,
 
     pub fn deinit(self: *MatmulNt) void {
-        if (self.scratch) |s| c.wgpuBufferRelease(s);
+        if (self.scratch) |s| fns.wgpuBufferRelease(s);
         self.* = undefined;
     }
 
     fn ensureScratch(self: *MatmulNt, ctx: Ctx, bytes: u64) ExecuteProgramError!c.WGPUBuffer {
         if (self.scratch) |s| {
             if (self.scratch_cap >= bytes) return s;
-            c.wgpuBufferRelease(s);
+            fns.wgpuBufferRelease(s);
             self.scratch = null;
             self.scratch_cap = 0;
         }

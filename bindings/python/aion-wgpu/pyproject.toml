@@ -1,0 +1,41 @@
+# The optional GPU runtime for `aion`: a thin, data-only package that ships the
+# prebuilt wgpu-native dynamic library for one platform. `aion` links no wgpu at
+# build time and loads this library at runtime via dlopen (see the `aion` README,
+# "GPU support"). `pip install aion[gpu]` pulls this in.
+#
+# The wheel is `py3-none-<platform>` (any CPython 3, no Python ABI, one platform):
+# it carries only a native library, so it is Python-version-independent. See
+# setup.py for the tag + staging logic.
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aion-wgpu"
+# Versioned after the wgpu-native release it wraps (see build.zig.zon). Keep the
+# major in sync with the `aion[gpu]` extra's `aion-wgpu>=X,<X+1` constraint.
+version = "29.0.4"
+description = "Prebuilt wgpu-native runtime for the optional GPU backend of aion"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Angelos-Ermis Mangos" }]
+keywords = ["wgpu", "webgpu", "gpu", "aion"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The staged native runtime (exactly one of these is present per platform) plus
+# typing marker.
+aion_wgpu = ["*.dll", "*.so", "*.dylib", "py.typed"]

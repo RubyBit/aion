@@ -24,6 +24,7 @@ const pipelines = @import("pipelines.zig");
 const TimestampProfiler = @import("timestamp_profile.zig").TimestampProfiler;
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 const Built = pipelines.Built;
 
 pub const FrameError = error{ExecutionFailed};
@@ -59,7 +60,7 @@ pub const UniformPool = struct {
         }
         const b = wgpu.createUniformBuffer(self.gpu.device, SLOT_BYTES) catch return error.ExecutionFailed;
         self.buffers.append(self.allocator, b) catch {
-            c.wgpuBufferRelease(b);
+            fns.wgpuBufferRelease(b);
             return error.ExecutionFailed;
         };
         self.cursor += 1;
@@ -67,7 +68,7 @@ pub const UniformPool = struct {
     }
 
     pub fn deinit(self: *UniformPool) void {
-        for (self.buffers.items) |b| c.wgpuBufferRelease(b);
+        for (self.buffers.items) |b| fns.wgpuBufferRelease(b);
         self.buffers.deinit(self.allocator);
         self.* = undefined;
     }
@@ -108,8 +109,8 @@ pub const BindGroupCache = struct {
 
     pub fn deinit(self: *BindGroupCache) void {
         for (self.entries.items) |e| {
-            c.wgpuBindGroupRelease(e.bind_group);
-            c.wgpuBufferRelease(e.uniform_buf);
+            fns.wgpuBindGroupRelease(e.bind_group);
+            fns.wgpuBufferRelease(e.uniform_buf);
         }
         self.entries.deinit(self.allocator);
         self.* = undefined;
@@ -125,8 +126,8 @@ pub const BindGroupCache = struct {
 
     fn buildEntry(self: *BindGroupCache, built: Built, buffers: []const c.WGPUBuffer, sizes: []const u64, ubytes: []const u8, ub_size: u64) FrameError!Entry {
         const ub = wgpu.createUniformBuffer(self.gpu.device, UniformPool.SLOT_BYTES) catch return error.ExecutionFailed;
-        errdefer c.wgpuBufferRelease(ub);
-        c.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, ubytes.ptr, ubytes.len);
+        errdefer fns.wgpuBufferRelease(ub);
+        fns.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, ubytes.ptr, ubytes.len);
 
         var entries: [MAX_B]c.WGPUBindGroupEntry = undefined;
         for (buffers, 0..) |buf, i| {
@@ -144,7 +145,7 @@ pub const BindGroupCache = struct {
         bgd.layout = built.bgl;
         bgd.entryCount = buffers.len + 1;
         bgd.entries = &entries;
-        const bg = c.wgpuDeviceCreateBindGroup(self.gpu.device, &bgd) orelse return error.ExecutionFailed;
+        const bg = fns.wgpuDeviceCreateBindGroup(self.gpu.device, &bgd) orelse return error.ExecutionFailed;
 
         var e: Entry = .{
             .pipeline = built.pipeline,
@@ -177,16 +178,16 @@ pub const BindGroupCache = struct {
             }
             // Mismatch: rebuild this slot in place.
             const ne = try self.buildEntry(built, buffers, sizes, ubytes, ub_size);
-            c.wgpuBindGroupRelease(e.bind_group);
-            c.wgpuBufferRelease(e.uniform_buf);
+            fns.wgpuBindGroupRelease(e.bind_group);
+            fns.wgpuBufferRelease(e.uniform_buf);
             e.* = ne;
             self.cursor += 1;
             return ne.bind_group;
         }
         const ne = try self.buildEntry(built, buffers, sizes, ubytes, ub_size);
         self.entries.append(self.allocator, ne) catch {
-            c.wgpuBindGroupRelease(ne.bind_group);
-            c.wgpuBufferRelease(ne.uniform_buf);
+            fns.wgpuBindGroupRelease(ne.bind_group);
+            fns.wgpuBufferRelease(ne.uniform_buf);
             return error.ExecutionFailed;
         };
         self.cursor += 1;
@@ -231,7 +232,7 @@ pub const Frame = struct {
     const MAX_BINDINGS = 10;
 
     pub fn init(allocator: std.mem.Allocator, gpu: *wgpu.Gpu) FrameError!Self {
-        const enc = c.wgpuDeviceCreateCommandEncoder(gpu.device, null) orelse return error.ExecutionFailed;
+        const enc = fns.wgpuDeviceCreateCommandEncoder(gpu.device, null) orelse return error.ExecutionFailed;
         return .{
             .gpu = gpu,
             .allocator = allocator,
@@ -246,10 +247,10 @@ pub const Frame = struct {
     pub fn deinit(self: *Self) void {
         if (self.encoder != null) {
             self.endComputePass();
-            c.wgpuCommandEncoderRelease(self.encoder);
+            fns.wgpuCommandEncoderRelease(self.encoder);
         }
-        for (self.transient_groups.items) |g| c.wgpuBindGroupRelease(g);
-        for (self.transient_buffers.items) |b| c.wgpuBufferRelease(b);
+        for (self.transient_groups.items) |g| fns.wgpuBindGroupRelease(g);
+        for (self.transient_buffers.items) |b| fns.wgpuBufferRelease(b);
         self.transient_groups.deinit(self.allocator);
         self.transient_buffers.deinit(self.allocator);
         self.* = undefined;
@@ -289,11 +290,11 @@ pub const Frame = struct {
         } else {
             ub = wgpu.createUniformBuffer(self.gpu.device, ub_size) catch return error.ExecutionFailed;
             self.transient_buffers.append(self.allocator, ub) catch {
-                c.wgpuBufferRelease(ub);
+                fns.wgpuBufferRelease(ub);
                 return error.ExecutionFailed;
             };
         }
-        c.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, uniform_bytes.ptr, uniform_bytes.len);
+        fns.wgpuQueueWriteBuffer(self.gpu.queue, ub, 0, uniform_bytes.ptr, uniform_bytes.len);
 
         // Bind group: storage buffers then the uniform at the trailing binding.
         var entries: [MAX_BINDINGS]c.WGPUBindGroupEntry = undefined;
@@ -314,9 +315,9 @@ pub const Frame = struct {
         bgd.layout = built.bgl;
         bgd.entryCount = buffers.len + 1;
         bgd.entries = &entries;
-        const bg = c.wgpuDeviceCreateBindGroup(self.gpu.device, &bgd) orelse return error.ExecutionFailed;
+        const bg = fns.wgpuDeviceCreateBindGroup(self.gpu.device, &bgd) orelse return error.ExecutionFailed;
         self.transient_groups.append(self.allocator, bg) catch {
-            c.wgpuBindGroupRelease(bg);
+            fns.wgpuBindGroupRelease(bg);
             return error.ExecutionFailed;
         };
 
@@ -332,12 +333,12 @@ pub const Frame = struct {
             self.beginAttributedPass(built, groups, uniform_bytes, buffer_sizes)
         else
             self.getComputePass();
-        c.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
-        c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
-        c.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
+        fns.wgpuComputePassEncoderSetPipeline(pass, built.pipeline);
+        fns.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
+        fns.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[0], groups[1], groups[2]);
         if (attributed) {
-            c.wgpuComputePassEncoderEnd(pass);
-            c.wgpuComputePassEncoderRelease(pass);
+            fns.wgpuComputePassEncoderEnd(pass);
+            fns.wgpuComputePassEncoderRelease(pass);
         }
     }
 
@@ -352,20 +353,20 @@ pub const Frame = struct {
                         writes.endOfPassWriteIndex = first + 1;
                         var desc: c.WGPUComputePassDescriptor = std.mem.zeroes(c.WGPUComputePassDescriptor);
                         desc.timestampWrites = &writes;
-                        self.compute_pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
+                        self.compute_pass = fns.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
                     }
                 }
             }
             if (self.compute_pass == null)
-                self.compute_pass = c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+                self.compute_pass = fns.wgpuCommandEncoderBeginComputePass(self.encoder, null);
         }
         return self.compute_pass;
     }
 
     fn endComputePass(self: *Self) void {
         const pass = self.compute_pass orelse return;
-        c.wgpuComputePassEncoderEnd(pass);
-        c.wgpuComputePassEncoderRelease(pass);
+        fns.wgpuComputePassEncoderEnd(pass);
+        fns.wgpuComputePassEncoderRelease(pass);
         self.compute_pass = null;
     }
 
@@ -378,10 +379,10 @@ pub const Frame = struct {
                 writes.endOfPassWriteIndex = first + 1;
                 var desc: c.WGPUComputePassDescriptor = std.mem.zeroes(c.WGPUComputePassDescriptor);
                 desc.timestampWrites = &writes;
-                return c.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
+                return fns.wgpuCommandEncoderBeginComputePass(self.encoder, &desc);
             }
         }
-        return c.wgpuCommandEncoderBeginComputePass(self.encoder, null);
+        return fns.wgpuCommandEncoderBeginComputePass(self.encoder, null);
     }
 
     /// Record a device buffer copy. Copies are encoder-level commands, ordered
@@ -389,7 +390,7 @@ pub const Frame = struct {
     /// offsets be multiples of 4 (callers check).
     pub fn recordCopy(self: *Self, src: c.WGPUBuffer, src_off: u64, dst: c.WGPUBuffer, dst_off: u64, bytes: u64) void {
         self.endComputePass();
-        c.wgpuCommandEncoderCopyBufferToBuffer(self.encoder, src, src_off, dst, dst_off, bytes);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(self.encoder, src, src_off, dst, dst_off, bytes);
         self.records += 1;
     }
 
@@ -412,11 +413,11 @@ pub const Frame = struct {
         self.timestamps = timestamps;
         // The queue holds its own references to the submitted bind groups /
         // uniforms until the GPU is done, so releasing our handles now is safe.
-        for (self.transient_groups.items) |g| c.wgpuBindGroupRelease(g);
-        for (self.transient_buffers.items) |b| c.wgpuBufferRelease(b);
+        for (self.transient_groups.items) |g| fns.wgpuBindGroupRelease(g);
+        for (self.transient_buffers.items) |b| fns.wgpuBufferRelease(b);
         self.transient_groups.clearRetainingCapacity();
         self.transient_buffers.clearRetainingCapacity();
-        self.encoder = c.wgpuDeviceCreateCommandEncoder(self.gpu.device, null) orelse return error.ExecutionFailed;
+        self.encoder = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null) orelse return error.ExecutionFailed;
         self.compute_pass = null;
         self.records = 0;
         self.submits += 1;
@@ -426,10 +427,10 @@ pub const Frame = struct {
     pub fn submit(self: *Self) void {
         self.endComputePass();
         if (self.timestamps) |prof| prof.resolvePending(self.encoder);
-        const cmd = c.wgpuCommandEncoderFinish(self.encoder, null);
-        c.wgpuCommandEncoderRelease(self.encoder);
+        const cmd = fns.wgpuCommandEncoderFinish(self.encoder, null);
+        fns.wgpuCommandEncoderRelease(self.encoder);
         self.encoder = null; // deinit() must not double-release.
-        c.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
-        c.wgpuCommandBufferRelease(cmd);
+        fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
+        fns.wgpuCommandBufferRelease(cmd);
     }
 };

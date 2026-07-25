@@ -8,6 +8,7 @@ const wgpu = @import("wgpu.zig");
 const pipelines = @import("pipelines.zig");
 const profile = @import("../../profile.zig");
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 
 pub const Mode = enum {
     /// One timestamp pair per compute pass; preserves normal dispatch batching.
@@ -44,13 +45,13 @@ pub const TimestampProfiler = struct {
         var qd: c.WGPUQuerySetDescriptor = std.mem.zeroes(c.WGPUQuerySetDescriptor);
         qd.type = c.WGPUQueryType_Timestamp;
         qd.count = cap;
-        const qs = c.wgpuDeviceCreateQuerySet(gpu.device, &qd) orelse return error.ExecutionFailed;
-        errdefer c.wgpuQuerySetRelease(qs);
+        const qs = fns.wgpuDeviceCreateQuerySet(gpu.device, &qd) orelse return error.ExecutionFailed;
+        errdefer fns.wgpuQuerySetRelease(qs);
         const bytes = @as(u64, cap) * @sizeOf(u64);
         const resolve = wgpu.createBuffer(gpu.device, bytes, c.WGPUBufferUsage_QueryResolve | c.WGPUBufferUsage_CopySrc) catch return error.ExecutionFailed;
-        errdefer c.wgpuBufferRelease(resolve);
+        errdefer fns.wgpuBufferRelease(resolve);
         const read = wgpu.createBuffer(gpu.device, bytes, c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst) catch return error.ExecutionFailed;
-        errdefer c.wgpuBufferRelease(read);
+        errdefer fns.wgpuBufferRelease(read);
         var out: TimestampProfiler = .{ .allocator = allocator, .gpu = gpu, .query_set = qs, .resolve_buffer = resolve, .read_buffer = read, .query_capacity = cap, .session = session, .track = track, .mode = mode };
         try out.samples.ensureTotalCapacity(allocator, cap / 2);
         return out;
@@ -58,9 +59,9 @@ pub const TimestampProfiler = struct {
 
     pub fn deinit(self: *TimestampProfiler) void {
         self.samples.deinit(self.allocator);
-        c.wgpuBufferRelease(self.read_buffer);
-        c.wgpuBufferRelease(self.resolve_buffer);
-        c.wgpuQuerySetRelease(self.query_set);
+        fns.wgpuBufferRelease(self.read_buffer);
+        fns.wgpuBufferRelease(self.resolve_buffer);
+        fns.wgpuQuerySetRelease(self.query_set);
         self.* = undefined;
     }
 
@@ -120,8 +121,8 @@ pub const TimestampProfiler = struct {
         const count = self.query_count;
         if (count == 0) return;
         const bytes = @as(u64, count) * @sizeOf(u64);
-        c.wgpuCommandEncoderResolveQuerySet(encoder, self.query_set, 0, count, self.resolve_buffer, 0);
-        c.wgpuCommandEncoderCopyBufferToBuffer(encoder, self.resolve_buffer, 0, self.read_buffer, 0, bytes);
+        fns.wgpuCommandEncoderResolveQuerySet(encoder, self.query_set, 0, count, self.resolve_buffer, 0);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(encoder, self.resolve_buffer, 0, self.read_buffer, 0, bytes);
     }
 
     /// Resolve device timestamps into the backend-neutral session. The raw GPU
@@ -129,13 +130,13 @@ pub const TimestampProfiler = struct {
     /// clock domain are claimed.
     pub fn readResults(self: *TimestampProfiler) !void {
         if (self.query_count == 0) return;
-        _ = c.wgpuDevicePoll(self.gpu.device, 1, null);
+        _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
         const bytes: usize = @as(usize, self.query_count) * @sizeOf(u64);
         try self.gpu.mapBlocking(self.read_buffer, c.WGPUMapMode_Read, 0, bytes);
-        const raw_ptr = c.wgpuBufferGetConstMappedRange(self.read_buffer, 0, bytes) orelse return error.MapFailed;
-        defer c.wgpuBufferUnmap(self.read_buffer);
+        const raw_ptr = fns.wgpuBufferGetConstMappedRange(self.read_buffer, 0, bytes) orelse return error.MapFailed;
+        defer fns.wgpuBufferUnmap(self.read_buffer);
         const ticks: [*]const u64 = @ptrCast(@alignCast(raw_ptr));
-        const period: f64 = @floatCast(c.wgpuQueueGetTimestampPeriod(self.gpu.queue));
+        const period: f64 = @floatCast(fns.wgpuQueueGetTimestampPeriod(self.gpu.queue));
 
         for (self.samples.items) |s| {
             const begin = ticks[s.first_query];

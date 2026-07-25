@@ -7,8 +7,12 @@
 //! and handles adapter (GPU) selection. Raw handles stay reachable via `wgpu.c`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-/// The translate-c'd wgpu.h, re-exported so callers drop to raw C any time.
+/// The translate-c'd wgpu.h: **types, enums and constants only** (`c.WGPU…`).
+/// These are header-level declarations, so referencing them creates no link
+/// dependency. wgpu *functions* are never called through `c` — they are resolved
+/// at runtime and dispatched through `w` (see the loader below).
 pub const c = @import("wgpu");
 
 pub const Error = error{
@@ -21,7 +25,184 @@ pub const Error = error{
     MapFailed,
     BufferCreate,
     BadAdapterIndex,
+    /// wgpu-native could not be loaded (no `aion-wgpu` package / system library).
+    Unavailable,
 };
+
+// ── wgpu-native is loaded at runtime, never linked ──────────────────────────
+// wgpu-native ships as a standalone dynamic library (~a few MiB). Linking it
+// would make the whole Python extension fail to load whenever it is absent, so
+// instead the static `aion` archive references ZERO wgpu symbols: every function
+// the backend calls is looked up by name on first use and dispatched through the
+// table `w`. A CPU-only deployment (no `aion-wgpu` package, no system wgpu) never
+// loads it, and GPU device creation fails cleanly with `error.Unavailable`
+// (surfaced to the C ABI as `AION_UNSUPPORTED`).
+//
+// The library path comes from `AION_WGPU_LIB` when set — the Python `aion`
+// package points it at the bundled `aion-wgpu` library; the in-tree Zig GPU
+// test/bench run steps point it at the fetched wgpu-native prebuilt — otherwise
+// the platform's default search is used (a system install or a copy beside the
+// process).
+
+/// Runtime dispatch table over every wgpu-native function the backend calls: one
+/// field per function, typed straight from the translate-c'd signature so call
+/// sites stay fully type-checked. This declaration is the single source of truth
+/// — `ensureLoaded` resolves exactly these fields by name, and calling a wgpu
+/// function that is not a field here is a COMPILE error, which keeps the set
+/// exhaustive by construction. Call through it as `fns.wgpuXxx(args)`.
+/// Handrolled because std.DynLib is @compileError on win 
+const Procs = struct {
+    wgpuAdapterGetInfo: *const @TypeOf(c.wgpuAdapterGetInfo),
+    wgpuAdapterGetLimits: *const @TypeOf(c.wgpuAdapterGetLimits),
+    wgpuAdapterHasFeature: *const @TypeOf(c.wgpuAdapterHasFeature),
+    wgpuAdapterInfoFreeMembers: *const @TypeOf(c.wgpuAdapterInfoFreeMembers),
+    wgpuAdapterRelease: *const @TypeOf(c.wgpuAdapterRelease),
+    wgpuAdapterRequestDevice: *const @TypeOf(c.wgpuAdapterRequestDevice),
+    wgpuBindGroupLayoutRelease: *const @TypeOf(c.wgpuBindGroupLayoutRelease),
+    wgpuBindGroupRelease: *const @TypeOf(c.wgpuBindGroupRelease),
+    wgpuBufferGetConstMappedRange: *const @TypeOf(c.wgpuBufferGetConstMappedRange),
+    wgpuBufferMapAsync: *const @TypeOf(c.wgpuBufferMapAsync),
+    wgpuBufferRelease: *const @TypeOf(c.wgpuBufferRelease),
+    wgpuBufferUnmap: *const @TypeOf(c.wgpuBufferUnmap),
+    wgpuCommandBufferRelease: *const @TypeOf(c.wgpuCommandBufferRelease),
+    wgpuCommandEncoderBeginComputePass: *const @TypeOf(c.wgpuCommandEncoderBeginComputePass),
+    wgpuCommandEncoderCopyBufferToBuffer: *const @TypeOf(c.wgpuCommandEncoderCopyBufferToBuffer),
+    wgpuCommandEncoderFinish: *const @TypeOf(c.wgpuCommandEncoderFinish),
+    wgpuCommandEncoderRelease: *const @TypeOf(c.wgpuCommandEncoderRelease),
+    wgpuCommandEncoderResolveQuerySet: *const @TypeOf(c.wgpuCommandEncoderResolveQuerySet),
+    wgpuComputePassEncoderDispatchWorkgroups: *const @TypeOf(c.wgpuComputePassEncoderDispatchWorkgroups),
+    wgpuComputePassEncoderEnd: *const @TypeOf(c.wgpuComputePassEncoderEnd),
+    wgpuComputePassEncoderRelease: *const @TypeOf(c.wgpuComputePassEncoderRelease),
+    wgpuComputePassEncoderSetBindGroup: *const @TypeOf(c.wgpuComputePassEncoderSetBindGroup),
+    wgpuComputePassEncoderSetPipeline: *const @TypeOf(c.wgpuComputePassEncoderSetPipeline),
+    wgpuComputePipelineGetBindGroupLayout: *const @TypeOf(c.wgpuComputePipelineGetBindGroupLayout),
+    wgpuComputePipelineRelease: *const @TypeOf(c.wgpuComputePipelineRelease),
+    wgpuCreateInstance: *const @TypeOf(c.wgpuCreateInstance),
+    wgpuDeviceCreateBindGroup: *const @TypeOf(c.wgpuDeviceCreateBindGroup),
+    wgpuDeviceCreateBuffer: *const @TypeOf(c.wgpuDeviceCreateBuffer),
+    wgpuDeviceCreateCommandEncoder: *const @TypeOf(c.wgpuDeviceCreateCommandEncoder),
+    wgpuDeviceCreateComputePipeline: *const @TypeOf(c.wgpuDeviceCreateComputePipeline),
+    wgpuDeviceCreateQuerySet: *const @TypeOf(c.wgpuDeviceCreateQuerySet),
+    wgpuDeviceCreateShaderModule: *const @TypeOf(c.wgpuDeviceCreateShaderModule),
+    wgpuDeviceGetLimits: *const @TypeOf(c.wgpuDeviceGetLimits),
+    wgpuDeviceGetQueue: *const @TypeOf(c.wgpuDeviceGetQueue),
+    wgpuDevicePoll: *const @TypeOf(c.wgpuDevicePoll),
+    wgpuDeviceRelease: *const @TypeOf(c.wgpuDeviceRelease),
+    wgpuInstanceEnumerateAdapters: *const @TypeOf(c.wgpuInstanceEnumerateAdapters),
+    wgpuInstanceProcessEvents: *const @TypeOf(c.wgpuInstanceProcessEvents),
+    wgpuInstanceRelease: *const @TypeOf(c.wgpuInstanceRelease),
+    wgpuInstanceRequestAdapter: *const @TypeOf(c.wgpuInstanceRequestAdapter),
+    wgpuQuerySetRelease: *const @TypeOf(c.wgpuQuerySetRelease),
+    wgpuQueueGetTimestampPeriod: *const @TypeOf(c.wgpuQueueGetTimestampPeriod),
+    wgpuQueueRelease: *const @TypeOf(c.wgpuQueueRelease),
+    wgpuQueueSubmit: *const @TypeOf(c.wgpuQueueSubmit),
+    wgpuQueueWriteBuffer: *const @TypeOf(c.wgpuQueueWriteBuffer),
+    wgpuSetLogCallback: *const @TypeOf(c.wgpuSetLogCallback),
+    wgpuSetLogLevel: *const @TypeOf(c.wgpuSetLogLevel),
+    wgpuShaderModuleRelease: *const @TypeOf(c.wgpuShaderModuleRelease),
+};
+
+var procs: Procs = undefined;
+
+/// The wgpu dispatch table. Valid only after a successful `ensureLoaded()`, which
+/// every code path guarantees by loading before its first wgpu call.
+pub const fns = &procs;
+
+var load_state: enum { unattempted, ok, failed } = .unattempted;
+
+/// Load wgpu-native and populate `fns` (idempotent). Must run before the first
+/// wgpu call on any path — instance creation and the log setters. Returns
+/// `error.Unavailable` if the library, or any expected symbol, is missing.
+pub fn ensureLoaded() Error!void {
+    switch (load_state) {
+        .ok => return,
+        .failed => return Error.Unavailable,
+        .unattempted => {},
+    }
+    load_state = .failed; // until fully wired, so a partial load never looks OK
+    const handle = openLibrary() orelse return Error.Unavailable;
+    inline for (@typeInfo(Procs).@"struct".fields) |f| {
+        const sym = dlSymbol(handle, f.name) orelse {
+            dlClose(handle);
+            return Error.Unavailable;
+        };
+        // dlsym/GetProcAddress hand back an align-1 opaque pointer; function
+        // pointers require higher alignment on some targets (e.g. 4 on aarch64).
+        // The address is a real code symbol, so the alignment cast is sound.
+        @field(procs, f.name) = @ptrCast(@alignCast(sym));
+    }
+    load_state = .ok;
+}
+
+const default_names: []const [:0]const u8 = switch (builtin.os.tag) {
+    .windows => &.{"wgpu_native.dll"},
+    .macos => &.{"libwgpu_native.dylib"},
+    else => &.{"libwgpu_native.so"},
+};
+
+fn openLibrary() ?LibHandle {
+    if (std.c.getenv("AION_WGPU_LIB")) |env| {
+        const path = std.mem.span(env);
+        if (path.len != 0) {
+            if (dlOpen(path)) |h| return h;
+        }
+    }
+    inline for (default_names) |name| {
+        if (dlOpen(name)) |h| return h;
+    }
+    return null;
+}
+
+// Minimal cross-platform dynamic loader. std.DynLib is `@compileError` on Windows
+// in this Zig, so the Win32 loader is declared directly; POSIX uses libc
+// `dlopen`/`dlsym` (already linked on non-Windows targets). Only the active
+// platform's block is analyzed, so the Win32 externs never reach a POSIX build.
+const is_windows = builtin.os.tag == .windows;
+const LibHandle = if (is_windows) std.os.windows.HMODULE else *anyopaque;
+
+const loader = if (is_windows) struct {
+    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?std.os.windows.HMODULE;
+    extern "kernel32" fn GetProcAddress(module: std.os.windows.HMODULE, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FreeLibrary(module: std.os.windows.HMODULE) callconv(.winapi) i32;
+
+    fn open(path: []const u8) ?LibHandle {
+        var wbuf: [4096]u16 = undefined;
+        if (path.len >= wbuf.len) return null;
+        const n = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], path) catch return null;
+        wbuf[n] = 0;
+        return LoadLibraryW(wbuf[0..n :0]);
+    }
+    fn symbol(handle: LibHandle, name: [:0]const u8) ?*const anyopaque {
+        return GetProcAddress(handle, name.ptr);
+    }
+    fn close(handle: LibHandle) void {
+        _ = FreeLibrary(handle);
+    }
+} else struct {
+    fn open(path: []const u8) ?LibHandle {
+        var buf: [4096]u8 = undefined;
+        if (path.len >= buf.len) return null;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        return std.c.dlopen(buf[0..path.len :0].ptr, .{ .NOW = true });
+    }
+    fn symbol(handle: LibHandle, name: [:0]const u8) ?*const anyopaque {
+        return std.c.dlsym(handle, name.ptr);
+    }
+    fn close(handle: LibHandle) void {
+        _ = std.c.dlclose(handle);
+    }
+};
+
+fn dlOpen(path: []const u8) ?LibHandle {
+    return loader.open(path);
+}
+fn dlSymbol(handle: LibHandle, name: [:0]const u8) ?*const anyopaque {
+    return loader.symbol(handle, name);
+}
+fn dlClose(handle: LibHandle) void {
+    loader.close(handle);
+}
 
 /// Which GPU to prefer when several are present (e.g. iGPU + discrete).
 pub const Power = enum { default, low, high };
@@ -69,7 +250,7 @@ fn pumpUntil(instance: c.WGPUInstance, done: *const bool) bool {
     var i: usize = 0;
     while (!done.*) : (i += 1) {
         if (i > 1_000_000) return false;
-        c.wgpuInstanceProcessEvents(instance);
+        fns.wgpuInstanceProcessEvents(instance);
     }
     return true;
 }
@@ -150,25 +331,25 @@ pub const AdapterDesc = struct {
 pub fn describeAdapter(adapter: c.WGPUAdapter) AdapterDesc {
     var d: AdapterDesc = .{};
     var info: c.WGPUAdapterInfo = std.mem.zeroes(c.WGPUAdapterInfo);
-    if (c.wgpuAdapterGetInfo(adapter, &info) == c.WGPUStatus_Success) {
+    if (fns.wgpuAdapterGetInfo(adapter, &info) == c.WGPUStatus_Success) {
         const name = fromStrv(info.device);
         d.name_len = @min(name.len, d.name.len);
         @memcpy(d.name[0..d.name_len], name[0..d.name_len]);
         d.backend = info.backendType;
         d.kind = info.adapterType;
         d.vendor_id = info.vendorID;
-        c.wgpuAdapterInfoFreeMembers(info);
+        fns.wgpuAdapterInfoFreeMembers(info);
     }
     return d;
 }
 
 /// Enumerate all adapters into `buf`; returns how many were written. Adapters
-/// are owned by the caller (release with `c.wgpuAdapterRelease`).
+/// are owned by the caller (release with `fns.wgpuAdapterRelease`).
 pub fn listAdapters(instance: c.WGPUInstance, buf: []c.WGPUAdapter) usize {
-    const total = c.wgpuInstanceEnumerateAdapters(instance, null, null);
+    const total = fns.wgpuInstanceEnumerateAdapters(instance, null, null);
     const n = @min(total, buf.len);
     if (n == 0) return 0;
-    _ = c.wgpuInstanceEnumerateAdapters(instance, null, buf.ptr);
+    _ = fns.wgpuInstanceEnumerateAdapters(instance, null, buf.ptr);
     return n;
 }
 
@@ -207,11 +388,12 @@ pub const Gpu = struct {
     timestamp_query: bool = false,
 
     pub fn init(opts: Options) Error!Gpu {
-        const instance = c.wgpuCreateInstance(null) orelse return Error.NoInstance;
-        errdefer c.wgpuInstanceRelease(instance);
+        try ensureLoaded();
+        const instance = fns.wgpuCreateInstance(null) orelse return Error.NoInstance;
+        errdefer fns.wgpuInstanceRelease(instance);
 
         const adapter = try pickAdapter(instance, opts);
-        errdefer c.wgpuAdapterRelease(adapter);
+        errdefer fns.wgpuAdapterRelease(adapter);
 
         // Learn what the adapter supports, then REQUEST those limits so a capable
         // GPU grants more than the spec-minimum defaults (e.g. >16KB shared memory,
@@ -219,9 +401,9 @@ pub const Gpu = struct {
         // adapter's reported limits is always valid; if the request fails for any
         // reason we retry with null (spec defaults).
         var adapter_limits: c.WGPULimits = std.mem.zeroes(c.WGPULimits);
-        const have_adapter_limits = c.wgpuAdapterGetLimits(adapter, &adapter_limits) == c.WGPUStatus_Success;
+        const have_adapter_limits = fns.wgpuAdapterGetLimits(adapter, &adapter_limits) == c.WGPUStatus_Success;
 
-        const want_timestamps = c.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0;
+        const want_timestamps = fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0;
         var timestamp_query = want_timestamps;
         const device = requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, timestamp_query) orelse
             requestDevice(instance, adapter, null, timestamp_query) orelse fallback: {
@@ -231,16 +413,16 @@ pub const Gpu = struct {
                 break :fallback requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, false) orelse
                     (requestDevice(instance, adapter, null, false) orelse return Error.NoDevice);
             };
-        errdefer c.wgpuDeviceRelease(device);
+        errdefer fns.wgpuDeviceRelease(device);
 
         // Re-query the GRANTED limits (may be the requested ones, or defaults).
         var granted: Limits = .{};
         var dev_limits: c.WGPULimits = std.mem.zeroes(c.WGPULimits);
-        if (c.wgpuDeviceGetLimits(device, &dev_limits) == c.WGPUStatus_Success) {
+        if (fns.wgpuDeviceGetLimits(device, &dev_limits) == c.WGPUStatus_Success) {
             granted = Limits.fromWgpu(dev_limits);
         }
 
-        const queue = c.wgpuDeviceGetQueue(device);
+        const queue = fns.wgpuDeviceGetQueue(device);
         return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted, .timestamp_query = timestamp_query };
     }
 
@@ -273,7 +455,7 @@ pub const Gpu = struct {
             desc.nextInChain = &extras.chain;
         }
         var dreq: DeviceReq = .{};
-        _ = c.wgpuAdapterRequestDevice(adapter, &desc, .{
+        _ = fns.wgpuAdapterRequestDevice(adapter, &desc, .{
             .nextInChain = null,
             .mode = c.WGPUCallbackMode_AllowProcessEvents,
             .callback = onDevice,
@@ -291,11 +473,11 @@ pub const Gpu = struct {
             var bufs: [16]c.WGPUAdapter = undefined;
             const n = listAdapters(instance, &bufs);
             if (want >= n) {
-                for (bufs[0..n]) |a| c.wgpuAdapterRelease(a);
+                for (bufs[0..n]) |a| fns.wgpuAdapterRelease(a);
                 return Error.BadAdapterIndex;
             }
             for (bufs[0..n], 0..) |a, i| {
-                if (i != want) c.wgpuAdapterRelease(a);
+                if (i != want) fns.wgpuAdapterRelease(a);
             }
             return bufs[want];
         }
@@ -310,7 +492,7 @@ pub const Gpu = struct {
             .backendType = backendType(opts.backend),
             .compatibleSurface = null,
         };
-        _ = c.wgpuInstanceRequestAdapter(instance, &ro, .{
+        _ = fns.wgpuInstanceRequestAdapter(instance, &ro, .{
             .nextInChain = null,
             .mode = c.WGPUCallbackMode_AllowProcessEvents,
             .callback = onAdapter,
@@ -323,10 +505,10 @@ pub const Gpu = struct {
     }
 
     pub fn deinit(self: *Gpu) void {
-        c.wgpuQueueRelease(self.queue);
-        c.wgpuDeviceRelease(self.device);
-        c.wgpuAdapterRelease(self.adapter);
-        c.wgpuInstanceRelease(self.instance);
+        fns.wgpuQueueRelease(self.queue);
+        fns.wgpuDeviceRelease(self.device);
+        fns.wgpuAdapterRelease(self.adapter);
+        fns.wgpuInstanceRelease(self.instance);
         self.* = undefined;
     }
 
@@ -338,7 +520,7 @@ pub const Gpu = struct {
     /// Synchronously map `buffer` (blocks via the event loop).
     pub fn mapBlocking(self: *Gpu, buffer: c.WGPUBuffer, mode: c.WGPUMapMode, offset: usize, size: usize) Error!void {
         var mreq: MapReq = .{};
-        _ = c.wgpuBufferMapAsync(buffer, mode, offset, size, .{
+        _ = fns.wgpuBufferMapAsync(buffer, mode, offset, size, .{
             .nextInChain = null,
             .mode = c.WGPUCallbackMode_AllowProcessEvents,
             .callback = onMap,
@@ -355,14 +537,14 @@ pub const Gpu = struct {
     /// all released. (Storage buffers aren't MAP_READ, hence the copy.)
     pub fn readBuffer(self: *Gpu, src: c.WGPUBuffer, src_offset: u64, dst: []u8) Error!void {
         const staging = try createBuffer(self.device, dst.len, c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst);
-        defer c.wgpuBufferRelease(staging);
+        defer fns.wgpuBufferRelease(staging);
 
-        const enc = c.wgpuDeviceCreateCommandEncoder(self.device, null);
-        c.wgpuCommandEncoderCopyBufferToBuffer(enc, src, src_offset, staging, 0, dst.len);
-        const cmd = c.wgpuCommandEncoderFinish(enc, null);
-        c.wgpuCommandEncoderRelease(enc);
-        c.wgpuQueueSubmit(self.queue, 1, &cmd);
-        c.wgpuCommandBufferRelease(cmd);
+        const enc = fns.wgpuDeviceCreateCommandEncoder(self.device, null);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, src, src_offset, staging, 0, dst.len);
+        const cmd = fns.wgpuCommandEncoderFinish(enc, null);
+        fns.wgpuCommandEncoderRelease(enc);
+        fns.wgpuQueueSubmit(self.queue, 1, &cmd);
+        fns.wgpuCommandBufferRelease(cmd);
 
         // Block until all submitted work (the compute that produced `src`, then the
         // copy above) is done. Without this, `mapBlocking`'s bounded event-pump can
@@ -370,12 +552,12 @@ pub const Gpu = struct {
         // longer than the pump's iteration budget), surfacing as a spurious map
         // timeout. Polling with wait=true makes readback robust regardless of how
         // much work was queued.
-        _ = c.wgpuDevicePoll(self.device, 1, null);
+        _ = fns.wgpuDevicePoll(self.device, 1, null);
 
         try self.mapBlocking(staging, c.WGPUMapMode_Read, 0, dst.len);
-        const mapped = c.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return Error.MapFailed;
+        const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return Error.MapFailed;
         @memcpy(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);
-        c.wgpuBufferUnmap(staging);
+        fns.wgpuBufferUnmap(staging);
     }
 };
 
@@ -384,7 +566,7 @@ pub fn createBuffer(device: c.WGPUDevice, size: u64, usage: c.WGPUBufferUsage) E
     var bd: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
     bd.usage = usage;
     bd.size = size;
-    return c.wgpuDeviceCreateBuffer(device, &bd) orelse Error.BufferCreate;
+    return fns.wgpuDeviceCreateBuffer(device, &bd) orelse Error.BufferCreate;
 }
 
 /// Create a uniform buffer (host-writable via `wgpuQueueWriteBuffer`). Uniform

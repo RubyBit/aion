@@ -26,10 +26,14 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.26"]
-# GPU is a source-build feature toggle, not a runtime dependency: this marker
-# signals intent, but the wgpu-native backend is only linked when the extension
-# is (re)built with AION_PY_GPU=1. See README ("GPU support").
-gpu = []
+# GPU support: the published `aion` wheels already contain the GPU backend (the
+# seam is compiled in), but link NO wgpu — it is loaded at runtime via dlopen.
+# `pip install aion[gpu]` pulls the `aion-wgpu` companion, which ships just the
+# wgpu-native runtime library; `aion`'s package __init__ then points the loader
+# at it. The marker skips the one target wgpu-native ships no prebuilt for
+# (linux/aarch64), where `aion[gpu]` stays CPU-only rather than failing to
+# resolve. `aion-wgpu` is versioned after the wgpu-native release it wraps.
+gpu = ["aion-wgpu>=29.0.4,<30; sys_platform != 'linux' or platform_machine != 'aarch64'"]
 
 # PEP 735 dependency groups: local dev/test environments, not package extras.
 # `uv sync` installs the `dev` group by default; use `--group test` for just the
@@ -51,12 +55,21 @@ dev = [
 ]
 
 # Persistent native-build switches for these bindings (read by tools/build_zig.py).
-# `gpu = true` links the wgpu-native GPU backend into the extension. Under uv the
-# build cache is env-blind, so this pyproject switch — not just `AION_PY_GPU` — is
-# what reliably (re)builds with GPU. The `AION_PY_GPU` env var still overrides
-# (set `0` to force CPU-only, e.g. for portable CPU wheels).
+# `gpu = true` compiles the wgpu-native GPU backend (the "seam") into the extension.
+# No wgpu is linked or bundled — it is loaded at runtime via dlopen — so this only
+# controls whether GPU code is present; the wgpu runtime itself comes from the
+# `aion-wgpu` package (`aion[gpu]`). Under uv the build cache is env-blind, so this
+# pyproject switch — not just `AION_PY_GPU` — is what reliably (re)builds with the
+# seam. `AION_PY_GPU` still overrides it (set `0` for a smaller CPU-only extension,
+# e.g. the linux/aarch64 wheel that has no wgpu prebuilt).
 [tool.aion]
 gpu = true
+
+# Dev-only: resolve the optional GPU runtime companion from the sibling directory
+# so `uv sync --extra gpu` works from a repo checkout before it is published.
+# Ignored by pip/build (they read it from PyPI); does not affect published wheels.
+[tool.uv.sources]
+aion-wgpu = { path = "aion-wgpu" }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -70,9 +83,9 @@ version = {attr = "aion.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Native artifact(s) and typing/stub metadata. `*.dll` covers the wgpu runtime
-# shipped beside the extension in GPU builds.
-aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "*.dll", "_ffi/*.h"]
+# The compiled extension module and typing/stub metadata. No wgpu runtime is
+# bundled here — it ships in the `aion-wgpu` package and is loaded at runtime.
+aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "_ffi/*.h"]
 
 [tool.pyright]
 include = ["src/aion", "type_tests"]
@@ -82,3 +95,33 @@ typeCheckingMode = "standard"
 strict = ["src/aion/_ffi", "type_tests"]
 reportMissingTypeStubs = false
 reportUnnecessaryTypeIgnoreComment = "warning"
+
+# ── Wheel building (see .github/workflows/publish.yml) ──────────────────────
+# Each wheel embeds the statically-linked Aion runtime + the GPU seam (which
+# loads wgpu-native at runtime via dlopen — nothing wgpu is linked or bundled).
+# On targets with no wgpu-native prebuilt (linux/aarch64), build.zig degrades to
+# a CPU-only build automatically, and the `aion[gpu]` extra skips `aion-wgpu`.
+[tool.cibuildwheel]
+build = "cp312-* cp313-*"
+skip = "*-musllinux_*" # musl would need a separate in-container Zig; manylinux only.
+build-frontend = "build"
+# Sanity-check the wheel imports on the target interpreter (no GPU runtime here,
+# so this exercises the CPU path and the graceful "no wgpu" fallback).
+test-command = "python -c \"import aion; print('aion', aion.__version__)\""
+
+[tool.cibuildwheel.environment]
+AION_PY_GPU = "1"          # compile the GPU seam where a wgpu prebuilt exists
+AION_PY_MULTIVERSION = "1" # portable CPU: runtime CPUID dispatch, one wheel fits all
+AION_PY_CPU = "baseline"   # conservative ISA floor for the main module
+
+# Linux wheels build in a manylinux container. Zig is installed on the host
+# (mlugg/setup-zig) and the host filesystem is visible at /host, so point the
+# build at the host zig rather than installing it inside the container.
+[tool.cibuildwheel.linux]
+environment-pass = ["HOST_ZIG"]
+
+[tool.cibuildwheel.linux.environment]
+AION_PY_GPU = "1"
+AION_PY_MULTIVERSION = "1"
+AION_PY_CPU = "baseline"
+AION_ZIG_EXE = "/host$HOST_ZIG"

@@ -713,9 +713,11 @@ fn wgpuLog(level: wgpu.c.WGPULogLevel, message: wgpu.c.WGPUStringView, _: ?*anyo
 fn run(args: std.process.Args) !void {
     const alloc = std.heap.page_allocator;
 
+    // wgpu-native is loaded at runtime; nothing here may call it until it's in.
+    try wgpu.ensureLoaded();
     // Surface wgpu-native validation/limit errors (otherwise swallowed as ExecutionFailed).
-    wgpu.c.wgpuSetLogCallback(wgpuLog, null);
-    wgpu.c.wgpuSetLogLevel(wgpu.c.WGPULogLevel_Warn);
+    wgpu.fns.wgpuSetLogCallback(wgpuLog, null);
+    wgpu.fns.wgpuSetLogLevel(wgpu.c.WGPULogLevel_Warn);
 
     var it = try args.iterateAllocator(alloc);
     defer it.deinit();

@@ -1,0 +1,10 @@
+# Staged native runtime (fetched at build time from the pinned wgpu-native
+# release; never committed). See setup.py.
+/src/aion_wgpu/*.dll
+/src/aion_wgpu/*.so
+/src/aion_wgpu/*.dylib
+
+# Build artifacts
+/build/
+/dist/
+*.egg-info/

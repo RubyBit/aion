@@ -41,23 +41,24 @@ _artifacts = _build_zig.build_aion()
 include_dirs = [str(_artifacts.include_dir)]
 extra_objects = [str(_artifacts.link_lib_path)]
 
-# GPU build: the static `aion` archive leaves wgpu symbols unresolved, so add the
-# wgpu import lib to this extension's final link. Also hand the runtime DLL(s) to
-# setup.py (via env) so it can place them next to the built extension.
-for _implib in getattr(_artifacts, "gpu_import_libs", ()):
-    extra_objects.append(str(_implib))
-_runtime_dlls = [str(p) for p in getattr(_artifacts, "runtime_dlls", ())]
-if _runtime_dlls:
-    os.environ["AION_PY_RUNTIME_DLLS"] = os.pathsep.join(_runtime_dlls)
+# GPU builds add nothing to the link: the `aion` archive references zero wgpu
+# symbols and loads wgpu-native at runtime via dlopen (shipped by the optional
+# `aion-wgpu` package). So the extension is identical whether or not GPU is on,
+# apart from the seam code compiled into the static archive.
 
 extra_compile_args: list[str] = []
 extra_link_args: list[str] = []
 libraries: list[str] = []
 
-# Linux: we link a static library into a shared module; ensure pthread flags.
+# Linux/macOS: we link a static library into a shared module; ensure pthread flags.
 if os.name == "posix":
     extra_compile_args += ["-pthread"]
     extra_link_args += ["-pthread"]
+    # The GPU seam resolves wgpu-native at runtime via dlopen/dlsym; on older
+    # glibc (e.g. manylinux2014) those live in libdl, so link it explicitly.
+    # On macOS they are in libSystem (no -ldl), so only do this on Linux.
+    if sys.platform.startswith("linux"):
+        libraries += ["dl"]
 
 # Windows: make sure the extension links the basic system import libraries.
 # (Some toolchain configurations do not pull these in implicitly for extension modules.)

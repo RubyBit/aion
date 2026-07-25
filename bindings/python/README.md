@@ -2,6 +2,16 @@
 
 Python bindings for the Aion runtime, implemented on top of Aion’s stable C ABI (`include/aion.h`).
 
+## Install
+
+```bash
+pip install aion         # CPU (prebuilt wheels; no Zig/toolchain needed)
+pip install aion[gpu]    # + optional GPU runtime (see "GPU support")
+```
+
+Wheels are published for CPython 3.12/3.13 on Windows (x64), Linux (x86_64 &
+aarch64), and macOS (arm64 & x86_64). Other platforms build from source (below).
+
 ## Build requirements (from source)
 
 Building from source requires:
@@ -137,30 +147,9 @@ converters; its ops return `aion.Value`, a builder-bound handle. The high-level
 `Tensor` lowers to it at compile time. Reach for `Builder`/`Value` only when you
 need that low-level control; otherwise `Tensor` is the front door.
 
-### GPU support (optional)
+### GPU 
 
-GPU is an **opt-in, source-build feature** (it links `wgpu-native` and ships
-`wgpu_native.dll` beside the extension). Enable it with the persistent switch in
-`pyproject.toml`:
-
-```toml
-[tool.aion]
-gpu = true
-```
-
-then rebuild: `uv sync --reinstall-package aion`. Under `uv` this pyproject switch
-is the reliable way to (re)build with GPU — uv's build cache is **env-blind**, so
-`AION_PY_GPU=1` alone won't force a rebuild once a CPU wheel is cached. The
-`AION_PY_GPU` env var still *overrides* the switch (set `AION_PY_GPU=0` to force a
-portable CPU-only build, e.g. for wheels). On a CPU-only build, GPU calls return
-`AION_UNSUPPORTED` (surfaced as `aion.AionError`).
-
-> **GPU status.** Device selection, `tensor.to`, migration round-trips, and GPU
-> model *loading* work. Running *full models* on the GPU is **experimental**: the
-> GPU backend does not yet cover every op real models use, so `model.run()` may
-> raise `AION_UNSUPPORTED`. CPU execution is the supported path today.
-
-Once built with GPU support, and with a discrete GPU present:
+With `aion[gpu]` installed and a discrete GPU present:
 
 ```python
 import aion

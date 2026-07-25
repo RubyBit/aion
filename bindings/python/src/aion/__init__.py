@@ -1,8 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os as _os
 from collections.abc import Sequence
 from typing import cast
+
+
+def _register_wgpu_runtime() -> None:
+    """Point the native GPU loader at the wgpu-native runtime, if available.
+
+    GPU support links no wgpu at build time; the runtime library ships in the
+    optional ``aion-wgpu`` package (``pip install aion[gpu]``) and is loaded on
+    demand via ``AION_WGPU_LIB``. When that package is installed and the embedder
+    hasn't already set the variable, hand its bundled library path to the loader.
+    Without it, GPU calls cleanly surface ``AION_UNSUPPORTED`` and CPU execution
+    is unaffected — so this never raises.
+    """
+    if _os.environ.get("AION_WGPU_LIB"):
+        return
+    try:
+        import importlib
+
+        # Optional companion, present only with `aion[gpu]`; resolve dynamically
+        # so it is not a hard (or type-checked) dependency of the base package.
+        path = importlib.import_module("aion_wgpu").library_path()
+    except Exception:
+        return
+    if path:
+        _os.environ["AION_WGPU_LIB"] = str(path)
+
+
+# Runs before any native GPU context can be created (import time).
+_register_wgpu_runtime()
 
 from . import nn
 from .builder import Builder, DynamicAxes, Value

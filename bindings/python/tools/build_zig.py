@@ -17,6 +17,12 @@ class ZigBuildArtifacts:
     The Python bindings always *static-link* Aion into the cffi extension module
     (`_aion_cffi.pyd` / `.so`), so there is no separate shared library to ship.
     `link_lib_path` is the static archive fed to the extension's linker.
+
+    GPU builds (`AION_PY_GPU=1`) add nothing here: wgpu-native is neither linked
+    nor bundled — the archive resolves it at runtime via dlopen (see
+    `src/aion/backend/gpu/wgpu.zig`). The wgpu runtime ships in the separate
+    `aion-wgpu` package, which `aion[gpu]` pulls in; the loader finds it via the
+    `AION_WGPU_LIB` path that `aion`'s package `__init__` sets from it.
     """
 
     repo_root: Path
@@ -26,13 +32,6 @@ class ZigBuildArtifacts:
     # Static archive linked into the extension module:
     #   Windows -> aion.lib   ·   Linux/macOS -> libaion.a
     link_lib_path: Path
-    # GPU (`AION_PY_GPU=1`) extras. Empty tuples on a CPU-only build.
-    #   gpu_import_libs: extra objects the consumer must add to its final link
-    #                    (Windows import lib for wgpu_native.dll).
-    #   runtime_dlls:    shared libs to place next to the built extension so it
-    #                    loads at runtime (Windows wgpu_native.dll).
-    gpu_import_libs: tuple[Path, ...] = ()
-    runtime_dlls: tuple[Path, ...] = ()
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -205,27 +204,13 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
     if not link_lib_path.is_file():
         raise RuntimeError(f"Expected installed static library not found: {link_lib_path}")
 
-    # GPU build extras: the wgpu import lib (link input) + runtime DLL, installed
-    # by build.zig into the prefix. Windows-only for now (Linux/macOS resolve the
-    # shared lib via the module's rpath into the zig cache).
-    gpu_import_libs: list[Path] = []
-    runtime_dlls: list[Path] = []
-    if enable_gpu and is_windows:
-        implib = prefix / "lib" / "wgpu_native.dll.lib"
-        dll = prefix / "bin" / "wgpu_native.dll"
-        if not implib.is_file():
-            raise RuntimeError(f"GPU build expected wgpu import lib not found: {implib}")
-        if not dll.is_file():
-            raise RuntimeError(f"GPU build expected wgpu runtime DLL not found: {dll}")
-        gpu_import_libs.append(implib)
-        runtime_dlls.append(dll)
-
+    # GPU builds add no link inputs and no bundled runtime: the archive references
+    # zero wgpu symbols (resolved at runtime via dlopen). `enable_gpu` only decided
+    # whether the seam was compiled in, via `-Dgpu` above.
     return ZigBuildArtifacts(
         repo_root=repo_root,
         prefix=prefix,
         include_dir=include_dir,
         header_path=header_path,
         link_lib_path=link_lib_path,
-        gpu_import_libs=tuple(gpu_import_libs),
-        runtime_dlls=tuple(runtime_dlls),
     )

@@ -20,6 +20,7 @@ const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 const Ctx = context.Ctx;
 const Frame = @import("../frame.zig").Frame;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -66,7 +67,7 @@ pub const MatMulParams = extern struct {
 };
 
 fn syncDevice(ctx: Ctx) void {
-    _ = c.wgpuDevicePoll(ctx.gpu.device, 1, null);
+    _ = fns.wgpuDevicePoll(ctx.gpu.device, 1, null);
 }
 
 /// A config is eligible only when it fits this device's limits and, for vec4
@@ -167,13 +168,13 @@ pub const Matmul = struct {
     pub fn deinit(self: *Matmul) void {
         self.tune.deinit();
         self.arena.deinit();
-        if (self.dq_scratch) |s| c.wgpuBufferRelease(s);
+        if (self.dq_scratch) |s| fns.wgpuBufferRelease(s);
     }
 
     fn ensureDqScratch(self: *Matmul, ctx: Ctx, bytes: u64) ExecuteProgramError!c.WGPUBuffer {
         if (self.dq_scratch) |s| {
             if (self.dq_scratch_cap >= bytes) return s;
-            c.wgpuBufferRelease(s);
+            fns.wgpuBufferRelease(s);
             self.dq_scratch = null;
             self.dq_scratch_cap = 0;
         }

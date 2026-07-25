@@ -18,6 +18,7 @@ const std = @import("std");
 const wgpu = @import("wgpu.zig");
 
 const c = wgpu.c;
+const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
 
 /// A WGSL kernel: a name (cache key for its module) and its embedded source.
 pub const KernelDesc = struct {
@@ -55,13 +56,13 @@ pub const Pipelines = struct {
     pub fn deinit(self: *Self) void {
         var eit = self.entries.iterator();
         while (eit.next()) |e| {
-            c.wgpuBindGroupLayoutRelease(e.value_ptr.bgl);
-            c.wgpuComputePipelineRelease(e.value_ptr.pipeline);
+            fns.wgpuBindGroupLayoutRelease(e.value_ptr.bgl);
+            fns.wgpuComputePipelineRelease(e.value_ptr.pipeline);
             self.allocator.free(e.key_ptr.*);
         }
         self.entries.deinit();
         var mit = self.modules.valueIterator();
-        while (mit.next()) |m| c.wgpuShaderModuleRelease(m.*);
+        while (mit.next()) |m| fns.wgpuShaderModuleRelease(m.*);
         self.modules.deinit();
         self.* = undefined;
     }
@@ -73,7 +74,7 @@ pub const Pipelines = struct {
         w.code = wgpu.strv(kernel.wgsl);
         var smd: c.WGPUShaderModuleDescriptor = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
         smd.nextInChain = &w.chain;
-        const m = c.wgpuDeviceCreateShaderModule(self.gpu.device, &smd) orelse return error.ExecutionFailed;
+        const m = fns.wgpuDeviceCreateShaderModule(self.gpu.device, &smd) orelse return error.ExecutionFailed;
         self.modules.put(kernel.name, m) catch return error.ExecutionFailed;
         return m;
     }
@@ -88,23 +89,23 @@ pub const Pipelines = struct {
         var cpd: c.WGPUComputePipelineDescriptor = std.mem.zeroes(c.WGPUComputePipelineDescriptor);
         cpd.compute.module = module;
         cpd.compute.entryPoint = wgpu.strv(entry);
-        const pipeline = c.wgpuDeviceCreateComputePipeline(self.gpu.device, &cpd) orelse return error.ExecutionFailed;
+        const pipeline = fns.wgpuDeviceCreateComputePipeline(self.gpu.device, &cpd) orelse return error.ExecutionFailed;
 
         // Reflect the auto-derived layout once and cache it.
-        const bgl = c.wgpuComputePipelineGetBindGroupLayout(pipeline, 0) orelse {
-            c.wgpuComputePipelineRelease(pipeline);
+        const bgl = fns.wgpuComputePipelineGetBindGroupLayout(pipeline, 0) orelse {
+            fns.wgpuComputePipelineRelease(pipeline);
             return error.ExecutionFailed;
         };
         const built: Built = .{ .pipeline = pipeline, .bgl = bgl, .kernel_name = kernel.name, .entry_name = entry };
         const owned_key = self.allocator.dupe(u8, key) catch {
-            c.wgpuBindGroupLayoutRelease(bgl);
-            c.wgpuComputePipelineRelease(pipeline);
+            fns.wgpuBindGroupLayoutRelease(bgl);
+            fns.wgpuComputePipelineRelease(pipeline);
             return error.ExecutionFailed;
         };
         self.entries.put(owned_key, built) catch {
             self.allocator.free(owned_key);
-            c.wgpuBindGroupLayoutRelease(bgl);
-            c.wgpuComputePipelineRelease(pipeline);
+            fns.wgpuBindGroupLayoutRelease(bgl);
+            fns.wgpuComputePipelineRelease(pipeline);
             return error.ExecutionFailed;
         };
         return built;

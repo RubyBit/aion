@@ -15,7 +15,7 @@ fn runSmallModel(
     a_t: api.Tensor,
     b_t: api.Tensor,
 ) !f32 {
-    var bld = api.Builder.init(ctx.allocator);
+    var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
     const A = try bld.param(a_t);
@@ -68,7 +68,7 @@ test "api: gpu model output matches cpu model (compileOn)" {
 /// device-resident across steps instead of flushing it each run, and reading it
 /// back below goes through the on-demand `syncToHost`.
 fn runKvCacheSteps(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
-    var bld = api.Builder.init(ctx.allocator);
+    var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
     const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 2 }), "cache");
@@ -130,7 +130,7 @@ test "api: gpu kv-cache decode carries device-resident state (matches cpu)" {
 /// SequenceAppend, `state + delta` produces a distinct output tensor, so every
 /// run must copy that result back into the device-resident state slot.
 fn runNonInPlaceStateSteps(ctx: *api.Context, dev: api.DeviceSelector) ![4]f32 {
-    var bld = api.Builder.init(ctx.allocator);
+    var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
     const State = try bld.name(try bld.input(.f32, &[_]usize{4}), "state");
@@ -177,7 +177,7 @@ test "api: non-in-place recurrent state carries on gpu without host-only copy" {
 /// Grow-on-demand decode on `dev`: cache starts at capacity 2 and the runtime
 /// grows its slot as appends cross capacity (up to 8). Returns the final cache.
 fn runGrowableDecode(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
-    var bld = api.Builder.init(ctx.allocator);
+    var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
     const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");
@@ -250,7 +250,7 @@ test "api: device growth is frame-safe with an in-frame cache read" {
     };
     defer ctx.deinit();
 
-    var bld = api.Builder.init(ctx.allocator);
+    var bld = api.Builder.init(&ctx);
     defer bld.deinit();
 
     const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");

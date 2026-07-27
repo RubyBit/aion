@@ -1130,7 +1130,7 @@ pub export fn aion_builder_create(ctx_opt: ?*AionContext, out_builder: ?*?*AionB
     };
     b.* = .{
         .owner = ctx,
-        .builder = api.Builder.init(ctx.allocator),
+        .builder = api.Builder.init(&ctx.ctx),
         .str_arena = std.heap.ArenaAllocator.init(ctx.allocator),
     };
     out_builder.?.* = b;
@@ -1197,6 +1197,186 @@ pub export fn aion_builder_name(b_opt: ?*AionBuilder, value: AionValueId, name: 
     return .AION_OK;
 }
 
+/// Bind a weight under a semantic, scope-qualified name (`layers.3/attn/weight`).
+///
+/// Unlike `aion_builder_param`, whose generated name is positional and shifts when
+/// construction order changes, this produces the stable key that load/swap-by-name
+/// depends on.
+pub export fn aion_builder_param_named(
+    b_opt: ?*AionBuilder,
+    tensor: ?*const AionTensor,
+    name: ?[*:0]const u8,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    const t: *const AionTensor = tensor orelse return .AION_INVALID_ARGUMENT;
+    if (name == null or out_value == null) return .AION_INVALID_ARGUMENT;
+
+    const ref = b.builder.paramNamed(t.tensor, std.mem.span(name.?)) catch |e| {
+        b.owner.setLastError("builder_param_named", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+// --- scopes ------------------------------------------------------------------
+// Scopes nest, so a module tree produces `state_dict`-style parameter paths.
+// `begin_*` hands back the depth it opened at; pass that to `end_scope`, which
+// closes every scope at or below it (so an early return cannot leak a level).
+
+pub export fn aion_builder_begin_scope(
+    b_opt: ?*AionBuilder,
+    name: ?[*:0]const u8,
+    out_depth: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (name == null) return .AION_INVALID_ARGUMENT;
+
+    const scope = b.builder.beginScope(std.mem.span(name.?)) catch |e| {
+        b.owner.setLastError("builder_begin_scope", e);
+        return mapError(e);
+    };
+    if (out_depth) |o| o.* = scope.depth;
+    return .AION_OK;
+}
+
+/// Open a scope named `{base}#{n}`, numbered per parent scope. The resolved
+/// segment is written to `buf` when provided.
+pub export fn aion_builder_begin_auto_scope(
+    b_opt: ?*AionBuilder,
+    base: ?[*:0]const u8,
+    out_depth: ?*usize,
+    buf: [*c]u8,
+    cap: usize,
+    out_len: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (base == null) return .AION_INVALID_ARGUMENT;
+
+    const scope = b.builder.beginAutoScope(std.mem.span(base.?)) catch |e| {
+        b.owner.setLastError("builder_begin_auto_scope", e);
+        return mapError(e);
+    };
+    if (out_depth) |o| o.* = scope.depth;
+    copyStringToBuf(scope.name, buf, cap, out_len);
+    return .AION_OK;
+}
+
+pub export fn aion_builder_end_scope(b_opt: ?*AionBuilder, depth: usize) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.builder.endScopeAtDepth(depth);
+    return .AION_OK;
+}
+
+pub export fn aion_builder_scope_path(
+    b_opt: ?*const AionBuilder,
+    buf: [*c]u8,
+    cap: usize,
+    out_len: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    copyStringToBuf(b.builder.scopePath(), buf, cap, out_len);
+    return .AION_OK;
+}
+
+// --- synthesized constants ----------------------------------------------------
+// Several ops require an operand where the maths wants a number. These bind (and
+// cache) that operand, so a model that needs the same identity vector or scalar in
+// many layers pays for one.
+
+/// A cached one-element f32 constant, for scalar affine through the broadcast op.
+pub export fn aion_builder_constant(
+    b_opt: ?*AionBuilder,
+    value: f32,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+
+    const ref = b.builder.constant(value) catch |e| {
+        b.owner.setLastError("builder_constant", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+/// A cached `[dim]` f32 vector filled with `fill` — the identity `gamma` (1.0) or
+/// `beta` (0.0) of a norm.
+pub export fn aion_builder_filled_vec(
+    b_opt: ?*AionBuilder,
+    dim: usize,
+    fill: f32,
+    out_value: ?*AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_value == null) return .AION_INVALID_ARGUMENT;
+
+    const ref = (if (fill == 0.0) b.builder.zeros(dim) else if (fill == 1.0) b.builder.ones(dim) else {
+        b.owner.setLastError("builder_filled_vec", error.InvalidArgument);
+        return .AION_INVALID_ARGUMENT;
+    }) catch |e| {
+        b.owner.setLastError("builder_filled_vec", e);
+        return mapError(e);
+    };
+    out_value.?.* = ref.value;
+    return .AION_OK;
+}
+
+/// 0 = not a bound parameter, 1 = a user-supplied weight, 2 = a synthesized
+/// constant. Distinguishes model state from operands the Builder had to invent.
+pub export fn aion_builder_param_kind(
+    b_opt: ?*const AionBuilder,
+    value: AionValueId,
+    out_kind: ?*u32,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (out_kind == null) return .AION_INVALID_ARGUMENT;
+    out_kind.?.* = switch (b.builder.paramKind(vref(value)) orelse {
+        out_kind.?.* = 0;
+        return .AION_OK;
+    }) {
+        .user => 1,
+        .synthesized => 2,
+    };
+    return .AION_OK;
+}
+
+/// The debug name attached to a value, or empty when it has none.
+///
+/// This is the name that lands in the package and that load/swap-by-name uses, so
+/// reading it back is how a caller sees a model's parameter paths without
+/// recomputing them.
+pub export fn aion_builder_value_name(
+    b_opt: ?*const AionBuilder,
+    value: AionValueId,
+    buf: [*c]u8,
+    cap: usize,
+    out_len: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    copyStringToBuf(b.builder.valueName(vref(value)) orelse "", buf, cap, out_len);
+    return .AION_OK;
+}
+
+/// Whether the graph binds a parameter under `name`, of either kind.
+pub export fn aion_builder_has_param_named(
+    b_opt: ?*const AionBuilder,
+    name: ?[*:0]const u8,
+    out_found: ?*u8,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (name == null or out_found == null) return .AION_INVALID_ARGUMENT;
+    out_found.?.* = if (b.builder.hasParamNamed(std.mem.span(name.?))) 1 else 0;
+    return .AION_OK;
+}
+
 /// Authoring-time shape introspection (available thanks to eager per-op
 /// inference). Shapes reflect the authoring *placeholder* sizes: an axis declared
 /// dynamic reports the size it was declared with, propagated through derived
@@ -1215,6 +1395,48 @@ pub export fn aion_builder_value_shape(b_opt: ?*const AionBuilder, value: AionVa
     const shape = b.builder.knownShape(vref(value)) orelse return .AION_INVALID_ARGUMENT;
     if (out_rank != shape.len) return .AION_INVALID_ARGUMENT;
     @memcpy(out_dims[0..out_rank], shape);
+    return .AION_OK;
+}
+
+/// The dim symbol on `value`'s `axis`, if that axis is free.
+///
+/// Writes the NUL-terminated name into `buf` (truncated to `cap`) and its full
+/// length into `out_len`, like the other string readers. An axis with a fixed size
+/// yields an empty name and length 0 — a normal answer, not an error.
+///
+/// This is how a binding builds a shape that keeps its input's free axes without
+/// re-tracking symbols on its own side: ask, then pass the answer back to a view op.
+pub export fn aion_builder_value_dim_symbol(
+    b_opt: ?*const AionBuilder,
+    value: AionValueId,
+    axis: usize,
+    buf: [*c]u8,
+    cap: usize,
+    out_len: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    const dim = b.builder.dimAt(vref(value), axis) catch return .AION_INVALID_ARGUMENT;
+    copyStringToBuf(switch (dim) {
+        .size => "",
+        .symbol => |s| s,
+    }, buf, cap, out_len);
+    return .AION_OK;
+}
+
+/// The authoring placeholder size of a declared dim symbol.
+///
+/// A free axis still needs a concrete size to author with; this is where a caller
+/// that wants to build a symbolic view dim gets one, so the placeholder is only
+/// ever recorded in one place — the builder that took the declaration.
+pub export fn aion_builder_symbol_size(
+    b_opt: ?*const AionBuilder,
+    name: ?[*:0]const u8,
+    out_size: ?*usize,
+) callconv(.c) AionStatus {
+    const b: *const AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    if (name == null or out_size == null) return .AION_INVALID_ARGUMENT;
+    // Undeclared is a caller error, same as it is on the Zig side.
+    out_size.?.* = b.builder.symbolSize(std.mem.span(name.?)) orelse return .AION_INVALID_ARGUMENT;
     return .AION_OK;
 }
 
@@ -1572,6 +1794,20 @@ pub export fn aion_builder_mark_output(b_opt: ?*AionBuilder, value: AionValueId,
         b.owner.setLastError("mark_output", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
+    return .AION_OK;
+}
+
+/// Forget every output marked so far.
+///
+/// `mark_output` accumulates, so without this "compile exactly these outputs" is
+/// not expressible: a second compile of the same builder carries the first one's
+/// outputs too. Callers that pass an explicit output set clear first, which is
+/// also what lets a single value be compiled and evaluated on a builder that is
+/// still being authored.
+pub export fn aion_builder_clear_outputs(b_opt: ?*AionBuilder) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    b.outputs.clearRetainingCapacity();
     return .AION_OK;
 }
 

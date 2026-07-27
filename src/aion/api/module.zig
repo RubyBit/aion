@@ -25,10 +25,16 @@ pub fn moduleTypeName(comptime T: type) []const u8 {
     return full[dot + 1 ..];
 }
 
-/// Begin an inferred module scope for type `T` unless a user-defined module
-/// scope is already active.
+/// Begin a module scope for type `T`, nested inside any enclosing scope.
+///
+/// `explicit_name` overrides the *segment* name (use it to get `layers.3` instead
+/// of `Linear#7`); it does not suppress the scope. Scopes nest, so composing
+/// modules yields `state_dict`-style paths.
+///
+/// Still returns an optional so existing
+/// `const scope = try beginModuleScope(...); defer endModuleScope(bld, scope);`
+/// call sites compile unchanged — it simply never returns `null` now.
 pub fn beginModuleScope(comptime T: type, bld: *Builder, explicit_name: ?[]const u8) Builder.Error!?Builder.Scope {
-    if (bld.hasActiveScope()) return null;
     if (explicit_name) |n| return try bld.beginScope(n);
     return try bld.beginAutoScope(moduleTypeName(T));
 }
@@ -87,6 +93,12 @@ pub const ModuleDyn = struct {
         name: *const fn (ctx: *const anyopaque) []const u8,
         forward: *const fn (ctx: *anyopaque, bld: *Builder, input: TensorRef) ForwardError!TensorRef,
         deinit: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void = null,
+
+        /// Set when `forward` already opens its own module scope, so `ModuleDyn`
+        /// must not add a second one. `moduleDynFrom` sets it (the module it wraps
+        /// scopes itself via `beginModuleScope`); hand-written vtables leave it
+        /// false and get an auto-scope named after `name()`.
+        self_scoping: bool = false,
     };
 
     const Self = @This();
@@ -100,11 +112,10 @@ pub const ModuleDyn = struct {
     }
 
     pub fn forward(self: *Self, bld: *Builder, input: TensorRef) ForwardError!TensorRef {
-        if (!bld.hasActiveScope()) {
-            const scope: Builder.Scope = try bld.beginAutoScope(self.name());
-            defer bld.endScope(scope);
-            return self.vtable.forward(self.ctx, bld, input);
-        }
+        if (self.vtable.self_scoping) return self.vtable.forward(self.ctx, bld, input);
+
+        const scope: Builder.Scope = try bld.beginAutoScope(self.name());
+        defer bld.endScope(scope);
         return self.vtable.forward(self.ctx, bld, input);
     }
 
@@ -151,6 +162,8 @@ pub fn moduleDynFrom(comptime T: type, module: *T) ModuleDyn {
             .name = name,
             .forward = forward,
             .deinit = null,
+            // `T.forward` opens its own scope; don't wrap it in a second one.
+            .self_scoping = true,
         };
     };
 

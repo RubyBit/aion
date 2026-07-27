@@ -1,7 +1,7 @@
 """Static contract tests; this module is checked by Pyright, not executed."""
 from typing import assert_type
 
-from aion import AionDType, Builder, Context, LoadedModel, Tensor, Value
+from aion import AionDType, Builder, Context, LoadedModel, Tensor, TensorRef
 from aion.tensor import TensorData
 from aion._ffi import ContextHandle, ModelHandle, TensorHandle
 
@@ -20,7 +20,7 @@ assert_type(tensor.to("cpu"), Tensor)
 
 builder = Builder(ctx)
 value = builder.input((2, 3))
-assert_type(value, Value)
+assert_type(value, TensorRef)
 assert_type(value.shape, tuple[int, ...])
 assert_type(value.dtype, AionDType)
 

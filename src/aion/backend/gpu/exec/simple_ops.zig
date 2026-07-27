@@ -128,11 +128,18 @@ pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) Exec
 /// row. b's 1-D tiling matches out's last-dim tiling (compile-validated), so out
 /// tile (.., ti_last) pairs with b tile ti_last. Tiles must be fully packed (the
 /// kernel decomposes a flat index with `% cols`).
+///
+/// A single-element b is a scalar broadcast over every column: it is one tile, so
+/// it pairs with every out tile, and passing `cols = 1` makes the kernel's
+/// `b[i % cols]` read `b[0]`.
 pub fn execBroadcastLastDim(ctx: Ctx, frame: *Frame, s: executable.StepBroadcastLastDimBinaryTiled) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
     try requireF32(meta.dtype);
     if (meta.rank < 2) return error.Unsupported;
+
+    const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
+    const b_scalar: bool = (b_meta.rank == 1 and b_meta.shape[0] == 1);
 
     const entry: [:0]const u8 = switch (s.op) {
         .add => "bcast_add",
@@ -151,7 +158,7 @@ pub fn execBroadcastLastDim(ctx: Ctx, frame: *Frame, s: executable.StepBroadcast
         const ti_last = coords[@as(usize, meta.rank) - 1];
 
         const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, ti_last) catch return error.ExecutionFailed;
+        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, if (b_scalar) 0 else ti_last) catch return error.ExecutionFailed;
         const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         defer {
             hs.releaseConst(da.token);
@@ -164,7 +171,7 @@ pub fn execBroadcastLastDim(ctx: Ctx, frame: *Frame, s: executable.StepBroadcast
 
         const n = context.packedElems(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)]) orelse return error.Unsupported;
         const a_n = context.packedElems(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
-        const cols: u32 = std.math.cast(u32, dout.shape_mem[@as(usize, dout.rank) - 1]) orelse return error.Unsupported;
+        const cols: u32 = if (b_scalar) 1 else (std.math.cast(u32, dout.shape_mem[@as(usize, dout.rank) - 1]) orelse return error.Unsupported);
         if (a_n != n or db.shape_mem[0] < cols) return error.Unsupported;
 
         const bufs = [_]c.WGPUBuffer{

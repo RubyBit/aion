@@ -249,3 +249,47 @@ pub fn encodeTileIndex(meta: TensorMeta, coords: []const usize) StoreError!usize
     }
     return idx;
 }
+
+/// Rank ceiling for the inline coordinate buffers below, matching `graph.MAX_RANK`.
+pub const max_rank: usize = 8;
+
+/// Tile index of the operand tile an output tile reads, for an operand that
+/// broadcasts into the output's tile grid.
+///
+/// `leading` is the output tile's coordinates over the dims the operand broadcasts
+/// across; `inner` is the operand's own innermost coordinates, which the caller
+/// supplies because they need not be the output's (a matmul reads `B` at
+/// `[.., k, n]` while writing `C` at `[.., m, n]`).
+///
+/// Broadcasting is right-aligned, and a dim the operand *does not have* behaves
+/// exactly like one it has as size 1. That extension to rank is what lets a
+/// `[K, N]` weight serve a `[batch, seq, K]` activation as-is. It matters beyond
+/// convenience: the alternative — rank-padding the weight with a view op — is a
+/// materializing copy that quantized tensors cannot express at all, and it replaces
+/// an externally-bound weight with a node result, costing it eligibility for
+/// horizontal matmul fusion.
+///
+/// Every tiled kernel resolves its broadcast operands through this, so the rule is
+/// stated once instead of per operand per backend.
+pub fn broadcastTileIndex(
+    meta: TensorMeta,
+    leading: []const usize,
+    inner: []const usize,
+) StoreError!usize {
+    const rank: usize = meta.tile_counts.len;
+    if (rank == 0 or rank > max_rank) return StoreError.InvalidArgument;
+    if (meta.shape.len != rank or inner.len > rank) return StoreError.InvalidArgument;
+
+    const broadcast_dims: usize = rank - inner.len;
+    if (broadcast_dims > leading.len) return StoreError.InvalidArgument;
+    const offset: usize = leading.len - broadcast_dims;
+
+    var coords: [max_rank]usize = @splat(0);
+    var d: usize = 0;
+    while (d < broadcast_dims) : (d += 1) {
+        coords[d] = if (meta.shape[d] == 1) 0 else leading[d + offset];
+    }
+    @memcpy(coords[broadcast_dims..rank], inner);
+
+    return encodeTileIndex(meta, coords[0..rank]);
+}

@@ -196,7 +196,11 @@ fn fuseSet(
     remap: *std.AutoHashMap(ValueId, ValueId),
 ) Error!void {
     const head = set[0];
-    const rank = head.rank;
+    // The weight's rank and the output's need not agree: a `[K, N]` weight broadcasts
+    // into a `[batch, seq, K]` activation, so the concatenation is shaped by the
+    // former and the replacement matmul and slices by the latter.
+    const head_out = graph.values.items[@intCast(head.out_id)];
+    const out_rank: usize = head_out.shape.len;
 
     // Concatenate the weights along N (cached on the store across recompiles).
     const sources: []TensorId = try allocator.alloc(TensorId, set.len);
@@ -213,11 +217,10 @@ fn fuseSet(
     const w_vid = try newValue(graph, head.dtype, w_t.shape, @intCast(w_cat));
 
     // Cat matmul output: same as any member output but with last dim = ΣN.
-    const head_out = graph.values.items[@intCast(head.out_id)];
     var cat_shape: [MAX_RANK]usize = undefined;
-    @memcpy(cat_shape[0..rank], head_out.shape);
-    cat_shape[rank - 1] = sum_n;
-    const cat_vid = try newValue(graph, head_out.dtype.?, cat_shape[0..rank], null);
+    @memcpy(cat_shape[0..out_rank], head_out.shape);
+    cat_shape[out_rank - 1] = sum_n;
+    const cat_vid = try newValue(graph, head_out.dtype.?, cat_shape[0..out_rank], null);
 
     // Replacement nodes: one wide matmul + one slice per original output.
     const nodes = try allocator.alloc(Node, 1 + set.len);
@@ -235,10 +238,10 @@ fn fuseSet(
         const slice_vid = try newValue(graph, out_v.dtype.?, out_v.shape, null);
 
         var starts: [MAX_RANK]usize = .{0} ** MAX_RANK;
-        starts[rank - 1] = offset;
+        starts[out_rank - 1] = offset;
         nodes[idx + 1] = .{
             .op = .{ .ViewSliceND = .{
-                .starts = try arenaUsize(graph, starts[0..rank]),
+                .starts = try arenaUsize(graph, starts[0..out_rank]),
                 .lens = try arenaUsize(graph, out_v.shape),
             } },
             .inputs = try arenaIds(graph, &[_]ValueId{cat_vid}),

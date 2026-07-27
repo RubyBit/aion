@@ -85,43 +85,41 @@ const TinySileroForward = struct {
     c: TensorRef,
 };
 
-fn loadTinySileroWeights(weights: *api.Weights) !TinySileroWeights {
+/// Where the parameters come from: tensors already in hand, or a package to read
+/// them out of by name.
+const WeightSource = union(enum) {
+    tensors: TinySileroWeights,
+    package: []const u8,
+};
+
+/// The synthetic tensors, arranged into the model's parameter tree.
+///
+/// This is the only place the two sources meet: after it, one `bind` serves both,
+/// because a layer only ever asks for the fields its own `Weights` declares.
+fn weightTree(w: TinySileroWeights) TinySileroVAD.Weights {
     return .{
-        .stft_w = try weights.initializerTensorByDebugName("stft_w"),
-
-        .conv1_w = try weights.initializerTensorByDebugName("conv1_w"),
-        .conv1_b = try weights.initializerTensorByDebugName("conv1_b"),
-        .conv2_w = try weights.initializerTensorByDebugName("conv2_w"),
-        .conv2_b = try weights.initializerTensorByDebugName("conv2_b"),
-        .conv3_w = try weights.initializerTensorByDebugName("conv3_w"),
-        .conv3_b = try weights.initializerTensorByDebugName("conv3_b"),
-        .conv4_w = try weights.initializerTensorByDebugName("conv4_w"),
-        .conv4_b = try weights.initializerTensorByDebugName("conv4_b"),
-
-        .lstm_w_ih = try weights.initializerTensorByDebugName("lstm_w_ih"),
-        .lstm_w_hh = try weights.initializerTensorByDebugName("lstm_w_hh"),
-        .lstm_b_ih = try weights.initializerTensorByDebugName("lstm_b_ih"),
-        .lstm_b_hh = try weights.initializerTensorByDebugName("lstm_b_hh"),
-
-        .final_w = try weights.initializerTensorByDebugName("final_w"),
-        .final_b = try weights.initializerTensorByDebugName("final_b"),
+        .stft_conv = .{ .weight = w.stft_w },
+        .conv1 = .{ .weight = w.conv1_w, .bias = w.conv1_b },
+        .conv2 = .{ .weight = w.conv2_w, .bias = w.conv2_b },
+        .conv3 = .{ .weight = w.conv3_w, .bias = w.conv3_b },
+        .conv4 = .{ .weight = w.conv4_w, .bias = w.conv4_b },
+        .lstm = .{
+            .weight_ih = w.lstm_w_ih,
+            .weight_hh = w.lstm_w_hh,
+            .bias_ih = w.lstm_b_ih,
+            .bias_hh = w.lstm_b_hh,
+        },
+        .final_conv = .{ .weight = w.final_w, .bias = w.final_b },
     };
-}
-
-fn loadTinySileroWeightsFromPath(ctx: *api.Context, path: []const u8) !TinySileroWeights {
-    var weights: api.Weights = try ctx.loadWeightsPath(path, .{});
-    defer weights.deinit();
-    return loadTinySileroWeights(&weights);
 }
 
 fn buildTinySileroModel(
     ctx: *api.Context,
-    allocator: std.mem.Allocator,
-    weights: TinySileroWeights,
+    source: WeightSource,
     pad_mode: types.PadMode,
     chunk_input_len: usize,
 ) !api.Model {
-    var bld: Builder = api.Builder.init(allocator);
+    var bld: Builder = api.Builder.init(ctx);
     defer bld.deinit();
 
     // x is a real per-chunk input; h/c are recurrent state declared as public
@@ -131,7 +129,36 @@ fn buildTinySileroModel(
     const h_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.h);
     const c_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.c);
 
-    const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
+    // The package view owns the loaded tensors, so it has to stay open until the
+    // builder that binds them is done.
+    var weights_opt: ?api.Weights = null;
+    defer if (weights_opt) |*w| w.deinit();
+
+    // Both branches end at a `Params`, so the model is built by one `bind` call.
+    // The source object has to outlive that call, hence the locals.
+    var tensors: nn.Source(TinySileroVAD.Weights) = undefined;
+    var pkg: nn.Package = undefined;
+
+    const params: nn.Params = switch (source) {
+        .tensors => |w| blk: {
+            tensors = .from(weightTree(w));
+            break :blk tensors.auto();
+        },
+        .package => |path| blk: {
+            weights_opt = try ctx.loadWeightsPath(path, .{});
+            pkg = nn.Package.init(&weights_opt.?);
+            break :blk pkg.auto();
+        },
+    };
+
+    const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, params, pad_mode);
+
+    if (source == .package) {
+        // Catch a package carrying weights this architecture has no slot for,
+        // rather than silently ignoring them.
+        try pkg.expectAllLoaded(&bld);
+    }
+
     const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref });
 
     // Name the outputs so they can be read by name and referenced by io-aliases,
@@ -165,82 +192,60 @@ const TinySileroVAD = struct {
 
     const Self = @This();
 
-    pub fn bind(bld: *Builder, weights: TinySileroWeights, pad_mode: types.PadMode) Builder.Error!Self {
-        const stft_conv: nn.Conv1D = try nn.Conv1D.bind(bld, weights.stft_w, null, .{
-            .stride = 128,
-            .dilation = 1,
-            .pad_left = 0,
-            .pad_right = 64,
-            .pad_mode = pad_mode,
-            .groups = 1,
-        });
+    /// Per-layer convolution settings.
+    const Config = struct {
+        stft: nn.Conv1D.Options,
+        conv1: nn.Conv1D.Options,
+        conv2: nn.Conv1D.Options,
+        conv3: nn.Conv1D.Options,
+        conv4: nn.Conv1D.Options,
+        final: nn.Conv1D.Options,
 
-        const conv1: nn.Conv1D = try nn.Conv1D.bind(bld, weights.conv1_w, weights.conv1_b, .{
-            .stride = 1,
-            .dilation = 1,
-            .pad_left = 1,
-            .pad_right = 1,
-            .pad_mode = .zero,
-            .groups = 1,
-        });
-        const conv2: nn.Conv1D = try nn.Conv1D.bind(bld, weights.conv2_w, weights.conv2_b, .{
-            .stride = 2,
-            .dilation = 1,
-            .pad_left = 1,
-            .pad_right = 1,
-            .pad_mode = .zero,
-            .groups = 1,
-        });
-        const conv3: nn.Conv1D = try nn.Conv1D.bind(bld, weights.conv3_w, weights.conv3_b, .{
-            .stride = 2,
-            .dilation = 1,
-            .pad_left = 1,
-            .pad_right = 1,
-            .pad_mode = .zero,
-            .groups = 1,
-        });
-        const conv4: nn.Conv1D = try nn.Conv1D.bind(bld, weights.conv4_w, weights.conv4_b, .{
-            .stride = 1,
-            .dilation = 1,
-            .pad_left = 1,
-            .pad_right = 1,
-            .pad_mode = .zero,
-            .groups = 1,
-        });
+        fn init(pad_mode: types.PadMode) Config {
+            const mid: nn.Conv1D.Options = .{ .pad_left = 1, .pad_right = 1 };
+            return .{
+                .stft = .{ .stride = 128, .pad_right = 64, .pad_mode = pad_mode },
+                .conv1 = .{ .stride = 1, .pad_left = mid.pad_left, .pad_right = mid.pad_right },
+                .conv2 = .{ .stride = 2, .pad_left = mid.pad_left, .pad_right = mid.pad_right },
+                .conv3 = .{ .stride = 2, .pad_left = mid.pad_left, .pad_right = mid.pad_right },
+                .conv4 = .{ .stride = 1, .pad_left = mid.pad_left, .pad_right = mid.pad_right },
+                .final = .{},
+            };
+        }
+    };
 
-        if (weights.lstm_w_ih.shape.len != 2 or weights.lstm_w_hh.shape.len != 2) return Builder.Error.InvalidArgument;
-        const input_size: usize = weights.lstm_w_ih.shape[0];
-        const gate_dim: usize = weights.lstm_w_ih.shape[1];
-        if (input_size != 128 or gate_dim != 512) return Builder.Error.InvalidArgument;
-        if (weights.lstm_w_hh.shape[0] != 128 or weights.lstm_w_hh.shape[1] != 512) return Builder.Error.InvalidArgument;
-        if (weights.lstm_b_ih.shape.len != 1 or weights.lstm_b_ih.shape[0] != 512) return Builder.Error.InvalidArgument;
-        if (weights.lstm_b_hh.shape.len != 1 or weights.lstm_b_hh.shape[0] != 512) return Builder.Error.InvalidArgument;
+    /// This model's parameters, exactly as `nn` layers declare their own: a field
+    /// per sub-layer, whose type says what that sub-layer needs. A composite model
+    /// is not a special case — it is one more node in the same tree.
+    pub const Weights = struct {
+        stft_conv: nn.Conv1D.Weights,
+        conv1: nn.Conv1D.Weights,
+        conv2: nn.Conv1D.Weights,
+        conv3: nn.Conv1D.Weights,
+        conv4: nn.Conv1D.Weights,
+        lstm: nn.LSTMCell.Weights,
+        final_conv: nn.Conv1D.Weights,
+    };
 
-        const lstm_cell: nn.LSTMCell = try nn.LSTMCell.bind(
-            bld,
-            weights.lstm_w_ih,
-            weights.lstm_w_hh,
-            weights.lstm_b_ih,
-            weights.lstm_b_hh,
-        );
+    /// One constructor, whatever the weights come from.
+    ///
+    /// `params` is either a `Weights` literal over tensors in hand or a
+    /// `nn.Package` source over a loaded `.aion`. Each child is named through
+    /// `Weights` below, so the scope a layer is stored under and the key it is
+    /// looked up by are the same field and cannot disagree.
+    pub fn bind(bld: *Builder, params: anytype, pad_mode: types.PadMode) nn.BindError!Self {
+        var src = nn.binding(Weights, params);
+        const p: nn.Params = src.params();
 
-        const final_conv: nn.Conv1D = try nn.Conv1D.bind(bld, weights.final_w, weights.final_b, .{
-            .stride = 1,
-            .dilation = 1,
-            .pad_left = 0,
-            .pad_right = 0,
-            .pad_mode = .zero,
-            .groups = 1,
-        });
-
+        const cfg = Config.init(pad_mode);
         return .{
-            .stft_conv = stft_conv,
-            .conv1 = conv1,
-            .conv2 = conv2,
-            .conv3 = conv3,
-            .conv4 = conv4,
-            .lstm_cell = lstm_cell,
-            .final_conv = final_conv,
+            .stft_conv = try nn.Conv1D.bind(bld, p.child(Weights, .stft_conv), cfg.stft),
+            .conv1 = try nn.Conv1D.bind(bld, p.child(Weights, .conv1), cfg.conv1),
+            .conv2 = try nn.Conv1D.bind(bld, p.child(Weights, .conv2), cfg.conv2),
+            .conv3 = try nn.Conv1D.bind(bld, p.child(Weights, .conv3), cfg.conv3),
+            .conv4 = try nn.Conv1D.bind(bld, p.child(Weights, .conv4), cfg.conv4),
+            .lstm_cell = try nn.LSTMCell.bind(bld, p.child(Weights, .lstm), .{}),
+            .final_conv = try nn.Conv1D.bind(bld, p.child(Weights, .final_conv), cfg.final),
         };
     }
 
@@ -482,18 +487,18 @@ fn createSyntheticWeights(ctx: *api.Context, allocator: std.mem.Allocator) !Tiny
 
 fn exportTinySileroPackage(
     ctx: *api.Context,
-    allocator: std.mem.Allocator,
     weights: TinySileroWeights,
     chunk_input_len: usize,
     pad_mode: types.PadMode,
     file: std.Io.File,
 ) !void {
-    var bld: Builder = api.Builder.init(allocator);
+    var bld: Builder = api.Builder.init(ctx);
     defer bld.deinit();
 
     const x_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, chunk_input_len }), ModelTensorNames.x);
     const h_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.h);
     const c_ref: TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 128 }), ModelTensorNames.c);
+
 
     const tiny: TinySileroVAD = try TinySileroVAD.bind(&bld, weights, pad_mode);
     const out: TinySileroForward = try tiny.forward(&bld, x_ref, .{ .h = h_ref, .c = c_ref });
@@ -764,15 +769,15 @@ fn mainImpl(args: std.process.Args) !void {
     var ctx: api.Context = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    const tiny_weights: TinySileroWeights = if (opts.weights_path) |p| blk: {
+    const source: WeightSource = if (opts.weights_path) |p| blk: {
         std.debug.print("weights: loading weights-only .aion from {s}\n", .{p});
-        break :blk try loadTinySileroWeightsFromPath(&ctx, p);
+        break :blk .{ .package = p };
     } else blk: {
         std.debug.print("weights: using deterministic synthetic weights\n", .{});
-        break :blk try createSyntheticWeights(&ctx, allocator);
+        break :blk .{ .tensors = try createSyntheticWeights(&ctx, allocator) };
     };
 
-    var model: api.Model = try buildTinySileroModel(&ctx, allocator, tiny_weights, opts.pad_mode, chunk_input_len);
+    var model: api.Model = try buildTinySileroModel(&ctx, source, opts.pad_mode, chunk_input_len);
     defer model.deinit();
 
     // One reusable input tensor for `x`. The LSTM state (h/c) is io-aliased and

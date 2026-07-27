@@ -34,6 +34,13 @@ class ZigBuildArtifacts:
     link_lib_path: Path
 
 
+# Per-process cache of completed builds, keyed by (prefix, resolved config). One
+# `pip install` builds twice — once from `setup.py` to decide whether the extension
+# needs relinking, once from the cffi builder — and this makes the second free.
+# Deliberately per-process: across processes a source edit may have landed.
+_MEMO: dict[tuple[str, str], "ZigBuildArtifacts"] = {}
+
+
 def _find_repo_root(start: Path) -> Path:
     cur = start.resolve()
     for p in (cur, *cur.parents):
@@ -172,7 +179,6 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
     header_path = include_dir / "aion.h"
     link_lib_path = prefix / "lib" / _static_lib_name(system)
 
-    # Reuse an existing install only when it was built with the exact same config.
     config_stamp_path = prefix / ".aion-build-config.json"
     build_config = {
         "optimize": optimize,
@@ -184,20 +190,20 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
         "platform": system,
     }
 
-    def prefix_is_ready() -> bool:
-        if not (header_path.is_file() and link_lib_path.is_file()):
-            return False
-        try:
-            stamp = json.loads(config_stamp_path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        return stamp == build_config
+    # Always invoke `zig build install`. Do NOT try to skip it by inspecting the
+    # installed artifacts: `setup.py` pins this prefix to a deterministic path
+    # under `build_temp`, so any "is the prefix already populated?" check reuses a
+    # library built from *older sources* whenever only `src/` changed — the config
+    # stamp cannot see source edits. Zig's own build cache already makes a no-op
+    # rebuild ~1s, so there is nothing to win here and a stale-link bug to lose.
+    memo_key = (str(prefix), json.dumps(build_config, sort_keys=True))
+    if memo_key in _MEMO:
+        return _MEMO[memo_key]
 
-    if not prefix_is_ready():
-        _run(cmd, cwd=repo_root)
-        config_stamp_path.write_text(
-            json.dumps(build_config, sort_keys=True, indent=2), encoding="utf-8"
-        )
+    _run(cmd, cwd=repo_root)
+    config_stamp_path.write_text(
+        json.dumps(build_config, sort_keys=True, indent=2), encoding="utf-8"
+    )
 
     if not header_path.is_file():
         raise RuntimeError(f"Expected installed header not found: {header_path}")
@@ -207,10 +213,17 @@ def build_aion(prefix: Path | None = None) -> ZigBuildArtifacts:
     # GPU builds add no link inputs and no bundled runtime: the archive references
     # zero wgpu symbols (resolved at runtime via dlopen). `enable_gpu` only decided
     # whether the seam was compiled in, via `-Dgpu` above.
-    return ZigBuildArtifacts(
+    artifacts = ZigBuildArtifacts(
         repo_root=repo_root,
         prefix=prefix,
         include_dir=include_dir,
         header_path=header_path,
         link_lib_path=link_lib_path,
     )
+    # `setup.py` builds up front to decide whether the extension needs relinking,
+    # and the cffi builder asks again while generating the extension. Memoize per
+    # (prefix, config) so the second call is free — while still never skipping the
+    # build for a *new* configuration, and never caching across processes, where a
+    # source edit could have landed in between.
+    _MEMO[(str(prefix), json.dumps(build_config, sort_keys=True))] = artifacts
+    return artifacts

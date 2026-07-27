@@ -75,8 +75,11 @@ def test_spec_name_overrides_param_name(ctx):
 
 
 def test_multi_input_and_dict_outputs(ctx):
-    class Net(nn.Module):
-        def forward(self, a, b):
+    # A traced module may return a {name: value} mapping; the base class is
+    # parameterized by what `forward` returns, so that is declared rather than
+    # hidden behind `Any`.
+    class Net(nn.Module[dict[str, aion.TensorRef]]):
+        def forward(self, a: aion.TensorRef, b: aion.TensorRef) -> dict[str, aion.TensorRef]:
             return {"sum": a + b, "prod": a * b}
 
     model = aion.compile(Net(), aion.spec((2, 3)), aion.spec((2, 3)), ctx=ctx)
@@ -142,12 +145,16 @@ def test_export_reload(ctx, tmp_path):
     assert np.allclose(model.run({"x": xv})["output0"], xv * 3.0, atol=1e-6)
 
 
-def test_nn_layer_outside_trace_raises():
+def test_nn_layer_works_against_a_bare_builder():
+    """A layer reads the builder off its input, so it needs no ambient trace."""
     w = np.eye(4, dtype=np.float32)
     with aion.Context(thread_count=1) as ctx:
-        x = aion.Builder(ctx).input((1, 4))
-        with pytest.raises(RuntimeError, match="aion.compile"):
-            nn.Linear(w)(x)
+        b = aion.Builder(ctx)
+        try:
+            y = nn.Linear(w)(b.input((1, 4)))
+            assert y.shape == (1, 4)
+        finally:
+            b.close()
 
 
 def test_export_requires_path(ctx):

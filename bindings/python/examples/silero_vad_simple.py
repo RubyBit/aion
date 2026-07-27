@@ -16,7 +16,7 @@ from _common import add_device_args, load_model_with_device
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
     repo_root = Path(__file__).resolve().parents[3]
-    return repo_root / "models" / "silero" / "silero_vad_16k.aion"
+    return repo_root / "models" / "silero" / "silero_vad_nn.aion" # 16k
 
 
 def build_signal(chunks: int, num_samples: int, context_size: int) -> np.ndarray:

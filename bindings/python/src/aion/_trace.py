@@ -1,54 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tracing front-end: turn an `nn.Module` into a runnable/serialized graph.
 
-`compile`/`export` run the module's `forward` once under a scoped *ambient
-builder* (a `contextvars` slot), so layers add ops to that builder without any
-builder threaded through user code. The ambient scope is private — the explicit
-escape hatch for manual graph construction is `aion.Builder` directly.
+`compile`/`export` build the declared inputs on a fresh `Builder` and run the
+module's `forward` once. No ambient state is involved: a layer reads the builder
+off the `TensorRef` it is given, so the same layer works here and against a bare
+`aion.Builder`.
 """
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import inspect
 import os
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, Sequence, Tuple, cast
+from typing import Any, Optional, Sequence, Tuple, cast
 
-from .builder import Builder, OutputsLike, Value
+from .builder import Builder, OutputsLike, TensorRef
 from .context import Context
 from .device import DeviceLike
 from .dtype import normalize_dtype
 from .enums import AionDType
 from .model import LoadedModel
 from .tensor import Tensor
-
-# The builder active during a trace. Set only by compile/export.
-_ACTIVE: contextvars.ContextVar[Builder | None] = contextvars.ContextVar(
-    "aion_active_builder", default=None
-)
-
-
-def active_builder() -> Builder:
-    """The builder for the in-progress trace; raises if called outside one."""
-    b = _ACTIVE.get()
-    if b is None:
-        raise RuntimeError(
-            "nn layers must be called inside aion.compile()/aion.export(); "
-            "for manual graph construction use aion.Builder directly."
-        )
-    return b
-
-
-@contextlib.contextmanager
-def _tracing(builder: Builder) -> Iterator[Builder]:
-    token = _ACTIVE.set(builder)
-    try:
-        yield builder
-    finally:
-        _ACTIVE.reset(token)
-
 
 @dataclass(frozen=True)
 class InputSpec:
@@ -108,7 +79,7 @@ def _trace_module(
     """Build inputs from specs, run forward once under the ambient builder.
 
     Returns `(builder, outputs)` where `outputs` is whatever `forward` returned
-    (a `Value`, a sequence, or a `{name: Value}` mapping). The builder is left
+    (a `TensorRef`, a sequence, or a `{name: TensorRef}` mapping). The builder is left
     open; the caller owns tearing it down.
     """
     from .builder import Builder
@@ -126,83 +97,28 @@ def _trace_module(
             v = builder.input(dims, dtype=s.dtype, dynamic=dyn)
             builder.name(v, nm)
             inputs.append(v)
-        with _tracing(builder):
-            outputs = cast(Any, module)(*inputs)
+        outputs = cast(Any, module)(*inputs)
         return builder, cast(OutputsLike, outputs)
     except BaseException:
         builder.close()
         raise
 
 
-def _is_graph_outputs(obj: object) -> bool:
-    """True if `obj` is a lazy `Tensor` (or a list/dict of them) — the
-    Tensor-first authoring path, as opposed to an `nn.Module` to trace."""
-    def is_lazy(v: object) -> bool:
-        return isinstance(v, Tensor) and v._lazy
-
-    if is_lazy(obj):
-        return True
-    if isinstance(obj, Mapping):
-        vals = list(obj.values())
-        return bool(vals) and all(is_lazy(v) for v in vals)
-    if isinstance(obj, (list, tuple)):
-        return bool(obj) and all(is_lazy(v) for v in obj)
-    return False
-
-
-def _named_outputs(outputs: object) -> list[tuple[str, Tensor]]:
-    """Normalize `outputs` to an ordered list of `(name, lazy_tensor)`.
-
-    A `{name: tensor}` mapping names explicitly; otherwise a tensor's own
-    `.rename(...)` is the default, falling back to positional `output{i}`.
-    """
-    if isinstance(outputs, Mapping):
-        return [
-            (str(key), cast(Tensor, value))
-            for key, value in outputs.items()
-        ]
-    seq = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
-    typed = [cast(Tensor, value) for value in seq]
-    return [(value._name or f"output{i}", value) for i, value in enumerate(typed)]
-
-
-def _compile_graph(
-    outputs: object, *, device: DeviceLike = None
-) -> LoadedModel:
-    """Lower a lazy-Tensor DAG into a fresh builder and compile it in place."""
-    from .tensor import _lower
-
-    named = _named_outputs(outputs)
-    b, out_values = _lower([t for _, t in named])
-    for (nm, _), v in zip(named, out_values):
-        b.mark_output(v, nm)
-    model = b.compile(device=device)
-    model._attach_authoring_builder(b)
-    return model
-
-
 def compile(
     module: object,
     *specs: InputSpec,
-    inputs: Sequence[Tensor] | None = None,
     device: DeviceLike = None,
     ctx: Context | None = None,
 ) -> LoadedModel:
-    """Compile a model to an in-process `LoadedModel`.
+    """Trace `module`'s `forward` once and compile it to a `LoadedModel`.
 
-    Two forms:
-    - **Tensor-first:** ``aion.compile(outputs, inputs=[...])`` where `outputs`
-      is a lazy `Tensor` / list / ``{name: Tensor}`` built with operators, and
-      `inputs` are the `aion.tensor(shape=...)` free inputs to expose.
-    - **nn tracing:** ``aion.compile(module, spec(...), ...)`` traces an
-      `nn.Module`'s `forward` once.
+    ``aion.compile(module, spec(...), ...)``. Inputs are built from the specs and
+    passed to `forward` as `TensorRef`s, so a module composes the same ops a raw
+    `Builder` would — there is one graph representation.
 
     The authoring builder owns the model's weight tensors, so it is attached to
     the model and closed with it.
     """
-    if _is_graph_outputs(module):
-        return _compile_graph(module, device=device)
-
     builder, outputs = _trace_module(module, specs, ctx=ctx)
     try:
         model = builder.compile(outputs, device=device)
@@ -217,37 +133,13 @@ def export(
     module: object,
     *args: object,
     path: str | os.PathLike[str] | None = None,
-    inputs: Sequence[Tensor] | None = None,
     ctx: Context | None = None,
 ) -> None:
-    """Serialize a model to a `.aion` file.
+    """Serialize a traced module to a `.aion` file.
 
-    Two forms (mirroring `compile`):
-    - **Tensor-first:** ``aion.export(outputs, "m.aion", inputs=[...])``.
-    - **nn tracing:** ``aion.export(module, spec(...), "m.aion")``.
-
-    The path is the last positional arg or `path=`.
+    ``aion.export(module, spec(...), "m.aion")``. The path is the last positional
+    arg or `path=`.
     """
-    if _is_graph_outputs(module):
-        from .tensor import _lower
-
-        p = path
-        rest = list(args)
-        if p is None:
-            if rest and isinstance(rest[-1], (str, os.PathLike)):
-                p = rest.pop()
-            else:
-                raise TypeError("export() requires a path (as the last positional arg or path=)")
-        named = _named_outputs(module)
-        b, out_values = _lower([t for _, t in named])
-        try:
-            for (nm, _), v in zip(named, out_values):
-                b.mark_output(v, nm)
-            b.export(str(p))
-        finally:
-            b.close()
-        return
-
     specs = list(args)
     if path is None:
         if specs and isinstance(specs[-1], (str, os.PathLike)):
@@ -263,4 +155,4 @@ def export(
         builder.close()
 
 
-__all__ = ["InputSpec", "spec", "compile", "export", "active_builder"]
+__all__ = ["InputSpec", "spec", "compile", "export"]

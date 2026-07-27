@@ -228,8 +228,10 @@ pub const Context = struct {
         return self.cpu.backend();
     }
 
-    pub fn builder(self: *const Self) api_builder.Builder {
-        return api_builder.Builder.init(self.allocator);
+    /// A `Builder` bound to this context. The context must outlive the builder and
+    /// must not be moved while it is alive (the builder holds a pointer to it).
+    pub fn builder(self: *Self) api_builder.Builder {
+        return api_builder.Builder.init(self);
     }
 
     pub fn exportModel(
@@ -685,8 +687,9 @@ pub const Context = struct {
             });
         }
 
-        // Transfer graph ownership to the model; the builder keeps a fresh empty graph.
-        const owned_graph = b.takeGraph();
+        // The model owns a copy; the builder keeps its graph so authoring can go on
+        // after (and across) compiles.
+        const owned_graph = try b.cloneGraph();
         return api_loaded_model.Model.initCompiled(
             self.allocator,
             dev.backend,

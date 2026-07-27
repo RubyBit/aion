@@ -136,7 +136,7 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
         t_mask.copy_from(mask)
         t_frame.copy_from([0]); t_sym.copy_from([0])
         t_count.copy_from([0]); t_active.copy_from([1])
-        t_toks.copy_from([0] * max_out)
+        t_toks.copy_from([[0]] * max_out)
         m.run()
         oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
         ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()

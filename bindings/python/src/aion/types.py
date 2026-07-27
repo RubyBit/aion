@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterable, Sequence, TypeAlias, Union
 
+from .enums import AionDType
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -28,12 +30,18 @@ else:  # runtime: no hard numpy dependency
 # A tensor shape (all concrete ints).
 Shape: TypeAlias = Sequence[int]
 
+# Anything accepted where a dtype is expected. Kept here rather than spelled out
+# per call site so `dtype=` means one thing across the whole API; `normalize_dtype`
+# is what turns it into an `AionDType`.
+DTypeLike: TypeAlias = Union[str, "AionDType"]
+
 # f32 scalar / value conveniences.
 F32Scalar: TypeAlias = float
 F32Values: TypeAlias = Iterable[float]
 
 __all__ = [
     "ArrayLike",
+    "DTypeLike",
     "F32ArrayLike",
     "F32Scalar",
     "F32Values",

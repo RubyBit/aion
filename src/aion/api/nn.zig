@@ -1,278 +1,135 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-const std = @import("std");
+//! Neural-network layers built on top of `api.Builder`.
+//!
+//! Design goals:
+//! - Keep the core API graph-hidden and tensor-first.
+//! - `bind` registers parameters once; `forward` wires activations and allocates
+//!   nothing at runtime.
+//! - Parameters get semantic, hierarchical debug names (`Block#0/attn#0/weight`),
+//!   which is what makes load/swap-by-name usable on a real model.
+//!
+//! Everything takes the `Builder`. It carries the `Context`, so a layer can
+//! synthesize the constants some ops require as operands — the identity `gamma`/
+//! `beta` of a scale-only norm, or the one-element vector a scalar multiply needs —
+//! and the `Builder` caches them, so a 35-layer model binds each one once.
+//!
+//! Weight layouts are Aion's, not any framework's: dense weights are matmul-B
+//! ordered (`[in, out]`), conv1d is `[k, c_in/groups, c_out]` (NLC), conv2d is
+//! `[k_h, k_w, c_in/groups, c_out]` (NHWC). Converting a foreign checkpoint into
+//! that order is the converter's job.
 
-const api_builder = @import("builder.zig");
-const module_api = @import("module.zig");
-const api_tensor = @import("tensor.zig");
-const types = @import("../backend/types.zig");
+const layer_mod = @import("nn/layer.zig");
+const linear_mod = @import("nn/linear.zig");
+const norm_mod = @import("nn/norm.zig");
+const conv_mod = @import("nn/conv.zig");
+const recurrent_mod = @import("nn/recurrent.zig");
+const activation_mod = @import("nn/activation.zig");
+const container_mod = @import("nn/container.zig");
+const mlp_mod = @import("nn/mlp.zig");
+const attention_mod = @import("nn/attention.zig");
+const functional_mod = @import("nn/functional.zig");
+const initializers_mod = @import("nn/initializers.zig");
+const state_mod = @import("nn/state.zig");
 
-pub const Builder = api_builder.Builder;
-pub const TensorRef = api_builder.TensorRef;
-pub const Tensor = api_tensor.Tensor;
+// --- shared handles ---------------------------------------------------------
+pub const Builder = layer_mod.Builder;
+pub const TensorRef = layer_mod.TensorRef;
+pub const Tensor = layer_mod.Tensor;
+pub const Context = layer_mod.Context;
+pub const LayerName = layer_mod.LayerName;
 
-/// Simple neural-network helper layers built on top of `api.Builder`.
-///
-/// Design goals:
-/// - Keep the core API graph-hidden and tensor-first.
-/// - Provide ergonomic wrappers that bind parameters once (`bind`) and then
-///   apply them multiple times (`forward`).
-/// - Avoid runtime allocations in `forward`.
-pub const Linear = struct {
-    w: TensorRef,
-    b: ?TensorRef = null,
+// --- projections / lookup ---------------------------------------------------
+pub const Linear = linear_mod.Linear;
+pub const Embedding = linear_mod.Embedding;
 
-    const Self = @This();
+// --- normalization ----------------------------------------------------------
+pub const LayerNorm = norm_mod.LayerNorm;
+pub const RMSNorm = norm_mod.RMSNorm;
+pub const NormOptions = norm_mod.Options;
 
-    pub fn bind(bld: *Builder, w: Tensor, bias: ?Tensor) Builder.Error!Self {
-        const w_ref: TensorRef = try bld.param(w);
-        const b_ref: ?TensorRef = if (bias) |bt| try bld.param(bt) else null;
-        return .{ .w = w_ref, .b = b_ref };
-    }
+// --- convolution ------------------------------------------------------------
+pub const Conv1D = conv_mod.Conv1D;
+pub const Conv2D = conv_mod.Conv2D;
+pub const depthwise = conv_mod.depthwise;
+pub const ResBlock2D = conv_mod.ResBlock2D;
+pub const PadMode = conv_mod.PadMode;
 
-    /// y = x @ w + b (bias broadcast over last dim if present)
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-        const scope = try module_api.beginModuleScope(@This(), bld, null);
-        defer module_api.endModuleScope(bld, scope);
+// --- recurrent --------------------------------------------------------------
+pub const LSTMCell = recurrent_mod.LSTMCell;
+pub const LSTMState = recurrent_mod.LSTMState;
 
-        const y: TensorRef = try bld.matmul(x, self.w, 1.0, 0.0);
-        if (self.b) |b0| {
-            return bld.broadcastAddLastDim(y, b0);
-        }
-        return y;
-    }
-};
+// --- activations ------------------------------------------------------------
+pub const Activation = activation_mod.Activation;
+pub const ActivationKind = activation_mod.Kind;
+pub const relu = activation_mod.relu;
+pub const gelu = activation_mod.gelu;
+pub const silu = activation_mod.silu;
+pub const sigmoid = activation_mod.sigmoid;
+pub const tanh = activation_mod.tanh;
+pub const log = activation_mod.log;
+pub const softmaxLastDim = activation_mod.softmaxLastDim;
 
-pub const Conv2D = struct {
-    w: TensorRef,
-    b: ?TensorRef = null,
-    opts: Options = .{},
+// --- containers -------------------------------------------------------------
+pub const Sequential = container_mod.Sequential;
+pub const Residual = container_mod.Residual;
 
-    const Self = @This();
+// --- feed-forward blocks ----------------------------------------------------
+pub const FeedForward = mlp_mod.FeedForward;
+pub const GatedMLP = mlp_mod.GatedMLP;
+pub const GLU = mlp_mod.GLU;
 
-    pub const Options = struct {
-        stride_h: usize = 1,
-        stride_w: usize = 1,
-        dilation_h: usize = 1,
-        dilation_w: usize = 1,
-        pad_top: usize = 0,
-        pad_bottom: usize = 0,
-        pad_left: usize = 0,
-        pad_right: usize = 0,
-        pad_mode: types.PadMode = .zero,
-        groups: usize = 1,
-    };
+// --- attention --------------------------------------------------------------
+pub const RoPE = attention_mod.RoPE;
+pub const KVCache = attention_mod.KVCache;
+pub const CachedAttention = attention_mod.CachedAttention;
+pub const RelPosSelfAttention = attention_mod.RelPosSelfAttention;
 
-    pub fn bind(bld: *Builder, w: Tensor, bias: ?Tensor, opts: Options) Builder.Error!Self {
-        const w_ref: TensorRef = try bld.param(w);
-        const b_ref: ?TensorRef = if (bias) |bt| try bld.param(bt) else null;
-        return .{ .w = w_ref, .b = b_ref, .opts = opts };
-    }
+// --- constant-bearing helpers ----------------------------------------------
+pub const scale = functional_mod.scale;
+pub const shift = functional_mod.shift;
+pub const softcap = functional_mod.softcap;
 
-    /// NHWC conv2d (channel-last) with weight layout [k_h, k_w, c_in/groups, c_out].
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-        const scope = try module_api.beginModuleScope(@This(), bld, null);
-        defer module_api.endModuleScope(bld, scope);
+// --- parameter sources / introspection ---------------------------------------
+// Every layer has exactly one constructor, `bind(bld, params, opts)`, and declares
+// its parameters as a type: `pub const Weights`, where a `Tensor` field is a
+// parameter and a struct field is a sub-layer. So the call site is a typed literal
+// the compiler checks — no path strings anywhere:
+//
+//     const fc = try nn.Linear.bind(&bld, .{ .weight = w, .bias = b }, .{});
+//
+//     const mlp = try nn.GatedMLP.bind(&bld, .{
+//         .gate_up_proj = .{ .weight = gu },
+//         .down_proj    = .{ .weight = d },
+//     }, .{ .act = .silu });
+//
+// A required weight has no default, so omitting one does not compile; a misspelled
+// field is a compile error rather than a bind-time failure; and `bind` reaches its
+// own children through the same type (`p.child(Weights, .down_proj)`), so the field
+// name and the graph path cannot drift.
+//
+// The other source is a loaded package, which resolves those same paths:
+//
+//     var pkg = nn.Package.init(&weights);
+//     const mlp = try nn.GatedMLP.bind(&bld, pkg.at("mlp"), .{});
+//
+// A layer therefore cannot support one source and not the other. `Source(W)` is a
+// weights tree flattened once and shared across several layers — a whole model's,
+// say; a single layer never needs one, since `bind` builds it on its own frame.
+// `Params` is the type-erased form all three arrive as, and writing a `resolveFn`
+// is how you plug in a source of your own.
+pub const Params = state_mod.Params;
+pub const Source = state_mod.Source;
+pub const Package = state_mod.Package;
+/// What a layer's `bind` calls to accept all three spellings. A model of your own
+/// composed out of `nn` layers uses it the same way they do.
+pub const binding = state_mod.binding;
+pub const BindError = state_mod.BindError;
+pub const forEachParam = state_mod.forEachParam;
+pub const collectParamNames = state_mod.collectParamNames;
 
-        return bld.conv2dPadMode(
-            x,
-            self.w,
-            self.b,
-            self.opts.stride_h,
-            self.opts.stride_w,
-            self.opts.dilation_h,
-            self.opts.dilation_w,
-            self.opts.pad_top,
-            self.opts.pad_bottom,
-            self.opts.pad_left,
-            self.opts.pad_right,
-            self.opts.pad_mode,
-            self.opts.groups,
-        );
-    }
-};
-
-pub const Conv1D = struct {
-    w: TensorRef,
-    b: ?TensorRef = null,
-    opts: Options = .{},
-
-    const Self = @This();
-
-    pub const Options = struct {
-        stride: usize = 1,
-        dilation: usize = 1,
-        pad_left: usize = 0,
-        pad_right: usize = 0,
-        pad_mode: types.PadMode = .zero,
-        groups: usize = 1,
-    };
-
-    pub fn bind(bld: *Builder, w: Tensor, bias: ?Tensor, opts: Options) Builder.Error!Self {
-        const w_ref: TensorRef = try bld.param(w);
-        const b_ref: ?TensorRef = if (bias) |bt| try bld.param(bt) else null;
-        return .{ .w = w_ref, .b = b_ref, .opts = opts };
-    }
-
-    /// NLC (channel-last) conv1d with weight layout [k, c_in/groups, c_out].
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-        const scope = try module_api.beginModuleScope(@This(), bld, null);
-        defer module_api.endModuleScope(bld, scope);
-
-        return bld.conv1dPadMode(
-            x,
-            self.w,
-            self.b,
-            self.opts.stride,
-            self.opts.dilation,
-            self.opts.pad_left,
-            self.opts.pad_right,
-            self.opts.pad_mode,
-            self.opts.groups,
-        );
-    }
-};
-
-/// A tiny residual block: conv -> relu -> conv -> add(skip) -> relu.
-pub const ResBlock2D = struct {
-    conv1: Conv2D,
-    conv2: Conv2D,
-
-    const Self = @This();
-
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-        const y1: TensorRef = try self.conv1.forward(bld, x);
-        const a1: TensorRef = try bld.relu(y1);
-        const y2: TensorRef = try self.conv2.forward(bld, a1);
-        const sum: TensorRef = try bld.add(y2, x);
-        return bld.relu(sum);
-    }
-};
-
-pub const LSTMState = struct {
-    h: TensorRef,
-    c: TensorRef,
-};
-
-/// Single-timestep LSTM cell.
-///
-/// Weight layout (Aion-native):
-/// - w_ih: [input_size, 4*hidden]
-/// - w_hh: [hidden, 4*hidden]
-/// - b_ih: [4*hidden] (optional)
-/// - b_hh: [4*hidden] (optional)
-///
-/// Forward expects rank-2 inputs:
-/// - x:      [batch, input_size]
-/// - h_prev: [batch, hidden]
-/// - c_prev: [batch, hidden]
-pub const LSTMCell = struct {
-    w_ih: TensorRef,
-    w_hh: TensorRef,
-    b_ih: ?TensorRef = null,
-    b_hh: ?TensorRef = null,
-
-    input_size: usize,
-    hidden_size: usize,
-
-    const Self = @This();
-
-    pub fn bind(bld: *Builder, w_ih: Tensor, w_hh: Tensor, b_ih: ?Tensor, b_hh: ?Tensor) Builder.Error!Self {
-        // Bias policy: either both provided or both omitted.
-        if ((b_ih != null) != (b_hh != null)) return Builder.Error.InvalidArgument;
-
-        if (w_ih.shape.len != 2) return Builder.Error.InvalidArgument;
-        if (w_hh.shape.len != 2) return Builder.Error.InvalidArgument;
-
-        const input_size: usize = w_ih.shape[0];
-        const gate_dim: usize = w_ih.shape[1];
-        if (input_size == 0 or gate_dim == 0) return Builder.Error.InvalidArgument;
-        if (gate_dim % 4 != 0) return Builder.Error.InvalidArgument;
-
-        const hidden_size: usize = gate_dim / 4;
-        if (hidden_size == 0) return Builder.Error.InvalidArgument;
-
-        const want_w_hh0: usize = hidden_size;
-        const want_w_hh1: usize = std.math.mul(usize, hidden_size, 4) catch return Builder.Error.InvalidArgument;
-        if (w_hh.shape[0] != want_w_hh0 or w_hh.shape[1] != want_w_hh1) return Builder.Error.InvalidArgument;
-
-        if (b_ih) |bt| {
-            if (bt.shape.len != 1) return Builder.Error.InvalidArgument;
-            if (bt.shape[0] != gate_dim) return Builder.Error.InvalidArgument;
-        }
-        if (b_hh) |bt| {
-            if (bt.shape.len != 1) return Builder.Error.InvalidArgument;
-            if (bt.shape[0] != gate_dim) return Builder.Error.InvalidArgument;
-        }
-
-        const w_ih_ref: TensorRef = try bld.param(w_ih);
-        const w_hh_ref: TensorRef = try bld.param(w_hh);
-        const b_ih_ref: ?TensorRef = if (b_ih) |bt| try bld.param(bt) else null;
-        const b_hh_ref: ?TensorRef = if (b_hh) |bt| try bld.param(bt) else null;
-
-        return .{
-            .w_ih = w_ih_ref,
-            .w_hh = w_hh_ref,
-            .b_ih = b_ih_ref,
-            .b_hh = b_hh_ref,
-            .input_size = input_size,
-            .hidden_size = hidden_size,
-        };
-    }
-
-    pub fn forward(self: Self, bld: *Builder, x: TensorRef, h_prev: TensorRef, c_prev: TensorRef) Builder.Error!LSTMState {
-        const scope = try module_api.beginModuleScope(@This(), bld, null);
-        defer module_api.endModuleScope(bld, scope);
-
-        const x_shape_opt: ?[]const usize = bld.knownShape(x);
-        const h_shape_opt: ?[]const usize = bld.knownShape(h_prev);
-        const c_shape_opt: ?[]const usize = bld.knownShape(c_prev);
-
-        if (x_shape_opt) |x_shape| {
-            if (x_shape.len != 2) return Builder.Error.InvalidArgument;
-            if (x_shape[1] != self.input_size) return Builder.Error.InvalidArgument;
-        }
-        if (h_shape_opt) |h_shape| {
-            if (h_shape.len != 2) return Builder.Error.InvalidArgument;
-            if (h_shape[1] != self.hidden_size) return Builder.Error.InvalidArgument;
-        }
-        if (c_shape_opt) |c_shape| {
-            if (c_shape.len != 2) return Builder.Error.InvalidArgument;
-            if (c_shape[1] != self.hidden_size) return Builder.Error.InvalidArgument;
-        }
-
-        var batch_opt: ?usize = null;
-        if (h_shape_opt) |h_shape| {
-            batch_opt = h_shape[0];
-        }
-        if (c_shape_opt) |c_shape| {
-            if (batch_opt) |b0| {
-                if (c_shape[0] != b0) return Builder.Error.InvalidArgument;
-            } else {
-                batch_opt = c_shape[0];
-            }
-        }
-        if (x_shape_opt) |x_shape| {
-            if (batch_opt) |b0| {
-                if (x_shape[0] != b0) return Builder.Error.InvalidArgument;
-            } else {
-                batch_opt = x_shape[0];
-            }
-        }
-
-        const batch: usize = batch_opt orelse return Builder.Error.InvalidArgument;
-        if (batch == 0) return Builder.Error.InvalidArgument;
-
-        // Fused single-step LSTM cell.
-        // Output is a packed [batch, 2h] state: [h_t | c_t].
-        const packed_state: TensorRef = try bld.lstmCell(x, h_prev, c_prev, self.w_ih, self.w_hh, self.b_ih, self.b_hh);
-
-        const h: usize = self.hidden_size;
-        const h_t: TensorRef = try bld.slice2d(packed_state, 0, batch, 0, h);
-        const c_t: TensorRef = try bld.slice2d(packed_state, 0, batch, h, h);
-        return .{ .h = h_t, .c = c_t };
-    }
-};
-
-pub fn softmaxLastDim(bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
-    return bld.softmax(x, -1);
-}
+// --- host-side constant builders (tables, masks) ----------------------------
+pub const initializers = initializers_mod;
+pub const sinusoidalRelPos = initializers_mod.sinusoidalRelPos;
+pub const causalMask = initializers_mod.causalMask;
+pub const slidingWindowMask = initializers_mod.slidingWindowMask;
+pub const chunkedLimitedMask = initializers_mod.chunkedLimitedMask;

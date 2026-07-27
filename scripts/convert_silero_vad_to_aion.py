@@ -49,7 +49,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 import aion
-from aion import Builder
+from aion import Builder, nn
 from aion.enums import AionInputRoleKind
 
 
@@ -183,6 +183,12 @@ WEIGHT_ORDER: Tuple[str, ...] = (
 )
 
 
+# Every parameter is exported under a `<layer>/<param>` debug name, which is how a
+# consumer finds it again (see `examples/silero_vad.zig`). The table that used to map
+# those out by hand is gone: the `nn` layer named `conv1` writes `conv1/weight` and
+# `conv1/bias` itself, so the names cannot drift from the layers that produce them.
+
+
 def extract_weights(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     out: Dict[str, np.ndarray] = {}
     for name in WEIGHT_ORDER:
@@ -243,41 +249,42 @@ def build_silero(
     h = b.input((1, 128), dynamic={0: "batch"}).rename("h")
     c = b.input((1, 128), dynamic={0: "batch"}).rename("c")
 
-    # Weights (f32 params).
-    p = {name: b.param(weights[name]) for name in WEIGHT_ORDER}
+    # `nn` layers hold the weights as data and bind them under `<layer>/<param>`
+    # themselves, which is exactly the naming this model already exported — so those
+    # debug names are now produced by the layer rather than pinned on by hand
+    # afterwards, and `examples/silero_vad.zig` finds them unchanged.
+    w = weights
+    stft_conv = nn.Conv1D(w["stft_w"], name="stft_conv", stride=128,
+                          pad_right=int(stft_pad_right), pad_mode=pad_mode)
+    convs = [
+        nn.Conv1D(w[f"conv{i}_w"], w[f"conv{i}_b"], name=f"conv{i}",
+                  stride=stride, pad_left=1, pad_right=1)
+        for i, stride in ((1, 1), (2, 2), (3, 2), (4, 1))
+    ]
+    lstm = nn.LSTMCell(w["lstm_w_ih"], w["lstm_w_hh"], w["lstm_b_ih"], w["lstm_b_hh"],
+                       name="lstm")
+    final_conv = nn.Conv1D(w["final_w"], w["final_b"], name="final_conv")
 
     # Forward graph.
-    x3 = b.unsqueeze(x, 2)
-    stft = b.conv1d(x3, p["stft_w"], stride=128, dilation=1,
-                    pad_left=0, pad_right=int(stft_pad_right), pad_mode=pad_mode, groups=1)
+    stft = stft_conv(b.unsqueeze(x, 2))
 
     # real/imag halves; the batch axis length is symbolic.
     real = b.slice(stft, (0, 0, 0), ("batch", t_steps, cutoff))
     imag = b.slice(stft, (0, 0, cutoff), ("batch", t_steps, cutoff))
-    mag = b.mul(real, real)
-    mag = b.add(mag, b.mul(imag, imag))
-    mag = b.unary("sqrt", mag)
+    mag = b.unary("sqrt", real * real + imag * imag)
 
-    def conv_relu(inp, w, bias, *, stride, pad):
-        out = b.conv1d(inp, p[w], p[bias], stride=stride, dilation=1,
-                       pad_left=pad, pad_right=pad, pad_mode="zero", groups=1)
-        return b.unary("relu", out)
+    for conv in convs:
+        mag = conv(mag).relu()
 
-    c1 = conv_relu(mag, "conv1_w", "conv1_b", stride=1, pad=1)
-    c2 = conv_relu(c1, "conv2_w", "conv2_b", stride=2, pad=1)
-    c3 = conv_relu(c2, "conv3_w", "conv3_b", stride=2, pad=1)
-    c4 = conv_relu(c3, "conv4_w", "conv4_b", stride=1, pad=1)
+    features = b.squeeze(mag, 1)  # [batch, 128]
 
-    features = b.squeeze(c4, 1)  # [batch, 128]
+    # `LSTMCell` unpacks the fused op's `[batch, 2h]` state, so the offsets are not
+    # the caller's to know.
+    h_t, c_t = lstm(features, h, c)
+    h_t = h_t.rename("next_h")
+    c_t = c_t.rename("next_c")
 
-    packed = b.lstm_cell(features, h, c, p["lstm_w_ih"], p["lstm_w_hh"], p["lstm_b_ih"], p["lstm_b_hh"])
-    h_t = b.slice(packed, (0, 0), ("batch", 128)).rename("next_h")
-    c_t = b.slice(packed, (0, 128), ("batch", 128)).rename("next_c")
-
-    act = b.unary("relu", b.unsqueeze(h_t, 1))
-    logits = b.conv1d(act, p["final_w"], p["final_b"], stride=1, dilation=1,
-                      pad_left=0, pad_right=0, pad_mode="zero", groups=1)
-    probs = b.unary("sigmoid", logits)
+    probs = final_conv(b.unsqueeze(h_t, 1).relu()).sigmoid()
     probs = b.squeeze(probs, 2)               # [batch, 1]
     probs = b.reduce("mean", probs, axis=1)   # [batch]
     probs = b.unsqueeze(probs, 1).rename("prob")  # [batch, 1]

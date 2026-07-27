@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PyTorch-like model authoring on top of the Aion C ABI.
 
-Build a graph in code with `Builder`, wiring ops through `Value` handles (which
+Build a graph in code with `Builder`, wiring ops through `TensorRef` handles (which
 support `@`, `+`, `-`, `*`, `/`), then either `compile()` it to a runnable
 `LoadedModel` in-process or `export()` it to a `.aion` file.
 
@@ -16,12 +16,15 @@ validation, and serialization all come from one source of truth.
 """
 from __future__ import annotations
 
+import contextlib
 from types import TracebackType
+from collections.abc import Generator
 from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Union, overload
 
 from .context import Context
 from .device import DeviceLike, _normalize_device
 from .dtype import normalize_dtype as _as_dtype
+from .errors import AionError
 from ._ffi.authoring import (
     AttentionAttrs,
     AxisAttrs,
@@ -53,10 +56,23 @@ from ._ffi.authoring import (
     builder_if,
     builder_input,
     builder_loop,
+    builder_clear_outputs,
     builder_mark_output,
+    builder_begin_auto_scope,
+    builder_begin_scope,
+    builder_constant,
+    builder_end_scope,
+    builder_filled_vec,
+    builder_has_param_named,
     builder_name,
     builder_param,
+    builder_param_kind,
+    builder_param_named,
+    builder_scope_path,
+    builder_value_name,
     builder_value_dtype,
+    builder_symbol_size,
+    builder_value_dim_symbol,
     builder_value_shape,
     compile_builder,
     create_builder,
@@ -75,7 +91,8 @@ from .enums import (
     AionUnaryOp,
 )
 from .tensor import Tensor
-from .types import Shape
+from .types import NDArray
+from .types import DTypeLike, Shape
 
 if TYPE_CHECKING:
     from .model import LoadedModel
@@ -88,20 +105,22 @@ WeightData = object
 # authoring placeholder.
 DynamicAxes = Union[None, Sequence[int], Mapping[int, str]]
 # What `compile`/`export` accept as outputs: one value, a list, or {name: value}.
-OutputsLike = Union["Value", Sequence["Value"], Mapping[str, "Value"]]
+OutputsLike = Union["TensorRef", Sequence["TensorRef"], Mapping[str, "TensorRef"]]
 _PAD_MODES = {
     "zero": AionPadMode.AION_PAD_ZERO,
     "reflect": AionPadMode.AION_PAD_REFLECT,
 }
 
-class Value:
-    """A builder-bound graph value (an opaque u32 id in one `Builder`).
+class TensorRef:
+    """A handle on a value in one `Builder`'s graph (an opaque u32 id).
 
-    This is the **low-level** authoring handle returned by `Builder` ops and by
-    `nn` layers. It supports the graph operators/fluent forms and authoring-time
-    `shape`/`dtype` introspection (eager per-op inference). The seamless
-    high-level lazy value users reach for is `aion.Tensor` (see `tensor.py`),
-    which lowers to this at compile time. `Builder` is the explicit escape hatch.
+    This is *the* authoring handle — what `Builder` ops and `nn` layers take and
+    return. It carries the operators and fluent forms (`(x @ w).relu()`) plus
+    authoring-time `shape`/`dtype` introspection via eager per-op inference, and
+    it knows its own builder, so a layer needs no ambient state.
+
+    It is the counterpart of `TensorRef` in the Zig API; `aion.Tensor` is the
+    separate *data* handle, the same split Zig makes with `api.Tensor`.
     """
 
     __slots__ = ("_b", "id", "_name")
@@ -112,50 +131,52 @@ class Value:
         self._name = None
 
     # --- operators ---------------------------------------------------------
-    def __matmul__(self, other: "Value") -> "Value":
+    def __matmul__(self, other: "TensorRef") -> "TensorRef":
         return self._b.matmul(self, other)
 
-    def __add__(self, other: "Value") -> "Value":
+    def __add__(self, other: "TensorRef") -> "TensorRef":
         return self._b.add(self, other)
 
-    def __sub__(self, other: "Value") -> "Value":
+    def __sub__(self, other: "TensorRef") -> "TensorRef":
         return self._b.sub(self, other)
 
-    def __mul__(self, other: "Value") -> "Value":
+    def __mul__(self, other: "TensorRef") -> "TensorRef":
         return self._b.mul(self, other)
 
-    def __truediv__(self, other: "Value") -> "Value":
+    def __truediv__(self, other: "TensorRef") -> "TensorRef":
         return self._b.div(self, other)
 
     # --- fluent method forms ----------------------------------------------
-    def relu(self) -> "Value":
+    def relu(self) -> "TensorRef":
         return self._b.unary("relu", self)
 
-    def gelu(self) -> "Value":
+    def gelu(self) -> "TensorRef":
         return self._b.unary("gelu", self)
 
-    def silu(self) -> "Value":
+    def silu(self) -> "TensorRef":
         return self._b.unary("silu", self)
 
-    def sigmoid(self) -> "Value":
+    def sigmoid(self) -> "TensorRef":
         return self._b.unary("sigmoid", self)
 
-    def tanh(self) -> "Value":
+    def tanh(self) -> "TensorRef":
         return self._b.unary("tanh", self)
 
-    def softmax(self, axis: int = -1) -> "Value":
+    def softmax(self, axis: int = -1) -> "TensorRef":
         return self._b.softmax(self, axis)
 
-    def reshape(self, shape: Sequence[int]) -> "Value":
+    def reshape(self, shape: Sequence[Union[int, str]]) -> "TensorRef":
+        # Same vocabulary as `Builder.reshape`: a str names a declared dim symbol, so
+        # a symbolic axis survives the fluent form too.
         return self._b.reshape(self, shape)
 
-    def transpose2d(self) -> "Value":
+    def transpose2d(self) -> "TensorRef":
         return self._b.transpose2d(self)
 
-    def cast(self, dtype: object) -> "Value":
+    def cast(self, dtype: object) -> "TensorRef":
         return self._b.cast(self, dtype)
 
-    def rename(self, name: str) -> "Value":
+    def rename(self, name: str) -> "TensorRef":
         self._b.name(self, name)
         self._name = name
         return self
@@ -174,6 +195,28 @@ class Value:
         )
 
     @property
+    def dims(self) -> tuple[Union[int, str], ...]:
+        """Shape as *authored*: a str on a free axis, an int on a fixed one.
+
+        A free axis is one some input declared with `symbolic_dim`; inference
+        carries the symbol to every value derived from it. Feed these straight back
+        to `reshape`/`slice`, which speak the same vocabulary, and an axis the caller
+        made free stays free instead of freezing at its placeholder size:
+
+            q = (x @ w).reshape((*x.dims[:2], heads, head_dim))
+
+        `shape` is the same thing with the placeholder sizes substituted in.
+        """
+        sizes = self.shape
+        return tuple(
+            builder_value_dim_symbol(
+                self._b._ctx_owner.ptr, self._b.ptr, self.id, axis
+            )
+            or size
+            for axis, size in enumerate(sizes)
+        )
+
+    @property
     def dtype(self) -> AionDType:
         return builder_value_dtype(
             self._b._ctx_owner.ptr, self._b.ptr, self.id
@@ -183,8 +226,73 @@ class Value:
     def ndim(self) -> int:
         return len(self.shape)
 
+    # --- evaluation --------------------------------------------------------
+
+    def eval(self) -> "Tensor":
+        """Compute this value and return the result as data.
+
+        For looking at a value while authoring — `print(y)`, `y.numpy()` — without
+        naming outputs or building a model. `compile` hands the model a *copy* of
+        the graph, so this leaves the builder untouched and you keep building.
+        Compilation is pruned to this value's cone, so the cost is what the value
+        needs and not what the whole graph holds.
+
+        Memoized: the graph is append-only, so a value's result cannot change.
+        Raises if the value depends on an input with no data bound — that is not a
+        computable value, and the message names the input.
+        """
+        cached = self._b._eval_cache.get(self.id)
+        if cached is not None:
+            return cached
+
+        name = "__eval__"
+        model = self._b.compile({name: self})
+        try:
+            # Compilation is pruned to this value's cone, so any public input the
+            # model reports is one this value genuinely depends on. Refuse rather
+            # than run: the runtime would zero-fill them and hand back numbers that
+            # look real.
+            needed = model.input_names()
+            if needed:
+                raise ValueError(
+                    "cannot evaluate: depends on input(s) with no data bound: "
+                    + ", ".join(needed)
+                    + ". Bind them and run a compiled model instead."
+                )
+            model.run()
+            # Copy out of the model's storage so the result outlives it.
+            result = model.output_tensor(name).tolist()
+        finally:
+            model.close()
+
+        from .tensor import Tensor
+
+        value = Tensor(result, ctx=self._b._ctx_owner)
+        self._b._eval_cache[self.id] = value
+        return value
+
+    def numpy(self) -> "NDArray":
+        """Evaluate and return the result as a numpy array."""
+        return self.eval().numpy()
+
+    def item(self) -> float | int:
+        """Evaluate and return a one-element result as a Python scalar."""
+        return self.eval().item()
+
+    def tolist(self) -> object:
+        """Evaluate and return the result as nested Python lists."""
+        return self.eval().tolist()
+
     def __repr__(self) -> str:
-        return f"Value(id={self.id})"
+        try:
+            shape, dtype = self.shape, self.dtype.name
+        except Exception:
+            return f"TensorRef(id={self.id})"
+        try:
+            return f"TensorRef(shape={shape}, dtype={dtype}, value={self.tolist()!r})"
+        except Exception:
+            # Not computable (e.g. depends on an unbound input) — still describe it.
+            return f"TensorRef(shape={shape}, dtype={dtype})"
 
 
 class Builder:
@@ -201,9 +309,9 @@ class Builder:
         # Keep param tensors alive for the builder's lifetime.
         self._params: list[Tensor] = []
         self._symbol_counter = 0
-        # dim-symbol name -> authoring placeholder size (the declared axis size),
-        # used to resolve symbolic slice/reshape dims to a concrete placeholder.
-        self._symbol_placeholders: dict[str, int] = {}
+        # value id -> evaluated result. Safe to memoize: the graph is append-only,
+        # so what a value computes to cannot change once computed.
+        self._eval_cache: dict[int, Tensor] = {}
         ctx._register_child(self)
 
     @property
@@ -258,9 +366,9 @@ class Builder:
         self,
         shape: Shape,
         *,
-        dtype: Union[str, AionDType] = "f32",
+        dtype: DTypeLike = "f32",
         dynamic: DynamicAxes = None,
-    ) -> Value:
+    ) -> TensorRef:
         """Declare a public runtime input.
 
         `shape` is all concrete ints. `dynamic` marks which axes vary at runtime
@@ -275,11 +383,9 @@ class Builder:
         symbolic = _resolve_dynamic(dynamic, len(dims), self)
 
         value_id = builder_input(self._ctx_owner.ptr, self.ptr, dt, dims)
-        v = Value(self, value_id)
+        v = TensorRef(self, value_id)
         for axis, name in symbolic:
             self._add_dim_symbol(v, axis, name)
-            # Record the declared placeholder so symbolic view dims can resolve it.
-            self._symbol_placeholders.setdefault(name, dims[axis])
         return v
 
     def _auto_symbol_name(self) -> str:
@@ -287,7 +393,7 @@ class Builder:
         self._symbol_counter += 1
         return name
 
-    def _add_dim_symbol(self, value: Value, axis: int, name: str) -> None:
+    def _add_dim_symbol(self, value: TensorRef, axis: int, name: str) -> None:
         builder_add_dim_symbol(
             self._ctx_owner.ptr, self.ptr, value.id, axis, name
         )
@@ -296,10 +402,10 @@ class Builder:
         self,
         data: WeightData,
         *,
-        dtype: Union[str, AionDType] = "f32",
+        dtype: DTypeLike = "f32",
         shape: Optional[Shape] = None,
         quant_axis: Optional[int] = None,
-    ) -> Value:
+    ) -> TensorRef:
         """Bind a weight from data (a `Tensor`, numpy array, or nested list).
 
         A float `dtype` binds the data directly; a quantized `dtype`
@@ -308,32 +414,134 @@ class Builder:
         embedding table). When `data` is already a `Tensor`, `dtype`/`shape`/
         `quant_axis` are ignored.
         """
-        if isinstance(data, Tensor):
-            t = data
-        else:
-            dt = _as_dtype(dtype)
-            if dt in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
-                if shape is None:
-                    shape = _infer_shape(data)
-                t = Tensor.quantize(self._ctx_owner, shape, data, dtype=dt, quant_axis=quant_axis)
-            else:
-                t = Tensor(data, ctx=self._ctx_owner, dtype=dt)
+        t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
         self._params.append(t)
+        return TensorRef(self, builder_param(self._ctx_owner.ptr, self.ptr, t.ptr))
 
-        value_id = builder_param(self._ctx_owner.ptr, self.ptr, t.ptr)
-        return Value(self, value_id)
+    def _as_param_tensor(
+        self,
+        data: WeightData,
+        *,
+        dtype: DTypeLike = "f32",
+        shape: Optional[Shape] = None,
+        quant_axis: Optional[int] = None,
+    ) -> Tensor:
+        """Coerce weight data to a Tensor this context owns (see `param`)."""
+        if isinstance(data, Tensor):
+            return data
+        dt = _as_dtype(dtype)
+        if dt in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
+            if shape is None:
+                shape = _infer_shape(data)
+            return Tensor.quantize(self._ctx_owner, shape, data, dtype=dt, quant_axis=quant_axis)
+        return Tensor(data, ctx=self._ctx_owner, dtype=dt)
 
-    def name(self, value: Value, name: str) -> Value:
+    def name(self, value: TensorRef, name: str) -> TensorRef:
         builder_name(self._ctx_owner.ptr, self.ptr, value.id, name)
         return value
+
+    def param_named(
+        self,
+        data: WeightData,
+        name: str,
+        *,
+        dtype: DTypeLike = "f32",
+        shape: Optional[Shape] = None,
+        quant_axis: Optional[int] = None,
+    ) -> TensorRef:
+        """Bind a weight under a semantic, scope-qualified name (`.../weight`).
+
+        The name persists into the package as a `debug_name`, which is the key the
+        load- and swap-by-name paths use. Prefer this over `param`, whose generated
+        name is positional and shifts if construction order changes.
+        """
+        t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
+        self._params.append(t)
+        return TensorRef(self, builder_param_named(self._ctx_owner.ptr, self.ptr, t.ptr, name))
+
+    # --- scopes ------------------------------------------------------------
+
+    @property
+    def scope_path(self) -> str:
+        """The `/`-joined path of all open scopes (`""` when none are open)."""
+        return builder_scope_path(self.ptr)
+
+    @contextlib.contextmanager
+    def scope(self, name: str) -> Generator[str, None, None]:
+        """Open a named scope, nested inside any already-open one.
+
+        Parameters bound inside land under `<path>/<param>`, which is what makes
+        them addressable in a loaded model.
+        """
+        depth = builder_begin_scope(self._ctx_owner.ptr, self.ptr, name)
+        try:
+            yield name
+        finally:
+            builder_end_scope(self._ctx_owner.ptr, self.ptr, depth)
+
+    @contextlib.contextmanager
+    def auto_scope(self, base: str) -> Generator[str, None, None]:
+        """Open a scope named `{base}#{n}`, numbered per parent scope.
+
+        Note the tradeoff: numbering follows bind order, so inserting a layer ahead
+        of others shifts their numbers and re-keys their parameters. Use `scope`
+        with an explicit name for anything you intend to look up later.
+        """
+        depth, segment = builder_begin_auto_scope(self._ctx_owner.ptr, self.ptr, base)
+        try:
+            yield segment
+        finally:
+            builder_end_scope(self._ctx_owner.ptr, self.ptr, depth)
+
+    # --- synthesized constants ---------------------------------------------
+
+    def constant(self, value: float) -> TensorRef:
+        """A cached one-element f32 constant, for ops needing a scalar operand.
+
+        Aion has no scalar-typed operand: `x * k` goes through the broadcast op with
+        a size-1 vector. This keeps that operand one element regardless of what it
+        multiplies, and shares it across every use of the same value.
+        """
+        return TensorRef(self, builder_constant(self._ctx_owner.ptr, self.ptr, value))
+
+    def zeros(self, dim: int) -> TensorRef:
+        """A cached `[dim]` f32 zeros vector: the identity `beta` of a norm."""
+        return TensorRef(self, builder_filled_vec(self._ctx_owner.ptr, self.ptr, dim, 0.0))
+
+    def ones(self, dim: int) -> TensorRef:
+        """A cached `[dim]` f32 ones vector: the identity `gamma` of a norm."""
+        return TensorRef(self, builder_filled_vec(self._ctx_owner.ptr, self.ptr, dim, 1.0))
+
+    # --- parameter introspection -------------------------------------------
+
+    def param_kind(self, value: TensorRef) -> Optional[str]:
+        """`"user"`, `"synthesized"`, or None if `value` is not a bound parameter.
+
+        Distinguishes a model weight from a constant the Builder had to invent for
+        an op that requires an operand where the maths wants a number.
+        """
+        kind = builder_param_kind(self.ptr, value.id)
+        return {1: "user", 2: "synthesized"}.get(kind)
+
+    def has_param_named(self, name: str) -> bool:
+        """Whether this graph binds a parameter under `name`, of either kind."""
+        return builder_has_param_named(self.ptr, name)
+
+    def value_name(self, value: TensorRef) -> str:
+        """The debug name attached to `value`, or "" when it has none.
+
+        This is the name that lands in the package, so it is the authority on
+        where a parameter lives — nothing needs to recompute the path.
+        """
+        return builder_value_name(self.ptr, value.id)
 
     # --- op emit -----------------------------------------------------------
     def _emit(
         self,
         op: AionOp,
-        inputs: Sequence[Value],
+        inputs: Sequence[TensorRef],
         attrs: OpAttrs = None,
-    ) -> Value:
+    ) -> TensorRef:
         value_id = emit_op(
             self._ctx_owner.ptr,
             self.ptr,
@@ -341,44 +549,44 @@ class Builder:
             [value.id for value in inputs],
             attrs,
         )
-        return Value(self, value_id)
+        return TensorRef(self, value_id)
 
     # Structured ops.
-    def matmul(self, a: Value, b: Value, alpha: float = 1.0, beta: float = 0.0) -> Value:
+    def matmul(self, a: TensorRef, b: TensorRef, alpha: float = 1.0, beta: float = 0.0) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_MATMUL, (a, b), MatmulAttrs(alpha, beta)
         )
 
-    def matmul_nt(self, a: Value, b: Value, alpha: float = 1.0, beta: float = 0.0) -> Value:
+    def matmul_nt(self, a: TensorRef, b: TensorRef, alpha: float = 1.0, beta: float = 0.0) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_MATMUL_NT, (a, b), MatmulAttrs(alpha, beta)
         )
 
-    def _elemwise(self, op: AionBinaryOp, a: Value, b: Value) -> Value:
+    def _elemwise(self, op: AionBinaryOp, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_ELEMWISE, (a, b), ElemwiseAttrs(int(op))
         )
 
-    def add(self, a: Value, b: Value) -> Value:
+    def add(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_ADD, a, b)
 
-    def sub(self, a: Value, b: Value) -> Value:
+    def sub(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_SUB, a, b)
 
-    def mul(self, a: Value, b: Value) -> Value:
+    def mul(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_MUL, a, b)
 
-    def div(self, a: Value, b: Value) -> Value:
+    def div(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_DIV, a, b)
 
-    def broadcast_add(self, a: Value, b: Value) -> Value:
+    def broadcast_add(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM,
             (a, b),
             ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_ADD)),
         )
 
-    def gelu_mul(self, a: Value, b: Value) -> Value:
+    def gelu_mul(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_GELU_MUL, (a, b))
 
     _UNARY = {
@@ -391,41 +599,41 @@ class Builder:
         "log": AionUnaryOp.AION_UNARY_LOG,
     }
 
-    def unary(self, op: str, a: Value) -> Value:
+    def unary(self, op: str, a: TensorRef) -> TensorRef:
         u = self._UNARY[op]
         return self._emit(AionOp.AION_OP_UNARY, (a,), UnaryAttrs(int(u)))
 
-    def softmax(self, a: Value, axis: int = -1) -> Value:
+    def softmax(self, a: TensorRef, axis: int = -1) -> TensorRef:
         return self._emit(AionOp.AION_OP_SOFTMAX, (a,), AxisAttrs(axis))
 
-    def rmsnorm(self, x: Value, gamma: Value, beta: Value, *, eps: float = 1e-6, normalized_shape: Sequence[int]) -> Value:
+    def rmsnorm(self, x: TensorRef, gamma: TensorRef, beta: TensorRef, *, eps: float = 1e-6, normalized_shape: Sequence[int]) -> TensorRef:
         return self._norm(AionOp.AION_OP_RMSNORM, x, gamma, beta, eps, normalized_shape)
 
-    def layernorm(self, x: Value, gamma: Value, beta: Value, *, eps: float = 1e-5, normalized_shape: Sequence[int]) -> Value:
+    def layernorm(self, x: TensorRef, gamma: TensorRef, beta: TensorRef, *, eps: float = 1e-5, normalized_shape: Sequence[int]) -> TensorRef:
         return self._norm(AionOp.AION_OP_LAYERNORM, x, gamma, beta, eps, normalized_shape)
 
     def _norm(
         self,
         op: AionOp,
-        x: Value,
-        gamma: Value,
-        beta: Value,
+        x: TensorRef,
+        gamma: TensorRef,
+        beta: TensorRef,
         eps: float,
         normalized_shape: Sequence[int],
-    ) -> Value:
+    ) -> TensorRef:
         attrs = NormAttrs(
             float(eps), tuple(int(dim) for dim in normalized_shape)
         )
         return self._emit(op, (x, gamma, beta), attrs)
 
-    def gather_rows(self, table: Value, indices: Value) -> Value:
+    def gather_rows(self, table: TensorRef, indices: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_GATHER_ROWS, (table, indices))
 
-    def rope1d(self, x: Value, positions: Value, *, base_frequency: float, scale_factor: float = 1.0, rope_proportion: float = 1.0) -> Value:
+    def rope1d(self, x: TensorRef, positions: TensorRef, *, base_frequency: float, scale_factor: float = 1.0, rope_proportion: float = 1.0) -> TensorRef:
         attrs = Rope1DAttrs(base_frequency, scale_factor, rope_proportion)
         return self._emit(AionOp.AION_OP_ROPE1D, (x, positions), attrs)
 
-    def concat(self, values: Sequence[Value], axis: int) -> Value:
+    def concat(self, values: Sequence[TensorRef], axis: int) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_CONCAT, tuple(values), AxisAttrs(axis)
         )
@@ -441,35 +649,40 @@ class Builder:
         names: list[Optional[str]] = []
         for d in dims:
             if isinstance(d, str):
-                if d not in self._symbol_placeholders:
+                # The placeholder lives with the declaration, on the builder itself,
+                # so it is recorded once rather than mirrored on this side.
+                try:
+                    concrete.append(
+                        builder_symbol_size(self._ctx_owner.ptr, self.ptr, d)
+                    )
+                except AionError as exc:
                     raise ValueError(
                         f"unknown dim symbol {d!r}; declare it on an input via "
-                        f"input(..., dynamic={{axis: {d!r}}})")
-                concrete.append(int(self._symbol_placeholders[d]))
+                        f"input(..., dynamic={{axis: {d!r}}})") from exc
                 names.append(d)
             else:
                 concrete.append(int(d))
                 names.append(None)
         return ViewDims(tuple(concrete), tuple(names))
 
-    def reshape(self, a: Value, shape: Sequence[Union[int, str]]) -> Value:
+    def reshape(self, a: TensorRef, shape: Sequence[Union[int, str]]) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_RESHAPE,
             (a,),
             ReshapeAttrs(self._resolve_view_dims(shape)),
         )
 
-    def transpose2d(self, a: Value) -> Value:
+    def transpose2d(self, a: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_TRANSPOSE2D, (a,))
 
-    def cast(self, a: Value, dtype: object) -> Value:
+    def cast(self, a: TensorRef, dtype: object) -> TensorRef:
         dt = _as_dtype(dtype)
         return self._emit(AionOp.AION_OP_CAST, (a,), CastAttrs(dt))
 
-    def argmax(self, a: Value, axis: int = -1) -> Value:
+    def argmax(self, a: TensorRef, axis: int = -1) -> TensorRef:
         return self._emit(AionOp.AION_OP_ARGMAX, (a,), AxisAttrs(axis))
 
-    def reduce(self, op: str, a: Value, axis: Optional[int] = None) -> Value:
+    def reduce(self, op: str, a: TensorRef, axis: Optional[int] = None) -> TensorRef:
         r = AionReduceOp.AION_REDUCE_SUM if op == "sum" else AionReduceOp.AION_REDUCE_MEAN
 
         return self._emit(
@@ -486,30 +699,30 @@ class Builder:
         "ge": AionBinaryOp.AION_BINARY_GE,
     }
 
-    def compare(self, op: str, a: Value, b: Value) -> Value:
+    def compare(self, op: str, a: TensorRef, b: TensorRef) -> TensorRef:
         """Elementwise comparison (`eq/ne/lt/gt/le/ge`) producing i32 {0,1}."""
         return self._elemwise(self._COMPARE[op], a, b)
 
     # --- broadcast (last-dim vector) binary variants ----------------------
-    def broadcast_mul(self, a: Value, vec: Value) -> Value:
+    def broadcast_mul(self, a: TensorRef, vec: TensorRef) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
             ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_MUL)))
 
-    def broadcast_sub(self, a: Value, vec: Value) -> Value:
+    def broadcast_sub(self, a: TensorRef, vec: TensorRef) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
             ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_SUB)))
 
-    def broadcast_div(self, a: Value, vec: Value) -> Value:
+    def broadcast_div(self, a: TensorRef, vec: TensorRef) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
             ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_DIV)))
 
     # --- convolutions -----------------------------------------------------
-    def conv1d(self, x: Value, weight: Value, bias: Optional[Value] = None, *,
+    def conv1d(self, x: TensorRef, weight: TensorRef, bias: Optional[TensorRef] = None, *,
                stride: int = 1, dilation: int = 1, pad_left: int = 0, pad_right: int = 0,
-               groups: int = 1, pad_mode: str = "zero") -> Value:
+               groups: int = 1, pad_mode: str = "zero") -> TensorRef:
         inputs = (x, weight) if bias is None else (x, weight, bias)
 
         attrs = Conv1DAttrs(
@@ -522,10 +735,10 @@ class Builder:
         )
         return self._emit(AionOp.AION_OP_CONV1D, inputs, attrs)
 
-    def conv2d(self, x: Value, weight: Value, bias: Optional[Value] = None, *,
+    def conv2d(self, x: TensorRef, weight: TensorRef, bias: Optional[TensorRef] = None, *,
                stride_h: int = 1, stride_w: int = 1, dilation_h: int = 1, dilation_w: int = 1,
                pad_top: int = 0, pad_bottom: int = 0, pad_left: int = 0, pad_right: int = 0,
-               groups: int = 1, pad_mode: str = "zero") -> Value:
+               groups: int = 1, pad_mode: str = "zero") -> TensorRef:
         inputs = (x, weight) if bias is None else (x, weight, bias)
 
         attrs = Conv2DAttrs(
@@ -543,29 +756,29 @@ class Builder:
         return self._emit(AionOp.AION_OP_CONV2D, inputs, attrs)
 
     # --- signal (FFT) -----------------------------------------------------
-    def stft(self, signal: Value, window: Value, *, n_fft: int, hop_length: int,
-             center: bool = False) -> Value:
+    def stft(self, signal: TensorRef, window: TensorRef, *, n_fft: int, hop_length: int,
+             center: bool = False) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_STFT,
             (signal, window),
             StftAttrs(n_fft, hop_length, center),
         )
 
-    def rfft(self, x: Value) -> Value:
+    def rfft(self, x: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_RFFT, (x,))
 
     # --- views ------------------------------------------------------------
-    def squeeze(self, a: Value, axis: Optional[int] = None) -> Value:
+    def squeeze(self, a: TensorRef, axis: Optional[int] = None) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_SQUEEZE, (a,), OptionalAxisAttrs(axis)
         )
 
-    def unsqueeze(self, a: Value, axis: int) -> Value:
+    def unsqueeze(self, a: TensorRef, axis: int) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_UNSQUEEZE, (a,), AxisAttrs(axis)
         )
 
-    def slice(self, a: Value, starts: Sequence[int], lens: Sequence[Union[int, str]]) -> Value:
+    def slice(self, a: TensorRef, starts: Sequence[int], lens: Sequence[Union[int, str]]) -> TensorRef:
         """N-D slice (one `start`/`len` per axis). A `len` may be an int (constant)
         or a dim-symbol name (declared via `input(dynamic=...)`) for a symbolic axis."""
         starts_l = [int(s) for s in starts]
@@ -576,24 +789,40 @@ class Builder:
         )
         return self._emit(AionOp.AION_OP_SLICE, (a,), attrs)
 
+    def slice_last_dim(self, a: TensorRef, start: int, length: int) -> TensorRef:
+        """Take `length` elements from `start` along the last axis, keeping every
+        leading axis whole. Mirrors `Builder.sliceLastDim` in the Zig API.
+
+        This is how a fused projection is split back into its parts (QKV,
+        gate/up), which otherwise means spelling out full starts/lens per call.
+        """
+        shape = a.shape
+        if not shape:
+            raise ValueError("slice_last_dim needs a ranked value")
+        starts = [0] * len(shape)
+        lens = list(shape)
+        starts[-1] = int(start)
+        lens[-1] = int(length)
+        return self.slice(a, starts, lens)
+
     # --- attention --------------------------------------------------------
-    def attention(self, q: Value, k: Value, v: Value, *, scale: float, causal: bool = False) -> Value:
+    def attention(self, q: TensorRef, k: TensorRef, v: TensorRef, *, scale: float, causal: bool = False) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_ATTENTION,
             (q, k, v),
             AttentionAttrs(scale, causal),
         )
 
-    def mha(self, q: Value, k: Value, v: Value, *, scale: float, causal: bool, heads: int) -> Value:
+    def mha(self, q: TensorRef, k: TensorRef, v: TensorRef, *, scale: float, causal: bool, heads: int) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_MHA,
             (q, k, v),
             AttentionAttrs(scale, causal, heads),
         )
 
-    def mha_cached(self, q: Value, k: Value, v: Value, positions: Value, end_index: Value, *,
+    def mha_cached(self, q: TensorRef, k: TensorRef, v: TensorRef, positions: TensorRef, end_index: TensorRef, *,
                    scale: float, causal: bool = True, sliding_window: int = 0,
-                   attn_logits_soft_cap: float = 0.0) -> Value:
+                   attn_logits_soft_cap: float = 0.0) -> TensorRef:
         attrs = MhaCachedAttrs(
             scale, causal, sliding_window, attn_logits_soft_cap
         )
@@ -603,9 +832,9 @@ class Builder:
             attrs,
         )
 
-    def relpos_mha(self, q: Value, k: Value, v: Value, pos_emb: Value, bu: Value, bv: Value,
-                   mask: Optional[Value] = None, *, scale: float, heads: int) -> Value:
-        inputs: list[Value] = [q, k, v, pos_emb, bu, bv]
+    def relpos_mha(self, q: TensorRef, k: TensorRef, v: TensorRef, pos_emb: TensorRef, bu: TensorRef, bv: TensorRef,
+                   mask: Optional[TensorRef] = None, *, scale: float, heads: int) -> TensorRef:
+        inputs: list[TensorRef] = [q, k, v, pos_emb, bu, bv]
         if mask is not None:
             inputs.append(mask)
 
@@ -616,27 +845,27 @@ class Builder:
         )
 
     # --- recurrent / indexed / misc ---------------------------------------
-    def lstm_cell(self, x: Value, h: Value, c: Value, w_ih: Value, w_hh: Value,
-                  b_ih: Optional[Value] = None, b_hh: Optional[Value] = None) -> Value:
+    def lstm_cell(self, x: TensorRef, h: TensorRef, c: TensorRef, w_ih: TensorRef, w_hh: TensorRef,
+                  b_ih: Optional[TensorRef] = None, b_hh: Optional[TensorRef] = None) -> TensorRef:
         """One LSTM step -> `[batch, 2*hidden]` = (h_t | c_t). Biases are both-or-neither."""
         if (b_ih is None) != (b_hh is None):
             raise ValueError("lstm_cell requires both b_ih and b_hh or neither")
-        inputs: list[Value] = [x, h, c, w_ih, w_hh]
+        inputs: list[TensorRef] = [x, h, c, w_ih, w_hh]
         if b_ih is not None and b_hh is not None:
             inputs.extend((b_ih, b_hh))
         return self._emit(AionOp.AION_OP_LSTM_CELL, inputs)
 
-    def sequence_append(self, cache: Value, new_kv: Value, end_index: Value) -> Value:
+    def sequence_append(self, cache: TensorRef, new_kv: TensorRef, end_index: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_SEQUENCE_APPEND, (cache, new_kv, end_index))
 
-    def scatter_row(self, buf: Value, index: Value, src: Value) -> Value:
+    def scatter_row(self, buf: TensorRef, index: TensorRef, src: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_SCATTER_ROW, (buf, index, src))
 
-    def copy(self, a: Value) -> Value:
+    def copy(self, a: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_COPY, (a,))
 
     # --- output aliases & input roles -------------------------------------
-    def add_output_alias(self, input_value: Value, output_value: Value) -> None:
+    def add_output_alias(self, input_value: TensorRef, output_value: TensorRef) -> None:
         """Alias a graph input to an output (io-aliased recurrent state write-back).
 
         The output must already be marked (see `mark_output`)."""
@@ -647,7 +876,7 @@ class Builder:
             output_value.id,
         )
 
-    def add_input_role(self, value: Value, kind: AionInputRoleKind, *,
+    def add_input_role(self, value: TensorRef, kind: AionInputRoleKind, *,
                        axis: Optional[int] = None, capacity_symbol: Optional[str] = None,
                        zero_init: bool = True, growable: bool = False, ring: bool = False) -> None:
         """Tag an input with a runtime role (KV cache, positions, tokens, state, …).
@@ -671,7 +900,7 @@ class Builder:
         """Start a region (an `if` branch body or `loop` body). No nesting."""
         builder_begin_region(self._ctx_owner.ptr, self.ptr)
 
-    def end_region(self, outputs: Sequence[Value]) -> RegionId:
+    def end_region(self, outputs: Sequence[TensorRef]) -> RegionId:
         """Close the active region; returns a region id for `if_`/`loop`."""
         return builder_end_region(
             self._ctx_owner.ptr,
@@ -680,8 +909,8 @@ class Builder:
         )
 
     def if_(
-        self, cond: Value, then_region: RegionId, else_region: RegionId
-    ) -> Value:
+        self, cond: TensorRef, then_region: RegionId, else_region: RegionId
+    ) -> TensorRef:
         """Single-output conditional over an i32 `[1]` predicate `cond`."""
         value_id = builder_if(
             self._ctx_owner.ptr,
@@ -690,31 +919,31 @@ class Builder:
             then_region,
             else_region,
         )
-        return Value(self, value_id)
+        return TensorRef(self, value_id)
 
     @overload
-    def loop(self, carried: Value, body_region: RegionId, trip: int, *,
-             cond_carry: Optional[int] = None, check_before: bool = True) -> Value: ...
+    def loop(self, carried: TensorRef, body_region: RegionId, trip: int, *,
+             cond_carry: Optional[int] = None, check_before: bool = True) -> TensorRef: ...
     @overload
-    def loop(self, carried: Sequence[Value], body_region: RegionId, trip: int, *,
-             cond_carry: Optional[int] = None, check_before: bool = True) -> list[Value]: ...
+    def loop(self, carried: Sequence[TensorRef], body_region: RegionId, trip: int, *,
+             cond_carry: Optional[int] = None, check_before: bool = True) -> list[TensorRef]: ...
 
     def loop(
         self,
-        carried: Union[Value, Sequence[Value]],
+        carried: Union[TensorRef, Sequence[TensorRef]],
         body_region: RegionId,
         trip: int,
         *,
         cond_carry: Optional[int] = None,
         check_before: bool = True,
-    ) -> Union[Value, list[Value]]:
+    ) -> Union[TensorRef, list[TensorRef]]:
         """Run `body_region` up to `trip` times, threading the carried value(s).
 
-        Pass a single `Value` (returns a `Value`) or a sequence for a multi-carry
+        Pass a single `TensorRef` (returns a `TensorRef`) or a sequence for a multi-carry
         loop (returns a `list`). `cond_carry` names the carry index holding the i32
         `[1]` continue predicate, if any.
         """
-        single = isinstance(carried, Value)
+        single = isinstance(carried, TensorRef)
         inits = [carried] if single else list(carried)
         output_ids = builder_loop(
             self._ctx_owner.ptr,
@@ -725,11 +954,11 @@ class Builder:
             cond_carry=cond_carry,
             check_before=check_before,
         )
-        values = [Value(self, value_id) for value_id in output_ids]
+        values = [TensorRef(self, value_id) for value_id in output_ids]
         return values[0] if single else values
 
     # --- declarations & terminals -----------------------------------------
-    def mark_output(self, value: Value, name: str) -> None:
+    def mark_output(self, value: TensorRef, name: str) -> None:
         builder_mark_output(
             self._ctx_owner.ptr, self.ptr, value.id, name
         )
@@ -737,11 +966,20 @@ class Builder:
     def add_metadata(self, key: str, value: str) -> None:
         builder_add_metadata(self._ctx_owner.ptr, self.ptr, key, value)
 
+    def clear_outputs(self) -> None:
+        """Forget every output marked so far."""
+        builder_clear_outputs(self._ctx_owner.ptr, self.ptr)
+
     def _mark_outputs(self, outputs: OutputsLike) -> None:
+        # Replace rather than extend: `compile(outputs)` means *these* outputs.
+        # `mark_output` accumulates on the builder, so without clearing, a second
+        # compile would silently carry the first one's outputs.
+        self.clear_outputs()
+
         # A `{name: value}` mapping names outputs explicitly; otherwise a value's
         # own `.rename(...)` (its `_name`) is the default, falling back to the
         # positional `output{i}`.
-        if isinstance(outputs, Value):
+        if isinstance(outputs, TensorRef):
             self.mark_output(outputs, getattr(outputs, "_name", None) or "output0")
         elif isinstance(outputs, Mapping):
             for name, v in outputs.items():

@@ -29,7 +29,7 @@ from .types import NDArray
 type TensorData = int | float | list[TensorData]
 
 if TYPE_CHECKING:
-    from .builder import Builder, Value
+    from .builder import Builder, TensorRef
     from .model import LoadedModel
 
 def _as_shape(shape: Sequence[int]) -> list[int]:
@@ -143,206 +143,24 @@ def _is_ndarray(x) -> bool:
     return np is not None and isinstance(x, np.ndarray)
 
 
-# --- lazy DAG lowering ----------------------------------------------------
-# A lazy `Tensor` is an immutable node `(op, inputs, attrs)`; concrete tensors
-# and free inputs are its leaves. Nothing touches the core until we *lower* the
-# reachable DAG into a throwaway `Builder` (walked once, memoized), which the
-# core validates + shape-infers. Shape/dtype, realize, and compile/export all go
-# through `_lower`. Because each lowering builds a fresh builder from the
-# immutable DAG, there is no shared/destructible graph state — tensors combine
-# freely, realize any time, re-realize at will.
-
-def _walk(outputs):
-    """Yield every distinct Tensor reachable from `outputs` (self + inputs)."""
-    seen: set[int] = set()
-    stack = list(outputs)
-    while stack:
-        t = stack.pop()
-        if not isinstance(t, Tensor) or id(t) in seen:
-            continue
-        seen.add(id(t))
-        yield t
-        if t._lazy:
-            stack.extend(i for i in t._inputs if isinstance(i, Tensor))
-
-
-def _resolve_ctx(outputs):
-    ctx = None
-    for t in _walk(outputs):
-        c = t._ctx_owner
-        if ctx is None:
-            ctx = c
-        elif c is not ctx:
-            raise ValueError("tensors belong to different contexts")
-    if ctx is None:
-        raise ValueError("no context found for lazy tensor(s)")
-    return ctx
-
-
-def _has_free_input(outputs) -> bool:
-    return any(t._lazy and t._op == "input" for t in _walk(outputs))
-
-
-def _scalar_const_value(value, sibling, b):
-    """A scalar `Value` broadcast to `sibling`'s shape (elemwise won't broadcast
-    a `(1,)`), dtype following `sibling`."""
-    dt = sibling.dtype
-    shape = sibling.shape
-    if dt == AionDType.AION_DTYPE_I32:
-        if isinstance(value, float) and not float(value).is_integer():
-            raise TypeError("cannot combine a non-integer scalar with an i32 tensor; cast explicitly")
-        np_dtype, val = "int32", int(value)
-    elif dt == AionDType.AION_DTYPE_F32:
-        np_dtype, val = "float32", float(value)
-    else:
-        raise TypeError(f"scalar arithmetic is not supported for dtype {dt.name}; cast explicitly")
-
-    np = _try_numpy()
-    if np is not None:
-        const = Tensor(np.full(shape, val, dtype=np_dtype), ctx=b.context)
-    else:
-        const = Tensor._from_flat(
-            b.context,
-            shape,
-            [float(val)] * _elem_count(shape),
-            AionDType.AION_DTYPE_F32,
-        )
-    return b.param(const)
-
-
-def _lower(outputs) -> "tuple[Builder, list[Value]]":
-    """Emit the DAG reachable from `outputs` into a fresh `Builder`.
-
-    Returns `(builder, [Value per output])`. Each node is emitted once
-    (memoized); a lazy node caches its inferred shape/dtype so later `.shape`
-    queries are free.
-    """
-    from .builder import Builder, Value
-
-    ctx = _resolve_ctx(outputs)
-    b = Builder(ctx=ctx)
-    memo: dict[int, "Value"] = {}
-
-    def operand(x):
-        # A raw scalar has no Value on its own; the caller (elemwise) handles it.
-        if isinstance(x, Tensor):
-            return emit(x)
-        if _is_ndarray(x):
-            return b.param(Tensor(x, ctx=ctx))
-        raise TypeError(f"unsupported operand for a tensor op: {type(x).__name__}")
-
-    def emit(t):
-        k = id(t)
-        cached = memo.get(k)
-        if cached is not None:
-            return cached
-        if not t._lazy:
-            v = b.param(t)  # concrete leaf -> baked param
-        else:
-            v = _emit_node(t, b, emit, operand)
-            if t._shape_cache is None:
-                t._shape_cache = tuple(v.shape)
-                t._dtype_cache = v.dtype
-            if t._name:
-                b.name(v, t._name)
-        memo[k] = v
-        return v
-
-    out_values = [emit(t) for t in outputs]
-    return b, out_values
-
-
-def _emit_node(t, b, emit, operand):
-    op, ins, at = t._op, t._inputs, t._attrs
-    if op == "input":
-        return b.input(at["shape"], dtype=at["dtype"], dynamic=at.get("dynamic"))
-    if op == "matmul":
-        return b.matmul(operand(ins[0]), operand(ins[1]), at.get("alpha", 1.0), at.get("beta", 0.0))
-    if op == "unary":
-        return b.unary(at["op"], operand(ins[0]))
-    if op == "softmax":
-        return b.softmax(operand(ins[0]), at["axis"])
-    if op == "reshape":
-        return b.reshape(operand(ins[0]), at["shape"])
-    if op == "transpose2d":
-        return b.transpose2d(operand(ins[0]))
-    if op == "cast":
-        return b.cast(operand(ins[0]), at["dtype"])
-    if op in ("add", "sub", "mul", "div"):
-        xv, yv = _emit_pair(ins[0], ins[1], b, emit, operand)
-        return getattr(b, op)(xv, yv)
-    raise ValueError(f"unknown lazy op {op!r}")
-
-
-def _emit_pair(x, y, b, emit, operand):
-    xv = None if _is_py_scalar(x) else operand(x)
-    yv = None if _is_py_scalar(y) else operand(y)
-    if xv is None and yv is None:
-        raise TypeError("a binary op needs at least one tensor operand")
-    if xv is None:
-        xv = _scalar_const_value(x, yv, b)
-    if yv is None:
-        yv = _scalar_const_value(y, xv, b)
-    return xv, yv
-
-
-def _realize_many(tensors, *, device: DeviceLike = None):
-    """Lower + compile + run one throwaway graph, materializing each lazy tensor.
-
-    Lazy tensors are flipped to CONCRETE in place, each keeping the `LoadedModel`
-    (and its baked params) alive. Shared subgraphs are emitted once, so passing
-    several tensors realizes them in a single compile + run.
-    """
-    lazies = [t for t in tensors if t._lazy]
-    if not lazies:
-        return list(tensors)
-    if _has_free_input(lazies):
-        raise RuntimeError(
-            "cannot realize a graph with unbound inputs; build a runnable model "
-            "with aion.compile(outputs, inputs=[...]) and bind them at run time"
-        )
-
-    b, out_values = _lower(lazies)
-    names = []
-    for i, (t, v) in enumerate(zip(lazies, out_values)):
-        nm = t._name or f"__out{i}"
-        b.mark_output(v, nm)
-        names.append(nm)
-    model = b.compile(device=device)
-    model._attach_authoring_builder(b)  # keep baked params alive
-    model.run()
-    for t, nm in zip(lazies, names):
-        h = model.output_tensor(nm)
-        t._adopt(h)               # flip LAZY -> CONCRETE in place
-        t._realize_model = model  # keep output storage alive
-        t._op = None
-        t._inputs = []            # release the DAG for GC
-    return list(tensors)
-
-
 class Tensor:
-    """The high-level value: either CONCRETE data or a LAZY DAG node.
+    """Concrete tensor data: owns an `AionTensor*`; storage belongs to the Context.
 
-    - CONCRETE: owns an `AionTensor*` handle (`_t`); underlying storage is owned
-      by the Context. Produced by `aion.tensor(data)` and the factories.
-    - LAZY: an immutable graph node `(_op, _inputs, _attrs)`; owns no C storage.
-      Produced by operators and `aion.tensor(shape=...)`. Materialized to
-      CONCRETE (in place) by `.realize()` / `.numpy()` / `aion.realize`.
+    This is the *data* handle — what you write inputs into, read outputs out of,
+    and hand to a layer as a weight. It is deliberately not a graph node: graphs
+    are built from `TensorRef`s on a `Builder`, which is the single graph
+    representation (and the same split the Zig API makes between `api.Tensor` and
+    `TensorRef`).
     """
 
-    # Instance attributes (assigned in `_init_from_handle` / `_from_node`;
-    # declared here so type checkers see them). `_lazy` selects the mode.
-    _lazy: bool
+    # Instance attributes (assigned in `_init_from_handle`; declared here so type
+    # checkers see them).
     _ctx_owner: "Context"
     _closed: bool
     _dtype_cache: Optional[AionDType]
     _shape_cache: Optional[tuple[int, ...]]
-    _t: TensorHandle | None          # CONCRETE: typed opaque native handle
-    _op: Optional[str]               # LAZY: op name ("matmul", "add", "input", ...)
-    _inputs: list[Any]               # LAZY: operands (Tensor | scalar | ndarray)
-    _attrs: dict[str, Any]           # LAZY: op-specific attributes
-    _name: Optional[str]             # LAZY: `.rename()` — default input/output name
-    _realize_model: Optional["LoadedModel"]  # kept alive after realize (output storage)
+    _t: TensorHandle | None          # typed opaque native handle
+    _name: Optional[str]             # parameter name carried into a graph
 
     def __init__(
         self,
@@ -379,7 +197,7 @@ class Tensor:
         if np is not None and isinstance(data, np.ndarray):
             from .numpy import _tensor_from_numpy
 
-            self._adopt(_tensor_from_numpy(ctx, data, dtype=dtype))
+            self._take(_tensor_from_numpy(ctx, data, dtype=dtype))
             if device is not None:
                 self.to(device)
             return
@@ -389,7 +207,7 @@ class Tensor:
         ):
             from .numpy import _tensor_from_numpy
 
-            self._adopt(_tensor_from_numpy(ctx, data, dtype=dtype))
+            self._take(_tensor_from_numpy(ctx, data, dtype=dtype))
             if device is not None:
                 self.to(device)
             return
@@ -436,10 +254,14 @@ class Tensor:
         self._closed = False
         self._dtype_cache = dtype
         self._shape_cache = shape
-        # CONCRETE mode: owns C storage, not a lazy DAG node.
-        self._lazy = False
+        # A concrete tensor keeps whatever name it was given: lowered into a graph
+        # it becomes a param, and a param's name is how a loaded model finds it.
+        if not hasattr(self, "_name"):
+            self._name = None
 
-    def _adopt(self, other: "Tensor") -> None:
+    def _take(self, other: "Tensor") -> None:
+        """Adopt `other`'s handle, leaving it closed. Used by the numpy paths,
+        which build a finished tensor that `__init__` must become."""
         handle = other._require_handle()
         self._init_from_handle(
             other._ctx_owner,
@@ -449,6 +271,7 @@ class Tensor:
         )
         other._t = None
         other._closed = True
+
 
     @classmethod
     def _from_handle(
@@ -463,112 +286,65 @@ class Tensor:
         self._init_from_handle(ctx, ptr, dtype=dtype, shape=shape)
         return self
 
-    @classmethod
-    def _from_node(
-        cls,
-        op: str,
-        inputs: list[Any],
-        attrs: dict[str, Any],
-        ctx: "Context",
-        name: str | None = None,
-    ) -> "Tensor":
-        """Create a LAZY tensor: an immutable DAG node `(op, inputs, attrs)`.
-
-        `inputs` may hold Tensors, Python scalars, or numpy arrays; leaves are
-        resolved at lowering time. Owns no C storage — teardown is inert
-        (`close`/`__del__` are no-ops). `realize()` flips it to CONCRETE in place.
-        """
-        self = cls.__new__(cls)
-        self._lazy = True
-        self._op = op
-        self._inputs = list(inputs)
-        self._attrs = attrs
-        self._ctx_owner = ctx
-        self._name = name
-        self._t = None
-        self._closed = True  # inert: no handle to free, not a context child
-        self._dtype_cache = None
-        self._shape_cache = None
-        self._realize_model = None
-        return self
 
     @property
     def ptr(self) -> TensorHandle:
         return self._require_handle()
+
+    def ref(self, builder: "Builder | None" = None) -> "TensorRef":
+        """Bind this data into a graph and return the handle to compose on.
+
+        `Tensor` is data and has no operators — the graph lives on a `Builder`. This
+        is the one step across that line:
+
+            x = aion.tensor(np_x).ref()
+            print((x @ w.ref()).relu())
+
+        With no `builder`, it uses the Context's scratch builder, so exploring costs
+        no ceremony. Pass an explicit builder when authoring a model, so that model
+        owns its graph.
+
+        The name carried by `rename()` becomes the parameter name, which is how a
+        loaded model looks the weight up.
+        """
+        b = builder if builder is not None else self._ctx_owner.scratch_builder()
+        if self._name is not None:
+            return b.param_named(self, self._name)
+        return b.param(self)
 
     def _require_handle(self) -> TensorHandle:
         if self._t is None:
             raise RuntimeError("Tensor has no concrete native handle")
         return self._t
 
-    # --- lazy op surface (build an immutable DAG; nothing runs yet) --------
-    def _mk(self, kind: str, inputs: list, **attrs) -> "Tensor":
-        return Tensor._from_node(kind, inputs, attrs, ctx=self._ctx_owner)
 
-    def __matmul__(self, other: object) -> "Tensor":
-        return self._mk("matmul", [self, other])
 
-    def __rmatmul__(self, other: object) -> "Tensor":
-        return self._mk("matmul", [other, self])
 
-    def __add__(self, other: object) -> "Tensor":
-        return self._mk("add", [self, other])
 
-    def __radd__(self, other: object) -> "Tensor":
-        return self._mk("add", [other, self])
 
-    def __sub__(self, other: object) -> "Tensor":
-        return self._mk("sub", [self, other])
 
-    def __rsub__(self, other: object) -> "Tensor":
-        return self._mk("sub", [other, self])
 
-    def __mul__(self, other: object) -> "Tensor":
-        return self._mk("mul", [self, other])
 
-    def __rmul__(self, other: object) -> "Tensor":
-        return self._mk("mul", [other, self])
 
-    def __truediv__(self, other: object) -> "Tensor":
-        return self._mk("div", [self, other])
 
-    def __rtruediv__(self, other: object) -> "Tensor":
-        return self._mk("div", [other, self])
 
-    def __neg__(self) -> "Tensor":
-        return self._mk("mul", [self, -1])
 
-    def relu(self) -> "Tensor":
-        return self._mk("unary", [self], op="relu")
 
-    def gelu(self) -> "Tensor":
-        return self._mk("unary", [self], op="gelu")
 
-    def silu(self) -> "Tensor":
-        return self._mk("unary", [self], op="silu")
 
-    def sigmoid(self) -> "Tensor":
-        return self._mk("unary", [self], op="sigmoid")
 
-    def tanh(self) -> "Tensor":
-        return self._mk("unary", [self], op="tanh")
 
-    def softmax(self, axis: int = -1) -> "Tensor":
-        return self._mk("softmax", [self], axis=axis)
 
-    def reshape(self, shape: Sequence[int]) -> "Tensor":
-        return self._mk("reshape", [self], shape=tuple(int(d) for d in shape))
 
-    def transpose2d(self) -> "Tensor":
-        return self._mk("transpose2d", [self])
 
-    def cast(self, dtype: object) -> "Tensor":
-        return self._mk("cast", [self], dtype=dtype)
 
     def rename(self, name: str) -> "Tensor":
-        if not self._lazy:
-            raise TypeError("rename() is only valid on a lazy tensor (input/op result)")
-        self._name = name  # the default input/output name at lower/compile/export
+        """Set the name this tensor carries into a graph.
+
+        This is the *parameter* name a loaded model looks the weight up by, so
+        naming weights is how a model gets a usable `state_dict`.
+        """
+        self._name = name
         return self
 
     @property
@@ -576,19 +352,7 @@ class Tensor:
         return len(self.shape)
 
     # --- materialization ---------------------------------------------------
-    def realize(self, *, device: DeviceLike = None) -> "Tensor":
-        """Compile + run this lazy graph, becoming a CONCRETE tensor (returns self).
 
-        A no-op on an already-CONCRETE tensor. To materialize several results
-        from one graph in a single compile + run, use `aion.realize([...])`.
-        """
-        if self._lazy:
-            _realize_many([self], device=device)
-        return self
-
-    def _ensure_realized(self) -> None:
-        if self._lazy:
-            _realize_many([self], device=None)
 
     def to(self, device: DeviceLike) -> "Tensor":
         """Migrate this tensor to `device` (move semantics; returns self).
@@ -597,10 +361,8 @@ class Tensor:
         `read_*`/`write_*` fail until you migrate back with ``.to("cpu")``.
         Idempotent when already on the target device. Accepts ``"cpu"``,
         ``"gpu"``, ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind``.
-        A GRAPH (lazy) tensor is realized first (on the default device).
-        """
+            """
 
-        self._ensure_realized()
         kind, index = _normalize_device(device)
         move_tensor(
             self._ctx_owner.ptr, self._require_handle(), int(kind), int(index)
@@ -610,7 +372,6 @@ class Tensor:
     def device(self) -> str:
         """The device this tensor is resident on: ``"cpu"`` or ``"gpu:N"``."""
 
-        self._ensure_realized()
         kind, index = tensor_device(self._ctx_owner.ptr, self._require_handle())
         return _device_to_str(kind, index)
 
@@ -797,8 +558,6 @@ class Tensor:
         return _elem_count(self.shape)
 
     def __repr__(self) -> str:
-        if getattr(self, "_lazy", False):
-            return f"Tensor(lazy, op={self._op!r})"
         if getattr(self, "_closed", True):
             return "Tensor(<closed>)"
         try:
@@ -808,28 +567,13 @@ class Tensor:
 
     @property
     def dtype(self) -> AionDType:
-        if self._lazy:
-            if self._dtype_cache is None:
-                self._infer_meta()
-            assert self._dtype_cache is not None  # populated by _infer_meta
-            return self._dtype_cache
         if self._dtype_cache is None:
             self._dtype_cache = tensor_dtype(self._require_handle())
         return self._dtype_cache
 
-    def _infer_meta(self) -> None:
-        """Lower this lazy node once to cache its shape + dtype (core inference)."""
-        b, _ = _lower([self])
-        b.close()  # throwaway; shapes were cached on the nodes during emit
 
     @property
     def shape(self) -> tuple[int, ...]:
-        if self._lazy:
-            if self._shape_cache is None:
-                self._infer_meta()
-            assert self._shape_cache is not None  # populated by _infer_meta
-            return self._shape_cache
-
         if self._shape_cache is not None:
             return self._shape_cache
 
@@ -840,7 +584,6 @@ class Tensor:
 
     # --- host conversion and mutation ------------------------------------
     def _flat_values(self) -> list[int | float]:
-        self._ensure_realized()
         if _is_quant(self.dtype):
             raise NotImplementedError(
                 f"{self.dtype.name}: quantized tensors cannot be converted to Python values"
@@ -872,8 +615,6 @@ class Tensor:
 
     def copy_from(self, values: object) -> "Tensor":
         """Copy array-like data into this tensor and return ``self``."""
-        if self._lazy:
-            raise TypeError("cannot mutate a lazy tensor; it is a computed value")
         dt = self.dtype
         if _is_quant(dt):
             raise NotImplementedError(f"{dt.name}: quantized tensors cannot be mutated")
@@ -931,5 +672,4 @@ class Tensor:
     def numpy(self) -> NDArray:
         from .numpy import _tensor_to_numpy
 
-        self._ensure_realized()
         return _tensor_to_numpy(self)

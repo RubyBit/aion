@@ -56,8 +56,9 @@ from typing import IO, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 import aion
-from aion import Builder, Value
+from aion import Builder, TensorRef, nn
 from aion.enums import AionInputRoleKind as RK
+from aion.nn import functional as F
 
 # ------------------------------- architecture --------------------------------
 
@@ -141,27 +142,115 @@ class _Loader:
 # two weight-packing idioms (q8_0 matmul-B and q8_0 embedding) and layer norm.
 
 
-def q8b(b: Builder, w_torch: np.ndarray) -> Value:
-    """PyTorch linear `[out, in]` -> Aion matmul-B `[1, in, out]` q8_0 param.
+def q8b(b: Builder, w_torch: np.ndarray) -> TensorRef:
+    """PyTorch linear `[out, in]` -> a q8_0 matmul-B param bound as `[1, in, out]`.
 
-    Aion MatMul requires A and B to share rank; the residual stream A is rank-3
-    `[B, S, K]`, so dense weights are stored `[1, K, N]` and broadcast. Blocks
-    q8_0 along the K axis (rank-2, the default `quant_axis`)."""
+    The encoder's weights go through `nn` (see `mm_b`), which stores them at their
+    natural `[K, N]` rank. This remains for the RNN-T decode loop, which is written
+    directly on the Builder — control flow is the low-level escape hatch — and whose
+    graph was authored against the rank-3 form.
+    """
     w_t = np.ascontiguousarray(w_torch.T)  # [K, N]
     k, n = int(w_t.shape[0]), int(w_t.shape[1])
     return b.param(w_t.reshape(1, k, n), dtype="q8_0", shape=(1, k, n))
 
 
-def q8_embed(b: Builder, table: np.ndarray) -> Value:
+def q8_embed(b: Builder, table: np.ndarray) -> TensorRef:
     """Embedding table `[V, D]` -> q8_0 param blocked along the feature dim D."""
     v, d = int(table.shape[0]), int(table.shape[1])
     return b.param(np.ascontiguousarray(table), dtype="q8_0", shape=(v, d), quant_axis=1)
 
 
-def layernorm(b: Builder, x: Value, base: str, loader: _Loader, nd: Shape) -> Value:
-    g = b.param(loader.get(f"{base}.weight"))
-    be = b.param(loader.get(f"{base}.bias"))
-    return b.layernorm(x, g, be, eps=LN_EPS, normalized_shape=nd)
+def mm_b(w_torch: np.ndarray) -> np.ndarray:
+    """A PyTorch linear's `[out, in]` weight in Aion's matmul-B layout `[in, out]`.
+
+    Adapting someone else's layout is a converter's job. Rank 2 is all it needs —
+    MatMul broadcasts a `[K, N]` weight into a rank-3 `[B, S, K]` activation — and
+    `nn` does the q8_0 quantization, blocking along K.
+    """
+    return np.ascontiguousarray(w_torch.T)
+
+
+def ln(loader: _Loader, base: str, name: str) -> nn.LayerNorm:
+    """A LayerNorm from the checkpoint, under this model's epsilon."""
+    return nn.LayerNorm(
+        loader.get(f"{base}.weight"), loader.get(f"{base}.bias"),
+        eps=LN_EPS, name=name,
+    )
+
+
+class ConformerLayer(nn.Module):
+    """One FastConformer block: half-scaled FF, rel-pos MHSA, conv module, half-scaled
+    FF, output norm — the macaron layout.
+
+    Held as a module so the batch encoder and the cache-aware streaming encoder share
+    one definition. They differ only in what happens *between* projection and
+    attention (streaming prepends cached K/V) and around the depthwise conv (streaming
+    prepends a cached left context), which is why those two steps are the caller's and
+    everything else lives here.
+    """
+
+    def __init__(self, loader: _Loader, li: int, *, t_kv: int,
+                 mask: Optional[TensorRef] = None, conv_pad_left: int = 0) -> None:
+        # The caller opens a `layers.{li}` scope around the body, so every parameter
+        # below lands under it without this type having to know its own index.
+        pf = f"encoder.layers.{li}"
+        get = loader.get
+
+        # The sinusoidal table projected through `linear_pos` is fixed, so it is
+        # folded on the host once per layer rather than emitted as two ops.
+        p_len = 2 * t_kv - 1
+        pe_proj = ((sinusoidal_pe(t_kv, D_MODEL) @ get(f"{pf}.self_attn.linear_pos.weight").T)
+                   .reshape(p_len, N_HEADS, HEAD_DIM).transpose(1, 0, 2))
+
+        self.norm_feed_forward1 = ln(loader, f"{pf}.norm_feed_forward1", "norm_feed_forward1")
+        self.feed_forward1 = nn.FeedForward(
+            mm_b(get(f"{pf}.feed_forward1.linear1.weight")),
+            mm_b(get(f"{pf}.feed_forward1.linear2.weight")),
+            act="silu", dtype="q8_0", name="feed_forward1")
+
+        self.norm_self_att = ln(loader, f"{pf}.norm_self_att", "norm_self_att")
+        self.self_attn = nn.RelPosSelfAttention(
+            mm_b(get(f"{pf}.self_attn.linear_q.weight")),
+            mm_b(get(f"{pf}.self_attn.linear_k.weight")),
+            mm_b(get(f"{pf}.self_attn.linear_v.weight")),
+            mm_b(get(f"{pf}.self_attn.linear_out.weight")),
+            np.ascontiguousarray(pe_proj),
+            get(f"{pf}.self_attn.pos_bias_u"),
+            get(f"{pf}.self_attn.pos_bias_v"),
+            heads=N_HEADS, scale=ATT_SCALE, mask=mask,
+            dtype="q8_0", name="self_attn")
+
+        # Pointwise convs are k=1, i.e. matmuls, so they are stored q8_0 and take the
+        # fast matmul path; only the depthwise conv stays f32.
+        self.norm_conv = ln(loader, f"{pf}.norm_conv", "norm_conv")
+        self.conv_glu = nn.GLU(mm_b(get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0]),
+                               dtype="q8_0", name="conv/pointwise_conv1")
+        # Causal padding in the batch path; the streaming path pads with a cached
+        # left context instead, so it asks for none.
+        self.conv_dw = nn.DepthwiseConv1D(
+            np.transpose(get(f"{pf}.conv.depthwise_conv.weight"), (2, 1, 0)),
+            pad_left=conv_pad_left, pad_right=0, name="conv/depthwise_conv")
+        # A LayerNorm occupies the batch-norm slot in this checkpoint.
+        self.conv_norm = ln(loader, f"{pf}.conv.batch_norm", "conv/batch_norm")
+        self.conv_out = nn.Linear(mm_b(get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0]),
+                                  dtype="q8_0", name="conv/pointwise_conv2")
+
+        self.norm_feed_forward2 = ln(loader, f"{pf}.norm_feed_forward2", "norm_feed_forward2")
+        self.feed_forward2 = nn.FeedForward(
+            mm_b(get(f"{pf}.feed_forward2.linear1.weight")),
+            mm_b(get(f"{pf}.feed_forward2.linear2.weight")),
+            act="silu", dtype="q8_0", name="feed_forward2")
+
+        self.norm_out = ln(loader, f"{pf}.norm_out", "norm_out")
+
+    def ff1(self, h: TensorRef) -> TensorRef:
+        """The macaron half-step: `h + 0.5 * FF(norm(h))`."""
+        return h + F.scale(self.feed_forward1(self.norm_feed_forward1(h)), 0.5)
+
+    def ff2_and_out(self, h: TensorRef) -> TensorRef:
+        h = h + F.scale(self.feed_forward2(self.norm_feed_forward2(h)), 0.5)
+        return self.norm_out(h)
 
 
 # ------------------------------ positional emb -------------------------------
@@ -180,7 +269,7 @@ def sinusoidal_pe(length: int, d_model: int) -> np.ndarray:
 # --------------------------------- encoder -----------------------------------
 
 
-def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> Value:
+def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> TensorRef:
     """In-graph NeMo log-mel: audio [n,1] -> feat [1, t_mel, 128].
 
     Matches AudioToMelSpectrogramPreprocessor (normalize="NA"=none): preemphasis
@@ -211,12 +300,12 @@ def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> Value:
     spec = b.stft(sig, win_id, n_fft=N_FFT, hop_length=HOP_LEN, center=True)  # [1,t_mel,514]
     re = b.slice(spec, (0, 0, 0), (1, t_mel, bins))
     im = b.slice(spec, (0, 0, bins), (1, t_mel, bins))
-    power = b.add(b.mul(re, re), b.mul(im, im))             # [1,t_mel,257]
-    mel = b.matmul(power, fb_b)                             # [1,t_mel,128]
+    power = b.add(re * re, im * im)             # [1,t_mel,257]
+    mel = power @ fb_b                             # [1,t_mel,128]
     return b.unary("log", b.broadcast_add(mel, guard))     # [1,t_mel,128]
 
 
-def build_att_mask(b: Builder, t_out: int, att_left: int, att_right: int) -> Value:
+def build_att_mask(b: Builder, t_out: int, att_left: int, att_right: int) -> TensorRef:
     """Additive [t_out, t_out] chunked_limited mask (0 allowed, -1e9 masked)."""
     chunk = att_right + 1
     m = np.full((t_out, t_out), -1e9, np.float32)
@@ -228,7 +317,7 @@ def build_att_mask(b: Builder, t_out: int, att_left: int, att_right: int) -> Val
     return b.param(m)
 
 
-def build_subsample(loader: _Loader, b: Builder, feat: Value, t_mel: int) -> Value:
+def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) -> TensorRef:
     """dw_striding ×8 subsampling: feat [1, t_mel, 128] -> h [1, t_out, 1024]."""
     t_out = calc_length(t_mel)
 
@@ -246,7 +335,7 @@ def build_subsample(loader: _Loader, b: Builder, feat: Value, t_mel: int) -> Val
     out_wq = q8b(b, out_w)
     out_b = b.param(loader.get(f"{pe}.out.bias"))
 
-    relu = lambda x: b.unary("relu", x)
+    relu = lambda x: x.relu()
     x = b.reshape(feat, (1, t_mel, FEAT_IN, 1))
 
     # CausalConv2D pads both spatial dims (top/left=k-1=2, bottom/right=stride-1=1).
@@ -261,11 +350,11 @@ def build_subsample(loader: _Loader, b: Builder, feat: Value, t_mel: int) -> Val
     x = c2(x, w5, b5, SUB_CH, True)
     x = relu(c2(x, w6, b6, 1, False))
     x = b.reshape(x, (1, t_out, FREQ_OUT * SUB_CH))  # NHWC flatten (f*256+c)
-    return b.broadcast_add(b.matmul(x, out_wq), out_b)  # [1, t_out, 1024]
+    return b.broadcast_add(x @ out_wq, out_b)  # [1, t_out, 1024]
 
 
 def build_encoder(loader: _Loader, b: Builder, t_mel: int,
-                  att_left: Optional[int] = None, att_right: int = 0) -> Value:
+                  att_left: Optional[int] = None, att_right: int = 0) -> TensorRef:
     t_out = calc_length(t_mel)
     p_len = 2 * t_out - 1
 
@@ -282,65 +371,20 @@ def build_encoder(loader: _Loader, b: Builder, t_mel: int,
 
     # ---- 24 conformer layers ----
     for li in range(N_LAYERS):
-        pf = f"encoder.layers.{li}"
+        with b.scope(f"layers.{li}"):
+            layer = ConformerLayer(loader, li, t_kv=t_out, mask=att_mask,
+                                   conv_pad_left=CONV_K - 1)
+            h = layer.ff1(h)
 
-        def ffn(x, ff_pref):
-            l1 = q8b(b, loader.get(f"{ff_pref}.linear1.weight"))
-            l2 = q8b(b, loader.get(f"{ff_pref}.linear2.weight"))
-            a = b.matmul(x, l1)
-            a = b.unary("silu", a)
-            return b.matmul(a, l2)
+            # Q/K/V are three separate matmuls sharing `norm_self_att(h)`; the compiler
+            # fuses them into one wide matmul plus slices.
+            h = h + layer.self_attn(layer.norm_self_att(h))
 
-        # FF1 (x0.5)
-        hn = layernorm(b, h, f"{pf}.norm_feed_forward1", loader, (D_MODEL,))
-        ff1 = ffn(hn, f"{pf}.feed_forward1")
-        half = b.param(np.full((D_MODEL,), 0.5, dtype=np.float32))
-        h = b.add(h, b.broadcast_mul(ff1, half))
+            c = layer.conv_glu(layer.norm_conv(h))
+            c = layer.conv_norm(layer.conv_dw(c)).silu()
+            h = h + layer.conv_out(c)
 
-        # MHSA (rel-pos)
-        hn = layernorm(b, h, f"{pf}.norm_self_att", loader, (D_MODEL,))
-        q = b.reshape(b.matmul(hn, q8b(b, loader.get(f"{pf}.self_attn.linear_q.weight"))),
-                      (1, t_out, N_HEADS, HEAD_DIM))
-        k = b.reshape(b.matmul(hn, q8b(b, loader.get(f"{pf}.self_attn.linear_k.weight"))),
-                      (1, t_out, N_HEADS, HEAD_DIM))
-        v = b.reshape(b.matmul(hn, q8b(b, loader.get(f"{pf}.self_attn.linear_v.weight"))),
-                      (1, t_out, N_HEADS, HEAD_DIM))
-        # pos_emb projected per layer: linear_pos @ sinusoidal -> [P, 1024] -> [H, P, HD]
-        pe = sinusoidal_pe(t_out, D_MODEL)  # [P, 1024]
-        lin_pos = loader.get(f"{pf}.self_attn.linear_pos.weight")  # [1024, 1024]
-        pe_proj = (pe @ lin_pos.T).reshape(p_len, N_HEADS, HEAD_DIM).transpose(1, 0, 2)  # [H, P, HD]
-        pe_id = b.param(np.ascontiguousarray(pe_proj))
-        bu = b.param(loader.get(f"{pf}.self_attn.pos_bias_u"))  # [H, HD]
-        bv = b.param(loader.get(f"{pf}.self_attn.pos_bias_v"))
-        att = b.relpos_mha(q, k, v, pe_id, bu, bv, att_mask, scale=ATT_SCALE, heads=N_HEADS)  # [1,T,H,HD]
-        att = b.reshape(att, (1, t_out, D_MODEL))
-        att = b.matmul(att, q8b(b, loader.get(f"{pf}.self_attn.linear_out.weight")))
-        h = b.add(h, att)
-
-        # Conv module. Pointwise convs are k=1 == matmul; store them q8 and route
-        # through the fast matmul path. Only the depthwise conv stays f32.
-        hn = layernorm(b, h, f"{pf}.norm_conv", loader, (D_MODEL,))
-        pw1 = q8b(b, loader.get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0])  # [2048,1024]
-        c = b.matmul(hn, pw1)  # [1,T,2048]
-        a = b.slice(c, (0, 0, 0), (1, t_out, D_MODEL))
-        g = b.slice(c, (0, 0, D_MODEL), (1, t_out, D_MODEL))
-        c = b.mul(a, b.unary("sigmoid", g))  # GLU
-        dw = b.param(np.transpose(loader.get(f"{pf}.conv.depthwise_conv.weight"), (2, 1, 0)))  # [9,1,1024]
-        c = b.conv1d(c, dw, None, stride=1, dilation=1, pad_left=CONV_K - 1, pad_right=0, groups=D_MODEL)
-        c = layernorm(b, c, f"{pf}.conv.batch_norm", loader, (D_MODEL,))  # LayerNorm slot
-        c = b.unary("silu", c)
-        pw2 = q8b(b, loader.get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0])  # [1024,1024]
-        c = b.matmul(c, pw2)  # [1,T,1024]
-        h = b.add(h, c)
-
-        # FF2 (x0.5)
-        hn = layernorm(b, h, f"{pf}.norm_feed_forward2", loader, (D_MODEL,))
-        ff2 = ffn(hn, f"{pf}.feed_forward2")
-        half2 = b.param(np.full((D_MODEL,), 0.5, dtype=np.float32))
-        h = b.add(h, b.broadcast_mul(ff2, half2))
-
-        # final norm
-        h = layernorm(b, h, f"{pf}.norm_out", loader, (D_MODEL,))
+            h = layer.ff2_and_out(h)
 
     return h
 
@@ -351,7 +395,7 @@ MAX_SYMBOLS = 10
 BLANK = VOCAB  # 1024
 
 
-def _ingraph_decode(loader: _Loader, b: Builder, enc: Value, t_out: int, max_out: int) -> None:
+def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max_out: int) -> None:
     """In-graph greedy RNNT decode over `enc [1, t_out, 1024]`. Adds outputs
     out_count/out_tokens + persistent decode state (last/h0/c0/h1/c1) with their
     IoAliases. Named multi-carry Loop, early-exit via `active = frame < t_out`."""
@@ -412,10 +456,10 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: Value, t_out: int, max_out
     h1o = b.slice(st1, (0, 0), (1, H))
     c1o = b.slice(st1, (0, H), (1, H))
 
-    fproj = b.broadcast_add(b.matmul(enc_frame, enc_w), enc_b)      # [1,1,640]
+    fproj = b.broadcast_add(enc_frame @ enc_w, enc_b)      # [1,1,640]
     gproj = b.broadcast_add(b.matmul(b.reshape(h1o, (1, 1, H)), pred_w), pred_b)
-    sj = b.unary("relu", b.add(fproj, gproj))                      # [1,1,640]
-    logits = b.broadcast_add(b.matmul(sj, jn_w), jn_b)             # [1,1,1025]
+    sj = b.unary("relu", fproj + gproj)                      # [1,1,640]
+    logits = b.broadcast_add(sj @ jn_w, jn_b)             # [1,1,1025]
     k = b.reshape(b.argmax(logits, axis=2), (1,))                  # [1] i32
 
     # advance = (k==blank) or (sym>=max_symbols);  emit = 1 - advance.
@@ -427,12 +471,12 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: Value, t_out: int, max_out
     def sel_row(keep, take):  # emit ? take : keep, over [1,H]
         diff_c = b.reshape(b.sub(take, keep), (H, 1))             # [H,1]
         scaled = b.reshape(b.broadcast_mul(diff_c, emit_f), (1, H))  # [1,H]
-        return b.add(keep, scaled)
+        return keep + scaled
 
     # Next state (arithmetic select on named carries).
-    frame_next = b.add(frame_in, advance)                          # +1 on advance
-    sym_next = b.mul(b.add(sym_in, one_i), emit)                   # sym+1 on emit else 0
-    count_next = b.add(count_in, emit)                             # +1 on emit
+    frame_next = frame_in + advance                          # +1 on advance
+    sym_next = b.mul(sym_in + one_i, emit)                   # sym+1 on emit else 0
+    count_next = count_in + emit                             # +1 on emit
     last_next = b.add(last_in, b.mul(b.sub(k, last_in), emit))     # k on emit
     active_next = b.compare("lt", frame_next, T_i)                 # i32 [1] {0,1}
     h0_next, c0_next = sel_row(h0_in, h0o), sel_row(c0_in, c0o)
@@ -486,61 +530,33 @@ def _stream_conformer_layers(loader, b, h, att_left, chunk, t_kv, cache_mask, k_
     """24 cache-aware conformer layers over chunk `h [1,chunk,1024]`. Returns
     (enc, k_out, v_out, conv_out)."""
     conv_left = CONV_K - 1
-    p_len = 2 * t_kv - 1
-
-    def ffn(x, pref):
-        l1 = q8b(b, loader.get(f"{pref}.linear1.weight"))
-        l2 = q8b(b, loader.get(f"{pref}.linear2.weight"))
-        return b.matmul(b.unary("silu", b.matmul(x, l1)), l2)
 
     k_out, v_out, conv_out = [], [], []
     for li in range(N_LAYERS):
-        pf = f"encoder.layers.{li}"
-        hn = layernorm(b, h, f"{pf}.norm_feed_forward1", loader, (D_MODEL,))
-        h = b.add(h, b.broadcast_mul(ffn(hn, f"{pf}.feed_forward1"),
-                                     b.param(np.full((D_MODEL,), 0.5, np.float32))))
-        hn = layernorm(b, h, f"{pf}.norm_self_att", loader, (D_MODEL,))  # [1,chunk,1024]
-        # Fused QKV projection of ONLY the new chunk frames (M=chunk): one matmul
-        # instead of three, then prepend the cached K/V.
-        wqkv = np.concatenate([loader.get(f"{pf}.self_attn.linear_q.weight"),
-                               loader.get(f"{pf}.self_attn.linear_k.weight"),
-                               loader.get(f"{pf}.self_attn.linear_v.weight")], axis=0)  # [3072,1024]
-        qkv = b.matmul(hn, q8b(b, wqkv))                        # [1,chunk,3072]
-        q = b.reshape(b.slice(qkv, (0, 0, 0), (1, chunk, D_MODEL)), (1, chunk, N_HEADS, HEAD_DIM))
-        k_c = b.reshape(b.slice(qkv, (0, 0, D_MODEL), (1, chunk, D_MODEL)), (1, chunk, N_HEADS, HEAD_DIM))
-        v_c = b.reshape(b.slice(qkv, (0, 0, 2 * D_MODEL), (1, chunk, D_MODEL)), (1, chunk, N_HEADS, HEAD_DIM))
-        k = b.concat([k_in[li], k_c], axis=1)                   # [1,t_kv,H,D]
-        v = b.concat([v_in[li], v_c], axis=1)
-        pe = sinusoidal_pe(t_kv, D_MODEL)
-        lin_pos = loader.get(f"{pf}.self_attn.linear_pos.weight")
-        pe_proj = (pe @ lin_pos.T).reshape(p_len, N_HEADS, HEAD_DIM).transpose(1, 0, 2)
-        pe_id = b.param(np.ascontiguousarray(pe_proj))
-        bu = b.param(loader.get(f"{pf}.self_attn.pos_bias_u"))
-        bv = b.param(loader.get(f"{pf}.self_attn.pos_bias_v"))
-        att = b.relpos_mha(q, k, v, pe_id, bu, bv, cache_mask, scale=ATT_SCALE, heads=N_HEADS)
-        att = b.matmul(b.reshape(att, (1, chunk, D_MODEL)), q8b(b, loader.get(f"{pf}.self_attn.linear_out.weight")))
-        h = b.add(h, att)
-        k_out.append(b.slice(k, (0, chunk, 0, 0), (1, att_left, N_HEADS, HEAD_DIM)))  # last att_left
-        v_out.append(b.slice(v, (0, chunk, 0, 0), (1, att_left, N_HEADS, HEAD_DIM)))
+        # The same layer definition the batch encoder uses. Only the two steps that
+        # consult a cache are written out here.
+        with b.scope(f"layers.{li}"):
+            layer = ConformerLayer(loader, li, t_kv=t_kv, mask=cache_mask)
+            h = layer.ff1(h)
 
-        hn = layernorm(b, h, f"{pf}.norm_conv", loader, (D_MODEL,))
-        pw1 = q8b(b, loader.get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0])  # [2048,1024]
-        c = b.matmul(hn, pw1)                                                   # [1,chunk,2048]
-        glu = b.mul(b.slice(c, (0, 0, 0), (1, chunk, D_MODEL)),
-                    b.unary("sigmoid", b.slice(c, (0, 0, D_MODEL), (1, chunk, D_MODEL))))
-        glu_full = b.concat([conv_in[li], glu], axis=1)
-        dw = b.param(np.transpose(loader.get(f"{pf}.conv.depthwise_conv.weight"), (2, 1, 0)))
-        c = b.conv1d(glu_full, dw, None, stride=1, dilation=1, pad_left=0, pad_right=0, groups=D_MODEL)
-        c = b.unary("silu", layernorm(b, c, f"{pf}.conv.batch_norm", loader, (D_MODEL,)))
-        pw2 = q8b(b, loader.get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0])  # [1024,1024]
-        c = b.matmul(c, pw2)                                                    # [1,chunk,1024]
-        h = b.add(h, c)
-        conv_out.append(b.slice(glu_full, (0, chunk, 0), (1, conv_left, D_MODEL)))
+            # Project only the new chunk's frames, then prepend the cached K/V. Q/K/V
+            # are separate matmuls over a shared operand, which the compiler fuses
+            # into one wide matmul — so this no longer pre-concatenates the weights.
+            q, k_c, v_c = layer.self_attn.project(layer.norm_self_att(h))
+            k = b.concat([k_in[li], k_c], axis=1)                   # [1,t_kv,H,D]
+            v = b.concat([v_in[li], v_c], axis=1)
+            h = h + layer.self_attn.attend(q, k, v)
+            k_out.append(b.slice(k, (0, chunk, 0, 0), (1, att_left, N_HEADS, HEAD_DIM)))  # last att_left
+            v_out.append(b.slice(v, (0, chunk, 0, 0), (1, att_left, N_HEADS, HEAD_DIM)))
 
-        hn = layernorm(b, h, f"{pf}.norm_feed_forward2", loader, (D_MODEL,))
-        h = b.add(h, b.broadcast_mul(ffn(hn, f"{pf}.feed_forward2"),
-                                     b.param(np.full((D_MODEL,), 0.5, np.float32))))
-        h = layernorm(b, h, f"{pf}.norm_out", loader, (D_MODEL,))
+            # The depthwise conv's left context comes from the cache rather than from
+            # padding, so the GLU output is spliced before the conv and re-cached after.
+            glu_full = b.concat([conv_in[li], layer.conv_glu(layer.norm_conv(h))], axis=1)
+            c = layer.conv_norm(layer.conv_dw(glu_full)).silu()
+            h = h + layer.conv_out(c)
+            conv_out.append(b.slice(glu_full, (0, chunk, 0), (1, conv_left, D_MODEL)))
+
+            h = layer.ff2_and_out(h)
     return h, k_out, v_out, conv_out
 
 

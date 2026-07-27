@@ -35,6 +35,92 @@ fn compileRequire(cond: bool) CompileError!void {
     if (!cond) return CompileError.InvalidArgument;
 }
 
+/// Which nodes a compile actually has to lower: those reachable backwards from
+/// `graph.outputs`.
+///
+/// Without this, `compile(outputs)` lowers *every* node the graph has ever held,
+/// so anything authored and not asked for — a discarded branch, an expression
+/// evaluated while exploring — is compiled into the program and paid for at run
+/// time. Keying off the requested outputs makes the program depend on what was
+/// asked for rather than on the order things were written.
+///
+/// A node stays if *any* of its outputs is live (`Loop`/`If` produce several), and
+/// its inputs then become live in turn. Nodes are appended in dependency order, so
+/// one reverse sweep settles it.
+///
+/// A live control-flow node also keeps whatever its regions read. A region body
+/// references outer values directly — they are not routed through the `If`/`Loop`
+/// node's own inputs — so walking only `node.inputs` would prune a value that a
+/// loop body is the sole consumer of, which is how this first broke the Nemotron
+/// ASR graph.
+fn liveNodes(allocator: std.mem.Allocator, graph: *const graph_mod.Graph) CompileError![]bool {
+    const live_values: []bool = allocator.alloc(bool, graph.values.items.len) catch return CompileError.OutOfMemory;
+    defer allocator.free(live_values);
+    @memset(live_values, false);
+
+    const live: []bool = allocator.alloc(bool, graph.nodes.items.len) catch return CompileError.OutOfMemory;
+    errdefer allocator.free(live);
+    @memset(live, false);
+
+    for (graph.outputs.items) |vid| {
+        const idx: usize = @intCast(vid);
+        if (idx < live_values.len) live_values[idx] = true;
+    }
+
+    var i: usize = graph.nodes.items.len;
+    while (i > 0) {
+        i -= 1;
+        const node = graph.nodes.items[i];
+
+        var produces_live: bool = live_values[@intCast(node.output)];
+        for (node.extra_outputs) |eid| {
+            if (live_values[@intCast(eid)]) produces_live = true;
+        }
+        if (!produces_live) continue;
+
+        live[i] = true;
+        for (node.inputs) |in| {
+            const in_idx: usize = @intCast(in);
+            if (in_idx < live_values.len) live_values[in_idx] = true;
+        }
+        markRegionReads(graph, node, live_values);
+    }
+
+    return live;
+}
+
+/// Mark every value a live node's regions read, so nothing a region body depends
+/// on gets pruned out from under it.
+///
+/// Conservative on purpose: a region's nodes may reference outer values anywhere in
+/// their inputs, and a region output may itself be an outer value passed straight
+/// through, so both are marked. Regions are few and small next to the main graph,
+/// and being wrong here means miscompiling control flow.
+fn markRegionReads(graph: *const graph_mod.Graph, node: graph_mod.Node, live_values: []bool) void {
+    const region_ids: [2]?u32 = switch (node.op) {
+        .If => |iff| .{ iff.then_region, iff.else_region },
+        .Loop => |lp| .{ lp.body_region, null },
+        else => return,
+    };
+
+    for (region_ids) |maybe_rid| {
+        const rid = maybe_rid orelse continue;
+        if (rid >= graph.regions.items.len) continue;
+        const region = graph.regions.items[rid];
+
+        for (region.nodes) |rn| {
+            for (rn.inputs) |in| {
+                const idx: usize = @intCast(in);
+                if (idx < live_values.len) live_values[idx] = true;
+            }
+        }
+        for (region.outputs) |oid| {
+            const idx: usize = @intCast(oid);
+            if (idx < live_values.len) live_values[idx] = true;
+        }
+    }
+}
+
 fn normalizeAxis(axis: i32, rank: usize) CompileError!usize {
     if (rank == 0) return CompileError.InvalidArgument;
     const r_i32: i32 = @intCast(rank);
@@ -118,17 +204,23 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             const b: *const TiledTensor = mgr.getConst(s.b) catch return CompileError.InvalidArgument;
 
             try compileRequire(c.rank >= 2);
-            try compileRequire(a.rank == c.rank and b.rank == c.rank);
+            try compileRequire(a.rank == c.rank);
+            // B may carry fewer batch dims and broadcast into the rest, right-aligned
+            // — see `tensor_store.broadcastTileIndex`.
+            try compileRequire(b.rank >= 2 and b.rank <= c.rank);
             try compileRequire(!a.dtype.info().is_quantized);
             try compileRequire(!c.dtype.info().is_quantized);
             try compileRequire(isScalarSupported(a.dtype));
             try compileRequire(isScalarSupported(c.dtype));
 
             const rank: usize = @as(usize, c.rank);
+            const b_rank: usize = @as(usize, b.rank);
+            const b_off: usize = rank - b_rank;
             var d: usize = 0;
             while (d + 2 < rank) : (d += 1) {
                 const ad: usize = a.shape[d];
-                const bd: usize = b.shape[d];
+                // A dim B does not have is a broadcast dim, exactly like a size-1 one.
+                const bd: usize = if (d >= b_off) b.shape[d - b_off] else 1;
                 const cd: usize = c.shape[d];
                 if (ad != bd and ad != 1 and bd != 1) return CompileError.InvalidArgument;
                 try compileRequire(cd == @max(ad, bd));
@@ -144,12 +236,14 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
                     try compileRequire(a.tile_counts[d] == c.tile_counts[d]);
                 }
 
-                if (bd == 1) {
-                    try compileRequire(b.tile_shape[d] == 1);
-                    try compileRequire(b.tile_counts[d] == 1);
-                } else {
-                    try compileRequire(b.tile_shape[d] == c.tile_shape[d]);
-                    try compileRequire(b.tile_counts[d] == c.tile_counts[d]);
+                if (d >= b_off) {
+                    if (bd == 1) {
+                        try compileRequire(b.tile_shape[d - b_off] == 1);
+                        try compileRequire(b.tile_counts[d - b_off] == 1);
+                    } else {
+                        try compileRequire(b.tile_shape[d - b_off] == c.tile_shape[d]);
+                        try compileRequire(b.tile_counts[d - b_off] == c.tile_counts[d]);
+                    }
                 }
             }
 
@@ -172,18 +266,18 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             }
 
             // Shapes (batched): [..., m, k] @ [..., k, n] -> [..., m, n].
-            try compileRequire(a.shape[rank - 1] == b.shape[rank - 2]);
+            try compileRequire(a.shape[rank - 1] == b.shape[b_rank - 2]);
             try compileRequire(c.shape[rank - 2] == a.shape[rank - 2]);
-            try compileRequire(c.shape[rank - 1] == b.shape[rank - 1]);
+            try compileRequire(c.shape[rank - 1] == b.shape[b_rank - 1]);
 
             // Canonical tiling geometry for last two dims.
             try compileRequire(a.tile_shape[rank - 2] == c.tile_shape[rank - 2]);
-            try compileRequire(b.tile_shape[rank - 1] == c.tile_shape[rank - 1]);
-            try compileRequire(a.tile_shape[rank - 1] == b.tile_shape[rank - 2]);
+            try compileRequire(b.tile_shape[b_rank - 1] == c.tile_shape[rank - 1]);
+            try compileRequire(a.tile_shape[rank - 1] == b.tile_shape[b_rank - 2]);
 
             try compileRequire(a.tile_counts[rank - 2] == c.tile_counts[rank - 2]);
-            try compileRequire(b.tile_counts[rank - 1] == c.tile_counts[rank - 1]);
-            try compileRequire(a.tile_counts[rank - 1] == b.tile_counts[rank - 2]);
+            try compileRequire(b.tile_counts[b_rank - 1] == c.tile_counts[rank - 1]);
+            try compileRequire(a.tile_counts[rank - 1] == b.tile_counts[b_rank - 2]);
 
             if (b.dtype.info().is_quantized) {
                 const be: usize = b.dtype.info().block_elems;
@@ -234,10 +328,16 @@ fn validateStep(mgr: *StorageManager, policy: plan_mod.TilePolicy, step: Step) C
             try requireSameTileCounts(out, a);
 
             const last: usize = @as(usize, out.rank) - 1;
-            try compileRequire(b.shape[0] == out.shape[last]);
-            // b is tiled along the last dimension.
-            try compileRequire(b.tile_shape[0] == out.tile_shape[last]);
-            try compileRequire(b.tile_counts[0] == out.tile_counts[last]);
+            if (b.shape[0] == 1) {
+                // Scalar broadcast: one element reused for every column, so b is
+                // a single tile regardless of how out is tiled.
+                try compileRequire(b.tile_shape[0] == 1 and b.tile_counts[0] == 1);
+            } else {
+                try compileRequire(b.shape[0] == out.shape[last]);
+                // b is tiled along the last dimension.
+                try compileRequire(b.tile_shape[0] == out.tile_shape[last]);
+                try compileRequire(b.tile_counts[0] == out.tile_counts[last]);
+            }
             _ = s.op;
         },
 
@@ -1275,7 +1375,10 @@ pub fn compileGraphOpt(
     policy: plan_mod.TilePolicy,
     opt: OptPolicy,
 ) CompileError!Program {
-    try infer_mod.infer(graph);
+    infer_mod.infer(graph) catch |e| {
+        if (traceEnabled()) std.debug.print("[aion][compile] infer failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
 
     // Graph-rewrite optimization passes (e.g. horizontal MatMul fusion). Runs
     // after inference (so rewrites see concrete shapes) and before the
@@ -1339,8 +1442,12 @@ pub fn compileGraphOpt(
 
     var ctx: AllocCtx = .{ .allocator = allocator, .mgr = mgr, .policy = policy, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor };
 
-    // Lower nodes in order.
-    for (graph.nodes.items) |node| {
+    // Lower nodes in order, skipping any whose results nothing asked for.
+    const live: []bool = try liveNodes(allocator, graph);
+    defer allocator.free(live);
+
+    for (graph.nodes.items, 0..) |node, idx| {
+        if (!live[idx]) continue;
         try lowerNode(allocator, graph, node, mgr, policy, &ctx, &steps, &blocks);
     }
 
@@ -1431,12 +1538,16 @@ fn lowerNode(
             const a_id: usize = @intCast(node.inputs[0]);
             const b_id: usize = @intCast(node.inputs[1]);
             const a_v = graph.values.items[a_id];
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             const b_v = graph.values.items[b_id];
             const rank: usize = a_v.shape.len;
+            // B carries its own rank: it may have fewer batch dims than A and
+            // broadcast into them (see `tensor_store.broadcastTileIndex`).
+            const b_rank: usize = b_v.shape.len;
             const m: usize = a_v.shape[rank - 2];
             const k: usize = a_v.shape[rank - 1];
             const b_dtype: types.DType = b_v.dtype.?;
-            const n: usize = b_v.shape[rank - 1];
+            const n: usize = b_v.shape[b_rank - 1];
 
             // Quantized B tensors cannot be re-tiled today (we only have scalar
             // retile kernels), so their tiling must be stable across dynamic M.
@@ -1452,20 +1563,22 @@ fn lowerNode(
             var b_tile_buf: [MAX_RANK]usize = undefined;
             const c_tile: []usize = c_tile_buf[0..rank];
             const a_tile: []usize = a_tile_buf[0..rank];
-            const b_tile: []usize = b_tile_buf[0..rank];
+            const b_tile: []usize = b_tile_buf[0..b_rank];
 
             var d: usize = 0;
             while (d + 2 < rank) : (d += 1) {
                 c_tile[d] = 1;
                 a_tile[d] = 1;
-                b_tile[d] = 1;
             }
+            d = 0;
+            while (d + 2 < b_rank) : (d += 1) b_tile[d] = 1;
+
             c_tile[rank - 2] = tiles.tm;
             c_tile[rank - 1] = tiles.tn;
             a_tile[rank - 2] = tiles.tm;
             a_tile[rank - 1] = tiles.tk;
-            b_tile[rank - 2] = tiles.tk;
-            b_tile[rank - 1] = tiles.tn;
+            b_tile[b_rank - 2] = tiles.tk;
+            b_tile[b_rank - 1] = tiles.tn;
 
             const c_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, c_tile);
 
@@ -1554,8 +1667,11 @@ fn lowerNode(
             const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, a_id, a_v.dtype.?, a_v.shape, tile_out);
 
             const last: usize = out_shape.len - 1;
-            // b must be rank-1 tiled to match the last-dim tile.
-            const b_tile: [1]usize = .{tile_out[last]};
+            // b must be rank-1 tiled to match the last-dim tile — except a
+            // single-element b, which broadcasts over every column and so stays
+            // one untiled scalar.
+            const b_is_scalar: bool = (b_v.shape.len == 1 and b_v.shape[0] == 1);
+            const b_tile: [1]usize = .{if (b_is_scalar) 1 else tile_out[last]};
             const b_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, b_id, b_v.dtype.?, b_v.shape, b_tile[0..]);
 
             try appendStepChecked(allocator, mgr, policy, steps, .{ .BroadcastLastDimBinaryTiled = .{ .op = bb.op, .out = out_tid, .a = a_tid, .b = b_tid } });
@@ -2608,61 +2724,75 @@ fn lowerNode(
         .ViewReshape => {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
+            // A view cannot reinterpret a block-quantized layout. Reject before
+            // allocating: creating the output first surfaces this as an unrelated
+            // quant-axis alignment error from storage, far from the real cause.
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             var out_tile_buf: [MAX_RANK]usize = undefined;
             const out_tile: []usize = out_tile_buf[0..out_shape.len];
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
-            // Materialize reshape (scalar-only for now).
-            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             try appendStepChecked(allocator, mgr, policy, steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
         },
 
         .ViewSqueeze => {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
+            // A view cannot reinterpret a block-quantized layout. Reject before
+            // allocating: creating the output first surfaces this as an unrelated
+            // quant-axis alignment error from storage, far from the real cause.
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             var out_tile_buf: [MAX_RANK]usize = undefined;
             const out_tile: []usize = out_tile_buf[0..out_shape.len];
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
-            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             try appendStepChecked(allocator, mgr, policy, steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
         },
 
         .ViewUnsqueeze => {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
+            // A view cannot reinterpret a block-quantized layout. Reject before
+            // allocating: creating the output first surfaces this as an unrelated
+            // quant-axis alignment error from storage, far from the real cause.
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             var out_tile_buf: [MAX_RANK]usize = undefined;
             const out_tile: []usize = out_tile_buf[0..out_shape.len];
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
-            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             try appendStepChecked(allocator, mgr, policy, steps, .{ .ReshapeScalar = .{ .dst = out_tid, .src = a_tid } });
         },
 
         .ViewTranspose2D => {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
+            // A view cannot reinterpret a block-quantized layout. Reject before
+            // allocating: creating the output first surfaces this as an unrelated
+            // quant-axis alignment error from storage, far from the real cause.
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             var out_tile_buf: [MAX_RANK]usize = undefined;
             const out_tile: []usize = out_tile_buf[0..out_shape.len];
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
-            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             try appendStepChecked(allocator, mgr, policy, steps, .{ .Transpose2DScalar = .{ .dst = out_tid, .src = a_tid } });
         },
 
         .ViewSliceND => |sl| {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
+            // A view cannot reinterpret a block-quantized layout. Reject before
+            // allocating: creating the output first surfaces this as an unrelated
+            // quant-axis alignment error from storage, far from the real cause.
+            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             var out_tile_buf: [MAX_RANK]usize = undefined;
             const out_tile: []usize = out_tile_buf[0..out_shape.len];
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
-            if (a_v.dtype.?.info().is_quantized) return CompileError.InvalidArgument;
 
             var starts_buf: [MAX_RANK]usize = .{0} ** MAX_RANK;
             if (sl.starts.len == 0 or sl.starts.len > MAX_RANK) return CompileError.InvalidArgument;

@@ -12,6 +12,7 @@ from ._ffi.handles import ContextHandle
 from ._ffi.runtime import create_context, destroy_context
 
 if TYPE_CHECKING:
+    from .builder import Builder
     from .model import LoadedModel
     from .tensor import Tensor
 
@@ -82,6 +83,9 @@ class Context:
         self._ctx: ContextHandle | None = create_context(thread_count, gpu_list)
         self._closed = False
         self._children: weakref.WeakSet[object] = weakref.WeakSet()
+        # Graph owner for values built without an explicit Builder (see
+        # `scratch_builder`). Strong ref: nothing else keeps it alive.
+        self._scratch: "Builder | None" = None
 
     @classmethod
     def gpu(
@@ -105,6 +109,29 @@ class Context:
             raise RuntimeError("Context is closed")
         return self._ctx
 
+    def scratch_builder(self) -> "Builder":
+        """A builder for values created without naming one — lazily made, then reused.
+
+        `aion.tensor(data)` produces *data*, and composing ops needs a graph, so
+        something has to own one. This is that owner, so exploratory work costs no
+        ceremony:
+
+            x = aion.tensor(np_x, ctx=ctx)
+            print((x @ w).relu())          # no `with aion.Builder(...)` needed
+
+        Safe to share because `compile` prunes to the requested outputs: values you
+        explored and did not ask for never reach a compiled model. It does grow
+        monotonically across a long session, though — a fresh `Context` clears it.
+
+        Models should still use an explicit `Builder`: one graph per model keeps
+        ownership and teardown obvious.
+        """
+        from .builder import Builder
+
+        if self._scratch is None or self._scratch._closed:
+            self._scratch = Builder(self)
+        return self._scratch
+
     def _register_child(self, obj: object) -> None:
         self._children.add(obj)
 
@@ -125,6 +152,8 @@ class Context:
             except Exception:
                 # Keep cleanup resilient: try closing remaining children.
                 pass
+
+        self._scratch = None
 
         handle = self._ctx
         if handle is not None:

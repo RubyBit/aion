@@ -63,11 +63,16 @@ const MLP = struct {
 
     const Self = @This();
 
-    pub fn bind(bld: *Builder, weights: Weights) Builder.Error!Self {
+    pub fn bind(bld: *Builder, weights: Weights) nn.BindError!Self {
+        // A layer resolves its parameters from a source. The tensors are already in
+        // hand here, so that source is a struct literal; the same layer would load
+        // from a package by passing `pkg.at("fc1")` instead. Naming each layer makes
+        // the exported parameter names readable (`fc1/weight`, `fc1/bias`, ...) and
+        // stable, which is what lets a loaded model find and swap one layer later.
         return .{
-            .fc1 = try nn.Linear.bind(bld, weights.fc1_w, weights.fc1_b),
-            .fc2 = try nn.Linear.bind(bld, weights.fc2_w, weights.fc2_b),
-            .fc_out = try nn.Linear.bind(bld, weights.fc_out_w, weights.fc_out_b),
+            .fc1 = try nn.Linear.bind(bld, .{ .weight = weights.fc1_w, .bias = weights.fc1_b }, .{ .name = "fc1" }),
+            .fc2 = try nn.Linear.bind(bld, .{ .weight = weights.fc2_w, .bias = weights.fc2_b }, .{ .name = "fc2" }),
+            .fc_out = try nn.Linear.bind(bld, .{ .weight = weights.fc_out_w, .bias = weights.fc_out_b }, .{ .name = "fc_out" }),
         };
     }
 
@@ -90,8 +95,8 @@ const Weights = struct {
     fc_out_b: Tensor,
 };
 
-fn buildModel(ctx: *api.Context, allocator: std.mem.Allocator, weights: Weights, in_dim: usize) !api.Model {
-    var bld: Builder = api.Builder.init(allocator);
+fn buildModel(ctx: *api.Context, weights: Weights, in_dim: usize) !api.Model {
+    var bld: Builder = api.Builder.init(ctx);
     defer bld.deinit();
 
     // A single public input. Batch is fixed at 1 here to keep the example small.
@@ -219,7 +224,7 @@ fn mainImpl(args: std.process.Args) !void {
     defer ctx.deinit();
 
     const weights: Weights = try createSyntheticWeights(&ctx, allocator, opts);
-    var model: api.Model = try buildModel(&ctx, allocator, weights, opts.in_dim);
+    var model: api.Model = try buildModel(&ctx, weights, opts.in_dim);
     defer model.deinit();
 
     // One reusable input tensor, filled once.

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NewType, TypeAlias
+from collections.abc import Callable
+from typing import Any, NewType, TypeAlias
 
 from ..enums import AionDType, AionOp
 from ._raw import ffi, lib
@@ -216,6 +217,37 @@ def builder_value_dtype(
     return AionDType(int(out[0]))
 
 
+def builder_value_dim_symbol(
+    ctx: ContextHandle, builder: BuilderHandle, value: ValueId, axis: int
+) -> str | None:
+    """The dim symbol on `axis`, or None when that axis has a fixed size."""
+    out_len = ffi.new("size_t*")
+    buf = ffi.new("char[]", 128)
+    status = lib.aion_builder_value_dim_symbol(
+        builder.raw, int(value), int(axis), buf, 128, out_len
+    )
+    raise_for_status(status, ctx, what="aion_builder_value_dim_symbol")
+    if int(out_len[0]) == 0:
+        return None
+    if int(out_len[0]) >= 128:
+        buf = ffi.new("char[]", int(out_len[0]) + 1)
+        status = lib.aion_builder_value_dim_symbol(
+            builder.raw, int(value), int(axis), buf, int(out_len[0]) + 1, out_len
+        )
+        raise_for_status(status, ctx, what="aion_builder_value_dim_symbol")
+    return ffi.string(buf).decode("utf-8")
+
+
+def builder_symbol_size(
+    ctx: ContextHandle, builder: BuilderHandle, name: str
+) -> int:
+    """The authoring placeholder size a dim symbol was declared with."""
+    out = ffi.new("size_t*")
+    status = lib.aion_builder_symbol_size(builder.raw, name.encode("utf-8"), out)
+    raise_for_status(status, ctx, what="aion_builder_symbol_size")
+    return int(out[0])
+
+
 def builder_input(
     ctx: ContextHandle,
     builder: BuilderHandle,
@@ -261,6 +293,102 @@ def builder_name(
 ) -> None:
     status = lib.aion_builder_name(builder.raw, int(value), _string(name))
     raise_for_status(status, ctx, what="aion_builder_name")
+
+
+def builder_param_named(
+    ctx: ContextHandle, builder: BuilderHandle, tensor: TensorHandle, name: str
+) -> ValueId:
+    out = ffi.new("AionValueId*")
+    status = lib.aion_builder_param_named(builder.raw, tensor.raw, _string(name), out)
+    raise_for_status(status, ctx, what="aion_builder_param_named")
+    return ValueId(int(out[0]))
+
+
+def _read_str(fn: Callable[..., int], *args: Any) -> str:
+    """Two-pass buf/cap/out_len read, the ABI's convention for returned strings."""
+    out_len = ffi.new("size_t*")
+    status = fn(*args, ffi.NULL, 0, out_len)
+    if status != 0:
+        return ""
+    size = int(out_len[0])
+    if size == 0:
+        return ""
+    buf = ffi.new("char[]", size + 1)
+    status = fn(*args, buf, size + 1, out_len)
+    if status != 0:
+        return ""
+    return ffi.string(buf, int(out_len[0])).decode("utf-8")
+
+
+def builder_begin_scope(ctx: ContextHandle, builder: BuilderHandle, name: str) -> int:
+    out = ffi.new("size_t*")
+    status = lib.aion_builder_begin_scope(builder.raw, _string(name), out)
+    raise_for_status(status, ctx, what="aion_builder_begin_scope")
+    return int(out[0])
+
+
+def builder_begin_auto_scope(
+    ctx: ContextHandle, builder: BuilderHandle, base: str
+) -> tuple[int, str]:
+    """Returns `(depth, resolved segment)` — the segment is `{base}#{n}`."""
+    out_depth = ffi.new("size_t*")
+    out_len = ffi.new("size_t*")
+    status = lib.aion_builder_begin_auto_scope(
+        builder.raw, _string(base), out_depth, ffi.NULL, 0, out_len
+    )
+    raise_for_status(status, ctx, what="aion_builder_begin_auto_scope")
+    # The scope is already open; read its name back from the builder's path.
+    size = int(out_len[0])
+    depth = int(out_depth[0])
+    if size == 0:
+        return depth, base
+    path = builder_scope_path(builder)
+    return depth, path.rsplit("/", 1)[-1] if path else base
+
+
+def builder_end_scope(ctx: ContextHandle, builder: BuilderHandle, depth: int) -> None:
+    status = lib.aion_builder_end_scope(builder.raw, int(depth))
+    raise_for_status(status, ctx, what="aion_builder_end_scope")
+
+
+def builder_scope_path(builder: BuilderHandle) -> str:
+    return _read_str(lib.aion_builder_scope_path, builder.raw)
+
+
+def builder_constant(ctx: ContextHandle, builder: BuilderHandle, value: float) -> ValueId:
+    out = ffi.new("AionValueId*")
+    status = lib.aion_builder_constant(builder.raw, float(value), out)
+    raise_for_status(status, ctx, what="aion_builder_constant")
+    return ValueId(int(out[0]))
+
+
+def builder_filled_vec(
+    ctx: ContextHandle, builder: BuilderHandle, dim: int, fill: float
+) -> ValueId:
+    out = ffi.new("AionValueId*")
+    status = lib.aion_builder_filled_vec(builder.raw, int(dim), float(fill), out)
+    raise_for_status(status, ctx, what="aion_builder_filled_vec")
+    return ValueId(int(out[0]))
+
+
+def builder_param_kind(builder: BuilderHandle, value: ValueId) -> int:
+    """0 = not a parameter, 1 = user weight, 2 = synthesized constant."""
+    out = ffi.new("uint32_t*")
+    if lib.aion_builder_param_kind(builder.raw, int(value), out) != 0:
+        return 0
+    return int(out[0])
+
+
+def builder_value_name(builder: BuilderHandle, value: ValueId) -> str:
+    """The debug name attached to a value, or "" when it has none."""
+    return _read_str(lib.aion_builder_value_name, builder.raw, int(value))
+
+
+def builder_has_param_named(builder: BuilderHandle, name: str) -> bool:
+    out = ffi.new("uint8_t*")
+    if lib.aion_builder_has_param_named(builder.raw, _string(name), out) != 0:
+        return False
+    return int(out[0]) != 0
 
 
 def emit_op(
@@ -479,6 +607,12 @@ def builder_mark_output(
         builder.raw, int(value), _string(name)
     )
     raise_for_status(status, ctx, what="aion_builder_mark_output")
+
+
+def builder_clear_outputs(ctx: ContextHandle, builder: BuilderHandle) -> None:
+    """Forget every output marked so far (see `aion_builder_clear_outputs`)."""
+    status = lib.aion_builder_clear_outputs(builder.raw)
+    raise_for_status(status, ctx, what="aion_builder_clear_outputs")
 
 
 def builder_add_metadata(

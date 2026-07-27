@@ -262,8 +262,6 @@ pub const Matmul = struct {
         const k_tiles = a_meta.tile_counts[rank - 1];
 
         var coords_buf: [8]usize = undefined;
-        var a_coords_buf: [8]usize = undefined;
-        var b_coords_buf: [8]usize = undefined;
 
         var ci: usize = 0;
         while (ci < tile_total) : (ci += 1) {
@@ -276,20 +274,9 @@ pub const Matmul = struct {
             while (ti_k < k_tiles) : (ti_k += 1) {
                 const beta: f32 = if (ti_k == 0) s.beta else 1.0;
 
-                const a_coords = a_coords_buf[0..rank];
-                const b_coords = b_coords_buf[0..rank];
-                var bd: usize = 0;
-                while (bd + 2 < rank) : (bd += 1) {
-                    a_coords[bd] = if (a_meta.shape[bd] == 1) 0 else coords[bd];
-                    b_coords[bd] = if (b_meta.shape[bd] == 1) 0 else coords[bd];
-                }
-                a_coords[rank - 2] = ti_m;
-                a_coords[rank - 1] = ti_k;
-                b_coords[rank - 2] = ti_k;
-                b_coords[rank - 1] = ti_n;
-
-                const a_lin = tensor_store_mod.encodeTileIndex(a_meta, a_coords) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.encodeTileIndex(b_meta, b_coords) catch return error.ExecutionFailed;
+                const batch: []const usize = coords[0 .. rank - 2];
+                const a_lin = tensor_store_mod.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k }) catch return error.ExecutionFailed;
+                const b_lin = tensor_store_mod.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n }) catch return error.ExecutionFailed;
                 try recordTileGemmLinear(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
             }
         }
@@ -331,8 +318,6 @@ pub const Matmul = struct {
         const k_tiles = a_meta.tile_counts[rank - 1];
 
         var coords_buf: [8]usize = undefined;
-        var a_coords_buf: [8]usize = undefined;
-        var b_coords_buf: [8]usize = undefined;
 
         var ci: usize = 0;
         while (ci < tile_total) : (ci += 1) {
@@ -344,20 +329,9 @@ pub const Matmul = struct {
             var ti_k: usize = 0;
             while (ti_k < k_tiles) : (ti_k += 1) {
                 const beta: f32 = if (ti_k == 0) s.beta else 1.0;
-                const a_coords = a_coords_buf[0..rank];
-                const b_coords = b_coords_buf[0..rank];
-                var bd: usize = 0;
-                while (bd + 2 < rank) : (bd += 1) {
-                    a_coords[bd] = if (a_meta.shape[bd] == 1) 0 else coords[bd];
-                    b_coords[bd] = if (b_meta.shape[bd] == 1) 0 else coords[bd];
-                }
-                a_coords[rank - 2] = ti_m;
-                a_coords[rank - 1] = ti_k;
-                b_coords[rank - 2] = ti_k;
-                b_coords[rank - 1] = ti_n;
-
-                const a_lin = tensor_store_mod.encodeTileIndex(a_meta, a_coords) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.encodeTileIndex(b_meta, b_coords) catch return error.ExecutionFailed;
+                const batch: []const usize = coords[0 .. rank - 2];
+                const a_lin = tensor_store_mod.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k }) catch return error.ExecutionFailed;
+                const b_lin = tensor_store_mod.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n }) catch return error.ExecutionFailed;
                 try self.recordQuantTileGemm(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
             }
         }

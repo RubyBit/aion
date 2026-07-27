@@ -437,6 +437,32 @@ AION_API AionStatus aion_builder_input(AionBuilder* b, AionDType dtype, size_t r
 AION_API AionStatus aion_builder_param(AionBuilder* b, const AionTensor* tensor, AionValueId* out_value);
 AION_API AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name);
 
+// Bind a weight under a semantic, scope-qualified name (`layers.3/attn/weight`).
+// Unlike aion_builder_param, whose generated name is positional and shifts when
+// construction order changes, this is the stable key load/swap-by-name uses.
+AION_API AionStatus aion_builder_param_named(AionBuilder* b, const AionTensor* tensor, const char* name, AionValueId* out_value);
+
+// Scopes nest, so a module tree produces `state_dict`-style parameter paths.
+// begin_* hands back the depth it opened at; pass that to end_scope, which closes
+// every scope at or below it (so an early return cannot leak a level).
+AION_API AionStatus aion_builder_begin_scope(AionBuilder* b, const char* name, size_t* out_depth);
+// Opens `{base}#{n}`, numbered per parent scope; writes the resolved segment.
+AION_API AionStatus aion_builder_begin_auto_scope(AionBuilder* b, const char* base, size_t* out_depth, char* buf, size_t cap, size_t* out_len);
+AION_API AionStatus aion_builder_end_scope(AionBuilder* b, size_t depth);
+AION_API AionStatus aion_builder_scope_path(const AionBuilder* b, char* buf, size_t cap, size_t* out_len);
+
+// Several ops require an operand where the maths wants a number. These bind (and
+// cache) that operand, so needing the same identity vector or scalar in many
+// layers costs one parameter.
+AION_API AionStatus aion_builder_constant(AionBuilder* b, float value, AionValueId* out_value);
+// `fill` must be 0.0 (a norm's identity beta) or 1.0 (its identity gamma).
+AION_API AionStatus aion_builder_filled_vec(AionBuilder* b, size_t dim, float fill, AionValueId* out_value);
+
+// 0 = not a bound parameter, 1 = user-supplied weight, 2 = synthesized constant.
+AION_API AionStatus aion_builder_param_kind(const AionBuilder* b, AionValueId value, uint32_t* out_kind);
+AION_API AionStatus aion_builder_value_name(const AionBuilder* b, AionValueId value, char* buf, size_t cap, size_t* out_len);
+AION_API AionStatus aion_builder_has_param_named(const AionBuilder* b, const char* name, uint8_t* out_found);
+
 // Authoring-time shape/dtype introspection (eager per-op inference keeps every
 // value's shape current). Shapes reflect authoring placeholder sizes: an axis
 // declared dynamic reports the size it was declared with, propagated to derived
@@ -444,6 +470,15 @@ AION_API AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const c
 AION_API AionStatus aion_builder_value_rank(const AionBuilder* b, AionValueId value, size_t* out_rank);
 AION_API AionStatus aion_builder_value_shape(const AionBuilder* b, AionValueId value, size_t* out_dims, size_t out_rank);
 AION_API AionStatus aion_builder_value_dtype(const AionBuilder* b, AionValueId value, AionDType* out_dtype);
+// The dim symbol on `axis`, or an empty name when that axis has a fixed size. An
+// axis is free because some input declared it so (aion_builder_add_dim_symbol) and
+// inference carried the symbol to everything derived from it, so a caller can
+// rebuild a shape without freezing an axis it was never told about.
+AION_API AionStatus aion_builder_value_dim_symbol(const AionBuilder* b, AionValueId value, size_t axis, char* buf, size_t cap, size_t* out_len);
+// The authoring placeholder size a dim symbol was declared with. A free axis still
+// needs a concrete size to author against; asking here keeps that size recorded in
+// one place instead of mirrored by every caller.
+AION_API AionStatus aion_builder_symbol_size(const AionBuilder* b, const char* name, size_t* out_size);
 
 // Append one op. Reads only the AionOpAttr member matching `spec->op`; variable
 // arity (concat, optional bias/mask) is carried by `spec->inputs`.
@@ -462,6 +497,9 @@ AION_API AionStatus aion_builder_loop(AionBuilder* b, const AionValueId* carried
 
 // Declarations consumed by compile/export. Marking an output also names it.
 AION_API AionStatus aion_builder_mark_output(AionBuilder* b, AionValueId value, const char* name);
+// Forget every output marked so far. `mark_output` accumulates, so a caller that
+// means "compile exactly these outputs" clears first.
+AION_API AionStatus aion_builder_clear_outputs(AionBuilder* b);
 AION_API AionStatus aion_builder_add_output_alias(AionBuilder* b, AionValueId input_value, AionValueId output_value);
 AION_API AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint8_t allow_ring);
 AION_API AionStatus aion_builder_add_dim_symbol(AionBuilder* b, AionValueId value, size_t axis, const char* name);

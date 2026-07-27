@@ -25,6 +25,21 @@ pub const Value = struct {
     /// Shape owned by the graph arena. Empty => unknown.
     shape: []const usize = &[_]usize{},
 
+    /// Per-axis dimension symbol, or null on axes with a fixed size. Empty means
+    /// "no axis is symbolic"; otherwise it has one entry per axis of `shape`.
+    ///
+    /// A symbol says the size in `shape` is only the size this graph was authored
+    /// at — the axis is free, and one compile serves any size on it. Declared once
+    /// where a tensor is defined (`Builder.symbolicDim`) and propagated by
+    /// inference, so a layer can ask its input which of its axes are free instead
+    /// of having to be told. Strings are arena-owned, like `shape`.
+    ///
+    /// This matters at *authoring* time. At runtime shapes are re-inferred from
+    /// the real input shapes, so nothing downstream reads these — except the two
+    /// places an author bakes a size into the graph, a view's `new_shape` and a
+    /// slice's `lens`, which is what `Builder`'s view dim symbols record for export.
+    dim_symbols: []const ?[]const u8 = &.{},
+
     /// Producing node if any.
     producer: ?NodeId = null,
 
@@ -471,7 +486,8 @@ pub const Graph = struct {
 
     const Self = @This();
 
-    const MAX_RANK: usize = 8;
+    /// Maximum tensor rank the graph (and the tiling/exec layers) support.
+    pub const MAX_RANK: usize = 8;
 
     pub fn init(allocator: std.mem.Allocator) Self {
         const arena = std.heap.ArenaAllocator.init(allocator);
@@ -518,7 +534,13 @@ pub const Graph = struct {
 
         for (self.values.items) |v| {
             const sh: []const usize = if (v.shape.len == 0) &[_]usize{} else try out.dupeShape(v.shape);
-            out.values.append(allocator, .{ .dtype = v.dtype, .shape = sh, .producer = v.producer, .external = v.external }) catch return GraphError.OutOfMemory;
+            out.values.append(allocator, .{
+                .dtype = v.dtype,
+                .shape = sh,
+                .dim_symbols = try dupeDimSymbols(aa, v.dim_symbols),
+                .producer = v.producer,
+                .external = v.external,
+            }) catch return GraphError.OutOfMemory;
         }
         for (self.nodes.items) |n| {
             out.nodes.append(allocator, try cloneNode(aa, n)) catch return GraphError.OutOfMemory;
@@ -531,6 +553,17 @@ pub const Graph = struct {
             const outs = allocator.dupe(ValueId, r.outputs) catch return GraphError.OutOfMemory;
             errdefer allocator.free(outs);
             out.regions.append(allocator, .{ .nodes = nodes, .outputs = outs }) catch return GraphError.OutOfMemory;
+        }
+        return out;
+    }
+
+    /// Symbol names are interned in the source graph's arena, so a clone that may
+    /// outlive it needs its own copies.
+    fn dupeDimSymbols(aa: std.mem.Allocator, syms: []const ?[]const u8) GraphError![]const ?[]const u8 {
+        if (syms.len == 0) return &.{};
+        const out = aa.alloc(?[]const u8, syms.len) catch return GraphError.OutOfMemory;
+        for (syms, 0..) |maybe_name, i| {
+            out[i] = if (maybe_name) |name| (aa.dupe(u8, name) catch return GraphError.OutOfMemory) else null;
         }
         return out;
     }

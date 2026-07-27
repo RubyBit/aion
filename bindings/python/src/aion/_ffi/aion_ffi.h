@@ -268,10 +268,22 @@ void aion_builder_destroy(AionBuilder* b);
 AionStatus aion_builder_input(AionBuilder* b, AionDType dtype, size_t rank, const size_t* shape, AionValueId* out_value);
 AionStatus aion_builder_param(AionBuilder* b, const AionTensor* tensor, AionValueId* out_value);
 AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name);
+AionStatus aion_builder_param_named(AionBuilder* b, const AionTensor* tensor, const char* name, AionValueId* out_value);
+AionStatus aion_builder_begin_scope(AionBuilder* b, const char* name, size_t* out_depth);
+AionStatus aion_builder_begin_auto_scope(AionBuilder* b, const char* base, size_t* out_depth, char* buf, size_t cap, size_t* out_len);
+AionStatus aion_builder_end_scope(AionBuilder* b, size_t depth);
+AionStatus aion_builder_scope_path(const AionBuilder* b, char* buf, size_t cap, size_t* out_len);
+AionStatus aion_builder_constant(AionBuilder* b, float value, AionValueId* out_value);
+AionStatus aion_builder_filled_vec(AionBuilder* b, size_t dim, float fill, AionValueId* out_value);
+AionStatus aion_builder_param_kind(const AionBuilder* b, AionValueId value, uint32_t* out_kind);
+AionStatus aion_builder_value_name(const AionBuilder* b, AionValueId value, char* buf, size_t cap, size_t* out_len);
+AionStatus aion_builder_has_param_named(const AionBuilder* b, const char* name, uint8_t* out_found);
 
 AionStatus aion_builder_value_rank(const AionBuilder* b, AionValueId value, size_t* out_rank);
 AionStatus aion_builder_value_shape(const AionBuilder* b, AionValueId value, size_t* out_dims, size_t out_rank);
 AionStatus aion_builder_value_dtype(const AionBuilder* b, AionValueId value, AionDType* out_dtype);
+AionStatus aion_builder_value_dim_symbol(const AionBuilder* b, AionValueId value, size_t axis, char* buf, size_t cap, size_t* out_len);
+AionStatus aion_builder_symbol_size(const AionBuilder* b, const char* name, size_t* out_size);
 
 AionStatus aion_builder_op(AionBuilder* b, const AionOpSpec* spec, AionValueId* out_value);
 
@@ -282,6 +294,7 @@ AionStatus aion_builder_if(AionBuilder* b, AionValueId cond, AionRegionId then_r
 AionStatus aion_builder_loop(AionBuilder* b, const AionValueId* carried, size_t carried_len, AionRegionId body_region, size_t trip, size_t cond_carry, uint8_t has_cond_carry, uint8_t check_before, AionValueId* out_values);
 
 AionStatus aion_builder_mark_output(AionBuilder* b, AionValueId value, const char* name);
+AionStatus aion_builder_clear_outputs(AionBuilder* b);
 AionStatus aion_builder_add_output_alias(AionBuilder* b, AionValueId input_value, AionValueId output_value);
 AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint8_t allow_ring);
 AionStatus aion_builder_add_dim_symbol(AionBuilder* b, AionValueId value, size_t axis, const char* name);

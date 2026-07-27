@@ -29,10 +29,14 @@ dev = [
     { name = "soundfile" },
     { name = "tokenizers" },
     { name = "torch" },
+    { name = "typing-extensions" },
 ]
 test = [
     { name = "numpy" },
     { name = "pytest" },
+]
+typing = [
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -55,11 +59,13 @@ dev = [
     { name = "soundfile", specifier = ">=0.12" },
     { name = "tokenizers", specifier = ">=0.23.1" },
     { name = "torch", specifier = ">=2.2" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 test = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=9" },
 ]
+typing = [{ name = "typing-extensions", specifier = ">=4.12" }]
 
 [[package]]
 name = "aion-wgpu"

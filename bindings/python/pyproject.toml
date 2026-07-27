@@ -41,8 +41,11 @@ gpu = ["aion-wgpu>=29.0.4,<30; sys_platform != 'linux' or platform_machine != 'a
 [dependency-groups]
 # numpy: the test fixtures build synthetic .aion packages via the C-ABI Builder.
 test = ["pytest>=9", "numpy>=1.26"]
+# Type-check only: PEP 696 TypeVar defaults are not in 3.12's `typing`.
+typing = ["typing-extensions>=4.12"]
 dev = [
   "pyright>=1.1",
+  "typing-extensions>=4.12",  # PEP 696 TypeVar defaults, for type-checking only
   "tokenizers>=0.23.1",
   "pytest>=9",
   "numpy>=1.26",
@@ -88,7 +91,11 @@ where = ["src"]
 aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "_ffi/*.h"]
 
 [tool.pyright]
-include = ["src/aion", "type_tests"]
+include = ["src/aion", "type_tests", "tests"]
+# Resolve dev-only imports (pytest, numpy) from the project venv, so checking the
+# tests does not report every fixture import as missing.
+venvPath = "."
+venv = ".venv"
 exclude = ["src/aion/_ffi/build.py"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"

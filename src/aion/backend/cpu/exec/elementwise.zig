@@ -237,6 +237,12 @@ pub fn execBroadcastLastDimBinaryTiled(
     if (out_meta.rank < 2) return BackendError.InvalidArgument;
     if (out_meta.rank > 8) return BackendError.InvalidArgument;
 
+    // A single-element `b` is a scalar broadcast over every column: it lives in
+    // one tile (compile-validated), and the kernels' `b[i % cols]` indexing turns
+    // into `b[0]` when we pass `col_count = 1`.
+    const b_meta = try store.meta(s.b);
+    const b_scalar: bool = (b_meta.rank == 1 and b_meta.shape[0] == 1);
+
     var tile_total: usize = 1;
     var d: usize = 0;
     while (d < @as(usize, out_meta.rank)) : (d += 1) {
@@ -254,6 +260,7 @@ pub fn execBroadcastLastDimBinaryTiled(
                 out: tensor_store.TensorId,
                 a: tensor_store.TensorId,
                 b: tensor_store.TensorId,
+                b_scalar: bool,
 
                 stop: std.atomic.Value(bool) = .init(false),
                 err_mutex: std.Io.Mutex = .init,
@@ -294,7 +301,7 @@ pub fn execBroadcastLastDimBinaryTiled(
                             return;
                         };
                         defer t.store.releaseConst(a_tile.token);
-                        const b_tile = t.store.acquireTileConst(t.b, ti_last, 0) catch |e| {
+                        const b_tile = t.store.acquireTileConst(t.b, if (t.b_scalar) 0 else ti_last, 0) catch |e| {
                             t.fail(e);
                             return;
                         };
@@ -303,7 +310,7 @@ pub fn execBroadcastLastDimBinaryTiled(
                         const out_view = out_tile.bufferView();
                         const a_view = a_tile.bufferView();
                         const b_view = b_tile.bufferView();
-                        const col_count: usize = out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
+                        const col_count: usize = if (t.b_scalar) 1 else out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
                         const elem_count: usize = exec_utils.elemCountFromTileView(out_view);
                         if (out_view.layout.rank < 2) {
                             t.fail(BackendError.InvalidArgument);
@@ -364,7 +371,7 @@ pub fn execBroadcastLastDimBinaryTiled(
                 }
             };
 
-            var task: Task = .{ .store = store, .out_meta = out_meta, .op = s.op, .out = s.out, .a = s.a, .b = s.b };
+            var task: Task = .{ .store = store, .out_meta = out_meta, .op = s.op, .out = s.out, .a = s.a, .b = s.b, .b_scalar = b_scalar };
             var grain: usize = if (tile_bytes == 0) 16 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
             if (grain > tile_total) grain = tile_total;
             p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
@@ -385,14 +392,14 @@ pub fn execBroadcastLastDimBinaryTiled(
         defer store.releaseMut(out_tile.token);
         const a_tile = try store.acquireTileConstLinear(s.a, tile_index);
         defer store.releaseConst(a_tile.token);
-        const b_tile = try store.acquireTileConst(s.b, ti_last, 0);
+        const b_tile = try store.acquireTileConst(s.b, if (b_scalar) 0 else ti_last, 0);
         defer store.releaseConst(b_tile.token);
 
         const out_view = out_tile.bufferView();
         const a_view = a_tile.bufferView();
         const b_view = b_tile.bufferView();
         if (out_view.layout.rank < 2) return BackendError.InvalidArgument;
-        const col_count: usize = out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
+        const col_count: usize = if (b_scalar) 1 else out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
         const elem_count: usize = exec_utils.elemCountFromTileView(out_view);
 
         switch (out_view.dtype) {

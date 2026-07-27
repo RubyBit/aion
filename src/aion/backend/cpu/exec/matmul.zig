@@ -803,8 +803,6 @@ fn execMatMulTiledBatched(
                     const k_tiles_local: usize = t.a_meta.tile_counts[rank_local - 1];
 
                     var coords_buf: [8]usize = undefined;
-                    var a_coords_buf: [8]usize = undefined;
-                    var b_coords_buf: [8]usize = undefined;
 
                     var tile_index: usize = start;
                     while (tile_index < end) : (tile_index += 1) {
@@ -832,24 +830,12 @@ fn execMatMulTiledBatched(
                         while (ti_k < k_tiles_local) : (ti_k += 1) {
                             const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
 
-                            const a_coords: []usize = a_coords_buf[0..rank_local];
-                            const b_coords: []usize = b_coords_buf[0..rank_local];
-
-                            var bd: usize = 0;
-                            while (bd + 2 < rank_local) : (bd += 1) {
-                                a_coords[bd] = if (t.a_meta.shape[bd] == 1) 0 else coords[bd];
-                                b_coords[bd] = if (t.b_meta.shape[bd] == 1) 0 else coords[bd];
-                            }
-                            a_coords[rank_local - 2] = ti_m;
-                            a_coords[rank_local - 1] = ti_k;
-                            b_coords[rank_local - 2] = ti_k;
-                            b_coords[rank_local - 1] = ti_n;
-
-                            const a_tile_index: usize = tensor_store.encodeTileIndex(t.a_meta, a_coords) catch |e| {
+                            const batch: []const usize = coords[0 .. rank_local - 2];
+                            const a_tile_index: usize = tensor_store.broadcastTileIndex(t.a_meta, batch, &.{ ti_m, ti_k }) catch |e| {
                                 t.fail(e);
                                 return;
                             };
-                            const b_tile_index: usize = tensor_store.encodeTileIndex(t.b_meta, b_coords) catch |e| {
+                            const b_tile_index: usize = tensor_store.broadcastTileIndex(t.b_meta, batch, &.{ ti_k, ti_n }) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -997,8 +983,6 @@ fn execMatMulTiledBatched(
     }
 
     var coords_buf: [8]usize = undefined;
-    var a_coords_buf: [8]usize = undefined;
-    var b_coords_buf: [8]usize = undefined;
 
     var tile_index: usize = 0;
     while (tile_index < tile_total) : (tile_index += 1) {
@@ -1018,21 +1002,9 @@ fn execMatMulTiledBatched(
         while (ti_k < k_tiles) : (ti_k += 1) {
             const beta_tile: f32 = if (ti_k == 0) s.beta else 1.0;
 
-            const a_coords: []usize = a_coords_buf[0..rank];
-            const b_coords: []usize = b_coords_buf[0..rank];
-
-            var bd: usize = 0;
-            while (bd + 2 < rank) : (bd += 1) {
-                a_coords[bd] = if (a_meta.shape[bd] == 1) 0 else coords[bd];
-                b_coords[bd] = if (b_meta.shape[bd] == 1) 0 else coords[bd];
-            }
-            a_coords[rank - 2] = ti_m;
-            a_coords[rank - 1] = ti_k;
-            b_coords[rank - 2] = ti_k;
-            b_coords[rank - 1] = ti_n;
-
-            const a_tile_index: usize = try tensor_store.encodeTileIndex(a_meta, a_coords);
-            const b_tile_index: usize = try tensor_store.encodeTileIndex(b_meta, b_coords);
+            const batch: []const usize = coords[0 .. rank - 2];
+            const a_tile_index: usize = try tensor_store.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k });
+            const b_tile_index: usize = try tensor_store.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n });
 
             const a_tile = try store.acquireTileConstLinear(s.a, a_tile_index);
             defer store.releaseConst(a_tile.token);
@@ -1205,7 +1177,6 @@ fn execMatMulTiledBatchedF16Grouped(
                     var prefix_coords: [8]usize = .{0} ** 8;
                     var c_coords: [8]usize = .{0} ** 8;
                     var a_coords: [8]usize = .{0} ** 8;
-                    var b_coords: [8]usize = .{0} ** 8;
 
                     var g: usize = start;
                     while (g < end) : (g += 1) {
@@ -1219,14 +1190,7 @@ fn execMatMulTiledBatchedF16Grouped(
                         while (ti_k < k_tiles_local) : (ti_k += 1) {
                             if (t.stop.load(.acquire)) return;
 
-                            var pd: usize = 0;
-                            while (pd < prefix_rank_local) : (pd += 1) {
-                                b_coords[pd] = if (t.b_meta.shape[pd] == 1) 0 else prefix_coords[pd];
-                            }
-                            b_coords[m_dim_local] = ti_k;
-                            b_coords[n_dim_local] = ti_n;
-
-                            const b_idx: usize = tensor_store.encodeTileIndex(t.b_meta, b_coords[0..rank_local]) catch |e| {
+                            const b_idx: usize = tensor_store.broadcastTileIndex(t.b_meta, prefix_coords[0..prefix_rank_local], &.{ ti_k, ti_n }) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -1336,7 +1300,6 @@ fn execMatMulTiledBatchedF16Grouped(
     var prefix_coords: [8]usize = .{0} ** 8;
     var c_coords: [8]usize = .{0} ** 8;
     var a_coords: [8]usize = .{0} ** 8;
-    var b_coords: [8]usize = .{0} ** 8;
 
     var prefix_idx: usize = 0;
     while (prefix_idx < prefix_total) : (prefix_idx += 1) {
@@ -1353,14 +1316,7 @@ fn execMatMulTiledBatchedF16Grouped(
         while (ti_n < n_tiles) : (ti_n += 1) {
             var ti_k: usize = 0;
             while (ti_k < k_tiles) : (ti_k += 1) {
-                var pd: usize = 0;
-                while (pd < prefix_rank) : (pd += 1) {
-                    b_coords[pd] = if (b_meta.shape[pd] == 1) 0 else prefix_coords[pd];
-                }
-                b_coords[m_dim] = ti_k;
-                b_coords[n_dim] = ti_n;
-
-                const b_idx: usize = try tensor_store.encodeTileIndex(b_meta, b_coords[0..rank]);
+                const b_idx: usize = try tensor_store.broadcastTileIndex(b_meta, prefix_coords[0..prefix_rank], &.{ ti_k, ti_n });
                 const b_tile = try store.acquireTileConstLinear(s.b, b_idx);
                 defer store.releaseConst(b_tile.token);
                 const b_view = b_tile.bufferView();

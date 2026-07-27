@@ -396,7 +396,9 @@ def main() -> None:
                 if stopped_by is not None:
                     break
 
-                tokens_step.copy_from([next_id])
+                # The decode input is `[batch, seq] == (1, 1)`, so the token has to be
+                # nested to match: `copy_from` checks the shape rather than the count.
+                tokens_step.copy_from([[next_id]])
 
                 t0_step_run_ns = time.perf_counter_ns()
                 model.run()

@@ -38,6 +38,36 @@ From `bindings/python/`:
 - Run tests:
   - `uv run pytest`
 
+> **Changed the Zig core? `uv sync` will not pick it up.** uv's build cache keys on
+> this project directory, and the Zig sources live *outside* it (`../../src`), so
+> edits there do not invalidate the cached wheel. Rebuild and test like this:
+>
+> ```bash
+> uv pip install --no-build-isolation --no-deps --force-reinstall .
+> ./.venv/Scripts/python.exe -m pytest        # .venv/bin/python on Linux/macOS
+> ```
+>
+> Use the interpreter directly rather than `uv run`, which re-syncs and puts the
+> cached wheel back.
+>
+> Two staleness traps sit behind that command, both now closed — worth knowing
+> because when they bite there is no error, only wrong behaviour from code you are
+> no longer looking at:
+>
+> - `tools/build_zig.py` always invokes `zig build install` (never skips on a
+>   config stamp, which cannot see source edits). Zig's own content cache makes a
+>   no-op rebuild ~1s.
+> - setuptools decides whether to relink the extension by comparing it against the
+>   cffi-generated C file, which is byte-identical on every build — so a changed
+>   `aion.lib` alone would *not* trigger a relink. `setup.py` therefore treats the
+>   archive as the staleness input: it builds Aion first, forces a relink when the
+>   archive is newer than the extension, and fails the build if the extension is
+>   somehow still older afterwards.
+>
+> If you ever suspect you are running stale bytes, the tell is the extension's
+> size/mtime under `.venv/Lib/site-packages/aion/`; `rm -rf build` forces a clean
+> relink.
+
 Build tuning env vars (for native extension build):
 
 - `AION_PY_OPTIMIZE` (default: `ReleaseFast`)
@@ -102,50 +132,78 @@ If you pass `thread_count`, it creates a dedicated context for that model.
 `LoadedModel.run_numpy(...)` is a convenience wrapper that accepts Tensor *or* array-like inputs and
 returns NumPy arrays for outputs.
 
-### Building models (Tensor-first)
+### Building models
 
-`aion.Tensor` — created with `aion.tensor(...)` — is the one high-level value you
-use. It is an **immutable lazy value**: operators (`@`, `+`, `-`, `*`, `/`,
-`.relu()`, `.softmax()`, …) build a small graph, and `.numpy()` / `.realize()`
-compiles and runs it. There are no builder lifecycles to manage — tensors
-combine freely, materialize any time, and re-materialize at will.
+There is one graph representation. `aion.Builder` holds it; its ops and every
+`aion.nn` layer take and return `aion.TensorRef`, a handle on a value in that graph.
+`TensorRef` carries the operators and fluent forms, so composing reads the way you
+would expect, and it knows its own builder — layers need no ambient state. This
+is the same split the Zig API makes between `TensorRef` and `api.Tensor`.
 
-Compute on concrete data reads like NumPy — no explicit `Builder` needed:
+`aion.Tensor` is the **data** handle: what you write inputs into, read outputs
+out of, and hand a layer as a weight. It is not a graph node.
 
 ```python
 import aion, numpy as np
+from aion import nn
 
-a = aion.tensor(np.random.randn(2, 4).astype("f4"))   # concrete
-w = aion.tensor(np.random.randn(4, 3).astype("f4"))   # concrete
-y = (a @ w).relu()                                     # lazy
-print(y.shape)                                         # (2, 3) — inferred, no run
-print(y.numpy())                                       # compiles + runs
+ctx = aion.Context()
+w = aion.tensor(np.random.randn(4, 3).astype("f4"))    # data
+
+with aion.Builder(ctx) as b:
+    x = b.input((1, 4)).rename("x")                    # TensorRef
+    y = nn.Linear(w)(x).relu().rename("y")             # TensorRef
+    model = b.compile([y])
+
+out = model.run_numpy({"x": np.ones((1, 4), "f4")})["y"]
 ```
 
-`aion.realize([y1, y2])` materializes several results in a single compile + run
-(a shared subgraph is emitted once); it is an efficiency tool, never required.
-
-Author a reusable model from symbolic **free inputs**, then compile or export it:
+For a reusable module, `aion.compile` traces `forward` once against inputs built
+from the specs — the same `TensorRef`s, so a module composes exactly the ops a raw
+`Builder` would:
 
 ```python
-x = aion.tensor(shape=(1, 4), name="x")               # symbolic free input
-w = aion.tensor(np.random.randn(4, 3).astype("f4"))
-model = aion.compile({"y": (x @ w).relu()}, inputs=[x])
-out = model.run_numpy({"x": np.ones((1, 4), "f4")})["y"]
-
-aion.export({"y": x @ w}, "mlp.aion", inputs=[x])      # or serialize
+model = aion.compile(MyModule(), aion.spec((None, 4)))   # None = dynamic axis
+aion.export(MyModule(), aion.spec((None, 4)), "mlp.aion")
 ```
 
 `dtype` accepts a single vocabulary everywhere — `"f32"`, `"i32"`, `aion.float32`,
 a NumPy dtype, or the `AionDType` enum — and `aion.tensor(np.array(..., np.int32))`
-infers `i32`. For the higher-level PyTorch-style module API, see `aion.nn` with
-`aion.compile(module, aion.spec(...))`.
+infers `i32`.
 
-**Low-level escape hatch.** `aion.Builder` is the imperative graph-construction
-API (control flow, in-place ops, KV-cache roles/aliases) used by the model
-converters; its ops return `aion.Value`, a builder-bound handle. The high-level
-`Tensor` lowers to it at compile time. Reach for `Builder`/`Value` only when you
-need that low-level control; otherwise `Tensor` is the front door.
+**Looking at a value while you build.** `compile` hands the model a *copy* of the
+graph, so authoring survives it — you can compile twice, compile different outputs,
+and keep building afterwards. That also means a value can be computed just to look
+at it:
+
+```python
+with aion.Builder(ctx) as b:
+    y = (b.param(a) @ b.param(w)).relu()
+    print(y)              # TensorRef(shape=(1, 2), dtype=..., value=[[1.0, 0.0]])
+    print(y.numpy())      # same result, memoized
+    z = y + y             # still building on y
+```
+
+Compilation is pruned to the value's cone, so this costs what the value needs
+rather than what the whole graph holds. Evaluating something that depends on a
+public input raises and names it: the runtime would otherwise zero-fill the input
+and hand back a plausible-looking answer.
+
+**Exploring without naming a Builder.** `Tensor.ref()` binds data into a graph and
+hands back the handle — using the Context's scratch builder unless you pass one:
+
+```python
+x = aion.tensor(np_x, ctx=ctx)
+w = aion.tensor(np_w, ctx=ctx)
+
+y = (x.ref() @ w.ref()).relu()      # no `with aion.Builder(...)`
+print(y)
+print(nn.Linear(w)(y).numpy())      # nn composes into the same graph
+```
+
+Safe to share because compile prunes: values you explored and did not ask for never
+reach a compiled model. The scratch graph does grow across a long session — a fresh
+`Context` clears it. Author models on an explicit `Builder` so each owns its graph.
 
 ### GPU 
 

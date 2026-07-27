@@ -142,7 +142,7 @@ class StreamFull:
         # Re-seed the per-run decode carries (the Loop leaves final values here).
         self.t_frame.copy_from([0]); self.t_sym.copy_from([0])
         self.t_count.copy_from([0]); self.t_active.copy_from([1])
-        self.t_toks.copy_from([0] * self.max_out)
+        self.t_toks.copy_from([[0]] * self.max_out)
         m.run()
         oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
         ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()

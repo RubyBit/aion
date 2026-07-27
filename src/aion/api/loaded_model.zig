@@ -1439,6 +1439,7 @@ pub const Model = struct {
                     value_map[idx] = vid;
                 }
 
+
                 // Regions are built lazily, just before the main `If`/`Loop` node that
                 // references them, so a region body can reference values produced by
                 // earlier main nodes (e.g. an in-graph decode Loop reading the encoder out).
@@ -1474,6 +1475,7 @@ pub const Model = struct {
                         value_map[eid] = extra_buf[i];
                     }
                 }
+
 
                 for (pkg.outputs, 0..) |sig, idx| out_ids[idx] = value_map[sig.value];
 

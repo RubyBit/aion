@@ -77,7 +77,7 @@ pub const Linear = struct {
         else
             try bld.matmul(x, self.w, self.opts.alpha, self.opts.beta);
 
-        if (self.b) |b0| return bld.broadcastAddLastDim(y, b0);
+        if (self.b) |b0| return bld.add(y, b0);
         return y;
     }
 };
@@ -123,6 +123,6 @@ pub const Embedding = struct {
     pub fn forward(self: Self, bld: *Builder, ids: TensorRef) Builder.Error!TensorRef {
         const scope = try self.id.enter(bld);
         defer bld.endScope(scope);
-        return bld.gatherRows(self.table, ids);
+        return bld.gather(self.table, ids, 0, 0);
     }
 };

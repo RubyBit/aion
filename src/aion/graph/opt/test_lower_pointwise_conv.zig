@@ -101,7 +101,7 @@ fn runParity(with_bias: bool) !void {
         try std.testing.expectEqual(@as(usize, 0), countOp(&g, .Conv1D));
         try std.testing.expectEqual(@as(usize, 1), countOp(&g, .MatMul));
         if (with_bias) {
-            try std.testing.expectEqual(@as(usize, 1), countOp(&g, .BroadcastLastDimBinary));
+            try std.testing.expectEqual(@as(usize, 1), countOp(&g, .ElemwiseBinary));
         }
 
         const got = try allocator.alloc(u8, out_elems * 4);

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..dtype import float16, float32
 from ..types import DTypeLike
 from ..builder import Builder, TensorRef, WeightData
 from ..enums import AionInputRoleKind
@@ -39,7 +40,7 @@ class RoPE(Module):
 
 
 class KVCache:
-    """A `[batch, kv_heads, capacity, head_dim]` cache the runtime carries.
+    """A `[batch, capacity, kv_heads, head_dim]` cache the runtime carries.
 
     Bundles the three things a cache needs, which converters wire by hand and
     which are easy to get subtly wrong:
@@ -60,7 +61,7 @@ class KVCache:
         head_dim: int,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f16",
+        dtype: DTypeLike = float16,
         capacity: int = 0,
         capacity_symbol: Optional[str] = None,
         growable: bool = False,
@@ -78,8 +79,8 @@ class KVCache:
         self.capacity_symbol = capacity_symbol
         self.growable = bool(growable)
 
-        dyn = {2: capacity_symbol} if capacity_symbol else None
-        self.input = b.input((batch, kv_heads, cap, head_dim), dtype=dtype, dynamic=dyn)
+        dyn = {1: capacity_symbol} if capacity_symbol else None
+        self.input = b.input((batch, cap, kv_heads, head_dim), dtype=dtype, dynamic=dyn)
         if name:
             b.name(self.input, name)
         self.current = self.input
@@ -87,7 +88,7 @@ class KVCache:
     def append(self, kv: TensorRef, write_index: TensorRef) -> TensorRef:
         """Append this step's K or V, casting to the cache dtype first.
 
-        `kv` is `[batch, kv_heads, seq, head_dim]` (head-second, like the cache).
+        `kv` is `[batch, seq, kv_heads, head_dim]`, like the cache.
         Advances `current`, so repeated calls chain.
         """
         from ..dtype import normalize_dtype
@@ -102,7 +103,7 @@ class KVCache:
         return {
             "value": self.input,
             "kind": AionInputRoleKind.AION_ROLE_SEQUENCE_CACHE,
-            "axis": 2,
+            "axis": 1,
             "capacity_symbol": self.capacity_symbol,
             "zero_init": True,
             "growable": self.growable,
@@ -118,8 +119,9 @@ class KVCache:
         self._b.add_output_alias(self.input, self.current)
 
 
-class CachedAttention(Module):
-    """Multi-head attention over a KV cache — the decode-time attention.
+class Attention(Module):
+    """Grouped-query attention — over a KV cache (decode) or a plain sequence
+    (prefill, encoders); `attend` takes the cache indices or omits them.
 
     Q, K and V are separate projections, the way checkpoints ship them;
     concatenating them into one wide projection is a fusion the compiler performs
@@ -150,12 +152,14 @@ class CachedAttention(Module):
         sliding_window: int = 0,
         attn_logits_soft_cap: float = 0.0,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         if heads <= 0 or kv_heads <= 0 or head_dim <= 0:
             raise ValueError("heads, kv_heads and head_dim must be > 0")
         if heads % kv_heads != 0:
             raise ValueError(f"heads ({heads}) must be a multiple of kv_heads ({kv_heads})")
+        if sliding_window > 0 and not causal:
+            raise ValueError("sliding_window requires causal attention")
 
         self._layer_name = name
         self.heads, self.kv_heads, self.head_dim = heads, kv_heads, head_dim
@@ -181,8 +185,8 @@ class CachedAttention(Module):
 
         Split out because every modern transformer inserts Q/K norms or RoPE
         between projection and attention — so all three come back in the layout
-        those operate on, `[b, s, h, d]` (k/v with `kv_heads`). Moving K/V heads
-        next to batch for the cache store is the cache's business, not this one's.
+        those operate on, `[b, s, h, d]` (k/v with `kv_heads`). This is also the
+        cache and attention layout.
 
         k/v are `None` on a layer that only reads a shared cache.
         """
@@ -209,20 +213,31 @@ class CachedAttention(Module):
     def attend(
         self,
         q: TensorRef,
-        k_cache: TensorRef,
-        v_cache: TensorRef,
-        positions: TensorRef,
-        visible_end: TensorRef,
+        k: TensorRef,
+        v: TensorRef,
+        query_positions: Optional[TensorRef] = None,
+        kv_lengths: Optional[TensorRef] = None,
     ) -> TensorRef:
-        """Attend `q` against the caches, then apply the output projection."""
+        """Attend `q` against `k`/`v`, then apply the output projection.
+
+        The controls are independent. `query_positions` defaults to each query's
+        row index and `kv_lengths` defaults to `t`. Causal attention with unequal
+        query/key lengths therefore requires explicit query positions. K/V are
+        always `[batch, t, kv_heads, head_dim]`.
+        """
         b = builder_of(q)
         with self._scoped(b):
-            attn = b.mha_cached(
-                q, k_cache, v_cache, positions, visible_end,
-                scale=self.scale,
-                causal=self.causal,
-                sliding_window=self.sliding_window,
-                attn_logits_soft_cap=self.attn_logits_soft_cap,
+            opts = {
+                "scale": self.scale,
+                "causal": self.causal,
+                "sliding_window": self.sliding_window,
+                "attn_logits_soft_cap": self.attn_logits_soft_cap,
+            }
+            attn = b.attention(
+                q, k, v,
+                query_positions=query_positions,
+                kv_lengths=kv_lengths,
+                **opts,
             )
             # Heads merge back into one feature axis; batch and time carry over.
             d = attn.dims
@@ -254,37 +269,44 @@ class RelPosSelfAttention(Module):
         pos_bias_u: WeightData,
         pos_bias_v: WeightData,
         *,
-        heads: int,
         scale: float,
         mask: Optional[TensorRef] = None,
+        chunk_size: int = 0,
+        chunk_left: int = 0,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
 
+        # `heads` and `head_dim` are pos_emb's dims 0 and 2; neither is declared
+        # separately, so neither can disagree with the weights.
         pe = _shape_of(pos_emb)
         if len(pe) != 3:
             raise ValueError(f"pos_emb must be [heads, 2*T-1, head_dim], got {pe}")
-        if int(pe[0]) != int(heads):
-            raise ValueError(f"pos_emb has {pe[0]} heads, but {heads} were declared")
 
-        self.heads = int(heads)
+        self.heads = int(pe[0])
         self.head_dim = int(pe[2])
         self.scale = float(scale)
         self.mask = mask
+        # Chunked-limited window; structural, so prefer it over encoding the same
+        # pattern in `mask` (see Builder.relpos_mha).
+        if chunk_size == 0 and chunk_left != 0:
+            raise ValueError("chunk_left requires chunk_size")
+        self.chunk_size = int(chunk_size)
+        self.chunk_left = int(chunk_left)
 
         self.q_proj = Linear(q, dtype=dtype)
         self.k_proj = Linear(k, dtype=dtype)
         self.v_proj = Linear(v, dtype=dtype)
         self.o_proj = Linear(o, dtype=dtype)
-        self.pos_emb = Parameter(pos_emb, dtype="f32")
-        self.pos_bias_u = Parameter(pos_bias_u, dtype="f32")
-        self.pos_bias_v = Parameter(pos_bias_v, dtype="f32")
+        self.pos_emb = Parameter(pos_emb, dtype=float32)
+        self.pos_bias_u = Parameter(pos_bias_u, dtype=float32)
+        self.pos_bias_v = Parameter(pos_bias_v, dtype=float32)
 
     def project(self, x: TensorRef) -> tuple[TensorRef, TensorRef, TensorRef]:
         """Q/K/V split into heads, `[batch, time, heads, head_dim]` each.
 
-        Split from `attend` for the same reason `CachedAttention.project` is: a
+        Split from `attend` for the same reason `Attention.project` is: a
         streaming encoder prepends cached K/V from earlier chunks in between, so the
         two cannot be one step.
         """
@@ -310,7 +332,8 @@ class RelPosSelfAttention(Module):
                 self.pos_bias_v.value(b, "pos_bias_v"),
                 self.mask,
                 scale=self.scale,
-                heads=self.heads,
+                chunk_size=self.chunk_size,
+                chunk_left=self.chunk_left,
             )
             return self.o_proj(
                 b.reshape(att, (*att.dims[:2], self.heads * self.head_dim))

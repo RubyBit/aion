@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 from .enums import AionDType
+from .types import DTypeLike
 
 
 @dataclass(frozen=True)
@@ -44,19 +45,13 @@ _TABLE: dict[AionDType, DTypeInfo] = {
     AionDType.AION_DTYPE_Q4_0: DTypeInfo(AionDType.AION_DTYPE_Q4_0, None,      None,       0, True),
 }
 
-# String spellings accepted everywhere a dtype is expected.
-_ALIASES: dict[str, AionDType] = {
-    "f32": AionDType.AION_DTYPE_F32,
-    "float32": AionDType.AION_DTYPE_F32,
-    "f16": AionDType.AION_DTYPE_F16,
-    "float16": AionDType.AION_DTYPE_F16,
-    "half": AionDType.AION_DTYPE_F16,
-    "i8": AionDType.AION_DTYPE_I8,
-    "int8": AionDType.AION_DTYPE_I8,
-    "i32": AionDType.AION_DTYPE_I32,
-    "int32": AionDType.AION_DTYPE_I32,
-    "q8_0": AionDType.AION_DTYPE_Q8_0,
-    "q4_0": AionDType.AION_DTYPE_Q4_0,
+_DISPLAY_NAMES: dict[AionDType, str] = {
+    AionDType.AION_DTYPE_F32: "float32",
+    AionDType.AION_DTYPE_F16: "float16",
+    AionDType.AION_DTYPE_I8: "int8",
+    AionDType.AION_DTYPE_I32: "int32",
+    AionDType.AION_DTYPE_Q8_0: "q8_0",
+    AionDType.AION_DTYPE_Q4_0: "q4_0",
 }
 
 # numpy dtype name -> enum, derived from the table (scalar dtypes only).
@@ -77,52 +72,65 @@ def _np_name(x: object) -> Optional[str]:
         return None
 
 
-def normalize_dtype(x: object) -> AionDType:
-    """Map an `AionDType` | dtype string | numpy dtype | int to `AionDType`."""
+def normalize_dtype(x: DTypeLike) -> AionDType:
+    """Map an Aion constant or supported NumPy dtype to ``AionDType``."""
     if isinstance(x, AionDType):
         return x
     if isinstance(x, str):
-        key = x.lower()
-        try:
-            return _ALIASES[key]
-        except KeyError:
-            raise ValueError(f"unknown dtype {x!r}") from None
-    # bool is an int subclass; treat it as a numpy/other dtype, not enum ordinal.
-    if isinstance(x, int) and not isinstance(x, bool):
-        return AionDType(int(x))
+        raise TypeError(
+            f"dtype strings are not supported; use an Aion constant such as "
+            f"aion.float32 instead of {x!r}"
+        )
+    if isinstance(x, int):
+        raise TypeError(
+            "raw dtype ordinals are not supported; use an Aion dtype constant "
+            "such as aion.float32"
+        )
     name = _np_name(x)
     if name is not None:
         try:
             return _NP_TO_ENUM[name]
         except KeyError:
             raise ValueError(f"no Aion dtype for numpy dtype {name!r}") from None
-    raise ValueError(f"cannot interpret {x!r} as a dtype")
+    raise TypeError(
+        f"dtype must be an Aion dtype constant or NumPy dtype, got "
+        f"{type(x).__name__}"
+    )
 
 
-def info(dtype: object) -> DTypeInfo:
+def dtype_name(dtype: DTypeLike) -> str:
+    """Return the concise public name for an Aion dtype."""
+    return _DISPLAY_NAMES[normalize_dtype(dtype)]
+
+
+def info(dtype: DTypeLike) -> DTypeInfo:
     """Metadata record for a dtype (accepts any `normalize_dtype` input)."""
     return _TABLE[normalize_dtype(dtype)]
 
 
-def numpy_dtype(dtype: object) -> "np.dtype[Any]":
+def numpy_dtype(dtype: DTypeLike) -> "np.dtype[Any]":
     """numpy dtype for a scalar Aion dtype; raises for quantized dtypes."""
     di = info(dtype)
     if di.np_name is None:
-        raise NotImplementedError(f"{di.enum.name} has no host numpy representation")
+        raise NotImplementedError(
+            f"{dtype_name(di.enum)} has no host numpy representation"
+        )
     import numpy as np
 
     return np.dtype(di.np_name)
 
 
-def c_elem(dtype: object) -> str:
+def c_elem(dtype: DTypeLike) -> str:
     """cffi element type name for a scalar Aion dtype; raises for quantized."""
     di = info(dtype)
     if di.c_elem is None:
-        raise NotImplementedError(f"{di.enum.name} has no per-element host buffer type")
+        raise NotImplementedError(
+            f"{dtype_name(di.enum)} has no per-element host buffer type"
+        )
     return di.c_elem
 
 
-def is_quantized(dtype: object) -> bool:
+def is_quantized(dtype: DTypeLike) -> bool:
     return info(dtype).is_quantized
 
 
@@ -136,6 +144,7 @@ q4_0 = AionDType.AION_DTYPE_Q4_0
 
 __all__ = [
     "DTypeInfo",
+    "dtype_name",
     "normalize_dtype",
     "info",
     "numpy_dtype",

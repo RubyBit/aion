@@ -22,13 +22,12 @@ const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 const matmul_nt_registry = @import("../registry/matmul_nt_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
 const attention_registry = @import("../registry/attention_registry.zig");
-const relpos_mha_registry = @import("../registry/relpos_mha_registry.zig");
 const conv1d_registry = @import("../registry/conv1d_registry.zig");
 const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
 
 /// Bumped whenever the `DispatchTable` layout or any kernel-struct ABI changes.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Ordering of the tiled (packed-GEMM) kernel arrays below.
 pub const TILE_SMALL = 0;
@@ -53,7 +52,7 @@ pub const DispatchTable = struct {
     matmul_nt: matmul_nt_registry.Kernels,
     matvec: matvec_registry.Kernels,
     attention: attention_registry.Kernels,
-    relpos_mha: relpos_mha_registry.Kernels,
+    relpos_mha: attention_registry.Kernels,
     conv1d: conv1d_registry.Kernels,
     conv2d: conv2d_registry.Kernels,
     fft: fft_registry.FftKernels,

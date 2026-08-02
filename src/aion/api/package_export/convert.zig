@@ -7,7 +7,6 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .GeluMul => .GeluMul,
         .MatMul => |mm| .{ .MatMul = .{ .alpha = mm.alpha, .beta = mm.beta } },
         .ElemwiseBinary => |eb| .{ .ElemwiseBinary = .{ .op = eb.op } },
-        .BroadcastLastDimBinary => |eb| .{ .BroadcastLastDimBinary = .{ .op = eb.op } },
         .Unary => |u| .{ .Unary = .{ .op = u.op } },
         .Softmax => |s| .{ .Softmax = .{ .axis = s.axis } },
         .Conv1D => |cv| .{ .Conv1D = .{
@@ -38,16 +37,24 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
             .eps = ln.eps,
             .normalized_shape = try package_file.makeConstantShapeTerms(allocator, ln.normalized_shape),
         } },
-        .Attention => |attn| .{ .Attention = .{ .scale = attn.scale, .causal = attn.causal } },
-        .MultiHeadAttention => |attn| .{ .MultiHeadAttention = .{ .scale = attn.scale, .causal = attn.causal, .heads = attn.heads } },
-        .RelPosMHA => |attn| .{ .RelPosMHA = .{ .scale = attn.scale, .heads = attn.heads, .has_mask = attn.has_mask } },
+        .RelPosMHA => |attn| .{ .RelPosMHA = .{
+            .scale = attn.scale,
+            .has_mask = attn.has_mask,
+            .chunk_size = attn.chunk_size,
+            .chunk_left = attn.chunk_left,
+        } },
         .ArgMax => |am| .{ .ArgMax = .{ .axis = am.axis } },
         .ScatterRow => .ScatterRow,
-        .MultiHeadAttentionCached => |attn| .{ .MultiHeadAttentionCached = .{
+        .Gather => |gg| .{ .Gather = .{ .axis = gg.axis, .batch_dims = gg.batch_dims } },
+        .Dim => |dd| .{ .Dim = .{ .axis = dd.axis } },
+        .Iota => |io| .{ .Iota = .{ .axis = io.axis } },
+        .Attention => |attn| .{ .Attention = .{
             .scale = attn.scale,
             .causal = attn.causal,
             .sliding_window = attn.sliding_window,
             .attn_logits_soft_cap = attn.attn_logits_soft_cap,
+            .controls = @as(u8, @intFromBool(attn.has_query_positions)) |
+                (@as(u8, @intFromBool(attn.has_kv_lengths)) << 1),
         } },
         .Reduce => |rr| .{ .Reduce = .{ .op = rr.op, .axis = rr.axis } },
         .Concat => |cc| .{ .Concat = .{ .axis = cc.axis } },
@@ -55,7 +62,6 @@ pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
         .RFFT => .RFFT,
         .STFT => |st| .{ .STFT = .{ .n_fft = st.n_fft, .hop_length = st.hop_length, .center = st.center } },
         .Copy => .Copy,
-        .GatherRows => .GatherRows,
         .RoPE1D => |rp| .{ .RoPE1D = .{
             .base_frequency = rp.base_frequency,
             .scale_factor = rp.scale_factor,

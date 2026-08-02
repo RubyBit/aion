@@ -49,9 +49,9 @@ def run_aion(model_path: Path, *, chunks: int, num_samples: int, context_size: i
     with aion.load_model(str(model_path), thread_count=thread_count) as model:
         ctx = model.context
 
-        x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.AionDType.AION_DTYPE_F32)
-        h_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_F32)
-        c_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_F32)
+        x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.float32)
+        h_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.float32)
+        c_t = aion.Tensor.zeros((1, 128), ctx=ctx, dtype=aion.float32)
 
         prob_t = None
         next_h_t = None

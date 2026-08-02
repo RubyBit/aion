@@ -63,7 +63,7 @@ def main() -> None:
 
         ctx = model.context
 
-        x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.AionDType.AION_DTYPE_F32)
+        x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.float32)
 
         prob_t = None
         probs = np.zeros(args.chunks, dtype=np.float32)

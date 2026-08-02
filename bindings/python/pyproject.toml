@@ -44,6 +44,7 @@ test = ["pytest>=9", "numpy>=1.26"]
 # Type-check only: PEP 696 TypeVar defaults are not in 3.12's `typing`.
 typing = ["typing-extensions>=4.12"]
 dev = [
+  "aion-wgpu>=29.0.4,<30; sys_platform != 'linux' or platform_machine != 'aarch64'",
   "pyright>=1.1",
   "typing-extensions>=4.12",  # PEP 696 TypeVar defaults, for type-checking only
   "tokenizers>=0.23.1",
@@ -69,10 +70,30 @@ dev = [
 gpu = true
 
 # Dev-only: resolve the optional GPU runtime companion from the sibling directory
-# so `uv sync --extra gpu` works from a repo checkout before it is published.
+# so the default development environment and `uv sync --extra gpu` work from a
+# repo checkout before it is published.
 # Ignored by pip/build (they read it from PyPI); does not affect published wheels.
 [tool.uv.sources]
 aion-wgpu = { path = "aion-wgpu" }
+
+[tool.uv]
+# The native extension is built from the repository's Zig core, outside this
+# Python project. uv normally keys a local build only on pyproject.toml/setup.py,
+# which can restore stale native bytes after a core edit. Include every native
+# build input so a normal `uv run ...` rebuilds the editable package when needed.
+# Do not include generated `_aion_cffi` binaries here: build outputs must not
+# invalidate their own cache key.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "tools/**/*.py" },
+  { file = "src/aion/_ffi/build.py" },
+  { file = "src/aion/_ffi/aion_ffi.h" },
+  { file = "../../build.zig" },
+  { file = "../../build.zig.zon" },
+  { file = "../../include/**/*.h" },
+  { file = "../../src/**/*.zig" },
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -91,12 +112,20 @@ where = ["src"]
 aion = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.pyd", "_ffi/*.h"]
 
 [tool.pyright]
-include = ["src/aion", "type_tests", "tests"]
-# Resolve dev-only imports (pytest, numpy) from the project venv, so checking the
-# tests does not report every fixture import as missing.
-venvPath = "."
-venv = ".venv"
-exclude = ["src/aion/_ffi/build.py"]
+include = [
+  "src/aion",
+  "type_tests",
+  "tests",
+  "examples",
+  "../../scripts/convert_gemma4_e2b_to_aion.py",
+  "../../scripts/convert_nemotron_asr_to_aion.py",
+]
+exclude = [
+  "src/aion/_ffi/build.py",
+  "build",
+  ".venv",
+]
+extraPaths = ["src"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 strict = ["src/aion/_ffi", "type_tests"]

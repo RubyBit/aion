@@ -1511,14 +1511,20 @@ pub fn reduceAxisScalar(
 
                             const seg_start: usize = in_local_lin;
                             const seg_end: usize = in_local_lin + run_len;
-                            const part: f32 = switch (t.a_meta.dtype) {
-                                .f32 => reduce_k.sumF32Range(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
+                            const part: f64 = switch (t.a_meta.dtype) {
+                                .f32 => @as(f64, reduce_k.sumF32Range(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
                                     t.fail(e);
                                     return;
-                                },
-                                .f16 => reduce_k.sumF16RangeToF32(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
+                                }),
+                                .f16 => @as(f64, reduce_k.sumF16RangeToF32(in_cache.tile.bytes, seg_start, seg_end) catch |e| {
                                     t.fail(e);
                                     return;
+                                }),
+                                .i32 => sum: {
+                                    const vals: []align(1) const i32 = @ptrCast(in_cache.tile.bytes);
+                                    var integer_sum: i64 = 0;
+                                    for (vals[seg_start..seg_end]) |v| integer_sum += v;
+                                    break :sum @floatFromInt(integer_sum);
                                 },
                                 else => {
                                     t.fail(BackendError.InvalidArgument);
@@ -1526,7 +1532,7 @@ pub fn reduceAxisScalar(
                                 },
                             };
 
-                            acc += @as(f64, part);
+                            acc += part;
                             a_i += run_len;
                         }
                     } else {
@@ -1569,6 +1575,10 @@ pub fn reduceAxisScalar(
                                     const v: f16 = @as(*align(1) const f16, @ptrCast(in_cache.tile.bytes[in_off .. in_off + 2].ptr)).*;
                                     acc += @as(f64, @floatCast(v));
                                 },
+                                .i32 => {
+                                    const v: i32 = @as(*align(1) const i32, @ptrCast(in_cache.tile.bytes[in_off .. in_off + 4].ptr)).*;
+                                    acc += @floatFromInt(v);
+                                },
                                 else => {
                                     t.fail(BackendError.InvalidArgument);
                                     return;
@@ -1588,6 +1598,9 @@ pub fn reduceAxisScalar(
                         },
                         .f16 => {
                             @as(*align(1) f16, @ptrCast(out_view.bytes[out_off .. out_off + 2].ptr)).* = @floatCast(@as(f32, @floatCast(acc)));
+                        },
+                        .i32 => {
+                            @as(*align(1) i32, @ptrCast(out_view.bytes[out_off .. out_off + 4].ptr)).* = @intFromFloat(acc);
                         },
                         else => {
                             t.fail(BackendError.InvalidArgument);

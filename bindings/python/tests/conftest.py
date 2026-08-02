@@ -50,7 +50,7 @@ def _build_tiny_q8(path: Path) -> TinyModel:
     w = w_torch.T.copy()  # [K=32, N=3] reference
     with Builder() as b:
         x = b.input((2, 32)).rename("x")
-        wp = b.param(w, dtype="q8_0", shape=(32, 3))
+        wp = b.param(w, dtype=aion.q8_0, shape=(32, 3))
         y = b.matmul(x, wp).rename("y")
         b.add_metadata("arch", "test-tiny-matmul-q8")
         b.export(str(path), {"y": y})

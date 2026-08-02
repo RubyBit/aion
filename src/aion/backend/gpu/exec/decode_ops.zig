@@ -275,6 +275,101 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRowsTiled
     }
 }
 
+/// Batched canonical gather:
+///   out[b, l, :] = data[b, indices[b, l], :]
+///
+/// The compiler tiles batch as one and keeps the feature row contiguous. As
+/// with the multi-tile GatherRows fallback, indices are resolved on the host
+/// and each selected row is recorded as a device-to-device copy.
+pub fn execGather(ctx: Ctx, frame: *Frame, s: executable.StepGatherTiled) ExecuteProgramError!void {
+    if (s.axis != 1 or s.batch_dims != 1) return error.Unsupported;
+
+    const hs = ctx.rstore.tensorStore();
+    const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
+    const data_meta = hs.meta(s.data) catch return error.ExecutionFailed;
+    const idx_meta = hs.meta(s.indices) catch return error.ExecutionFailed;
+    if (out_meta.rank != 3 or data_meta.rank != 3 or idx_meta.rank != 2) return error.Unsupported;
+    if (idx_meta.dtype != .i32 or context.totalTiles(idx_meta) != 1) return error.Unsupported;
+    if (out_meta.dtype != data_meta.dtype) return error.Unsupported;
+
+    const elem_bytes: usize = switch (out_meta.dtype) {
+        .f32 => 4,
+        .f16 => 2,
+        else => return error.Unsupported,
+    };
+    const batch = data_meta.shape[0];
+    const sequence = data_meta.shape[1];
+    const width = data_meta.shape[2];
+    const gathered = idx_meta.shape[1];
+    if (idx_meta.shape[0] != batch or out_meta.shape[0] != batch or
+        out_meta.shape[1] != gathered or out_meta.shape[2] != width)
+    {
+        return error.Unsupported;
+    }
+    const row_bytes = width * elem_bytes;
+    if (row_bytes % 4 != 0 or data_meta.tile_counts[2] != 1 or out_meta.tile_counts[2] != 1) return error.Unsupported;
+
+    try ctx.submitPendingIfDeviceDirty(frame, s.indices);
+    const idx = try HostI32.acquire(hs, s.indices);
+    defer idx.release();
+    if (idx.vals.len < batch * gathered) return error.ExecutionFailed;
+
+    var cached_data_tile: ?usize = null;
+    var data_tile: resident_mod.TileRefDevice = undefined;
+    defer if (cached_data_tile != null) hs.releaseConst(data_tile.token);
+
+    const total = context.totalTiles(out_meta);
+    var out_linear: usize = 0;
+    while (out_linear < total) : (out_linear += 1) {
+        var out_coords: [tensor_store_mod.INLINE_RANK]usize = @splat(0);
+        tensor_store_mod.decodeTileCoords(out_meta, out_linear, out_coords[0..3]) catch return error.ExecutionFailed;
+        const base_b = out_coords[0] * out_meta.tile_shape[0];
+        const base_l = out_coords[1] * out_meta.tile_shape[1];
+
+        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, out_linear) catch return error.ExecutionFailed;
+        defer hs.releaseMut(dout.token);
+        if (context.packedElems(dout.rank, dout.shape_mem[0..3], dout.strides_mem[0..3]) == null) return error.Unsupported;
+        const out_buf = ctx.devmem.bufferFor(dout.handle).?;
+
+        var lb: usize = 0;
+        while (lb < dout.shape_mem[0]) : (lb += 1) {
+            var ll: usize = 0;
+            while (ll < dout.shape_mem[1]) : (ll += 1) {
+                const b = base_b + lb;
+                const l = base_l + ll;
+                if (b >= batch or l >= gathered) return error.ExecutionFailed;
+                const selected_i32 = idx.vals[b * gathered + l];
+                if (selected_i32 < 0) return error.ExecutionFailed;
+                const selected: usize = @intCast(selected_i32);
+                if (selected >= sequence) return error.ExecutionFailed;
+
+                const data_coords = [_]usize{
+                    b / data_meta.tile_shape[0],
+                    selected / data_meta.tile_shape[1],
+                    0,
+                };
+                const data_linear = tensor_store_mod.encodeTileIndex(data_meta, &data_coords) catch return error.ExecutionFailed;
+                if (cached_data_tile == null or cached_data_tile.? != data_linear) {
+                    if (cached_data_tile != null) hs.releaseConst(data_tile.token);
+                    cached_data_tile = null;
+                    data_tile = ctx.rstore.acquireTileDeviceConstLinear(s.data, data_linear) catch return error.ExecutionFailed;
+                    cached_data_tile = data_linear;
+                    if (context.packedElems(data_tile.rank, data_tile.shape_mem[0..3], data_tile.strides_mem[0..3]) == null) return error.Unsupported;
+                }
+
+                const local_b = b % data_meta.tile_shape[0];
+                const local_s = selected % data_meta.tile_shape[1];
+                const src_elem = (local_b * data_tile.shape_mem[1] + local_s) * width;
+                const dst_elem = (lb * dout.shape_mem[1] + ll) * width;
+                const src_off = src_elem * elem_bytes;
+                const dst_off = dst_elem * elem_bytes;
+                if (src_off + row_bytes > data_tile.len or dst_off + row_bytes > dout.len) return error.ExecutionFailed;
+                frame.recordCopy(ctx.devmem.bufferFor(data_tile.handle).?, src_off, out_buf, dst_off, row_bytes);
+            }
+        }
+    }
+}
+
 // ---- RoPE1D ------------------------------------------------------------------
 
 /// out = rope(x, positions) over packed [B, L, N, H] tiles (f32, full head dim
@@ -343,7 +438,7 @@ pub fn execRoPE(ctx: Ctx, frame: *Frame, s: executable.StepRoPE1DTiled) ExecuteP
 
 // ---- SequenceAppend -----------------------------------------------------------
 
-/// cache[b, h, end[b] + t, :] = new_kv[b, h, t, :], in place. Mirrors the CPU
+/// cache[b, end[b] + t, h, :] = new_kv[b, t, h, :], in place. Mirrors the CPU
 /// row loop (incl. `mapSequenceStep` ring/growth mapping) but records one device
 /// buffer copy per row. end_index is read on the host at record time.
 pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceAppendTiled) ExecuteProgramError!void {
@@ -361,9 +456,9 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
     };
 
     const batch = cache_meta.shape[0];
-    const heads = cache_meta.shape[1];
+    const heads = cache_meta.shape[2];
     const head_dim = cache_meta.shape[3];
-    const new_len = new_meta.shape[2];
+    const new_len = new_meta.shape[1];
     const row_bytes = head_dim * elem_bytes;
     if (row_bytes % 4 != 0) return error.Unsupported;
     if (end_meta.dtype != .i32 or end_meta.shape[0] < batch) return error.Unsupported;
@@ -383,11 +478,11 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
         const t_start: usize = @intCast(end_idx.vals[b]);
         var t: usize = 0;
         while (t < new_len) : (t += 1) {
-            _ = hs.mapSequenceStep(s.cache, t_start + t, cache_meta.shape[2]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.cache, t_start + t, cache_meta.shape[1]) catch return error.ExecutionFailed;
         }
     }
     cache_meta = hs.meta(s.cache) catch return error.ExecutionFailed;
-    const cache_t = cache_meta.shape[2];
+    const cache_t = cache_meta.shape[1];
     if (new_len == 0) return;
 
     // Cached device tiles: decode touches exactly one src and one dst tile.
@@ -407,8 +502,8 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
             while (t < new_len) : (t += 1) {
                 const dst_t = hs.mapSequenceStep(s.cache, t_start + t, cache_t) catch return error.ExecutionFailed;
 
-                const src_coords = [4]usize{ b / new_meta.tile_shape[0], h / new_meta.tile_shape[1], t / new_meta.tile_shape[2], 0 };
-                const dst_coords = [4]usize{ b / cache_meta.tile_shape[0], h / cache_meta.tile_shape[1], dst_t / cache_meta.tile_shape[2], 0 };
+                const src_coords = [4]usize{ b / new_meta.tile_shape[0], t / new_meta.tile_shape[1], h / new_meta.tile_shape[2], 0 };
+                const dst_coords = [4]usize{ b / cache_meta.tile_shape[0], dst_t / cache_meta.tile_shape[1], h / cache_meta.tile_shape[2], 0 };
                 const src_lin = tensor_store_mod.encodeTileIndex(new_meta, &src_coords) catch return error.ExecutionFailed;
                 const dst_lin = tensor_store_mod.encodeTileIndex(cache_meta, &dst_coords) catch return error.ExecutionFailed;
 
@@ -425,8 +520,8 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
                     dst_cached = dst_lin;
                 }
 
-                const src_off = tileRowOffset(src_tile, new_meta, b, h, t, src_coords) orelse return error.Unsupported;
-                const dst_off = tileRowOffset(dst_tile, cache_meta, b, h, dst_t, dst_coords) orelse return error.Unsupported;
+                const src_off = tileRowOffset(src_tile, new_meta, b, t, h, src_coords) orelse return error.Unsupported;
+                const dst_off = tileRowOffset(dst_tile, cache_meta, b, dst_t, h, dst_coords) orelse return error.Unsupported;
                 if (src_off % 4 != 0 or dst_off % 4 != 0) return error.Unsupported;
                 if (src_off + row_bytes > src_tile.len or dst_off + row_bytes > dst_tile.len) return error.ExecutionFailed;
 

@@ -16,10 +16,11 @@ from typing import Any, Optional, Sequence, Tuple, cast
 from .builder import Builder, OutputsLike, TensorRef
 from .context import Context
 from .device import DeviceLike
-from .dtype import normalize_dtype
+from .dtype import float32, normalize_dtype
 from .enums import AionDType
 from .model import LoadedModel
 from .tensor import Tensor
+from .types import DTypeLike
 
 @dataclass(frozen=True)
 class InputSpec:
@@ -36,7 +37,7 @@ class InputSpec:
     placeholder: int = 1
 
 
-def spec(shape: Sequence[Optional[int]], dtype: object = "f32", name: Optional[str] = None,
+def spec(shape: Sequence[Optional[int]], dtype: DTypeLike = float32, name: Optional[str] = None,
          *, placeholder: int = 1) -> InputSpec:
     """Describe a traced input. `None` in `shape` = a dynamic axis."""
     shp = tuple(shape)

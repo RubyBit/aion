@@ -831,11 +831,11 @@ fn execMatMulTiledBatched(
                             const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
 
                             const batch: []const usize = coords[0 .. rank_local - 2];
-                            const a_tile_index: usize = tensor_store.broadcastTileIndex(t.a_meta, batch, &.{ ti_m, ti_k }) catch |e| {
+                            const a_tile_index: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, ti_k }, null) catch |e| {
                                 t.fail(e);
                                 return;
                             };
-                            const b_tile_index: usize = tensor_store.broadcastTileIndex(t.b_meta, batch, &.{ ti_k, ti_n }) catch |e| {
+                            const b_tile_index: usize = tensor_store.projectTileIndex(t.b_meta, batch, &.{ ti_k, ti_n }, null) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -1003,8 +1003,8 @@ fn execMatMulTiledBatched(
             const beta_tile: f32 = if (ti_k == 0) s.beta else 1.0;
 
             const batch: []const usize = coords[0 .. rank - 2];
-            const a_tile_index: usize = try tensor_store.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k });
-            const b_tile_index: usize = try tensor_store.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n });
+            const a_tile_index: usize = try tensor_store.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null);
+            const b_tile_index: usize = try tensor_store.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null);
 
             const a_tile = try store.acquireTileConstLinear(s.a, a_tile_index);
             defer store.releaseConst(a_tile.token);
@@ -1190,7 +1190,7 @@ fn execMatMulTiledBatchedF16Grouped(
                         while (ti_k < k_tiles_local) : (ti_k += 1) {
                             if (t.stop.load(.acquire)) return;
 
-                            const b_idx: usize = tensor_store.broadcastTileIndex(t.b_meta, prefix_coords[0..prefix_rank_local], &.{ ti_k, ti_n }) catch |e| {
+                            const b_idx: usize = tensor_store.projectTileIndex(t.b_meta, prefix_coords[0..prefix_rank_local], &.{ ti_k, ti_n }, null) catch |e| {
                                 t.fail(e);
                                 return;
                             };
@@ -1316,7 +1316,7 @@ fn execMatMulTiledBatchedF16Grouped(
         while (ti_n < n_tiles) : (ti_n += 1) {
             var ti_k: usize = 0;
             while (ti_k < k_tiles) : (ti_k += 1) {
-                const b_idx: usize = try tensor_store.broadcastTileIndex(b_meta, prefix_coords[0..prefix_rank], &.{ ti_k, ti_n });
+                const b_idx: usize = try tensor_store.projectTileIndex(b_meta, prefix_coords[0..prefix_rank], &.{ ti_k, ti_n }, null);
                 const b_tile = try store.acquireTileConstLinear(s.b, b_idx);
                 defer store.releaseConst(b_tile.token);
                 const b_view = b_tile.bufferView();

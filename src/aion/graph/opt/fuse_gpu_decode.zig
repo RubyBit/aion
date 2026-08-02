@@ -25,22 +25,38 @@ pub fn run(allocator: std.mem.Allocator, graph: *Graph, policy: plan.TilePolicy)
     @memset(drop, false);
     var changed = false;
     for (graph.nodes.items, 0..) |node, i| {
-        const u = switch (node.op) { .Unary => |x| x, else => continue };
+        const u = switch (node.op) {
+            .Unary => |x| x,
+            else => continue,
+        };
         if (u.op != .gelu or reads[@intCast(node.output)] != 1 or output[@intCast(node.output)]) continue;
         var consumer: ?usize = null;
         var j = i + 1;
         while (j < graph.nodes.items.len) : (j += 1) for (graph.nodes.items[j].inputs) |id| {
-            if (id == node.output) { consumer = j; break; }
+            if (id == node.output) {
+                consumer = j;
+                break;
+            }
         };
         const ci = consumer orelse continue;
-        const b = switch (graph.nodes.items[ci].op) { .ElemwiseBinary => |x| x, else => continue };
+        const b = switch (graph.nodes.items[ci].op) {
+            .ElemwiseBinary => |x| x,
+            else => continue,
+        };
         if (b.op != .mul) continue;
         const other = if (graph.nodes.items[ci].inputs[0] == node.output) graph.nodes.items[ci].inputs[1] else graph.nodes.items[ci].inputs[0];
+        // GeluMul is an identical-shape fused kernel. A broadcast multiply must
+        // remain ElemwiseBinary so its broadcast plan is preserved.
+        const gelu_shape = graph.values.items[@intCast(node.output)].shape;
+        const other_shape = graph.values.items[@intCast(other)].shape;
+        if (gelu_shape.len != other_shape.len or !std.mem.eql(usize, gelu_shape, other_shape)) continue;
         const inputs = graph.arenaAlloc().alloc(ValueId, 2) catch return Error.OutOfMemory;
-        inputs[0] = node.inputs[0]; inputs[1] = other;
+        inputs[0] = node.inputs[0];
+        inputs[1] = other;
         graph.nodes.items[ci].op = .GeluMul;
         graph.nodes.items[ci].inputs = inputs;
-        drop[i] = true; changed = true;
+        drop[i] = true;
+        changed = true;
     }
     if (!changed) return;
     var kept: std.ArrayList(Node) = .empty;

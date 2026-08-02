@@ -117,7 +117,7 @@ def test_linear_2d_weight_serves_a_3d_activation(b):
 
 def test_embedding_lookup(b):
     table = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], np.float32)
-    ids = b.input((1, 2), dtype="i32").rename("ids")
+    ids = b.input((1, 2), dtype=aion.int32).rename("ids")
     got = run(b, nn.Embedding(table)(ids), {"ids": np.array([[2, 0]], np.int32)})
     assert np.allclose(got, [[[5.0, 6.0], [1.0, 2.0]]])
 
@@ -289,8 +289,8 @@ def test_cached_attention_reader_layer_has_no_kv_projections(b):
     # the rest only project Q and attend over it. Omitting k/v says so.
     eye = np.eye(2, dtype=np.float32)
 
-    def attn(**kw: object) -> nn.CachedAttention:
-        return nn.CachedAttention(
+    def attn(**kw: object) -> nn.Attention:
+        return nn.Attention(
             eye, eye, heads=1, kv_heads=1, head_dim=2, scale=1.0, **kw  # type: ignore[arg-type]
         )
 
@@ -309,7 +309,7 @@ def test_cached_attention_reader_layer_has_no_kv_projections(b):
 def test_cached_attention_rejects_k_without_v():
     eye = np.eye(2, dtype=np.float32)
     with pytest.raises(ValueError, match="both k_proj and v_proj"):
-        nn.CachedAttention(eye, eye, k_proj=eye, heads=1, kv_heads=1, head_dim=2, scale=1.0)
+        nn.Attention(eye, eye, k_proj=eye, heads=1, kv_heads=1, head_dim=2, scale=1.0)
 
 
 def _relpos(heads=2, head_dim=2, time=3, seed=0):

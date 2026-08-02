@@ -438,7 +438,7 @@ test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce
     try g.bindExternal(bias_in, @intCast(bias_tid));
 
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
-    const d = try g.addBroadcastLastDimBinary(.add, c, bias_in);
+    const d = try g.addElemwiseBinary(.add, c, bias_in);
     const e = try g.addRelu(d);
     const f = try g.addCopy(e);
     const gg = try g.addElemwiseBinary(.mul, f, f);
@@ -1644,264 +1644,115 @@ test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     }
 }
 
-test "cpu backend: attention rank-2 matches reference (f32)" {
+// The three tests that used to sit here drove `Attention` (rank-2/3) and
+// `MultiHeadAttention` (rank-4 head-major), the pre-cache ops. They are gone; the
+// unified `Attention` op is covered by the cached tests below plus this one, which
+// pins the no-index path: with the index operands omitted, the result must equal
+// the cached path fed the indices those defaults stand for.
+test "cpu backend: attention over a plain sequence equals the cached path with implied indices" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
-    const m: usize = 7;
-    const n: usize = 11;
-    const dk: usize = 9;
-    const dv: usize = 13;
+    const bsz: usize = 1;
+    const l_q: usize = 4;
+    const h_q: usize = 4;
+    const h_kv: usize = 2;
+    const t: usize = 4; // no cache: T == the sequence length
+    const d_k: usize = 3;
+    const d_v: usize = 2;
 
-    const q_bytes_len: usize = m * dk * 4;
-    const k_bytes_len: usize = n * dk * 4;
-    const v_bytes_len: usize = n * dv * 4;
-    const out_bytes_len: usize = m * dv * 4;
+    const scale: f32 = 0.5;
 
-    const q_buf: []u8 = try allocator.alloc(u8, q_bytes_len);
+    const q_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_k * @sizeOf(f32));
     defer allocator.free(q_buf);
-    const k_buf: []u8 = try allocator.alloc(u8, k_bytes_len);
+    const k_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t * d_k * @sizeOf(f32));
     defer allocator.free(k_buf);
-    const v_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
+    const v_buf: []u8 = try allocator.alloc(u8, bsz * h_kv * t * d_v * @sizeOf(f32));
     defer allocator.free(v_buf);
 
     const q_vals: []align(1) f32 = asF32Slice(q_buf);
     const k_vals: []align(1) f32 = asF32Slice(k_buf);
     const v_vals: []align(1) f32 = asF32Slice(v_buf);
+    for (q_vals, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.07;
+    for (k_vals, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9))) * 0.05;
+    for (v_vals, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11))) * 0.06;
 
-    // Keep magnitudes modest so expApprox and reference stay close.
-    for (0..m * dk) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 31))) - 15))) * 0.03;
-    for (0..n * dk) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 29))) - 14))) * 0.03;
-    for (0..n * dv) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 37))) - 18))) * 0.02;
-
-    const scale: f32 = 0.25;
-
-    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
-    defer cpu.deinit();
-    const backend: Backend = cpu.backend();
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    // Intentionally awkward tiling to exercise retile.
-    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, dk }, &[_]usize{ 3, 4 }, .{ .tile_alignment = 64 });
-    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ n, dk }, &[_]usize{ 4, 5 }, .{ .tile_alignment = 64 });
-    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ n, dv }, &[_]usize{ 5, 3 }, .{ .tile_alignment = 64 });
-    try sm.writeFromPackedScalar(q_tid, q_buf);
-    try sm.writeFromPackedScalar(k_tid, k_buf);
-    try sm.writeFromPackedScalar(v_tid, v_buf);
-
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
+    // The defaults the op supplies when the operands are absent: position == row,
+    // every key live.
+    const implied_pos: []i32 = try allocator.alloc(i32, bsz * l_q);
+    defer allocator.free(implied_pos);
+    for (implied_pos, 0..) |*x, i| x.* = @intCast(i % l_q);
+    const implied_end: []i32 = try allocator.alloc(i32, bsz);
+    defer allocator.free(implied_end);
+    for (implied_end) |*x| x.* = @intCast(t);
 
     inline for (.{
-        .{ .causal = false, .name = "noncausal" },
-        .{ .causal = true, .name = "causal" },
+        .{ .causal = true, .sliding = @as(usize, 0) },
+        .{ .causal = false, .sliding = @as(usize, 0) },
+        .{ .causal = true, .sliding = @as(usize, 2) },
     }) |case| {
-        var g = graph_mod.Graph.init(allocator);
+        const ref_vals: []f32 = try allocator.alloc(f32, bsz * l_q * h_q * d_v);
+        defer allocator.free(ref_vals);
+        cachedGqaRefF32(
+            ref_vals,
+            q_vals,
+            k_vals,
+            v_vals,
+            implied_pos,
+            implied_end,
+            bsz,
+            l_q,
+            h_q,
+            h_kv,
+            t,
+            d_k,
+            d_v,
+            scale,
+            case.causal,
+            case.sliding,
+            0.0,
+        );
+
+        var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+        defer sm.deinit();
+
+        const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 2, 2, d_k }, .{ .tile_alignment = 64 });
+        const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
+        const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
+        try sm.writeFromPackedScalar(q_tid, q_buf);
+        try sm.writeFromPackedScalar(k_tid, k_buf);
+        try sm.writeFromPackedScalar(v_tid, v_buf);
+
+        var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
         defer g.deinit();
 
-        const q_in = try g.addInput(.f32, &[_]usize{ m, dk });
-        const k_in = try g.addInput(.f32, &[_]usize{ n, dk });
-        const v_in = try g.addInput(.f32, &[_]usize{ n, dv });
+        const q_in = try g.addInput(.f32, &[_]usize{ bsz, l_q, h_q, d_k });
+        const k_in = try g.addInput(.f32, &[_]usize{ bsz, t, h_kv, d_k });
+        const v_in = try g.addInput(.f32, &[_]usize{ bsz, t, h_kv, d_v });
         try g.bindExternal(q_in, @intCast(q_tid));
         try g.bindExternal(k_in, @intCast(k_tid));
         try g.bindExternal(v_in, @intCast(v_tid));
 
-        const y = try g.addAttention(q_in, k_in, v_in, scale, case.causal);
-        try g.setOutputs(&[_]graph_mod.ValueId{y});
+        // No positions, no end_index.
+        const out = try g.addAttention(q_in, k_in, v_in, null, null, scale, case.causal, case.sliding, 0.0);
+        try g.setOutputs(&[_]graph_mod.ValueId{out});
 
+        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
         var prog = try program.compileGraph(allocator, &g, &sm, policy);
         defer prog.deinit();
-        try backend.executeProgram(&prog, sm.tensorStore());
 
-        const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
+        var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
+        defer cpu.deinit();
+        try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+        const out_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_v * @sizeOf(f32));
         defer allocator.free(out_buf);
         try sm.readToPackedScalar(prog.outputs[0], out_buf);
         const out_vals: []align(1) f32 = asF32Slice(out_buf);
 
-        const ref: []f32 = try allocator.alloc(f32, m * dv);
-        defer allocator.free(ref);
-        attentionRefF32(allocator, ref, q_vals, k_vals, v_vals, m, n, dk, dv, scale, case.causal);
-
-        var max_abs: f32 = 0.0;
-        for (out_vals, ref) |got, r0| {
+        for (out_vals, ref_vals) |got, want| {
             try std.testing.expect(std.math.isFinite(got));
-            max_abs = @max(max_abs, @abs(got - r0));
+            try std.testing.expectApproxEqAbs(want, got, 1e-5);
         }
-        if (!(max_abs <= 6e-2)) {
-            std.debug.print("attention {s} mismatch max_abs={}\n", .{ case.name, max_abs });
-            return error.TestExpectedEqual;
-        }
-    }
-}
-
-test "cpu backend: attention rank-3 batched matches reference (f32)" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const batch: usize = 2;
-    const m: usize = 4;
-    const n: usize = 5;
-    const dk: usize = 6;
-    const dv: usize = 7;
-
-    const q_bytes_len: usize = batch * m * dk * 4;
-    const k_bytes_len: usize = batch * n * dk * 4;
-    const v_bytes_len: usize = batch * n * dv * 4;
-    const out_bytes_len: usize = batch * m * dv * 4;
-
-    const q_buf: []u8 = try allocator.alloc(u8, q_bytes_len);
-    defer allocator.free(q_buf);
-    const k_buf: []u8 = try allocator.alloc(u8, k_bytes_len);
-    defer allocator.free(k_buf);
-    const v_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
-    defer allocator.free(v_buf);
-
-    const q_vals: []align(1) f32 = asF32Slice(q_buf);
-    const k_vals: []align(1) f32 = asF32Slice(k_buf);
-    const v_vals: []align(1) f32 = asF32Slice(v_buf);
-
-    for (0..batch * m * dk) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 31))) - 15))) * 0.03;
-    for (0..batch * n * dk) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 29))) - 14))) * 0.03;
-    for (0..batch * n * dv) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 37))) - 18))) * 0.02;
-
-    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-
-    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
-    defer cpu.deinit();
-    const backend: Backend = cpu.backend();
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
-    const st = plan_mod.chooseAttentionTiles(policy, m, n, dk, dv);
-
-    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, dk }, &[_]usize{ 1, st.tm, st.tk }, .{ .tile_alignment = 64 });
-    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, n, dk }, &[_]usize{ 1, st.tn, st.tk }, .{ .tile_alignment = 64 });
-    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, n, dv }, &[_]usize{ 1, st.tn, st.tv }, .{ .tile_alignment = 64 });
-    try sm.writeFromPackedScalar(q_tid, q_buf);
-    try sm.writeFromPackedScalar(k_tid, k_buf);
-    try sm.writeFromPackedScalar(v_tid, v_buf);
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const q_in = try g.addInput(.f32, &[_]usize{ batch, m, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ batch, n, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ batch, n, dv });
-    try g.bindExternal(q_in, @intCast(q_tid));
-    try g.bindExternal(k_in, @intCast(k_tid));
-    try g.bindExternal(v_in, @intCast(v_tid));
-
-    const y = try g.addAttention(q_in, k_in, v_in, scale, false);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
-    defer prog.deinit();
-    try backend.executeProgram(&prog, sm.tensorStore());
-
-    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
-    defer allocator.free(out_buf);
-    try sm.readToPackedScalar(prog.outputs[0], out_buf);
-    const out_vals: []align(1) f32 = asF32Slice(out_buf);
-
-    const ref: []f32 = try allocator.alloc(f32, batch * m * dv);
-    defer allocator.free(ref);
-    attentionRefBatchedF32(allocator, ref, q_vals, k_vals, v_vals, batch, m, n, dk, dv, scale, false);
-
-    var max_abs: f32 = 0.0;
-    for (out_vals, ref) |got, r0| {
-        try std.testing.expect(std.math.isFinite(got));
-        max_abs = @max(max_abs, @abs(got - r0));
-    }
-    if (!(max_abs <= 6e-2)) {
-        std.debug.print("batched attention mismatch max_abs={}\n", .{max_abs});
-        return error.TestExpectedEqual;
-    }
-}
-
-test "cpu backend: multi-head attention rank-4 batched matches reference (f32)" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const batch: usize = 2;
-    const heads: usize = 2;
-    const m_head: usize = 3;
-    const n_head: usize = 4;
-    const dk: usize = 5;
-    const dv: usize = 6;
-
-    const q_bytes_len: usize = batch * heads * m_head * dk * 4;
-    const k_bytes_len: usize = batch * heads * n_head * dk * 4;
-    const v_bytes_len: usize = batch * heads * n_head * dv * 4;
-    const out_bytes_len: usize = batch * heads * m_head * dv * 4;
-
-    const q_buf: []u8 = try allocator.alloc(u8, q_bytes_len);
-    defer allocator.free(q_buf);
-    const k_buf: []u8 = try allocator.alloc(u8, k_bytes_len);
-    defer allocator.free(k_buf);
-    const v_buf: []u8 = try allocator.alloc(u8, v_bytes_len);
-    defer allocator.free(v_buf);
-
-    const q_vals: []align(1) f32 = asF32Slice(q_buf);
-    const k_vals: []align(1) f32 = asF32Slice(k_buf);
-    const v_vals: []align(1) f32 = asF32Slice(v_buf);
-
-    for (0..batch * heads * m_head * dk) |i| q_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 31))) - 15))) * 0.03;
-    for (0..batch * heads * n_head * dk) |i| k_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 29))) - 14))) * 0.03;
-    for (0..batch * heads * n_head * dv) |i| v_vals[i] = (@as(f32, @floatFromInt(@as(i32, @intCast((i % 37))) - 18))) * 0.02;
-
-    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-
-    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
-    defer cpu.deinit();
-    const backend: Backend = cpu.backend();
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
-    const st = plan_mod.chooseAttentionTiles(policy, m_head, n_head, dk, dv);
-
-    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, m_head, dk }, &[_]usize{ 1, 1, st.tm, st.tk }, .{ .tile_alignment = 64 });
-    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dk }, &[_]usize{ 1, 1, st.tn, st.tk }, .{ .tile_alignment = 64 });
-    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dv }, &[_]usize{ 1, 1, st.tn, st.tv }, .{ .tile_alignment = 64 });
-    try sm.writeFromPackedScalar(q_tid, q_buf);
-    try sm.writeFromPackedScalar(k_tid, k_buf);
-    try sm.writeFromPackedScalar(v_tid, v_buf);
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const q_in = try g.addInput(.f32, &[_]usize{ batch, heads, m_head, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dv });
-    try g.bindExternal(q_in, @intCast(q_tid));
-    try g.bindExternal(k_in, @intCast(k_tid));
-    try g.bindExternal(v_in, @intCast(v_tid));
-
-    const y = try g.addMultiHeadAttention(q_in, k_in, v_in, scale, false, heads);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
-    defer prog.deinit();
-    try backend.executeProgram(&prog, sm.tensorStore());
-
-    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
-    defer allocator.free(out_buf);
-    try sm.readToPackedScalar(prog.outputs[0], out_buf);
-    const out_vals: []align(1) f32 = asF32Slice(out_buf);
-
-    const ref: []f32 = try allocator.alloc(f32, batch * heads * m_head * dv);
-    defer allocator.free(ref);
-    attentionRefBatchedMultiHeadF32(allocator, ref, q_vals, k_vals, v_vals, batch, heads, m_head, n_head, dk, dv, scale, false);
-
-    var max_abs: f32 = 0.0;
-    for (out_vals, ref) |got, r0| {
-        try std.testing.expect(std.math.isFinite(got));
-        max_abs = @max(max_abs, @abs(got - r0));
-    }
-    if (!(max_abs <= 6e-2)) {
-        std.debug.print("batched multi-head attention mismatch max_abs={}\n", .{max_abs});
-        return error.TestExpectedEqual;
     }
 }
 
@@ -2047,7 +1898,7 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     try g.bindExternal(u_in, @intCast(u_tid));
     try g.bindExternal(vb_in, @intCast(vb_tid));
 
-    const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, heads);
+    const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program.compileGraph(allocator, &g, &sm, policy);
@@ -2070,6 +1921,144 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     }
     if (!(max_abs <= 6e-2)) {
         std.debug.print("rel-pos mha mismatch max_abs={}\n", .{max_abs});
+        return error.TestExpectedEqual;
+    }
+}
+
+// The structural chunked-limited window must be indistinguishable from the additive
+// mask that used to encode the same pattern — that equivalence is the whole premise
+// of the attribute, since it lets the executors skip out-of-window keys instead of
+// scoring them and adding -1e9. Runs BOTH forms through the same graph shape and
+// compares outputs elementwise.
+test "cpu backend: chunked-limited window equals the equivalent additive mask" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 2;
+    const heads: usize = 2;
+    const t: usize = 12; // T_q == T_kv
+    const d: usize = 8;
+    const p_len: usize = 2 * t - 1;
+    const chunk: usize = 4;
+    const left: usize = 5; // deliberately NOT a multiple of chunk
+    const qkv_len: usize = batch * t * heads * d;
+
+    const q_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(q_buf);
+    const k_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(k_buf);
+    const v_buf: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(v_buf);
+    const pe_buf: []u8 = try allocator.alloc(u8, heads * p_len * d * 4);
+    defer allocator.free(pe_buf);
+    const u_buf: []u8 = try allocator.alloc(u8, heads * d * 4);
+    defer allocator.free(u_buf);
+    const vb_buf: []u8 = try allocator.alloc(u8, heads * d * 4);
+    defer allocator.free(vb_buf);
+    const mask_buf: []u8 = try allocator.alloc(u8, t * t * 4);
+    defer allocator.free(mask_buf);
+
+    for (asF32Slice(q_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) * 0.03;
+    for (asF32Slice(k_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) * 0.03;
+    for (asF32Slice(v_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) * 0.02;
+    for (asF32Slice(pe_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.025;
+    for (asF32Slice(u_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.05;
+    for (asF32Slice(vb_buf), 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.04;
+
+    // The mask the Nemotron converter used to bake in for `chunked_limited`.
+    const mask_vals: []align(1) f32 = asF32Slice(mask_buf);
+    for (0..t) |i| {
+        for (0..t) |j| {
+            const cs: usize = (i / chunk) * chunk;
+            const lo: usize = cs - @min(cs, left);
+            const hi: usize = @min(cs + chunk, t);
+            mask_vals[i * t + j] = if (j >= lo and j < hi) 0.0 else -1.0e9;
+        }
+    }
+
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d)));
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    // `use_mask`: the old encoding. Otherwise the structural window.
+    const run = struct {
+        fn go(
+            alloc: std.mem.Allocator,
+            be: Backend,
+            pol: plan_mod.TilePolicy,
+            sc: f32,
+            use_mask: bool,
+            bufs: [7][]u8,
+            out: []u8,
+        ) !void {
+            var sm = manager_mod.StorageManager.init(alloc);
+            defer sm.deinit();
+
+            const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+            const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+            const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
+            const pe_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, p_len, d }, &[_]usize{ 1, p_len, d }, .{ .tile_alignment = 64 });
+            const u_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
+            const vb_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
+            const m_tid = try sm.createTiledTensor(.f32, &[_]usize{ t, t }, &[_]usize{ t, t }, .{ .tile_alignment = 64 });
+            try sm.writeFromPackedScalar(q_tid, bufs[0]);
+            try sm.writeFromPackedScalar(k_tid, bufs[1]);
+            try sm.writeFromPackedScalar(v_tid, bufs[2]);
+            try sm.writeFromPackedScalar(pe_tid, bufs[3]);
+            try sm.writeFromPackedScalar(u_tid, bufs[4]);
+            try sm.writeFromPackedScalar(vb_tid, bufs[5]);
+            try sm.writeFromPackedScalar(m_tid, bufs[6]);
+
+            var g = graph_mod.Graph.init(alloc);
+            defer g.deinit();
+            const q_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+            const k_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+            const v_in = try g.addInput(.f32, &[_]usize{ batch, t, heads, d });
+            const pe_in = try g.addInput(.f32, &[_]usize{ heads, p_len, d });
+            const u_in = try g.addInput(.f32, &[_]usize{ heads, d });
+            const vb_in = try g.addInput(.f32, &[_]usize{ heads, d });
+            const m_in = try g.addInput(.f32, &[_]usize{ t, t });
+            try g.bindExternal(q_in, @intCast(q_tid));
+            try g.bindExternal(k_in, @intCast(k_tid));
+            try g.bindExternal(v_in, @intCast(v_tid));
+            try g.bindExternal(pe_in, @intCast(pe_tid));
+            try g.bindExternal(u_in, @intCast(u_tid));
+            try g.bindExternal(vb_in, @intCast(vb_tid));
+            try g.bindExternal(m_in, @intCast(m_tid));
+
+            const y = if (use_mask)
+                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, m_in, sc, 0, 0)
+            else
+                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, sc, chunk, left);
+            try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+            var prog = try program.compileGraph(alloc, &g, &sm, pol);
+            defer prog.deinit();
+            try be.executeProgram(&prog, sm.tensorStore());
+            try sm.readToPackedScalar(prog.outputs[0], out);
+        }
+    }.go;
+
+    const bufs: [7][]u8 = .{ q_buf, k_buf, v_buf, pe_buf, u_buf, vb_buf, mask_buf };
+    const masked: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(masked);
+    const windowed: []u8 = try allocator.alloc(u8, qkv_len * 4);
+    defer allocator.free(windowed);
+
+    try run(allocator, backend, policy, scale, true, bufs, masked);
+    try run(allocator, backend, policy, scale, false, bufs, windowed);
+
+    var max_abs: f32 = 0.0;
+    for (asF32Slice(masked), asF32Slice(windowed)) |a, b| {
+        try std.testing.expect(std.math.isFinite(a) and std.math.isFinite(b));
+        max_abs = @max(max_abs, @abs(a - b));
+    }
+    // Not bit-identical: the masked path softmaxes over all T keys (the -1e9 entries
+    // contribute exp(-80)-ish), the windowed path over the window only.
+    if (!(max_abs <= 1e-5)) {
+        std.debug.print("windowed vs masked mismatch max_abs={}\n", .{max_abs});
         return error.TestExpectedEqual;
     }
 }
@@ -2657,7 +2646,7 @@ test "cpu backend: gather rows matches reference (f32)" {
     try g.bindExternal(table_in, @intCast(table_tid));
     try g.bindExternal(idx_in, @intCast(idx_tid));
 
-    const out = try g.addGatherRows(table_in, idx_in);
+    const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
@@ -2683,6 +2672,76 @@ test "cpu backend: gather rows matches reference (f32)" {
             }
         }
     }
+}
+
+test "cpu backend: shape index ops and batched gather derive pooling indices" {
+    const allocator = std.testing.allocator;
+    const b: usize = 2;
+    const s: usize = 4;
+    const d: usize = 3;
+    const l: usize = 2;
+
+    var data_vals: [b * s * d]f32 = undefined;
+    for (0..b) |bi| {
+        for (0..s) |si| {
+            for (0..d) |di| {
+                data_vals[(bi * s + si) * d + di] = @floatFromInt(bi * 100 + si * 10 + di);
+            }
+        }
+    }
+    const indices_vals = [_]i32{ 3, 1, 0, 2 };
+    const tokens_vals = [_]i32{0} ** (b * s);
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+    const data_tid = try sm.createTiledTensor(.f32, &.{ b, s, d }, &.{ 1, 2, d }, .{ .tile_alignment = 64 });
+    const indices_tid = try sm.createTiledTensor(.i32, &.{ b, l }, &.{ 1, 1 }, .{ .tile_alignment = 64 });
+    const tokens_tid = try sm.createTiledTensor(.i32, &.{ b, s }, &.{ 1, 2 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(data_tid, std.mem.sliceAsBytes(&data_vals));
+    try sm.writeFromPackedScalar(indices_tid, std.mem.sliceAsBytes(&indices_vals));
+    try sm.writeFromPackedScalar(tokens_tid, std.mem.sliceAsBytes(&tokens_vals));
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const data = try g.addInput(.f32, &.{ b, s, d });
+    const indices = try g.addInput(.i32, &.{ b, l });
+    const tokens = try g.addInput(.i32, &.{ b, s });
+    try g.bindExternal(data, @intCast(data_tid));
+    try g.bindExternal(indices, @intCast(indices_tid));
+    try g.bindExternal(tokens, @intCast(tokens_tid));
+
+    const gathered = try g.addGather(data, indices, 1, 1);
+    const positions = try g.addIota(tokens, 1);
+    const seq_len = try g.addDim(tokens, 1);
+    try g.setOutputs(&.{ gathered, positions, seq_len });
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    var gathered_vals: [b * l * d]f32 = undefined;
+    var positions_vals: [b * s]i32 = undefined;
+    var seq_len_vals: [1]i32 = undefined;
+    try sm.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(&gathered_vals));
+    try sm.readToPackedScalar(prog.outputs[1], std.mem.sliceAsBytes(&positions_vals));
+    try sm.readToPackedScalar(prog.outputs[2], std.mem.sliceAsBytes(&seq_len_vals));
+
+    for (0..b) |bi| {
+        for (0..l) |li| {
+            const source: usize = @intCast(indices_vals[bi * l + li]);
+            for (0..d) |di| {
+                try std.testing.expectEqual(
+                    data_vals[(bi * s + source) * d + di],
+                    gathered_vals[(bi * l + li) * d + di],
+                );
+            }
+        }
+        for (0..s) |si| try std.testing.expectEqual(@as(i32, @intCast(si)), positions_vals[bi * s + si]);
+    }
+    try std.testing.expectEqual(@as(i32, @intCast(s)), seq_len_vals[0]);
 }
 
 test "cpu backend: gather rows matches reference (f16)" {
@@ -2728,7 +2787,7 @@ test "cpu backend: gather rows matches reference (f16)" {
     try g.bindExternal(table_in, @intCast(table_tid));
     try g.bindExternal(idx_in, @intCast(idx_tid));
 
-    const out = try g.addGatherRows(table_in, idx_in);
+    const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
@@ -2844,7 +2903,7 @@ test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
     try g.bindExternal(table_in, @intCast(table_tid));
     try g.bindExternal(idx_in, @intCast(idx_tid));
 
-    const out = try g.addGatherRows(table_in, idx_in);
+    const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
@@ -3109,7 +3168,7 @@ test "cpu backend: gather rows out-of-bounds returns InvalidArgument" {
     try g.bindExternal(table_in, @intCast(table_tid));
     try g.bindExternal(idx_in, @intCast(idx_tid));
 
-    const out = try g.addGatherRows(table_in, idx_in);
+    const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
@@ -4591,8 +4650,8 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
                 const dst_t: usize = t_start + t;
                 var d: usize = 0;
                 while (d < d_head) : (d += 1) {
-                    const src_idx: usize = (((b * heads + h) * append_len + t) * d_head) + d;
-                    const dst_idx: usize = (((b * heads + h) * t_cap + dst_t) * d_head) + d;
+                    const src_idx: usize = (((b * append_len + t) * heads + h) * d_head) + d;
+                    const dst_idx: usize = (((b * t_cap + dst_t) * heads + h) * d_head) + d;
                     expected[dst_idx] = new_vals[src_idx];
                 }
             }
@@ -4603,8 +4662,8 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     defer sm.deinit();
 
     // v1 constraints: single tile over batch+heads, full head-dim tile.
-    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, t_cap, d_head }, &[_]usize{ bsz, heads, 3, d_head }, .{ .tile_alignment = 64 });
-    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, append_len, d_head }, &[_]usize{ bsz, heads, 1, d_head }, .{ .tile_alignment = 64 });
+    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 3, heads, d_head }, .{ .tile_alignment = 64 });
+    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
     const end_tid = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
@@ -4613,8 +4672,8 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     var g = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
-    const cache_in = try g.addInput(.f32, &[_]usize{ bsz, heads, t_cap, d_head });
-    const new_in = try g.addInput(.f32, &[_]usize{ bsz, heads, append_len, d_head });
+    const cache_in = try g.addInput(.f32, &[_]usize{ bsz, t_cap, heads, d_head });
+    const new_in = try g.addInput(.f32, &[_]usize{ bsz, append_len, heads, d_head });
     const end_in = try g.addInput(.i32, &[_]usize{bsz});
     try g.bindExternal(cache_in, @intCast(cache_tid));
     try g.bindExternal(new_in, @intCast(new_tid));
@@ -4675,8 +4734,8 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, t_cap, d_head }, &[_]usize{ bsz, heads, 2, d_head }, .{ .tile_alignment = 64 });
-    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, append_len, d_head }, &[_]usize{ bsz, heads, 1, d_head }, .{ .tile_alignment = 64 });
+    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
+    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
     const end_tid = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
@@ -4685,8 +4744,8 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     var g = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
-    const cache_in = try g.addInput(.f32, &[_]usize{ bsz, heads, t_cap, d_head });
-    const new_in = try g.addInput(.f32, &[_]usize{ bsz, heads, append_len, d_head });
+    const cache_in = try g.addInput(.f32, &[_]usize{ bsz, t_cap, heads, d_head });
+    const new_in = try g.addInput(.f32, &[_]usize{ bsz, append_len, heads, d_head });
     const end_in = try g.addInput(.i32, &[_]usize{bsz});
     try g.bindExternal(cache_in, @intCast(cache_tid));
     try g.bindExternal(new_in, @intCast(new_tid));
@@ -4736,8 +4795,8 @@ test "cpu backend: kv cache append ring policy wraps time index" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, t_cap, d_head }, &[_]usize{ bsz, heads, 2, d_head }, .{ .tile_alignment = 64 });
-    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, append_len, d_head }, &[_]usize{ bsz, heads, 1, d_head }, .{ .tile_alignment = 64 });
+    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
+    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
     const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
@@ -4747,8 +4806,8 @@ test "cpu backend: kv cache append ring policy wraps time index" {
     var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
-    const cache_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, heads, t_cap, d_head });
-    const new_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, heads, append_len, d_head });
+    const cache_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, t_cap, heads, d_head });
+    const new_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, append_len, heads, d_head });
     const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
     try g.bindExternal(cache_in, @intCast(cache_tid));
     try g.bindExternal(new_in, @intCast(new_tid));
@@ -4808,8 +4867,8 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, t_cap, d_head }, &[_]usize{ bsz, heads, 2, d_head }, .{ .tile_alignment = 64 });
-    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, heads, append_len, d_head }, &[_]usize{ bsz, heads, 1, d_head }, .{ .tile_alignment = 64 });
+    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
+    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
     const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
@@ -4819,8 +4878,8 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
-    const cache_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, heads, t_cap, d_head });
-    const new_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, heads, append_len, d_head });
+    const cache_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, t_cap, heads, d_head });
+    const new_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, append_len, heads, d_head });
     const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
     try g.bindExternal(cache_in, @intCast(cache_tid));
     try g.bindExternal(new_in, @intCast(new_tid));
@@ -4838,7 +4897,7 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     try cpu.backend().executeProgram(&prog, sm.tensorStore());
 
     const grown_meta: *const manager_mod.TiledTensor = try sm.getConst(cache_tid);
-    try std.testing.expectEqual(@as(usize, 8), grown_meta.shape[2]);
+    try std.testing.expectEqual(@as(usize, 8), grown_meta.shape[1]);
 
     const out_buf: []u8 = try allocator.alloc(u8, bsz * heads * 8 * d_head * @sizeOf(f32));
     defer allocator.free(out_buf);
@@ -4921,8 +4980,8 @@ fn cachedGqaRefF32(
 
                 var t: usize = lower;
                 while (t < upper) : (t += 1) {
-                    const k_base: usize = (((b * h_kv + hkv_idx) * t_cap + t) * d_k);
-                    const v_base: usize = (((b * h_kv + hkv_idx) * t_cap + t) * d_v);
+                    const k_base: usize = (((b * t_cap + t) * h_kv + hkv_idx) * d_k);
+                    const v_base: usize = (((b * t_cap + t) * h_kv + hkv_idx) * d_v);
 
                     var dot: f32 = 0.0;
                     var dk_i: usize = 0;
@@ -5034,8 +5093,8 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     defer sm.deinit();
 
     const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_kv, t_cap, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_kv, t_cap, d_v }, &[_]usize{ 1, 1, 2, d_v }, .{ .tile_alignment = 64 });
+    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
+    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
     const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
     const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
 
@@ -5049,8 +5108,8 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     defer g.deinit();
 
     const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, l_q, h_q, d_k });
-    const k_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, h_kv, t_cap, d_k });
-    const v_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, h_kv, t_cap, d_v });
+    const k_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k });
+    const v_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v });
     const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ bsz, l_q });
     const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
 
@@ -5060,7 +5119,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     try g.bindExternal(pos_in, @intCast(pos_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(
+    const out: graph_mod.ValueId = try g.addAttention(
         q_in,
         k_in,
         v_in,
@@ -5177,8 +5236,8 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     defer sm.deinit();
 
     const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, h_kv, t_cap, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, h_kv, t_cap, d_v }, &[_]usize{ 1, 1, 2, d_v }, .{ .tile_alignment = 64 });
+    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
+    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
     const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
     const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
 
@@ -5192,8 +5251,8 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     defer g.deinit();
 
     const q_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ bsz, l_q, h_q, d_k });
-    const k_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, h_kv, t_cap, d_k });
-    const v_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, h_kv, t_cap, d_v });
+    const k_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k });
+    const v_in: graph_mod.ValueId = try g.addInput(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v });
     const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ bsz, l_q });
     const end_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{bsz});
 
@@ -5203,7 +5262,7 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     try g.bindExternal(pos_in, @intCast(pos_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(
+    const out: graph_mod.ValueId = try g.addAttention(
         q_in,
         k_in,
         v_in,

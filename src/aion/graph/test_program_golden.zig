@@ -172,18 +172,19 @@ fn buildElemwiseUnary(b: *B) anyerror!ValueId {
 }
 
 fn buildAttention(b: *B) anyerror!ValueId {
-    // Single-head attention: exercises chooseAttentionTiles + attention caps.
-    const q = try b.input(.f32, &[_]usize{ 8, 16 });
-    const k = try b.input(.f32, &[_]usize{ 8, 16 });
-    const v = try b.input(.f32, &[_]usize{ 8, 16 });
-    return b.g.addAttention(q, k, v, 0.25, false);
+    // Plain-sequence attention (no index operands): pins that the lowering emits
+    // one AttentionTiled with the operands' own tiling and no retile steps.
+    const q = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
+    const k = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
+    const v = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
+    return b.g.addAttention(q, k, v, null, null, 0.25, false, 0, 0.0);
 }
 
 fn buildDecodeChain(b: *B) anyerror!ValueId {
     // gather -> rmsnorm -> matmul -> softmax, a decode-shaped chain.
     const table = try b.input(.f32, &[_]usize{ 256, 128 });
     const idx = try b.input(.i32, &[_]usize{ 1, 1 });
-    const emb = try b.g.addGatherRows(table, idx); // [1,1,128]
+    const emb = try b.g.addGather(table, idx, 0, 0); // [1,1,128]
     const x = try b.g.addViewReshape(emb, &[_]usize{ 1, 128 });
     const gamma = try b.input(.f32, &[_]usize{128});
     const beta = try b.input(.f32, &[_]usize{128});
@@ -304,10 +305,10 @@ const golden_attention =
     \\blocks=0
     \\outputs=[3]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[8,16] tile=[8,16] counts=[1,1]
-    \\  #1 f32 rank=2 shape=[8,16] tile=[8,16] counts=[1,1]
-    \\  #2 f32 rank=2 shape=[8,16] tile=[8,16] counts=[1,1]
-    \\  #3 f32 rank=2 shape=[8,16] tile=[8,16] counts=[1,1]
+    \\  #0 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
+    \\  #1 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
+    \\  #2 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
+    \\  #3 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
     \\
 ;
 

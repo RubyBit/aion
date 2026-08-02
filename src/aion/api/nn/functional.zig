@@ -14,13 +14,13 @@ pub const TensorRef = layer_mod.TensorRef;
 /// Requires rank >= 2, which the broadcast op enforces.
 pub fn scale(bld: *Builder, x: TensorRef, k: f32) Builder.Error!TensorRef {
     if (k == 1.0) return x;
-    return bld.broadcastLastDim(.mul, x, try bld.constant(k));
+    return bld.mul(x, try bld.constant(k));
 }
 
 /// `x + k`, same one-element-constant treatment as `scale`.
 pub fn shift(bld: *Builder, x: TensorRef, k: f32) Builder.Error!TensorRef {
     if (k == 0.0) return x;
-    return bld.broadcastLastDim(.add, x, try bld.constant(k));
+    return bld.add(x, try bld.constant(k));
 }
 
 /// `cap * tanh(x / cap)` — a smooth clamp to `(-cap, cap)`.

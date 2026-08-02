@@ -950,35 +950,34 @@ pub const AionOp = enum(c_int) {
     AION_OP_MATMUL = 0,
     AION_OP_MATMUL_NT = 1,
     AION_OP_ELEMWISE = 2,
-    AION_OP_BROADCAST_LAST_DIM = 3,
-    AION_OP_UNARY = 4,
-    AION_OP_SOFTMAX = 5,
-    AION_OP_LAYERNORM = 6,
-    AION_OP_RMSNORM = 7,
-    AION_OP_ATTENTION = 8,
-    AION_OP_MHA = 9,
-    AION_OP_MHA_CACHED = 10,
-    AION_OP_RELPOS_MHA = 11,
-    AION_OP_CONV1D = 12,
-    AION_OP_CONV2D = 13,
-    AION_OP_COPY = 14,
-    AION_OP_GATHER_ROWS = 15,
-    AION_OP_ROPE1D = 16,
-    AION_OP_SEQUENCE_APPEND = 17,
-    AION_OP_REDUCE = 18,
-    AION_OP_CONCAT = 19,
-    AION_OP_RESHAPE = 20,
-    AION_OP_SQUEEZE = 21,
-    AION_OP_UNSQUEEZE = 22,
-    AION_OP_TRANSPOSE2D = 23,
-    AION_OP_SLICE = 24,
-    AION_OP_LSTM_CELL = 25,
-    AION_OP_RFFT = 26,
-    AION_OP_STFT = 27,
-    AION_OP_CAST = 28,
-    AION_OP_ARGMAX = 29,
-    AION_OP_SCATTER_ROW = 30,
-    AION_OP_GELU_MUL = 31,
+    AION_OP_UNARY = 3,
+    AION_OP_SOFTMAX = 4,
+    AION_OP_LAYERNORM = 5,
+    AION_OP_RMSNORM = 6,
+    AION_OP_ATTENTION = 7,
+    AION_OP_RELPOS_MHA = 8,
+    AION_OP_CONV1D = 9,
+    AION_OP_CONV2D = 10,
+    AION_OP_COPY = 11,
+    AION_OP_ROPE1D = 12,
+    AION_OP_SEQUENCE_APPEND = 13,
+    AION_OP_REDUCE = 14,
+    AION_OP_CONCAT = 15,
+    AION_OP_RESHAPE = 16,
+    AION_OP_SQUEEZE = 17,
+    AION_OP_UNSQUEEZE = 18,
+    AION_OP_TRANSPOSE2D = 19,
+    AION_OP_SLICE = 20,
+    AION_OP_LSTM_CELL = 21,
+    AION_OP_RFFT = 22,
+    AION_OP_STFT = 23,
+    AION_OP_CAST = 24,
+    AION_OP_ARGMAX = 25,
+    AION_OP_SCATTER_ROW = 26,
+    AION_OP_GELU_MUL = 27,
+    AION_OP_GATHER = 28,
+    AION_OP_DIM = 29,
+    AION_OP_IOTA = 30,
 };
 
 /// Per-op attributes. Only the member matching `AionOpSpec.op` is read.
@@ -988,9 +987,15 @@ pub const AionOpAttr = extern union {
     unary: extern struct { op: AionUnaryOp },
     softmax: extern struct { axis: i32 },
     norm: extern struct { eps: f32, normalized_shape: [*c]const usize, normalized_shape_len: usize },
-    attention: extern struct { scale: f32, causal: u8, heads: usize },
-    mha_cached: extern struct { scale: f32, causal: u8, sliding_window: usize, attn_logits_soft_cap: f32 },
-    relpos_mha: extern struct { scale: f32, heads: usize },
+    attention: extern struct {
+        scale: f32,
+        causal: u8,
+        sliding_window: usize,
+        attn_logits_soft_cap: f32,
+        has_query_positions: u8,
+        has_kv_lengths: u8,
+    },
+    relpos_mha: extern struct { scale: f32, chunk_size: usize = 0, chunk_left: usize = 0 },
     conv1d: extern struct {
         stride: usize,
         dilation: usize,
@@ -1021,6 +1026,7 @@ pub const AionOpAttr = extern union {
     stft: extern struct { n_fft: usize, hop_length: usize, center: u8 },
     cast: extern struct { to_dtype: AionDType },
     argmax: extern struct { axis: i32 },
+    gather: extern struct { axis: i32, batch_dims: usize },
 };
 
 /// A single op to append to a builder: which op, its input value ids (like a
@@ -1476,10 +1482,6 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
             try need(n, 2, spec.inputs);
             break :blk try bld.elemwiseBinary(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
         },
-        .AION_OP_BROADCAST_LAST_DIM => blk: {
-            try need(n, 2, spec.inputs);
-            break :blk try bld.broadcastLastDim(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
-        },
         .AION_OP_UNARY => blk: {
             try need(n, 1, spec.inputs);
             break :blk try bld.unary(unaryFromC(spec.attr.unary.op), in(spec, 0));
@@ -1499,24 +1501,29 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
         },
         .AION_OP_ATTENTION => blk: {
             try need(n, 3, spec.inputs);
-            break :blk try bld.attention(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.attention.scale, spec.attr.attention.causal != 0);
-        },
-        .AION_OP_MHA => blk: {
-            try need(n, 3, spec.inputs);
-            break :blk try bld.mha(in(spec, 0), in(spec, 1), in(spec, 2), spec.attr.attention.scale, spec.attr.attention.causal != 0, spec.attr.attention.heads);
-        },
-        .AION_OP_MHA_CACHED => blk: {
-            try need(n, 5, spec.inputs);
-            break :blk try bld.multiHeadAttentionCached(
+            const a = spec.attr.attention;
+            var control_idx: usize = 3;
+            const query_positions: ?api.TensorRef = if (a.has_query_positions != 0) blk2: {
+                if (control_idx >= n) return api.Builder.Error.InvalidArgument;
+                defer control_idx += 1;
+                break :blk2 in(spec, control_idx);
+            } else null;
+            const kv_lengths: ?api.TensorRef = if (a.has_kv_lengths != 0) blk2: {
+                if (control_idx >= n) return api.Builder.Error.InvalidArgument;
+                defer control_idx += 1;
+                break :blk2 in(spec, control_idx);
+            } else null;
+            if (control_idx != n) return api.Builder.Error.InvalidArgument;
+            break :blk try bld.attention(
                 in(spec, 0),
                 in(spec, 1),
                 in(spec, 2),
-                in(spec, 3),
-                in(spec, 4),
-                spec.attr.mha_cached.scale,
-                spec.attr.mha_cached.causal != 0,
-                spec.attr.mha_cached.sliding_window,
-                spec.attr.mha_cached.attn_logits_soft_cap,
+                query_positions,
+                kv_lengths,
+                a.scale,
+                a.causal != 0,
+                a.sliding_window,
+                a.attn_logits_soft_cap,
             );
         },
         .AION_OP_RELPOS_MHA => blk: {
@@ -1531,7 +1538,10 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
                 in(spec, 5),
                 mask,
                 spec.attr.relpos_mha.scale,
-                spec.attr.relpos_mha.heads,
+                .{
+                    .size = spec.attr.relpos_mha.chunk_size,
+                    .left = spec.attr.relpos_mha.chunk_left,
+                },
             );
         },
         .AION_OP_CONV1D => blk: {
@@ -1572,10 +1582,6 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
         .AION_OP_COPY => blk: {
             try need(n, 1, spec.inputs);
             break :blk try bld.copy(in(spec, 0));
-        },
-        .AION_OP_GATHER_ROWS => blk: {
-            try need(n, 2, spec.inputs);
-            break :blk try bld.gatherRows(in(spec, 0), in(spec, 1));
         },
         .AION_OP_ROPE1D => blk: {
             try need(n, 2, spec.inputs);
@@ -1671,6 +1677,18 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
         .AION_OP_GELU_MUL => blk: {
             try need(n, 2, spec.inputs);
             break :blk try bld.geluMul(in(spec, 0), in(spec, 1));
+        },
+        .AION_OP_GATHER => blk: {
+            try need(n, 2, spec.inputs);
+            break :blk try bld.gather(in(spec, 0), in(spec, 1), spec.attr.gather.axis, spec.attr.gather.batch_dims);
+        },
+        .AION_OP_DIM => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.dimSize(in(spec, 0), spec.attr.argmax.axis);
+        },
+        .AION_OP_IOTA => blk: {
+            try need(n, 1, spec.inputs);
+            break :blk try bld.iota(in(spec, 0), spec.attr.argmax.axis);
         },
     };
     return out.value;

@@ -152,13 +152,18 @@ def q8b(b: Builder, w_torch: np.ndarray) -> TensorRef:
     """
     w_t = np.ascontiguousarray(w_torch.T)  # [K, N]
     k, n = int(w_t.shape[0]), int(w_t.shape[1])
-    return b.param(w_t.reshape(1, k, n), dtype="q8_0", shape=(1, k, n))
+    return b.param(w_t.reshape(1, k, n), dtype=aion.q8_0, shape=(1, k, n))
 
 
 def q8_embed(b: Builder, table: np.ndarray) -> TensorRef:
     """Embedding table `[V, D]` -> q8_0 param blocked along the feature dim D."""
     v, d = int(table.shape[0]), int(table.shape[1])
-    return b.param(np.ascontiguousarray(table), dtype="q8_0", shape=(v, d), quant_axis=1)
+    return b.param(
+        np.ascontiguousarray(table),
+        dtype=aion.q8_0,
+        shape=(v, d),
+        quant_axis=1,
+    )
 
 
 def mm_b(w_torch: np.ndarray) -> np.ndarray:
@@ -191,7 +196,8 @@ class ConformerLayer(nn.Module):
     """
 
     def __init__(self, loader: _Loader, li: int, *, t_kv: int,
-                 mask: Optional[TensorRef] = None, conv_pad_left: int = 0) -> None:
+                 mask: Optional[TensorRef] = None, conv_pad_left: int = 0,
+                 chunk_size: int = 0, chunk_left: int = 0) -> None:
         # The caller opens a `layers.{li}` scope around the body, so every parameter
         # below lands under it without this type having to know its own index.
         pf = f"encoder.layers.{li}"
@@ -207,7 +213,7 @@ class ConformerLayer(nn.Module):
         self.feed_forward1 = nn.FeedForward(
             mm_b(get(f"{pf}.feed_forward1.linear1.weight")),
             mm_b(get(f"{pf}.feed_forward1.linear2.weight")),
-            act="silu", dtype="q8_0", name="feed_forward1")
+                act="silu", dtype=aion.q8_0, name="feed_forward1")
 
         self.norm_self_att = ln(loader, f"{pf}.norm_self_att", "norm_self_att")
         self.self_attn = nn.RelPosSelfAttention(
@@ -218,14 +224,15 @@ class ConformerLayer(nn.Module):
             np.ascontiguousarray(pe_proj),
             get(f"{pf}.self_attn.pos_bias_u"),
             get(f"{pf}.self_attn.pos_bias_v"),
-            heads=N_HEADS, scale=ATT_SCALE, mask=mask,
-            dtype="q8_0", name="self_attn")
+            scale=ATT_SCALE, mask=mask,
+                chunk_size=chunk_size, chunk_left=chunk_left,
+                dtype=aion.q8_0, name="self_attn")
 
         # Pointwise convs are k=1, i.e. matmuls, so they are stored q8_0 and take the
         # fast matmul path; only the depthwise conv stays f32.
         self.norm_conv = ln(loader, f"{pf}.norm_conv", "norm_conv")
         self.conv_glu = nn.GLU(mm_b(get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0]),
-                               dtype="q8_0", name="conv/pointwise_conv1")
+                dtype=aion.q8_0, name="conv/pointwise_conv1")
         # Causal padding in the batch path; the streaming path pads with a cached
         # left context instead, so it asks for none.
         self.conv_dw = nn.DepthwiseConv1D(
@@ -234,13 +241,13 @@ class ConformerLayer(nn.Module):
         # A LayerNorm occupies the batch-norm slot in this checkpoint.
         self.conv_norm = ln(loader, f"{pf}.conv.batch_norm", "conv/batch_norm")
         self.conv_out = nn.Linear(mm_b(get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0]),
-                                  dtype="q8_0", name="conv/pointwise_conv2")
+                dtype=aion.q8_0, name="conv/pointwise_conv2")
 
         self.norm_feed_forward2 = ln(loader, f"{pf}.norm_feed_forward2", "norm_feed_forward2")
         self.feed_forward2 = nn.FeedForward(
             mm_b(get(f"{pf}.feed_forward2.linear1.weight")),
             mm_b(get(f"{pf}.feed_forward2.linear2.weight")),
-            act="silu", dtype="q8_0", name="feed_forward2")
+                act="silu", dtype=aion.q8_0, name="feed_forward2")
 
         self.norm_out = ln(loader, f"{pf}.norm_out", "norm_out")
 
@@ -294,7 +301,7 @@ def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> TensorRef:
     # broadcasts over the trailing dim of size 1).
     x_main = b.slice(audio, (1, 0), (n - 1, 1))
     x_prev = b.slice(audio, (0, 0), (n - 1, 1))
-    diff = b.sub(x_main, b.broadcast_mul(x_prev, coef))      # [n-1,1]
+    diff = b.sub(x_main, b.mul(x_prev, coef))      # [n-1,1]
     y = b.concat([b.slice(audio, (0, 0), (1, 1)), diff], axis=0)  # [n,1]
     sig = b.reshape(y, (1, n))                               # [1,n]
     spec = b.stft(sig, win_id, n_fft=N_FFT, hop_length=HOP_LEN, center=True)  # [1,t_mel,514]
@@ -302,19 +309,7 @@ def build_logmel(loader: _Loader, b: Builder, t_mel: int) -> TensorRef:
     im = b.slice(spec, (0, 0, bins), (1, t_mel, bins))
     power = b.add(re * re, im * im)             # [1,t_mel,257]
     mel = power @ fb_b                             # [1,t_mel,128]
-    return b.unary("log", b.broadcast_add(mel, guard))     # [1,t_mel,128]
-
-
-def build_att_mask(b: Builder, t_out: int, att_left: int, att_right: int) -> TensorRef:
-    """Additive [t_out, t_out] chunked_limited mask (0 allowed, -1e9 masked)."""
-    chunk = att_right + 1
-    m = np.full((t_out, t_out), -1e9, np.float32)
-    for i in range(t_out):
-        cs = (i // chunk) * chunk
-        ce = min(cs + chunk, t_out)
-        lo = max(0, cs - att_left)
-        m[i, lo:ce] = 0.0
-    return b.param(m)
+    return b.unary("log", b.add(mel, guard))     # [1,t_mel,128]
 
 
 def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) -> TensorRef:
@@ -350,7 +345,7 @@ def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) ->
     x = c2(x, w5, b5, SUB_CH, True)
     x = relu(c2(x, w6, b6, 1, False))
     x = b.reshape(x, (1, t_out, FREQ_OUT * SUB_CH))  # NHWC flatten (f*256+c)
-    return b.broadcast_add(x @ out_wq, out_b)  # [1, t_out, 1024]
+    return b.add(x @ out_wq, out_b)  # [1, t_out, 1024]
 
 
 def build_encoder(loader: _Loader, b: Builder, t_mel: int,
@@ -358,12 +353,19 @@ def build_encoder(loader: _Loader, b: Builder, t_mel: int,
     t_out = calc_length(t_mel)
     p_len = 2 * t_out - 1
 
-    # Optional chunked_limited attention mask (cache-aware streaming). Frames are
-    # grouped into non-overlapping chunks of size att_right+1; every frame in a
-    # chunk attends to the whole chunk plus att_left frames before the chunk start
-    # (so early-chunk frames get up to att_right lookahead). This matches NeMo
+    # Optional chunked_limited attention (cache-aware streaming). Frames are grouped
+    # into non-overlapping chunks of size att_right+1; every frame in a chunk attends
+    # to the whole chunk plus att_left frames before the chunk start (so early-chunk
+    # frames get up to att_right lookahead). This matches NeMo
     # att_context_style="chunked_limited", att_context_size=[att_left, att_right].
-    att_mask = build_att_mask(b, t_out, att_left, att_right) if att_left is not None else None
+    #
+    # It goes on the op as two integers, NOT as an additive [t_out, t_out] mask: the
+    # pattern is one contiguous key interval per row, so the kernels can restrict the
+    # work to the window (~att_left + chunk keys) instead of scoring all t_out keys and
+    # adding -1e9 to nearly all of them. At t_out = 3750 that mask was also a 56 MB
+    # parameter in the file.
+    chunk_size = (att_right + 1) if att_left is not None else 0
+    chunk_left = att_left if att_left is not None else 0
 
     # ---- in-graph log-mel -> dw_striding subsampling -> h [1, T_out, 1024] ----
     feat = build_logmel(loader, b, t_mel)        # [1, T_mel, 128]
@@ -372,7 +374,8 @@ def build_encoder(loader: _Loader, b: Builder, t_mel: int,
     # ---- 24 conformer layers ----
     for li in range(N_LAYERS):
         with b.scope(f"layers.{li}"):
-            layer = ConformerLayer(loader, li, t_kv=t_out, mask=att_mask,
+            layer = ConformerLayer(loader, li, t_kv=t_out,
+                                   chunk_size=chunk_size, chunk_left=chunk_left,
                                    conv_pad_left=CONV_K - 1)
             h = layer.ff1(h)
 
@@ -400,7 +403,7 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     out_count/out_tokens + persistent decode state (last/h0/c0/h1/c1) with their
     IoAliases. Named multi-carry Loop, early-exit via `active = frame < t_out`."""
     H = PRED_HIDDEN
-    enc2d = b.reshape(enc, (t_out, D_MODEL))     # [t_out, 1024]  (GatherRows table)
+    enc2d = b.reshape(enc, (t_out, D_MODEL))     # [t_out, 1024] gather table
 
     dp = "decoder.prediction"
     embed = q8_embed(b, loader.get(f"{dp}.embed.weight"))
@@ -422,32 +425,34 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     jn_w = q8b(b, loader.get("joint.joint_net.2.weight"))
     jn_b = b.param(loader.get("joint.joint_net.2.bias"))
 
-    one_i = b.param(np.array([1], np.int32), dtype="i32")           # [1]
-    blank_i = b.param(np.array([BLANK], np.int32), dtype="i32")
-    maxsym_i = b.param(np.array([MAX_SYMBOLS], np.int32), dtype="i32")
-    T_i = b.param(np.array([t_out], np.int32), dtype="i32")
+    one_i = b.param(np.array([1], np.int32), dtype=aion.int32)       # [1]
+    blank_i = b.param(np.array([BLANK], np.int32), dtype=aion.int32)
+    maxsym_i = b.param(np.array([MAX_SYMBOLS], np.int32), dtype=aion.int32)
+    T_i = b.param(np.array([t_out], np.int32), dtype=aion.int32)
 
     # Decode state as named, separately-typed carries (no packing). Persistent
     # cross-chunk state (last_token, LSTM h/c) is IoAlias'd output->input; the
     # per-run loop bookkeeping (frame/sym/count/active) and the output token
     # buffer are bound fresh each run.
-    frame_in = b.input((1,), dtype="i32").rename("frame_in")        # init 0
-    sym_in = b.input((1,), dtype="i32").rename("sym_in")            # init 0
-    count_in = b.input((1,), dtype="i32").rename("count_in")        # init 0
-    active_in = b.input((1,), dtype="i32").rename("active_in")      # init 1
-    last_in = b.input((1,), dtype="i32").rename("last_in")          # init BLANK
+    frame_in = b.input((1,), dtype=aion.int32).rename("frame_in")   # init 0
+    sym_in = b.input((1,), dtype=aion.int32).rename("sym_in")       # init 0
+    count_in = b.input((1,), dtype=aion.int32).rename("count_in")   # init 0
+    active_in = b.input((1,), dtype=aion.int32).rename("active_in") # init 1
+    last_in = b.input((1,), dtype=aion.int32).rename("last_in")     # init BLANK
     h0_in = b.input((1, H)).rename("h0_in")
     c0_in = b.input((1, H)).rename("c0_in")
     h1_in = b.input((1, H)).rename("h1_in")
     c1_in = b.input((1, H)).rename("c1_in")
-    toks_in = b.input((max_out, 1), dtype="i32").rename("toks_in")  # init zeros
+    # ScatterRow treats a rank-1 buffer as a sequence of scalar rows, which is
+    # exactly the token-buffer contract. Keep it rank-1 from input to output.
+    toks_in = b.input((max_out,), dtype=aion.int32).rename("toks_in")  # init zeros
 
     b.begin_region()
     # `active` (carry 3) is the continue predicate; the loop only runs the body
     # while frame < t_out, so the gather frame is always in-range (no clamp needed).
-    # GatherRows wants rank-2 indices, so reshape the [1] carries to [1,1].
-    enc_frame = b.gather_rows(enc2d, b.reshape(frame_in, (1, 1)))    # [1,1,1024]
-    emb = b.reshape(b.gather_rows(embed, b.reshape(last_in, (1, 1))), (1, H))  # [1,640]
+    # Gather indices stay rank-2 so lookup results retain batch/time axes.
+    enc_frame = b.gather(enc2d, b.reshape(frame_in, (1, 1)), axis=0)    # [1,1,1024]
+    emb = b.reshape(b.gather(embed, b.reshape(last_in, (1, 1)), axis=0), (1, H))  # [1,640]
 
     st0 = b.lstm_cell(emb, h0_in, c0_in, *w0)
     h0o = b.slice(st0, (0, 0), (1, H))
@@ -456,21 +461,21 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     h1o = b.slice(st1, (0, 0), (1, H))
     c1o = b.slice(st1, (0, H), (1, H))
 
-    fproj = b.broadcast_add(enc_frame @ enc_w, enc_b)      # [1,1,640]
-    gproj = b.broadcast_add(b.matmul(b.reshape(h1o, (1, 1, H)), pred_w), pred_b)
+    fproj = b.add(enc_frame @ enc_w, enc_b)      # [1,1,640]
+    gproj = b.add(b.matmul(b.reshape(h1o, (1, 1, H)), pred_w), pred_b)
     sj = b.unary("relu", fproj + gproj)                      # [1,1,640]
-    logits = b.broadcast_add(sj @ jn_w, jn_b)             # [1,1,1025]
+    logits = b.add(sj @ jn_w, jn_b)             # [1,1,1025]
     k = b.reshape(b.argmax(logits, axis=2), (1,))                  # [1] i32
 
     # advance = (k==blank) or (sym>=max_symbols);  emit = 1 - advance.
     advance = b.compare("ge", b.add(b.compare("eq", k, blank_i),
                                     b.compare("ge", sym_in, maxsym_i)), one_i)  # i32 [1]
     emit = b.sub(one_i, advance)                                    # i32 [1]
-    emit_f = b.reshape(b.cast(emit, "f32"), (1,))                  # f32 [1]
+    emit_f = b.reshape(b.cast(emit, aion.float32), (1,))           # f32 [1]
 
     def sel_row(keep, take):  # emit ? take : keep, over [1,H]
         diff_c = b.reshape(b.sub(take, keep), (H, 1))             # [H,1]
-        scaled = b.reshape(b.broadcast_mul(diff_c, emit_f), (1, H))  # [1,H]
+        scaled = b.reshape(b.mul(diff_c, emit_f), (1, H))  # [1,H]
         return keep + scaled
 
     # Next state (arithmetic select on named carries).
@@ -483,7 +488,7 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     h1_next, c1_next = sel_row(h1_in, h1o), sel_row(c1_in, c1o)
     # Always write k at index `count`; only emit advances `count`, so blank
     # writes land at a slot the next emit overwrites and sit outside [:count].
-    toks_next = b.scatter_row(toks_in, count_in, k)               # [max_out,1] i32
+    toks_next = b.scatter_row(toks_in, count_in, k)                    # [max_out] i32
 
     body = b.end_region([frame_next, sym_next, count_next, active_next, last_next,
                          h0_next, c0_next, h1_next, c1_next, toks_next])
@@ -493,9 +498,8 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     _, _, count_out, _, last_out, h0_out, c0_out, h1_out, c1_out, toks_out = outs
 
     count_o = count_out
-    tokens_o = b.reshape(toks_out, (max_out,))
     b.mark_output(count_o, "out_count")                            # i32 [1]
-    b.mark_output(tokens_o, "out_tokens")                          # i32 [max_out]
+    b.mark_output(toks_out, "out_tokens")                          # i32 [max_out]
     b.mark_output(last_out, "last_out")
     b.mark_output(h0_out, "h0_out")
     b.mark_output(c0_out, "c0_out")

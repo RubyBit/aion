@@ -94,7 +94,7 @@ test "api: build+compile+run (matmul/broadcast/relu/copy/reduce)" {
     const Bias = try bld.param(bias_t);
 
     const C = try bld.matmul(A, B, 1.0, 0.0);
-    const D = try bld.broadcastAddLastDim(C, Bias);
+    const D = try bld.add(C, Bias);
     const E = try bld.relu(D);
     const F = try bld.copy(E);
     const G = try bld.mul(F, F);
@@ -226,7 +226,7 @@ test "api: reduceAxis mean over last dim" {
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), out_vals[1], 1e-6);
 }
 
-test "api: broadcastLastDim accepts a size-1 scalar operand" {
+test "api: elemwise broadcasting accepts a size-1 scalar operand" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -244,8 +244,8 @@ test "api: broadcastLastDim accepts a size-1 scalar operand" {
 
     const X: api.TensorRef = try bld.param(x_t);
     const K: api.TensorRef = try bld.param(k_t);
-    const Scaled: api.TensorRef = try bld.broadcastLastDim(.mul, X, K);
-    const Shifted: api.TensorRef = try bld.broadcastLastDim(.add, Scaled, K);
+    const Scaled: api.TensorRef = try bld.mul(X, K);
+    const Shifted: api.TensorRef = try bld.add(Scaled, K);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Shifted}, .{});
     defer model.deinit();
@@ -259,7 +259,7 @@ test "api: broadcastLastDim accepts a size-1 scalar operand" {
     for (want, 0..) |w, i| try std.testing.expectApproxEqAbs(w, out_vals[i], 1e-6);
 }
 
-test "api: broadcastLastDim scalar operand spans multiple column tiles" {
+test "api: scalar broadcast spans multiple column tiles" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -281,7 +281,7 @@ test "api: broadcastLastDim scalar operand spans multiple column tiles" {
 
     const X: api.TensorRef = try bld.param(x_t);
     const K: api.TensorRef = try bld.param(k_t);
-    const Y: api.TensorRef = try bld.broadcastLastDim(.mul, X, K);
+    const Y: api.TensorRef = try bld.mul(X, K);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
@@ -296,7 +296,7 @@ test "api: broadcastLastDim scalar operand spans multiple column tiles" {
     }
 }
 
-test "api: broadcastLastDim still rejects a mismatched vector length" {
+test "api: elemwise broadcasting rejects a mismatched vector length" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -314,7 +314,7 @@ test "api: broadcastLastDim still rejects a mismatched vector length" {
 
     const X: api.TensorRef = try bld.param(x_t);
     const B: api.TensorRef = try bld.param(bad_t);
-    try std.testing.expectError(error.ShapeMismatch, bld.broadcastLastDim(.mul, X, B));
+    try std.testing.expectError(error.ShapeMismatch, bld.mul(X, B));
 }
 
 test "api: squeeze and unsqueeze roundtrip" {
@@ -1266,7 +1266,7 @@ test "api: growable state input grows on demand up to its bound" {
     defer bld.deinit();
 
     // cache [1,1,T,1] starts at T=2; sequenceAppend writes `new` at cache[end].
-    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2, 1, 1 }), "cache");
     const New = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 1, 1 }), "new");
     const End = try bld.name(try bld.input(.i32, &[_]usize{1}), "end");
     const Out = try bld.name(try bld.sequenceAppend(Cache, New, End), "cache_out");
@@ -1284,7 +1284,7 @@ test "api: growable state input grows on demand up to its bound" {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromArray([1][1][2][1]f32{.{.{ .{0}, .{0} }}});
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
     try model.bindInput("cache", cache0);
 
     // Append 1..5 at positions 0..4; capacity grows 2 -> 4 (at pos 2) -> 8 (at pos 4).
@@ -1299,7 +1299,7 @@ test "api: growable state input grows on demand up to its bound" {
 
     // The slot grew to capacity 8; the first five entries hold the appended values.
     const out = try model.outputTensorAt(0);
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 8, 1 }, out.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 8, 1, 1 }, out.getShape());
     var vals: [8]f32 = undefined;
     try out.read(&vals);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 4, 5, 0, 0, 0 }, &vals);
@@ -1331,14 +1331,14 @@ test "api: input roles auto-drive cache indices and positions (compile path)" {
     const WriteIdx = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_write_index");
     const VisibleEnd = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_visible_end");
     const Positions = try bld.name(try bld.input(.i32, &[_]usize{ 1, 1 }), "positions");
-    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 1 }), "cache");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 4, 1, 1 }), "cache");
 
-    const Emb = try bld.gatherRows(Table, Tokens); // [1,1,1]
+    const Emb = try bld.gather(Table, Tokens, 0, 0); // [1,1,1]
     const New4 = try bld.reshape(Emb, &[_]usize{ 1, 1, 1, 1 });
     const CacheOut = try bld.name(try bld.sequenceAppend(Cache, New4, WriteIdx), "next_cache");
     // `cache_visible_end` is consumed by no node in this toy graph; it is still a
     // public input the runtime must feed.
-    const PosProbe = try bld.name(try bld.gatherRows(Table, Positions), "pos_probe"); // table[position]
+    const PosProbe = try bld.name(try bld.gather(Table, Positions, 0, 0), "pos_probe"); // table[position]
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{ CacheOut, PosProbe }, .{
         .output_aliases = &[_]api.OutputAlias{.{ .input = Cache, .output = CacheOut }},
@@ -1347,7 +1347,7 @@ test "api: input roles auto-drive cache indices and positions (compile path)" {
             .{ .input = WriteIdx, .kind = .cache_write_index },
             .{ .input = VisibleEnd, .kind = .cache_visible_end },
             .{ .input = Positions, .kind = .positions, .axis = 1 },
-            .{ .input = Cache, .kind = .sequence_cache, .axis = 2 },
+            .{ .input = Cache, .kind = .sequence_cache, .axis = 1 },
         },
     });
     defer model.deinit();
@@ -1441,13 +1441,13 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
         const Table = try bld.param(table_t);
         const Tokens = try bld.name(try bld.input(.i32, &[_]usize{ 1, 1 }), "tokens");
         const WriteIdx = try bld.name(try bld.input(.i32, &[_]usize{1}), "cache_write_index");
-        const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 1 }), "cache");
+        const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 4, 1, 1 }), "cache");
 
-        const Emb = try bld.gatherRows(Table, Tokens); // [1,1,1]
+        const Emb = try bld.gather(Table, Tokens, 0, 0); // [1,1,1]
         const New4 = try bld.reshape(Emb, &[_]usize{ 1, 1, 1, 1 });
         const CacheOut = try bld.name(try bld.sequenceAppend(Cache, New4, WriteIdx), "next_cache");
 
-        try bld.symbolicDim(Cache, 2, "G");
+        try bld.symbolicDim(Cache, 1, "G");
         try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
             .{ .name = "next_cache", .tensor = CacheOut },
         }, .{
@@ -1455,7 +1455,7 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
             .input_roles = &[_]api.InputRoleDecl{
                 .{ .input = Tokens, .kind = .tokens, .axis = 1 },
                 .{ .input = WriteIdx, .kind = .cache_write_index },
-                .{ .input = Cache, .kind = .sequence_cache, .axis = 2, .capacity_symbol = "G", .allow_growable = true },
+                .{ .input = Cache, .kind = .sequence_cache, .axis = 1, .capacity_symbol = "G", .allow_growable = true },
             },
         });
     }
@@ -1481,7 +1481,7 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
         try std.testing.expectEqual(@as(u64, 3), model.currentPosition());
 
         const out = try model.outputTensor("next_cache");
-        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 6, 1 }, out.getShape());
+        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 6, 1, 1 }, out.getShape());
         var vals: [6]f32 = undefined;
         try out.read(&vals);
         try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 0, 0, 0 }, &vals);
@@ -1501,7 +1501,7 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
 
         // Appends at positions 0..3 grow the slot 2 -> 4 (doubling), under the ceiling 6.
         const out = try model.outputTensor("next_cache");
-        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 4, 1 }, out.getShape());
+        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 4, 1, 1 }, out.getShape());
         var vals: [4]f32 = undefined;
         try out.read(&vals);
         try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 20 }, &vals);
@@ -1519,7 +1519,7 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
         try model.bindInput("tokens", tok_t);
         try std.testing.expectError(error.InvalidArgument, model.run());
 
-        const cache_t = try ctx.fromArray([1][1][3][1]f32{.{.{ .{0}, .{0}, .{0} }}});
+        const cache_t = try ctx.fromArray([1][3][1][1]f32{.{ .{.{0}}, .{.{0}}, .{.{0}} }});
         try model.bindInput("cache", cache_t);
         try model.run();
         const out = try model.outputTensor("next_cache");
@@ -2323,7 +2323,7 @@ test "api.module: moduleDynFrom converts nn.Linear" {
     // `Linear#0`. Without that flag this would double-nest as
     // `Linear#0/Linear#0/...`.
     try std.testing.expect(bld.valueName(Y) != null);
-    try std.testing.expectEqualStrings("Linear#0/broadcast_add_last_dim#1", bld.valueName(Y).?);
+    try std.testing.expectEqualStrings("Linear#0/add#1", bld.valueName(Y).?);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
@@ -2398,7 +2398,7 @@ test "api.module: custom module can use introspection scope helpers" {
         gain: api.TensorRef,
 
         fn forwardInner(self: @This(), bld: *api.Builder, x: api.TensorRef) api.Builder.Error!api.TensorRef {
-            const gx: api.TensorRef = try bld.broadcastAddLastDim(x, self.gain);
+            const gx: api.TensorRef = try bld.add(x, self.gain);
             return bld.relu(gx);
         }
 
@@ -2753,7 +2753,7 @@ test "api: paramNamed gives params a semantic, scope-qualified debug name" {
         W = try bld.paramNamed(w_t, "weight");
         B = try bld.paramNamed(b_t, "bias");
         MM = try bld.matmul(X, W, 1.0, 0.0);
-        Y = try bld.broadcastAddLastDim(MM, B);
+        Y = try bld.add(MM, B);
     }
 
     try std.testing.expectEqualStrings("layers.3/q_proj/weight", bld.valueName(W).?);
@@ -2761,7 +2761,7 @@ test "api: paramNamed gives params a semantic, scope-qualified debug name" {
     // Params must not consume op indices: the matmul is still #0 even though two
     // params were bound before it.
     try std.testing.expectEqualStrings("layers.3/q_proj/matmul#0", bld.valueName(MM).?);
-    try std.testing.expectEqualStrings("layers.3/q_proj/broadcast_add_last_dim#1", bld.valueName(Y).?);
+    try std.testing.expectEqualStrings("layers.3/q_proj/add#1", bld.valueName(Y).?);
 
     // An empty name is rejected rather than silently producing a trailing slash.
     try std.testing.expectError(error.InvalidArgument, bld.paramNamed(b_t, ""));
@@ -2832,24 +2832,8 @@ test "api: sequenceAppend mutates cache in-place" {
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][2]f32{
-        .{
-            .{
-                .{ 0.0, 1.0 },
-                .{ 2.0, 3.0 },
-                .{ 4.0, 5.0 },
-                .{ 6.0, 7.0 },
-            },
-        },
-    });
-    const new_t: api.Tensor = try ctx.fromArray([1][1][2][2]f32{
-        .{
-            .{
-                .{ 50.0, 51.0 },
-                .{ 60.0, 61.0 },
-            },
-        },
-    });
+    const cache_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 1, 2 }, &[_]f32{ 0, 1, 2, 3, 4, 5, 6, 7 });
+    const new_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 1, 2 }, &[_]f32{ 50, 51, 60, 61 });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{1});
 
     var bld = api.Builder.init(&ctx);
@@ -2865,7 +2849,7 @@ test "api: sequenceAppend mutates cache in-place" {
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
     try std.testing.expectEqual(cache_t.id, out_t.id);
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 4, 2 }, out_t.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 4, 1, 2 }, out_t.getShape());
 
     var out_vals: [8]f32 = undefined;
     try out_t.read(&out_vals);
@@ -2890,24 +2874,8 @@ test "api: sequenceAppend ring policy wraps" {
     });
     defer ctx.deinit();
 
-    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][1]f32{
-        .{
-            .{
-                .{0.0},
-                .{1.0},
-                .{2.0},
-                .{3.0},
-            },
-        },
-    });
-    const new_t: api.Tensor = try ctx.fromArray([1][1][2][1]f32{
-        .{
-            .{
-                .{90.0},
-                .{91.0},
-            },
-        },
-    });
+    const cache_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 1, 1 }, &[_]f32{ 0, 1, 2, 3 });
+    const new_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &[_]f32{ 90, 91 });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{3});
     try ctx.setTensorSequenceCachePolicy(cache_t, .{ .ring = .{ .window_tokens = 4 } });
 
@@ -2944,24 +2912,8 @@ test "api: sequenceAppend growable policy expands physical capacity" {
     });
     defer ctx.deinit();
 
-    const cache_t: api.Tensor = try ctx.fromArray([1][1][4][1]f32{
-        .{
-            .{
-                .{0.0},
-                .{1.0},
-                .{2.0},
-                .{3.0},
-            },
-        },
-    });
-    const new_t: api.Tensor = try ctx.fromArray([1][1][2][1]f32{
-        .{
-            .{
-                .{90.0},
-                .{91.0},
-            },
-        },
-    });
+    const cache_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 1, 1 }, &[_]f32{ 0, 1, 2, 3 });
+    const new_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &[_]f32{ 90, 91 });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{5});
 
     try ctx.setTensorSequenceCachePolicy(cache_t, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
@@ -2979,7 +2931,7 @@ test "api: sequenceAppend growable policy expands physical capacity" {
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
     try std.testing.expectEqual(cache_t.id, out_t.id);
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 8, 1 }, out_t.getShape());
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 8, 1, 1 }, out_t.getShape());
 
     var out_vals: [8]f32 = undefined;
     try out_t.read(&out_vals);
@@ -2995,7 +2947,7 @@ test "api: sequenceAppend growable policy expands physical capacity" {
     }, out_vals[0..]);
 }
 
-test "api: multiHeadAttentionCached matches deterministic windowed-causal averages" {
+test "api: attention matches deterministic windowed-causal averages" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -3003,8 +2955,8 @@ test "api: multiHeadAttentionCached matches deterministic windowed-causal averag
 
     // Shapes:
     // q:       [B=1, Lq=2, Hq=4, Dk=2]
-    // k_cache: [B=1, Hkv=2, T=6, Dk=2]
-    // v_cache: [B=1, Hkv=2, T=6, Dv=1]
+    // k_cache: [B=1, T=6, Hkv=2, Dk=2]
+    // v_cache: [B=1, T=6, Hkv=2, Dv=1]
     // positions: [1,2], end_index: [1]
     var q_vals: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
     var k_vals: [1 * 2 * 6 * 2]f32 = .{0.0} ** (1 * 2 * 6 * 2);
@@ -3013,15 +2965,15 @@ test "api: multiHeadAttentionCached matches deterministic windowed-causal averag
     // kv-head 0 tokens => [1,2,3,4,5,6]
     // kv-head 1 tokens => [10,20,30,40,50,60]
     for (0..6) |t| {
-        v_vals[(0 * 2 * 6 * 1) + (0 * 6 * 1) + (t * 1)] = @as(f32, @floatFromInt(@as(i32, @intCast(t + 1))));
-        v_vals[(0 * 2 * 6 * 1) + (1 * 6 * 1) + (t * 1)] = @as(f32, @floatFromInt(@as(i32, @intCast((t + 1) * 10))));
+        v_vals[t * 2] = @as(f32, @floatFromInt(@as(i32, @intCast(t + 1))));
+        v_vals[t * 2 + 1] = @as(f32, @floatFromInt(@as(i32, @intCast((t + 1) * 10))));
     }
 
     const pos_t: api.Tensor = try ctx.fromArray([1][2]i32{.{ 4, 5 }});
     const end_t: api.Tensor = try ctx.fromArray([1]i32{6});
     const q_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 2 }, q_vals[0..]);
-    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 6, 2 }, k_vals[0..]);
-    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 6, 1 }, v_vals[0..]);
+    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 6, 2, 2 }, k_vals[0..]);
+    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 6, 2, 1 }, v_vals[0..]);
 
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
@@ -3032,7 +2984,7 @@ test "api: multiHeadAttentionCached matches deterministic windowed-causal averag
     const Pos: api.TensorRef = try bld.param(pos_t);
     const End: api.TensorRef = try bld.param(end_t);
 
-    const Out: api.TensorRef = try bld.multiHeadAttentionCached(
+    const Out: api.TensorRef = try bld.attention(
         Q,
         K,
         V,
@@ -3073,7 +3025,7 @@ test "api: multiHeadAttentionCached matches deterministic windowed-causal averag
     }
 }
 
-test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
+test "api: attention validates H_q % H_kv == 0" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -3084,8 +3036,8 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     var v_vals: [1 * 2 * 4 * 1]f32 = .{0.0} ** (1 * 2 * 4 * 1);
 
     const q_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 1, 3, 2 }, q_vals[0..]);
-    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 2 }, k_vals[0..]);
-    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 4, 1 }, v_vals[0..]);
+    const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 2, 2 }, k_vals[0..]);
+    const v_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 2, 1 }, v_vals[0..]);
     const pos_t: api.Tensor = try ctx.fromArray([1][1]i32{.{0}});
     const end_t: api.Tensor = try ctx.fromArray([1]i32{1});
 
@@ -3099,7 +3051,7 @@ test "api: multiHeadAttentionCached validates H_q % H_kv == 0" {
     const End: api.TensorRef = try bld.param(end_t);
 
     // H_q (3) % H_kv (2) != 0: eager per-op inference rejects this at the op call.
-    try std.testing.expectError(error.ShapeMismatch, bld.multiHeadAttentionCached(Q, K, V, Pos, End, 1.0, true, 0, 0.0));
+    try std.testing.expectError(error.ShapeMismatch, bld.attention(Q, K, V, Pos, End, 1.0, true, 0, 0.0));
 }
 
 /// Dequantize a `[K, N]` q8_0 weight packed by `packQ8WeightKN` back to f32.

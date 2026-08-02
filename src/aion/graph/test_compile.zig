@@ -103,9 +103,129 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     try g.bindExternal(pos_in, @intCast(pos_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addMultiHeadAttentionCached(q_in, k_in, v_in, pos_in, end_in, 1.0, true, 0, 0.0);
+    const out: graph_mod.ValueId = try g.addAttention(q_in, k_in, v_in, pos_in, end_in, 1.0, true, 0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
     try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, policy));
+}
+
+test "graph: attention controls are independent and ambiguous causal defaults are rejected" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+        const q = try g.addInput(.f32, &[_]usize{ 2, 1, 4, 8 });
+        const k = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 8 });
+        const v = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 6 });
+        const positions = try g.addInput(.i32, &[_]usize{ 2, 1 });
+        const out = try g.addAttention(q, k, v, positions, null, 0.25, true, 0, 0.0);
+        try infer_mod.infer(&g);
+        try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 1, 4, 6 }, g.values.items[out].shape);
+    }
+
+    {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+        const q = try g.addInput(.f32, &[_]usize{ 2, 3, 4, 8 });
+        const k = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 8 });
+        const v = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 6 });
+        const lengths = try g.addInput(.i32, &[_]usize{2});
+        _ = try g.addAttention(q, k, v, null, lengths, 0.25, false, 0, 0.0);
+        try infer_mod.infer(&g);
+    }
+
+    {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+        const q = try g.addInput(.f32, &[_]usize{ 1, 1, 4, 8 });
+        const k = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 8 });
+        const v = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 6 });
+        _ = try g.addAttention(q, k, v, null, null, 0.25, true, 0, 0.0);
+        try std.testing.expectError(infer_mod.InferError.ShapeMismatch, infer_mod.infer(&g));
+    }
+
+    {
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+        const q = try g.addInput(.f32, &[_]usize{ 1, 7, 4, 8 });
+        const k = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 8 });
+        const v = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 6 });
+        _ = try g.addAttention(q, k, v, null, null, 0.25, false, 4, 0.0);
+        try std.testing.expectError(infer_mod.InferError.InvalidGraph, infer_mod.infer(&g));
+    }
+}
+
+test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
+    // A *computed* `[B, L, H, D]` q/k — the shape every attention layer feeds RoPE —
+    // is square-tiled across its last two axes by the default policy once it passes
+    // `small_tensor_threshold`, which splits D. RoPE needs whole head-dim vectors
+    // (it rotates i against i + D/2), and used to reject that tiling outright,
+    // failing any prefill long enough to cross the threshold. It must retile now.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const l: usize = 2;
+    const k_in_dim: usize = 2;
+    const heads: usize = 2;
+    const head_dim: usize = 4;
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, l, k_in_dim }, &[_]usize{ 1, 1, k_in_dim }, .{ .tile_alignment = 64 });
+    const w_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k_in_dim, heads * head_dim }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, l }, &[_]usize{ 1, l }, .{ .tile_alignment = 64 });
+
+    var x_init: [1 * l * k_in_dim]f32 = .{0.0} ** (1 * l * k_in_dim);
+    var w_init: [k_in_dim * heads * head_dim]f32 = .{0.0} ** (k_in_dim * heads * head_dim);
+    var pos_init: [l]i32 = .{ 0, 1 };
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x_init[0..]));
+    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w_init[0..]));
+    try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(pos_init[0..]));
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, l, k_in_dim });
+    const w_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ k_in_dim, heads * head_dim });
+    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ 1, l });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(w_tid));
+    try g.bindExternal(pos_in, @intCast(pos_tid));
+
+    // Projected then split into heads: a computed value, so its tiling is the
+    // policy's, not an input signature's.
+    const proj: graph_mod.ValueId = try g.addMatMul(x_in, w_in, 1.0, 0.0);
+    const q: graph_mod.ValueId = try g.addViewReshape(proj, &[_]usize{ 1, l, heads, head_dim });
+    const out: graph_mod.ValueId = try g.addRoPE1D(q, pos_in, 10000.0, 1.0, 1.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{out});
+
+    // `small_tensor_threshold = 1` forces the square-tiling path that splits D;
+    // `base_square_2d = 2` makes the split observable at these tiny sizes.
+    const policy: plan_mod.TilePolicy = .{
+        .base_square_2d = 2,
+        .base_1d = 2,
+        .small_tensor_threshold = 1,
+        .tile_alignment = 64,
+    };
+    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+
+    // The lowered step must see whole head-dim vectors on both x and out.
+    var saw_rope: bool = false;
+    for (prog.steps) |step| {
+        switch (step) {
+            .RoPE1DTiled => |s| {
+                saw_rope = true;
+                for ([_]manager_mod.TensorId{ s.x, s.out }) |tid| {
+                    const t = try sm.getConst(tid);
+                    try std.testing.expectEqual(@as(usize, head_dim), t.tile_shape[3]);
+                    try std.testing.expectEqual(@as(usize, 1), t.tile_counts[3]);
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_rope);
 }

@@ -2,23 +2,20 @@
 //
 //! Attention execution for the GPU backend.
 //!
-//! Three steps route here:
-//!   - `AttentionTiled` / `MultiHeadAttentionTiled` -> `execAttention`
-//!     (kernels/attention.wgsl): the compiler tiles lead (batch/head) dims as
-//!     size-1 and — under the GPU tile policy — the whole [m, dk]/[n, dk]/
-//!     [n, dv] slice into ONE tile, so each slice is one dispatch with one
-//!     workgroup per query row.
-//!   - `MultiHeadAttentionCachedTiled` -> `execAttentionCached`
-//!     (kernels/attention_cached.wgsl): cached GQA over single-buffer KV caches
-//!     (f32 or f16 — bound as u32 words, no shader-f16 extension needed), with
-//!     positions/end_index read ON DEVICE and identity/ring time mapping done
-//!     in-kernel. Only cache GROWTH needs the host: end_index is read at record
-//!     time to pre-touch `mapSequenceStep` (same protocol as the CPU executor
-//!     and the GPU KV-append), then metadata is re-fetched.
+//! Two steps route here:
+//!   - `AttentionTiled` -> `execAttention` (kernels/attention.wgsl):
+//!     GQA over single-buffer k/v (f32 or f16 — bound as u32 words, no
+//!     shader-f16 extension needed). Optional query positions and K/V lengths
+//!     are read ON DEVICE, with identity/ring time mapping done in-kernel;
+//!     only cache GROWTH needs the host, where K/V lengths are read at record time
+//!     to pre-touch `mapSequenceStep` (same protocol as the CPU executor and the
+//!     GPU KV-append) before metadata is re-fetched. Defaults are position == row
+//!     and all T keys live, with no host round-trip.
+//!   - `RelPosMHATiled` -> `execRelPosMHA` (kernels/relpos_mha.wgsl).
 //!
-//! v1 scope: f32 q/out (+f32 kernels for plain attention); dk <= 512 (the
-//! kernels stage the q row in shared memory) and dv <= 1024 (per-thread
-//! accumulator registers). Wider heads fall back with `error.Unsupported`.
+//! v1 scope: f32 q/out; dk <= 512 (the kernels stage the q row in shared memory)
+//! and dv <= 1024 (per-thread accumulator registers). Wider heads fall back with
+//! `error.Unsupported`.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -36,7 +33,6 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const KernelDesc = pipelines.KernelDesc;
 
 const attn_kernel: KernelDesc = .{ .name = "attention", .wgsl = @embedFile("../kernels/attention.wgsl") };
-const cached_kernel: KernelDesc = .{ .name = "attention_cached", .wgsl = @embedFile("../kernels/attention_cached.wgsl") };
 const merge_kernel: KernelDesc = .{ .name = "attention_merge", .wgsl = @embedFile("../kernels/attention_merge.wgsl") };
 const relpos_kernel: KernelDesc = .{ .name = "relpos_mha", .wgsl = @embedFile("../kernels/relpos_mha.wgsl") };
 
@@ -44,23 +40,82 @@ const relpos_kernel: KernelDesc = .{ .name = "relpos_mha", .wgsl = @embedFile(".
 const MAX_DK: u32 = 512;
 const MAX_DV: u32 = 1024;
 
-/// Field order matches `struct Params` in attention.wgsl.
-const AttnParams = extern struct {
-    m: u32,
-    n: u32,
-    dk: u32,
-    dv: u32,
-    q_row: u32,
-    k_row: u32,
-    v_row: u32,
-    o_row: u32,
-    scale: f32,
-    causal: u32,
-    _p0: u32 = 0,
-    _p1: u32 = 0,
-};
+// ---------------------------------------------------------------------------
+// Row-block and split-K tuning.
+//
+// HEURISTICS, measured on an RTX 4080 Laptop (Vulkan) 2026-07-30 — deliberately NOT in
+// `autotune.zig`, which exists for the matmul candidate MENU where the right tiling is
+// genuinely device- and shape-dependent and worth timing on device. These are static
+// parameters feeding a shape-adaptive rule (`chooseRowBlock`). Re-tune with
+// `gpu-bench --suite kernels --op attn_seq|attn_cached|attn_window|relpos_mha|
+// relpos_chunked`, and mind the clock-ramp trap that `bench_gpu.warmUp` exists for.
+// ---------------------------------------------------------------------------
 
-/// Field order matches `struct Params` in attention_cached.wgsl.
+/// Query rows per attention workgroup; must match `RMAX` in attention.wgsl. 8 measured
+/// SLOWER on all three attention shapes (register pressure from the per-row
+/// `dots`/`sv`/`m_new`/`resc`/`acc` arrays) even though the freed workgroup memory
+/// allows it — a measured ceiling, not an arbitrary one.
+const MAX_ROWS: usize = 4;
+/// Query rows per RelPosMHA workgroup; must match `RMAX` in relpos_mha.wgsl.
+const MAX_RELPOS_ROWS: usize = 4;
+
+/// Floats in each kernel's workgroup q-staging array — `q_s` in attention.wgsl and
+/// `qu_s`/`qv_s` in relpos_mha.wgsl. A row block must satisfy `rows * dk <= this`, and
+/// the value is what keeps both kernels inside the 16 KiB workgroup-storage floor.
+/// WGSL array sizes must be literals, so this is a hand-kept mirror: change it here and
+/// in the kernel together (the shaders name this constant in a comment).
+const Q_STAGE_FLOATS: usize = 1024;
+/// Block-grid size below which split-K pays off; ~2x the SM count of a mid/high-end
+/// part. Raising it to 256 made the long-cache decode fall back to a narrower row block
+/// and measured 1.6x slower, so it is a two-sided choice, not a floor to raise freely.
+const MIN_BLOCKS: usize = 128;
+/// Preferred keys per split-K segment (a full 256-key chunk plus headroom); shrunk
+/// toward `MIN_SEG_KEYS` only as far as needed to fill the device.
+const SEG_KEYS: usize = 512;
+/// Floor on segment length — below this the score phase idles most of its threads.
+const MIN_SEG_KEYS: usize = 64;
+/// Cap on segments, keeping the partials buffer and the merge loop small.
+const MAX_SEGS: usize = 64;
+
+fn ceilDiv(a: usize, b: usize) usize {
+    return (a + b - 1) / b;
+}
+
+const RowBlock = struct { rh: usize, rl: usize };
+
+/// Pick the (heads x rows) block each workgroup handles.
+///
+/// A bigger block reads the K/V range once for more query rows — traffic falls as
+/// 1/rows — but it also divides the block grid, and a small grid can't keep the
+/// device busy. So: take the LARGEST block whose grid still fills the device once
+/// split-K has been applied. `rh` must divide `gqa` (never straddle a kv head) and
+/// the tile's head count (the head base is a multiple of it).
+///
+/// When no candidate fills the device — a short sliding window over few heads, where
+/// there simply isn't enough work — hedge at two rows rather than one: half the
+/// traffic reduction for double the blocks measured best on that shape.
+fn chooseRowBlock(gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize, d_k: usize) RowBlock {
+    const max_segs: usize = @min(@max(@as(usize, 1), span_hint / MIN_SEG_KEYS), MAX_SEGS);
+    const rows_cap: usize = @min(MAX_ROWS, @max(@as(usize, 1), Q_STAGE_FLOATS / @max(d_k, 1)));
+
+    var hedge: ?RowBlock = null;
+    var target: usize = rows_cap;
+    while (true) {
+        var rh: usize = @min(@min(gqa, th), target);
+        while (rh > 1 and ((gqa % rh) != 0 or (th % rh) != 0)) rh -= 1;
+        const rl: usize = @max(@as(usize, 1), @min(tl, target / rh));
+        const cand: RowBlock = .{ .rh = rh, .rl = rl };
+
+        const blocks: usize = tb * ceilDiv(th, rh) * ceilDiv(tl, rl);
+        if (blocks * max_segs >= MIN_BLOCKS) return cand;
+        if (rh * rl == 2) hedge = cand;
+        if (target <= 1) break;
+        target /= 2;
+    }
+    return hedge orelse .{ .rh = 1, .rl = 1 };
+}
+
+/// Field order matches `struct Params` in attention.wgsl.
 const CachedParams = extern struct {
     base_b: u32,
     base_h: u32,
@@ -79,95 +134,15 @@ const CachedParams = extern struct {
     scale: f32,
     soft_cap: f32,
     segs: u32 = 1,
-    _p0: u32 = 0,
-    _p1: u32 = 0,
-    _p2: u32 = 0,
+    base_l: u32,
+    has_pos: u32,
+    has_lengths: u32,
+    rl: u32,
+    rh: u32,
 };
 
 /// Field order matches `struct Params` in attention_merge.wgsl.
 const MergeParams = extern struct { rows: u32, segs: u32, dv: u32, stride: u32 };
-
-const packedElemsSized = context.packedElemsSized;
-
-// ---- Attention / MultiHeadAttention -------------------------------------------
-
-/// Fused attention over lead-dim slices. `s` is either `StepAttentionTiled` or
-/// `StepMultiHeadAttentionTiled` (identical field layout for our purposes: the
-/// head count is just another size-1-tiled lead dim).
-pub fn execAttention(ctx: Ctx, frame: *Frame, s: anytype) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
-    const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    const q_meta = hs.meta(s.q) catch return error.ExecutionFailed;
-    const k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
-    const v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
-
-    if (out_meta.dtype != .f32 or q_meta.dtype != .f32 or k_meta.dtype != .f32 or v_meta.dtype != .f32) return error.Unsupported;
-    const rank: usize = @as(usize, out_meta.rank);
-    if (rank < 2) return error.Unsupported;
-
-    // v1: each slice's [m,dk]/[n,dk]/[n,dv]/[m,dv] must live in ONE tile (the
-    // GPU tile policy produces exactly this; CPU-policy programs fall back).
-    inline for (.{ out_meta, q_meta, k_meta, v_meta }) |meta| {
-        if (meta.tile_counts[rank - 2] != 1 or meta.tile_counts[rank - 1] != 1) return error.Unsupported;
-    }
-
-    const built = try ctx.pipes.get(attn_kernel, "attn_row_f32");
-
-    // Lead dims are tiled size-1 with equal counts across operands (compile
-    // contract), and trailing counts are all 1 — so one linear tile index
-    // enumerates the same slice in all four tensors.
-    const total = context.totalTiles(out_meta);
-    var ti: usize = 0;
-    while (ti < total) : (ti += 1) {
-        const dq = ctx.rstore.acquireTileDeviceConstLinear(s.q, ti) catch return error.ExecutionFailed;
-        const dk_t = ctx.rstore.acquireTileDeviceConstLinear(s.k, ti) catch return error.ExecutionFailed;
-        const dv_t = ctx.rstore.acquireTileDeviceConstLinear(s.v, ti) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
-        defer {
-            hs.releaseConst(dq.token);
-            hs.releaseConst(dk_t.token);
-            hs.releaseConst(dv_t.token);
-            hs.releaseMut(dout.token);
-        }
-        if (!context.storageBindingFits(ctx, dq.len) or !context.storageBindingFits(ctx, dk_t.len) or
-            !context.storageBindingFits(ctx, dv_t.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
-
-        const qv = context.rowView(dq.rank, dq.shape_mem[0..@as(usize, dq.rank)], dq.strides_mem[0..@as(usize, dq.rank)]) orelse return error.Unsupported;
-        const kv = context.rowView(dk_t.rank, dk_t.shape_mem[0..@as(usize, dk_t.rank)], dk_t.strides_mem[0..@as(usize, dk_t.rank)]) orelse return error.Unsupported;
-        const vv = context.rowView(dv_t.rank, dv_t.shape_mem[0..@as(usize, dv_t.rank)], dv_t.strides_mem[0..@as(usize, dv_t.rank)]) orelse return error.Unsupported;
-        const ov = context.rowView(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)]) orelse return error.Unsupported;
-
-        if (qv.cols != kv.cols) return error.Unsupported; // dk
-        if (kv.rows != vv.rows) return error.Unsupported; // n
-        if (ov.rows != qv.rows or ov.cols != vv.cols) return error.Unsupported;
-        if (qv.cols > MAX_DK or ov.cols > MAX_DV) return error.Unsupported;
-        if (ov.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
-        if (kv.rows == 0) return error.Unsupported;
-
-        const params: AttnParams = .{
-            .m = ov.rows,
-            .n = kv.rows,
-            .dk = qv.cols,
-            .dv = ov.cols,
-            .q_row = qv.row_stride,
-            .k_row = kv.row_stride,
-            .v_row = vv.row_stride,
-            .o_row = ov.row_stride,
-            .scale = s.scale,
-            .causal = @intFromBool(s.causal),
-        };
-        const bufs = [_]c.WGPUBuffer{
-            ctx.devmem.bufferFor(dq.handle).?,
-            ctx.devmem.bufferFor(dk_t.handle).?,
-            ctx.devmem.bufferFor(dv_t.handle).?,
-            ctx.devmem.bufferFor(dout.handle).?,
-        };
-        const sizes = [_]u64{ dq.len, dk_t.len, dv_t.len, dout.len };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ ov.rows, 1, 1 });
-    }
-}
-
-// ---- RelPosMHA ----------------------------------------------------------------
 
 /// Field order matches `struct Params` in relpos_mha.wgsl.
 const RelPosParams = extern struct {
@@ -178,9 +153,13 @@ const RelPosParams = extern struct {
     u_base: u32,
     v_base: u32,
     has_mask: u32,
-    _pad: u32 = 0,
+    chunk_size: u32,
+    chunk_left: u32,
+    rl: u32,
     scale: f32,
 };
+
+const packedElemsSized = context.packedElemsSized;
 
 /// Conformer relative-positional MHA: one dispatch per (batch, head) slice.
 /// The compile contract tiles q/k/v/out `[B, T, H, D]` as `[1, T, 1, D]`, so
@@ -204,7 +183,11 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
     const t_kv = k_meta.shape[1];
     const p_len = pe_meta.shape[1];
     if (p_len != 2 * t_kv - 1 or t_q > t_kv or t_q == 0) return error.Unsupported;
-    if (d > MAX_DK or d > MAX_DV) return error.Unsupported;
+    // RelPosMHA has ONE head dim for q/k/v, so the attention kernel's separate
+    // dk/dv ceilings don't apply: the binding limits are the q staging arrays
+    // (`rl * d <= RELPOS_Q_STAGE`, checked once `rl` is chosen) and the per-thread
+    // accumulator array (`d <= ACC * WG`).
+    if (d > MAX_DV) return error.Unsupported;
     if (t_q > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
     // Per-head [P, D] / [D] panels must be intra-tile.
     if (pe_meta.tile_counts[1] != 1 or pe_meta.tile_counts[2] != 1) return error.Unsupported;
@@ -252,6 +235,12 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
                 hs.releaseConst(dbv.token);
             }
 
+            // `rl` query rows per workgroup: K/V rows are shared by the whole block
+            // (pos_emb is not — its band shifts per row). Bounded by the kernel's
+            // RMAX and by the q staging arrays.
+            const rl: usize = @min(@min(MAX_RELPOS_ROWS, t_q), @max(@as(usize, 1), Q_STAGE_FLOATS / @max(d, 1)));
+            if (rl * d > Q_STAGE_FLOATS) return error.Unsupported;
+
             // Slice panels and the per-head tables must be packed.
             if ((context.packedElems(dq.rank, dq.shape_mem[0..4], dq.strides_mem[0..4]) orelse return error.Unsupported) < t_q * d) return error.Unsupported;
             if ((context.packedElems(dk_t.rank, dk_t.shape_mem[0..4], dk_t.strides_mem[0..4]) orelse return error.Unsupported) < t_kv * d) return error.Unsupported;
@@ -270,6 +259,9 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
                 .u_base = @intCast((h % bu_ts0) * d),
                 .v_base = @intCast((h % bv_ts0) * d),
                 .has_mask = @intFromBool(mask_tile != null),
+                .chunk_size = std.math.cast(u32, s.chunk_size) orelse return error.Unsupported,
+                .chunk_left = std.math.cast(u32, s.chunk_left) orelse return error.Unsupported,
+                .rl = @intCast(rl),
                 .scale = s.scale,
             };
             const mask_buf = if (mask_tile) |mt| ctx.devmem.bufferFor(mt.handle).? else ctx.devmem.bufferFor(dq.handle).?;
@@ -285,26 +277,30 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
                 ctx.devmem.bufferFor(dout.handle).?,
             };
             const sizes = [_]u64{ dq.len, dk_t.len, dv_t.len, dpe.len, dbu.len, dbv.len, mask_len, dout.len };
-            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(t_q), 1, 1 });
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(ceilDiv(t_q, rl)), 1, 1 });
         }
     }
 }
 
-// ---- MultiHeadAttentionCached --------------------------------------------------
+// ---- Attention --------------------------------------------------
 
-/// Cached GQA over external KV caches. One dispatch per out/q tile with a
+/// Grouped-query attention over k/v — a KV cache when the step carries the index
+/// operands, a plain sequence otherwise. One dispatch per out/q tile with a
 /// workgroup per (b, l, hq); everything except cache growth stays on-device.
-pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadAttentionCachedTiled) ExecuteProgramError!void {
+pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
+    const has_pos: bool = s.query_positions != null;
+    const has_lengths: bool = s.kv_lengths != null;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const q_meta = hs.meta(s.q) catch return error.ExecutionFailed;
-    var k_meta = hs.meta(s.k_cache) catch return error.ExecutionFailed;
-    var v_meta = hs.meta(s.v_cache) catch return error.ExecutionFailed;
-    const pos_meta = hs.meta(s.positions) catch return error.ExecutionFailed;
-    const end_meta = hs.meta(s.end_index) catch return error.ExecutionFailed;
+    var k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
+    var v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
+    const pos_meta = if (s.query_positions) |t| hs.meta(t) catch return error.ExecutionFailed else null;
+    const lengths_meta = if (s.kv_lengths) |t| hs.meta(t) catch return error.ExecutionFailed else null;
 
     if (out_meta.rank != 4 or q_meta.rank != 4 or k_meta.rank != 4 or v_meta.rank != 4) return error.Unsupported;
-    if (pos_meta.rank != 2 or end_meta.rank != 1) return error.Unsupported;
+    if (has_pos and pos_meta.?.rank != 2) return error.Unsupported;
+    if (has_lengths and lengths_meta.?.rank != 1) return error.Unsupported;
     if (out_meta.dtype != .f32 or q_meta.dtype != .f32) return error.Unsupported; // f16 q later
     if (k_meta.dtype != v_meta.dtype) return error.Unsupported;
     const kv_f16 = switch (k_meta.dtype) {
@@ -312,31 +308,33 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
         .f16 => true,
         else => return error.Unsupported,
     };
-    if (pos_meta.dtype != .i32 or end_meta.dtype != .i32) return error.Unsupported;
+    if (has_pos and pos_meta.?.dtype != .i32) return error.Unsupported;
+    if (has_lengths and lengths_meta.?.dtype != .i32) return error.Unsupported;
 
     if (out_meta.tile_counts[3] != 1 or q_meta.tile_counts[3] != 1) return error.Unsupported;
     // v1: each cache is ONE device buffer (decode caches are created that way);
-    // end_index is a single tiny tile.
+    // K/V lengths are a single tiny tile.
     if (context.totalTiles(k_meta) != 1 or context.totalTiles(v_meta) != 1) return error.Unsupported;
-    if (context.totalTiles(end_meta) != 1) return error.Unsupported;
+    if (has_lengths and context.totalTiles(lengths_meta.?) != 1) return error.Unsupported;
 
     const batch = q_meta.shape[0];
     const h_q = q_meta.shape[2];
     const d_k = q_meta.shape[3];
-    const h_kv = k_meta.shape[1];
+    const h_kv = k_meta.shape[2];
     const d_v = v_meta.shape[3];
     if (h_q == 0 or h_kv == 0 or h_q % h_kv != 0) return error.Unsupported;
-    if (k_meta.shape[0] != batch or v_meta.shape[0] != batch or v_meta.shape[1] != h_kv) return error.Unsupported;
+    if (k_meta.shape[0] != batch or v_meta.shape[0] != batch or v_meta.shape[2] != h_kv) return error.Unsupported;
     if (k_meta.shape[3] != d_k) return error.Unsupported;
     if (out_meta.shape[3] != d_v) return error.Unsupported;
     if (d_k > MAX_DK or d_v > MAX_DV) return error.Unsupported;
     if (kv_f16 and (d_k % 2 != 0 or d_v % 2 != 0)) return error.Unsupported; // word-aligned rows
-    if (end_meta.shape[0] < batch) return error.Unsupported;
+    if (has_lengths and lengths_meta.?.shape[0] < batch) return error.Unsupported;
 
-    // Pre-touch cache growth on the host (growable policies may reallocate),
-    // then re-fetch metadata — same protocol as the CPU executor.
-    {
-        const tile = hs.acquireTileConstLinear(s.end_index, 0) catch return error.ExecutionFailed;
+    // Pre-touch cache growth on the host (growable policies may reallocate), then
+    // re-fetch metadata — same protocol as the CPU executor. Only a cache can grow,
+    // so a plain sequence skips the host round-trip entirely.
+    if (has_lengths) {
+        const tile = hs.acquireTileConstLinear(s.kv_lengths.?, 0) catch return error.ExecutionFailed;
         defer hs.releaseConst(tile.token);
         const ptr: [*]align(1) const i32 = @ptrCast(tile.bytes.ptr);
         const vals = ptr[0 .. tile.bytes.len / @sizeOf(i32)];
@@ -346,18 +344,18 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
             if (vals[b] < 0) return error.ExecutionFailed;
             const valid_end: usize = @intCast(vals[b]);
             if (valid_end == 0) continue;
-            _ = hs.mapSequenceStep(s.k_cache, valid_end - 1, k_meta.shape[2]) catch return error.ExecutionFailed;
-            _ = hs.mapSequenceStep(s.v_cache, valid_end - 1, v_meta.shape[2]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.k, valid_end - 1, k_meta.shape[1]) catch return error.ExecutionFailed;
+            _ = hs.mapSequenceStep(s.v, valid_end - 1, v_meta.shape[1]) catch return error.ExecutionFailed;
         }
     }
-    k_meta = hs.meta(s.k_cache) catch return error.ExecutionFailed;
-    v_meta = hs.meta(s.v_cache) catch return error.ExecutionFailed;
-    const t_cap = k_meta.shape[2];
-    if (v_meta.shape[2] != t_cap or t_cap == 0) return error.Unsupported;
+    k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
+    v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
+    const t_cap = k_meta.shape[1];
+    if (v_meta.shape[1] != t_cap or t_cap == 0) return error.Unsupported;
 
     // Time mapping: identity for none/growable, modulo for ring — resolved
     // in-kernel (no per-token host round-trips).
-    const policy_info = hs.sequenceCachePolicyInfo(s.k_cache);
+    const policy_info = hs.sequenceCachePolicyInfo(s.k);
     const is_ring = policy_info.kind == .ring;
     const ring_window: usize = if (is_ring) blk: {
         const configured: usize = policy_info.ring_window_tokens;
@@ -365,21 +363,27 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
     } else 0;
     if (is_ring and ring_window == 0) return error.Unsupported;
 
-    const built = try ctx.pipes.get(cached_kernel, "mha_cached");
+    const built = try ctx.pipes.get(attn_kernel, "attn_row");
 
     const kv_elem: usize = if (kv_f16) 2 else 4;
-    const dk_c = ctx.rstore.acquireTileDeviceConstLinear(s.k_cache, 0) catch return error.ExecutionFailed;
-    const dv_c = ctx.rstore.acquireTileDeviceConstLinear(s.v_cache, 0) catch return error.ExecutionFailed;
-    const dend = ctx.rstore.acquireTileDeviceConstLinear(s.end_index, 0) catch return error.ExecutionFailed;
+    const dk_c = ctx.rstore.acquireTileDeviceConstLinear(s.k, 0) catch return error.ExecutionFailed;
+    const dv_c = ctx.rstore.acquireTileDeviceConstLinear(s.v, 0) catch return error.ExecutionFailed;
+    // WGSL has no optional binding, so slots 3/4 must be filled even when the
+    // kernel never reads them: `dq` stands in, gated off by `has_idx`. Same
+    // dummy-operand idiom `execRelPosMHA` uses for its optional mask.
+    const dend_opt: ?resident_mod.TileRefDevice = if (s.kv_lengths) |t|
+        ctx.rstore.acquireTileDeviceConstLinear(t, 0) catch return error.ExecutionFailed
+    else
+        null;
     defer {
         hs.releaseConst(dk_c.token);
         hs.releaseConst(dv_c.token);
-        hs.releaseConst(dend.token);
+        if (dend_opt) |d| hs.releaseConst(d.token);
     }
     if (!context.storageBindingFits(ctx, dk_c.len) or !context.storageBindingFits(ctx, dv_c.len)) return error.Unsupported;
     if (packedElemsSized(dk_c.rank, dk_c.shape_mem[0..4], dk_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
     if (packedElemsSized(dv_c.rank, dv_c.shape_mem[0..4], dv_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
-    if (dk_c.shape_mem[2] != t_cap or dv_c.shape_mem[2] != t_cap) return error.Unsupported;
+    if (dk_c.shape_mem[1] != t_cap or dv_c.shape_mem[1] != t_cap) return error.Unsupported;
 
     const total = context.totalTiles(out_meta);
     var ti: usize = 0;
@@ -390,35 +394,73 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
         const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         const q_lin = tensor_store_mod.encodeTileIndex(q_meta, coords[0..4]) catch return error.ExecutionFailed;
         const dq = ctx.rstore.acquireTileDeviceConstLinear(s.q, q_lin) catch return error.ExecutionFailed;
-        const pos_lin = tensor_store_mod.encodeTileIndex(pos_meta, coords[0..2]) catch return error.ExecutionFailed;
-        const dpos = ctx.rstore.acquireTileDeviceConstLinear(s.positions, pos_lin) catch return error.ExecutionFailed;
+        const dpos_opt: ?resident_mod.TileRefDevice = if (s.query_positions) |pid| blk: {
+            const pos_lin = tensor_store_mod.encodeTileIndex(pos_meta.?, coords[0..2]) catch return error.ExecutionFailed;
+            break :blk ctx.rstore.acquireTileDeviceConstLinear(pid, pos_lin) catch return error.ExecutionFailed;
+        } else null;
         defer {
             hs.releaseMut(dout.token);
             hs.releaseConst(dq.token);
-            hs.releaseConst(dpos.token);
+            if (dpos_opt) |d| hs.releaseConst(d.token);
         }
         if (!context.storageBindingFits(ctx, dq.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
         // Packed tiles: the kernel computes flat offsets from tile-local dims.
         if (context.packedElems(dout.rank, dout.shape_mem[0..4], dout.strides_mem[0..4]) == null) return error.Unsupported;
         if (context.packedElems(dq.rank, dq.shape_mem[0..4], dq.strides_mem[0..4]) == null) return error.Unsupported;
-        if (packedElemsSized(dpos.rank, dpos.shape_mem[0..2], dpos.strides_mem[0..2], 4) == null) return error.Unsupported;
+        if (dpos_opt) |dpos| {
+            if (packedElemsSized(dpos.rank, dpos.shape_mem[0..2], dpos.strides_mem[0..2], 4) == null) return error.Unsupported;
+        }
 
         const tb = dout.shape_mem[0];
         const tl = dout.shape_mem[1];
         const th = dout.shape_mem[2];
         if (dq.shape_mem[0] != tb or dq.shape_mem[1] != tl or dq.shape_mem[2] != th) return error.Unsupported;
         if (dq.shape_mem[3] != d_k or dout.shape_mem[3] != d_v) return error.Unsupported;
-        if (dpos.shape_mem[0] != tb or dpos.shape_mem[1] != tl) return error.Unsupported;
+        if (dpos_opt) |dpos| {
+            if (dpos.shape_mem[0] != tb or dpos.shape_mem[1] != tl) return error.Unsupported;
+        }
+
+        // Slots 3/4 fall back to `dq` when there are no index operands; the kernel
+        // gates every read of them on `has_idx`, so the contents are never touched.
+        const idx_bufs = [_]c.WGPUBuffer{
+            ctx.devmem.bufferFor(if (dpos_opt) |d| d.handle else dq.handle).?,
+            ctx.devmem.bufferFor(if (dend_opt) |d| d.handle else dq.handle).?,
+        };
+        const idx_sizes = [_]u64{
+            if (dpos_opt) |d| d.len else dq.len,
+            if (dend_opt) |d| d.len else dq.len,
+        };
         if (tb > context.MAX_GROUPS_PER_DIM or tl > context.MAX_GROUPS_PER_DIM or th > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
 
-        // Split-K (flash-decoding) when the plain grid can't occupy the GPU:
-        // few output rows over a long cache. Each segment covers ~512 keys;
-        // capped so partials stay small and the merge loop stays cheap.
         const rows_total: usize = tb * tl * th;
+
+        // `rh` query heads x `rl` query rows per workgroup, all sharing one K/V panel.
+        // The split is sized off the range a row ACTUALLY scans — with a sliding
+        // window that is the window, not the cache capacity.
+        const gqa: usize = h_q / h_kv;
+        const span_hint: usize = if (s.sliding_window > 0) @min(t_cap, s.sliding_window) else t_cap;
+        const rb: RowBlock = chooseRowBlock(gqa, th, tl, tb, span_hint, d_k);
+        const rh: usize = rb.rh;
+        const rl: usize = rb.rl;
+        // Both are kernel invariants: `rows` indexes fixed-size arrays there, and q
+        // staging is bounded by `Q_STAGE_FLOATS`.
+        if (rh * rl > MAX_ROWS or rh * rl * d_k > Q_STAGE_FLOATS) return error.Unsupported;
+
+        const grid_h: usize = ceilDiv(th, rh);
+        const grid_l: usize = ceilDiv(tl, rl);
+        const blocks: usize = tb * grid_h * grid_l;
         var segs: usize = 1;
-        if (rows_total <= 64 and t_cap >= 1024) {
-            segs = @min(@min(t_cap / 512, 32), @as(usize, context.MAX_GROUPS_PER_DIM) / @max(tb, 1));
+        if (blocks < MIN_BLOCKS and span_hint >= 2 * MIN_SEG_KEYS) {
+            // Prefer segments that fill a whole 256-key chunk; shrink only as far as
+            // needed to fill the device, since a short segment leaves threads idle in
+            // the score phase.
+            var seg_keys: usize = SEG_KEYS;
+            while (seg_keys > MIN_SEG_KEYS and blocks * ceilDiv(span_hint, seg_keys) < MIN_BLOCKS) {
+                seg_keys /= 2;
+            }
+            segs = @min(ceilDiv(span_hint, seg_keys), MAX_SEGS);
+            segs = @min(segs, @as(usize, context.MAX_GROUPS_PER_DIM) / @max(tb, 1));
             if (segs < 2) segs = 1;
         }
 
@@ -440,6 +482,13 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
             .scale = s.scale,
             .soft_cap = s.attn_logits_soft_cap,
             .segs = @intCast(segs),
+            // Without explicit query positions, a query's position is its GLOBAL row, so the
+            // kernel needs this tile's offset along L.
+            .base_l = @intCast(coords[1] * out_meta.tile_shape[1]),
+            .has_pos = @intFromBool(has_pos),
+            .has_lengths = @intFromBool(has_lengths),
+            .rl = @intCast(rl),
+            .rh = @intCast(rh),
         };
 
         if (segs > 1) {
@@ -447,24 +496,24 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
             const part_bytes: u64 = @as(u64, rows_total) * segs * stride * @sizeOf(f32);
             const scratch = ctx.scratch.ensure(ctx.gpu, part_bytes) catch return error.ExecutionFailed;
             {
-                const b1 = try ctx.pipes.get(cached_kernel, "mha_cached_split");
+                const b1 = try ctx.pipes.get(attn_kernel, "attn_split");
                 const bufs = [_]c.WGPUBuffer{
                     ctx.devmem.bufferFor(dq.handle).?,
                     ctx.devmem.bufferFor(dk_c.handle).?,
                     ctx.devmem.bufferFor(dv_c.handle).?,
-                    ctx.devmem.bufferFor(dpos.handle).?,
-                    ctx.devmem.bufferFor(dend.handle).?,
+                    idx_bufs[0],
+                    idx_bufs[1],
                     scratch,
                 };
-                const sizes = [_]u64{ dq.len, dk_c.len, dv_c.len, dpos.len, dend.len, part_bytes };
+                const sizes = [_]u64{ dq.len, dk_c.len, dv_c.len, idx_sizes[0], idx_sizes[1], part_bytes };
                 try frame.recordCompute(b1, &bufs, &sizes, std.mem.asBytes(&params), .{
-                    @intCast(th),
-                    @intCast(tl),
+                    @intCast(grid_h),
+                    @intCast(grid_l),
                     @intCast(tb * segs),
                 });
             }
             {
-                const b2 = try ctx.pipes.get(merge_kernel, "mha_cached_merge");
+                const b2 = try ctx.pipes.get(merge_kernel, "attn_merge");
                 const mp: MergeParams = .{
                     .rows = @intCast(rows_total),
                     .segs = @intCast(segs),
@@ -486,14 +535,14 @@ pub fn execAttentionCached(ctx: Ctx, frame: *Frame, s: executable.StepMultiHeadA
             ctx.devmem.bufferFor(dq.handle).?,
             ctx.devmem.bufferFor(dk_c.handle).?,
             ctx.devmem.bufferFor(dv_c.handle).?,
-            ctx.devmem.bufferFor(dpos.handle).?,
-            ctx.devmem.bufferFor(dend.handle).?,
+            idx_bufs[0],
+            idx_bufs[1],
             ctx.devmem.bufferFor(dout.handle).?,
         };
-        const sizes = [_]u64{ dq.len, dk_c.len, dv_c.len, dpos.len, dend.len, dout.len };
+        const sizes = [_]u64{ dq.len, dk_c.len, dv_c.len, idx_sizes[0], idx_sizes[1], dout.len };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{
-            @intCast(th),
-            @intCast(tl),
+            @intCast(grid_h),
+            @intCast(grid_l),
             @intCast(tb),
         });
     }

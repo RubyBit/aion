@@ -359,3 +359,94 @@ pub fn execGatherRowsTiled(
     // Sequential fallback.
     try runner.runRange(0, tile_total);
 }
+
+/// Batched sequence-row gather:
+///   data    [B,S,D]
+///   indices [B,L]
+///   out     [B,L,D]
+/// with `axis=1, batch_dims=1`.
+pub fn execGatherTiled(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    s: executable.StepGatherTiled,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    _ = pool;
+    _ = thread_count;
+    if (s.axis != 1 or s.batch_dims != 1) return BackendError.InvalidArgument;
+
+    const out_meta = try store.meta(s.out);
+    const data_meta = try store.meta(s.data);
+    const idx_meta = try store.meta(s.indices);
+    if (out_meta.rank != 3 or data_meta.rank != 3 or idx_meta.rank != 2) return BackendError.InvalidArgument;
+    if (idx_meta.dtype != .i32 or out_meta.dtype != data_meta.dtype) return BackendError.InvalidArgument;
+    const elem_bytes: usize = switch (out_meta.dtype) {
+        .f16 => 2,
+        .f32 => 4,
+        else => return BackendError.InvalidArgument,
+    };
+
+    const batch = data_meta.shape[0];
+    const seq = data_meta.shape[1];
+    const width = data_meta.shape[2];
+    const picks = idx_meta.shape[1];
+    if (idx_meta.shape[0] != batch or out_meta.shape[0] != batch or
+        out_meta.shape[1] != picks or out_meta.shape[2] != width) return BackendError.InvalidArgument;
+    if (data_meta.tile_counts[2] != 1 or out_meta.tile_counts[2] != 1) return BackendError.InvalidArgument;
+
+    const idx_tile = try store.acquireTileConstLinear(s.indices, 0);
+    defer store.releaseConst(idx_tile.token);
+    const idx_view = idx_tile.bufferView();
+    const idx_ptr: [*]align(1) const i32 = @ptrCast(idx_view.bytes.ptr);
+    const idx_vals = idx_ptr[0 .. idx_view.bytes.len / @sizeOf(i32)];
+    if (idx_vals.len < batch * picks) return BackendError.InvalidArgument;
+
+    var out_linear: usize = 0;
+    var out_coords: [8]usize = @splat(0);
+    var out_total: usize = 1;
+    for (out_meta.tile_counts[0..3]) |n| out_total *= n;
+    while (out_linear < out_total) : (out_linear += 1) {
+        try tensor_store.decodeTileCoords(out_meta, out_linear, out_coords[0..3]);
+        const out_tile = try store.acquireTileMutLinear(s.out, out_linear);
+        defer store.releaseMut(out_tile.token);
+        const out_view = out_tile.bufferView();
+
+        const base_b = out_coords[0] * out_meta.tile_shape[0];
+        const base_l = out_coords[1] * out_meta.tile_shape[1];
+        const tb = out_view.layout.shape[0];
+        const tl = out_view.layout.shape[1];
+        const td = out_view.layout.shape[2];
+        if (td != width) return BackendError.InvalidArgument;
+
+        for (0..tb) |lb| {
+            const b = base_b + lb;
+            for (0..tl) |ll| {
+                const l = base_l + ll;
+                if (b >= batch or l >= picks) return BackendError.InvalidArgument;
+                const raw = idx_vals[b * picks + l];
+                if (raw < 0) return BackendError.InvalidArgument;
+                const row: usize = @intCast(raw);
+                if (row >= seq) return BackendError.InvalidArgument;
+
+                const data_linear =
+                    (b / data_meta.tile_shape[0]) * data_meta.tile_counts[1] +
+                    (row / data_meta.tile_shape[1]);
+                const data_tile = try store.acquireTileConstLinear(s.data, data_linear);
+                defer store.releaseConst(data_tile.token);
+                const data_view = data_tile.bufferView();
+                const local_b = b % data_meta.tile_shape[0];
+                const local_s = row % data_meta.tile_shape[1];
+                if (local_b >= data_view.layout.shape[0] or local_s >= data_view.layout.shape[1]) return BackendError.InvalidArgument;
+
+                const row_bytes = width * elem_bytes;
+                const src_off = (local_b * data_view.layout.shape[1] + local_s) * row_bytes;
+                const dst_off = (lb * tl + ll) * row_bytes;
+                if (src_off + row_bytes > data_view.bytes.len or dst_off + row_bytes > out_view.bytes.len) return BackendError.InvalidArgument;
+                copyRowVectorized(
+                    out_view.bytes[dst_off .. dst_off + row_bytes],
+                    data_view.bytes[src_off .. src_off + row_bytes],
+                );
+            }
+        }
+    }
+}

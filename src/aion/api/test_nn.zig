@@ -485,7 +485,7 @@ test "api.nn: a free axis survives a layer's reshape" {
         try std.testing.expectEqualStrings("seq", (try fx.bld.dimAt(X, 1)).symbol);
 
         // A reader layer: no K/V projections, so `project` returns Q alone.
-        const attn = try nn.CachedAttention.bind(&fx.bld, .{
+        const attn = try nn.Attention.bind(&fx.bld, .{
             .q_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ model_dim, model_dim }, &proj_vals) },
             .o_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ model_dim, model_dim }, &proj_vals) },
         }, .{ .heads = heads, .kv_heads = 1, .head_dim = head_dim, .scale = 1.0 }, .{ .name = "self_attn" });
@@ -719,7 +719,7 @@ test "api.nn: a literal, a shared Named, and a Params bind identically" {
 
 // ------------------------------------------------------------ attention -----
 
-test "api.nn: KVCache + CachedAttention decode two steps against real history" {
+test "api.nn: KVCache + Attention decode two steps against real history" {
     // A one-head, one-dim attention step. With identity projections and scale 1,
     // attention over a growing cache reduces to a softmax-weighted average of the
     // values seen so far, which is checkable by hand.
@@ -754,7 +754,7 @@ test "api.nn: KVCache + CachedAttention decode two steps against real history" {
     });
 
     const eye = try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0}); // [1,1] identity
-    const attn = try nn.CachedAttention.bind(&fx.bld, .{
+    const attn = try nn.Attention.bind(&fx.bld, .{
         .q_proj = .{ .weight = eye },
         .k_proj = .{ .weight = eye },
         .v_proj = .{ .weight = eye },
@@ -834,14 +834,14 @@ test "api.nn: a reader layer attends over a cache another layer wrote" {
 
     const eye = try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0});
 
-    const writer = try nn.CachedAttention.bind(&fx.bld, .{
+    const writer = try nn.Attention.bind(&fx.bld, .{
         .q_proj = .{ .weight = eye },
         .k_proj = .{ .weight = eye },
         .v_proj = .{ .weight = eye },
         .o_proj = .{ .weight = eye },
     }, .{ .heads = 1, .kv_heads = 1, .head_dim = 1, .scale = 1.0 }, .{ .name = "w" });
 
-    const reader = try nn.CachedAttention.bind(&fx.bld, .{
+    const reader = try nn.Attention.bind(&fx.bld, .{
         .q_proj = .{ .weight = eye },
         .o_proj = .{ .weight = eye },
     }, .{ .heads = 1, .kv_heads = 1, .head_dim = 1, .scale = 1.0 }, .{ .name = "r" });
@@ -872,7 +872,7 @@ test "api.nn: a reader layer attends over a cache another layer wrote" {
     _ = try reader.attend(&fx.bld, rp.q, k_now, v_now, positions, visible);
 }
 
-test "api.nn: CachedAttention rejects K without V" {
+test "api.nn: Attention rejects K without V" {
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
@@ -880,21 +880,21 @@ test "api.nn: CachedAttention rejects K without V" {
     const eye = try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0});
     // A layer that projects K but not V cannot fill a cache; catching it here beats
     // a confusing shape failure later.
-    try std.testing.expectError(error.InvalidArgument, nn.CachedAttention.bind(&fx.bld, .{
+    try std.testing.expectError(error.InvalidArgument, nn.Attention.bind(&fx.bld, .{
         .q_proj = .{ .weight = eye },
         .k_proj = .{ .weight = eye },
         .o_proj = .{ .weight = eye },
     }, .{ .heads = 1, .kv_heads = 1, .head_dim = 1, .scale = 1.0 }, .{}));
 }
 
-test "api.nn: CachedAttention rejects head counts that are not a GQA multiple" {
+test "api.nn: Attention rejects head counts that are not a GQA multiple" {
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
 
     const eye = try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0});
     // 3 query heads cannot be split across 2 KV heads.
-    try std.testing.expectError(error.InvalidArgument, nn.CachedAttention.bind(&fx.bld, .{
+    try std.testing.expectError(error.InvalidArgument, nn.Attention.bind(&fx.bld, .{
         .q_proj = .{ .weight = eye },
         .k_proj = .{ .weight = eye },
         .v_proj = .{ .weight = eye },
@@ -921,18 +921,18 @@ test "api.nn: KVCache append casts to the cache dtype" {
     const kv = try fx.bld.input(.f32, &[_]usize{ 1, 1, 1, 4 });
     const appended = try cache.append(&fx.bld, kv, idx);
     try std.testing.expectEqual(types.DType.f16, fx.bld.dtypeOf(appended).?);
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 8, 4 }, fx.bld.knownShape(appended).?);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 8, 1, 4 }, fx.bld.knownShape(appended).?);
 
     // Cache layout passed in by mistake: `kv_heads` is not where it should be.
     var swapped = try nn.KVCache.bind(&fx.bld, 1, 1, 4, .{ .dtype = .f16, .capacity = 8 });
     const wrong = try fx.bld.input(.f32, &[_]usize{ 1, 4, 1, 1 });
     try std.testing.expectError(error.ShapeMismatch, swapped.append(&fx.bld, wrong, idx));
 
-    // More than one KV head needs a real transpose, which the graph has no op for.
-    // Rejected rather than reinterpreted, since a reshape would silently scramble it.
+    // Multi-head GQA uses the same projection-native layout.
     var multi = try nn.KVCache.bind(&fx.bld, 1, 2, 4, .{ .dtype = .f16, .capacity = 8 });
     const kv2 = try fx.bld.input(.f32, &[_]usize{ 1, 3, 2, 4 });
-    try std.testing.expectError(error.Unsupported, multi.append(&fx.bld, kv2, idx));
+    const appended2 = try multi.append(&fx.bld, kv2, idx);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 8, 2, 4 }, fx.bld.knownShape(appended2).?);
 
     // A capacity of zero has no valid interpretation.
     try std.testing.expectError(error.InvalidArgument, nn.KVCache.bind(&fx.bld, 1, 1, 1, .{ .capacity = 0 }));

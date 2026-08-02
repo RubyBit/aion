@@ -17,6 +17,7 @@ from collections.abc import Callable, Generator, Iterator
 from typing import TYPE_CHECKING, Any, Generic, Optional
 
 from ..builder import Builder, TensorRef, WeightData
+from ..dtype import float32
 from ..types import DTypeLike, Shape
 
 
@@ -70,11 +71,11 @@ class Parameter:
         self,
         data: WeightData,
         *,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         shape: Optional[Shape] = None,
         quant_axis: Optional[int] = None,
     ) -> None:
-        self.data: object = data
+        self.data: WeightData = data
         # Passed through to `Builder.param_named`. `shape`/`quant_axis` matter for
         # quantized weights: an embedding table blocks along its feature axis, not
         # the matmul reduction axis.
@@ -318,5 +319,5 @@ class Residual(Module):
         b = builder_of(x)
         y = self.body(x)
         if self.scale != 1.0:
-            y = b.broadcast_mul(y, b.constant(self.scale))
+            y = b.mul(y, b.constant(self.scale))
         return b.add(x, y)

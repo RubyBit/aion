@@ -27,10 +27,9 @@ This subproject is set up to work well with **uv**.
 
 From `bindings/python/`:
 
-- Create/sync the environment and build the extension. The `dev` dependency
-  group (NumPy, tokenizers, torch, pytest, …) is installed by default:
-  - Windows (recommended): `uv sync --no-editable`
-  - Linux: `uv sync`
+- Create/sync the environment and build the extension: `uv sync`
+  - The default `dev` group includes NumPy, tokenizers, torch, pytest, and the
+    `aion-wgpu` runtime on supported platforms.
 
 - For a leaner env with just the test deps: `uv sync --group test`
 - For a runtime-only env (no dev/test tooling): `uv sync --no-default-groups`
@@ -38,21 +37,16 @@ From `bindings/python/`:
 - Run tests:
   - `uv run pytest`
 
-> **Changed the Zig core? `uv sync` will not pick it up.** uv's build cache keys on
-> this project directory, and the Zig sources live *outside* it (`../../src`), so
-> edits there do not invalidate the cached wheel. Rebuild and test like this:
+> **Changed the Zig core? Just use `uv run`.** The uv cache key includes
+> `../../src/**/*.zig`, the public headers, and the Zig build files, so the next
+> command rebuilds and relinks the editable package before it runs:
 >
 > ```bash
-> uv pip install --no-build-isolation --no-deps --force-reinstall .
-> ./.venv/Scripts/python.exe -m pytest        # .venv/bin/python on Linux/macOS
+> uv run pytest
+> uv run python examples/silero_vad_simple.py --device gpu
 > ```
 >
-> Use the interpreter directly rather than `uv run`, which re-syncs and puts the
-> cached wheel back.
->
-> Two staleness traps sit behind that command, both now closed — worth knowing
-> because when they bite there is no error, only wrong behaviour from code you are
-> no longer looking at:
+> Two lower-level staleness traps are also covered:
 >
 > - `tools/build_zig.py` always invokes `zig build install` (never skips on a
 >   config stamp, which cannot see source edits). Zig's own content cache makes a
@@ -64,9 +58,8 @@ From `bindings/python/`:
 >   archive is newer than the extension, and fails the build if the extension is
 >   somehow still older afterwards.
 >
-> If you ever suspect you are running stale bytes, the tell is the extension's
-> size/mtime under `.venv/Lib/site-packages/aion/`; `rm -rf build` forces a clean
-> relink.
+> To force a rebuild independently of the cache key, use
+> `uv sync --reinstall-package aion`.
 
 Build tuning env vars (for native extension build):
 
@@ -167,9 +160,10 @@ model = aion.compile(MyModule(), aion.spec((None, 4)))   # None = dynamic axis
 aion.export(MyModule(), aion.spec((None, 4)), "mlp.aion")
 ```
 
-`dtype` accepts a single vocabulary everywhere — `"f32"`, `"i32"`, `aion.float32`,
-a NumPy dtype, or the `AionDType` enum — and `aion.tensor(np.array(..., np.int32))`
-infers `i32`.
+`dtype` accepts Aion constants (`aion.float32`, `aion.float16`, `aion.int8`,
+`aion.int32`, and `aion.q8_0`) plus NumPy dtype classes/objects. Dtype strings
+and raw enum ordinals are intentionally unsupported. `aion.tensor(np.array(...,
+np.int32))` infers `aion.int32`.
 
 **Looking at a value while you build.** `compile` hands the model a *copy* of the
 graph, so authoring survives it — you can compile twice, compile different outputs,

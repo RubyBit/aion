@@ -41,7 +41,7 @@ HOP = 160
 
 
 def _i32(ctx, v, shape):
-    return aion.Tensor(np.full(shape, v, np.int32).tolist(), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
+    return aion.Tensor(np.full(shape, v, np.int32).tolist(), ctx=ctx, dtype=aion.int32)
 
 
 # ---------------- record-then-transcribe (offline model) ----------------
@@ -116,12 +116,26 @@ class StreamFull:
         # Per-run inputs (rewritten in place each step) — bound once.
         self.t_audio = fn(np.zeros((self.wsamp, 1), np.float32))
         self.t_mask = fn(np.zeros((self.chunk, self.t_kv), np.float32))
-        self.t_frame = _i32(ctx, 0, (1,)); self.t_sym = _i32(ctx, 0, (1,))
-        self.t_count = _i32(ctx, 0, (1,)); self.t_active = _i32(ctx, 1, (1,))
-        self.t_toks = _i32(ctx, 0, (self.max_out, 1))
-        m.bind_input("audio", self.t_audio); m.bind_input("cache_mask", self.t_mask)
-        m.bind_input("frame_in", self.t_frame); m.bind_input("sym_in", self.t_sym)
-        m.bind_input("count_in", self.t_count); m.bind_input("active_in", self.t_active)
+        self.t_frame = _i32(ctx, 0, (1,))
+        self.t_sym = _i32(ctx, 0, (1,))
+        self.t_count = _i32(ctx, 0, (1,))
+        self.t_active = _i32(ctx, 1, (1,))
+
+        # New exports use a rank-1 token buffer. Accept older packages whose
+        # converter emitted the equivalent [max_out, 1] scalar-row representation.
+        toks_index = m.input_names().index("toks_in")
+        toks_rank = m.input_rank(toks_index)
+        if toks_rank not in (1, 2):
+            raise ValueError(f"unsupported toks_in rank: {toks_rank}")
+        toks_shape = (self.max_out,) if toks_rank == 1 else (self.max_out, 1)
+        self.t_toks = aion.Tensor.zeros(toks_shape, ctx=ctx, dtype=aion.int32)
+
+        m.bind_input("audio", self.t_audio)
+        m.bind_input("cache_mask", self.t_mask)
+        m.bind_input("frame_in", self.t_frame)
+        m.bind_input("sym_in", self.t_sym)
+        m.bind_input("count_in", self.t_count)
+        m.bind_input("active_in", self.t_active)
         m.bind_input("toks_in", self.t_toks)
 
         # Persistent state (IoAlias'd, zero-init) — the caches and LSTM h/c are
@@ -140,12 +154,18 @@ class StreamFull:
         self.t_audio.copy_from(window.reshape(self.wsamp, 1))
         self.t_mask.copy_from(mask)
         # Re-seed the per-run decode carries (the Loop leaves final values here).
-        self.t_frame.copy_from([0]); self.t_sym.copy_from([0])
-        self.t_count.copy_from([0]); self.t_active.copy_from([1])
-        self.t_toks.copy_from([[0]] * self.max_out)
+        self.t_frame.copy_from(0)
+        self.t_sym.copy_from(0)
+        self.t_count.copy_from(0)
+        self.t_active.copy_from(1)
+        self.t_toks.copy_from(0)
         m.run()
-        oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
-        ot = m.output_tensor("out_tokens"); self.tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()
+        oc = m.output_tensor("out_count")
+        cnt = int(oc.item())
+        oc.close()
+        ot = m.output_tensor("out_tokens")
+        self.tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]
+        ot.close()
         self.c += 1
 
     def text(self):

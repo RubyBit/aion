@@ -92,7 +92,7 @@ def _load_tokenizer(path_or_url: str, *, cache_path: Path) -> _Tokenizer:
 
     def load_json(p: Path) -> _Tokenizer:
         try:
-            from tokenizers import Tokenizer  # type: ignore
+            from tokenizers import Tokenizer
         except Exception as e:  # pragma: no cover
             raise SystemExit(
                 "Hugging Face tokenizers is required for tokenizer.json; install via: uv pip install tokenizers"
@@ -101,7 +101,7 @@ def _load_tokenizer(path_or_url: str, *, cache_path: Path) -> _Tokenizer:
 
     def load_spm(p: Path) -> _Tokenizer:
         try:
-            import sentencepiece as spm  # type: ignore
+            import sentencepiece as spm
         except Exception as e:  # pragma: no cover
             raise SystemExit(
                 "sentencepiece is required for tokenizer.model; install via: uv pip install sentencepiece"
@@ -332,8 +332,8 @@ def main() -> None:
         ctx = model.context
 
         # Prefill tokens [1, S]; decode-step tensor [1, 1] rewritten in place.
-        tokens_prefill = aion.Tensor([prompt_ids], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
-        tokens_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
+        tokens_prefill = aion.Tensor([prompt_ids], ctx=ctx, dtype=aion.int32)
+        tokens_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.int32)
 
         try:
             # ---- Prefill ----
@@ -396,9 +396,7 @@ def main() -> None:
                 if stopped_by is not None:
                     break
 
-                # The decode input is `[batch, seq] == (1, 1)`, so the token has to be
-                # nested to match: `copy_from` checks the shape rather than the count.
-                tokens_step.copy_from([[next_id]])
+                tokens_step.copy_from(next_id)
 
                 t0_step_run_ns = time.perf_counter_ns()
                 model.run()

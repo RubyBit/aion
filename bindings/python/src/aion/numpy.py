@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from .dtype import is_quantized, normalize_dtype, numpy_dtype
+from .dtype import dtype_name, is_quantized, normalize_dtype, numpy_dtype
 from ._ffi.runtime import (
     create_tensor_from_buffer,
     read_tensor_into_buffer,
     write_tensor_from_buffer,
 )
 from .enums import AionDType
-from .types import NDArray
+from .types import ArrayLike, DTypeLike, NDArray
 
 if TYPE_CHECKING:
     from .context import Context
@@ -31,7 +31,7 @@ def _require_numpy():
     return np
 
 
-def _as_contiguous(array: object, dt: AionDType):
+def _as_contiguous(array: ArrayLike, dt: AionDType):
     """Coerce `array` to a C-contiguous, writable, itemsize-aligned buffer of the
     numpy dtype matching `dt`. Returns the (possibly copied) numpy array."""
     np = _require_numpy()
@@ -57,7 +57,9 @@ def _tensor_to_numpy(tensor: "Tensor") -> NDArray:
 
     dt = tensor.dtype
     if is_quantized(dt):
-        raise NotImplementedError(f"{dt.name}: quantized tensors have no numpy representation")
+        raise NotImplementedError(
+            f"{dtype_name(dt)}: quantized tensors have no numpy representation"
+        )
 
     shape = tensor.shape
     out = np.empty(shape, dtype=numpy_dtype(dt))
@@ -70,7 +72,7 @@ def _tensor_to_numpy(tensor: "Tensor") -> NDArray:
 
 
 def _tensor_from_numpy(
-    ctx: "Context", array: object, *, dtype: object | None = None
+    ctx: "Context", array: ArrayLike, *, dtype: DTypeLike | None = None
 ) -> "Tensor":
     """Create a tensor from a NumPy array. `dtype` defaults to the array's dtype
     (mapped to the nearest Aion scalar dtype)."""
@@ -80,7 +82,9 @@ def _tensor_from_numpy(
     else:
         dt = normalize_dtype(np.asarray(cast(Any, array)).dtype)
     if is_quantized(dt):
-        raise NotImplementedError(f"{dt.name}: use Tensor.quantize for quantized tensors")
+        raise NotImplementedError(
+            f"{dtype_name(dt)}: use Tensor.quantize for quantized tensors"
+        )
 
     arr = _as_contiguous(array, dt)
     if arr.ndim == 0:
@@ -98,17 +102,22 @@ def _tensor_from_numpy(
     return Tensor._from_handle(ctx, handle, dtype=dt, shape=tuple(shape))
 
 
-def _copy_numpy_into_tensor(tensor: "Tensor", array: object) -> None:
+def _copy_numpy_into_tensor(tensor: "Tensor", array: ArrayLike) -> None:
     """Write into an existing tensor from a NumPy array (dtype = tensor's;
     shape must match)."""
+    np = _require_numpy()
     dt = tensor.dtype
     if is_quantized(dt):
-        raise NotImplementedError(f"{dt.name}: quantized tensors have no numpy write path")
+        raise NotImplementedError(
+            f"{dtype_name(dt)}: quantized tensors have no numpy write path"
+        )
 
     arr = _as_contiguous(array, dt)
 
     expected_shape = tensor.shape
-    if tuple(arr.shape) != tuple(expected_shape):
+    if arr.ndim == 0:
+        arr = np.full(expected_shape, arr.item(), dtype=numpy_dtype(dt))
+    elif tuple(arr.shape) != tuple(expected_shape):
         raise ValueError(f"shape mismatch: tensor {expected_shape} vs array {arr.shape}")
 
     n = int(arr.size)

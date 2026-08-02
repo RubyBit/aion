@@ -25,7 +25,7 @@ in Python is only the per-layer composition.
 """
 from __future__ import annotations
 
-from .attention import CachedAttention, KVCache, RelPosSelfAttention, RoPE
+from .attention import Attention, KVCache, RelPosSelfAttention, RoPE
 from .functional import scale, shift, softcap
 from .layers import (
     Activation,
@@ -70,7 +70,7 @@ __all__ = [
     # attention
     "RoPE",
     "KVCache",
-    "CachedAttention",
+    "Attention",
     "RelPosSelfAttention",
     # constant-bearing helpers
     "scale",

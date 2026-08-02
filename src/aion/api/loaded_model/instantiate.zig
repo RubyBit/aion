@@ -32,7 +32,6 @@ pub fn instantiateNode(
         .GeluMul => try graph.addGeluMul(mapped_inputs[0], mapped_inputs[1]),
         .MatMul => |mm| try graph.addMatMul(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
         .ElemwiseBinary => |eb| try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
-        .BroadcastLastDimBinary => |eb| try graph.addBroadcastLastDimBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
         .Unary => |u| try graph.addUnary(u.op, mapped_inputs[0]),
         .Softmax => |s| try graph.addSoftmax(mapped_inputs[0], s.axis),
         .Conv1D => |cv| try graph.addConv1DWithPadMode(
@@ -69,8 +68,6 @@ pub fn instantiateNode(
             const shape = try package_file.resolveShapeTerms(graph.arenaAlloc(), pkg, ln.normalized_shape, optional_symbols);
             break :blk try graph.addRMSNorm(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], ln.eps, shape);
         },
-        .Attention => |attn| try graph.addAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal),
-        .MultiHeadAttention => |attn| try graph.addMultiHeadAttention(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2], attn.scale, attn.causal, @intCast(attn.heads)),
         .RelPosMHA => |attn| try graph.addRelPosMHA(
             mapped_inputs[0],
             mapped_inputs[1],
@@ -80,21 +77,33 @@ pub fn instantiateNode(
             mapped_inputs[5],
             if (attn.has_mask) mapped_inputs[6] else null,
             attn.scale,
-            @intCast(attn.heads),
+            @intCast(attn.chunk_size),
+            @intCast(attn.chunk_left),
         ),
         .ArgMax => |am| try graph.addArgMax(mapped_inputs[0], am.axis),
         .ScatterRow => try graph.addScatterRow(mapped_inputs[0], mapped_inputs[1], mapped_inputs[2]),
-        .MultiHeadAttentionCached => |attn| try graph.addMultiHeadAttentionCached(
-            mapped_inputs[0],
-            mapped_inputs[1],
-            mapped_inputs[2],
-            mapped_inputs[3],
-            mapped_inputs[4],
-            attn.scale,
-            attn.causal,
-            @intCast(attn.sliding_window),
-            attn.attn_logits_soft_cap,
-        ),
+        .Gather => |gg| try graph.addGather(mapped_inputs[0], mapped_inputs[1], gg.axis, @intCast(gg.batch_dims)),
+        .Dim => |dd| try graph.addDim(mapped_inputs[0], dd.axis),
+        .Iota => |io| try graph.addIota(mapped_inputs[0], io.axis),
+        .Attention => |attn| blk: {
+            var control_idx: usize = 3;
+            const positions: ?graph_mod.ValueId = if ((attn.controls & 1) != 0) p: {
+                defer control_idx += 1;
+                break :p mapped_inputs[control_idx];
+            } else null;
+            const lengths: ?graph_mod.ValueId = if ((attn.controls & 2) != 0) mapped_inputs[control_idx] else null;
+            break :blk try graph.addAttention(
+                mapped_inputs[0],
+                mapped_inputs[1],
+                mapped_inputs[2],
+                positions,
+                lengths,
+                attn.scale,
+                attn.causal,
+                @intCast(attn.sliding_window),
+                attn.attn_logits_soft_cap,
+            );
+        },
         .Reduce => |rr| if (rr.axis) |axis| try graph.addReduceAxis(rr.op, mapped_inputs[0], axis) else try graph.addReduce(rr.op, mapped_inputs[0]),
         .Concat => |cc| try graph.addConcat(mapped_inputs, cc.axis),
         .LSTMCell => |lc| try graph.addLSTMCell(
@@ -115,7 +124,6 @@ pub fn instantiateNode(
             st.center,
         ),
         .Copy => try graph.addCopy(mapped_inputs[0]),
-        .GatherRows => try graph.addGatherRows(mapped_inputs[0], mapped_inputs[1]),
         .RoPE1D => |rp| try graph.addRoPE1D(
             mapped_inputs[0],
             mapped_inputs[1],

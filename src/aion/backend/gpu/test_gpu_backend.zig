@@ -354,7 +354,7 @@ test "gpu backend: layernorm matches CPU" {
 }
 
 // The RNNT decoder's state gate (`sel_row`): keep + (take-keep)*emit, done via
-// reshape [1,H]->[H,1], bcast_mul by scalar emit [1], reshape back, add. This is
+// reshape [1,H]->[H,1], multiply by scalar emit [1], reshape back, add. This is
 // the exact op chain the in-graph loop runs every iteration for h0/c0/h1/c1.
 // `emit` (0 or 1) is baked into the b input's data seed.
 fn buildSelRow(alloc: std.mem.Allocator, mgr: *StorageManager, emit: f32) !BuiltProg {
@@ -370,7 +370,7 @@ fn buildSelRow(alloc: std.mem.Allocator, mgr: *StorageManager, emit: f32) !Built
 
     const diff = try g.addElemwiseBinary(.sub, take, keep); // [1,H]
     const diff_c = try g.addViewReshape(diff, &.{ H, 1 }); // [H,1]
-    const scaled_c = try g.addBroadcastLastDimBinary(.mul, diff_c, emit_f); // [H,1]
+    const scaled_c = try g.addElemwiseBinary(.mul, diff_c, emit_f); // [H,1]
     const scaled = try g.addViewReshape(scaled_c, &.{ 1, H }); // [1,H]
     const out = try g.addElemwiseBinary(.add, keep, scaled); // [1,H]
     return finishProgGpuTiled(alloc, &g, mgr, out);
@@ -395,12 +395,25 @@ fn buildBroadcast(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     // per-tile b lookup, not just a single broadcast vector.
     const av = try makeInput(&g, mgr, &.{ 96, 64 }, &.{ 32, 32 }, 8);
     const bv = try makeInput(&g, mgr, &.{64}, &.{32}, 9);
-    const out = try g.addBroadcastLastDimBinary(.mul, av, bv);
+    const out = try g.addElemwiseBinary(.mul, av, bv);
     return finishProg(alloc, &g, mgr, out);
 }
 
 test "gpu backend: broadcast-last-dim binary matches CPU" {
     try expectGpuMatchesCpu(buildBroadcast, 96 * 64, 1e-6);
+}
+
+fn buildGeneralBroadcast(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const av = try makeInput(&g, mgr, &.{ 2, 1, 5 }, &.{ 1, 1, 3 }, 210);
+    const bv = try makeInput(&g, mgr, &.{ 1, 3, 1 }, &.{ 1, 2, 1 }, 211);
+    const out = try g.addElemwiseBinary(.sub, av, bv);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+
+test "gpu backend: general right-aligned broadcast matches CPU" {
+    try expectGpuMatchesCpu(buildGeneralBroadcast, 2 * 3 * 5, 1e-6);
 }
 
 fn buildReduceAxis(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -562,13 +575,20 @@ fn packQ8Kmajor(alloc: std.mem.Allocator, vals: []const f32, k: usize, n: usize)
 // test shapes the CPU routes M==1 through an int8-GEMM that quantizes the
 // activation too (a *different*, lossier algorithm), so a CPU cross-check would
 // compare apples to oranges. On real Gemma shapes the CPU uses the f32-A path.
-fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !void {
+fn expectQ8KMajorGemvShape(
+    alloc: std.mem.Allocator,
+    batch: usize,
+    k: usize,
+    n: usize,
+    batched_activation: bool,
+    tol: f32,
+) !void {
     var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
     defer device.deinit();
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
 
-    const a = try alloc.alloc(f32, k);
+    const a = try alloc.alloc(f32, batch * k);
     defer alloc.free(a);
     for (a, 0..) |*v, i| {
         const kk: u32 = @intCast((i * 2654435761 + 20) % 1000);
@@ -584,28 +604,31 @@ fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !v
     defer alloc.free(packed_b);
 
     // Host reference: f32 A · dequant(B), per output column.
-    const ref = try alloc.alloc(f32, n);
+    const ref = try alloc.alloc(f32, batch * n);
     defer alloc.free(ref);
-    for (0..n) |col| {
-        var acc: f32 = 0;
-        for (0..k / 32) |bk| {
-            const off = (bk * n + col) * 34;
-            const scale: f32 = @as(f16, @bitCast(std.mem.readInt(u16, packed_b[off..][0..2], .little)));
-            for (0..32) |kk| {
-                const q: i8 = @bitCast(packed_b[off + 2 + kk]);
-                acc += a[bk * 32 + kk] * (@as(f32, @floatFromInt(q)) * scale);
+    for (0..batch) |row| {
+        for (0..n) |col| {
+            var acc: f32 = 0;
+            for (0..k / 32) |bk| {
+                const off = (bk * n + col) * 34;
+                const scale: f32 = @as(f16, @bitCast(std.mem.readInt(u16, packed_b[off..][0..2], .little)));
+                for (0..32) |kk| {
+                    const q: i8 = @bitCast(packed_b[off + 2 + kk]);
+                    acc += a[row * k + bk * 32 + kk] * (@as(f32, @floatFromInt(q)) * scale);
+                }
             }
+            ref[row * n + col] = acc;
         }
-        ref[col] = acc;
     }
 
     var mgr = StorageManager.init(alloc);
     defer mgr.deinit();
     var g = Graph.init(alloc);
     defer g.deinit();
-    const a_id = try mgr.createTiledTensor(.f32, &.{ 1, k }, &.{ 1, k }, .{});
+    const a_shape: []const usize = if (batched_activation) &.{ batch, 1, k } else &.{ 1, k };
+    const a_id = try mgr.createTiledTensor(.f32, a_shape, a_shape, .{});
     try mgr.writeFromPackedScalar(a_id, std.mem.sliceAsBytes(a));
-    const av = try g.addInput(.f32, &.{ 1, k });
+    const av = try g.addInput(.f32, a_shape);
     try g.bindExternal(av, a_id);
     const b_id = try mgr.createTiledTensor(.q8_0, &.{ k, n }, &.{ k, n }, .{ .tile_alignment = 64, .quant_axis = 0 });
     try mgr.writeFromPackedQuant(b_id, packed_b);
@@ -616,7 +639,7 @@ fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !v
     defer built.prog.deinit();
 
     try gb.backend().executeProgram(&built.prog, mgr.tensorStore());
-    const out = try alloc.alloc(f32, n);
+    const out = try alloc.alloc(f32, batch * n);
     defer alloc.free(out);
     try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(out));
 
@@ -628,9 +651,17 @@ fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !v
     }
 }
 
+fn expectQ8KMajorGemv(alloc: std.mem.Allocator, k: usize, n: usize, tol: f32) !void {
+    return expectQ8KMajorGemvShape(alloc, 1, k, n, false, tol);
+}
+
 // K = 256 (8 blocks = one partial 16-block chunk), N = 128 (64 column pairs).
 test "gpu backend: matmul q8_0 (K-major) matvec (M=1)" {
     try expectQ8KMajorGemv(std.testing.allocator, 256, 128, 1e-3);
+}
+
+test "gpu backend: batched matmul broadcasts rank-2 q8_0 weight" {
+    try expectQ8KMajorGemvShape(std.testing.allocator, 2, 256, 128, true, 1e-3);
 }
 
 // K = 1024 spans multiple 16-block chunks (32 block-rows / 16 = 2 chunks) to
@@ -670,7 +701,7 @@ fn buildGatherF32(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     defer g.deinit();
     const table = try makeInput(&g, mgr, &.{ 64, 32 }, &.{ 16, 32 }, 40);
     const idx = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
-    const out = try g.addGatherRows(table, idx);
+    const out = try g.addGather(table, idx, 0, 0);
     return finishProg(alloc, &g, mgr, out);
 }
 
@@ -684,7 +715,7 @@ fn buildGatherF32SingleTile(alloc: std.mem.Allocator, mgr: *StorageManager) !Bui
     // Single-tile table -> the device-side gather kernel (indices read on-GPU).
     const table = try makeInput(&g, mgr, &.{ 64, 32 }, &.{ 64, 32 }, 42);
     const idx = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
-    const out = try g.addGatherRows(table, idx);
+    const out = try g.addGather(table, idx, 0, 0);
     return finishProg(alloc, &g, mgr, out);
 }
 
@@ -712,7 +743,7 @@ fn buildGatherQ8(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     try g.bindExternal(tv, t_id);
 
     const idx = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
-    const out = try g.addGatherRows(tv, idx);
+    const out = try g.addGather(tv, idx, 0, 0);
     return finishProg(alloc, &g, mgr, out);
 }
 
@@ -742,7 +773,7 @@ fn buildGatherQ8SingleTile(alloc: std.mem.Allocator, mgr: *StorageManager) !Buil
     try g.bindExternal(tv, t_id);
 
     const idx = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
-    const out = try g.addGatherRows(tv, idx);
+    const out = try g.addGather(tv, idx, 0, 0);
     return finishProg(alloc, &g, mgr, out);
 }
 
@@ -766,7 +797,7 @@ fn buildGatherDeviceIdx(comptime multi_tile: bool) fn (std.mem.Allocator, *Stora
             const base = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
             const zero = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &[_]i32{0} ** 10);
             const idx = try g.addElemwiseBinary(.add, base, zero); // device-computed index
-            const out = try g.addGatherRows(table, idx);
+            const out = try g.addGather(table, idx, 0, 0);
             return finishProg(alloc, &g, mgr, out);
         }
     }.build;
@@ -798,8 +829,8 @@ test "gpu backend: rope matches CPU" {
 fn buildKVAppend(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
-    const cache = try makeInput(&g, mgr, &.{ 1, 2, 8, 16 }, &.{ 1, 2, 8, 16 }, 43);
-    const new_kv = try makeInput(&g, mgr, &.{ 1, 2, 3, 16 }, &.{ 1, 2, 3, 16 }, 44);
+    const cache = try makeInput(&g, mgr, &.{ 1, 8, 2, 16 }, &.{ 1, 8, 2, 16 }, 43);
+    const new_kv = try makeInput(&g, mgr, &.{ 1, 3, 2, 16 }, &.{ 1, 3, 2, 16 }, 44);
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{2});
     const out = try g.addSequenceAppend(cache, new_kv, end);
     return finishProg(alloc, &g, mgr, out);
@@ -836,49 +867,38 @@ fn finishProgGpuTiled(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager,
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
-fn buildAttention(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+fn buildAttentionSeq(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
-    // Rank-3: 2 lead slices, m=24 queries, n=20 keys, dk=32, dv=24 (deliberately
-    // not a multiple of 16 — exercises the exact-dim GPU tile chooser).
-    const q = try makeInput(&g, mgr, &.{ 2, 24, 32 }, &.{ 1, 24, 32 }, 50);
-    const k = try makeInput(&g, mgr, &.{ 2, 20, 32 }, &.{ 1, 20, 32 }, 51);
-    const v = try makeInput(&g, mgr, &.{ 2, 20, 24 }, &.{ 1, 20, 24 }, 52);
-    const out = try g.addAttention(q, k, v, 0.25, false);
+    // No positions/end_index: k/v are a plain sequence, so the kernel takes each
+    // query's position to be its row and all T keys to be live. Also the path where
+    // bindings 3/4 are dummies — a wrong `has_idx` would read q as i32 and diverge.
+    // GQA (4 q heads over 2 kv heads), causal, T long enough for several 256-key
+    // online-softmax chunks.
+    const q = try makeInput(&g, mgr, &.{ 2, 300, 4, 32 }, &.{ 2, 300, 4, 32 }, 50);
+    const k = try makeInput(&g, mgr, &.{ 2, 300, 2, 32 }, &.{ 2, 300, 2, 32 }, 51);
+    const v = try makeInput(&g, mgr, &.{ 2, 300, 2, 24 }, &.{ 2, 300, 2, 24 }, 52);
+    const out = try g.addAttention(q, k, v, null, null, 0.1767767, true, 0, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
-test "gpu backend: attention (non-causal) matches CPU" {
-    try expectGpuMatchesCpu(buildAttention, 2 * 24 * 24, 2e-5);
+test "gpu backend: attention over a plain sequence (no index operands) matches CPU" {
+    try expectGpuMatchesCpu(buildAttentionSeq, 2 * 300 * 4 * 24, 2e-5);
 }
 
-fn buildAttentionCausal(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+fn buildAttentionSeqNonCausal(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
-    const q = try makeInput(&g, mgr, &.{ 2, 24, 32 }, &.{ 1, 24, 32 }, 53);
-    const k = try makeInput(&g, mgr, &.{ 2, 24, 32 }, &.{ 1, 24, 32 }, 54);
-    const v = try makeInput(&g, mgr, &.{ 2, 24, 24 }, &.{ 1, 24, 24 }, 55);
-    const out = try g.addAttention(q, k, v, 0.25, true);
+    // Bidirectional (encoder-shaped) over the same sequence layout.
+    const q = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 53);
+    const k = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 54);
+    const v = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 55);
+    const out = try g.addAttention(q, k, v, null, null, 0.25, false, 0, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
-test "gpu backend: attention (causal) matches CPU" {
-    try expectGpuMatchesCpu(buildAttentionCausal, 2 * 24 * 24, 2e-5);
-}
-
-fn buildMHA(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
-    var g = Graph.init(alloc);
-    defer g.deinit();
-    // [B, H, T, D]: 2 batches x 3 heads, causal.
-    const q = try makeInput(&g, mgr, &.{ 2, 3, 40, 16 }, &.{ 1, 1, 40, 16 }, 56);
-    const k = try makeInput(&g, mgr, &.{ 2, 3, 24, 16 }, &.{ 1, 1, 24, 16 }, 57);
-    const v = try makeInput(&g, mgr, &.{ 2, 3, 24, 16 }, &.{ 1, 1, 24, 16 }, 58);
-    const out = try g.addMultiHeadAttention(q, k, v, 0.25, true, 3);
-    return finishProgGpuTiled(alloc, &g, mgr, out);
-}
-
-test "gpu backend: multi-head attention matches CPU" {
-    try expectGpuMatchesCpu(buildMHA, 2 * 3 * 40 * 16, 2e-5);
+test "gpu backend: attention over a plain sequence (bidirectional) matches CPU" {
+    try expectGpuMatchesCpu(buildAttentionSeqNonCausal, 1 * 24 * 3 * 32, 2e-5);
 }
 
 fn buildMHACached(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -887,11 +907,11 @@ fn buildMHACached(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     // GQA decode-ish shape with a T large enough to force several 256-key
     // chunks through the online softmax (T=600, end=520 / 100 per batch).
     const q = try makeInput(&g, mgr, &.{ 2, 3, 4, 32 }, &.{ 1, 3, 4, 32 }, 60);
-    const k = try makeInput(&g, mgr, &.{ 2, 2, 600, 32 }, &.{ 2, 2, 600, 32 }, 61);
-    const v = try makeInput(&g, mgr, &.{ 2, 2, 600, 32 }, &.{ 2, 2, 600, 32 }, 62);
+    const k = try makeInput(&g, mgr, &.{ 2, 600, 2, 32 }, &.{ 2, 600, 2, 32 }, 61);
+    const v = try makeInput(&g, mgr, &.{ 2, 600, 2, 32 }, &.{ 2, 600, 2, 32 }, 62);
     const pos = try makeInputI32(&g, mgr, &.{ 2, 3 }, &.{ 1, 3 }, &.{ 517, 518, 519, 97, 98, 99 });
     const end = try makeInputI32(&g, mgr, &.{2}, &.{2}, &.{ 520, 100 });
-    const out = try g.addMultiHeadAttentionCached(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -921,11 +941,11 @@ fn buildMHACachedF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg 
     defer g.deinit();
     // f16 caches + sliding window + logit soft cap in one program.
     const q = try makeInput(&g, mgr, &.{ 1, 2, 2, 16 }, &.{ 1, 2, 2, 16 }, 63);
-    const k = try makeInputF16(&g, mgr, &.{ 1, 1, 64, 16 }, &.{ 1, 1, 64, 16 }, 64);
-    const v = try makeInputF16(&g, mgr, &.{ 1, 1, 64, 16 }, &.{ 1, 1, 64, 16 }, 65);
+    const k = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 16 }, &.{ 1, 64, 1, 16 }, 64);
+    const v = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 16 }, &.{ 1, 64, 1, 16 }, 65);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 48, 49 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{50});
-    const out = try g.addMultiHeadAttentionCached(q, k, v, pos, end, 0.25, true, 20, 30.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.25, true, 20, 30.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -935,11 +955,11 @@ fn buildMHACachedSplitK(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPr
     // Long cache (T=2048 >= the split-K threshold) with a decode-shaped q:
     // exercises the flash-decoding split + merge path end-to-end.
     const q = try makeInput(&g, mgr, &.{ 1, 2, 4, 32 }, &.{ 1, 2, 4, 32 }, 66);
-    const k = try makeInput(&g, mgr, &.{ 1, 2, 2048, 32 }, &.{ 1, 2, 2048, 32 }, 67);
-    const v = try makeInput(&g, mgr, &.{ 1, 2, 2048, 32 }, &.{ 1, 2, 2048, 32 }, 68);
+    const k = try makeInput(&g, mgr, &.{ 1, 2048, 2, 32 }, &.{ 1, 2048, 2, 32 }, 67);
+    const v = try makeInput(&g, mgr, &.{ 1, 2048, 2, 32 }, &.{ 1, 2048, 2, 32 }, 68);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 1990, 1991 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{1992});
-    const out = try g.addMultiHeadAttentionCached(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1177,7 +1197,6 @@ test "gpu backend: stft (asr-scale, hop not dividing n_fft) matches CPU" {
     try expectGpuMatchesCpu(buildSTFTAudio, 1 * 101 * 514, 2e-3);
 }
 
-
 fn buildRelPosMHA(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
@@ -1190,12 +1209,31 @@ fn buildRelPosMHA(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const u = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 107);
     const vb = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 108);
     const mask = try makeInput(&g, mgr, &.{ 10, 10 }, &.{ 10, 10 }, 109);
-    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, mask, 0.25, 2);
+    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, mask, 0.25, 0, 0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
 test "gpu backend: rel-pos mha (masked) matches CPU" {
     try expectGpuMatchesCpu(buildRelPosMHA, 2 * 10 * 2 * 16, 2e-3);
+}
+
+/// Same shape, chunked-limited window instead of a mask, and a left context that is
+/// deliberately not a multiple of the chunk so the boundary arithmetic is exercised.
+fn buildRelPosMHAChunked(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 2, 10, 2, 16 }, &.{ 1, 10, 1, 16 }, 103);
+    const k = try makeInput(&g, mgr, &.{ 2, 10, 2, 16 }, &.{ 1, 10, 1, 16 }, 104);
+    const v = try makeInput(&g, mgr, &.{ 2, 10, 2, 16 }, &.{ 1, 10, 1, 16 }, 105);
+    const pe = try makeInput(&g, mgr, &.{ 2, 19, 16 }, &.{ 1, 19, 16 }, 106);
+    const u = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 107);
+    const vb = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 108);
+    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.25, 4, 3);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+
+test "gpu backend: rel-pos mha (chunked-limited window) matches CPU" {
+    try expectGpuMatchesCpu(buildRelPosMHAChunked, 2 * 10 * 2 * 16, 2e-3);
 }
 
 // ---- concat / views -------------------------------------------------------------
@@ -1286,16 +1324,16 @@ test "gpu backend: slice second half [1,1280]->[1,640] matches CPU" {
 }
 
 // The RNNT decoder's state gate multiplies a per-hidden delta [H,1] by the scalar
-// emit flag [1] (BroadcastLastDim with a size-1 last dim on the left operand).
+// emit flag [1] (ordinary scalar broadcasting).
 fn buildBcastMulColVec(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
     const a = try makeInput(&g, mgr, &.{ 640, 1 }, &.{ 640, 1 }, 31);
     const b = try makeInput(&g, mgr, &.{1}, &.{1}, 32);
-    const out = try g.addBroadcastLastDimBinary(.mul, a, b);
+    const out = try g.addElemwiseBinary(.mul, a, b);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
-test "gpu backend: bcast_mul [640,1]x[1] matches CPU" {
+test "gpu backend: scalar multiply [640,1]x[1] matches CPU" {
     try expectGpuMatchesCpu(buildBcastMulColVec, 640, 1e-5);
 }
 

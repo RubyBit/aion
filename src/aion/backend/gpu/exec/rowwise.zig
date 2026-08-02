@@ -30,6 +30,7 @@ const TileRefDevice = resident_mod.TileRefDevice;
 const softmax_kernel: KernelDesc = .{ .name = "softmax", .wgsl = @embedFile("../kernels/softmax.wgsl") };
 const norm_kernel: KernelDesc = .{ .name = "norm", .wgsl = @embedFile("../kernels/norm.wgsl") };
 const reduce_kernel: KernelDesc = .{ .name = "reduce", .wgsl = @embedFile("../kernels/reduce.wgsl") };
+const reduce_i32_kernel: KernelDesc = .{ .name = "reduce_i32", .wgsl = @embedFile("../kernels/reduce_i32.wgsl") };
 const argmax_kernel: KernelDesc = .{ .name = "argmax", .wgsl = @embedFile("../kernels/argmax.wgsl") };
 
 /// Uniform params shared by softmax (`rows/cols/x_row/o_row`) and, prefix-wise,
@@ -289,15 +290,22 @@ pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProg
 pub fn execReduceAxis(ctx: Ctx, frame: *Frame, s: executable.StepReduceAxis) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     const meta = hs.meta(s.a) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(out_meta.dtype);
+    if (meta.dtype != out_meta.dtype) return error.Unsupported;
+    switch (meta.dtype) {
+        .f32 => {},
+        .i32 => if (s.op != .sum) return error.Unsupported,
+        else => return error.Unsupported,
+    }
 
     const rank: usize = @as(usize, meta.rank);
     if (rank >= 2 and s.axis != rank - 1) return error.Unsupported; // v1: last axis only
     if (context.totalTiles(meta) != 1 or context.totalTiles(out_meta) != 1) return error.Unsupported;
 
-    const built = try ctx.pipes.get(reduce_kernel, reduceEntry(s.op));
+    const built = if (meta.dtype == .i32)
+        try ctx.pipes.get(reduce_i32_kernel, "reduce_sum_row")
+    else
+        try ctx.pipes.get(reduce_kernel, reduceEntry(s.op));
 
     const dx = ctx.rstore.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
     const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;

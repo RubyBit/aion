@@ -253,13 +253,14 @@ pub fn encodeTileIndex(meta: TensorMeta, coords: []const usize) StoreError!usize
 /// Rank ceiling for the inline coordinate buffers below, matching `graph.MAX_RANK`.
 pub const max_rank: usize = 8;
 
-/// Tile index of the operand tile an output tile reads, for an operand that
-/// broadcasts into the output's tile grid.
+/// Project coordinates from a right-aligned expanded tile grid into one
+/// operand's tile grid.
 ///
-/// `leading` is the output tile's coordinates over the dims the operand broadcasts
-/// across; `inner` is the operand's own innermost coordinates, which the caller
-/// supplies because they need not be the output's (a matmul reads `B` at
-/// `[.., k, n]` while writing `C` at `[.., m, n]`).
+/// `leading` supplies coordinates for the expanded prefix. `inner` supplies the
+/// operand's innermost coordinates when they differ from the output's, such as
+/// matmul's `[.., k, n]`. `broadcast_axes`, when present, is a mask over
+/// `leading`; masked coordinates project to zero. When absent, singleton
+/// operand dimensions are inferred from physical metadata.
 ///
 /// Broadcasting is right-aligned, and a dim the operand *does not have* behaves
 /// exactly like one it has as size 1. That extension to rank is what lets a
@@ -269,12 +270,13 @@ pub const max_rank: usize = 8;
 /// an externally-bound weight with a node result, costing it eligibility for
 /// horizontal matmul fusion.
 ///
-/// Every tiled kernel resolves its broadcast operands through this, so the rule is
-/// stated once instead of per operand per backend.
-pub fn broadcastTileIndex(
+/// Supplying an explicit mask is important for growable tensors: physical
+/// capacity may exceed the graph-specialized logical extent.
+pub fn projectTileIndex(
     meta: TensorMeta,
     leading: []const usize,
     inner: []const usize,
+    broadcast_axes: ?u8,
 ) StoreError!usize {
     const rank: usize = meta.tile_counts.len;
     if (rank == 0 or rank > max_rank) return StoreError.InvalidArgument;
@@ -287,9 +289,50 @@ pub fn broadcastTileIndex(
     var coords: [max_rank]usize = @splat(0);
     var d: usize = 0;
     while (d < broadcast_dims) : (d += 1) {
-        coords[d] = if (meta.shape[d] == 1) 0 else leading[d + offset];
+        const source_axis = d + offset;
+        const broadcasts = if (broadcast_axes) |axes|
+            (axes & (@as(u8, 1) << @intCast(source_axis))) != 0
+        else
+            meta.shape[d] == 1;
+        coords[d] = if (broadcasts) 0 else leading[source_axis];
     }
     @memcpy(coords[broadcast_dims..rank], inner);
 
     return encodeTileIndex(meta, coords[0..rank]);
+}
+
+test "projectTileIndex right-aligns operands and zeros logical broadcast axes" {
+    const meta: TensorMeta = .{
+        .dtype = .f32,
+        .rank = 2,
+        .shape = &.{ 8, 6 },
+        .tile_shape = &.{ 2, 2 },
+        .tile_counts = &.{ 4, 3 },
+        .tile_strides = &.{ 3, 1 },
+    };
+
+    // The rank-2 operand is aligned under output axes 1 and 2. Axis 1 is
+    // logically broadcast even though its growable physical extent is 8.
+    try std.testing.expectEqual(@as(usize, 2), try projectTileIndex(
+        meta,
+        &.{ 7, 3, 2 },
+        &.{},
+        @as(u8, 1) << 1,
+    ));
+}
+
+test "projectTileIndex derives physical singleton broadcasting for matmul" {
+    const meta: TensorMeta = .{
+        .dtype = .f32,
+        .rank = 3,
+        .shape = &.{ 1, 4, 6 },
+        .tile_shape = &.{ 1, 2, 2 },
+        .tile_counts = &.{ 1, 2, 3 },
+        .tile_strides = &.{ 6, 3, 1 },
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try projectTileIndex(meta, &.{9}, &.{ 1, 2 }, null),
+    );
 }

@@ -17,7 +17,6 @@ pub const Linear = linear_mod.Linear;
 pub const OutputAlias = package_export.OutputAlias;
 pub const InputRoleDecl = package_export.InputRoleDecl;
 
-
 /// Rotary position embedding over `x: [batch, seq, heads, head_dim]`, driven by an
 /// i32 `positions: [batch, seq]`.
 ///
@@ -52,7 +51,7 @@ pub const RoPE = struct {
     }
 };
 
-/// A `[batch, kv_heads, capacity, head_dim]` key/value cache that the runtime
+/// A `[batch, capacity, kv_heads, head_dim]` key/value cache that the runtime
 /// allocates, zero-fills, and carries across runs.
 ///
 /// This bundles the three things a cache needs, which every converter wires by
@@ -89,7 +88,7 @@ pub const KVCache = struct {
         growable: bool = false,
     };
 
-    /// Declare the cache input. `shape` is `[batch, kv_heads, capacity, head_dim]`;
+    /// Declare the cache input. `shape` is `[batch, capacity, kv_heads, head_dim]`;
     /// the capacity entry is replaced by `opts.capacity`/`opts.capacity_symbol`.
     pub fn bind(
         bld: *Builder,
@@ -109,57 +108,38 @@ pub const KVCache = struct {
         else
             opts.capacity;
 
-        const shape = [_]usize{ batch, kv_heads, capacity, head_dim };
+        const shape = [_]usize{ batch, capacity, kv_heads, head_dim };
         const input: TensorRef = try bld.input(opts.dtype, &shape);
         if (opts.name) |n| _ = try bld.name(input, n);
-        if (opts.capacity_symbol) |sym| try bld.symbolicDim(input, 2, sym);
+        if (opts.capacity_symbol) |sym| try bld.symbolicDim(input, 1, sym);
 
         return .{
             .input = input,
             .current = input,
             .dtype = opts.dtype,
-            .axis = 2,
+            .axis = 1,
             .capacity_symbol = opts.capacity_symbol,
             .growable = opts.growable,
         };
     }
 
-    /// Append this step's K or V, moving heads next to batch and casting to the
-    /// cache dtype.
+    /// Append this step's K or V, casting to the cache dtype.
     ///
-    /// `kv` is `[batch, seq, kv_heads, head_dim]` — what `CachedAttention.project`
-    /// returns, and the layout the K/V norms and RoPE operate on. The store is
-    /// `[batch, kv_heads, seq, head_dim]`, so this owns that difference: the cache's
-    /// layout is the cache's business, and pre-transposing in `project` would leave
-    /// no place to put the norm and RoPE that sit in between.
-    ///
-    /// Moving heads across `seq` is a *transpose*, which the graph can only express
-    /// as a reshape when one of the two axes is 1. With a single KV head — the
-    /// shared-cache case this type exists for — it always is. More KV heads need a
-    /// permute op the graph does not have yet, so that is rejected rather than
-    /// silently reinterpreted.
+    /// `kv` is `[batch, seq, kv_heads, head_dim]` — what `Attention.project`
+    /// returns and the cache stores. Keeping the projection and cache layouts the
+    /// same makes multi-KV-head append a direct operation.
     pub fn append(self: *Self, bld: *Builder, kv: TensorRef, write_index: TensorRef) Builder.Error!TensorRef {
         const dims: []const usize = bld.knownShape(kv) orelse return Builder.Error.InvalidArgument;
         const store: []const usize = bld.knownShape(self.input) orelse return Builder.Error.InvalidArgument;
         if (dims.len != 4 or store.len != 4) return Builder.Error.InvalidArgument;
 
-        const kv_heads: usize = store[1];
+        const kv_heads: usize = store[2];
         if (dims[2] != kv_heads or dims[3] != store[3]) return Builder.Error.ShapeMismatch;
-        if (kv_heads != 1) return Builder.Error.Unsupported;
 
-        // Same element order at one head, so a reshape does it — and going through
-        // `reshapeDims` keeps a free `seq` axis free.
-        const head_second: TensorRef = try bld.reshapeDims(kv, &[_]Builder.Dim{
-            try bld.dimAt(kv, 0),
-            .{ .size = kv_heads },
-            try bld.dimAt(kv, 1),
-            .{ .size = dims[3] },
-        });
-
-        const cast_kv: TensorRef = if (bld.dtypeOf(head_second)) |dt|
-            (if (dt == self.dtype) head_second else try bld.cast(head_second, self.dtype))
+        const cast_kv: TensorRef = if (bld.dtypeOf(kv)) |dt|
+            (if (dt == self.dtype) kv else try bld.cast(kv, self.dtype))
         else
-            try bld.cast(head_second, self.dtype);
+            try bld.cast(kv, self.dtype);
 
         self.current = try bld.sequenceAppend(self.current, cast_kv, write_index);
         return self.current;
@@ -194,7 +174,8 @@ pub const KVCache = struct {
     }
 };
 
-/// Multi-head attention over a KV cache — the decode-time attention.
+/// Grouped-query attention — over a KV cache (decode) or a plain sequence
+/// (prefill, encoders); `attend` takes the cache indices or omits them.
 ///
 /// Holds the four projections and the attention hyperparameters. Q, K and V are
 /// separate, the way checkpoints ship them; concatenating them into one wide
@@ -203,7 +184,7 @@ pub const KVCache = struct {
 ///
 /// Grouped-query attention falls out of `kv_heads < heads`; the op requires
 /// `heads % kv_heads == 0`.
-pub const CachedAttention = struct {
+pub const Attention = struct {
     q_proj: Linear,
     /// Null when this layer reads a cache another layer writes (see `Weights`).
     k_proj: ?Linear,
@@ -276,14 +257,14 @@ pub const CachedAttention = struct {
         if (cfg.heads == 0 or cfg.kv_heads == 0 or cfg.head_dim == 0) return Builder.Error.InvalidArgument;
         if (cfg.heads % cfg.kv_heads != 0) return Builder.Error.InvalidArgument;
         if (!std.math.isFinite(cfg.scale)) return Builder.Error.InvalidArgument;
+        if (cfg.sliding_window > 0 and !cfg.causal) return Builder.Error.InvalidArgument;
     }
 
     /// Q/K/V for this step, all reshaped to `[batch, seq, heads, head_dim]` (K/V
     /// with `kv_heads`).
     ///
-    /// One layout for all three, and it is the one the Q/K norms and RoPE operate
-    /// on, because those sit between projection and attention. Moving K/V heads
-    /// next to batch for the cache store is `KVCache.append`'s job.
+    /// One layout for all three, shared by projection, norms, RoPE, cache append,
+    /// and attention.
     ///
     /// `k`/`v` are null on a layer that only reads a shared cache — there is
     /// nothing to append, and `attend` is handed the owning layer's cache instead.
@@ -321,28 +302,33 @@ pub const CachedAttention = struct {
         };
     }
 
-    /// Attend `q` against the caches, then apply the output projection.
+    /// Attend `q` against k/v, then apply the output projection.
     ///
-    /// `q` is `[batch, seq, heads, head_dim]`; caches are the refs returned by
-    /// `KVCache.append`.
+    /// `q` is `[batch, seq, heads, head_dim]`; `k`/`v` are `[batch, t, kv_heads,
+    /// head_dim]` — the refs `KVCache.append` returns, or this layer's own
+    /// whole-sequence K/V when there is no cache.
+    ///
+    /// The controls are independent. `query_positions` defaults to each query's
+    /// row index and `kv_lengths` defaults to `t`. Causal attention with unequal
+    /// query/key lengths therefore requires explicit query positions.
     pub fn attend(
         self: Self,
         bld: *Builder,
         q: TensorRef,
-        k_cache: TensorRef,
-        v_cache: TensorRef,
-        positions: TensorRef,
-        visible_end: TensorRef,
+        k: TensorRef,
+        v: TensorRef,
+        query_positions: ?TensorRef,
+        kv_lengths: ?TensorRef,
     ) Builder.Error!TensorRef {
         const scope = try self.id.enter(bld);
         defer bld.endScope(scope);
 
-        const attn: TensorRef = try bld.multiHeadAttentionCached(
+        const attn: TensorRef = try bld.attention(
             q,
-            k_cache,
-            v_cache,
-            positions,
-            visible_end,
+            k,
+            v,
+            query_positions,
+            kv_lengths,
             self.cfg.scale,
             self.cfg.causal,
             self.cfg.sliding_window,
@@ -380,6 +366,7 @@ pub const RelPosSelfAttention = struct {
     heads: usize,
     head_dim: usize,
     scale: f32,
+    window: Builder.ChunkWindow = .{},
     id: LayerName = .{},
 
     const Self = @This();
@@ -399,10 +386,14 @@ pub const RelPosSelfAttention = struct {
         mask: ?Tensor = null,
     };
 
+    /// No `heads`: it is `pos_emb`'s dim 0, like `head_dim` is its dim 2.
     pub const Config = struct {
-        heads: usize,
         /// Logit scale, usually `1 / sqrt(head_dim)`.
         scale: f32,
+        /// Chunked-limited attention window. Structural, so it costs two integers
+        /// and lets the kernels skip out-of-window keys; prefer it over encoding
+        /// the same pattern in `Weights.mask`.
+        window: Builder.ChunkWindow = .{},
     };
 
     pub const Options = struct {
@@ -410,7 +401,6 @@ pub const RelPosSelfAttention = struct {
     };
 
     pub fn bind(bld: *Builder, params: anytype, cfg: Config, opts: Options) BindError!Self {
-        if (cfg.heads == 0) return error.InvalidArgument;
         if (!std.math.isFinite(cfg.scale)) return error.InvalidArgument;
 
         var src = state_mod.binding(Weights, params);
@@ -423,11 +413,14 @@ pub const RelPosSelfAttention = struct {
         const pos_bias_u = try p.get(bld, Weights, .pos_bias_u);
         const pos_bias_v = try p.get(bld, Weights, .pos_bias_v);
 
+        // `heads` and `head_dim` come off `pos_emb` ([heads, P, head_dim]); the biases
+        // must agree with it. Nothing declares the head count separately, so nothing
+        // can disagree with the weights.
         const pe = bld.knownShape(pos_emb) orelse return error.InvalidArgument;
-        if (pe.len != 3 or pe[0] != cfg.heads) return error.InvalidArgument;
+        if (pe.len != 3 or pe[0] == 0 or pe[2] == 0) return error.InvalidArgument;
         for ([_]TensorRef{ pos_bias_u, pos_bias_v }) |bias| {
             const bs = bld.knownShape(bias) orelse return error.InvalidArgument;
-            if (bs.len != 2 or bs[0] != cfg.heads) return error.InvalidArgument;
+            if (bs.len != 2 or bs[0] != pe[0] or bs[1] != pe[2]) return error.InvalidArgument;
         }
 
         return .{
@@ -439,9 +432,10 @@ pub const RelPosSelfAttention = struct {
             .pos_bias_u = pos_bias_u,
             .pos_bias_v = pos_bias_v,
             .mask = try p.getOpt(bld, Weights, .mask),
-            .heads = cfg.heads,
+            .heads = pe[0],
             .head_dim = pe[2],
             .scale = cfg.scale,
+            .window = cfg.window,
             .id = id,
         };
     }
@@ -451,7 +445,7 @@ pub const RelPosSelfAttention = struct {
 
     /// Run the three projections and split them into heads, without attending.
     ///
-    /// Split out for the same reason `CachedAttention.project` is: a streaming
+    /// Split out for the same reason `Attention.project` is: a streaming
     /// encoder prepends cached K/V from earlier chunks between projection and
     /// attention, so the two cannot be one step.
     pub fn project(self: Self, bld: *Builder, x: TensorRef) Builder.Error!Projected {
@@ -461,7 +455,7 @@ pub const RelPosSelfAttention = struct {
         const dims: []const usize = bld.knownShape(x) orelse return Builder.Error.InvalidArgument;
         if (dims.len != 3) return Builder.Error.InvalidArgument;
 
-        // Batch and time carry whatever freedom `x` has; see `CachedAttention.project`.
+        // Batch and time carry whatever freedom `x` has; see `Attention.project`.
         const head_shape = [_]Builder.Dim{
             try bld.dimAt(x, 0),
             try bld.dimAt(x, 1),
@@ -481,7 +475,7 @@ pub const RelPosSelfAttention = struct {
         const scope = try self.id.enter(bld);
         defer bld.endScope(scope);
 
-        const attn: TensorRef = try bld.relPosMHA(q, k, v, self.pos_emb, self.pos_bias_u, self.pos_bias_v, self.mask, self.scale, self.heads);
+        const attn: TensorRef = try bld.relPosMHA(q, k, v, self.pos_emb, self.pos_bias_u, self.pos_bias_v, self.mask, self.scale, self.window);
         const flat: TensorRef = try bld.reshapeDims(attn, &[_]Builder.Dim{
             try bld.dimAt(attn, 0),
             try bld.dimAt(attn, 1),
@@ -496,4 +490,3 @@ pub const RelPosSelfAttention = struct {
         return self.attend(bld, p.q, p.k, p.v);
     }
 };
-

@@ -246,7 +246,8 @@ pub const Matmul = struct {
     fn execBatched(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!void {
         const rank = c_meta.tile_counts.len;
         if (rank < 3 or rank > 8) return error.Unsupported;
-        if (a_meta.tile_counts.len != rank or b_meta.tile_counts.len != rank) return error.Unsupported;
+        const b_rank = b_meta.tile_counts.len;
+        if (a_meta.tile_counts.len != rank or b_rank < 2 or b_rank > rank) return error.Unsupported;
 
         try ensureTileBindingFits(ctx, c_meta);
         try ensureTileBindingFits(ctx, a_meta);
@@ -275,8 +276,8 @@ pub const Matmul = struct {
                 const beta: f32 = if (ti_k == 0) s.beta else 1.0;
 
                 const batch: []const usize = coords[0 .. rank - 2];
-                const a_lin = tensor_store_mod.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k }) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n }) catch return error.ExecutionFailed;
+                const a_lin = tensor_store_mod.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null) catch return error.ExecutionFailed;
+                const b_lin = tensor_store_mod.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null) catch return error.ExecutionFailed;
                 try recordTileGemmLinear(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
             }
         }
@@ -301,7 +302,8 @@ pub const Matmul = struct {
     fn execQuantB(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!void {
         const rank = c_meta.tile_counts.len;
         if (rank < 2 or rank > 8) return error.Unsupported;
-        if (a_meta.tile_counts.len != rank or b_meta.tile_counts.len != rank) return error.Unsupported;
+        const b_rank = b_meta.tile_counts.len;
+        if (a_meta.tile_counts.len != rank or b_rank < 2 or b_rank > rank) return error.Unsupported;
 
         // c/a fit checked with the f32 helper; b is q8_0 (tileBytes would misjudge
         // its packed size), so its per-tile device length is checked at record time.
@@ -330,8 +332,8 @@ pub const Matmul = struct {
             while (ti_k < k_tiles) : (ti_k += 1) {
                 const beta: f32 = if (ti_k == 0) s.beta else 1.0;
                 const batch: []const usize = coords[0 .. rank - 2];
-                const a_lin = tensor_store_mod.broadcastTileIndex(a_meta, batch, &.{ ti_m, ti_k }) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.broadcastTileIndex(b_meta, batch, &.{ ti_k, ti_n }) catch return error.ExecutionFailed;
+                const a_lin = tensor_store_mod.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null) catch return error.ExecutionFailed;
+                const b_lin = tensor_store_mod.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null) catch return error.ExecutionFailed;
                 try self.recordQuantTileGemm(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
             }
         }
@@ -599,12 +601,13 @@ fn recordTileGemmLinear(
     const m_dim: u32 = @intCast(dc.shape_mem[rank - 2]);
     const n_dim: u32 = @intCast(dc.shape_mem[rank - 1]);
     const k_dim: u32 = @intCast(da.shape_mem[rank - 1]);
+    const b_rank: usize = @intCast(db.rank);
     const params: MatMulParams = .{
         .m = m_dim,
         .n = n_dim,
         .k = k_dim,
         .a_row = @intCast(@divExact(da.strides_mem[rank - 2], @sizeOf(f32))),
-        .b_row = @intCast(@divExact(db.strides_mem[rank - 2], @sizeOf(f32))),
+        .b_row = @intCast(@divExact(db.strides_mem[b_rank - 2], @sizeOf(f32))),
         .c_row = @intCast(@divExact(dc.strides_mem[rank - 2], @sizeOf(f32))),
         .alpha = s.alpha,
         .beta = beta,

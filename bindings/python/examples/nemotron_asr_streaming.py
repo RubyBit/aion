@@ -36,7 +36,7 @@ HOP = 160
 
 def _i32(ctx, arr) -> "aion.Tensor":
     """Bind an i32 tensor."""
-    return aion.Tensor(np.asarray(arr, np.int32).tolist(), ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32)
+    return aion.Tensor(np.asarray(arr, np.int32).tolist(), ctx=ctx, dtype=aion.int32)
 
 
 def _fit_samples(audio: np.ndarray, n: int) -> np.ndarray:
@@ -62,8 +62,8 @@ def run_offline(model_path: str, md: dict, audio: np.ndarray, threads, args):
     n = (t_mel - 1) * HOP  # samples whose center-STFT yields t_mel frames
     a = _fit_samples(audio, n).astype(np.float32)
     m.bind_input("audio", aion.Tensor(a.reshape(n, 1), ctx=ctx))
-    m.bind_input("active_in", _i32(ctx, [1]))
-    m.bind_input("last_in", _i32(ctx, [blank]))
+    m.bind_input("active_in", _i32(ctx, 1))
+    m.bind_input("last_in", _i32(ctx, blank))
     m.run()
     oc = m.output_tensor("out_count")
     count = int(oc.item())
@@ -111,14 +111,26 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
     # Per-run inputs (rewritten in place each chunk) — bound once.
     t_audio = fn(np.zeros((wsamp, 1), np.float32))
     t_mask = fn(np.zeros((chunk, t_kv), np.float32))
-    t_frame, t_sym = _i32(ctx, [0]), _i32(ctx, [0])
-    t_count, t_active = _i32(ctx, [0]), _i32(ctx, [1])
-    t_toks = _i32(ctx, np.zeros((max_out, 1), np.int32))
-    m.bind_input("audio", t_audio); m.bind_input("cache_mask", t_mask)
-    m.bind_input("frame_in", t_frame); m.bind_input("sym_in", t_sym)
-    m.bind_input("count_in", t_count); m.bind_input("active_in", t_active)
+    t_frame, t_sym = _i32(ctx, 0), _i32(ctx, 0)
+    t_count, t_active = _i32(ctx, 0), _i32(ctx, 1)
+
+    # New exports use a rank-1 token buffer. Accept older packages whose
+    # converter emitted the equivalent [max_out, 1] scalar-row representation.
+    toks_index = m.input_names().index("toks_in")
+    toks_rank = m.input_rank(toks_index)
+    if toks_rank not in (1, 2):
+        raise ValueError(f"unsupported toks_in rank: {toks_rank}")
+    toks_shape = (max_out,) if toks_rank == 1 else (max_out, 1)
+    t_toks = aion.Tensor.zeros(toks_shape, ctx=ctx, dtype=aion.int32)
+
+    m.bind_input("audio", t_audio)
+    m.bind_input("cache_mask", t_mask)
+    m.bind_input("frame_in", t_frame)
+    m.bind_input("sym_in", t_sym)
+    m.bind_input("count_in", t_count)
+    m.bind_input("active_in", t_active)
     m.bind_input("toks_in", t_toks)
-    m.bind_input("last_in", _i32(ctx, [blank]))
+    m.bind_input("last_in", _i32(ctx, blank))
 
     tokens = []
     buf = np.concatenate([np.zeros(pad, np.float32), audio.astype(np.float32)])
@@ -134,12 +146,18 @@ def run_streaming(model_path: str, md: dict, audio: np.ndarray, sp, threads, arg
         mask[:, [j for j in range(t_kv) if thr <= j < att_left + real]] = 0.0
         t_audio.copy_from(w.reshape(wsamp, 1))
         t_mask.copy_from(mask)
-        t_frame.copy_from([0]); t_sym.copy_from([0])
-        t_count.copy_from([0]); t_active.copy_from([1])
-        t_toks.copy_from([[0]] * max_out)
+        t_frame.copy_from(0)
+        t_sym.copy_from(0)
+        t_count.copy_from(0)
+        t_active.copy_from(1)
+        t_toks.copy_from(0)
         m.run()
-        oc = m.output_tensor("out_count"); cnt = int(oc.item()); oc.close()
-        ot = m.output_tensor("out_tokens"); tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]; ot.close()
+        oc = m.output_tensor("out_count")
+        cnt = int(oc.item())
+        oc.close()
+        ot = m.output_tensor("out_tokens")
+        tokens += [int(x) for x in ot.numpy().reshape(-1)][:cnt]
+        ot.close()
         t_ms = (c + 1) * step * 1000 // SAMPLE_RATE
         print(f"[{t_ms:6d}ms] {sp.DecodeIds([int(t) for t in tokens])}")
     return tokens

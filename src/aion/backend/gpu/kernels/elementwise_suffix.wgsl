@@ -13,25 +13,25 @@
 struct Params { n: u32, cols: u32 };
 
 @compute @workgroup_size(64)
-fn bcast_add(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn suffix_add(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     for (var i = g.x; i < p.n; i += step) { o[i] = a[i] + b[i % p.cols]; }
 }
 
 @compute @workgroup_size(64)
-fn bcast_sub(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn suffix_sub(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     for (var i = g.x; i < p.n; i += step) { o[i] = a[i] - b[i % p.cols]; }
 }
 
 @compute @workgroup_size(64)
-fn bcast_mul(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn suffix_mul(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     for (var i = g.x; i < p.n; i += step) { o[i] = a[i] * b[i % p.cols]; }
 }
 
 @compute @workgroup_size(64)
-fn bcast_div(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn suffix_div(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     for (var i = g.x; i < p.n; i += step) { o[i] = a[i] / b[i % p.cols]; }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// Split-K merge for cached attention (see mha_cached_split in
-// attention_cached.wgsl): per output row, log-sum-exp-combine the segments'
+// Split-K merge for cached attention (see attn_split in
+// attention.wgsl): per output row, log-sum-exp-combine the segments'
 // unnormalized partials into the final normalized row.
 //
 // parts layout: entry (row * segs + seg) has stride (dv + 2) floats —
@@ -29,7 +29,7 @@ fn expApprox(x_in: f32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn mha_cached_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+fn attn_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let r = wid.x;
     let base = r * p.segs * p.stride;
 

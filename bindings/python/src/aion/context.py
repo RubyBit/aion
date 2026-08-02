@@ -8,6 +8,9 @@ import weakref
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from .device import GpuOptions
+from .enums import AionStatus
+from .errors import AionError
+from ._gpu_runtime import missing_wgpu_runtime_hint
 from ._ffi.handles import ContextHandle
 from ._ffi.runtime import create_context, destroy_context
 
@@ -80,7 +83,14 @@ class Context:
 
         gpu_list = list(gpus) if gpus else []
 
-        self._ctx: ContextHandle | None = create_context(thread_count, gpu_list)
+        try:
+            self._ctx: ContextHandle | None = create_context(thread_count, gpu_list)
+        except AionError as error:
+            if gpu_list and error.status == AionStatus.AION_UNSUPPORTED:
+                hint = missing_wgpu_runtime_hint()
+                if hint is not None:
+                    raise AionError(error.status, f"{error.message}. {hint}") from error
+            raise
         self._closed = False
         self._children: weakref.WeakSet[object] = weakref.WeakSet()
         # Graph owner for values built without an explicit Builder (see

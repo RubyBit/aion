@@ -26,14 +26,13 @@
 //!     bind-group layout per entry point -- reflected once, not per dispatch).
 //!
 //! Kernel coverage (f32, multi-tile): ElemwiseBinaryTiled, UnaryTiled,
-//! BroadcastLastDimBinaryTiled, CopyTiled (buffer-to-buffer, dtype-agnostic),
+//! broadcast-aware elementwise binary, CopyTiled (buffer-to-buffer, dtype-agnostic),
 //! MatMulTiled (rank-2, autotuned register-blocked GEMM), MatMulNTTiled
 //! (q8_0/f32 weights: GEMV for M==1, dequant + f32 GEMM for M>1), SoftmaxTiled /
 //! RMSNormTiled / LayerNormTiled / ReduceAll / ReduceAxis (row-wise, last axis
 //! intra-tile), GatherRows / RoPE1D / SequenceAppend / Cast (decode data
-//! movement), AttentionTiled / MultiHeadAttentionTiled (streaming-softmax
-//! kernel, one workgroup per query row), MultiHeadAttentionCachedTiled (GQA
-//! over f32/f16 KV caches, positions/end read on-device), Conv1DTiled /
+//! movement), AttentionTiled (GQA over f32/f16 k/v, positions/end read
+//! on-device when present), Conv1DTiled /
 //! Conv2DTiled (direct kernel). Everything else returns `error.Unsupported`.
 
 const std = @import("std");
@@ -374,7 +373,6 @@ pub const GpuBackend = struct {
             switch (step) {
                 .ElemwiseBinaryTiled => |s| try simple_ops.execElemwiseBinary(op_ctx, frame, s),
                 .GeluMulTiled => |s| try simple_ops.execGeluMul(op_ctx, frame, s),
-                .BroadcastLastDimBinaryTiled => |s| try simple_ops.execBroadcastLastDim(op_ctx, frame, s),
                 .UnaryTiled => |s| try simple_ops.execUnary(op_ctx, frame, s),
                 .CopyTiled => |s| try simple_ops.execCopy(op_ctx, frame, s),
                 .CastTiled => |s| try simple_ops.execCast(op_ctx, frame, s),
@@ -386,11 +384,10 @@ pub const GpuBackend = struct {
                 .ReduceAll => |s| try rowwise.execReduceAll(op_ctx, frame, s),
                 .ReduceAxis => |s| try rowwise.execReduceAxis(op_ctx, frame, s),
                 .GatherRowsTiled => |s| try decode_ops.execGatherRows(op_ctx, frame, s),
+                .GatherTiled => |s| try decode_ops.execGather(op_ctx, frame, s),
                 .RoPE1DTiled => |s| try decode_ops.execRoPE(op_ctx, frame, s),
                 .SequenceAppendTiled => |s| try decode_ops.execSequenceAppend(op_ctx, frame, s),
                 .AttentionTiled => |s| try attention_exec.execAttention(op_ctx, frame, s),
-                .MultiHeadAttentionTiled => |s| try attention_exec.execAttention(op_ctx, frame, s),
-                .MultiHeadAttentionCachedTiled => |s| try attention_exec.execAttentionCached(op_ctx, frame, s),
                 .RelPosMHATiled => |s| try attention_exec.execRelPosMHA(op_ctx, frame, s),
                 .Conv1DTiled => |s| try conv_exec.execConv1D(op_ctx, frame, s),
                 .Conv2DTiled => |s| try conv_exec.execConv2D(op_ctx, frame, s),

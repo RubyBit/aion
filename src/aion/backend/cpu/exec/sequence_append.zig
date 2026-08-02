@@ -31,7 +31,7 @@ pub fn execSequenceAppendTiled(
     if (end_idx_meta.dtype != .i32) return BackendError.InvalidArgument;
 
     if (cache_meta.shape[0] != new_kv_meta.shape[0]) return BackendError.InvalidArgument;
-    if (cache_meta.shape[1] != new_kv_meta.shape[1]) return BackendError.InvalidArgument;
+    if (cache_meta.shape[2] != new_kv_meta.shape[2]) return BackendError.InvalidArgument;
     if (cache_meta.shape[3] != new_kv_meta.shape[3]) return BackendError.InvalidArgument;
     if (end_idx_meta.shape[0] != cache_meta.shape[0]) return BackendError.InvalidArgument;
 
@@ -42,10 +42,10 @@ pub fn execSequenceAppendTiled(
     };
 
     const batch: usize = cache_meta.shape[0];
-    const heads: usize = cache_meta.shape[1];
-    const cache_t: usize = cache_meta.shape[2];
+    const cache_t: usize = cache_meta.shape[1];
+    const heads: usize = cache_meta.shape[2];
     const head_dim: usize = cache_meta.shape[3];
-    const new_len: usize = new_kv_meta.shape[2];
+    const new_len: usize = new_kv_meta.shape[1];
 
     const row_bytes: usize = std.math.mul(usize, head_dim, elem_bytes) catch return BackendError.InvalidArgument;
 
@@ -75,10 +75,10 @@ pub fn execSequenceAppendTiled(
     // Mapping may trigger growable physical expansion; refresh metadata before writes.
     cache_meta = try store.meta(s.cache);
     if (cache_meta.rank != 4) return BackendError.InvalidArgument;
-    if (cache_meta.shape[0] != batch or cache_meta.shape[1] != heads or cache_meta.shape[3] != head_dim) {
+    if (cache_meta.shape[0] != batch or cache_meta.shape[2] != heads or cache_meta.shape[3] != head_dim) {
         return BackendError.InvalidArgument;
     }
-    const cache_t_after_growth: usize = cache_meta.shape[2];
+    const cache_t_after_growth: usize = cache_meta.shape[1];
 
     if (new_len == 0) return;
 
@@ -114,13 +114,13 @@ pub fn execSequenceAppendTiled(
                 const dst_t: usize = store.mapSequenceStep(s.cache, dst_logical_t, cache_t_after_growth) catch return BackendError.InvalidArgument;
 
                 src_tile_coords[0] = b / new_kv_meta.tile_shape[0];
-                src_tile_coords[1] = h / new_kv_meta.tile_shape[1];
-                src_tile_coords[2] = t / new_kv_meta.tile_shape[2];
+                src_tile_coords[1] = t / new_kv_meta.tile_shape[1];
+                src_tile_coords[2] = h / new_kv_meta.tile_shape[2];
                 src_tile_coords[3] = 0;
 
                 dst_tile_coords[0] = b / cache_meta.tile_shape[0];
-                dst_tile_coords[1] = h / cache_meta.tile_shape[1];
-                dst_tile_coords[2] = dst_t / cache_meta.tile_shape[2];
+                dst_tile_coords[1] = dst_t / cache_meta.tile_shape[1];
+                dst_tile_coords[2] = h / cache_meta.tile_shape[2];
                 dst_tile_coords[3] = 0;
 
                 const src_tile_index: usize = try tensor_store.encodeTileIndex(new_kv_meta, src_tile_coords[0..4]);
@@ -145,12 +145,12 @@ pub fn execSequenceAppendTiled(
                 if (src_view.layout.rank != 4 or dst_view.layout.rank != 4) return BackendError.InvalidArgument;
 
                 const src_l_b: usize = b - src_tile_coords[0] * new_kv_meta.tile_shape[0];
-                const src_l_h: usize = h - src_tile_coords[1] * new_kv_meta.tile_shape[1];
-                const src_l_t: usize = t - src_tile_coords[2] * new_kv_meta.tile_shape[2];
+                const src_l_t: usize = t - src_tile_coords[1] * new_kv_meta.tile_shape[1];
+                const src_l_h: usize = h - src_tile_coords[2] * new_kv_meta.tile_shape[2];
 
                 const dst_l_b: usize = b - dst_tile_coords[0] * cache_meta.tile_shape[0];
-                const dst_l_h: usize = h - dst_tile_coords[1] * cache_meta.tile_shape[1];
-                const dst_l_t: usize = dst_t - dst_tile_coords[2] * cache_meta.tile_shape[2];
+                const dst_l_t: usize = dst_t - dst_tile_coords[1] * cache_meta.tile_shape[1];
+                const dst_l_h: usize = h - dst_tile_coords[2] * cache_meta.tile_shape[2];
 
                 const src_s0: usize = std.math.cast(usize, src_view.layout.strides_bytes[0]) orelse return BackendError.InvalidArgument;
                 const src_s1: usize = std.math.cast(usize, src_view.layout.strides_bytes[1]) orelse return BackendError.InvalidArgument;
@@ -165,13 +165,13 @@ pub fn execSequenceAppendTiled(
                 if (src_s3 != elem_bytes or dst_s3 != elem_bytes) return BackendError.InvalidArgument;
 
                 const src_off_0: usize = std.math.mul(usize, src_l_b, src_s0) catch return BackendError.InvalidArgument;
-                const src_off_1: usize = std.math.mul(usize, src_l_h, src_s1) catch return BackendError.InvalidArgument;
-                const src_off_2: usize = std.math.mul(usize, src_l_t, src_s2) catch return BackendError.InvalidArgument;
+                const src_off_1: usize = std.math.mul(usize, src_l_t, src_s1) catch return BackendError.InvalidArgument;
+                const src_off_2: usize = std.math.mul(usize, src_l_h, src_s2) catch return BackendError.InvalidArgument;
                 const src_off: usize = std.math.add(usize, std.math.add(usize, src_off_0, src_off_1) catch return BackendError.InvalidArgument, src_off_2) catch return BackendError.InvalidArgument;
 
                 const dst_off_0: usize = std.math.mul(usize, dst_l_b, dst_s0) catch return BackendError.InvalidArgument;
-                const dst_off_1: usize = std.math.mul(usize, dst_l_h, dst_s1) catch return BackendError.InvalidArgument;
-                const dst_off_2: usize = std.math.mul(usize, dst_l_t, dst_s2) catch return BackendError.InvalidArgument;
+                const dst_off_1: usize = std.math.mul(usize, dst_l_t, dst_s1) catch return BackendError.InvalidArgument;
+                const dst_off_2: usize = std.math.mul(usize, dst_l_h, dst_s2) catch return BackendError.InvalidArgument;
                 const dst_off: usize = std.math.add(usize, std.math.add(usize, dst_off_0, dst_off_1) catch return BackendError.InvalidArgument, dst_off_2) catch return BackendError.InvalidArgument;
 
                 const src_end: usize = std.math.add(usize, src_off, row_bytes) catch return BackendError.InvalidArgument;

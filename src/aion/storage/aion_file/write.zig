@@ -229,9 +229,6 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         .ElemwiseBinary => |eb| {
             try appendInt(out, allocator, u8, @intFromEnum(eb.op));
         },
-        .BroadcastLastDimBinary => |eb| {
-            try appendInt(out, allocator, u8, @intFromEnum(eb.op));
-        },
         .Unary => |u| {
             try appendInt(out, allocator, u8, @intFromEnum(u.op));
         },
@@ -269,17 +266,9 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         .Attention => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
-        },
-        .MultiHeadAttention => |attn| {
-            try appendInt(out, allocator, f32, attn.scale);
-            try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
-            try appendInt(out, allocator, u64, attn.heads);
-        },
-        .MultiHeadAttentionCached => |attn| {
-            try appendInt(out, allocator, f32, attn.scale);
-            try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
             try appendInt(out, allocator, u64, attn.sliding_window);
             try appendInt(out, allocator, f32, attn.attn_logits_soft_cap);
+            try appendInt(out, allocator, u8, attn.controls);
         },
         .Reduce => |rr| {
             try appendInt(out, allocator, u8, @intFromEnum(rr.op));
@@ -300,15 +289,21 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .RelPosMHA => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
-            try appendInt(out, allocator, u64, attn.heads);
             try appendInt(out, allocator, u8, if (attn.has_mask) 1 else 0);
+            try appendInt(out, allocator, u64, attn.chunk_size);
+            try appendInt(out, allocator, u64, attn.chunk_left);
         },
         .ArgMax => |am| {
             try appendInt(out, allocator, i32, am.axis);
         },
         .ScatterRow => {},
+        .Gather => |gg| {
+            try appendInt(out, allocator, i32, gg.axis);
+            try appendInt(out, allocator, u64, gg.batch_dims);
+        },
+        .Dim => |dd| try appendInt(out, allocator, i32, dd.axis),
+        .Iota => |io| try appendInt(out, allocator, i32, io.axis),
         .Copy => {},
-        .GatherRows => {},
         .RoPE1D => |rp| {
             try appendInt(out, allocator, f32, rp.base_frequency);
             try appendInt(out, allocator, f32, rp.scale_factor);

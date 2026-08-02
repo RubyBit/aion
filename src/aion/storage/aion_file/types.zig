@@ -12,7 +12,10 @@ pub const PadMode = backend_types.PadMode;
 pub const ValueId = graph_mod.ValueId;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-pub const current_version: u32 = 6;
+/// v10: RelPosMHA attrs dropped the redundant `heads` (it is q's dim 2) and gained
+/// the chunked-limited window (`chunk_size`/`chunk_left`). Parsing requires an exact
+/// match, so every `.aion` must be re-converted.
+pub const current_version: u32 = 10;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -165,7 +168,6 @@ pub const InputRole = struct {
 pub const NodeOp = union(graph_mod.OpTag) {
     MatMul: struct { alpha: f32, beta: f32 },
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
-    BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
     Conv1D: struct {
@@ -190,8 +192,6 @@ pub const NodeOp = union(graph_mod.OpTag) {
     },
     LayerNorm: struct { eps: f32, normalized_shape: []const ShapeTerm },
     RMSNorm: struct { eps: f32, normalized_shape: []const ShapeTerm },
-    Attention: struct { scale: f32, causal: bool },
-    MultiHeadAttention: struct { scale: f32, causal: bool, heads: u64 },
     Reduce: struct { op: ReduceOp, axis: ?i32 },
     Concat: struct { axis: i32 },
     LSTMCell: struct { has_bias: bool },
@@ -202,14 +202,6 @@ pub const NodeOp = union(graph_mod.OpTag) {
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const u64, lens: []const ShapeTerm },
 
-    /// Gather rows from a 2D table using i32 indices.
-    ///
-    /// Shapes:
-    /// - table:   [V, D]
-    /// - indices: [B, L]
-    /// - out:     [B, L, D]
-    GatherRows: void,
-
     RoPE1D: struct {
         base_frequency: f32,
         scale_factor: f32,
@@ -218,11 +210,13 @@ pub const NodeOp = union(graph_mod.OpTag) {
 
     SequenceAppend: void,
 
-    MultiHeadAttentionCached: struct {
+    /// Grouped-query attention. Bit 0 = query_positions, bit 1 = kv_lengths.
+    Attention: struct {
         scale: f32,
         causal: bool,
         sliding_window: u64,
         attn_logits_soft_cap: f32,
+        controls: u8,
     },
 
     Cast: struct { to_dtype: DType },
@@ -244,12 +238,17 @@ pub const NodeOp = union(graph_mod.OpTag) {
     RFFT: void,
     STFT: struct { n_fft: u64, hop_length: u64, center: bool },
 
-    RelPosMHA: struct { scale: f32, heads: u64, has_mask: bool },
+    /// No head count: it is q's dim 2. `chunk_size`/`chunk_left` are the
+    /// chunked-limited window (0 = full attention).
+    RelPosMHA: struct { scale: f32, has_mask: bool, chunk_size: u64 = 0, chunk_left: u64 = 0 },
 
     ArgMax: struct { axis: i32 },
 
     ScatterRow: void,
     GeluMul: void,
+    Gather: struct { axis: i32, batch_dims: u64 },
+    Dim: struct { axis: i32 },
+    Iota: struct { axis: i32 },
 };
 
 /// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
@@ -645,15 +644,19 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             if (ln.normalized_shape.len == 0 or ln.normalized_shape.len > max_rank) return PackageError.InvalidFormat;
             for (ln.normalized_shape) |term| try validateShapeTerm(pkg, term);
         },
-        .MultiHeadAttention => |attn| if (attn.heads == 0) return PackageError.InvalidFormat,
         .RelPosMHA => |attn| {
-            if (attn.heads == 0) return PackageError.InvalidFormat;
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
+            if (attn.chunk_size == 0 and attn.chunk_left != 0) return PackageError.InvalidFormat;
         },
-        .MultiHeadAttentionCached => |attn| {
-            _ = attn.causal;
+        .Attention => |attn| {
+            if ((attn.controls & ~@as(u8, 0x3)) != 0) return PackageError.InvalidFormat;
+            const expected_inputs: usize = 3 +
+                @as(usize, @intFromBool((attn.controls & 1) != 0)) +
+                @as(usize, @intFromBool((attn.controls & 2) != 0));
+            if (node.inputs.len != expected_inputs) return PackageError.InvalidFormat;
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
+            if (attn.sliding_window > 0 and !attn.causal) return PackageError.InvalidFormat;
         },
         .STFT => |st| if (st.n_fft < 4 or (st.n_fft & (st.n_fft - 1)) != 0 or st.hop_length == 0) return PackageError.InvalidFormat,
         .If => |iff| {

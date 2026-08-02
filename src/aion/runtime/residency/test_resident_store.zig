@@ -211,7 +211,7 @@ test "resident store: growable kv cache flushes and refreshes device residency" 
     var mgr = try manager_mod.StorageManager.initWithCache(a, .{ .ram_budget_bytes = 1 << 20 });
     defer mgr.deinit();
 
-    const cache = try mgr.createTiledTensor(.f32, &[_]usize{ 1, 1, 2, 1 }, &[_]usize{ 1, 1, 2, 1 }, .{});
+    const cache = try mgr.createTiledTensor(.f32, &[_]usize{ 1, 2, 1, 1 }, &[_]usize{ 1, 2, 1, 1 }, .{});
     try mgr.registerSequenceCachePolicy(cache, .{ .growable = .{
         .initial_capacity_tokens = 2,
         .growth_numerator = 2,
@@ -233,7 +233,7 @@ test "resident store: growable kv cache flushes and refreshes device residency" 
     _ = try store.mapSequenceStep(cache, 3, 2);
 
     const meta = try store.meta(cache);
-    try std.testing.expectEqual(@as(usize, 4), meta.shape[2]);
+    try std.testing.expectEqual(@as(usize, 4), meta.shape[1]);
 
     var host: [4]f32 = undefined;
     try mgr.readToPackedScalar(cache, std.mem.sliceAsBytes(host[0..]));

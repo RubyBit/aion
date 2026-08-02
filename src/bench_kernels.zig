@@ -178,7 +178,9 @@ pub const KOp = enum {
     scatter_row,
     attention,
     mha_cached,
+    mha_window,
     relpos,
+    relpos_chunked,
     conv1d,
     conv1d_dw,
     conv2d,
@@ -217,7 +219,7 @@ pub const KA = struct {
     pub const RO_D = 64; // rope [1, T, H, D]
     pub const KV_H = 8;
     pub const KV_T = 4096;
-    pub const KV_D = 64; // kv cache [1, H, T, D]
+    pub const KV_D = 64; // kv cache [1, T, H, D]
     pub const AM_ROWS = 4;
     pub const AM_COLS = 262144; // argmax (decode logits row)
     pub const SC_ROWS = 4096;
@@ -230,9 +232,16 @@ pub const KA = struct {
     pub const MC_HKV = 2;
     pub const MC_T = 4096;
     pub const MC_D = 64; // cached GQA decode
+    pub const MC_WIN = 512; // sliding window (Gemma-4 local layers)
+    pub const MC_SOFT_CAP = 30.0; // attn logit soft cap (tanh), same layers
     pub const RP_T = 512;
     pub const RP_H = 8;
     pub const RP_D = 64; // rel-pos MHA
+    // Chunked-limited config the Nemotron checkpoint was trained on
+    // (att_context_size = [70, 13] => chunk = 14, left = 70, window = 84 of 512).
+    pub const RP_CHUNK = 14;
+    pub const RP_LEFT = 70;
+    pub const RP_WIN = RP_LEFT + RP_CHUNK;
     pub const C1_L = 2048;
     pub const C1_C = 256;
     pub const C1_K = 9; // conv1d
@@ -276,20 +285,36 @@ pub fn kInfo(op: KOp) KInfo {
         .argmax => .{ .label = "argmax", .out_elems = KA.AM_ROWS, .bytes = @as(f64, KA.AM_ROWS * KA.AM_COLS) * 4.0, .out_i32 = true },
         .scatter_row => .{ .label = "scatter_row", .out_elems = KA.SC_ROWS * KA.SC_D, .bytes = @as(f64, KA.SC_D * 2) * 4.0 },
         .attention => .{
-            .label = "mha_causal",
+            .label = "attn_seq",
             .out_elems = KA.AT_B * KA.AT_H * KA.AT_T * KA.AT_D,
             // ~half the score matrix is masked out; QK^T + PV, 2 FLOP each.
             .flops = 2.0 * @as(f64, KA.AT_B * KA.AT_H) * @as(f64, KA.AT_T) * @as(f64, KA.AT_T) * @as(f64, KA.AT_D),
         },
         .mha_cached => .{
-            .label = "mha_cached",
+            .label = "attn_cached",
             .out_elems = KA.MC_HQ * KA.MC_D,
             .bytes = @as(f64, 2 * KA.MC_HKV * KA.MC_T * KA.MC_D) * 4.0, // k+v cache read
+        },
+        // Same cache, but only the last MC_WIN keys are in range — bytes count the
+        // rows actually touched, so GB/s stays comparable with `attn_cached` and a
+        // window that fails to narrow the read shows up as a collapsed rate.
+        .mha_window => .{
+            .label = "attn_window",
+            .out_elems = KA.MC_HQ * KA.MC_D,
+            .bytes = @as(f64, 2 * KA.MC_HKV * KA.MC_WIN * KA.MC_D) * 4.0,
         },
         .relpos => .{
             .label = "relpos_mha",
             .out_elems = KA.RP_T * KA.RP_H * KA.RP_D,
             .flops = 6.0 * @as(f64, KA.RP_H) * @as(f64, KA.RP_T) * @as(f64, KA.RP_T) * @as(f64, KA.RP_D),
+        },
+        // Same shape with the chunked-limited window engaged. FLOPs count only the
+        // keys inside each row's window, so this row's GF/s is comparable with
+        // `relpos_mha` above and its *time* shows what the window actually saves.
+        .relpos_chunked => .{
+            .label = "relpos_chunked",
+            .out_elems = KA.RP_T * KA.RP_H * KA.RP_D,
+            .flops = 6.0 * @as(f64, KA.RP_H) * @as(f64, KA.RP_T) * @as(f64, KA.RP_WIN) * @as(f64, KA.RP_D),
         },
         .conv1d => .{
             .label = "conv1d",
@@ -384,7 +409,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             defer alloc.free(idx_vals);
             for (idx_vals, 0..) |*v, i| v.* = @intCast((i * 2654435761 + 5) % KA.GA_V);
             const idx = try inputI32(&g, mgr, &.{ 1, KA.GA_ROWS }, &.{ 1, KA.GA_ROWS }, idx_vals);
-            break :blk try g.addGatherRows(table, idx);
+            break :blk try g.addGather(table, idx, 0, 0);
         },
         .rope => blk: {
             const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.RO_T, KA.RO_H, KA.RO_D }, &.{ 1, KA.RO_T, KA.RO_H, KA.RO_D }, 15);
@@ -395,8 +420,9 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             break :blk try g.addRoPE1D(x, pos, 10000.0, 1.0, 1.0);
         },
         .kv_append => blk: {
-            const cache = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_H, KA.KV_T, KA.KV_D }, &.{ 1, KA.KV_H, KA.KV_T, KA.KV_D }, 16);
-            const new_kv = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_H, 1, KA.KV_D }, &.{ 1, KA.KV_H, 1, KA.KV_D }, 17);
+            // Cache is [B, T, H, D] — time is dim 1, so one token is [B, 1, H, D].
+            const cache = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_T, KA.KV_H, KA.KV_D }, &.{ 1, KA.KV_T, KA.KV_H, KA.KV_D }, 16);
+            const new_kv = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.KV_H, KA.KV_D }, &.{ 1, 1, KA.KV_H, KA.KV_D }, 17);
             const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.KV_T / 2});
             break :blk try g.addSequenceAppend(cache, new_kv, end);
         },
@@ -411,18 +437,36 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             break :blk try g.addScatterRow(buf, idx, src);
         },
         .attention => blk: {
-            const q = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_H, KA.AT_T, KA.AT_D }, &.{ 1, 1, KA.AT_T, KA.AT_D }, 21);
-            const k = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_H, KA.AT_T, KA.AT_D }, &.{ 1, 1, KA.AT_T, KA.AT_D }, 22);
-            const v = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_H, KA.AT_T, KA.AT_D }, &.{ 1, 1, KA.AT_T, KA.AT_D }, 23);
-            break :blk try g.addMultiHeadAttention(q, k, v, 0.125, true, KA.AT_H);
+            // Plain sequence, causal, no query-position/KV-length controls.
+            // Unified layout: q [B, L_q, H_q, D], k/v [B, T, H_kv, D] — time is
+            // dim 1. q is tiled per head so both backends get parallel work (CPU
+            // threads over out tiles, GPU takes one dispatch per tile); k/v stay
+            // single-tile because the GPU exec binds each cache as ONE buffer.
+            const q = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ 1, KA.AT_T, 1, KA.AT_D }, 21);
+            const k = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 22);
+            const v = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 23);
+            break :blk try g.addAttention(q, k, v, null, null, 0.125, true, 0, 0.0);
         },
         .mha_cached => blk: {
+            // Decode: one query row (L_q = 1) against a long GQA cache. The 8
+            // output rows over a 4096-key cache are what put the GPU on the
+            // split-K (flash-decoding) path.
             const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
-            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_HKV, KA.MC_T, KA.MC_D }, &.{ 1, KA.MC_HKV, KA.MC_T, KA.MC_D }, 25);
-            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_HKV, KA.MC_T, KA.MC_D }, &.{ 1, KA.MC_HKV, KA.MC_T, KA.MC_D }, 26);
+            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
+            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
             const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
             const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
-            break :blk try g.addMultiHeadAttentionCached(q, kc, vc, pos, end, 0.125, true, 0, 0.0);
+            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, true, 0, 0.0);
+        },
+        .mha_window => blk: {
+            // Gemma-4 local layer at decode: same cache as `mha_cached`, but with
+            // a sliding window + logit soft cap (tanh per score) engaged.
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
+            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
+            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
+            const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
+            const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
+            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, true, KA.MC_WIN, KA.MC_SOFT_CAP);
         },
         .relpos => blk: {
             const t = KA.RP_T;
@@ -432,7 +476,17 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
             const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
             const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
-            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, KA.RP_H);
+            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, 0, 0);
+        },
+        .relpos_chunked => blk: {
+            const t = KA.RP_T;
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 27);
+            const k = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 28);
+            const v = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 29);
+            const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
+            const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
+            const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
+            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, KA.RP_CHUNK, KA.RP_LEFT);
         },
         .conv1d => blk: {
             const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.C1_C }, &.{ 1, KA.C1_L, KA.C1_C }, 33);

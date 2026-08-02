@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..dtype import float32
 from ..types import DTypeLike
 from ..builder import TensorRef, WeightData
 from .layers import Linear
@@ -22,7 +23,7 @@ class FeedForward(Module):
         name: Optional[str] = None,
         bias1: Optional[WeightData] = None,
         bias2: Optional[WeightData] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
         self.act = act
@@ -56,7 +57,7 @@ class GatedMLP(Module):
         *,
         act: str = "silu",
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
         self.act = act
@@ -87,7 +88,7 @@ class GLU(Module):
         bias: Optional[WeightData] = None,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
         total = int(_last_dim(weight))
@@ -105,7 +106,7 @@ class GLU(Module):
             return b.mul(a, b.unary("sigmoid", g))
 
 
-def _last_dim(data: object) -> int:
+def _last_dim(data: WeightData) -> int:
     from ..builder import _infer_shape
 
     shape = _infer_shape(data)

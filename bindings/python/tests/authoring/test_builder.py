@@ -59,7 +59,7 @@ def test_q8_linear_within_tolerance(ctx):
 
     class Net(nn.Module):
         def __init__(self):
-            self.fc = nn.Linear(w, dtype="q8_0")
+            self.fc = nn.Linear(w, dtype=aion.q8_0)
 
         def forward(self, x):
             return self.fc(x)
@@ -130,7 +130,7 @@ def test_value_shape_introspection(ctx):
     x = b.input((8, 4), dynamic=(0,)).rename("x")
     assert x.shape == (8, 4)
     assert x.ndim == 2
-    assert x.dtype == aion.AionDType.AION_DTYPE_F32
+    assert x.dtype == aion.float32
 
     w = np.arange(12, dtype=np.float32).reshape(4, 3)
     y = x @ b.param(w)
@@ -148,7 +148,7 @@ def test_shape_error_raised_at_offending_op(ctx):
 
 def test_if_control_flow(ctx):
     b = Builder(ctx)
-    cond = b.input((1,), dtype="i32").rename("cond")
+    cond = b.input((1,), dtype=aion.int32).rename("cond")
     then_v = b.input((1,)).rename("then_v")
     else_v = b.input((1,)).rename("else_v")
 
@@ -159,7 +159,7 @@ def test_if_control_flow(ctx):
     out = b.if_(cond, then_region, else_region).rename("out")
 
     model = b.compile({"out": out})
-    model.bind_input("cond", aion.Tensor([1], ctx=ctx, dtype=aion.AionDType.AION_DTYPE_I32))
+    model.bind_input("cond", aion.Tensor([1], ctx=ctx, dtype=aion.int32))
     model.bind_input("then_v", aion.Tensor([42.0], ctx=ctx))
     model.bind_input("else_v", aion.Tensor([7.0], ctx=ctx))
     model.run()

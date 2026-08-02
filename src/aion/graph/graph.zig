@@ -51,53 +51,37 @@ pub const Value = struct {
 pub const OpTag = enum(u8) {
     MatMul = 0,
     ElemwiseBinary = 1,
-    BroadcastLastDimBinary = 2,
-    Unary = 3,
-    Softmax = 4,
-    Conv1D = 5,
-    Conv2D = 6,
-    LayerNorm = 7,
-    RMSNorm = 8,
-    Attention = 9,
-    MultiHeadAttention = 10,
-    Reduce = 11,
-    Concat = 12,
-    LSTMCell = 13,
-    // Id 14 is retired (formerly ComplexAbsMean) — intentionally left as a gap
-    // to preserve stable on-disk / ABI op ids for the entries below.
-    Copy = 15,
-    ViewReshape = 16,
-    ViewSqueeze = 17,
-    ViewUnsqueeze = 18,
-    ViewTranspose2D = 19,
-    ViewSliceND = 20,
-    /// Embedding-style row gather: out[b,l,:] = table[indices[b,l], :]
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    GatherRows = 21,
+    Unary = 2,
+    Softmax = 3,
+    Conv1D = 4,
+    Conv2D = 5,
+    LayerNorm = 6,
+    RMSNorm = 7,
+    Reduce = 8,
+    Concat = 9,
+    LSTMCell = 10,
+    Copy = 11,
+    ViewReshape = 12,
+    ViewSqueeze = 13,
+    ViewUnsqueeze = 14,
+    ViewTranspose2D = 15,
+    ViewSliceND = 16,
 
     /// Rotary positional embedding over 1D positions.
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    RoPE1D = 22,
+    RoPE1D = 17,
 
     /// In-place KV cache append (scatter-write into existing cache tensor).
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    SequenceAppend = 23,
+    SequenceAppend = 18,
 
-    /// Cached grouped-query attention over external KV cache tensors.
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    MultiHeadAttentionCached = 24,
+    /// Grouped-query attention, over a KV cache or over a plain sequence.
+    Attention = 19,
 
     /// Elementwise scalar-dtype cast (shape- and layout-preserving).
     ///
     /// Supported pairs: f32<->f16. Primary use case: bridging the f32 output of
     /// quantized matmul to f16 KV caches before `SequenceAppend`.
     ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    Cast = 25,
+    Cast = 20,
 
     /// Matmul with the right operand conceptually transposed: C[m,n] = sum_k A[m,k] * B[n,k].
     ///
@@ -106,41 +90,35 @@ pub const OpTag = enum(u8) {
     /// (q8_0 `quant_axis == 1`). This is the layout an embedding table already has on
     /// disk, so tied logits can reuse the token embedding without duplicating it.
     ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    MatMulNT = 26,
+    MatMulNT = 21,
 
     /// Single-output conditional region.
-    If = 27,
+    If = 22,
 
     /// Single-carried-value loop region.
-    Loop = 28,
+    Loop = 23,
 
     /// Real FFT over the last dimension (power-of-two length).
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    /// (Id 14 is retired — formerly ComplexAbsMean — and intentionally unused.)
-    RFFT = 29,
+    RFFT = 24,
 
     /// Short-time Fourier transform (framing + window + real FFT).
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    STFT = 30,
+    STFT = 25,
 
     /// Relative-positional (Transformer-XL / Conformer) multi-head self-attention.
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    RelPosMHA = 31,
+    RelPosMHA = 26,
 
     /// Index of the maximum value along an axis (v1: last axis). Output dtype i32.
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    ArgMax = 32,
+    ArgMax = 27,
 
     /// In-place scatter of one row: buf[idx] = src. Output aliases buf.
-    ///
-    /// NOTE: Must be appended to preserve stable on-disk / ABI op ids.
-    ScatterRow = 33,
-    GeluMul = 34,
+    ScatterRow = 28,
+    GeluMul = 29,
+    /// General gather with TensorFlow-style `axis` / `batch_dims` semantics.
+    Gather = 30,
+    /// One input extent reified as an i32 one-element tensor.
+    Dim = 31,
+    /// Coordinate tensor with the input's shape, increasing along one axis.
+    Iota = 32,
 };
 
 pub const Op = union(OpTag) {
@@ -148,7 +126,6 @@ pub const Op = union(OpTag) {
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
-    BroadcastLastDimBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
 
@@ -196,29 +173,6 @@ pub const Op = union(OpTag) {
     /// out = (x / sqrt(mean(x^2) + eps)) * gamma + beta
     RMSNorm: struct { eps: f32, normalized_shape: []const usize },
 
-    /// Fused attention (batched over leading dims).
-    ///
-    /// Shapes:
-    /// - q: [..., m, dk]
-    /// - k: [..., n, dk]
-    /// - v: [..., n, dv]
-    /// - out: [..., m, dv]
-    ///
-    /// Computes softmax(scale * q @ k^T) @ v per leading-dim slice.
-    /// If causal, masks keys where key_index > query_index.
-    Attention: struct { scale: f32, causal: bool },
-
-    /// Fused multi-head attention (separate head dim).
-    ///
-    /// Separate head dim (batched):
-    /// - q: [..., h, m, dk]
-    /// - k: [..., h, n, dk]
-    /// - v: [..., h, n, dv]
-    /// - out: [..., h, m, dv]
-    ///
-    /// Computes softmax(scale * q @ k^T) @ v per head/slice.
-    /// If causal, masks keys where key_index > query_index (within head).
-    MultiHeadAttention: struct { scale: f32, causal: bool, heads: usize },
     Reduce: struct { op: ReduceOp, axis: ?i32 = null },
     Concat: struct { axis: i32 },
 
@@ -246,14 +200,6 @@ pub const Op = union(OpTag) {
     ViewTranspose2D: void,
     ViewSliceND: struct { starts: []const usize, lens: []const usize },
 
-    /// Gather rows from a 2D table using i32 indices.
-    ///
-    /// Shapes:
-    /// - table:   [V, D] (f16/f32)
-    /// - indices: [B, L] (i32)
-    /// - out:     [B, L, D]
-    GatherRows: void,
-
     /// Rotary positional embedding over head dimension using chunked-halves pairing.
     ///
     /// Inputs:
@@ -277,37 +223,44 @@ pub const Op = union(OpTag) {
     /// In-place KV cache append.
     ///
     /// Inputs:
-    /// - cache:     [B, H_kv, T, D] (f16/f32)
-    /// - new_kv:    [B, H_kv, new_len, D] (same dtype as cache)
+    /// - cache:     [B, T, H_kv, D] (f16/f32)
+    /// - new_kv:    [B, new_len, H_kv, D] (same dtype as cache)
     /// - end_index: [B] (i32)
     ///
     /// Output:
-    /// - out:       [B, H_kv, T, D] (aliased mutation semantics)
+    /// - out:       [B, T, H_kv, D] (aliased mutation semantics)
     SequenceAppend: void,
 
-    /// Cached grouped-query attention (GQA) over KV cache tensors.
+    /// Grouped-query attention (GQA) over time-major K/V, dense or cached.
     ///
     /// Inputs:
     /// - q:         [B, L_q, H_q, D_k]
-    /// - k_cache:   [B, H_kv, T, D_k]
-    /// - v_cache:   [B, H_kv, T, D_v]
-    /// - positions: [B, L_q] (i32)
-    /// - end_index: [B] (i32)
+    /// - k:               [B, T, H_kv, D_k]
+    /// - v:               [B, T, H_kv, D_v]
+    /// - query_positions: [B, L_q] (i32) -- optional
+    /// - kv_lengths:      [B] (i32)      -- optional
     ///
     /// Output:
     /// - out:       [B, L_q, H_q, D_v]
     ///
+    /// The controls are independent. Query positions default to row indices; K/V
+    /// lengths default to T. Position-dependent attention with L_q != T must supply
+    /// explicit query positions.
+    ///
     /// Semantics:
-    /// - valid keys are in logical range [0, end_index[b])
-    /// - causal mask uses absolute query positions from `positions`
+    /// - valid keys are in logical range [0, kv_lengths[b]), or [0, T) when absent
+    /// - causal mask uses absolute query positions from `query_positions`, or the query's
+    ///   row index when absent
     /// - sliding_window == 0 means global attention
     /// - attn_logits_soft_cap == 0 means disabled
     /// - requires H_q % H_kv == 0
-    MultiHeadAttentionCached: struct {
+    Attention: struct {
         scale: f32,
         causal: bool,
         sliding_window: usize,
         attn_logits_soft_cap: f32,
+        has_query_positions: bool,
+        has_kv_lengths: bool,
     },
 
     /// Elementwise scalar-dtype cast.
@@ -373,7 +326,18 @@ pub const Op = union(OpTag) {
     /// - out: [B, H, T_q, D]
     ///
     /// scores[i,j] = ((q[i]+u)·k[j] + (q[i]+v)·pos_emb[(T_q-1)-i+j]) * scale + mask[i,j]
-    RelPosMHA: struct { scale: f32, heads: usize, has_mask: bool },
+    /// Relative-positional MHA. `chunk_size > 0` selects chunked-limited attention
+    /// (NeMo `att_context_style="chunked_limited"`): the keys are cut into
+    /// non-overlapping chunks of `chunk_size`, and a query attends to its own chunk
+    /// plus `chunk_left` frames before that chunk's start — a contiguous interval,
+    /// so it costs two integers instead of an additive [T_q, T_kv] mask tensor.
+    /// `chunk_size == 0` means attend to every key (subject to `mask`).
+    RelPosMHA: struct {
+        scale: f32,
+        has_mask: bool,
+        chunk_size: usize = 0,
+        chunk_left: usize = 0,
+    },
 
     /// Index of max value along `axis` (v1: must be the last axis). Output i32,
     /// shape = input shape with `axis` removed (rank R-1; rank-1 input -> [1]).
@@ -383,6 +347,9 @@ pub const Op = union(OpTag) {
     /// "row" is buf[1:] flattened (scalar for rank-1 buf). Output aliases buf.
     ScatterRow: void,
     GeluMul: void,
+    Gather: struct { axis: i32, batch_dims: usize },
+    Dim: struct { axis: i32 },
+    Iota: struct { axis: i32 },
 };
 
 pub const InputArity = union(enum) {
@@ -406,16 +373,14 @@ pub fn opInputArity(op: Op) InputArity {
     return switch (op) {
         .MatMul => .{ .exact = 2 },
         .ElemwiseBinary => .{ .exact = 2 },
-        .BroadcastLastDimBinary => .{ .exact = 2 },
         .Unary => .{ .exact = 1 },
         .Softmax => .{ .exact = 1 },
         .Conv1D => .{ .range = .{ .min = 2, .max = 3 } },
         .Conv2D => .{ .range = .{ .min = 2, .max = 3 } },
         .LayerNorm => .{ .exact = 3 },
         .RMSNorm => .{ .exact = 3 },
-        .Attention => .{ .exact = 3 },
-        .MultiHeadAttention => .{ .exact = 3 },
-        .MultiHeadAttentionCached => .{ .exact = 5 },
+        // q, k, v, [query_positions], [kv_lengths]
+        .Attention => |a| .{ .exact = 3 + @as(usize, @intFromBool(a.has_query_positions)) + @as(usize, @intFromBool(a.has_kv_lengths)) },
         .Reduce => .{ .exact = 1 },
         .Concat => .{ .at_least = 1 },
         .LSTMCell => |lc| .{ .exact = if (lc.has_bias) 7 else 5 },
@@ -425,7 +390,6 @@ pub fn opInputArity(op: Op) InputArity {
         .ViewUnsqueeze => .{ .exact = 1 },
         .ViewTranspose2D => .{ .exact = 1 },
         .ViewSliceND => .{ .exact = 1 },
-        .GatherRows => .{ .exact = 2 },
         .RoPE1D => .{ .exact = 2 },
         .SequenceAppend => .{ .exact = 3 },
         .Cast => .{ .exact = 1 },
@@ -439,6 +403,9 @@ pub fn opInputArity(op: Op) InputArity {
         .ArgMax => .{ .exact = 1 },
         .ScatterRow => .{ .exact = 3 },
         .GeluMul => .{ .exact = 2 },
+        .Gather => .{ .exact = 2 },
+        .Dim => .{ .exact = 1 },
+        .Iota => .{ .exact = 1 },
     };
 }
 
@@ -743,10 +710,6 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .ElemwiseBinary = .{ .op = op } }, &[_]ValueId{ a, b });
     }
 
-    pub fn addBroadcastLastDimBinary(self: *Self, op: ElemwiseBinaryOp, a: ValueId, b: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.{ .BroadcastLastDimBinary = .{ .op = op } }, &[_]ValueId{ a, b });
-    }
-
     pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
     }
@@ -862,17 +825,16 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .RMSNorm = .{ .eps = eps, .normalized_shape = ns } }, &[_]ValueId{ x, gamma, beta });
     }
 
-    pub fn addAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool) GraphError!ValueId {
-        return self.addNodeInternal(.{ .Attention = .{ .scale = scale, .causal = causal } }, &[_]ValueId{ q, k, v });
-    }
-
-    pub fn addMultiHeadAttention(self: *Self, q: ValueId, k: ValueId, v: ValueId, scale: f32, causal: bool, heads: usize) GraphError!ValueId {
-        return self.addNodeInternal(.{ .MultiHeadAttention = .{ .scale = scale, .causal = causal, .heads = heads } }, &[_]ValueId{ q, k, v });
-    }
-
     /// Relative-positional multi-head self-attention (Conformer / Transformer-XL).
     /// `pos_emb` is [H, P, D] (P = 2*T_kv-1, already projected); biases are [H, D];
     /// `mask` (optional) is an additive [T_q, T_kv] tensor.
+    ///
+    /// `chunk_size`/`chunk_left` express chunked-limited attention structurally (see
+    /// `Op.RelPosMHA`); pass 0 for full attention. They compose with `mask`, which
+    /// then only has to carry what an interval cannot — e.g. streaming padding.
+    /// There is no `heads` parameter or attribute: the head count is `q`'s dim 2, and
+    /// every consumer reads it from the shape. (Carrying it separately is the exact
+    /// redundancy that got `MultiHeadAttention.heads` retired.)
     pub fn addRelPosMHA(
         self: *Self,
         q: ValueId,
@@ -883,9 +845,15 @@ pub const Graph = struct {
         pos_bias_v: ValueId,
         mask: ?ValueId,
         scale: f32,
-        heads: usize,
+        chunk_size: usize,
+        chunk_left: usize,
     ) GraphError!ValueId {
-        const op: Op = .{ .RelPosMHA = .{ .scale = scale, .heads = heads, .has_mask = (mask != null) } };
+        const op: Op = .{ .RelPosMHA = .{
+            .scale = scale,
+            .has_mask = (mask != null),
+            .chunk_size = chunk_size,
+            .chunk_left = chunk_left,
+        } };
         if (mask) |m| {
             return self.addNodeInternal(op, &[_]ValueId{ q, k, v, pos_emb, pos_bias_u, pos_bias_v, m });
         }
@@ -902,27 +870,34 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .ScatterRow = {} }, &[_]ValueId{ buf, idx, src });
     }
 
-    pub fn addMultiHeadAttentionCached(
+    /// Grouped-query attention; see `Op.Attention`. Optional query positions and
+    /// K/V lengths are independent and appended to the input list in that order.
+    pub fn addAttention(
         self: *Self,
         q: ValueId,
-        k_cache: ValueId,
-        v_cache: ValueId,
-        positions: ValueId,
-        end_index: ValueId,
+        k: ValueId,
+        v: ValueId,
+        query_positions: ?ValueId,
+        kv_lengths: ?ValueId,
         scale: f32,
         causal: bool,
         sliding_window: usize,
         attn_logits_soft_cap: f32,
     ) GraphError!ValueId {
-        return self.addNodeInternal(
-            .{ .MultiHeadAttentionCached = .{
-                .scale = scale,
-                .causal = causal,
-                .sliding_window = sliding_window,
-                .attn_logits_soft_cap = attn_logits_soft_cap,
-            } },
-            &[_]ValueId{ q, k_cache, v_cache, positions, end_index },
-        );
+        const op: Op = .{ .Attention = .{
+            .scale = scale,
+            .causal = causal,
+            .sliding_window = sliding_window,
+            .attn_logits_soft_cap = attn_logits_soft_cap,
+            .has_query_positions = (query_positions != null),
+            .has_kv_lengths = (kv_lengths != null),
+        } };
+        if (query_positions) |p| {
+            if (kv_lengths) |lens| return self.addNodeInternal(op, &[_]ValueId{ q, k, v, p, lens });
+            return self.addNodeInternal(op, &[_]ValueId{ q, k, v, p });
+        }
+        if (kv_lengths) |lens| return self.addNodeInternal(op, &[_]ValueId{ q, k, v, lens });
+        return self.addNodeInternal(op, &[_]ValueId{ q, k, v });
     }
 
     pub fn addRelu(self: *Self, a: ValueId) GraphError!ValueId {
@@ -946,8 +921,16 @@ pub const Graph = struct {
         return self.addNodeInternal(.Copy, &[_]ValueId{a});
     }
 
-    pub fn addGatherRows(self: *Self, table: ValueId, indices: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.GatherRows, &[_]ValueId{ table, indices });
+    pub fn addGather(self: *Self, data: ValueId, indices: ValueId, axis: i32, batch_dims: usize) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Gather = .{ .axis = axis, .batch_dims = batch_dims } }, &[_]ValueId{ data, indices });
+    }
+
+    pub fn addDim(self: *Self, input: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Dim = .{ .axis = axis } }, &[_]ValueId{input});
+    }
+
+    pub fn addIota(self: *Self, shape_like: ValueId, axis: i32) GraphError!ValueId {
+        return self.addNodeInternal(.{ .Iota = .{ .axis = axis } }, &[_]ValueId{shape_like});
     }
 
     pub fn addRoPE1D(

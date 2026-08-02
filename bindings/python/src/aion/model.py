@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Iterable, Mapping, Optional, overload
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, TypeAlias, Union, overload
 
 from .device import DeviceLike, _is_cpu, _normalize_device
 from ._ffi.handles import ModelHandle
@@ -25,14 +25,14 @@ from ._ffi.runtime import (
     set_state_input_policy,
 )
 from .enums import AionDType
-from .types import NDArray
+from .types import ArrayLike, NDArray
 
 if TYPE_CHECKING:
     from .context import Context
     from .tensor import Tensor
 
 # What model I/O accepts: a numpy array (or array-like) or an existing Tensor.
-InputValue = object
+InputValue: TypeAlias = Union["Tensor", ArrayLike]
 
 
 @dataclass(frozen=True)

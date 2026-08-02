@@ -84,7 +84,7 @@ pub fn Residual(comptime Body: type) type {
         pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
             const y: TensorRef = try self.body.forward(bld, x);
             const scaled: TensorRef = if (self.has_scale)
-                try bld.broadcastLastDim(.mul, y, self.scale)
+                try bld.mul(y, self.scale)
             else
                 y;
             return bld.add(x, scaled);

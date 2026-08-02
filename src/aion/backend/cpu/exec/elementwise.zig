@@ -12,6 +12,92 @@ const executable = @import("../../../runtime/executable.zig");
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
+fn execElemwiseBinaryTile(
+    store: tensor_store.TensorStore,
+    out_meta: tensor_store.TensorMeta,
+    a_meta: tensor_store.TensorMeta,
+    b_meta: tensor_store.TensorMeta,
+    s: executable.StepElemwiseBinaryTiled,
+    tile_index: usize,
+) !void {
+    var coords_buf: [tensor_store.INLINE_RANK]usize = @splat(0);
+    const coords = coords_buf[0..@as(usize, out_meta.rank)];
+    try tensor_store.decodeTileCoords(out_meta, tile_index, coords);
+    const a_index = try tensor_store.projectTileIndex(a_meta, coords, &.{}, s.broadcast.a_broadcast_axes);
+    const b_index = try tensor_store.projectTileIndex(b_meta, coords, &.{}, s.broadcast.b_broadcast_axes);
+
+    const out_tile = try store.acquireTileMutLinear(s.out, tile_index);
+    defer store.releaseMut(out_tile.token);
+    const a_tile = try store.acquireTileConstLinear(s.a, a_index);
+    defer store.releaseConst(a_tile.token);
+    const b_tile = try store.acquireTileConstLinear(s.b, b_index);
+    defer store.releaseConst(b_tile.token);
+
+    const out_view = out_tile.bufferView();
+    const a_view = a_tile.bufferView();
+    const b_view = b_tile.bufferView();
+    const n = exec_utils.elemCountFromTileView(out_view);
+
+    if (s.broadcast.kind == .identical) {
+        return switch (out_view.dtype) {
+            .f32 => elemwise.elemwiseBinaryF32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
+            .f16 => elemwise.elemwiseBinaryF16(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
+            .i32 => elemwise.elemwiseBinaryI32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
+            else => BackendError.InvalidArgument,
+        };
+    }
+
+    if (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) {
+        const cols = exec_utils.elemCountFromTileView(b_view);
+        return switch (out_view.dtype) {
+            .f32 => switch (s.op) {
+                .add => elemwise.contiguousSuffixBinaryF32Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .sub => elemwise.contiguousSuffixBinaryF32Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .mul => elemwise.contiguousSuffixBinaryF32Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .div => elemwise.contiguousSuffixBinaryF32Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                else => BackendError.InvalidArgument,
+            },
+            .f16 => switch (s.op) {
+                .add => elemwise.contiguousSuffixBinaryF16Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .sub => elemwise.contiguousSuffixBinaryF16Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .mul => elemwise.contiguousSuffixBinaryF16Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                .div => elemwise.contiguousSuffixBinaryF16Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+                else => BackendError.InvalidArgument,
+            },
+            .i32 => elemwise.contiguousSuffixBinaryI32Packed(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
+            else => BackendError.InvalidArgument,
+        };
+    }
+
+    return switch (out_view.dtype) {
+        .f32 => elemwise.elemwiseBroadcastF32(
+            s.op,
+            out_view,
+            a_view,
+            b_view,
+            s.broadcast.a_broadcast_axes,
+            s.broadcast.b_broadcast_axes,
+        ),
+        .f16 => elemwise.elemwiseBroadcastF16(
+            s.op,
+            out_view,
+            a_view,
+            b_view,
+            s.broadcast.a_broadcast_axes,
+            s.broadcast.b_broadcast_axes,
+        ),
+        .i32 => elemwise.elemwiseBroadcastI32(
+            s.op,
+            out_view,
+            a_view,
+            b_view,
+            s.broadcast.a_broadcast_axes,
+            s.broadcast.b_broadcast_axes,
+        ),
+        else => BackendError.InvalidArgument,
+    };
+}
+
 pub fn execElemwiseBinaryTiled(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
@@ -19,6 +105,8 @@ pub fn execElemwiseBinaryTiled(
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const out_meta = try store.meta(s.out);
+    const a_meta = try store.meta(s.a);
+    const b_meta = try store.meta(s.b);
     var tile_total: usize = 1;
     var d: usize = 0;
     while (d < @as(usize, out_meta.rank)) : (d += 1) {
@@ -32,10 +120,13 @@ pub fn execElemwiseBinaryTiled(
             const Task = struct {
                 store: tensor_store.TensorStore,
                 out_meta: tensor_store.TensorMeta,
+                a_meta: tensor_store.TensorMeta,
+                b_meta: tensor_store.TensorMeta,
                 op: types.ElemwiseBinaryOp,
                 out: tensor_store.TensorId,
                 a: tensor_store.TensorId,
                 b: tensor_store.TensorId,
+                broadcast: executable.ElementwiseBroadcastPlan,
 
                 stop: std.atomic.Value(bool) = .init(false),
                 err_mutex: std.Io.Mutex = .init,
@@ -58,55 +149,32 @@ pub fn execElemwiseBinaryTiled(
                     var i: usize = start;
                     while (i < end) : (i += 1) {
                         if (t.stop.load(.acquire)) return;
-                        if (i + 1 < end) {
-                            t.store.prefetchLinear(t.a, i + 1);
-                            t.store.prefetchLinear(t.b, i + 1);
-                        }
-
-                        const out_tile = t.store.acquireTileMutLinear(t.out, i) catch |e| {
+                        const step: executable.StepElemwiseBinaryTiled = .{
+                            .op = t.op,
+                            .out = t.out,
+                            .a = t.a,
+                            .b = t.b,
+                            .broadcast = t.broadcast,
+                        };
+                        execElemwiseBinaryTile(t.store, t.out_meta, t.a_meta, t.b_meta, step, i) catch |e| {
                             t.fail(e);
                             return;
                         };
-                        defer t.store.releaseMut(out_tile.token);
-                        const a_tile = t.store.acquireTileConstLinear(t.a, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseConst(a_tile.token);
-                        const b_tile = t.store.acquireTileConstLinear(t.b, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseConst(b_tile.token);
-
-                        const out_view = out_tile.bufferView();
-                        const a_view = a_tile.bufferView();
-                        const b_view = b_tile.bufferView();
-
-                        const n: usize = exec_utils.elemCountFromTileView(out_view);
-                        switch (out_view.dtype) {
-                            .f32 => elemwise.elemwiseBinaryF32(t.op, out_view.bytes, a_view.bytes, b_view.bytes, n) catch |e| {
-                                t.fail(e);
-                                return;
-                            },
-                            .f16 => elemwise.elemwiseBinaryF16(t.op, out_view.bytes, a_view.bytes, b_view.bytes, n) catch |e| {
-                                t.fail(e);
-                                return;
-                            },
-                            .i32 => elemwise.elemwiseBinaryI32(t.op, out_view.bytes, a_view.bytes, b_view.bytes, n) catch |e| {
-                                t.fail(e);
-                                return;
-                            },
-                            else => {
-                                t.fail(BackendError.InvalidArgument);
-                                return;
-                            },
-                        }
                     }
                 }
             };
 
-            var task: Task = .{ .store = store, .out_meta = out_meta, .op = s.op, .out = s.out, .a = s.a, .b = s.b };
+            var task: Task = .{
+                .store = store,
+                .out_meta = out_meta,
+                .a_meta = a_meta,
+                .b_meta = b_meta,
+                .op = s.op,
+                .out = s.out,
+                .a = s.a,
+                .b = s.b,
+                .broadcast = s.broadcast,
+            };
             // Grain based on bytes-per-tile: target ~256KiB per chunk.
             var grain: usize = if (tile_bytes == 0) 32 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
             if (grain > tile_total) grain = tile_total;
@@ -119,23 +187,7 @@ pub fn execElemwiseBinaryTiled(
     // Sequential fallback.
     var tile_index: usize = 0;
     while (tile_index < tile_total) : (tile_index += 1) {
-        const out_tile = try store.acquireTileMutLinear(s.out, tile_index);
-        defer store.releaseMut(out_tile.token);
-        const a_tile = try store.acquireTileConstLinear(s.a, tile_index);
-        defer store.releaseConst(a_tile.token);
-        const b_tile = try store.acquireTileConstLinear(s.b, tile_index);
-        defer store.releaseConst(b_tile.token);
-
-        const out_view = out_tile.bufferView();
-        const a_view = a_tile.bufferView();
-        const b_view = b_tile.bufferView();
-        const n: usize = exec_utils.elemCountFromTileView(out_view);
-        switch (out_view.dtype) {
-            .f32 => try elemwise.elemwiseBinaryF32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
-            .f16 => try elemwise.elemwiseBinaryF16(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
-            .i32 => try elemwise.elemwiseBinaryI32(s.op, out_view.bytes, a_view.bytes, b_view.bytes, n),
-            else => return BackendError.InvalidArgument,
-        }
+        try execElemwiseBinaryTile(store, out_meta, a_meta, b_meta, s, tile_index);
     }
 }
 
@@ -225,201 +277,6 @@ fn geluMulOneTile(store: tensor_store.TensorStore, out: tensor_store.TensorId, a
     if (out_view.dtype != .f32) return BackendError.InvalidArgument;
     try gelu_k.geluF32(out_view.bytes, a_view.bytes, n);
     try elemwise.elemwiseBinaryF32(.mul, out_view.bytes, out_view.bytes, b_view.bytes, n);
-}
-
-pub fn execBroadcastLastDimBinaryTiled(
-    pool: ?*thread_pool.ThreadPool,
-    thread_count: usize,
-    s: executable.StepBroadcastLastDimBinaryTiled,
-    store: tensor_store.TensorStore,
-) ExecuteProgramError!void {
-    const out_meta = try store.meta(s.out);
-    if (out_meta.rank < 2) return BackendError.InvalidArgument;
-    if (out_meta.rank > 8) return BackendError.InvalidArgument;
-
-    // A single-element `b` is a scalar broadcast over every column: it lives in
-    // one tile (compile-validated), and the kernels' `b[i % cols]` indexing turns
-    // into `b[0]` when we pass `col_count = 1`.
-    const b_meta = try store.meta(s.b);
-    const b_scalar: bool = (b_meta.rank == 1 and b_meta.shape[0] == 1);
-
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < @as(usize, out_meta.rank)) : (d += 1) {
-        tile_total *= out_meta.tile_counts[d];
-    }
-    const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
-    const min_total_bytes: usize = 256 * 1024;
-
-    if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                out_meta: tensor_store.TensorMeta,
-                op: types.ElemwiseBinaryOp,
-                out: tensor_store.TensorId,
-                a: tensor_store.TensorId,
-                b: tensor_store.TensorId,
-                b_scalar: bool,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-
-                    if (t.stop.load(.acquire)) return;
-
-                    var i: usize = start;
-                    while (i < end) : (i += 1) {
-                        if (t.stop.load(.acquire)) return;
-                        var coords_buf: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
-                        const coords: []usize = coords_buf[0..@as(usize, t.out_meta.rank)];
-                        tensor_store.decodeTileCoords(t.out_meta, i, coords) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        const ti_last: usize = coords[@as(usize, t.out_meta.rank) - 1];
-
-                        const out_tile = t.store.acquireTileMutLinear(t.out, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseMut(out_tile.token);
-                        const a_tile = t.store.acquireTileConstLinear(t.a, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseConst(a_tile.token);
-                        const b_tile = t.store.acquireTileConst(t.b, if (t.b_scalar) 0 else ti_last, 0) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseConst(b_tile.token);
-
-                        const out_view = out_tile.bufferView();
-                        const a_view = a_tile.bufferView();
-                        const b_view = b_tile.bufferView();
-                        const col_count: usize = if (t.b_scalar) 1 else out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
-                        const elem_count: usize = exec_utils.elemCountFromTileView(out_view);
-                        if (out_view.layout.rank < 2) {
-                            t.fail(BackendError.InvalidArgument);
-                            return;
-                        }
-
-                        switch (out_view.dtype) {
-                            .f32 => switch (t.op) {
-                                .add => elemwise.broadcastLastDimBinaryF32Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .sub => elemwise.broadcastLastDimBinaryF32Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .mul => elemwise.broadcastLastDimBinaryF32Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .div => elemwise.broadcastLastDimBinaryF32Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                else => {
-                                    t.fail(BackendError.InvalidArgument);
-                                    return;
-                                },
-                            },
-                            .f16 => switch (t.op) {
-                                .add => elemwise.broadcastLastDimBinaryF16Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .sub => elemwise.broadcastLastDimBinaryF16Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .mul => elemwise.broadcastLastDimBinaryF16Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                .div => elemwise.broadcastLastDimBinaryF16Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                },
-                                else => {
-                                    t.fail(BackendError.InvalidArgument);
-                                    return;
-                                },
-                            },
-                            else => {
-                                t.fail(BackendError.InvalidArgument);
-                                return;
-                            },
-                        }
-                    }
-                }
-            };
-
-            var task: Task = .{ .store = store, .out_meta = out_meta, .op = s.op, .out = s.out, .a = s.a, .b = s.b, .b_scalar = b_scalar };
-            var grain: usize = if (tile_bytes == 0) 16 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
-            if (grain > tile_total) grain = tile_total;
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
-    }
-
-    // Sequential fallback.
-    var tile_index: usize = 0;
-    while (tile_index < tile_total) : (tile_index += 1) {
-        var coords_buf: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
-        const coords: []usize = coords_buf[0..@as(usize, out_meta.rank)];
-        try tensor_store.decodeTileCoords(out_meta, tile_index, coords);
-        const ti_last: usize = coords[@as(usize, out_meta.rank) - 1];
-
-        const out_tile = try store.acquireTileMutLinear(s.out, tile_index);
-        defer store.releaseMut(out_tile.token);
-        const a_tile = try store.acquireTileConstLinear(s.a, tile_index);
-        defer store.releaseConst(a_tile.token);
-        const b_tile = try store.acquireTileConst(s.b, if (b_scalar) 0 else ti_last, 0);
-        defer store.releaseConst(b_tile.token);
-
-        const out_view = out_tile.bufferView();
-        const a_view = a_tile.bufferView();
-        const b_view = b_tile.bufferView();
-        if (out_view.layout.rank < 2) return BackendError.InvalidArgument;
-        const col_count: usize = if (b_scalar) 1 else out_view.layout.shape[@as(usize, out_view.layout.rank) - 1];
-        const elem_count: usize = exec_utils.elemCountFromTileView(out_view);
-
-        switch (out_view.dtype) {
-            .f32 => switch (s.op) {
-                .add => try elemwise.broadcastLastDimBinaryF32Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .sub => try elemwise.broadcastLastDimBinaryF32Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .mul => try elemwise.broadcastLastDimBinaryF32Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .div => try elemwise.broadcastLastDimBinaryF32Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                else => return BackendError.InvalidArgument,
-            },
-            .f16 => switch (s.op) {
-                .add => try elemwise.broadcastLastDimBinaryF16Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .sub => try elemwise.broadcastLastDimBinaryF16Packed(.sub, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .mul => try elemwise.broadcastLastDimBinaryF16Packed(.mul, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                .div => try elemwise.broadcastLastDimBinaryF16Packed(.div, out_view.bytes, a_view.bytes, b_view.bytes, elem_count, col_count),
-                else => return BackendError.InvalidArgument,
-            },
-            else => return BackendError.InvalidArgument,
-        }
-    }
 }
 
 pub fn execCopyTiled(

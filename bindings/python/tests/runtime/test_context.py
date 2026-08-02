@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import aion
+import aion.context as context_module
 
 
 def test_context_create_destroy():
@@ -12,9 +13,32 @@ def test_context_create_destroy():
         pass
 
 
+def test_gpu_context_adds_missing_runtime_hint(monkeypatch):
+    native_error = aion.AionError(
+        aion.AionStatus.AION_UNSUPPORTED,
+        "aion_context_create: AION_UNSUPPORTED",
+    )
+
+    def fail_create(_thread_count, _gpus):
+        raise native_error
+
+    monkeypatch.setattr(context_module, "create_context", fail_create)
+    monkeypatch.setattr(
+        context_module,
+        "missing_wgpu_runtime_hint",
+        lambda: "The optional wgpu-native runtime is not installed. Run `uv sync`.",
+    )
+
+    with pytest.raises(
+        aion.AionError,
+        match=r"wgpu-native runtime is not installed.*uv sync",
+    ):
+        aion.Context.gpu(thread_count=1)
+
+
 def test_context_close_auto_closes_live_children():
     ctx = aion.Context(thread_count=1)
-    _t = aion.Tensor.empty(ctx, (2, 2), dtype=aion.AionDType.AION_DTYPE_F32)
+    _t = aion.Tensor.empty(ctx, (2, 2), dtype=aion.float32)
     # Should not raise even though child tensor is still live.
     ctx.close()
 

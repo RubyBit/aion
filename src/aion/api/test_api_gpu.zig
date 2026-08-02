@@ -59,6 +59,50 @@ test "api: gpu model output matches cpu model (compileOn)" {
     try std.testing.expectApproxEqAbs(cpu_out, gpu_out, 1e-4);
 }
 
+fn runBatchedMatmul(
+    ctx: *api.Context,
+    dev: api.DeviceSelector,
+    a_t: api.Tensor,
+    b_t: api.Tensor,
+) ![24]f32 {
+    var bld = api.Builder.init(ctx);
+    defer bld.deinit();
+
+    const A = try bld.param(a_t); // [batch=2, seq=3, k=8]
+    const B = try bld.param(b_t); // [k=8, n=4], broadcast over batch/seq
+    const C = try bld.matmul(A, B, 1.0, 0.0);
+
+    var model = try ctx.compileOn(dev, &bld, &[_]api.TensorRef{C}, .{});
+    defer model.deinit();
+
+    const out = try model.runOutputTensor(0);
+    var vals: [24]f32 = undefined;
+    try out.read(&vals);
+    return vals;
+}
+
+test "api: gpu batched matmul broadcasts rank-2 weight (matches cpu)" {
+    const alloc = std.testing.allocator;
+
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var a_vals: [2 * 3 * 8]f32 = undefined;
+    var b_vals: [8 * 4]f32 = undefined;
+    for (&a_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.125;
+    for (&b_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+
+    const a_t = try ctx.fromF32(&.{ 2, 3, 8 }, &a_vals);
+    const b_t = try ctx.fromF32(&.{ 8, 4 }, &b_vals);
+
+    const cpu = try runBatchedMatmul(&ctx, .cpu, a_t, b_t);
+    const gpu_out = try runBatchedMatmul(&ctx, .{ .gpu = 0 }, a_t, b_t);
+    for (cpu, gpu_out) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+}
+
 /// Run a 2-step KV-cache "decode" on `dev`: an in-place `sequenceAppend` whose
 /// output is io-aliased back to the `cache` input, so the cache is recurrent
 /// state carried across runs. Returns the cache contents after both steps.
@@ -71,7 +115,7 @@ fn runKvCacheSteps(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
     var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
-    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 4, 2 }), "cache");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 4, 1, 2 }), "cache");
     const New = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 1, 2 }), "new_kv");
     const End = try bld.name(try bld.input(.i32, &[_]usize{1}), "end");
     const Out = try bld.name(try bld.sequenceAppend(Cache, New, End), "cache_out");
@@ -82,7 +126,7 @@ fn runKvCacheSteps(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
     defer model.deinit();
 
     // Seed the cache once with zeros; the io-alias then carries it across runs.
-    const cache0 = try ctx.fromArray([1][1][4][2]f32{.{.{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }}});
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 4, 1, 2 }, &([_]f32{0} ** 8));
     try model.bindInput("cache", cache0);
 
     const steps = [_]struct { end: i32, kv: [2]f32 }{
@@ -180,7 +224,7 @@ fn runGrowableDecode(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
     var bld = api.Builder.init(ctx);
     defer bld.deinit();
 
-    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2, 1, 1 }), "cache");
     const New = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 1, 1 }), "new");
     const End = try bld.name(try bld.input(.i32, &[_]usize{1}), "end");
     const Out = try bld.name(try bld.sequenceAppend(Cache, New, End), "cache_out");
@@ -197,7 +241,7 @@ fn runGrowableDecode(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromArray([1][1][2][1]f32{.{.{ .{0}, .{0} }}});
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
     try model.bindInput("cache", cache0);
 
     var pos: i32 = 0;
@@ -253,7 +297,7 @@ test "api: device growth is frame-safe with an in-frame cache read" {
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
 
-    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 2, 1 }), "cache");
+    const Cache = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2, 1, 1 }), "cache");
     const New = try bld.name(try bld.input(.f32, &[_]usize{ 1, 1, 1, 1 }), "new");
     const End = try bld.name(try bld.input(.i32, &[_]usize{1}), "end");
     const Pre = try bld.name(try bld.add(Cache, Cache), "pre"); // reads the cache buffer in-frame
@@ -271,7 +315,7 @@ test "api: device growth is frame-safe with an in-frame cache read" {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromArray([1][1][2][1]f32{.{.{ .{0}, .{0} }}});
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
     try model.bindInput("cache", cache0);
 
     var pos: i32 = 0;

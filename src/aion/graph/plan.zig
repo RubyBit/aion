@@ -80,17 +80,6 @@ pub const TilePolicy = struct {
     /// Used by both the tiling chooser and the compile-time validation guard.
     softmax_row_cap: usize = 256,
 
-    /// Attention query-row tile target (heuristic; favors tile-level parallelism).
-    attn_q_tile: usize = 32,
-    /// Attention key-block tile cap (chooser cap AND validation key-rows limit).
-    attn_k_tile_cap: usize = 128,
-    /// Attention value/output-column tile cap (chooser cap AND validation limit).
-    attn_v_tile_cap: usize = 64,
-    /// Attention head-dim tile cap (chooser).
-    attn_head_tile_cap: usize = 128,
-    /// Max attention query rows per tile accepted by the CPU kernel (validation).
-    attn_max_q_rows: usize = 256,
-
     // /// Target number of output tiles for matvec-shaped matmuls (M <= 4).
     // ///
     // /// Matvec matmuls parallelize over N tiles; with too few tiles, only a fraction
@@ -141,11 +130,6 @@ pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
             // tile — the caps that bound the CPU kernels' stack scratch don't
             // apply. The GPU attention exec binds one buffer per operand per
             // slice and rejects multi-tile last-two-dims with Unsupported.
-            .attn_q_tile = GPU_MACRO_TILE_CAP,
-            .attn_k_tile_cap = GPU_MACRO_TILE_CAP,
-            .attn_v_tile_cap = GPU_MACRO_TILE_CAP,
-            .attn_head_tile_cap = GPU_MACRO_TILE_CAP,
-            .attn_max_q_rows = GPU_MACRO_TILE_CAP,
         },
     };
 }
@@ -205,48 +189,6 @@ pub fn chooseNormTiles(policy: TilePolicy, m: usize, n: usize) struct { tm: usiz
     // Favor decent width along last dim; cap to base_square_2d like softmax.
     const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
     return .{ .tm = tm, .tn = tn };
-}
-
-pub fn chooseAttentionTiles(policy: TilePolicy, m: usize, n: usize, dk: usize, dv: usize) struct { tm: usize, tn: usize, tk: usize, tv: usize } {
-    // GPU targets: one tile per slice dimension (the kernel streams keys and
-    // holds no per-tile stack scratch), and no ×16 rounding — a split dv/dk
-    // tile would force the exec into multi-buffer bindings for no benefit.
-    if (policy.target_kind != .cpu) {
-        const tm_g: usize = @max(@as(usize, 1), @min(m, @min(policy.attn_q_tile, policy.base_1d)));
-        const tn_g: usize = @max(@as(usize, 1), @min(n, @min(policy.attn_k_tile_cap, policy.base_square_2d)));
-        const tk_g: usize = @max(@as(usize, 1), @min(dk, policy.attn_head_tile_cap));
-        const tv_g: usize = @max(@as(usize, 1), @min(dv, policy.attn_v_tile_cap));
-        return .{ .tm = tm_g, .tn = tn_g, .tk = tk_g, .tv = tv_g };
-    }
-
-    // Attention is row-wise over queries, and needs per-query scratch.
-    // IMPORTANT: we parallelize attention primarily across query tiles.
-    // Keep tm modest so we have enough tile-level parallelism on many-core CPUs.
-    const tm_cap: usize = policy.attn_q_tile;
-    const tm: usize = @max(@as(usize, 1), @min(tm_cap, @min(m, policy.base_1d)));
-
-    // Block keys modestly so per-row score scratch stays small.
-    const tn_cap: usize = policy.attn_k_tile_cap;
-    const tn: usize = @max(@as(usize, 1), @min(n, @min(tn_cap, policy.base_square_2d)));
-
-    // Block value/output columns to bound the accumulator scratch.
-    const tv_cap: usize = policy.attn_v_tile_cap;
-    var tv_target: usize = @min(dv, @min(tv_cap, policy.base_square_2d));
-    if (tv_target >= 16) {
-        tv_target = roundDownToMultiple(tv_target, 16);
-        if (tv_target == 0) tv_target = @min(@as(usize, 16), dv);
-    }
-    const tv: usize = @max(@as(usize, 1), @min(tv_target, dv));
-
-    // Block head dim reasonably; keep it SIMD-friendly.
-    var tk_target: usize = @min(policy.attn_head_tile_cap, dk);
-    if (tk_target >= 16) {
-        tk_target = roundDownToMultiple(tk_target, 16);
-        if (tk_target == 0) tk_target = @min(@as(usize, 16), dk);
-    }
-    const tk: usize = @max(@as(usize, 1), @min(tk_target, dk));
-
-    return .{ .tm = tm, .tn = tn, .tk = tk, .tv = tv };
 }
 
 pub fn chooseConv1DTiles(policy: TilePolicy, l: usize, c_out: usize) struct { tl: usize, tc: usize } {

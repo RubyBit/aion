@@ -28,6 +28,9 @@ pub fn Kernel(comptime tuning: Tuning) type {
         pub const simd_lanes: usize = lanes;
         pub const Vec = @Vector(lanes, f32);
 
+        /// Softmax/score post-processing at THIS variant's width (see `RangedOps`).
+        pub const ranged = RangedOps(lanes);
+
         pub inline fn vecLoad(ptr: [*]align(1) const f32) Self.Vec {
             return @as(*align(1) const [lanes]f32, @ptrCast(ptr)).*;
         }
@@ -178,6 +181,85 @@ pub fn Kernel(comptime tuning: Tuning) type {
             }
         }
 
+        /// Scores for a SMALL number of q rows — fewer than `mr`, where
+        /// `calcScoresF32`'s packed path degenerates to its scalar fallback
+        /// (`r0 + MR > m_q` takes the slow branch for every column block).
+        ///
+        /// Streams each key row ONCE and fans it into all `m_q` accumulators, so K
+        /// traffic drops by a factor of `m_q` — that is the GQA-decode win, where
+        /// every query head in a group reads the same K/V rows. `qs` must be a
+        /// gathered/contiguous panel (row stride `q_stride`).
+        pub fn calcScoresNarrowF32(
+            m_q: usize,
+            n_k: usize,
+            k_dim: usize,
+            qs: []align(1) const f32,
+            q_stride: usize,
+            ks: []align(1) const f32,
+            k_stride: usize,
+            scores: []f32,
+            score_stride: usize,
+        ) void {
+            var r0: usize = 0;
+            while (r0 < m_q) : (r0 += 8) {
+                const n: usize = @min(@as(usize, 8), m_q - r0);
+                switch (n) {
+                    1 => narrowN(1, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    2 => narrowN(2, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    3 => narrowN(3, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    4 => narrowN(4, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    5 => narrowN(5, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    6 => narrowN(6, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    7 => narrowN(7, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                    else => narrowN(8, r0, n_k, k_dim, qs, q_stride, ks, k_stride, scores, score_stride),
+                }
+            }
+        }
+
+        /// `N` q rows at a time with the row count comptime-known, so the FMA fan-out
+        /// over accumulators unrolls into registers.
+        fn narrowN(
+            comptime N: usize,
+            r0: usize,
+            n_k: usize,
+            k_dim: usize,
+            qs: []align(1) const f32,
+            q_stride: usize,
+            ks: []align(1) const f32,
+            k_stride: usize,
+            scores: []f32,
+            score_stride: usize,
+        ) void {
+            const vec_end: usize = k_dim - (k_dim % lanes);
+
+            var q_ptrs: [N][*]align(1) const f32 = undefined;
+            inline for (0..N) |r| q_ptrs[r] = qs[(r0 + r) * q_stride ..].ptr;
+
+            var c: usize = 0;
+            while (c < n_k) : (c += 1) {
+                const k_ptr: [*]align(1) const f32 = ks[c * k_stride ..].ptr;
+
+                var vacc: [N]Self.Vec = @splat(@as(Self.Vec, @splat(0.0)));
+                var i: usize = 0;
+                while (i < vec_end) : (i += lanes) {
+                    const vk: Self.Vec = Self.vecLoad(k_ptr + i);
+                    inline for (0..N) |r| {
+                        vacc[r] = @mulAdd(Self.Vec, Self.vecLoad(q_ptrs[r] + i), vk, vacc[r]);
+                    }
+                }
+
+                var acc: [N]f32 = undefined;
+                inline for (0..N) |r| acc[r] = @reduce(.Add, vacc[r]);
+                i = vec_end;
+                while (i < k_dim) : (i += 1) {
+                    const kv: f32 = k_ptr[i];
+                    inline for (0..N) |r| acc[r] += q_ptrs[r][i] * kv;
+                }
+
+                inline for (0..N) |r| scores[(r0 + r) * score_stride + c] += acc[r];
+            }
+        }
+
         pub fn accumulateValuesF32(
             m_tile: usize,
             n_v: usize,
@@ -309,92 +391,214 @@ pub fn accumulateValuesF32(
     DefaultKernel.accumulateValuesF32(m_tile, n_v, dv, scores, score_stride, vs, v_stride, acc, acc_stride);
 }
 
-pub fn applyScaleMaskF32(
-    scores: []f32,
-    m_tile: usize,
-    tn: usize,
-    head_n: usize,
-    local_key_row0: usize,
-    local_q_row0: usize,
-    scale: f32,
-    causal: bool,
-) void {
-    var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
-        const q_idx: usize = local_q_row0 + r;
-        if (local_key_row0 >= head_n) continue;
-        const valid_cols: usize = @min(tn, head_n - local_key_row0);
-        var c: usize = 0;
-        while (c < valid_cols) : (c += 1) {
-            const k_idx: usize = local_key_row0 + c;
-            const idx: usize = r * tn + c;
-            var v0: f32 = scores[idx] * scale;
-            if (causal and k_idx > q_idx) v0 = -std.math.inf(f32);
-            scores[idx] = v0;
-        }
-        if (valid_cols < tn) {
-            @memset(scores[r * tn + valid_cols .. r * tn + tn], -std.math.inf(f32));
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Ranged variants, for blocked (flash-style) attention.
+//
+// Each q row sees a CONTIGUOUS key range — causal, sliding-window and ring limits
+// are all one interval — so a key block is masked by a per-row `[lo, hi)` rather
+// than by an additive mask. Out-of-range entries are written as exact 0.0 after the
+// exp, which keeps them out of both the row sum and the V accumulation; using -inf
+// logits instead would leak `exp(-80)` per masked key into the denominator.
+// ---------------------------------------------------------------------------
 
-pub fn rowMaxF32(scores: []const f32, m_tile: usize, tn: usize, row_max: []f32) void {
-    const lanes: usize = comptime simd.lanesF32();
-    const VecT = @Vector(lanes, f32);
+/// The softmax/score-postprocessing family, generic over the SIMD width so each
+/// registry variant instantiates its own. These used to be file-scope functions that
+/// baked in `comptime simd.lanesF32()` — the BUILD target's width — while the GEMMs
+/// beside them came from the runtime-selected tier, so on a machine whose tier is wider
+/// than the baseline the two halves of the same kernel ran at different widths.
+/// Reachable as `Kernel(tuning).ranged` and through the registry.
+fn RangedOps(comptime lanes: usize) type {
+    return struct {
+        /// Fold `scores[r, lo[r]..hi[r]]` into the RUNNING per-row max (seed `row_max`
+        /// with the online-softmax state, or -inf). Empty ranges contribute nothing.
+        pub fn rowMaxRangeF32(
+            scores: []const f32,
+            rows: usize,
+            score_stride: usize,
+            lo: []const u32,
+            hi: []const u32,
+            row_max: []f32,
+        ) void {
+            const VecT = @Vector(lanes, f32);
 
-    var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
-        var mx: f32 = -std.math.inf(f32);
-        var c: usize = 0;
-        if (tn >= lanes) {
-            var vmx: VecT = @splat(-std.math.inf(f32));
-            while (c + lanes <= tn) : (c += lanes) {
-                const v: VecT = @as(*align(1) const VecT, @ptrCast(scores.ptr + r * tn + c)).*;
-                vmx = @max(vmx, v);
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                const c0: usize = lo[r];
+                const c1: usize = hi[r];
+                if (c1 <= c0) continue;
+
+                const base: [*]const f32 = scores.ptr + r * score_stride;
+                var mx: f32 = row_max[r];
+                var c: usize = c0;
+                if (c1 - c0 >= lanes) {
+                    var vmx: VecT = @splat(mx);
+                    while (c + lanes <= c1) : (c += lanes) {
+                        vmx = @max(vmx, @as(*align(1) const VecT, @ptrCast(base + c)).*);
+                    }
+                    mx = @reduce(.Max, vmx);
+                }
+                while (c < c1) : (c += 1) mx = @max(mx, base[c]);
+                row_max[r] = mx;
             }
-            mx = @reduce(.Max, vmx);
-        }
-        while (c < tn) : (c += 1) {
-            mx = @max(mx, scores[r * tn + c]);
-        }
-        row_max[r] = mx;
-    }
-}
-
-pub fn expNormalizeScoresF32(
-    scores: []f32,
-    m_tile: usize,
-    tn: usize,
-    m_new: []const f32,
-    l_state: []f32,
-) void {
-    const lanes: usize = comptime simd.lanesF32();
-    const VecT = @Vector(lanes, f32);
-
-    var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
-        const mn: f32 = m_new[r];
-        var ssum: f32 = 0.0;
-
-        var c: usize = 0;
-        const v_mn: VecT = @splat(mn);
-        var v_ssum: VecT = @splat(0.0);
-        while (c + lanes <= tn) : (c += lanes) {
-            const ptr: [*]f32 = scores.ptr + r * tn + c;
-            const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
-            const v_diff: VecT = fast_math.clampVecF32(lanes, v_s - v_mn, -80.0, 0.0);
-            const v_p: VecT = fast_math.expApproxVecF32(lanes, v_diff);
-            @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
-            v_ssum += v_p;
-        }
-        ssum += @reduce(.Add, v_ssum);
-        while (c < tn) : (c += 1) {
-            const idx: usize = r * tn + c;
-            const p: f32 = fast_math.expApproxF32(fast_math.clampF32(scores[idx] - mn, -80.0, 0.0));
-            scores[idx] = p;
-            ssum += p;
         }
 
-        l_state[r] += ssum;
-    }
+        /// In-place `exp(scores - m[r])` inside `[lo[r], hi[r])` and exact 0.0 outside (over
+        /// the full `tn` columns), adding each row's sum into `l_state[r]`.
+        pub fn expNormalizeRangeF32(
+            scores: []f32,
+            rows: usize,
+            score_stride: usize,
+            tn: usize,
+            lo: []const u32,
+            hi: []const u32,
+            m: []const f32,
+            l_state: []f32,
+        ) void {
+            const VecT = @Vector(lanes, f32);
+
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                const base: [*]f32 = scores.ptr + r * score_stride;
+                const c0: usize = @min(lo[r], tn);
+                const c1: usize = @min(hi[r], tn);
+
+                @memset(base[0..c0], 0.0);
+                @memset(base[c1..tn], 0.0);
+                if (c1 <= c0) continue;
+
+                const mr: f32 = m[r];
+                const v_m: VecT = @splat(mr);
+                var v_sum: VecT = @splat(0.0);
+                var ssum: f32 = 0.0;
+
+                var c: usize = c0;
+                while (c + lanes <= c1) : (c += lanes) {
+                    const ptr: [*]f32 = base + c;
+                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+                    const v_p: VecT = fast_math.expApproxVecF32(lanes, fast_math.clampVecF32(lanes, v_s - v_m, -80.0, 0.0));
+                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
+                    v_sum += v_p;
+                }
+                ssum += @reduce(.Add, v_sum);
+                while (c < c1) : (c += 1) {
+                    const p: f32 = fast_math.expApproxF32(fast_math.clampF32(base[c] - mr, -80.0, 0.0));
+                    base[c] = p;
+                    ssum += p;
+                }
+
+                l_state[r] += ssum;
+            }
+        }
+
+        /// `scores[r, lo[r]..hi[r]] = cap * tanh(scores / cap)` — Gemma-style logit soft cap,
+        /// applied to the raw logits before the softmax.
+        pub fn softCapRangeF32(
+            scores: []f32,
+            rows: usize,
+            score_stride: usize,
+            lo: []const u32,
+            hi: []const u32,
+            cap: f32,
+        ) void {
+            const VecT = @Vector(lanes, f32);
+            const inv_cap: f32 = 1.0 / cap;
+
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                const base: [*]f32 = scores.ptr + r * score_stride;
+                const c0: usize = lo[r];
+                const c1: usize = hi[r];
+                if (c1 <= c0) continue;
+
+                const v_cap: VecT = @splat(cap);
+                const v_inv: VecT = @splat(inv_cap);
+                var c: usize = c0;
+                while (c + lanes <= c1) : (c += lanes) {
+                    const ptr: [*]f32 = base + c;
+                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_cap * fast_math.tanhApproxVecF32(lanes, v_s * v_inv);
+                }
+                while (c < c1) : (c += 1) base[c] = cap * fast_math.tanhApproxF32(base[c] * inv_cap);
+            }
+        }
+
+        /// `acc[r, 0..dv] *= factors[r]` — the online-softmax rescale applied when a key
+        /// block raises a row's running max.
+        pub fn rescaleRowsF32(acc: []f32, rows: usize, dv: usize, acc_stride: usize, factors: []const f32) void {
+            const VecT = @Vector(lanes, f32);
+
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                const f: f32 = factors[r];
+                if (f == 1.0) continue;
+                const base: [*]f32 = acc.ptr + r * acc_stride;
+                const vf: VecT = @splat(f);
+                var j: usize = 0;
+                while (j + lanes <= dv) : (j += lanes) {
+                    const ptr: [*]f32 = base + j;
+                    @as(*align(1) VecT, @ptrCast(ptr)).* = @as(*align(1) const VecT, @ptrCast(ptr)).* * vf;
+                }
+                while (j < dv) : (j += 1) base[j] *= f;
+            }
+        }
+
+        pub fn rowMaxF32(scores: []const f32, m_tile: usize, tn: usize, row_max: []f32) void {
+            const VecT = @Vector(lanes, f32);
+
+            var r: usize = 0;
+            while (r < m_tile) : (r += 1) {
+                var mx: f32 = -std.math.inf(f32);
+                var c: usize = 0;
+                if (tn >= lanes) {
+                    var vmx: VecT = @splat(-std.math.inf(f32));
+                    while (c + lanes <= tn) : (c += lanes) {
+                        const v: VecT = @as(*align(1) const VecT, @ptrCast(scores.ptr + r * tn + c)).*;
+                        vmx = @max(vmx, v);
+                    }
+                    mx = @reduce(.Max, vmx);
+                }
+                while (c < tn) : (c += 1) {
+                    mx = @max(mx, scores[r * tn + c]);
+                }
+                row_max[r] = mx;
+            }
+        }
+
+        pub fn expNormalizeScoresF32(
+            scores: []f32,
+            m_tile: usize,
+            tn: usize,
+            m_new: []const f32,
+            l_state: []f32,
+        ) void {
+            const VecT = @Vector(lanes, f32);
+
+            var r: usize = 0;
+            while (r < m_tile) : (r += 1) {
+                const mn: f32 = m_new[r];
+                var ssum: f32 = 0.0;
+
+                var c: usize = 0;
+                const v_mn: VecT = @splat(mn);
+                var v_ssum: VecT = @splat(0.0);
+                while (c + lanes <= tn) : (c += lanes) {
+                    const ptr: [*]f32 = scores.ptr + r * tn + c;
+                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+                    const v_diff: VecT = fast_math.clampVecF32(lanes, v_s - v_mn, -80.0, 0.0);
+                    const v_p: VecT = fast_math.expApproxVecF32(lanes, v_diff);
+                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
+                    v_ssum += v_p;
+                }
+                ssum += @reduce(.Add, v_ssum);
+                while (c < tn) : (c += 1) {
+                    const idx: usize = r * tn + c;
+                    const p: f32 = fast_math.expApproxF32(fast_math.clampF32(scores[idx] - mn, -80.0, 0.0));
+                    scores[idx] = p;
+                    ssum += p;
+                }
+
+                l_state[r] += ssum;
+            }
+        }
+    };
 }

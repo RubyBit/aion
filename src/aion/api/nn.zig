@@ -81,7 +81,7 @@ pub const GLU = mlp_mod.GLU;
 // --- attention --------------------------------------------------------------
 pub const RoPE = attention_mod.RoPE;
 pub const KVCache = attention_mod.KVCache;
-pub const CachedAttention = attention_mod.CachedAttention;
+pub const Attention = attention_mod.Attention;
 pub const RelPosSelfAttention = attention_mod.RelPosSelfAttention;
 
 // --- constant-bearing helpers ----------------------------------------------

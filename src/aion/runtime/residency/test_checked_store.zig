@@ -62,7 +62,7 @@ test "checked store: decode chain is lease-balanced" {
 
     const table = try bindInput(&g, &mgr, .f32, &[_]usize{ 256, 128 });
     const idx = try bindInput(&g, &mgr, .i32, &[_]usize{ 1, 1 }); // zeroed -> index 0, valid
-    const emb = try g.addGatherRows(table, idx);
+    const emb = try g.addGather(table, idx, 0, 0);
     const x = try g.addViewReshape(emb, &[_]usize{ 1, 128 });
     const gamma = try bindInput(&g, &mgr, .f32, &[_]usize{128});
     const beta = try bindInput(&g, &mgr, .f32, &[_]usize{128});

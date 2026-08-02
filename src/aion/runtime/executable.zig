@@ -10,9 +10,30 @@ pub const MAX_CONTROL_OUTPUTS: usize = 16;
 pub const MAX_LOOP_CARRIED: usize = 16;
 
 pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
-pub const StepElemwiseBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
+pub const ElementwiseBroadcastKind = enum(u8) {
+    identical,
+    scalar_a,
+    scalar_b,
+    contiguous_suffix_a,
+    contiguous_suffix_b,
+    generic,
+};
+pub const ElementwiseBroadcastPlan = struct {
+    kind: ElementwiseBroadcastKind,
+    output_rank: u8,
+    a_broadcast_axes: u8,
+    b_broadcast_axes: u8,
+};
+pub const StepElemwiseBinaryTiled = struct {
+    op: types.ElemwiseBinaryOp,
+    out: TensorId,
+    a: TensorId,
+    b: TensorId,
+    broadcast: ElementwiseBroadcastPlan,
+};
+// Transitional source alias while the obsolete backend helper is removed. It
+// is not an executable Step tag and cannot occur in a compiled Program.
 pub const StepGeluMulTiled = struct { out: TensorId, a: TensorId, b: TensorId };
-pub const StepBroadcastLastDimBinaryTiled = struct { op: types.ElemwiseBinaryOp, out: TensorId, a: TensorId, b: TensorId };
 pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
 pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId, axis: i32 };
 pub const StepConv1DTiled = struct {
@@ -45,15 +66,16 @@ pub const StepConv2DTiled = struct {
 };
 pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
-pub const StepAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool };
-pub const StepMultiHeadAttentionTiled = struct { out: TensorId, q: TensorId, k: TensorId, v: TensorId, scale: f32, causal: bool, heads: usize };
-pub const StepMultiHeadAttentionCachedTiled = struct {
+/// Grouped-query attention; see `graph.Op.Attention`.
+///
+/// Optional query positions and K/V lengths are independent.
+pub const StepAttentionTiled = struct {
     out: TensorId,
     q: TensorId,
-    k_cache: TensorId,
-    v_cache: TensorId,
-    positions: TensorId,
-    end_index: TensorId,
+    k: TensorId,
+    v: TensorId,
+    query_positions: ?TensorId,
+    kv_lengths: ?TensorId,
     scale: f32,
     causal: bool,
     sliding_window: usize,
@@ -76,7 +98,9 @@ pub const StepRelPosMHATiled = struct {
     pos_bias_v: TensorId,
     mask: ?TensorId,
     scale: f32,
-    heads: usize,
+    /// Chunked-limited attention window (see `graph.Op.RelPosMHA`). 0 = full.
+    chunk_size: usize = 0,
+    chunk_left: usize = 0,
 };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: TensorId, axis: usize };
@@ -110,11 +134,21 @@ pub const StepRoPE1DTiled = struct {
     rope_proportion: f32,
 };
 
+/// General row gather. The first implementation supports the canonical
+/// `axis == batch_dims` forms used by embeddings and batched sequence pooling.
+pub const StepGatherTiled = struct {
+    out: TensorId,
+    data: TensorId,
+    indices: TensorId,
+    axis: u8,
+    batch_dims: u8,
+};
+
 /// In-place KV cache append.
 ///
 /// Shapes:
-/// - cache:     [B, H_kv, T, D] (f16/f32), written in-place
-/// - new_kv:    [B, H_kv, new_len, D] (f16/f32), read-only
+/// - cache:     [B, T, H_kv, D] (f16/f32), written in-place
+/// - new_kv:    [B, new_len, H_kv, D] (f16/f32), read-only
 /// - end_index: [B] (i32), per-batch append start offsets
 pub const StepSequenceAppendTiled = struct {
     cache: TensorId,
@@ -213,7 +247,6 @@ pub const Step = union(enum) {
     MatMulTiled: StepMatMulTiled,
     ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
     GeluMulTiled: StepGeluMulTiled,
-    BroadcastLastDimBinaryTiled: StepBroadcastLastDimBinaryTiled,
     UnaryTiled: StepUnaryTiled,
     SoftmaxTiled: StepSoftmaxTiled,
     Conv1DTiled: StepConv1DTiled,
@@ -221,8 +254,6 @@ pub const Step = union(enum) {
     LayerNormTiled: StepLayerNormTiled,
     RMSNormTiled: StepRMSNormTiled,
     AttentionTiled: StepAttentionTiled,
-    MultiHeadAttentionTiled: StepMultiHeadAttentionTiled,
-    MultiHeadAttentionCachedTiled: StepMultiHeadAttentionCachedTiled,
     RelPosMHATiled: StepRelPosMHATiled,
     ArgMax: StepArgMax,
     ScatterRow: StepScatterRow,
@@ -232,6 +263,7 @@ pub const Step = union(enum) {
     CopyTiled: StepCopyTiled,
 
     GatherRowsTiled: StepGatherRowsTiled,
+    GatherTiled: StepGatherTiled,
 
     RoPE1DTiled: StepRoPE1DTiled,
 

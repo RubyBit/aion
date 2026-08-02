@@ -780,8 +780,8 @@ fn buildRolesTestPackage(allocator: std.mem.Allocator) !package_file.Package {
 
     const cache_terms = try allocator.alloc(package_file.ShapeTerm, 4);
     cache_terms[0] = .{ .constant = 1 };
-    cache_terms[1] = .{ .constant = 1 };
-    cache_terms[2] = .{ .expr = 0 };
+    cache_terms[1] = .{ .expr = 0 };
+    cache_terms[2] = .{ .constant = 1 };
     cache_terms[3] = .{ .constant = 8 };
     pkg.values[0] = .{ .dtype = .f16, .rank = 4, .source = .public_input, .shape_terms = cache_terms };
     pkg.values[1] = .{
@@ -806,7 +806,7 @@ fn buildRolesTestPackage(allocator: std.mem.Allocator) !package_file.Package {
     pkg.input_roles[0] = .{
         .input = 0,
         .kind = .sequence_cache,
-        .axis = 2,
+        .axis = 1,
         .flags = package_file.InputRoleFlags.zero_init | package_file.InputRoleFlags.allow_growable,
         .capacity_symbol = 0,
     };
@@ -961,7 +961,7 @@ test "storage cache: lease tokens and policy info" {
     const mapped_grow_expand: usize = try store.mapSequenceStep(grow_tid, 8, 8);
     try std.testing.expectEqual(@as(usize, 8), mapped_grow_expand);
     const grow_meta: *const manager_mod.TiledTensor = try sm.getConst(grow_tid);
-    try std.testing.expectEqual(@as(usize, 16), grow_meta.shape[2]);
+    try std.testing.expectEqual(@as(usize, 16), grow_meta.shape[1]);
 
     const plain_tid: manager_mod.TensorId = try sm.createTiledTensor(
         .f32,

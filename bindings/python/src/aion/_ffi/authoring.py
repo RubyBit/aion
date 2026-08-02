@@ -43,6 +43,12 @@ class AxisAttrs:
 
 
 @dataclass(frozen=True)
+class GatherAttrs:
+    axis: int
+    batch_dims: int = 0
+
+
+@dataclass(frozen=True)
 class NormAttrs:
     eps: float
     normalized_shape: tuple[int, ...]
@@ -123,21 +129,22 @@ class SliceAttrs:
 class AttentionAttrs:
     scale: float
     causal: bool
-    heads: int | None = None
-
-
-@dataclass(frozen=True)
-class MhaCachedAttrs:
-    scale: float
-    causal: bool
-    sliding_window: int
-    attn_logits_soft_cap: float
+    sliding_window: int = 0
+    attn_logits_soft_cap: float = 0.0
+    has_query_positions: bool = False
+    has_kv_lengths: bool = False
 
 
 @dataclass(frozen=True)
 class RelposMhaAttrs:
+    #: No head count: it is q's dim 2 (q is ``[B, T, heads, head_dim]``).
     scale: float
-    heads: int
+    #: Chunked-limited attention window (NeMo ``chunked_limited``). 0 = every key.
+    #: A query attends to its own chunk of ``chunk_size`` keys plus ``chunk_left``
+    #: keys before that chunk's start — structural, so it replaces an additive
+    #: ``[T_q, T_kv]`` mask and lets the kernels skip out-of-window keys.
+    chunk_size: int = 0
+    chunk_left: int = 0
 
 
 OpAttrs: TypeAlias = (
@@ -145,6 +152,7 @@ OpAttrs: TypeAlias = (
     | ElemwiseAttrs
     | UnaryAttrs
     | AxisAttrs
+    | GatherAttrs
     | NormAttrs
     | Rope1DAttrs
     | ReshapeAttrs
@@ -156,7 +164,6 @@ OpAttrs: TypeAlias = (
     | OptionalAxisAttrs
     | SliceAttrs
     | AttentionAttrs
-    | MhaCachedAttrs
     | RelposMhaAttrs
     | None
 )
@@ -418,6 +425,8 @@ def emit_op(
             AionOp.AION_OP_CONCAT: spec.attr.concat,
             AionOp.AION_OP_ARGMAX: spec.attr.argmax,
             AionOp.AION_OP_UNSQUEEZE: spec.attr.unsqueeze,
+            AionOp.AION_OP_DIM: spec.attr.argmax,
+            AionOp.AION_OP_IOTA: spec.attr.argmax,
         }.get(op)
         if member is None:
             raise TypeError(f"AxisAttrs are not valid for {op.name}")
@@ -478,21 +487,22 @@ def emit_op(
         spec.attr.slice.len = len(attrs.starts)
         spec.attr.slice.len_symbols = symbols
     elif isinstance(attrs, AttentionAttrs):
-        if op not in (AionOp.AION_OP_ATTENTION, AionOp.AION_OP_MHA):
+        if op is not AionOp.AION_OP_ATTENTION:
             raise TypeError(f"AttentionAttrs are not valid for {op.name}")
         member = spec.attr.attention
         member.scale = float(attrs.scale)
         member.causal = 1 if attrs.causal else 0
-        if attrs.heads is not None:
-            member.heads = int(attrs.heads)
-    elif isinstance(attrs, MhaCachedAttrs):
-        spec.attr.mha_cached.scale = float(attrs.scale)
-        spec.attr.mha_cached.causal = 1 if attrs.causal else 0
-        spec.attr.mha_cached.sliding_window = int(attrs.sliding_window)
-        spec.attr.mha_cached.attn_logits_soft_cap = float(attrs.attn_logits_soft_cap)
+        member.sliding_window = int(attrs.sliding_window)
+        member.attn_logits_soft_cap = float(attrs.attn_logits_soft_cap)
+        member.has_query_positions = 1 if attrs.has_query_positions else 0
+        member.has_kv_lengths = 1 if attrs.has_kv_lengths else 0
+    elif isinstance(attrs, GatherAttrs):
+        spec.attr.gather.axis = int(attrs.axis)
+        spec.attr.gather.batch_dims = int(attrs.batch_dims)
     elif isinstance(attrs, RelposMhaAttrs):
         spec.attr.relpos_mha.scale = float(attrs.scale)
-        spec.attr.relpos_mha.heads = int(attrs.heads)
+        spec.attr.relpos_mha.chunk_size = int(attrs.chunk_size)
+        spec.attr.relpos_mha.chunk_left = int(attrs.chunk_left)
 
     out = ffi.new("AionValueId*")
     status = lib.aion_builder_op(builder.raw, spec, out)
@@ -652,8 +662,8 @@ __all__ = [
     "Conv1DAttrs",
     "Conv2DAttrs",
     "ElemwiseAttrs",
+    "GatherAttrs",
     "MatmulAttrs",
-    "MhaCachedAttrs",
     "NormAttrs",
     "OpAttrs",
     "OptionalAxisAttrs",

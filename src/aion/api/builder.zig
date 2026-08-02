@@ -594,12 +594,6 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    pub fn broadcastAddLastDim(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
-        const out: ValueId = try self.graph.addBroadcastLastDimBinary(.add, a.value, b.value);
-        try self.autoNameIfUnnamed(out, "broadcast_add_last_dim");
-        return .{ .value = out };
-    }
-
     pub fn relu(self: *Self, a: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addRelu(a.value);
         try self.autoNameIfUnnamed(out, "relu");
@@ -648,42 +642,32 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    pub fn attention(self: *Self, q: TensorRef, k: TensorRef, v: TensorRef, scale: f32, causal: bool) Error!TensorRef {
-        const out: ValueId = try self.graph.addAttention(q.value, k.value, v.value, scale, causal);
-        try self.autoNameIfUnnamed(out, "attention");
-        return .{ .value = out };
-    }
-
-    pub fn mha(self: *Self, q: TensorRef, k: TensorRef, v: TensorRef, scale: f32, causal: bool, heads: usize) Error!TensorRef {
-        const out: ValueId = try self.graph.addMultiHeadAttention(q.value, k.value, v.value, scale, causal, heads);
-        try self.autoNameIfUnnamed(out, "mha");
-        return .{ .value = out };
-    }
-
-    pub fn multiHeadAttentionCached(
+    /// Grouped-query attention over time-major k/v `[B, T, H_kv, D]`.
+    /// Optional query positions and K/V lengths are independent.
+    pub fn attention(
         self: *Self,
         q: TensorRef,
-        k_cache: TensorRef,
-        v_cache: TensorRef,
-        positions: TensorRef,
-        end_index: TensorRef,
+        k: TensorRef,
+        v: TensorRef,
+        query_positions: ?TensorRef,
+        kv_lengths: ?TensorRef,
         scale: f32,
         causal: bool,
         sliding_window: usize,
         attn_logits_soft_cap: f32,
     ) Error!TensorRef {
-        const out: ValueId = try self.graph.addMultiHeadAttentionCached(
+        const out: ValueId = try self.graph.addAttention(
             q.value,
-            k_cache.value,
-            v_cache.value,
-            positions.value,
-            end_index.value,
+            k.value,
+            v.value,
+            if (query_positions) |x| x.value else null,
+            if (kv_lengths) |x| x.value else null,
             scale,
             causal,
             sliding_window,
             attn_logits_soft_cap,
         );
-        try self.autoNameIfUnnamed(out, "mha_cached");
+        try self.autoNameIfUnnamed(out, "attention");
         return .{ .value = out };
     }
 
@@ -793,9 +777,27 @@ pub const Builder = struct {
     /// - table:   [V, D]
     /// - indices: [B, L]
     /// - out:     [B, L, D]
-    pub fn gatherRows(self: *Self, table: TensorRef, indices: TensorRef) Error!TensorRef {
-        const out: ValueId = try self.graph.addGatherRows(table.value, indices.value);
-        try self.autoNameIfUnnamed(out, "gather_rows");
+    /// Gather slices along `axis`, sharing the first `batch_dims` axes between
+    /// `data` and `indices`. This subsumes embedding lookup
+    /// (`axis=0,batch_dims=0`) and per-batch row selection
+    /// (`axis=1,batch_dims=1`).
+    pub fn gather(self: *Self, data: TensorRef, indices: TensorRef, axis: i32, batch_dims: usize) Error!TensorRef {
+        const out: ValueId = try self.graph.addGather(data.value, indices.value, axis, batch_dims);
+        try self.autoNameIfUnnamed(out, "gather");
+        return .{ .value = out };
+    }
+
+    pub fn dimSize(self: *Self, value: TensorRef, axis: i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addDim(value.value, axis);
+        try self.autoNameIfUnnamed(out, "dim");
+        return .{ .value = out };
+    }
+
+    /// Coordinate tensor with `shape_like`'s shape, increasing from zero along
+    /// `axis` and repeating over every other axis.
+    pub fn iota(self: *Self, shape_like: TensorRef, axis: i32) Error!TensorRef {
+        const out: ValueId = try self.graph.addIota(shape_like.value, axis);
+        try self.autoNameIfUnnamed(out, "iota");
         return .{ .value = out };
     }
 
@@ -829,8 +831,8 @@ pub const Builder = struct {
     /// In-place KV cache append.
     ///
     /// Inputs:
-    /// - cache:     [B, H_kv, T, D]
-    /// - new_kv:    [B, H_kv, new_len, D]
+    /// - cache:     [B, T, H_kv, D]
+    /// - new_kv:    [B, new_len, H_kv, D]
     /// - end_index: [B] (i32)
     ///
     /// Output:
@@ -1054,19 +1056,11 @@ pub const Builder = struct {
         return self.slice(a, &[_]usize{ start0, start1 }, &[_]usize{ len0, len1 });
     }
 
-    /// Generic elementwise binary op (`add`/`sub`/`mul`/`div` and the comparison
-    /// ops `eq`/`ne`/`lt`/`gt`/`le`/`ge`). `add`/`mul` also have named shortcuts.
+    /// Generic elementwise binary op with standard right-aligned broadcasting
+    /// (`add`/`sub`/`mul`/`div` and `eq`/`ne`/`lt`/`gt`/`le`/`ge`).
     pub fn elemwiseBinary(self: *Self, op: types.ElemwiseBinaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addElemwiseBinary(op, a.value, b.value);
         try self.autoNameIfUnnamed(out, @tagName(op));
-        return .{ .value = out };
-    }
-
-    /// Generic last-dim-broadcast binary op (`b` broadcasts along the last dim of
-    /// `a`). `broadcastAddLastDim` is the named `add` shortcut.
-    pub fn broadcastLastDim(self: *Self, op: types.ElemwiseBinaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
-        const out: ValueId = try self.graph.addBroadcastLastDimBinary(op, a.value, b.value);
-        try self.autoNameIfUnnamed(out, "broadcast_last_dim");
         return .{ .value = out };
     }
 
@@ -1106,8 +1100,17 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// Chunked-limited attention window: a query attends to its own chunk of
+    /// `size` keys plus `left` keys before that chunk's start. `size = 0` (the
+    /// default) means every key. Prefer this over an additive mask — it is two
+    /// integers instead of a [T_q, T_kv] tensor, and it lets the kernels skip the
+    /// keys outside the window instead of scoring and then discarding them.
+    pub const ChunkWindow = struct { size: usize = 0, left: usize = 0 };
+
     /// Relative-position multi-head self-attention (Transformer-XL / Conformer).
-    /// `mask` is optional.
+    /// `mask` is optional and composes with `window` (use it only for what an
+    /// interval cannot express, e.g. streaming padding). The head count comes from
+    /// `q`'s shape — it is never passed separately.
     pub fn relPosMHA(
         self: *Self,
         q: TensorRef,
@@ -1118,7 +1121,7 @@ pub const Builder = struct {
         pos_bias_v: TensorRef,
         mask: ?TensorRef,
         scale: f32,
-        heads: usize,
+        window: ChunkWindow,
     ) Error!TensorRef {
         const out: ValueId = try self.graph.addRelPosMHA(
             q.value,
@@ -1129,7 +1132,8 @@ pub const Builder = struct {
             pos_bias_v.value,
             if (mask) |m| m.value else null,
             scale,
-            heads,
+            window.size,
+            window.left,
         );
         try self.autoNameIfUnnamed(out, "relpos_mha");
         return .{ .value = out };

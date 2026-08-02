@@ -19,6 +19,7 @@ numpy = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
     { name = "numpy" },
     { name = "pyright" },
     { name = "pytest" },
@@ -49,6 +50,7 @@ provides-extras = ["numpy", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'", directory = "aion-wgpu" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyright", specifier = ">=1.1" },
     { name = "pytest", specifier = ">=9" },

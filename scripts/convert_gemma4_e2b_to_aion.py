@@ -33,6 +33,7 @@ Run:  uv run --project bindings/python \
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import sys
@@ -149,7 +150,7 @@ def _mm_b(w_torch: np.ndarray) -> np.ndarray:
     layout and takes no `transposed=` flag. Rank 2 is all it needs: MatMul broadcasts
     a `[K, N]` weight into a `[batch, seq, K]` activation, so the weight reaches the
     kernel exactly as stored, which is what keeps a quantized one usable at all.
-    Quantization itself is `nn`'s to do (`dtype="q8_0"`), blocking along K.
+    Quantization itself is `nn`'s to do (`dtype=aion.q8_0`), blocking along K.
     """
     return np.ascontiguousarray(w_torch.astype(np.float32, copy=False).T)
 
@@ -158,7 +159,9 @@ def _f32(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr.astype(np.float32, copy=False))
 
 
-def _input(b: Builder, name: str, dtype: str, shape: Shape) -> TensorRef:
+def _input(
+    b: Builder, name: str, dtype: aion.AionDType, shape: Shape
+) -> TensorRef:
     """Declare a public input; string dims are symbolic (dynamic) axes."""
     dims = [_PLACEHOLDER[d] if isinstance(d, str) else int(d) for d in shape]
     dyn = {i: d for i, d in enumerate(shape) if isinstance(d, str)} or None
@@ -173,7 +176,7 @@ def _scaled(b: Builder, x: TensorRef, factor: float) -> TensorRef:
     broadcast elementwise op takes a size-1 one. Before that, scaling a `[1, S, 1536]`
     activation meant baking a dense vector per distinct width and value.
     """
-    return b.broadcast_mul(x, b.constant(factor))
+    return b.mul(x, b.constant(factor))
 
 
 def _rms(gamma: Optional[np.ndarray], name: str, width: Optional[int] = None) -> nn.RMSNorm:
@@ -280,10 +283,14 @@ def _load_weights(loader: _WeightLoader) -> Tuple[_SharedWeights, List[_LayerWei
 def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights]):
     """Emit the full forward graph. Returns (logits, {src: (k_in, k_out, v_in, v_out)})."""
     # Public runtime inputs.
-    tokens = _input(b, "tokens", "i32", ("batch", "seq"))
-    positions = _input(b, "positions", "i32", ("batch", "seq"))
-    cache_write_index = _input(b, "cache_write_index", "i32", ("batch",))
-    cache_visible_end = _input(b, "cache_visible_end", "i32", ("batch",))
+    tokens = _input(b, "tokens", aion.int32, ("batch", "seq"))
+    positions = _input(b, "positions", aion.int32, ("batch", "seq"))
+    cache_write_index = _input(
+        b, "cache_write_index", aion.int32, ("batch",)
+    )
+    cache_visible_end = _input(
+        b, "cache_visible_end", aion.int32, ("batch",)
+    )
 
     # KV cache public inputs — f16, one pair per source layer.
     k_cache_in: Dict[int, TensorRef] = {}
@@ -292,22 +299,32 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
         is_glob = is_global_layer(src)
         head_dim = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
         t_dim: Union[int, str] = "G" if is_glob else LOCAL_SLIDING_WINDOW
-        k_cache_in[src] = _input(b, f"k_cache.layer{src}", "f16", ("batch", NUM_KV_HEADS, t_dim, head_dim))
-        v_cache_in[src] = _input(b, f"v_cache.layer{src}", "f16", ("batch", NUM_KV_HEADS, t_dim, head_dim))
+        k_cache_in[src] = _input(
+            b,
+            f"k_cache.layer{src}",
+            aion.float16,
+            ("batch", t_dim, NUM_KV_HEADS, head_dim),
+        )
+        v_cache_in[src] = _input(
+            b,
+            f"v_cache.layer{src}",
+            aion.float16,
+            ("batch", t_dim, NUM_KV_HEADS, head_dim),
+        )
 
     # ---- Embedding + PLI encoder ----
     # The token table is tied to the output head, so it is bound once here and the
     # head reuses that very parameter rather than a second copy of it.
-    embed = nn.Embedding(shared.embed_tokens, dtype="q8_0", name="embed_tokens")
+    embed = nn.Embedding(shared.embed_tokens, dtype=aion.q8_0, name="embed_tokens")
     emb_scaled = _scaled(b, embed(tokens), math.sqrt(EMBED_DIM))         # [B,S,1536]
 
-    pli_proj = nn.Linear(shared.per_layer_model_projection, dtype="q8_0",
+    pli_proj = nn.Linear(shared.per_layer_model_projection, dtype=aion.q8_0,
                          name="per_layer_model_projection")
     pli_proj_scaled = _scaled(b, pli_proj(emb_scaled), 1.0 / math.sqrt(EMBED_DIM))
     pli_proj_norm = _rms(shared.per_layer_projection_norm, "per_layer_projection_norm")(
         pli_proj_scaled.reshape(("batch", "seq", NUM_LAYERS, PLI_DIM)))
 
-    pli_emb = nn.Embedding(shared.embed_tokens_per_layer, dtype="q8_0",
+    pli_emb = nn.Embedding(shared.embed_tokens_per_layer, dtype=aion.q8_0,
                            name="embed_tokens_per_layer")
     pli_emb_r = _scaled(b, pli_emb(tokens), math.sqrt(PLI_DIM)).reshape(
         ("batch", "seq", NUM_LAYERS, PLI_DIM))
@@ -333,12 +350,12 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
         with b.scope(f"layers.{layer_idx}"):
             # A source layer projects K/V and writes its own cache; the layers after
             # it have no K/V projections and attend over the cache it produced.
-            attn = nn.CachedAttention(
+            attn = nn.Attention(
                 lw.q_proj, lw.o_proj,
                 k_proj=lw.k_proj, v_proj=lw.v_proj,
                 heads=NUM_HEADS, kv_heads=NUM_KV_HEADS, head_dim=head_dim,
                 scale=1.0, sliding_window=sliding, attn_logits_soft_cap=0.0,
-                dtype="q8_0", name="self_attn",
+                dtype=aion.q8_0, name="self_attn",
             )
 
             x_norm = _rms(lw.input_ln, "input_layernorm")(x)
@@ -358,26 +375,31 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
                 # all-ones identity rather than making the caller bake one.
                 v4 = _rms(None, "v_norm", head_dim)(v4)
 
-                # Heads move next to batch for the cache store. With one KV head that
-                # is a reshape rather than a transpose (which the graph has no op for).
                 for kv, cur in ((k4, k_cache_cur), (v4, v_cache_cur)):
-                    packed = kv.reshape(("batch", NUM_KV_HEADS, "seq", head_dim)).cast("f16")
-                    cur[layer_idx] = b.sequence_append(cur[layer_idx], packed, cache_write_index)
+                    cur[layer_idx] = b.sequence_append(
+                        cur[layer_idx], kv.cast(aion.float16), cache_write_index
+                    )
 
             # `src` names this layer's cache owner — itself when it is a source.
-            o_out = attn.attend(q, k_cache_cur[src], v_cache_cur[src],
-                               positions, cache_visible_end)
+            o_out = attn.attend(
+                q, k_cache_cur[src], v_cache_cur[src],
+                query_positions=positions, kv_lengths=cache_visible_end,
+            )
             x = x + _rms(lw.post_attn_ln, "post_attention_layernorm")(o_out)
 
             ff_in = _rms(lw.pre_ffn_ln, "pre_feedforward_layernorm")(x)
             # Split gate/up: the compiler fuses the pair and routes gelu through the
             # fused `gelu_mul`, so there is nothing to pre-concatenate or slice here.
             ff = nn.GatedMLP(lw.gate_proj, lw.up_proj, lw.down_proj,
-                             act="gelu", dtype="q8_0", name="mlp")(ff_in)
+                act="gelu", dtype=aion.q8_0, name="mlp")(ff_in)
             x = x + _rms(lw.post_ffn_ln, "post_feedforward_layernorm")(ff)
 
-            pli_gate = nn.Linear(lw.pli_gate, dtype="q8_0", name="per_layer_input_gate")
-            pli_out_proj = nn.Linear(lw.pli_proj, dtype="q8_0", name="per_layer_projection")
+            pli_gate = nn.Linear(
+                lw.pli_gate, dtype=aion.q8_0, name="per_layer_input_gate"
+            )
+            pli_out_proj = nn.Linear(
+                lw.pli_proj, dtype=aion.q8_0, name="per_layer_projection"
+            )
             pli_slice = b.slice(pli, (0, 0, layer_idx, 0), ("batch", "seq", 1, PLI_DIM))
             pli_out = pli_out_proj(
                 pli_gate(x).gelu() * pli_slice.reshape(("batch", "seq", PLI_DIM)))
@@ -390,7 +412,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     # Tied head: contract against the embedding table's *rows*, reusing the very
     # parameter `embed` bound rather than a second copy of the table.
     logits = b.matmul_nt(x, embed.weight_value(b))
-    logits = b.broadcast_div(logits, b.constant(FINAL_LOGIT_SOFTCAP)).tanh()
+    logits = b.div(logits, b.constant(FINAL_LOGIT_SOFTCAP)).tanh()
     logits = _scaled(b, logits, FINAL_LOGIT_SOFTCAP)
 
     caches = {src: (k_cache_in[src], k_cache_cur[src], v_cache_in[src], v_cache_cur[src])
@@ -420,11 +442,11 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
         for v in (k_cache_in[src], v_cache_in[src]):
             if is_glob:
                 # Global caches: free capacity symbol `G`, growable.
-                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=2,
+                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1,
                                  capacity_symbol="G", zero_init=True, growable=True)
             else:
                 # Local caches: fixed sliding-window size.
-                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=2, zero_init=True)
+                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1, zero_init=True)
 
     for key, value in [
         ("arch", "gemma4-e2b-text"),
@@ -452,6 +474,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 shared, layers = _load_weights(loader)
             out = _emit_forward(b, shared, layers)
             _finalize(b, *out)
+            # Binding/quantization copies weights into Aion-owned storage. Drop
+            # the checkpoint-side f32 arrays before export, which itself packs
+            # initializer sections and temporarily needs another large buffer.
+            del shared, layers
+            gc.collect()
             b.export(os.path.abspath(args.out_aion), None)
 
     print(f"[gemma4-e2b] wrote {args.out_aion}")

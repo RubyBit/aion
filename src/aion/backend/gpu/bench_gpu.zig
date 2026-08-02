@@ -127,13 +127,13 @@ fn buildMatMul(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.Tile
 
 // ---- ops suite (row-wise + elementwise kernels) -----------------------------
 
-const OpKind = enum { add, silu, bcast_mul, softmax, rmsnorm, layernorm };
+const OpKind = enum { add, silu, suffix_mul, softmax, rmsnorm, layernorm };
 
 fn opLabel(kind: OpKind) []const u8 {
     return switch (kind) {
         .add => "add",
         .silu => "silu",
-        .bcast_mul => "bcast",
+        .suffix_mul => "suffix",
         .softmax => "softmax",
         .rmsnorm => "rmsnorm",
         .layernorm => "layernorm",
@@ -148,7 +148,7 @@ fn opBytes(kind: OpKind, m: usize, n: usize) f64 {
     return 4.0 * switch (kind) {
         .add => 3.0 * mn, // 2 reads + 1 write
         .silu => 2.0 * mn,
-        .bcast_mul => 2.0 * mn + nn,
+        .suffix_mul => 2.0 * mn + nn,
         .softmax => 5.0 * mn, // x read twice, o written twice + read once
         .rmsnorm, .layernorm => 3.0 * mn + 2.0 * nn, // x twice, o once, g+b
     };
@@ -186,12 +186,12 @@ fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePoli
             break :blk try g.addElemwiseBinary(.add, xv, yv);
         },
         .silu => try g.addUnary(.silu, xv),
-        .bcast_mul => blk: {
+        .suffix_mul => blk: {
             const b_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{tile2[1]}, .{ .tile_alignment = policy.tile_alignment });
             try fillTensor(alloc, mgr, b_id, n, 3);
             const bv = try g.addInput(.f32, &[_]usize{n});
             try g.bindExternal(bv, b_id);
-            break :blk try g.addBroadcastLastDimBinary(.mul, xv, bv);
+            break :blk try g.addElemwiseBinary(.mul, xv, bv);
         },
         .softmax => try g.addSoftmax(xv, -1),
         .rmsnorm, .layernorm => blk: {
@@ -671,13 +671,29 @@ fn runKernels(alloc: std.mem.Allocator, a: Args) !void {
     }
 }
 
+/// Submit `prog` until `ms` of wall time has passed (at least once), with output
+/// flushing left ON so each iteration really completes on the device. Brings the
+/// GPU to boost clocks before a timed loop.
+fn warmUp(session: aion.backend.Session, prog: *const aion.program.Program, ms: u64) !void {
+    const budget_ns: u64 = ms * 1_000_000;
+    const start = nowNs();
+    while (true) {
+        try session.execute(prog);
+        if (nowNs() - start >= budget_ns) return;
+    }
+}
+
 /// Pure GPU kernel time: submit the compute `iters` times with NO per-iteration
 /// output readback, then block once on completion. Isolates kernel (+ CPU submit)
 /// throughput from the full-output D2H readback that `timeBackend` includes.
 fn timeGpuKernel(gb: *gpu.GpuBackend, session: aion.backend.Session, prog: *const aion.program.Program, iters: usize) !u64 {
+    // Spin the clocks up BEFORE the timed loop: this is always the first timed
+    // loop of a row, so without a real warmup it pays the ramp and can read
+    // slower than the e2e loop that runs after it on a hot device.
+    try warmUp(session, prog, 200);
     gb.flush_outputs = false;
     defer gb.flush_outputs = true;
-    try session.execute(prog); // warmup
+    try session.execute(prog);
     gb.sync();
     const start = nowNs();
     var i: usize = 0;

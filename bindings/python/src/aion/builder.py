@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Union, overload
 
 from .context import Context
 from .device import DeviceLike, _normalize_device
-from .dtype import normalize_dtype as _as_dtype
+from .dtype import dtype_name, float32, normalize_dtype as _as_dtype
 from .errors import AionError
 from ._ffi.authoring import (
     AttentionAttrs,
@@ -32,8 +32,8 @@ from ._ffi.authoring import (
     Conv1DAttrs,
     Conv2DAttrs,
     ElemwiseAttrs,
+    GatherAttrs,
     MatmulAttrs,
-    MhaCachedAttrs,
     NormAttrs,
     OpAttrs,
     OptionalAxisAttrs,
@@ -91,14 +91,13 @@ from .enums import (
     AionUnaryOp,
 )
 from .tensor import Tensor
-from .types import NDArray
-from .types import DTypeLike, Shape
+from .types import ArrayLike, DTypeLike, NDArray, Shape
 
 if TYPE_CHECKING:
     from .model import LoadedModel
 
 # A weight source: an existing Tensor, a numpy array, or a nested Python list.
-WeightData = object
+type WeightData = Tensor | ArrayLike
 # Which input axes are dynamic (vary at runtime): a sequence of axis indices
 # (auto-named symbols) or a {axis: symbol_name} mapping (reuse a name to tie axes
 # across inputs to the same runtime size). The declared int at each axis is the
@@ -173,7 +172,7 @@ class TensorRef:
     def transpose2d(self) -> "TensorRef":
         return self._b.transpose2d(self)
 
-    def cast(self, dtype: object) -> "TensorRef":
+    def cast(self, dtype: DTypeLike) -> "TensorRef":
         return self._b.cast(self, dtype)
 
     def rename(self, name: str) -> "TensorRef":
@@ -285,7 +284,7 @@ class TensorRef:
 
     def __repr__(self) -> str:
         try:
-            shape, dtype = self.shape, self.dtype.name
+            shape, dtype = self.shape, dtype_name(self.dtype)
         except Exception:
             return f"TensorRef(id={self.id})"
         try:
@@ -366,7 +365,7 @@ class Builder:
         self,
         shape: Shape,
         *,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         dynamic: DynamicAxes = None,
     ) -> TensorRef:
         """Declare a public runtime input.
@@ -402,14 +401,14 @@ class Builder:
         self,
         data: WeightData,
         *,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         shape: Optional[Shape] = None,
         quant_axis: Optional[int] = None,
     ) -> TensorRef:
         """Bind a weight from data (a `Tensor`, numpy array, or nested list).
 
         A float `dtype` binds the data directly; a quantized `dtype`
-        (``"q8_0"``) quantizes it in the core first, blocking along `quant_axis`
+        (``aion.q8_0``) quantizes it in the core first, blocking along `quant_axis`
         (default: the matmul-B reduction axis, rank-2; pass the last axis for an
         embedding table). When `data` is already a `Tensor`, `dtype`/`shape`/
         `quant_axis` are ignored.
@@ -422,7 +421,7 @@ class Builder:
         self,
         data: WeightData,
         *,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         shape: Optional[Shape] = None,
         quant_axis: Optional[int] = None,
     ) -> Tensor:
@@ -445,7 +444,7 @@ class Builder:
         data: WeightData,
         name: str,
         *,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         shape: Optional[Shape] = None,
         quant_axis: Optional[int] = None,
     ) -> TensorRef:
@@ -496,11 +495,11 @@ class Builder:
     # --- synthesized constants ---------------------------------------------
 
     def constant(self, value: float) -> TensorRef:
-        """A cached one-element f32 constant, for ops needing a scalar operand.
+        """A cached one-element f32 constant for elementwise scalar broadcasting.
 
-        Aion has no scalar-typed operand: `x * k` goes through the broadcast op with
-        a size-1 vector. This keeps that operand one element regardless of what it
-        multiplies, and shares it across every use of the same value.
+        Aion has no scalar-typed operand, so `x * k` uses a size-one tensor. This
+        keeps the operand one element regardless of what it multiplies and shares
+        it across every use of the same value.
         """
         return TensorRef(self, builder_constant(self._ctx_owner.ptr, self.ptr, value))
 
@@ -579,13 +578,6 @@ class Builder:
     def div(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_DIV, a, b)
 
-    def broadcast_add(self, a: TensorRef, b: TensorRef) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_BROADCAST_LAST_DIM,
-            (a, b),
-            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_ADD)),
-        )
-
     def gelu_mul(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_GELU_MUL, (a, b))
 
@@ -626,8 +618,28 @@ class Builder:
         )
         return self._emit(op, (x, gamma, beta), attrs)
 
-    def gather_rows(self, table: TensorRef, indices: TensorRef) -> TensorRef:
-        return self._emit(AionOp.AION_OP_GATHER_ROWS, (table, indices))
+    def gather(
+        self,
+        data: TensorRef,
+        indices: TensorRef,
+        *,
+        axis: int = 0,
+        batch_dims: int = 0,
+    ) -> TensorRef:
+        """Gather slices along an axis, sharing leading batch dimensions."""
+        return self._emit(
+            AionOp.AION_OP_GATHER,
+            (data, indices),
+            GatherAttrs(axis, batch_dims),
+        )
+
+    def dim(self, value: TensorRef, axis: int) -> TensorRef:
+        """Reify one concrete runtime dimension as an i32 one-element tensor."""
+        return self._emit(AionOp.AION_OP_DIM, (value,), AxisAttrs(axis))
+
+    def iota(self, shape_like: TensorRef, axis: int) -> TensorRef:
+        """Return i32 coordinates with `shape_like`'s shape along `axis`."""
+        return self._emit(AionOp.AION_OP_IOTA, (shape_like,), AxisAttrs(axis))
 
     def rope1d(self, x: TensorRef, positions: TensorRef, *, base_frequency: float, scale_factor: float = 1.0, rope_proportion: float = 1.0) -> TensorRef:
         attrs = Rope1DAttrs(base_frequency, scale_factor, rope_proportion)
@@ -675,7 +687,7 @@ class Builder:
     def transpose2d(self, a: TensorRef) -> TensorRef:
         return self._emit(AionOp.AION_OP_TRANSPOSE2D, (a,))
 
-    def cast(self, a: TensorRef, dtype: object) -> TensorRef:
+    def cast(self, a: TensorRef, dtype: DTypeLike) -> TensorRef:
         dt = _as_dtype(dtype)
         return self._emit(AionOp.AION_OP_CAST, (a,), CastAttrs(dt))
 
@@ -702,22 +714,6 @@ class Builder:
     def compare(self, op: str, a: TensorRef, b: TensorRef) -> TensorRef:
         """Elementwise comparison (`eq/ne/lt/gt/le/ge`) producing i32 {0,1}."""
         return self._elemwise(self._COMPARE[op], a, b)
-
-    # --- broadcast (last-dim vector) binary variants ----------------------
-    def broadcast_mul(self, a: TensorRef, vec: TensorRef) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_MUL)))
-
-    def broadcast_sub(self, a: TensorRef, vec: TensorRef) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_SUB)))
-
-    def broadcast_div(self, a: TensorRef, vec: TensorRef) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_BROADCAST_LAST_DIM, (a, vec),
-            ElemwiseAttrs(int(AionBinaryOp.AION_BINARY_DIV)))
 
     # --- convolutions -----------------------------------------------------
     def conv1d(self, x: TensorRef, weight: TensorRef, bias: Optional[TensorRef] = None, *,
@@ -806,34 +802,39 @@ class Builder:
         return self.slice(a, starts, lens)
 
     # --- attention --------------------------------------------------------
-    def attention(self, q: TensorRef, k: TensorRef, v: TensorRef, *, scale: float, causal: bool = False) -> TensorRef:
+    def attention(self, q: TensorRef, k: TensorRef, v: TensorRef, *,
+                  query_positions: Optional[TensorRef] = None,
+                  kv_lengths: Optional[TensorRef] = None, scale: float,
+                  causal: bool = True, sliding_window: int = 0,
+                  attn_logits_soft_cap: float = 0.0) -> TensorRef:
+        """Grouped-query attention in canonical time-major layout.
+
+        Q is `[batch, query, heads, key_dim]`; K/V are
+        `[batch, key, kv_heads, key/value_dim]`. `query_positions` and
+        `kv_lengths` are independent; they default to row indices and the full key
+        length. Causal unequal-length attention requires explicit positions.
+        """
+        inputs = [q, k, v]
+        if query_positions is not None:
+            inputs.append(query_positions)
+        if kv_lengths is not None:
+            inputs.append(kv_lengths)
         return self._emit(
             AionOp.AION_OP_ATTENTION,
-            (q, k, v),
-            AttentionAttrs(scale, causal),
-        )
-
-    def mha(self, q: TensorRef, k: TensorRef, v: TensorRef, *, scale: float, causal: bool, heads: int) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_MHA,
-            (q, k, v),
-            AttentionAttrs(scale, causal, heads),
-        )
-
-    def mha_cached(self, q: TensorRef, k: TensorRef, v: TensorRef, positions: TensorRef, end_index: TensorRef, *,
-                   scale: float, causal: bool = True, sliding_window: int = 0,
-                   attn_logits_soft_cap: float = 0.0) -> TensorRef:
-        attrs = MhaCachedAttrs(
-            scale, causal, sliding_window, attn_logits_soft_cap
-        )
-        return self._emit(
-            AionOp.AION_OP_MHA_CACHED,
-            (q, k, v, positions, end_index),
-            attrs,
+            tuple(inputs),
+            AttentionAttrs(
+                scale, causal, sliding_window, attn_logits_soft_cap,
+                query_positions is not None, kv_lengths is not None,
+            ),
         )
 
     def relpos_mha(self, q: TensorRef, k: TensorRef, v: TensorRef, pos_emb: TensorRef, bu: TensorRef, bv: TensorRef,
-                   mask: Optional[TensorRef] = None, *, scale: float, heads: int) -> TensorRef:
+                   mask: Optional[TensorRef] = None, *, scale: float,
+                   chunk_size: int = 0, chunk_left: int = 0) -> TensorRef:
+        """Relative-position MHA. The head count is `q`'s dim 2 — never passed.
+        `chunk_size`/`chunk_left` express chunked-limited attention structurally:
+        prefer them over baking the same pattern into `mask`, which costs a
+        [T_q, T_kv] tensor and forces every key to be scored."""
         inputs: list[TensorRef] = [q, k, v, pos_emb, bu, bv]
         if mask is not None:
             inputs.append(mask)
@@ -841,7 +842,7 @@ class Builder:
         return self._emit(
             AionOp.AION_OP_RELPOS_MHA,
             inputs,
-            RelposMhaAttrs(scale, heads),
+            RelposMhaAttrs(scale, chunk_size, chunk_left),
         )
 
     # --- recurrent / indexed / misc ---------------------------------------

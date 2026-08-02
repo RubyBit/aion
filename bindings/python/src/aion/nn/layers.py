@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional, Sequence, TypedDict
 
 from ..builder import TensorRef, WeightData
+from ..dtype import float32
 from ..types import DTypeLike
 from .module import Module, Parameter, builder_of
 
@@ -55,7 +56,7 @@ class Conv2DOpts(TypedDict):
 class Linear(Module):
     """`y = x @ w (+ b)`, with `w` in matmul-B layout `[in, out]`.
 
-    Pass ``dtype="q8_0"`` to quantize the weight in the core (bias stays float).
+    Pass ``dtype=aion.q8_0`` to quantize the weight in the core (bias stays float).
     """
 
     def __init__(
@@ -64,14 +65,14 @@ class Linear(Module):
         bias: Optional[WeightData] = None,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         alpha: float = 1.0,
         beta: float = 0.0,
         nt: bool = False,
     ) -> None:
         self._layer_name = name
         self.weight = Parameter(weight, dtype=dtype)
-        self.bias = Parameter(bias, dtype="f32") if bias is not None else None
+        self.bias = Parameter(bias, dtype=float32) if bias is not None else None
         self.alpha = float(alpha)
         self.beta = float(beta)
         # Contract against the weight's *rows* (`[out, in]`) instead of its
@@ -85,7 +86,7 @@ class Linear(Module):
             w = self.weight.value(b, "weight")
             y = b.matmul_nt(x, w, self.alpha, self.beta) if self.nt else b.matmul(x, w, self.alpha, self.beta)
             if self.bias is not None:
-                y = b.broadcast_add(y, self.bias.value(b, "bias"))
+                y = b.add(y, self.bias.value(b, "bias"))
             return y
 
 
@@ -102,7 +103,7 @@ class Embedding(Module):
         table: WeightData,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
         from ..dtype import is_quantized, normalize_dtype
@@ -119,7 +120,7 @@ class Embedding(Module):
     def forward(self, ids: TensorRef) -> TensorRef:
         b = builder_of(ids)
         with self._scoped(b):
-            return b.gather_rows(self.weight.value(b, "weight"), ids)
+            return b.gather(self.weight.value(b, "weight"), ids, axis=0)
 
 
 class _Norm(Module):
@@ -153,8 +154,8 @@ class _Norm(Module):
             )
         self.normalized_shape = shape
         self.eps = float(eps) if eps is not None else self._default_eps
-        self.weight = Parameter(gamma, dtype="f32") if gamma is not None else None
-        self.bias = Parameter(beta, dtype="f32") if beta is not None else None
+        self.weight = Parameter(gamma, dtype=float32) if gamma is not None else None
+        self.bias = Parameter(beta, dtype=float32) if beta is not None else None
 
     @property
     def _width(self) -> int:
@@ -201,7 +202,7 @@ class Conv1D(Module):
         bias: Optional[WeightData] = None,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         stride: int = 1,
         dilation: int = 1,
         pad_left: int = 0,
@@ -211,7 +212,7 @@ class Conv1D(Module):
     ) -> None:
         self._layer_name = name
         self.weight = Parameter(weight, dtype=dtype)
-        self.bias = Parameter(bias, dtype="f32") if bias is not None else None
+        self.bias = Parameter(bias, dtype=float32) if bias is not None else None
         self.opts: Conv1DOpts = {
             "stride": stride, "dilation": dilation, "pad_left": pad_left,
             "pad_right": pad_right, "pad_mode": pad_mode, "groups": groups,
@@ -249,7 +250,7 @@ class DepthwiseConv1D(Conv1D):
         bias: Optional[WeightData] = None,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         stride: int = 1,
         dilation: int = 1,
         pad_left: int = 0,
@@ -279,7 +280,7 @@ class Conv2D(Module):
         bias: Optional[WeightData] = None,
         *,
         name: Optional[str] = None,
-        dtype: DTypeLike = "f32",
+        dtype: DTypeLike = float32,
         stride_h: int = 1,
         stride_w: int = 1,
         dilation_h: int = 1,
@@ -293,7 +294,7 @@ class Conv2D(Module):
     ) -> None:
         self._layer_name = name
         self.weight = Parameter(weight, dtype=dtype)
-        self.bias = Parameter(bias, dtype="f32") if bias is not None else None
+        self.bias = Parameter(bias, dtype=float32) if bias is not None else None
         self.opts: Conv2DOpts = {
             "stride_h": stride_h, "stride_w": stride_w,
             "dilation_h": dilation_h, "dilation_w": dilation_w,
@@ -342,10 +343,10 @@ class LSTMCell(Module["tuple[TensorRef, TensorRef]"]):
 
         self.input_size = int(ih[0])
         self.hidden_size = hidden
-        self.weight_ih = Parameter(w_ih, dtype="f32")
-        self.weight_hh = Parameter(w_hh, dtype="f32")
-        self.bias_ih = Parameter(b_ih, dtype="f32") if b_ih is not None else None
-        self.bias_hh = Parameter(b_hh, dtype="f32") if b_hh is not None else None
+        self.weight_ih = Parameter(w_ih, dtype=float32)
+        self.weight_hh = Parameter(w_hh, dtype=float32)
+        self.bias_ih = Parameter(b_ih, dtype=float32) if b_ih is not None else None
+        self.bias_hh = Parameter(b_hh, dtype=float32) if b_hh is not None else None
 
     def forward(self, x: TensorRef, h: TensorRef, c: TensorRef) -> tuple[TensorRef, TensorRef]:
         b = builder_of(x)
@@ -380,7 +381,7 @@ class Activation(Module):
         return builder_of(x).unary(self.kind, x)
 
 
-def _shape_of(data: object) -> tuple[int, ...]:
+def _shape_of(data: WeightData) -> tuple[int, ...]:
     from ..builder import _infer_shape
 
     return _infer_shape(data)

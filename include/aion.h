@@ -361,35 +361,34 @@ typedef enum AionOp {
     AION_OP_MATMUL = 0,
     AION_OP_MATMUL_NT = 1,
     AION_OP_ELEMWISE = 2,
-    AION_OP_BROADCAST_LAST_DIM = 3,
-    AION_OP_UNARY = 4,
-    AION_OP_SOFTMAX = 5,
-    AION_OP_LAYERNORM = 6,
-    AION_OP_RMSNORM = 7,
-    AION_OP_ATTENTION = 8,
-    AION_OP_MHA = 9,
-    AION_OP_MHA_CACHED = 10,
-    AION_OP_RELPOS_MHA = 11,
-    AION_OP_CONV1D = 12,
-    AION_OP_CONV2D = 13,
-    AION_OP_COPY = 14,
-    AION_OP_GATHER_ROWS = 15,
-    AION_OP_ROPE1D = 16,
-    AION_OP_SEQUENCE_APPEND = 17,
-    AION_OP_REDUCE = 18,
-    AION_OP_CONCAT = 19,
-    AION_OP_RESHAPE = 20,
-    AION_OP_SQUEEZE = 21,
-    AION_OP_UNSQUEEZE = 22,
-    AION_OP_TRANSPOSE2D = 23,
-    AION_OP_SLICE = 24,
-    AION_OP_LSTM_CELL = 25,
-    AION_OP_RFFT = 26,
-    AION_OP_STFT = 27,
-    AION_OP_CAST = 28,
-    AION_OP_ARGMAX = 29,
-    AION_OP_SCATTER_ROW = 30,
-    AION_OP_GELU_MUL = 31,
+    AION_OP_UNARY = 3,
+    AION_OP_SOFTMAX = 4,
+    AION_OP_LAYERNORM = 5,
+    AION_OP_RMSNORM = 6,
+    AION_OP_ATTENTION = 7,
+    AION_OP_RELPOS_MHA = 8,
+    AION_OP_CONV1D = 9,
+    AION_OP_CONV2D = 10,
+    AION_OP_COPY = 11,
+    AION_OP_ROPE1D = 12,
+    AION_OP_SEQUENCE_APPEND = 13,
+    AION_OP_REDUCE = 14,
+    AION_OP_CONCAT = 15,
+    AION_OP_RESHAPE = 16,
+    AION_OP_SQUEEZE = 17,
+    AION_OP_UNSQUEEZE = 18,
+    AION_OP_TRANSPOSE2D = 19,
+    AION_OP_SLICE = 20,
+    AION_OP_LSTM_CELL = 21,
+    AION_OP_RFFT = 22,
+    AION_OP_STFT = 23,
+    AION_OP_CAST = 24,
+    AION_OP_ARGMAX = 25,
+    AION_OP_SCATTER_ROW = 26,
+    AION_OP_GELU_MUL = 27,
+    AION_OP_GATHER = 28,
+    AION_OP_DIM = 29,
+    AION_OP_IOTA = 30,
 } AionOp;
 
 // Per-op attributes. Only the member matching AionOpSpec.op is read.
@@ -399,9 +398,21 @@ typedef union AionOpAttr {
     struct { AionUnaryOp op; } unary;
     struct { int32_t axis; } softmax;
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;
-    struct { float scale; uint8_t causal; size_t heads; } attention;
-    struct { float scale; uint8_t causal; size_t sliding_window; float attn_logits_soft_cap; } mha_cached;
-    struct { float scale; size_t heads; } relpos_mha;
+    struct {
+        float scale;
+        uint8_t causal;
+        size_t sliding_window;
+        float attn_logits_soft_cap;
+        uint8_t has_query_positions;
+        uint8_t has_kv_lengths;
+    } attention;
+    // The head count is q's dim 2 (q is [B, T, heads, D]) — never passed separately.
+    //
+    // chunk_size = 0 means attend to every key; otherwise a query attends to its
+    // own chunk of `chunk_size` keys plus `chunk_left` keys before that chunk's
+    // start (NeMo "chunked_limited"). Structural, so it replaces an additive
+    // [T_q, T_kv] mask and lets the kernels skip out-of-window keys.
+    struct { float scale; size_t chunk_size; size_t chunk_left; } relpos_mha;
     struct { size_t stride; size_t dilation; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv1d;
     struct { size_t stride_h; size_t stride_w; size_t dilation_h; size_t dilation_w; size_t pad_top; size_t pad_bottom; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv2d;
     struct { float base_frequency; float scale_factor; float rope_proportion; } rope1d;
@@ -418,6 +429,7 @@ typedef union AionOpAttr {
     struct { size_t n_fft; size_t hop_length; uint8_t center; } stft;
     struct { AionDType to_dtype; } cast;
     struct { int32_t axis; } argmax;
+    struct { int32_t axis; size_t batch_dims; } gather;
 } AionOpAttr;
 
 // A single op to append: which op, its input value ids (like a graph node's

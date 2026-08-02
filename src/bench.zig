@@ -153,7 +153,9 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
             const v = it.next() orelse return error.InvalidArgument;
             opts.suite = try parseBenchSuite(v);
         } else if (std.mem.eql(u8, a, "--op")) {
-            opts.op_filter = it.next() orelse return error.InvalidArgument;
+            // The iterator owns its argv strings and frees them on deinit below,
+            // so the filter must outlive it — dupe (freed at process exit).
+            opts.op_filter = try allocator.dupe(u8, it.next() orelse return error.InvalidArgument);
         } else if (std.mem.eql(u8, a, "--iters")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.iters = try parseUsize(v);
@@ -765,148 +767,9 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     rep("rmsnorm", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f32)), 0, chk);
 }
 
+/// Grouped-query attention. `has_controls` binds explicit query positions and K/V
+/// lengths; otherwise the op uses row positions and the full K/V length.
 fn benchProgramAttentionF32(
-    allocator: std.mem.Allocator,
-    rnd: std.Random,
-    iters: usize,
-    m: usize,
-    n: usize,
-    dk: usize,
-    dv: usize,
-    causal: bool,
-    be: Backend,
-) !void {
-    var sm = StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseAttentionTiles(policy, m, n, dk, dv);
-
-    const q: []f32 = try allocator.alloc(f32, m * dk);
-    defer allocator.free(q);
-    const k: []f32 = try allocator.alloc(f32, n * dk);
-    defer allocator.free(k);
-    const v: []f32 = try allocator.alloc(f32, n * dv);
-    defer allocator.free(v);
-    fillRandomF32(rnd, q);
-    fillRandomF32(rnd, k);
-    fillRandomF32(rnd, v);
-
-    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, dk }, &[_]usize{ st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n, dk }, &[_]usize{ st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ n, dv }, &[_]usize{ st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
-    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
-    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k));
-    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v));
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const q_in = try g.addInput(.f32, &[_]usize{ m, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ n, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ n, dv });
-    try g.bindExternal(q_in, @intCast(q_tid));
-    try g.bindExternal(k_in, @intCast(k_tid));
-    try g.bindExternal(v_in, @intCast(v_tid));
-
-    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-    const y = try g.addAttention(q_in, k_in, v_in, scale, causal);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
-    defer prog.deinit();
-
-    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
-
-    // FLOPs (ignoring softmax exp overhead):
-    // - QK^T: 2*m*n*dk
-    // - P@V:  2*m*n*dv
-    const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
-
-    const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, dv / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, dv - 1);
-
-    const mode: []const u8 = if (causal) "causal" else "noncausal";
-    rep("attn_{s}", .{mode}, iters, ns, 0, @floatFromInt(flops_per), chk);
-}
-
-fn benchProgramMultiHeadAttentionSeparateF32(
-    allocator: std.mem.Allocator,
-    rnd: std.Random,
-    iters: usize,
-    batch: usize,
-    heads: usize,
-    m_head: usize,
-    n_head: usize,
-    dk: usize,
-    dv: usize,
-    causal: bool,
-    be: Backend,
-) !void {
-    var sm = StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseAttentionTiles(policy, m_head, n_head, dk, dv);
-
-    const q: []f32 = try allocator.alloc(f32, batch * heads * m_head * dk);
-    defer allocator.free(q);
-    const k: []f32 = try allocator.alloc(f32, batch * heads * n_head * dk);
-    defer allocator.free(k);
-    const v: []f32 = try allocator.alloc(f32, batch * heads * n_head * dv);
-    defer allocator.free(v);
-    fillRandomF32(rnd, q);
-    fillRandomF32(rnd, k);
-    fillRandomF32(rnd, v);
-
-    const q_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, m_head, dk }, &[_]usize{ 1, 1, st.tm, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const k_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dk }, &[_]usize{ 1, 1, st.tn, st.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const v_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, heads, n_head, dv }, &[_]usize{ 1, 1, st.tn, st.tv }, .{ .tile_alignment = policy.tile_alignment });
-    try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
-    try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k));
-    try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v));
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const q_in = try g.addInput(.f32, &[_]usize{ batch, heads, m_head, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ batch, heads, n_head, dv });
-    try g.bindExternal(q_in, @intCast(q_tid));
-    try g.bindExternal(k_in, @intCast(k_tid));
-    try g.bindExternal(v_in, @intCast(v_tid));
-
-    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-    const y = try g.addMultiHeadAttention(q_in, k_in, v_in, scale, causal, heads);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
-    defer prog.deinit();
-
-    const ns: u64 = try benchProgram(iters, be, &sm, &prog);
-
-    const flops_per: u64 = 2 * @as(u64, @intCast(batch)) * @as(u64, @intCast(heads)) * @as(u64, @intCast(m_head)) * @as(u64, @intCast(n_head)) *
-        (@as(u64, @intCast(dk)) + @as(u64, @intCast(dv)));
-
-    const out_tid: TensorId = prog.outputs[0];
-    const out_bytes_len: usize = batch * heads * m_head * dv * @sizeOf(f32);
-    const out_buf: []u8 = try allocator.alloc(u8, out_bytes_len);
-    defer allocator.free(out_buf);
-    try sm.readToPackedScalar(out_tid, out_buf);
-    const out_vals: []align(1) f32 = asF32Slice(out_buf);
-
-    const idx0: usize = 0;
-    const idx1: usize = (((batch / 2) * heads + (heads / 2)) * m_head + (m_head / 2)) * dv + (dv / 2);
-    const idx2: usize = (((batch - 1) * heads + (heads - 1)) * m_head + (m_head - 1)) * dv + (dv - 1);
-    const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
-
-    const mode: []const u8 = if (causal) "causal" else "noncausal";
-    rep("mha_sep_{s}", .{mode}, iters, ns, 0, @floatFromInt(flops_per), chk);
-}
-
-fn benchProgramMultiHeadAttentionCachedF32(
     allocator: std.mem.Allocator,
     rnd: std.Random,
     iters: usize,
@@ -920,6 +783,7 @@ fn benchProgramMultiHeadAttentionCachedF32(
     causal: bool,
     sliding_window: usize,
     attn_logits_soft_cap: f32,
+    has_controls: bool,
     label: []const u8,
     be: Backend,
 ) !void {
@@ -931,7 +795,9 @@ fn benchProgramMultiHeadAttentionCachedF32(
     defer sm.deinit();
 
     const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseAttentionTiles(policy, l_q, t_cache, dk, dv);
+    // Explicit benchmark tiling. Attention lowering inherits operand tiling.
+    const q_tile: usize = @max(@as(usize, 1), @min(l_q, 32));
+    const kv_tile: usize = @max(@as(usize, 1), @min(t_cache, 128));
 
     const q: []f32 = try allocator.alloc(f32, batch * l_q * h_q * dk);
     defer allocator.free(q);
@@ -941,8 +807,8 @@ fn benchProgramMultiHeadAttentionCachedF32(
     defer allocator.free(v_cache);
     const positions: []i32 = try allocator.alloc(i32, batch * l_q);
     defer allocator.free(positions);
-    const end_index: []i32 = try allocator.alloc(i32, batch);
-    defer allocator.free(end_index);
+    const kv_lengths: []i32 = try allocator.alloc(i32, batch);
+    defer allocator.free(kv_lengths);
 
     fillRandomF32(rnd, q);
     fillRandomF32(rnd, k_cache);
@@ -952,7 +818,7 @@ fn benchProgramMultiHeadAttentionCachedF32(
     // exercise realistic decode-time slices.
     const base_pos: usize = if (t_cache > l_q) t_cache - l_q else 0;
     for (0..batch) |b0| {
-        end_index[b0] = @intCast(t_cache);
+        kv_lengths[b0] = @intCast(t_cache);
         for (0..l_q) |l| {
             positions[b0 * l_q + l] = @intCast(base_pos + l);
         }
@@ -961,25 +827,25 @@ fn benchProgramMultiHeadAttentionCachedF32(
     const q_tid: TensorId = try sm.createTiledTensor(
         .f32,
         &[_]usize{ batch, l_q, h_q, dk },
-        &[_]usize{ 1, st.tm, 1, dk },
+        &[_]usize{ 1, q_tile, 1, dk },
         .{ .tile_alignment = policy.tile_alignment },
     );
     const k_tid: TensorId = try sm.createTiledTensor(
         .f32,
-        &[_]usize{ batch, h_kv, t_cache, dk },
-        &[_]usize{ 1, 1, st.tn, dk },
+        &[_]usize{ batch, t_cache, h_kv, dk },
+        &[_]usize{ 1, kv_tile, 1, dk },
         .{ .tile_alignment = policy.tile_alignment },
     );
     const v_tid: TensorId = try sm.createTiledTensor(
         .f32,
-        &[_]usize{ batch, h_kv, t_cache, dv },
-        &[_]usize{ 1, 1, st.tn, dv },
+        &[_]usize{ batch, t_cache, h_kv, dv },
+        &[_]usize{ 1, kv_tile, 1, dv },
         .{ .tile_alignment = policy.tile_alignment },
     );
     const pos_tid: TensorId = try sm.createTiledTensor(
         .i32,
         &[_]usize{ batch, l_q },
-        &[_]usize{ 1, st.tm },
+        &[_]usize{ 1, q_tile },
         .{ .tile_alignment = policy.tile_alignment },
     );
     const end_tid: TensorId = try sm.createTiledTensor(
@@ -993,24 +859,31 @@ fn benchProgramMultiHeadAttentionCachedF32(
     try sm.writeFromPackedScalar(k_tid, std.mem.sliceAsBytes(k_cache));
     try sm.writeFromPackedScalar(v_tid, std.mem.sliceAsBytes(v_cache));
     try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(positions));
-    try sm.writeFromPackedScalar(end_tid, std.mem.sliceAsBytes(end_index));
+    try sm.writeFromPackedScalar(end_tid, std.mem.sliceAsBytes(kv_lengths));
 
     var g = graph_mod.Graph.init(allocator);
     defer g.deinit();
 
     const q_in = try g.addInput(.f32, &[_]usize{ batch, l_q, h_q, dk });
-    const k_in = try g.addInput(.f32, &[_]usize{ batch, h_kv, t_cache, dk });
-    const v_in = try g.addInput(.f32, &[_]usize{ batch, h_kv, t_cache, dv });
-    const p_in = try g.addInput(.i32, &[_]usize{ batch, l_q });
-    const e_in = try g.addInput(.i32, &[_]usize{batch});
+    const k_in = try g.addInput(.f32, &[_]usize{ batch, t_cache, h_kv, dk });
+    const v_in = try g.addInput(.f32, &[_]usize{ batch, t_cache, h_kv, dv });
     try g.bindExternal(q_in, @intCast(q_tid));
     try g.bindExternal(k_in, @intCast(k_tid));
     try g.bindExternal(v_in, @intCast(v_tid));
-    try g.bindExternal(p_in, @intCast(pos_tid));
-    try g.bindExternal(e_in, @intCast(end_tid));
+
+    var p_in: ?graph_mod.ValueId = null;
+    var e_in: ?graph_mod.ValueId = null;
+    if (has_controls) {
+        const pv = try g.addInput(.i32, &[_]usize{ batch, l_q });
+        const ev = try g.addInput(.i32, &[_]usize{batch});
+        try g.bindExternal(pv, @intCast(pos_tid));
+        try g.bindExternal(ev, @intCast(end_tid));
+        p_in = pv;
+        e_in = ev;
+    }
 
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-    const y = try g.addMultiHeadAttentionCached(q_in, k_in, v_in, p_in, e_in, scale, causal, sliding_window, attn_logits_soft_cap);
+    const y = try g.addAttention(q_in, k_in, v_in, p_in, e_in, scale, causal, sliding_window, attn_logits_soft_cap);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
@@ -1061,7 +934,7 @@ fn benchProgramMultiHeadAttentionCachedF32(
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
     const mode: []const u8 = if (causal) "causal" else "noncausal";
-    rep("mhac_{s}_{s}", .{ mode, label }, iters, ns, 0, @as(f64, @floatFromInt(flops_total)) / @as(f64, @floatFromInt(iters)), chk);
+    rep("attn_{s}_{s}", .{ mode, label }, iters, ns, 0, @as(f64, @floatFromInt(flops_total)) / @as(f64, @floatFromInt(iters)), chk);
 }
 
 fn benchProgramSTFTF32(
@@ -2230,15 +2103,14 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
     try benchProgramSoftmaxF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramLayerNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
-    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, false, be);
-    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.m, opts.n, opts.k, opts.n, true, be);
-    try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, false, be);
-    try benchProgramMultiHeadAttentionSeparateF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.m, opts.n, opts.k, opts.n, true, be);
+    // Plain sequence (prefill / encoder shape), bidirectional then causal.
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, false, 0, 0.0, false, "seq", be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, true, 0, 0.0, false, "seq", be);
     const cached_h_kv: usize = if ((opts.heads % 2) == 0) @max(@as(usize, 1), opts.heads / 2) else 1;
-    try benchProgramMultiHeadAttentionCachedF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, 0, 0.0, "global", be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, 0, 0.0, true, "cache_global", be);
     const cached_sw: usize = @max(@as(usize, 1), opts.n / 2);
     if (cached_sw > 0 and cached_sw < opts.n) {
-        try benchProgramMultiHeadAttentionCachedF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, cached_sw, 0.0, "window", be);
+        try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, cached_sw, 0.0, true, "cache_window", be);
     }
     if ((opts.k % 2) == 0) {
         try benchProgramRoPE1DF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.heads, opts.k, be);

@@ -1,37 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os as _os
 from collections.abc import Sequence
 from typing import cast
 
-
-def _register_wgpu_runtime() -> None:
-    """Point the native GPU loader at the wgpu-native runtime, if available.
-
-    GPU support links no wgpu at build time; the runtime library ships in the
-    optional ``aion-wgpu`` package (``pip install aion[gpu]``) and is loaded on
-    demand via ``AION_WGPU_LIB``. When that package is installed and the embedder
-    hasn't already set the variable, hand its bundled library path to the loader.
-    Without it, GPU calls cleanly surface ``AION_UNSUPPORTED`` and CPU execution
-    is unaffected — so this never raises.
-    """
-    if _os.environ.get("AION_WGPU_LIB"):
-        return
-    try:
-        import importlib
-
-        # Optional companion, present only with `aion[gpu]`; resolve dynamically
-        # so it is not a hard (or type-checked) dependency of the base package.
-        path = importlib.import_module("aion_wgpu").library_path()
-    except Exception:
-        return
-    if path:
-        _os.environ["AION_WGPU_LIB"] = str(path)
+from ._gpu_runtime import register_wgpu_runtime
 
 
 # Runs before any native GPU context can be created (import time).
-_register_wgpu_runtime()
+register_wgpu_runtime()
 
 from . import nn
 from .builder import Builder, DynamicAxes, TensorRef
@@ -41,6 +18,7 @@ from .dtype import float16, float32, int8, int32, normalize_dtype, q4_0, q8_0
 from .errors import AionError
 from .model import LoadedModel, TensorSpec
 from .tensor import Tensor
+from .types import ArrayLike, DTypeLike
 from ._trace import InputSpec, compile, export, spec
 from .enums import AionDeviceKind, AionDType, AionGpuBackend, AionGpuPower, AionStatus
 
@@ -80,10 +58,10 @@ __version__ = "0.0.1"
 
 
 def tensor(
-    data: object | None = None,
+    data: ArrayLike | None = None,
     *,
     shape: Sequence[int] | None = None,
-    dtype: object | None = None,
+    dtype: DTypeLike | None = None,
     device: DeviceLike = None,
     name: str | None = None,
     dynamic: DynamicAxes = None,

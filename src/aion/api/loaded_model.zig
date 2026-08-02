@@ -876,13 +876,13 @@ pub const Model = struct {
                     if (opts.cache.capacity_tokens == 0) continue;
                     const cap: usize = opts.cache.capacity_tokens;
                     // Grow-on-demand needs the runtime-supported layout (rank-4,
-                    // sequence axis 2 — see `stateSlotCompatible`/`mapSequenceStep`)
+                    // sequence axis 1 — see `stateSlotCompatible`/`mapSequenceStep`)
                     // and the package's blessing; otherwise fall back to a full
                     // pre-allocation rather than failing the load.
                     const growable: ?types_mod.CacheGrowth = opts.cache.growable;
                     if (growable != null and
                         (role.flags & package_file.InputRoleFlags.allow_growable) != 0 and
-                        input_signatures[i].rank == 4 and role.axis == 2)
+                        input_signatures[i].rank == 4 and role.axis == 1)
                     {
                         const g = growable.?;
                         const initial: usize = @max(1, @min(g.initial_capacity_tokens, cap));
@@ -1439,7 +1439,6 @@ pub const Model = struct {
                     value_map[idx] = vid;
                 }
 
-
                 // Regions are built lazily, just before the main `If`/`Loop` node that
                 // references them, so a region body can reference values produced by
                 // earlier main nodes (e.g. an in-graph decode Loop reading the encoder out).
@@ -1475,7 +1474,6 @@ pub const Model = struct {
                         value_map[eid] = extra_buf[i];
                     }
                 }
-
 
                 for (pkg.outputs, 0..) |sig, idx| out_ids[idx] = value_map[sig.value];
 
@@ -1734,7 +1732,7 @@ const CacheEntry = struct {
 /// referenced by `If`/`Loop` nodes inside the body are built first (recursively),
 /// so no nested active region is needed. Region nodes may reference any value
 /// already in `value_map` — including outputs of earlier main nodes (e.g. the
-/// encoder output an in-graph decode Loop reads via GatherRows).
+/// encoder output an in-graph decode Loop reads via Gather).
 fn ensureRegionBuilt(
     package: *const Package,
     symbol_values: []const u64,

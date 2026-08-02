@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import math
+import struct
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence, cast
 
 from .device import DeviceLike, _device_to_str, _normalize_device
-from .dtype import is_quantized as _is_quant, normalize_dtype
+from .dtype import (
+    dtype_name,
+    float32,
+    is_quantized as _is_quant,
+    normalize_dtype,
+    q8_0,
+)
 from .context import Context
 from ._ffi.handles import TensorHandle
 from ._ffi.runtime import (
@@ -24,7 +31,7 @@ from ._ffi.runtime import (
     zero_tensor,
 )
 from .enums import AionDType
-from .types import NDArray
+from .types import ArrayLike, DTypeLike, NDArray
 
 type TensorData = int | float | list[TensorData]
 
@@ -81,7 +88,7 @@ def _flatten_nested_i32(data) -> tuple[tuple[int, ...], list[int]]:
 
     if isinstance(data, bool):
         return (), [int(data)]
-    if isinstance(data, int):
+    if isinstance(data, (int, float)):
         return (), [int(data)]
 
     if isinstance(data, (list, tuple)):
@@ -115,8 +122,35 @@ def _try_numpy():
         return None
 
 
-def _is_py_scalar(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+def _native_values(
+    dtype: AionDType, values: Iterable[int | float]
+) -> list[int | float]:
+    """Convert Python numbers to the host buffer representation for ``dtype``."""
+    if dtype == AionDType.AION_DTYPE_F32:
+        return [float(value) for value in values]
+    if dtype == AionDType.AION_DTYPE_F16:
+        return [
+            struct.unpack("=H", struct.pack("=e", float(value)))[0]
+            for value in values
+        ]
+    if dtype in (AionDType.AION_DTYPE_I8, AionDType.AION_DTYPE_I32):
+        return [int(value) for value in values]
+    raise NotImplementedError(
+        f"{dtype_name(dtype)} has no per-element host write path"
+    )
+
+
+def _flatten_for_dtype(
+    data: ArrayLike, dtype: AionDType
+) -> tuple[tuple[int, ...], list[int | float]]:
+    if dtype in (AionDType.AION_DTYPE_F32, AionDType.AION_DTYPE_F16):
+        return _flatten_nested(data)
+    if dtype in (AionDType.AION_DTYPE_I8, AionDType.AION_DTYPE_I32):
+        shape, values = _flatten_nested_i32(data)
+        return shape, cast(list[int | float], values)
+    raise NotImplementedError(
+        f"{dtype_name(dtype)} has no per-element host write path"
+    )
 
 
 def _infer_construct_dtype(data) -> AionDType:
@@ -164,17 +198,17 @@ class Tensor:
 
     def __init__(
         self,
-        data: object,
+        data: ArrayLike,
         *,
         ctx: "Context | None" = None,
-        dtype: object | None = None,
+        dtype: DTypeLike | None = None,
         device: DeviceLike = None,
     ) -> None:
         """Create a tensor from Python data.
 
         Examples:
             Tensor([1, 2, 3])
-            Tensor([[1, 2], [3, 4]], dtype=AionDType.AION_DTYPE_F32)
+            Tensor([[1, 2], [3, 4]], dtype=aion.float32)
             Tensor([1, 2, 3], device="gpu")   # built on CPU, then migrated
 
         `device` migrates the tensor after it is built and written on the CPU
@@ -212,12 +246,7 @@ class Tensor:
                 self.to(device)
             return
 
-        if dtype == AionDType.AION_DTYPE_F32:
-            shape, vals = _flatten_nested(data)
-        elif dtype == AionDType.AION_DTYPE_I32:
-            shape, vals = _flatten_nested_i32(data)
-        else:
-            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
+        shape, vals = _flatten_for_dtype(data, dtype)
 
         shp = _as_shape(shape)
         n = _elem_count(shp)
@@ -227,12 +256,7 @@ class Tensor:
         # The native runtime currently represents a scalar as shape (1,).
         if len(shp) == 0:
             shp = [1]
-        if dtype == AionDType.AION_DTYPE_F32:
-            native_values: list[int | float] = [float(v) for v in vals]
-        elif dtype == AionDType.AION_DTYPE_I32:
-            native_values = [int(v) for v in vals]
-        else:
-            raise NotImplementedError(f"tensor construction not implemented for dtype={dtype}")
+        native_values = _native_values(dtype, vals)
 
         handle = create_tensor(ctx.ptr, dtype, shp, native_values)
         self._init_from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
@@ -414,11 +438,11 @@ class Tensor:
         ctx: "Context",
         shape: Sequence[int],
         *,
-        dtype: object | None = None,
+        dtype: DTypeLike = float32,
         device: DeviceLike = None,
     ) -> "Tensor":
         shp = _as_shape(shape)
-        dtype = AionDType.AION_DTYPE_F32 if dtype is None else normalize_dtype(dtype)
+        dtype = normalize_dtype(dtype)
 
         handle = create_empty_tensor(ctx.ptr, dtype, shp)
         t = cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
@@ -433,7 +457,7 @@ class Tensor:
         shape: Sequence[int],
         tile_shape: Sequence[int],
         *,
-        dtype: object | None = None,
+        dtype: DTypeLike = float32,
     ) -> "Tensor":
         """Create an empty tensor with an explicit per-axis tile shape.
 
@@ -447,7 +471,7 @@ class Tensor:
         tshp = _as_shape(tile_shape)
         if len(tshp) != len(shp):
             raise ValueError(f"tile_shape rank {len(tshp)} != shape rank {len(shp)}")
-        dtype = AionDType.AION_DTYPE_F32 if dtype is None else normalize_dtype(dtype)
+        dtype = normalize_dtype(dtype)
 
         handle = create_empty_tiled_tensor(ctx.ptr, dtype, shp, tshp)
         return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
@@ -457,9 +481,9 @@ class Tensor:
         cls,
         ctx: "Context",
         shape: Sequence[int],
-        values: object,
+        values: ArrayLike,
         *,
-        dtype: object | None = None,
+        dtype: DTypeLike = q8_0,
         quant_axis: int | None = None,
     ) -> "Tensor":
         """Quantize row-major f32 `values` into a packed-quant tensor.
@@ -470,9 +494,11 @@ class Tensor:
         blocked along its feature dim. `values` may be a numpy array or a
         (possibly nested) Python sequence.
         """
-        dtype = AionDType.AION_DTYPE_Q8_0 if dtype is None else normalize_dtype(dtype)
+        dtype = normalize_dtype(dtype)
         if dtype not in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
-            raise ValueError(f"quantize expects a quantized dtype, got {dtype}")
+            raise ValueError(
+                f"quantize expects a quantized dtype, got {dtype_name(dtype)}"
+            )
 
         shp = _as_shape(shape)
         if quant_axis is None:
@@ -516,7 +542,7 @@ class Tensor:
         shape: Sequence[int],
         *,
         ctx: "Context | None" = None,
-        dtype: object | None = None,
+        dtype: DTypeLike = float32,
         device: DeviceLike = None,
     ) -> "Tensor":
         """Create a zero-initialized tensor.
@@ -550,8 +576,7 @@ class Tensor:
             raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
         if len(shp) == 0:
             shp = [1]
-        converter = float if dtype == AionDType.AION_DTYPE_F32 else int
-        handle = create_tensor(ctx.ptr, dtype, shp, [converter(value) for value in vals])
+        handle = create_tensor(ctx.ptr, dtype, shp, _native_values(dtype, vals))
         return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     def numel(self) -> int:
@@ -561,7 +586,7 @@ class Tensor:
         if getattr(self, "_closed", True):
             return "Tensor(<closed>)"
         try:
-            return f"Tensor(shape={self.shape}, dtype={self.dtype.name})"
+            return f"Tensor(shape={self.shape}, dtype={dtype_name(self.dtype)})"
         except Exception:
             return "Tensor(<uninitialized>)"
 
@@ -586,7 +611,7 @@ class Tensor:
     def _flat_values(self) -> list[int | float]:
         if _is_quant(self.dtype):
             raise NotImplementedError(
-                f"{self.dtype.name}: quantized tensors cannot be converted to Python values"
+                f"{dtype_name(self.dtype)}: quantized tensors cannot be converted to Python values"
             )
         n = _elem_count(self.shape)
         return read_tensor(self._ctx_owner.ptr, self._require_handle(), n)
@@ -613,11 +638,16 @@ class Tensor:
             raise ValueError(f"item() requires one element, got {self.numel()}")
         return self._flat_values()[0]
 
-    def copy_from(self, values: object) -> "Tensor":
-        """Copy array-like data into this tensor and return ``self``."""
+    def copy_from(self, values: ArrayLike) -> "Tensor":
+        """Copy data into this tensor, broadcasting a scalar, and return ``self``.
+
+        Non-scalar inputs must match the tensor's exact shape.
+        """
         dt = self.dtype
         if _is_quant(dt):
-            raise NotImplementedError(f"{dt.name}: quantized tensors cannot be mutated")
+            raise NotImplementedError(
+                f"{dtype_name(dt)}: quantized tensors cannot be mutated"
+            )
 
         np = _try_numpy()
         if np is not None:
@@ -626,42 +656,29 @@ class Tensor:
             _copy_numpy_into_tensor(self, values)
             return self
 
-        if dt == AionDType.AION_DTYPE_F32:
-            shape, vals = _flatten_nested(values)
-        elif dt == AionDType.AION_DTYPE_I32:
-            shape, vals = _flatten_nested_i32(values)
-        else:
-            raise NotImplementedError(
-                f"copy_from without NumPy is not implemented for {dt.name}"
-            )
-        if shape == () and self.shape == (1,):
-            shape = (1,)
-        if shape != self.shape:
+        shape, vals = _flatten_for_dtype(values, dt)
+        if shape == ():
+            vals *= self.numel()
+        elif shape != self.shape:
             raise ValueError(f"shape mismatch: tensor {self.shape} vs data {shape}")
-        py = float if dt == AionDType.AION_DTYPE_F32 else int
         write_tensor(
             self._ctx_owner.ptr,
             self._require_handle(),
-            [py(cast(Any, value)) for value in vals],
+            _native_values(dt, vals),
         )
         return self
 
-    def fill(self, value: float) -> "Tensor":
-        """In-place fill (f32 only). Returns self."""
-        if self.dtype != AionDType.AION_DTYPE_F32:
-            raise NotImplementedError("fill() is f32 only")
-        write_tensor(
-            self._ctx_owner.ptr,
-            self._require_handle(),
-            [float(value)] * self.numel(),
-        )
-        return self
+    def fill(self, value: int | float) -> "Tensor":
+        """In-place scalar fill. Returns self."""
+        return self.copy_from(value)
 
     def zero(self) -> "Tensor":
         """In-place zero fill (scalar dtypes). Returns self."""
         dt = self.dtype
         if _is_quant(dt):
-            raise NotImplementedError(f"zero() not implemented for dtype={dt.name}")
+            raise NotImplementedError(
+                f"zero() not implemented for dtype={dtype_name(dt)}"
+            )
         n = self.numel()
         # The native façade zero-initializes the temporary C buffer; for f16,
         # uint16 zero is IEEE-754 +0.0.

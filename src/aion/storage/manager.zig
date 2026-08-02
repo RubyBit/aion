@@ -587,10 +587,10 @@ pub const StorageManager = struct {
                 const policy: SequenceCachePolicy = sm.sequenceCachePolicy(tid);
                 switch (policy) {
                     .growable => |g| {
-                        // Grow along the sequence axis (axis 2) for rank-4 sequence caches.
+                        // Grow along the canonical time axis (axis 1).
                         const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
                         if (t_const.rank != 4) return tensor_store.StoreError.InvalidArgument;
-                        const current_cap: usize = t_const.shape[2];
+                        const current_cap: usize = t_const.shape[1];
 
                         if (logical_t >= current_cap) {
                             // Past the growth ceiling (the caller's max bound) is an error,
@@ -603,12 +603,12 @@ pub const StorageManager = struct {
                             }
                             // Never overshoot the ceiling.
                             if (g.max_capacity_tokens != 0 and target > g.max_capacity_tokens) target = g.max_capacity_tokens;
-                            sm.ensureTensorAxisCapacity(tid, 2, target) catch return tensor_store.StoreError.InvalidArgument;
+                            sm.ensureTensorAxisCapacity(tid, 1, target) catch return tensor_store.StoreError.InvalidArgument;
                         }
 
                         // Update cache policy internal state bookkeeping.
                         if (sm.cache) |*cache| {
-                            const latest_cap: usize = (sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument).shape[2];
+                            const latest_cap: usize = (sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument).shape[1];
                             _ = cache.mapLogicalTime(tid, logical_t, latest_cap) catch |e| {
                                 return switch (e) {
                                     error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
@@ -623,7 +623,7 @@ pub const StorageManager = struct {
                         if (sm.cache) |*cache| {
                             const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
                             var cap: usize = physical_capacity_tokens;
-                            if (@as(usize, t_const.rank) > 2) cap = t_const.shape[2];
+                            if (@as(usize, t_const.rank) > 1) cap = t_const.shape[1];
                             if (cap == 0) return tensor_store.StoreError.InvalidArgument;
                             return cache.mapLogicalTime(tid, logical_t, cap) catch |e| {
                                 return switch (e) {

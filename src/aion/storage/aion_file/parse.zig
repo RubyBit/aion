@@ -496,7 +496,6 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .GeluMul => .GeluMul,
         .MatMul => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
         .ElemwiseBinary => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
-        .BroadcastLastDimBinary => .{ .BroadcastLastDimBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
         .Unary => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
         .Softmax => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .If => .{ .If = .{ .then_region = try readIntCursor(bytes, &cursor, u32), .else_region = try readIntCursor(bytes, &cursor, u32) } },
@@ -543,17 +542,12 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         } },
         .LayerNorm => .{ .LayerNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
         .RMSNorm => .{ .RMSNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        .Attention => .{ .Attention = .{ .scale = try readIntCursor(bytes, &cursor, f32), .causal = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
-        .MultiHeadAttention => .{ .MultiHeadAttention = .{
-            .scale = try readIntCursor(bytes, &cursor, f32),
-            .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
-            .heads = try readIntCursor(bytes, &cursor, u64),
-        } },
-        .MultiHeadAttentionCached => .{ .MultiHeadAttentionCached = .{
+        .Attention => .{ .Attention = .{
             .scale = try readIntCursor(bytes, &cursor, f32),
             .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
             .sliding_window = try readIntCursor(bytes, &cursor, u64),
             .attn_logits_soft_cap = try readIntCursor(bytes, &cursor, f32),
+            .controls = try readIntCursor(bytes, &cursor, u8),
         } },
         .Reduce => .{ .Reduce = .{
             .op = try readEnumCursor(bytes, &cursor, ReduceOp),
@@ -569,13 +563,19 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         } },
         .RelPosMHA => .{ .RelPosMHA = .{
             .scale = try readIntCursor(bytes, &cursor, f32),
-            .heads = try readIntCursor(bytes, &cursor, u64),
             .has_mask = (try readIntCursor(bytes, &cursor, u8)) != 0,
+            .chunk_size = try readIntCursor(bytes, &cursor, u64),
+            .chunk_left = try readIntCursor(bytes, &cursor, u64),
         } },
         .ArgMax => .{ .ArgMax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .ScatterRow => .ScatterRow,
+        .Gather => .{ .Gather = .{
+            .axis = try readIntCursor(bytes, &cursor, i32),
+            .batch_dims = try readIntCursor(bytes, &cursor, u64),
+        } },
+        .Dim => .{ .Dim = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
+        .Iota => .{ .Iota = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .Copy => .Copy,
-        .GatherRows => .GatherRows,
         .RoPE1D => .{ .RoPE1D = .{
             .base_frequency = try readIntCursor(bytes, &cursor, f32),
             .scale_factor = try readIntCursor(bytes, &cursor, f32),

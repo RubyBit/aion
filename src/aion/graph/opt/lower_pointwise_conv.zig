@@ -62,7 +62,7 @@ pub fn run(allocator: std.mem.Allocator, graph: *Graph) Error!void {
                 .extra_outputs = node.extra_outputs,
             });
         } else {
-            // With bias [c_out]: matmul -> tmp, then broadcast-add bias -> output.
+            // With bias [c_out]: matmul -> tmp, then ordinary broadcast add.
             const out_v = graph.values.items[@intCast(node.output)];
             const tmp = try newValue(graph, out_v.dtype.?, out_v.shape);
             try new_nodes.append(allocator, .{
@@ -71,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator, graph: *Graph) Error!void {
                 .output = tmp,
             });
             try new_nodes.append(allocator, .{
-                .op = .{ .BroadcastLastDimBinary = .{ .op = .add } },
+                .op = .{ .ElemwiseBinary = .{ .op = .add } },
                 .inputs = try arenaIds(graph, &[_]ValueId{ tmp, node.inputs[2] }),
                 .output = node.output,
                 .extra_outputs = node.extra_outputs,

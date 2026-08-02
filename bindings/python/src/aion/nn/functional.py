@@ -23,7 +23,7 @@ def scale(x: TensorRef, k: float) -> TensorRef:
     if k == 1.0:
         return x
     b = builder_of(x)
-    return b.broadcast_mul(x, b.constant(k))
+    return b.mul(x, b.constant(k))
 
 
 def shift(x: TensorRef, k: float) -> TensorRef:
@@ -31,7 +31,7 @@ def shift(x: TensorRef, k: float) -> TensorRef:
     if k == 0.0:
         return x
     b = builder_of(x)
-    return b.broadcast_add(x, b.constant(k))
+    return b.add(x, b.constant(k))
 
 
 def softcap(x: TensorRef, cap: float) -> TensorRef:

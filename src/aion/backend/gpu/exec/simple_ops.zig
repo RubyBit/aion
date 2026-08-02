@@ -23,16 +23,32 @@ const KernelDesc = pipelines.KernelDesc;
 
 const elementwise_kernel: KernelDesc = .{ .name = "elementwise", .wgsl = @embedFile("../kernels/elementwise.wgsl") };
 const elementwise_i32_kernel: KernelDesc = .{ .name = "elementwise_i32", .wgsl = @embedFile("../kernels/elementwise_i32.wgsl") };
+const elementwise_broadcast_kernel: KernelDesc = .{ .name = "elementwise_broadcast", .wgsl = @embedFile("../kernels/elementwise_broadcast.wgsl") };
+const elementwise_broadcast_i32_kernel: KernelDesc = .{ .name = "elementwise_broadcast_i32", .wgsl = @embedFile("../kernels/elementwise_broadcast_i32.wgsl") };
 const unary_kernel: KernelDesc = .{ .name = "unary", .wgsl = @embedFile("../kernels/unary.wgsl") };
-const broadcast_kernel: KernelDesc = .{ .name = "broadcast", .wgsl = @embedFile("../kernels/broadcast.wgsl") };
+const elementwise_suffix_kernel: KernelDesc = .{ .name = "elementwise_suffix", .wgsl = @embedFile("../kernels/elementwise_suffix.wgsl") };
+const elementwise_suffix_i32_kernel: KernelDesc = .{ .name = "elementwise_suffix_i32", .wgsl = @embedFile("../kernels/elementwise_suffix_i32.wgsl") };
 const dequant_kernel: KernelDesc = .{ .name = "dequant", .wgsl = @embedFile("../kernels/dequant.wgsl") };
 
-const WORKGROUP_1D: u32 = 64; // must match @workgroup_size in elementwise/unary/broadcast.wgsl
+const WORKGROUP_1D: u32 = 64; // must match @workgroup_size in the 1-D elementwise and unary shaders
 
 /// Uniform params for the 1D elementwise/unary kernels (16-byte aligned).
 const ScalarParams = extern struct { n: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
-/// Uniform params for the broadcast-last-dim kernel.
-const BroadcastParams = extern struct { n: u32, cols: u32, _pad0: u32 = 0, _pad1: u32 = 0 };
+/// Uniform params for arbitrary right-aligned broadcasting, up to MAX_RANK=8.
+const ElementwiseBroadcastParams = extern struct {
+    n: u32,
+    rank: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    shape0: [4]u32,
+    shape1: [4]u32,
+    a_stride0: [4]u32,
+    a_stride1: [4]u32,
+    b_stride0: [4]u32,
+    b_stride1: [4]u32,
+};
+/// Uniform params for the packed contiguous-suffix fast path.
+const SuffixParams = extern struct { n: u32, cols: u32, _pad0: u32 = 0, _pad1: u32 = 0 };
 /// Uniform params matching dequant.wgsl's `Params` (cast uses only `count`).
 const CastParams = extern struct { n: u32 = 0, k: u32 = 0, src_wpr: u32 = 0, dst_row: u32 = 0, count: u32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 
@@ -50,16 +66,38 @@ fn requireF32(meta: types.DType) ExecuteProgramError!void {
 pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBinaryTiled) ExecuteProgramError!void {
     const hs = ctx.rstore.tensorStore();
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
+    const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
+    const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
+    const broadcast = s.broadcast.kind != .identical;
+    const fast_suffix = (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) and !s.op.isComparison();
 
     // Comparisons are i32-in/i32-out (infer enforces it); arithmetic is
     // dtype-preserving f32 or i32. Both element sizes are 4 bytes, so the
     // dispatch math below is dtype-agnostic — only the kernel module differs.
     const kernel: KernelDesc = switch (meta.dtype) {
-        .f32 => if (s.op.isComparison()) return error.Unsupported else elementwise_kernel,
-        .i32 => elementwise_i32_kernel,
+        .f32 => if (s.op.isComparison())
+            return error.Unsupported
+        else if (fast_suffix)
+            elementwise_suffix_kernel
+        else if (broadcast)
+            elementwise_broadcast_kernel
+        else
+            elementwise_kernel,
+        .i32 => if (fast_suffix)
+            elementwise_suffix_i32_kernel
+        else if (broadcast)
+            elementwise_broadcast_i32_kernel
+        else
+            elementwise_i32_kernel,
         else => return error.Unsupported,
     };
-    const entry: [:0]const u8 = switch (s.op) {
+    const entry: [:0]const u8 = if (fast_suffix) switch (s.op) {
+        .add => "suffix_add",
+        .sub => "suffix_sub",
+        .mul => "suffix_mul",
+        .div => "suffix_div",
+        else => unreachable,
+    } else switch (s.op) {
         .add => "add",
         .sub => "sub",
         .mul => "mul",
@@ -76,13 +114,20 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
     const total = context.totalTiles(meta);
     var ti: usize = 0;
     while (ti < total) : (ti += 1) {
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, ti) catch return error.ExecutionFailed;
+        var coords: [tensor_store_mod.INLINE_RANK]usize = @splat(0);
+        tensor_store_mod.decodeTileCoords(meta, ti, coords[0..@as(usize, meta.rank)]) catch return error.ExecutionFailed;
+        const a_ti = tensor_store_mod.projectTileIndex(a_meta, coords[0..@as(usize, meta.rank)], &.{}, s.broadcast.a_broadcast_axes) catch return error.ExecutionFailed;
+        const b_ti = tensor_store_mod.projectTileIndex(b_meta, coords[0..@as(usize, meta.rank)], &.{}, s.broadcast.b_broadcast_axes) catch return error.ExecutionFailed;
+
+        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, a_ti) catch return error.ExecutionFailed;
+        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, b_ti) catch return error.ExecutionFailed;
         const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
-        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dout.len)) {
+        defer {
             hs.releaseConst(da.token);
             hs.releaseConst(db.token);
             hs.releaseMut(dout.token);
+        }
+        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dout.len)) {
             return error.Unsupported;
         }
 
@@ -92,13 +137,57 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
             ctx.devmem.bufferFor(dout.handle).?,
         };
         const sizes = [_]u64{ da.len, db.len, dout.len };
-        const n: u32 = @intCast(dout.len / @sizeOf(f32));
-        const params: ScalarParams = .{ .n = n };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
+        const n = context.packedElems(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)]) orelse {
+            return error.Unsupported;
+        };
+        if (fast_suffix) {
+            const cols = context.packedElems(db.rank, db.shape_mem[0..@as(usize, db.rank)], db.strides_mem[0..@as(usize, db.rank)]) orelse return error.Unsupported;
+            const a_n = context.packedElems(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
+            if (a_n != n or cols == 0 or n % cols != 0) return error.Unsupported;
+            const params: SuffixParams = .{ .n = n, .cols = cols };
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
+        } else if (broadcast) {
+            var params: ElementwiseBroadcastParams = .{
+                .n = n,
+                .rank = meta.rank,
+                .shape0 = @splat(1),
+                .shape1 = @splat(1),
+                .a_stride0 = @splat(0),
+                .a_stride1 = @splat(0),
+                .b_stride0 = @splat(0),
+                .b_stride1 = @splat(0),
+            };
+            const out_rank: usize = meta.rank;
+            const a_rank: usize = a_meta.rank;
+            const b_rank: usize = b_meta.rank;
+            for (0..out_rank) |axis| {
+                const lane = axis % 4;
+                const high = axis >= 4;
+                const dim = std.math.cast(u32, dout.shape_mem[axis]) orelse return error.Unsupported;
+                if (high) params.shape1[lane] = dim else params.shape0[lane] = dim;
 
-        hs.releaseConst(da.token);
-        hs.releaseConst(db.token);
-        hs.releaseMut(dout.token);
+                if (axis >= out_rank - a_rank) {
+                    const aa = axis - (out_rank - a_rank);
+                    if ((s.broadcast.a_broadcast_axes & (@as(u8, 1) << @intCast(axis))) == 0) {
+                        if (da.strides_mem[aa] < 0 or @rem(da.strides_mem[aa], @sizeOf(u32)) != 0) return error.Unsupported;
+                        const stride = std.math.cast(u32, @divExact(da.strides_mem[aa], @sizeOf(u32))) orelse return error.Unsupported;
+                        if (high) params.a_stride1[lane] = stride else params.a_stride0[lane] = stride;
+                    }
+                }
+                if (axis >= out_rank - b_rank) {
+                    const ba = axis - (out_rank - b_rank);
+                    if ((s.broadcast.b_broadcast_axes & (@as(u8, 1) << @intCast(axis))) == 0) {
+                        if (db.strides_mem[ba] < 0 or @rem(db.strides_mem[ba], @sizeOf(u32)) != 0) return error.Unsupported;
+                        const stride = std.math.cast(u32, @divExact(db.strides_mem[ba], @sizeOf(u32))) orelse return error.Unsupported;
+                        if (high) params.b_stride1[lane] = stride else params.b_stride0[lane] = stride;
+                    }
+                }
+            }
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
+        } else {
+            const params: ScalarParams = .{ .n = n };
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
+        }
     }
 }
 
@@ -120,67 +209,6 @@ pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) Exec
         const sizes = [_]u64{ da.len, db.len, dout.len };
         const n: u32 = @intCast(dout.len / @sizeOf(f32));
         const params: ScalarParams = .{ .n = n };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
-    }
-}
-
-/// `out[.., j] = a[.., j] op b[j]` — b is a rank-1 vector broadcast across each
-/// row. b's 1-D tiling matches out's last-dim tiling (compile-validated), so out
-/// tile (.., ti_last) pairs with b tile ti_last. Tiles must be fully packed (the
-/// kernel decomposes a flat index with `% cols`).
-///
-/// A single-element b is a scalar broadcast over every column: it is one tile, so
-/// it pairs with every out tile, and passing `cols = 1` makes the kernel's
-/// `b[i % cols]` read `b[0]`.
-pub fn execBroadcastLastDim(ctx: Ctx, frame: *Frame, s: executable.StepBroadcastLastDimBinaryTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
-    const meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
-    if (meta.rank < 2) return error.Unsupported;
-
-    const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
-    const b_scalar: bool = (b_meta.rank == 1 and b_meta.shape[0] == 1);
-
-    const entry: [:0]const u8 = switch (s.op) {
-        .add => "bcast_add",
-        .sub => "bcast_sub",
-        .mul => "bcast_mul",
-        .div => "bcast_div",
-        else => return error.Unsupported,
-    };
-    const built = try ctx.pipes.get(broadcast_kernel, entry);
-
-    const total = context.totalTiles(meta);
-    var ti: usize = 0;
-    while (ti < total) : (ti += 1) {
-        var coords: [tensor_store_mod.INLINE_RANK]usize = @splat(0);
-        tensor_store_mod.decodeTileCoords(meta, ti, coords[0..@as(usize, meta.rank)]) catch return error.ExecutionFailed;
-        const ti_last = coords[@as(usize, meta.rank) - 1];
-
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, if (b_scalar) 0 else ti_last) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
-        defer {
-            hs.releaseConst(da.token);
-            hs.releaseConst(db.token);
-            hs.releaseMut(dout.token);
-        }
-        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dout.len)) {
-            return error.Unsupported;
-        }
-
-        const n = context.packedElems(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)]) orelse return error.Unsupported;
-        const a_n = context.packedElems(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
-        const cols: u32 = if (b_scalar) 1 else (std.math.cast(u32, dout.shape_mem[@as(usize, dout.rank) - 1]) orelse return error.Unsupported);
-        if (a_n != n or db.shape_mem[0] < cols) return error.Unsupported;
-
-        const bufs = [_]c.WGPUBuffer{
-            ctx.devmem.bufferFor(da.handle).?,
-            ctx.devmem.bufferFor(db.handle).?,
-            ctx.devmem.bufferFor(dout.handle).?,
-        };
-        const sizes = [_]u64{ da.len, db.len, dout.len };
-        const params: BroadcastParams = .{ .n = n, .cols = cols };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
     }
 }

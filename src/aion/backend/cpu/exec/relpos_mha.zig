@@ -28,12 +28,21 @@
 //
 // The op does not own the streaming ring buffer: the converter concatenates the
 // per-layer left-context cache onto K/V in-graph and slices the tail back out as the
-// next cache. The chunked-limited attention window is supplied via the additive mask.
+// next cache.
 //
-// Hot path: the `ac`/`bd` GEMMs and the V accumulation use the shared, SIMD-tuned
-// attention kernels selected per lane width (see `relpos_mha_registry`). Slices are
-// distributed across the thread pool. Lowering forces a single tile over the trailing
-// [T, D] dims so each (batch, head) slice is one contiguous tile.
+// Chunked-limited attention is STRUCTURAL (`chunk_size`/`chunk_left`): every query
+// row sees one contiguous key window, so the work is O(T_q * window) instead of
+// scoring all T_kv keys and masking almost all of them away. The additive `mask`
+// operand still applies inside the window, for what an interval cannot express
+// (streaming padding, or any bespoke pattern).
+//
+// Hot path: rows are processed in panels that share a key window. The `ac`/`bd` GEMMs
+// and the V accumulation use the shared, SIMD-tuned attention kernels selected per
+// lane width (see `attention_registry`). A panel also bounds the `pos_emb` band it
+// needs (consecutive rows shift by one), so `bd` costs `window + panel - 1` columns
+// per row instead of all `P = 2*T_kv - 1`. Slices are distributed across the thread
+// pool; lowering forces a single tile over the trailing [T, D] dims so each
+// (batch, head) slice is one contiguous tile.
 
 const std = @import("std");
 const backend_mod = @import("../../backend.zig");
@@ -44,8 +53,7 @@ const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 
 const simd = @import("../kernels/simd.zig");
-const attn_kernels = @import("../kernels/attention.zig");
-const relpos_registry = @import("../registry/relpos_mha_registry.zig");
+const attention_registry = @import("../registry/attention_registry.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -59,38 +67,47 @@ const Dims = struct {
     t_kv: usize,
     p: usize,
     d: usize,
+    /// Chunked-limited window (`chunk_size == 0` => `t_kv`): the widest key range a
+    /// single query row can see, which is what the score/pos_emb scratch is sized on.
+    w_max: usize,
+    /// Rows per panel, capped by `PANEL` and by the rows that share a key window.
+    panel: usize,
 };
 
 const Scratch = struct {
     qu: []f32, // [T_q * D]
     qv: []f32, // [T_q * D]
-    ac: []f32, // [T_q * T_kv]  (also holds the softmaxed scores)
-    bd: []f32, // [T_q * P]
+    ac: []f32, // [panel, w_max] scores, softmaxed in place
+    bd: []f32, // [panel, w_max + panel - 1] pos_emb band scores
     ktp: []f32, // packed-K scratch, sized for the larger (bd) GEMM
     qtp: []f32, // packed-Q scratch
-    row_max: []f32, // [T_q]
-    l: []f32, // [T_q]
+    row_max: []f32, // [panel]
+    l: []f32, // [panel]
+
+    fn bdWidth(dims: Dims) usize {
+        return dims.w_max + dims.panel - 1;
+    }
 
     fn perWorkerLen(dims: Dims, mr: usize, nr: usize) usize {
         const qu = dims.t_q * dims.d;
         const qv = dims.t_q * dims.d;
-        const ac = dims.t_q * dims.t_kv;
-        const bd = dims.t_q * dims.p;
-        const ktp = alignUp(dims.p, nr) * dims.d;
-        const qtp = alignUp(dims.t_q, mr) * dims.d;
-        return qu + qv + ac + bd + ktp + qtp + dims.t_q + dims.t_q;
+        const ac = dims.panel * dims.w_max;
+        const bd = dims.panel * bdWidth(dims);
+        const ktp = alignUp(bdWidth(dims), nr) * dims.d;
+        const qtp = alignUp(dims.panel, mr) * dims.d;
+        return qu + qv + ac + bd + ktp + qtp + dims.panel + dims.panel;
     }
 
     fn carve(buf: []f32, dims: Dims, mr: usize, nr: usize) Scratch {
         var off: usize = 0;
         const qu = take(buf, &off, dims.t_q * dims.d);
         const qv = take(buf, &off, dims.t_q * dims.d);
-        const ac = take(buf, &off, dims.t_q * dims.t_kv);
-        const bd = take(buf, &off, dims.t_q * dims.p);
-        const ktp = take(buf, &off, alignUp(dims.p, nr) * dims.d);
-        const qtp = take(buf, &off, alignUp(dims.t_q, mr) * dims.d);
-        const row_max = take(buf, &off, dims.t_q);
-        const l = take(buf, &off, dims.t_q);
+        const ac = take(buf, &off, dims.panel * dims.w_max);
+        const bd = take(buf, &off, dims.panel * bdWidth(dims));
+        const ktp = take(buf, &off, alignUp(bdWidth(dims), nr) * dims.d);
+        const qtp = take(buf, &off, alignUp(dims.panel, mr) * dims.d);
+        const row_max = take(buf, &off, dims.panel);
+        const l = take(buf, &off, dims.panel);
         return .{ .qu = qu, .qv = qv, .ac = ac, .bd = bd, .ktp = ktp, .qtp = qtp, .row_max = row_max, .l = l };
     }
 
@@ -101,8 +118,63 @@ const Scratch = struct {
     }
 };
 
+/// Keys visible to query row `i` under chunked-limited attention. The row's absolute
+/// index in the K/V window is `i + (t_kv - t_q)` (a left-context cache occupies the
+/// front), it attends to its own chunk plus `chunk_left` frames before that chunk's
+/// start, and the result is one contiguous interval — which is the whole reason this
+/// can replace an additive [T_q, T_kv] mask.
+fn keyWindow(dims: Dims, chunk_size: usize, chunk_left: usize, i: usize) struct { lo: usize, hi: usize } {
+    if (chunk_size == 0) return .{ .lo = 0, .hi = dims.t_kv };
+    const a: usize = i + (dims.t_kv - dims.t_q);
+    const cs: usize = (a / chunk_size) * chunk_size;
+    return .{
+        .lo = cs - @min(cs, chunk_left),
+        .hi = @min(cs + chunk_size, dims.t_kv),
+    };
+}
+
 inline fn alignUp(x: usize, a: usize) usize {
     return ((x + a - 1) / a) * a;
+}
+
+/// `scores[rows, n_k] += qs @ ks^T`, splitting the row range between the two score
+/// kernels: whole `mr` blocks go through the packed microkernel, the remainder through
+/// the narrow one. `calc_scores_f32` degrades to a SCALAR loop for a partial row block
+/// (`r0 + MR > m_q`), which a chunked window hits on every panel — a chunk of 14 rows
+/// is one 8-row block plus 6 rows that would otherwise be scored one element at a time.
+fn addScores(
+    kernels: attention_registry.Kernels,
+    rows: usize,
+    n_k: usize,
+    d: usize,
+    qs: []align(1) const f32,
+    q_stride: usize,
+    ks: []align(1) const f32,
+    k_stride: usize,
+    kt: []f32,
+    qt: []f32,
+    scores: []f32,
+    score_stride: usize,
+) void {
+    const mr: usize = kernels.tuning.mr;
+    const aligned: usize = (rows / mr) * mr;
+    if (aligned > 0) {
+        kernels.pack_k_block(n_k, d, ks, k_stride, kt);
+        kernels.calc_scores_f32(aligned, n_k, d, qs, q_stride, ks, k_stride, kt, qt, scores, score_stride);
+    }
+    if (aligned < rows) {
+        kernels.calc_scores_narrow_f32(
+            rows - aligned,
+            n_k,
+            d,
+            qs[aligned * q_stride ..],
+            q_stride,
+            ks,
+            k_stride,
+            scores[aligned * score_stride ..],
+            score_stride,
+        );
+    }
 }
 
 fn tileIndex(meta: tensor_store.TensorMeta, coords: []const usize) ExecuteProgramError!usize {
@@ -113,12 +185,11 @@ pub fn execRelPosMHATiled(
     allocator: std.mem.Allocator,
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    kernels: relpos_registry.Kernels,
+    kernels: attention_registry.Kernels,
     s: executable.StepRelPosMHATiled,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     if (!(s.scale > 0.0) or !std.math.isFinite(s.scale)) return BackendError.InvalidArgument;
-    if (s.heads == 0) return BackendError.InvalidArgument;
 
     const out_meta = try store.meta(s.out);
     const q_meta = try store.meta(s.q);
@@ -142,7 +213,7 @@ pub fn execRelPosMHATiled(
     const T_kv: usize = k_meta.shape[1];
     const P: usize = pe_meta.shape[1];
 
-    if (H != s.heads) return BackendError.InvalidArgument;
+    if (H == 0) return BackendError.InvalidArgument;
     if (q_meta.shape[0] != B or q_meta.shape[1] != T_q or q_meta.shape[2] != H or q_meta.shape[3] != D) return BackendError.InvalidArgument;
     if (k_meta.shape[0] != B or k_meta.shape[2] != H or k_meta.shape[3] != D) return BackendError.InvalidArgument;
     if (v_meta.shape[0] != B or v_meta.shape[1] != T_kv or v_meta.shape[2] != H or v_meta.shape[3] != D) return BackendError.InvalidArgument;
@@ -168,7 +239,26 @@ pub fn execRelPosMHATiled(
         if (m_meta.tile_counts[0] != 1 or m_meta.tile_counts[1] != 1) return BackendError.InvalidArgument;
     }
 
-    const dims: Dims = .{ .b = B, .h = H, .t_q = T_q, .t_kv = T_kv, .p = P, .d = D };
+    if (s.chunk_size == 0 and s.chunk_left != 0) return BackendError.InvalidArgument;
+    // Widest window any row can see, and the most rows that can share one window.
+    const w_max: usize = if (s.chunk_size == 0)
+        T_kv
+    else
+        @min(T_kv, s.chunk_size + s.chunk_left);
+    // Rows per panel: the tuned cap (see `attention_registry.Tuning.relpos_panel`),
+    // then whatever can actually share one key window.
+    const panel: usize = @min(kernels.tuning.relpos_panel, @min(T_q, if (s.chunk_size == 0) T_q else s.chunk_size));
+
+    const dims: Dims = .{
+        .b = B,
+        .h = H,
+        .t_q = T_q,
+        .t_kv = T_kv,
+        .p = P,
+        .d = D,
+        .w_max = w_max,
+        .panel = @max(@as(usize, 1), panel),
+    };
     const mr: usize = kernels.tuning.mr;
     const nr: usize = kernels.tuning.nr;
     const per_worker: usize = Scratch.perWorkerLen(dims, mr, nr);
@@ -187,7 +277,7 @@ pub fn execRelPosMHATiled(
             const Task = struct {
                 store: tensor_store.TensorStore,
                 s: executable.StepRelPosMHATiled,
-                kernels: relpos_registry.Kernels,
+                kernels: attention_registry.Kernels,
                 dims: Dims,
                 mr: usize,
                 nr: usize,
@@ -252,7 +342,7 @@ pub fn execRelPosMHATiled(
 fn computeSlice(
     store: tensor_store.TensorStore,
     s: executable.StepRelPosMHATiled,
-    kernels: relpos_registry.Kernels,
+    kernels: attention_registry.Kernels,
     dims: Dims,
     b: usize,
     h: usize,
@@ -315,17 +405,6 @@ fn computeSlice(
         }
     }
 
-    // --- ac = (q+u) @ k^T  -> [T_q, T_kv] ---
-    @memset(scratch.ac[0 .. T_q * T_kv], 0.0);
-    kernels.pack_k_block(T_kv, D, kbuf, D, scratch.ktp);
-    kernels.calc_scores_f32(T_q, T_kv, D, scratch.qu, D, kbuf, D, scratch.ktp, scratch.qtp, scratch.ac, T_kv);
-
-    // --- bd = (q+v) @ pos_emb^T -> [T_q, P] ---
-    @memset(scratch.bd[0 .. T_q * P], 0.0);
-    kernels.pack_k_block(P, D, pebuf, D, scratch.ktp);
-    kernels.calc_scores_f32(T_q, P, D, scratch.qv, D, pebuf, D, scratch.ktp, scratch.qtp, scratch.bd, P);
-
-    // --- combine: scores[i,j] = (ac + bd[i, base_i + j]) * scale + mask[i,j] ---
     const scale = s.scale;
     var mask_buf: ?[]align(1) const f32 = null;
     var mask_tok: ?usize = null;
@@ -337,43 +416,82 @@ fn computeSlice(
     }
     defer if (mask_tok) |tok| store.releaseConst(tok);
 
-    i = 0;
-    while (i < T_q) : (i += 1) {
-        const base: usize = (T_q - 1) - i;
-        const ac_row = scratch.ac[i * T_kv .. i * T_kv + T_kv];
-        const bd_row = scratch.bd[i * P + base .. i * P + base + T_kv];
-        if (mask_buf) |mb| {
-            const mrow = mb[i * T_kv .. i * T_kv + T_kv];
-            var j: usize = 0;
-            while (j < T_kv) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale + mrow[j];
-        } else {
-            var j: usize = 0;
-            while (j < T_kv) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale;
-        }
-    }
-
-    // --- softmax over keys (j) ---
-    @memset(scratch.row_max[0..T_q], -std.math.inf(f32));
-    attn_kernels.rowMaxF32(scratch.ac[0 .. T_q * T_kv], T_q, T_kv, scratch.row_max[0..T_q]);
-    @memset(scratch.l[0..T_q], 0.0);
-    attn_kernels.expNormalizeScoresF32(scratch.ac[0 .. T_q * T_kv], T_q, T_kv, scratch.row_max[0..T_q], scratch.l[0..T_q]);
-    i = 0;
-    while (i < T_q) : (i += 1) {
-        const denom = scratch.l[i];
-        if (!(denom > 0.0) or !std.math.isFinite(denom)) return BackendError.InvalidArgument;
-        const inv = 1.0 / denom;
-        const row = scratch.ac[i * T_kv .. i * T_kv + T_kv];
-        var j: usize = 0;
-        while (j < T_kv) : (j += 1) row[j] *= inv;
-    }
-
-    // --- out = scores @ v ---
     const out_t = try store.acquireTileMutLinear(s.out, try tileIndex((try store.meta(s.out)), &coords4));
     defer store.releaseMut(out_t.token);
     const ov = out_t.bufferView();
     if (ov.dtype != .f32) return BackendError.InvalidArgument;
     const obuf: []align(@alignOf(f32)) f32 = @alignCast(simd.bytesAsSliceMutUnaligned(f32, ov.bytes));
     if (obuf.len < T_q * D) return BackendError.InvalidArgument;
-    @memset(obuf[0 .. T_q * D], 0.0);
-    kernels.accumulate_values_f32(T_q, T_kv, D, scratch.ac[0 .. T_q * T_kv], T_kv, vbuf, D, obuf, D);
+
+    // --- row panels: rows sharing a key window, at most `panel` at a time ---
+    var r0: usize = 0;
+    while (r0 < T_q) {
+        const win = keyWindow(dims, s.chunk_size, s.chunk_left, r0);
+        // Extend the panel while the window and the cap allow it. With chunked
+        // attention that stops at the chunk boundary; unchunked, every row shares
+        // [0, T_kv) so it runs to the cap.
+        var r1: usize = r0 + 1;
+        while (r1 < T_q and (r1 - r0) < dims.panel) {
+            const w = keyWindow(dims, s.chunk_size, s.chunk_left, r1);
+            if (w.lo != win.lo or w.hi != win.hi) break;
+            r1 += 1;
+        }
+        const rows: usize = r1 - r0;
+        const n_k: usize = win.hi - win.lo;
+        if (n_k == 0 or n_k > dims.w_max) return BackendError.InvalidArgument;
+
+        // --- ac = (q+u) @ K[win]^T -> [rows, n_k] ---
+        const ac = scratch.ac[0 .. rows * n_k];
+        @memset(ac, 0.0);
+        const k_panel = kbuf[win.lo * D ..];
+        addScores(kernels, rows, n_k, D, scratch.qu[r0 * D ..], D, k_panel, D, scratch.ktp, scratch.qtp, ac, n_k);
+
+        // --- bd = (q+v) @ pos_emb[band]^T -> [rows, n_k + rows - 1] ---
+        // Row r reads pos_emb[base_r + win.lo ..][0..n_k] with base_r = (T_q-1) - r,
+        // so the panel's rows span one contiguous band starting at the LAST row's base.
+        const band: usize = n_k + rows - 1;
+        const pe_lo: usize = ((T_q - 1) - (r1 - 1)) + win.lo;
+        if (pe_lo + band > P) return BackendError.InvalidArgument;
+        const bd = scratch.bd[0 .. rows * band];
+        @memset(bd, 0.0);
+        const pe_panel = pebuf[pe_lo * D ..];
+        addScores(kernels, rows, band, D, scratch.qv[r0 * D ..], D, pe_panel, D, scratch.ktp, scratch.qtp, bd, band);
+
+        // --- combine: scores[i,j] = (ac + bd[i, shift_i + j]) * scale + mask ---
+        var ri: usize = 0;
+        while (ri < rows) : (ri += 1) {
+            const shift: usize = (r1 - 1) - (r0 + ri); // base_{r0+ri} - base_{r1-1}
+            const ac_row = ac[ri * n_k ..][0..n_k];
+            const bd_row = bd[ri * band + shift ..][0..n_k];
+            if (mask_buf) |mb| {
+                const mrow = mb[(r0 + ri) * T_kv + win.lo ..][0..n_k];
+                var j: usize = 0;
+                while (j < n_k) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale + mrow[j];
+            } else {
+                var j: usize = 0;
+                while (j < n_k) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale;
+            }
+        }
+
+        // --- softmax over the window ---
+        @memset(scratch.row_max[0..rows], -std.math.inf(f32));
+        kernels.row_max_f32(ac, rows, n_k, scratch.row_max[0..rows]);
+        @memset(scratch.l[0..rows], 0.0);
+        kernels.exp_normalize_scores_f32(ac, rows, n_k, scratch.row_max[0..rows], scratch.l[0..rows]);
+        ri = 0;
+        while (ri < rows) : (ri += 1) {
+            const denom = scratch.l[ri];
+            if (!(denom > 0.0) or !std.math.isFinite(denom)) return BackendError.InvalidArgument;
+            const inv = 1.0 / denom;
+            const row = ac[ri * n_k ..][0..n_k];
+            var j: usize = 0;
+            while (j < n_k) : (j += 1) row[j] *= inv;
+        }
+
+        // --- out[panel] = scores @ V[win] ---
+        @memset(obuf[r0 * D .. r1 * D], 0.0);
+        kernels.accumulate_values_f32(rows, n_k, D, ac, n_k, vbuf[win.lo * D ..], D, obuf[r0 * D ..], D);
+
+        r0 = r1;
+    }
 }

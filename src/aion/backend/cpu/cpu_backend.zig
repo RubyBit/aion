@@ -12,7 +12,6 @@ const cpu_target = @import("registry/cpu_target.zig");
 const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
-const relpos_mha_registry = @import("registry/relpos_mha_registry.zig");
 const conv1d_registry = @import("registry/conv1d_registry.zig");
 const conv2d_registry = @import("registry/conv2d_registry.zig");
 const fft_registry = @import("registry/fft_registry.zig");
@@ -25,7 +24,6 @@ const exec_softmax = @import("exec/softmax.zig");
 const exec_conv = @import("exec/conv.zig");
 const exec_layernorm = @import("exec/layernorm.zig");
 const exec_attention = @import("exec/attention.zig");
-const exec_attention_cached = @import("exec/attention_cached.zig");
 const exec_relpos_mha = @import("exec/relpos_mha.zig");
 const exec_argmax = @import("exec/argmax.zig");
 const exec_scatter = @import("exec/scatter.zig");
@@ -93,7 +91,7 @@ pub const CpuBackend = struct {
     matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
 
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
-    relpos_mha_kernels: relpos_mha_registry.Kernels = relpos_mha_registry.candidates[0].kernels,
+    relpos_mha_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
 
     depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
     depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
@@ -124,7 +122,6 @@ pub const CpuBackend = struct {
         /// Total threads to use including the calling thread.
         /// Set to 1 to disable parallelism (default).
         thread_count: usize = 1,
-
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -181,7 +178,7 @@ pub const CpuBackend = struct {
             self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
             self.matvec = matvec_registry.selectForTarget(target).kernels;
             self.attention_kernels = attention_registry.selectForTarget(target).kernels;
-            self.relpos_mha_kernels = relpos_mha_registry.selectForTarget(target).kernels;
+            self.relpos_mha_kernels = attention_registry.selectForTarget(target).kernels;
             self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
             self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
             self.fft = fft_registry.selectForTarget(target).kernels;
@@ -412,11 +409,6 @@ pub const CpuBackend = struct {
                 try ElemwiseExec.execGeluMulTiled(pool_ptr, self.thread_count, s, store);
             },
 
-            .BroadcastLastDimBinaryTiled => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try ElemwiseExec.execBroadcastLastDimBinaryTiled(pool_ptr, self.thread_count, s, store);
-            },
-
             .UnaryTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_unary.execUnaryTiled(pool_ptr, self.thread_count, s, store);
@@ -467,17 +459,7 @@ pub const CpuBackend = struct {
 
             .AttentionTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_attention.execAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
-            },
-
-            .MultiHeadAttentionTiled => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_attention.execMultiHeadAttentionTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
-            },
-
-            .MultiHeadAttentionCachedTiled => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_attention_cached.execMultiHeadAttentionCachedTiled(pool_ptr, self.thread_count, self.attention_kernels, s, store);
+                try exec_attention.execAttentionTiled(self.allocator, pool_ptr, self.thread_count, self.attention_kernels, s, store);
             },
 
             .RelPosMHATiled => |s| {
@@ -585,6 +567,10 @@ pub const CpuBackend = struct {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_gather.execGatherRowsTiled(pool_ptr, self.thread_count, s, store);
             },
+            .GatherTiled => |s| {
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                try exec_gather.execGatherTiled(pool_ptr, self.thread_count, s, store);
+            },
 
             .RoPE1DTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
@@ -644,7 +630,6 @@ pub const CpuBackend = struct {
             if (cpu_track) |track| p.recordSpan(track, .phase, "program", run_t0, profile.nowNs());
             p.report();
         }
-
     }
 
     fn kindImpl(_: *anyopaque) BackendKind {

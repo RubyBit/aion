@@ -321,7 +321,7 @@ def _relpos(heads=2, head_dim=2, time=3, seed=0):
     bias = {n: rng.standard_normal((heads, head_dim)).astype(np.float32) for n in "uv"}
     layer = nn.RelPosSelfAttention(
         w["q"], w["k"], w["v"], w["o"], pos_emb, bias["u"], bias["v"],
-        heads=heads, scale=head_dim ** -0.5, name="self_attn",
+        scale=head_dim ** -0.5, name="self_attn",
     )
     return layer, d
 
@@ -353,11 +353,8 @@ def test_relpos_self_attention_names_its_parameters(b):
         assert b.has_param_named(f"self_attn/{name}"), name
 
 
-def test_relpos_self_attention_head_dim_must_agree_with_pos_emb():
-    rng = np.random.default_rng(0)
-    w = rng.standard_normal((4, 4)).astype(np.float32)
-    bias = rng.standard_normal((2, 2)).astype(np.float32)
-    # 3 heads declared, but the table carries 2.
-    with pytest.raises(ValueError, match="pos_emb has 2 heads"):
-        nn.RelPosSelfAttention(w, w, w, w, rng.standard_normal((2, 5, 2)).astype(np.float32),
-                               bias, bias, heads=3, scale=1.0)
+def test_relpos_self_attention_infers_head_geometry_from_pos_emb():
+    layer, _ = _relpos(heads=3, head_dim=4)
+
+    assert layer.heads == 3
+    assert layer.head_dim == 4

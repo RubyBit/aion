@@ -7,7 +7,8 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aion"
+# Distribution name on PyPI; the import name is `aion`.
+name = "aion-engine"
 description = "Python bindings for the Aion runtime (via C ABI)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,16 +25,19 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.urls]
+Homepage = "https://github.com/RubyBit/aion"
+Repository = "https://github.com/RubyBit/aion"
+
 [project.optional-dependencies]
 numpy = ["numpy>=1.26"]
-# GPU support: the published `aion` wheels already contain the GPU backend (the
-# seam is compiled in), but link NO wgpu — it is loaded at runtime via dlopen.
-# `pip install aion[gpu]` pulls the `aion-wgpu` companion, which ships just the
-# wgpu-native runtime library; `aion`'s package __init__ then points the loader
-# at it. The marker skips the one target wgpu-native ships no prebuilt for
-# (linux/aarch64), where `aion[gpu]` stays CPU-only rather than failing to
-# resolve. `aion-wgpu` is versioned after the wgpu-native release it wraps.
-gpu = ["aion-wgpu>=29.0.4,<30; sys_platform != 'linux' or platform_machine != 'aarch64'"]
+# GPU support: the published `aion-engine` wheels already contain the GPU backend
+# (the seam is compiled in), but link NO wgpu — it is loaded at runtime via dlopen.
+# `pip install aion-engine[gpu]` pulls the `aion-wgpu` companion, which ships just
+# the wgpu-native runtime library; `aion`'s package __init__ then points the loader
+# at it. A companion wheel is published for every platform the runtime wheels
+# target. `aion-wgpu` is versioned after the wgpu-native release it wraps.
+gpu = ["aion-wgpu>=29.0.4,<30"]
 
 # PEP 735 dependency groups: local dev/test environments, not package extras.
 # `uv sync` installs the `dev` group by default; use `--group test` for just the
@@ -44,7 +48,7 @@ test = ["pytest>=9", "numpy>=1.26"]
 # Type-check only: PEP 696 TypeVar defaults are not in 3.12's `typing`.
 typing = ["typing-extensions>=4.12"]
 dev = [
-  "aion-wgpu>=29.0.4,<30; sys_platform != 'linux' or platform_machine != 'aarch64'",
+  "aion-wgpu>=29.0.4,<30",
   "pyright>=1.1",
   "typing-extensions>=4.12",  # PEP 696 TypeVar defaults, for type-checking only
   "tokenizers>=0.23.1",
@@ -62,10 +66,10 @@ dev = [
 # `gpu = true` compiles the wgpu-native GPU backend (the "seam") into the extension.
 # No wgpu is linked or bundled — it is loaded at runtime via dlopen — so this only
 # controls whether GPU code is present; the wgpu runtime itself comes from the
-# `aion-wgpu` package (`aion[gpu]`). Under uv the build cache is env-blind, so this
+# `aion-wgpu` package (`aion-engine[gpu]`). Under uv the build cache is env-blind, so this
 # pyproject switch — not just `AION_PY_GPU` — is what reliably (re)builds with the
-# seam. `AION_PY_GPU` still overrides it (set `0` for a smaller CPU-only extension,
-# e.g. the linux/aarch64 wheel that has no wgpu prebuilt).
+# seam. `AION_PY_GPU` still overrides it (set `0` for a smaller CPU-only
+# extension, or when building for a target with no wgpu-native prebuilt).
 [tool.aion]
 gpu = true
 
@@ -135,8 +139,8 @@ reportUnnecessaryTypeIgnoreComment = "warning"
 # ── Wheel building (see .github/workflows/publish.yml) ──────────────────────
 # Each wheel embeds the statically-linked Aion runtime + the GPU seam (which
 # loads wgpu-native at runtime via dlopen — nothing wgpu is linked or bundled).
-# On targets with no wgpu-native prebuilt (linux/aarch64), build.zig degrades to
-# a CPU-only build automatically, and the `aion[gpu]` extra skips `aion-wgpu`.
+# Every published target has a wgpu-native prebuilt pinned in build.zig.zon; on a
+# target that doesn't, build.zig degrades to a CPU-only build automatically.
 [tool.cibuildwheel]
 build = "cp312-* cp313-*"
 skip = "*-musllinux_*" # musl would need a separate in-container Zig; manylinux only.
@@ -146,7 +150,7 @@ build-frontend = "build"
 test-command = "python -c \"import aion; print('aion', aion.__version__)\""
 
 [tool.cibuildwheel.environment]
-AION_PY_GPU = "1"          # compile the GPU seam where a wgpu prebuilt exists
+AION_PY_GPU = "1"          # compile the GPU seam (all published targets have a prebuilt)
 AION_PY_MULTIVERSION = "1" # portable CPU: runtime CPUID dispatch, one wheel fits all
 AION_PY_CPU = "baseline"   # conservative ISA floor for the main module
 

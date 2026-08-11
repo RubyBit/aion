@@ -48,6 +48,11 @@
             .hash = "N-V-__8AALybrgOJ6ZwQeP_99RjvuyH-ue7AGJKrjWlG8kqn",
             .lazy = true,
         },
+        .wgpu_linux_aarch64 = .{
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-linux-aarch64-release.zip",
+            .hash = "N-V-__8AAFzZrAPHcNG4Cq6WLAOtgeHRpTbI9-VEdeDTu7Te",
+            .lazy = true,
+        },
         .wgpu_macos_aarch64 = .{
             .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-macos-aarch64-release.zip",
             .hash = "N-V-__8AAPgZfQL75QCbrZoUhXf7SdaHZMpJLDkpje4dJK3R",

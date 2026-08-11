@@ -22,7 +22,7 @@ __pycache__/
 
 
 **/build
-**/aion.egg-info
+**/aion_engine.egg-info
 bindings/python/src/Release
 
 zig-pkg

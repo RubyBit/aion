@@ -21,7 +21,7 @@ class ZigBuildArtifacts:
     GPU builds (`AION_PY_GPU=1`) add nothing here: wgpu-native is neither linked
     nor bundled — the archive resolves it at runtime via dlopen (see
     `src/aion/backend/gpu/wgpu.zig`). The wgpu runtime ships in the separate
-    `aion-wgpu` package, which `aion[gpu]` pulls in; the loader finds it via the
+    `aion-wgpu` package, which `aion-engine[gpu]` pulls in; the loader finds it via the
     `AION_WGPU_LIB` path that `aion`'s package `__init__` sets from it.
     """
 

@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
-name = "aion"
+name = "aion-engine"
 source = { editable = "." }
 dependencies = [
     { name = "cffi" },
@@ -11,7 +11,7 @@ dependencies = [
 
 [package.optional-dependencies]
 gpu = [
-    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "aion-wgpu" },
 ]
 numpy = [
     { name = "numpy" },
@@ -19,7 +19,7 @@ numpy = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "aion-wgpu" },
     { name = "numpy" },
     { name = "pyright" },
     { name = "pytest" },
@@ -42,7 +42,7 @@ typing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aion-wgpu", marker = "(platform_machine != 'aarch64' and extra == 'gpu') or (sys_platform != 'linux' and extra == 'gpu')", directory = "aion-wgpu" },
+    { name = "aion-wgpu", marker = "extra == 'gpu'", directory = "aion-wgpu" },
     { name = "cffi", specifier = ">=2.0" },
     { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.26" },
 ]
@@ -50,7 +50,7 @@ provides-extras = ["numpy", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "aion-wgpu", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'", directory = "aion-wgpu" },
+    { name = "aion-wgpu", directory = "aion-wgpu" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyright", specifier = ">=1.1" },
     { name = "pytest", specifier = ">=9" },

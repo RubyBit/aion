@@ -27,7 +27,7 @@ def _require_numpy():
     try:
         import numpy as np
     except Exception as e:  # pragma: no cover
-        raise ImportError("NumPy is required; install aion[numpy]") from e
+        raise ImportError("NumPy is required; install aion-engine[numpy]") from e
     return np
 
 

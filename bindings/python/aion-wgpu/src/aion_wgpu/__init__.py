@@ -3,7 +3,7 @@
 
 This package ships a single native library and exposes its path. `aion` imports
 this lazily and hands the path to its native loader (via ``AION_WGPU_LIB``); you
-normally never call this yourself. Install it with ``pip install aion[gpu]``.
+normally never call this yourself. Install it with ``pip install aion-engine[gpu]``.
 """
 from __future__ import annotations
 

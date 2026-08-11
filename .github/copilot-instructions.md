@@ -26,4 +26,4 @@ Utilizing `zig build bench` we can benchmark the libraries performance ensuring 
 When working with the Python bindings, run commands from `bindings/python` with
 `uv run`. The project's uv cache key includes the Zig core and build files, so
 the editable native extension is rebuilt automatically after Zig changes. Use
-`uv sync --reinstall-package aion` only to force a rebuild.
+`uv sync --reinstall-package aion-engine` only to force a rebuild.

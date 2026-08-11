@@ -1,15 +1,15 @@
-# Build and publish the `aion` and `aion-wgpu` wheels to PyPI via Trusted
-# Publishing (OIDC — no stored tokens). See bindings/python/README.md,
-# "Releasing", for the exact release steps and the one-time PyPI setup.
+# Build and publish the `aion-engine` and `aion-wgpu` wheels to PyPI via Trusted
+# Publishing (OIDC — no stored tokens).
 #
 #   push tag v*        -> build everything, publish to PyPI
 #   workflow_dispatch  -> choose testpypi (default) or pypi
 #
 # Two distributions are published, both built natively on each host (no
 # cross-compiling):
-#   - aion        : the runtime wheels (per OS/arch/Python), GPU seam included.
+#   - aion-engine : the runtime wheels (per OS/arch/Python), GPU seam included.
+#                   Distribution name; the import name is `aion`.
 #   - aion-wgpu   : the wgpu-native runtime, one py3-none-<platform> wheel per
-#                   host. `aion[gpu]` pulls it in.
+#                   host. `aion-engine[gpu]` pulls it in.
 # Both must have a Trusted Publisher registered on PyPI for this repo, this
 # workflow file, and the selected environment (`pypi` / `testpypi`).
 name: publish
@@ -69,9 +69,9 @@ jobs:
           CIBW_BUILD_VERBOSITY: "1"
 
       # The GPU-runtime companion, built natively for this host and dropped into
-      # the same wheelhouse. Skipped on linux/aarch64 (no wgpu-native prebuilt).
+      # the same wheelhouse — one per matrix target, so every published runtime
+      # wheel has a matching wgpu runtime.
       - name: Build aion-wgpu companion wheel
-        if: matrix.os != 'ubuntu-24.04-arm'
         shell: bash
         run: |
           python -m pip install --upgrade build
@@ -118,6 +118,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # `aion-wgpu` rarely changes version; skip re-uploading it on aion-only
-          # releases rather than failing on a duplicate.
+          # `aion-wgpu` rarely changes version; skip re-uploading it on
+          # aion-engine-only releases rather than failing on a duplicate.
           skip-existing: true

@@ -11,7 +11,7 @@
    ` :          \:
     `<_____A_____>
 
-      A I O N
+      A I O N (v0.0.1)
 ```
 
 The tensor manipulation library to rule them all.
@@ -30,7 +30,11 @@ You can install the library through pip with the following commands:
 
 ```bash
 pip install aion-engine
+pip install aion-engine[gpu]
 ```
+
+#### AION FILE FORMAT
+This is a moving target at this point and I don't want to lock in bad decisions on graph IR and metadata. As such converted models to aion format right now require a versions of the library which support the same version as it. When I feel satisfied on where it is, backwards compatability will be added to the library and the file format will be locked in. This mostly concerns destructive changes, as additive changes (such as new graph ops) won't push the version of the format. The current version of the aion file format is v10.
 
 #### LICENSE
  This project is dual-licensed under the terms of the Eclipse Public License v2.0 (EPL-2.0) or (at your option) the GNU General Public License v2.0 or later (GPL-2.0-or-later). See [LICENSE](LICENSE) for details. The bindings under the `bindings` directory are licensed under the Apache License 2.0. See [bindings/LICENSE](bindings/LICENSE) for details.

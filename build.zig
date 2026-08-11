@@ -568,7 +568,11 @@ fn wgpuDependency(b: *std.Build, target: std.Build.ResolvedTarget) ?WgpuDep {
     const t = target.result;
     const name: ?[]const u8 = switch (t.os.tag) {
         .windows => if (t.cpu.arch == .x86_64) "wgpu_windows_x86_64" else null,
-        .linux => if (t.cpu.arch == .x86_64) "wgpu_linux_x86_64" else null,
+        .linux => switch (t.cpu.arch) {
+            .x86_64 => "wgpu_linux_x86_64",
+            .aarch64 => "wgpu_linux_aarch64",
+            else => null,
+        },
         .macos => switch (t.cpu.arch) {
             .aarch64 => "wgpu_macos_aarch64",
             .x86_64 => "wgpu_macos_x86_64",

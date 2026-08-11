@@ -1,33 +1,25 @@
 # aion-wgpu
 
-Prebuilt [wgpu-native](https://github.com/gfx-rs/wgpu-native) runtime library for
-the **optional GPU backend** of [`aion`](https://pypi.org/project/aion/).
-
-You almost never install this directly — it is pulled in by:
+The prebuilt [wgpu-native](https://github.com/gfx-rs/wgpu-native) runtime for the
+optional GPU backend of [`aion-engine`](https://pypi.org/project/aion-engine/).
+You don't install it directly:
 
 ```bash
-pip install aion[gpu]
+pip install aion-engine[gpu]
 ```
 
-## What it is
+`aion-engine`'s wheels already contain the GPU backend code but link **no** wgpu:
+the library is loaded at runtime via `dlopen`. This package is the delivery
+vehicle — one platform-specific shared library (`wgpu_native.dll` /
+`libwgpu_native.so` / `libwgpu_native.dylib`) plus a `library_path()` helper that
+`aion` calls on import to point its loader at it.
 
-`aion`'s published wheels already contain the GPU backend code, but link **no**
-wgpu: the wgpu-native library is loaded at runtime via `dlopen`. This package is
-the delivery vehicle for that library — a single platform-specific shared object
-(`wgpu_native.dll` / `libwgpu_native.so` / `libwgpu_native.dylib`) and a
-`library_path()` helper. On import, `aion` finds it and points its loader at it.
-
-Keeping the (multi-MiB) runtime in a separate package means the default
-`pip install aion` stays small and CPU-only, and works on every platform —
-including `linux/aarch64`, where no wgpu-native prebuilt exists and `aion[gpu]`
-therefore stays CPU-only.
-
-## Versioning
+Keeping the multi-MiB runtime in its own package keeps `pip install aion-engine`
+small and CPU-only by default. One wheel is published per platform the runtime
+wheels target: Windows x64, Linux x86_64/aarch64, macOS arm64/x86_64.
 
 The version tracks the wgpu-native release it wraps (pinned in the repo's
-`build.zig.zon`, the single source of truth for the library's URL and hash).
+`build.zig.zon`, the single source of truth for that URL and hash).
 
-## Licensing
-
-The packaging code here is Apache-2.0. The bundled `wgpu_native` library is
-distributed by the wgpu project under its own terms (Apache-2.0 OR MIT).
+Licensing: the packaging code here is Apache-2.0; the bundled `wgpu_native`
+library ships under the wgpu project's own terms (Apache-2.0 OR MIT).

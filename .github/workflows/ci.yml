@@ -1,6 +1,6 @@
 # CPU correctness across platforms: Zig test suite + Python bindings build + pytest.
-# GPU stays out of CI for now (no adapters on hosted runners; wgpu prebuilts do not
-# cover linux-aarch64) — GPU tests self-skip locally via BackendUnavailable.
+# GPU stays out of CI for now (no adapters on hosted runners) — GPU tests
+# self-skip locally via BackendUnavailable.
 name: ci
 
 on:

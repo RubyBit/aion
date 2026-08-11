@@ -34,7 +34,7 @@ def missing_wgpu_runtime_hint() -> str | None:
         )
     return (
         "The optional wgpu-native runtime is not installed. Run `uv sync` in "
-        "bindings/python (development checkout) or install `aion[gpu]`."
+        "bindings/python (development checkout) or install `aion-engine[gpu]`."
     )
 
 

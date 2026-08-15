@@ -35,7 +35,7 @@ pub const LayerName = layer_mod.LayerName;
 pub fn Sequential(comptime Mods: type) type {
     const info = @typeInfo(Mods);
     if (info != .@"struct") @compileError("nn.Sequential expects a struct of layers");
-    if (info.@"struct".fields.len == 0) @compileError("nn.Sequential needs at least one layer");
+    if (info.@"struct".field_names.len == 0) @compileError("nn.Sequential needs at least one layer");
 
     return struct {
         mods: Mods,
@@ -53,8 +53,8 @@ pub fn Sequential(comptime Mods: type) type {
 
         pub fn forward(self: Self, bld: *Builder, x: TensorRef) Builder.Error!TensorRef {
             var cur: TensorRef = x;
-            inline for (info.@"struct".fields) |field| {
-                cur = try @field(self.mods, field.name).forward(bld, cur);
+            inline for (info.@"struct".field_names) |field_name| {
+                cur = try @field(self.mods, field_name).forward(bld, cur);
             }
             return cur;
         }

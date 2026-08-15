@@ -256,6 +256,64 @@ pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store
                         const ti_m0: usize = tile_idx0 - ti_n * tc0;
                         const ti_m_end: usize = group_end - ti_n * tc0;
 
+                        // A decode matvec owns one output-N tile on this worker.
+                        // Stream every q8 K tile into one SIMD accumulator so the
+                        // storage tiling does not force per-tile pack/reduce/write
+                        // overhead. The packed path remains available for GEMM and
+                        // isolated small tiles where packing can be amortized.
+                        if (is_matvec and t.b_dtype == .q8_0 and tc0 == 1 and k_tiles > 1) {
+                            var c_tile = t.store.acquireTileMut(t.s.c, 0, ti_n) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseMut(c_tile.token);
+                            const c_view = c_tile.bufferView();
+                            const n_tile: usize = c_view.layout.shape[1];
+                            const acc_reserve = n_tile * 64;
+                            const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[1] / 32) * 36, 32);
+
+                            var fused_ti_k: usize = 0;
+                            while (fused_ti_k < k_tiles) : (fused_ti_k += 1) {
+                                const a_tile = t.store.acquireTileConst(t.s.a, 0, fused_ti_k) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(a_tile.token);
+                                const b_tile = t.store.acquireTileConst(t.s.b, fused_ti_k, ti_n) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(b_tile.token);
+
+                                const a_view = a_tile.bufferView();
+                                const b_view = b_tile.bufferView();
+                                const params: MatMulParams = .{
+                                    .m = 1,
+                                    .n = n_tile,
+                                    .k = a_view.layout.shape[1],
+                                    .alpha = t.s.alpha,
+                                    .beta = t.s.beta,
+                                };
+                                t.matvec.matvec_q8_0_kmajor_accumulate(
+                                    params,
+                                    c_view.bytes,
+                                    a_view.bytes,
+                                    b_view.bytes,
+                                    t.scratch[tid][0..acc_reserve],
+                                    @alignCast(t.scratch[tid][acc_reserve + fused_ti_k * prep_stride ..][0..prep_stride]),
+                                    true,
+                                    fused_ti_k == 0,
+                                    fused_ti_k + 1 == k_tiles,
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+
+                            i = group_end;
+                            continue;
+                        }
+
                         var ti_k: usize = 0;
                         while (ti_k < k_tiles) : (ti_k += 1) {
                             if (t.stop.load(.acquire)) return;
@@ -802,7 +860,95 @@ fn execMatMulTiledBatched(
                     const rank_local: usize = @as(usize, t.c_meta.rank);
                     const k_tiles_local: usize = t.a_meta.tile_counts[rank_local - 1];
 
+                    // Decode weights are physically tile-major with adjacent N
+                    // tiles contiguous inside each K wave. Process a worker's
+                    // adjacent output range K-first so its reads follow that
+                    // layout, retaining one full-K accumulator per output tile.
+                    if (rank_local == 3 and t.b_dtype == .q8_0 and t.a_meta.shape[1] == 1 and
+                        t.c_meta.tile_counts[0] == 1 and t.c_meta.tile_counts[1] == 1 and
+                        k_tiles_local > 1)
+                    {
+                        const range_count = end - start;
+                        const max_n_tile = t.c_meta.tile_shape[2];
+                        const acc_stride = std.mem.alignForward(usize, max_n_tile * 32, 32);
+                        const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[2] / 32) * 36, 32);
+                        const prep_base = range_count * acc_stride;
+                        const scratch_need = prep_base + k_tiles_local * prep_stride;
+                        if (scratch_need > t.scratch[tid].len) {
+                            t.fail(BackendError.InvalidArgument);
+                            return;
+                        }
+
+                        var ti_k: usize = 0;
+                        while (ti_k < k_tiles_local) : (ti_k += 1) {
+                            const a_tile_index = tensor_store.projectTileIndex(t.a_meta, &.{0}, &.{ 0, ti_k }, null) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            const a_tile = t.store.acquireTileConstLinear(t.s.a, a_tile_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseConst(a_tile.token);
+                            const a_view = a_tile.bufferView();
+
+                            var local: usize = 0;
+                            while (local < range_count) : (local += 1) {
+                                const tile_index = start + local;
+                                const ti_n = tile_index;
+                                const b_tile_index = tensor_store.projectTileIndex(t.b_meta, &.{0}, &.{ ti_k, ti_n }, null) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                const b_tile = t.store.acquireTileConstLinear(t.s.b, b_tile_index) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(b_tile.token);
+                                const b_view = b_tile.bufferView();
+                                const n_tile = b_view.layout.shape[b_view.layout.rank - 1];
+                                const is_last_k = ti_k + 1 == k_tiles_local;
+
+                                var c_bytes: []u8 = &.{};
+                                var c_token: ?usize = null;
+                                defer if (c_token) |token| t.store.releaseMut(token);
+                                if (is_last_k) {
+                                    var c_tile = t.store.acquireTileMutLinear(t.s.c, tile_index) catch |e| {
+                                        t.fail(e);
+                                        return;
+                                    };
+                                    c_token = c_tile.token;
+                                    c_bytes = c_tile.bufferView().bytes;
+                                }
+
+                                const params: MatMulParams = .{
+                                    .m = 1,
+                                    .n = n_tile,
+                                    .k = a_view.layout.shape[2],
+                                    .alpha = t.s.alpha,
+                                    .beta = t.s.beta,
+                                };
+                                t.matvec.matvec_q8_0_kmajor_accumulate(
+                                    params,
+                                    c_bytes,
+                                    a_view.bytes,
+                                    b_view.bytes,
+                                    @alignCast(t.scratch[tid][local * acc_stride ..][0..acc_stride]),
+                                    @alignCast(t.scratch[tid][prep_base + ti_k * prep_stride ..][0..prep_stride]),
+                                    local == 0,
+                                    ti_k == 0,
+                                    is_last_k,
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+                        }
+                        return;
+                    }
+
                     var coords_buf: [8]usize = undefined;
+                    var cached_a_tile0: ?usize = null;
 
                     var tile_index: usize = start;
                     while (tile_index < end) : (tile_index += 1) {
@@ -825,6 +971,64 @@ fn execMatMulTiledBatched(
                         const c_view0 = c_tile.bufferView();
                         const m_tile: usize = c_view0.layout.shape[rank_local - 2];
                         const n_tile: usize = c_view0.layout.shape[rank_local - 1];
+
+                        if (t.b_dtype == .q8_0 and m_tile == 1 and k_tiles_local > 1) {
+                            const batch: []const usize = coords[0 .. rank_local - 2];
+                            const a_tile_index0: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, 0 }, null) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            const prepare_a = cached_a_tile0 == null or cached_a_tile0.? != a_tile_index0;
+                            const acc_reserve = n_tile * 64;
+                            const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[rank_local - 1] / 32) * 36, 32);
+                            var fused_ti_k: usize = 0;
+                            while (fused_ti_k < k_tiles_local) : (fused_ti_k += 1) {
+                                const a_tile_index: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, fused_ti_k }, null) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                const b_tile_index: usize = tensor_store.projectTileIndex(t.b_meta, batch, &.{ fused_ti_k, ti_n }, null) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+
+                                const a_tile = t.store.acquireTileConstLinear(t.s.a, a_tile_index) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(a_tile.token);
+                                const b_tile = t.store.acquireTileConstLinear(t.s.b, b_tile_index) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(b_tile.token);
+                                const a_view = a_tile.bufferView();
+                                const b_view = b_tile.bufferView();
+                                const params: MatMulParams = .{
+                                    .m = 1,
+                                    .n = n_tile,
+                                    .k = a_view.layout.shape[rank_local - 1],
+                                    .alpha = t.s.alpha,
+                                    .beta = t.s.beta,
+                                };
+                                t.matvec.matvec_q8_0_kmajor_accumulate(
+                                    params,
+                                    c_view0.bytes,
+                                    a_view.bytes,
+                                    b_view.bytes,
+                                    t.scratch[tid][0..acc_reserve],
+                                    @alignCast(t.scratch[tid][acc_reserve + fused_ti_k * prep_stride ..][0..prep_stride]),
+                                    prepare_a,
+                                    fused_ti_k == 0,
+                                    fused_ti_k + 1 == k_tiles_local,
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                            }
+                            cached_a_tile0 = a_tile_index0;
+                            continue;
+                        }
 
                         var ti_k: usize = 0;
                         while (ti_k < k_tiles_local) : (ti_k += 1) {
@@ -1174,9 +1378,9 @@ fn execMatMulTiledBatchedF16Grouped(
                     const n_tiles_local: usize = t.c_meta.tile_counts[n_dim_local];
                     const k_tiles_local: usize = t.a_meta.tile_counts[n_dim_local];
 
-                    var prefix_coords: [8]usize = .{0} ** 8;
-                    var c_coords: [8]usize = .{0} ** 8;
-                    var a_coords: [8]usize = .{0} ** 8;
+                    var prefix_coords: [8]usize = @splat(0);
+                    var c_coords: [8]usize = @splat(0);
+                    var a_coords: [8]usize = @splat(0);
 
                     var g: usize = start;
                     while (g < end) : (g += 1) {
@@ -1297,9 +1501,9 @@ fn execMatMulTiledBatchedF16Grouped(
         }
     }
 
-    var prefix_coords: [8]usize = .{0} ** 8;
-    var c_coords: [8]usize = .{0} ** 8;
-    var a_coords: [8]usize = .{0} ** 8;
+    var prefix_coords: [8]usize = @splat(0);
+    var c_coords: [8]usize = @splat(0);
+    var a_coords: [8]usize = @splat(0);
 
     var prefix_idx: usize = 0;
     while (prefix_idx < prefix_total) : (prefix_idx += 1) {

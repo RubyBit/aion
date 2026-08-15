@@ -53,7 +53,7 @@ pub const AionContext = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     ctx: api.Context = undefined,
 
-    last_err_buf: [512]u8 = .{0} ** 512,
+    last_err_buf: [512]u8 = @splat(0),
     last_err_len: usize = 0,
 
     fn init(thread_count: usize, gpus: []const api.GpuOptions) !AionContext {

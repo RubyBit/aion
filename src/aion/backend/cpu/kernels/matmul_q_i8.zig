@@ -133,7 +133,7 @@ inline fn scaleF16BitsToF32(bits: u16) f32 {
 
 /// Quantize one K block (32 f32) to signed i8 in [-127,127]; returns the block scale.
 /// (The x86 unsigned×signed dot re-biases to u8 internally; SDOT uses these directly.)
-inline fn quantizeABlock(a_blk: [*]align(1) const f32, out_i8: [*]i8) f32 {
+pub inline fn quantizeABlock(a_blk: [*]align(1) const f32, out_i8: [*]i8) f32 {
     var amax: f32 = 0.0;
     var t: usize = 0;
     while (t < Q8_0_BLOCK_ELEMS) : (t += 1) amax = @max(amax, @abs(a_blk[t]));

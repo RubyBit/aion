@@ -70,7 +70,7 @@ pub fn execRFFT(
     defer allocator.free(scratch);
 
     // Packed strides over the leading (frame) dims for linear<->coord decoding.
-    var lead_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var lead_strides: [MAX_RANK]usize = @splat(0);
     if (leading_rank > 0) {
         var stride: usize = 1;
         var dd: usize = leading_rank;
@@ -85,7 +85,7 @@ pub fn execRFFT(
     var out_cache: exec_utils.TileCacheMutND = .{};
     defer out_cache.deinit(store);
 
-    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var coords: [MAX_RANK]usize = @splat(0);
 
     var group_start: usize = 0;
     while (group_start < frames) : (group_start += lanes) {

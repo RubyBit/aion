@@ -795,7 +795,7 @@ fn buildGatherDeviceIdx(comptime multi_tile: bool) fn (std.mem.Allocator, *Stora
             const table_tile: [2]usize = if (multi_tile) .{ 16, 32 } else .{ 64, 32 };
             const table = try makeInput(&g, mgr, &.{ 64, 32 }, &table_tile, 41);
             const base = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &GATHER_IDX);
-            const zero = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &[_]i32{0} ** 10);
+            const zero = try makeInputI32(&g, mgr, &.{ 2, 5 }, &.{ 2, 5 }, &@as([10]i32, @splat(0)));
             const idx = try g.addElemwiseBinary(.add, base, zero); // device-computed index
             const out = try g.addGather(table, idx, 0, 0);
             return finishProg(alloc, &g, mgr, out);

@@ -1809,12 +1809,17 @@ fn runDecodeSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOpti
     const tn_sweep = [_]usize{ 64, 256, 1024 };
 
     for (shapes) |s| {
+        if (opts.op_filter) |filter| {
+            if (!std.mem.eql(u8, filter, s.label)) continue;
+        }
         try benchDecodeMatMul(allocator, rnd, opts.iters, s.k, s.n, s.label, be);
         for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, s.k, s.n, tn, s.label, be);
         std.debug.print("\n", .{});
     }
     // Tied-logits projection: NT only (the real model path), huge N.
-    for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, 1536, 262144, tn, "logits_tied", be);
+    if (opts.op_filter == null or std.mem.eql(u8, opts.op_filter.?, "logits_tied")) {
+        for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, 1536, 262144, tn, "logits_tied", be);
+    }
 }
 
 fn makeCpuBackend(allocator: std.mem.Allocator, threads: usize) !CpuBackend {

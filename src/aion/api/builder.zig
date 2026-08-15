@@ -862,7 +862,7 @@ pub const Builder = struct {
 
     pub fn concat(self: *Self, tensors: []const TensorRef, axis: i32) Error!TensorRef {
         if (tensors.len == 0) return Error.InvalidArgument;
-        var ids: [16]ValueId = .{0} ** 16;
+        var ids: [16]ValueId = @splat(0);
         if (tensors.len > ids.len) return Error.InvalidArgument;
         var i: usize = 0;
         while (i < tensors.len) : (i += 1) {

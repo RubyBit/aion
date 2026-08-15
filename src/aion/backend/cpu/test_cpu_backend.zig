@@ -2120,7 +2120,7 @@ test "cpu backend: packed-state loop (slice/cast/i32-add/scatter/concat) — in-
 
     const state_tid = try mgr.createTiledTensor(.f32, &[_]usize{L}, &[_]usize{L}, .{});
     const one_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    var s0: [L]f32 = .{0.0} ** L;
+    var s0: [L]f32 = @splat(0.0);
     try mgr.writeFromPackedScalar(state_tid, std.mem.sliceAsBytes(s0[0..]));
     var onev: [1]i32 = .{1};
     try mgr.writeFromPackedScalar(one_tid, std.mem.sliceAsBytes(onev[0..]));
@@ -2251,7 +2251,7 @@ test "cpu backend: loop body lowers matmul + relu (region full-op lowering)" {
 
     var cbuf: [N]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
     try mgr.writeFromPackedScalar(carried_tid, std.mem.sliceAsBytes(cbuf[0..]));
-    var wbuf: [N * N]f32 = .{0.0} ** (N * N);
+    var wbuf: [N * N]f32 = @splat(0.0);
     {
         var i: usize = 0;
         while (i < N) : (i += 1) wbuf[i * N + i] = 0.5; // W = 0.5 * I
@@ -2690,7 +2690,7 @@ test "cpu backend: shape index ops and batched gather derive pooling indices" {
         }
     }
     const indices_vals = [_]i32{ 3, 1, 0, 2 };
-    const tokens_vals = [_]i32{0} ** (b * s);
+    const tokens_vals: [b * s]i32 = @splat(0);
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();

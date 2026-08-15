@@ -191,8 +191,8 @@ pub fn Kernel(comptime lanes: usize) type {
             // Lanes >= count are zero-padded so their butterflies stay finite.
             // Marshal through arrays since @Vector lvalues can't be indexed at runtime.
             for (0..m) |n| {
-                var re_arr: [lanes]f32 = .{0.0} ** lanes;
-                var im_arr: [lanes]f32 = .{0.0} ** lanes;
+                var re_arr: [lanes]f32 = @splat(0.0);
+                var im_arr: [lanes]f32 = @splat(0.0);
                 for (0..count) |l| {
                     const base: usize = l * n_fft + 2 * n;
                     re_arr[l] = in_group[base];

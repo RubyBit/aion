@@ -10,7 +10,7 @@ const fast = @import("../backend/cpu/kernels/fast_math.zig");
 
 const nn = api.nn;
 
-fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
     return try dir.createFile(std.testing.io, sub_path, flags);
 }
 
@@ -830,7 +830,7 @@ test "api.nn: lstm cell (single step)" {
 
     // Error path: wrong bias shape.
     const bad_bias: api.Tensor = try ctx.tensor(.f32, &[_]usize{gate_dim - 1});
-    var tmp: [gate_dim - 1]f32 = .{0.0} ** (gate_dim - 1);
+    var tmp: [gate_dim - 1]f32 = @splat(0.0);
     try bad_bias.write(tmp[0..]);
 
     var bld_bad = api.Builder.init(&ctx);
@@ -1284,7 +1284,7 @@ test "api: growable state input grows on demand up to its bound" {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &@as([2]f32, @splat(0)));
     try model.bindInput("cache", cache0);
 
     // Append 1..5 at positions 0..4; capacity grows 2 -> 4 (at pos 2) -> 8 (at pos 4).
@@ -1682,7 +1682,7 @@ test "api: loadModel can swap initializers by debug name (overwrite + retarget)"
 
     // Retarget initializer tensor-id to a new tensor (and patch cached programs).
     var ones_w: api.Tensor = try load_ctx.tensor(.f32, &[_]usize{ 2, 3 });
-    var ones_vals: [6]f32 = .{1.0} ** 6;
+    var ones_vals: [6]f32 = @splat(1.0);
     try ones_w.write(ones_vals[0..]);
     try model.retargetInitializerByDebugName("W", ones_w);
 
@@ -2958,9 +2958,9 @@ test "api: attention matches deterministic windowed-causal averages" {
     // k_cache: [B=1, T=6, Hkv=2, Dk=2]
     // v_cache: [B=1, T=6, Hkv=2, Dv=1]
     // positions: [1,2], end_index: [1]
-    var q_vals: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
-    var k_vals: [1 * 2 * 6 * 2]f32 = .{0.0} ** (1 * 2 * 6 * 2);
-    var v_vals: [1 * 2 * 6 * 1]f32 = .{0.0} ** (1 * 2 * 6 * 1);
+    var q_vals: [1 * 2 * 4 * 2]f32 = @splat(0.0);
+    var k_vals: [1 * 2 * 6 * 2]f32 = @splat(0.0);
+    var v_vals: [1 * 2 * 6 * 1]f32 = @splat(0.0);
 
     // kv-head 0 tokens => [1,2,3,4,5,6]
     // kv-head 1 tokens => [10,20,30,40,50,60]
@@ -3031,9 +3031,9 @@ test "api: attention validates H_q % H_kv == 0" {
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    var q_vals: [1 * 1 * 3 * 2]f32 = .{0.0} ** (1 * 1 * 3 * 2);
-    var k_vals: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
-    var v_vals: [1 * 2 * 4 * 1]f32 = .{0.0} ** (1 * 2 * 4 * 1);
+    var q_vals: [1 * 1 * 3 * 2]f32 = @splat(0.0);
+    var k_vals: [1 * 2 * 4 * 2]f32 = @splat(0.0);
+    var v_vals: [1 * 2 * 4 * 1]f32 = @splat(0.0);
 
     const q_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 1, 3, 2 }, q_vals[0..]);
     const k_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 2, 2 }, k_vals[0..]);

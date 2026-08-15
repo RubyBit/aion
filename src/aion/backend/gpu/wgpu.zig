@@ -121,15 +121,15 @@ pub fn ensureLoaded() Error!void {
     }
     load_state = .failed; // until fully wired, so a partial load never looks OK
     const handle = openLibrary() orelse return Error.Unavailable;
-    inline for (@typeInfo(Procs).@"struct".fields) |f| {
-        const sym = dlSymbol(handle, f.name) orelse {
+    inline for (@typeInfo(Procs).@"struct".field_names) |field_name| {
+        const sym = dlSymbol(handle, field_name) orelse {
             dlClose(handle);
             return Error.Unavailable;
         };
         // dlsym/GetProcAddress hand back an align-1 opaque pointer; function
         // pointers require higher alignment on some targets (e.g. 4 on aarch64).
         // The address is a real code symbol, so the alignment cast is sound.
-        @field(procs, f.name) = @ptrCast(@alignCast(sym));
+        @field(procs, field_name) = @ptrCast(@alignCast(sym));
     }
     load_state = .ok;
 }

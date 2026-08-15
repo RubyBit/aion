@@ -31,7 +31,7 @@ concurrency:
 
 env:
   # Keep in sync with .github/workflows/ci.yml and build.zig.zon's dev pin.
-  ZIG_VERSION: 0.16.0-dev.2984+cb7d2b056
+  ZIG_VERSION: 0.17.0-dev.1756+613c03321
 
 jobs:
   build-aion:

@@ -491,7 +491,7 @@ fn writeHeader(writer: *WriteCursor, section_count: u32, dir_offset: u64, file_s
     try writeInt(writer, u64, dir_offset);
     try writeInt(writer, u64, file_size);
     try writeInt(writer, u64, 0);
-    var reserved: [32]u8 = .{0} ** 32;
+    var reserved: [32]u8 = @splat(0);
     try writer.writeAll(&reserved);
 }
 
@@ -507,7 +507,7 @@ fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: 
     switch (@typeInfo(T)) {
         .int => std.mem.writeInt(T, &buf, value, .little),
         .float => |float_info| {
-            const IntT = std.meta.Int(.unsigned, float_info.bits);
+            const IntT = @Int(.unsigned, float_info.bits);
             const bits: IntT = @bitCast(value);
             std.mem.writeInt(IntT, @ptrCast(&buf), bits, .little);
         },

@@ -44,8 +44,8 @@ test "graph: matmul rejects mismatched non-quant dtypes" {
     const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
 
     // Contents are irrelevant; compilation should fail before execution.
-    var a_zero: [a_bytes_len]u8 = [_]u8{0} ** a_bytes_len;
-    var b_zero: [b_bytes_len]u8 = [_]u8{0} ** b_bytes_len;
+    var a_zero: [a_bytes_len]u8 = @splat(0);
+    var b_zero: [b_bytes_len]u8 = @splat(0);
     try sm.writeFromPackedScalar(a_tid, a_zero[0..]);
     try sm.writeFromPackedScalar(b_tid, b_zero[0..]);
 
@@ -76,9 +76,9 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, 1 }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
     const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{ .tile_alignment = 64 });
 
-    var q_init: [1 * 1 * 3 * 2]f32 = .{0.0} ** (1 * 1 * 3 * 2);
-    var k_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
-    var v_init: [1 * 2 * 4 * 2]f32 = .{0.0} ** (1 * 2 * 4 * 2);
+    var q_init: [1 * 1 * 3 * 2]f32 = @splat(0.0);
+    var k_init: [1 * 2 * 4 * 2]f32 = @splat(0.0);
+    var v_init: [1 * 2 * 4 * 2]f32 = @splat(0.0);
     var pos_init: [1]i32 = .{0};
     var end_init: [1]i32 = .{1};
 
@@ -177,8 +177,8 @@ test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
     const w_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k_in_dim, heads * head_dim }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
     const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, l }, &[_]usize{ 1, l }, .{ .tile_alignment = 64 });
 
-    var x_init: [1 * l * k_in_dim]f32 = .{0.0} ** (1 * l * k_in_dim);
-    var w_init: [k_in_dim * heads * head_dim]f32 = .{0.0} ** (k_in_dim * heads * head_dim);
+    var x_init: [1 * l * k_in_dim]f32 = @splat(0.0);
+    var w_init: [k_in_dim * heads * head_dim]f32 = @splat(0.0);
     var pos_init: [l]i32 = .{ 0, 1 };
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x_init[0..]));
     try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w_init[0..]));

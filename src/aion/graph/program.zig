@@ -2178,7 +2178,7 @@ fn lowerNode(
             try fillTileShapeDefault(policy, out_dt, out_shape, out_tile);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
 
-            var in_ids: [16]TensorId = .{0} ** 16;
+            var in_ids: [16]TensorId = @splat(0);
             if (node.inputs.len > in_ids.len) return CompileError.InvalidArgument;
 
             var i: usize = 0;
@@ -2563,9 +2563,9 @@ fn lowerNode(
             const then_t: *const TiledTensor = try mgr.getConst(then_tid);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, then_t.tile_shape);
 
-            var outputs_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
-            var then_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
-            var else_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = .{0} ** executable.MAX_CONTROL_OUTPUTS;
+            var outputs_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = @splat(0);
+            var then_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = @splat(0);
+            var else_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = @splat(0);
             outputs_arr[0] = out_tid;
             then_arr[0] = then_tid;
             else_arr[0] = else_tid;
@@ -2589,13 +2589,13 @@ fn lowerNode(
 
             // Gather carry-in tensors before lowering the body so it can reconcile
             // each carried output's tiling to the matching carry buffer.
-            var carried_arr: [executable.MAX_LOOP_CARRIED]TensorId = .{0} ** executable.MAX_LOOP_CARRIED;
+            var carried_arr: [executable.MAX_LOOP_CARRIED]TensorId = @splat(0);
             var i: usize = 0;
             while (i < n) : (i += 1) carried_arr[i] = try ensureAnyTensor(ctx, @intCast(node.inputs[i]));
 
             const body_block: executable.BlockId = try lowerRegionBlock(allocator, graph, body_region, mgr, policy, ctx, blocks, carried_arr[0..n]);
 
-            var body_arr: [executable.MAX_LOOP_CARRIED]TensorId = .{0} ** executable.MAX_LOOP_CARRIED;
+            var body_arr: [executable.MAX_LOOP_CARRIED]TensorId = @splat(0);
             i = 0;
             while (i < n) : (i += 1) {
                 body_arr[i] = try ensureAnyTensor(ctx, @intCast(body_region.outputs[i]));
@@ -2775,7 +2775,7 @@ fn lowerNode(
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             const a_tid: TensorId = try ensureAnyTensor(ctx, a_id);
 
-            var starts_buf: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var starts_buf: [MAX_RANK]usize = @splat(0);
             if (sl.starts.len == 0 or sl.starts.len > MAX_RANK) return CompileError.InvalidArgument;
             const rank: usize = sl.starts.len;
             var d: usize = 0;

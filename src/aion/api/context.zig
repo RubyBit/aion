@@ -520,7 +520,7 @@ pub const Context = struct {
         }
 
         const ShapeInfo = comptime blk: {
-            var dims: [api_tiling.MAX_RANK]usize = .{0} ** api_tiling.MAX_RANK;
+            var dims: [api_tiling.MAX_RANK]usize = @splat(0);
             var rank: usize = 0;
             var cur: type = base_arr_t;
             while (true) {

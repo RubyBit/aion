@@ -260,7 +260,10 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    for (tier_objs[0..n_tiers]) |o| aion_mod.addObject(o);
+    // Zig 0.17's configuration serializer visits public named modules before
+    // indexing compile steps. Referencing the emitted object as a LazyPath keeps
+    // the same dependency while avoiding a serializer panic on `.addObject(o)`.
+    for (tier_objs[0..n_tiers]) |o| aion_mod.addObjectFile(o.getEmittedBin());
 
     // Shipped library: main module floored to x86_64_v3, dispatch on, tier
     // objects linked. This is the artifact installed to `zig-out/lib`.
@@ -373,7 +376,7 @@ pub fn build(b: *std.Build) void {
             target.query.zigTriple(b.allocator) catch @panic("OOM"),
         });
     }
-    if (b.args) |args| run_lib_tests.addArgs(args);
+    run_lib_tests.addPassthruArgs();
     addRawTestModules(b, run_lib_tests, test_build_options);
     if (skip_thread_pool_tests) run_lib_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
     test_step.dependOn(&run_lib_tests.step);
@@ -393,7 +396,7 @@ pub fn build(b: *std.Build) void {
             target.query.zigTriple(b.allocator) catch @panic("OOM"),
         });
     }
-    if (b.args) |args| run_fast_tests.addArgs(args);
+    run_fast_tests.addPassthruArgs();
     addRawTestModules(b, run_fast_tests, test_build_options);
     run_fast_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
     test_fast_step.dependOn(&run_fast_tests.step);
@@ -429,7 +432,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench = b.addRunArtifact(bench_exe);
     if (wgpu_dep) |wd| wd.prepareRun(b, run_bench);
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
 
     const bench_step = b.step("bench", "Run microbenchmarks");
     bench_step.dependOn(&run_bench.step);
@@ -464,7 +467,7 @@ pub fn build(b: *std.Build) void {
         // CPU-vs-GPU benchmark (separate artifact for GPU-specific workloads).
         //   zig build gpu-bench -Doptimize=ReleaseFast -- --m 1024 --n 1024 --k 1024
         const gpu_bench_run = addGpuBench(b, target, optimize, aion_mod, bench_kernels_mod, wd, gpu_check);
-        if (b.args) |args| gpu_bench_run.addArgs(args);
+        gpu_bench_run.addPassthruArgs();
         const gpu_bench_step = b.step("gpu-bench", "Build and run the CPU-vs-GPU benchmark");
         gpu_bench_step.dependOn(&gpu_bench_run.step);
     }
@@ -515,13 +518,13 @@ pub fn build(b: *std.Build) void {
             });
             const run_ex = b.addRunArtifact(ex_exe);
             if (wgpu_dep) |wd| wd.prepareRun(b, run_ex);
-            if (b.args) |args| run_ex.addArgs(args);
+            run_ex.addPassthruArgs();
             examples_step.dependOn(&run_ex.step);
 
             const run_ex_bench = b.addRunArtifact(ex_exe);
             if (wgpu_dep) |wd| wd.prepareRun(b, run_ex_bench);
             run_ex_bench.addArgs(&.{ "--bench-iters", "10" });
-            if (b.args) |args| run_ex_bench.addArgs(args);
+            run_ex_bench.addPassthruArgs();
             bench_examples_step.dependOn(&run_ex_bench.step);
         }
     }
@@ -556,7 +559,10 @@ const WgpuDep = struct {
     /// The library is loaded at runtime (not linked), so its full path is handed
     /// over via `AION_WGPU_LIB` — the same env var the Python `aion` package sets.
     fn prepareRun(self: WgpuDep, b: *std.Build, run: *std.Build.Step.Run) void {
-        const path = self.dep.path(b.fmt("lib/{s}", .{self.runtimeLibName()})).getPath(b);
+        const path = self.dep.builder.root.joinString(
+            b.allocator,
+            b.fmt("lib/{s}", .{self.runtimeLibName()}),
+        ) catch @panic("OOM");
         run.setEnvironmentVariable("AION_WGPU_LIB", path);
     }
 };

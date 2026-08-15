@@ -225,7 +225,7 @@ test "cpu kernels: unary gelu f32 properties and accuracy" {
 
 test "cpu kernels: unary sqrt f32 and f16" {
     var x = [_]f32{ 0.0, 0.25, 1.0, 2.25, 16.0, 81.0 };
-    var out = [_]f32{0.0} ** x.len;
+    var out: [x.len]f32 = @splat(0.0);
     try sqrt_k.sqrtF32(std.mem.sliceAsBytes(out[0..]), std.mem.sliceAsBytes(x[0..]), x.len);
 
     for (x, out) |v, got| {
@@ -263,8 +263,8 @@ fn softmaxRefRowF32(out: []f32, x: []const f32) void {
 test "cpu kernels: softmax f32 matches reference (rank-1)" {
     // This tests the core softmax math used by the tiled exec.
     var x = [_]f32{ -4.0, -1.0, 0.0, 0.5, 1.0, 2.0, 4.0 };
-    var out = [_]f32{0} ** x.len;
-    var ref = [_]f32{0} ** x.len;
+    var out: [x.len]f32 = @splat(0);
+    var ref: [x.len]f32 = @splat(0);
     softmaxRefRowF32(ref[0..], x[0..]);
 
     // Use the exec helpers by building fake BufferViews around packed memory.
@@ -339,8 +339,8 @@ test "cpu kernels: tuned f32 matmul via registry" {
     for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
     for (b[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
 
-    var c_ref: [m * n]f32 = [_]f32{0.0} ** (m * n);
-    var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    var c_ref: [m * n]f32 = @splat(0.0);
+    var c: [m * n]f32 = @splat(0.0);
 
     naiveMatmulF32(params, c_ref[0..], a[0..], b[0..]);
 
@@ -385,9 +385,9 @@ test "cpu kernels: attention calcScores handles partial tiles" {
     for (q[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
     for (k[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
 
-    var scores: [M * N]f32 = [_]f32{0.0} ** (M * N);
-    var qt: [M * K]f32 = [_]f32{0.0} ** (M * K);
-    var kt: [N * K]f32 = [_]f32{0.0} ** (N * K);
+    var scores: [M * N]f32 = @splat(0.0);
+    var qt: [M * K]f32 = @splat(0.0);
+    var kt: [N * K]f32 = @splat(0.0);
 
     kernels.pack_q_block(M, K, q[0..], K, qt[0..]);
     kernels.pack_k_block(N, K, k[0..], K, kt[0..]);
@@ -423,8 +423,8 @@ test "cpu kernels: matvec f32" {
     for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
     for (b[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
 
-    var c_ref: [n]f32 = [_]f32{0.0} ** n;
-    var c: [n]f32 = [_]f32{0.0} ** n;
+    var c_ref: [n]f32 = @splat(0.0);
+    var c: [n]f32 = @splat(0.0);
 
     // naive
     var j: usize = 0;
@@ -454,8 +454,8 @@ test "cpu kernels: matvec f16" {
     for (a[0..]) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
     for (b[0..]) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
 
-    var c_ref: [n]f32 = [_]f32{0.0} ** n;
-    var c: [n]f16 = [_]f16{@as(f16, 0.0)} ** n;
+    var c_ref: [n]f32 = @splat(0.0);
+    var c: [n]f16 = @splat(@as(f16, 0.0));
 
     // naive f32 reference from f16 inputs
     var j: usize = 0;
@@ -565,8 +565,8 @@ test "cpu kernels: tuned q8_0 matmul via registry" {
         }
     }
 
-    var c_ref: [m * n]f32 = [_]f32{0.0} ** (m * n);
-    var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    var c_ref: [m * n]f32 = @splat(0.0);
+    var c: [m * n]f32 = @splat(0.0);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
     const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
@@ -611,8 +611,8 @@ test "cpu kernels: tuned q4_0 matmul via registry" {
         }
     }
 
-    var c_ref: [m * n]f32 = [_]f32{0.0} ** (m * n);
-    var c: [m * n]f32 = [_]f32{0.0} ** (m * n);
+    var c_ref: [m * n]f32 = @splat(0.0);
+    var c: [m * n]f32 = @splat(0.0);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
     const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
@@ -654,7 +654,7 @@ test "cpu kernels: matvec q8_0" {
     }
 
     // naive reference
-    var c_ref: [n]f32 = [_]f32{0.0} ** n;
+    var c_ref: [n]f32 = @splat(0.0);
     var j: usize = 0;
     while (j < n) : (j += 1) {
         var acc: f32 = 0.0;
@@ -665,7 +665,7 @@ test "cpu kernels: matvec q8_0" {
         c_ref[j] = acc;
     }
 
-    var c: [n]f32 = [_]f32{0.0} ** n;
+    var c: [n]f32 = @splat(0.0);
     const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
@@ -709,7 +709,7 @@ test "cpu kernels: direct matvec q8_0 k-major" {
         }
     }
 
-    var c_ref: [n]f32 = [_]f32{0.0} ** n;
+    var c_ref: [n]f32 = @splat(0.0);
     var j: usize = 0;
     while (j < n) : (j += 1) {
         var acc: f32 = 0.0;
@@ -720,7 +720,7 @@ test "cpu kernels: direct matvec q8_0 k-major" {
         c_ref[j] = acc;
     }
 
-    var c: [n]f32 = [_]f32{0.0} ** n;
+    var c: [n]f32 = @splat(0.0);
     const kernels = matvec_registry.candidates[1].kernels;
     try kernels.matvec_q8_0_kmajor(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);

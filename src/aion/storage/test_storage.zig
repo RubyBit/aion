@@ -12,7 +12,7 @@ const simd = @import("../backend/cpu/kernels/simd.zig");
 
 const DType = types.DType;
 
-fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
     return try dir.createFile(std.testing.io, sub_path, flags);
 }
 

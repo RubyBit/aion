@@ -249,7 +249,7 @@ pub const Tensor = struct {
             else => false,
         }) {
             const pinfo = @typeInfo(OutT).pointer;
-            if (pinfo.is_const) return StorageError.InvalidArgument;
+            if (pinfo.attrs.@"const") return StorageError.InvalidArgument;
             const Elem: type = pinfo.child;
             const dt: DType = dtypeOf(Elem) orelse return StorageError.InvalidArgument;
             if (self.dtype != dt) return StorageError.InvalidArgument;
@@ -260,7 +260,7 @@ pub const Tensor = struct {
         // Accept: *[N]T (mutable)
         if (arrayInfoIfPointerToArray(OutT)) |ainfo| {
             const pinfo = @typeInfo(OutT).pointer;
-            if (pinfo.is_const) return StorageError.InvalidArgument;
+            if (pinfo.attrs.@"const") return StorageError.InvalidArgument;
 
             const Elem: type = ainfo.child;
             const dt: DType = dtypeOf(Elem) orelse return StorageError.InvalidArgument;

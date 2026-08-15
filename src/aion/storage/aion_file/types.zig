@@ -46,7 +46,7 @@ pub const SectionType = enum(u32) {
     input_roles = 13,
 };
 
-pub const section_slot_count = @typeInfo(SectionType).@"enum".fields.len;
+pub const section_slot_count = @typeInfo(SectionType).@"enum".field_names.len;
 
 pub const SectionFlags = struct {
     pub const required: u32 = 1 << 0;
@@ -532,7 +532,7 @@ fn validateInputRoles(pkg: *const Package) PackageError!void {
         if (alias.input < pkg.inputs.len) aliased[alias.input] = true;
     }
 
-    var singleton_seen = [_]bool{false} ** 4; // write_index, visible_end, positions, tokens
+    var singleton_seen: [4]bool = @splat(false); // write_index, visible_end, positions, tokens
 
     for (pkg.input_roles) |role| {
         const input_idx: usize = role.input;

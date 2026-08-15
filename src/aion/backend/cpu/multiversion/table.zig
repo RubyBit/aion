@@ -27,7 +27,7 @@ const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
 
 /// Bumped whenever the `DispatchTable` layout or any kernel-struct ABI changes.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 4;
 
 /// Ordering of the tiled (packed-GEMM) kernel arrays below.
 pub const TILE_SMALL = 0;

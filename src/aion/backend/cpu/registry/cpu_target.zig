@@ -24,8 +24,11 @@ pub const SimdWidth = enum {
 pub const Target = struct {
     simd_width: SimdWidth,
     preferred_f32_lanes: usize,
+    quant_dot: QuantDot,
     caches: cpuid.Caches,
 };
+
+pub const QuantDot = enum { f32, vex, evex, sdot };
 
 pub fn simdWidthFromF32Lanes(lanes: usize) SimdWidth {
     return switch (lanes) {
@@ -40,6 +43,11 @@ pub fn fromCpuInfo(info: cpuid.CpuInfo) Target {
     return .{
         .simd_width = simdWidthFromF32Lanes(lanes),
         .preferred_f32_lanes = lanes,
+        .quant_dot = switch (info.arch) {
+            .x86_64 => if (info.features.avx512_vnni) .evex else if (info.features.avx_vnni) .vex else .f32,
+            .aarch64 => if (info.features.dotprod or info.features.i8mm) .sdot else .f32,
+            else => .f32,
+        },
         .caches = info.caches,
     };
 }

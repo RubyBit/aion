@@ -74,7 +74,7 @@ pub fn execRoPE1DTiled(
         scale_factor: f32,
 
         fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
-            var coords: [8]usize = .{0} ** 8;
+            var coords: [8]usize = @splat(0);
 
             var i: usize = start;
             while (i < end) : (i += 1) {

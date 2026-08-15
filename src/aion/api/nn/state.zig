@@ -142,8 +142,8 @@ fn assertSubLayer(comptime W: type, comptime field: std.meta.FieldEnum(W)) void 
 /// How many `Tensor` leaves a weights tree can hold.
 fn leafCount(comptime W: type) usize {
     var n: usize = 0;
-    for (@typeInfo(W).@"struct".fields) |f| {
-        const T = unwrapOptional(f.type);
+    for (@typeInfo(W).@"struct".field_types) |field_type| {
+        const T = unwrapOptional(field_type);
         n += if (T == Tensor) 1 else leafCount(T);
     }
     return n;
@@ -215,20 +215,21 @@ pub fn Source(comptime W: type) type {
 }
 
 fn appendLeaves(comptime W: type, w: W, comptime prefix: []const u8, out: anytype) void {
-    inline for (@typeInfo(W).@"struct".fields) |f| {
-        const path = comptime if (prefix.len == 0) f.name else prefix ++ "/" ++ f.name;
-        const value = @field(w, f.name);
+    const info = @typeInfo(W).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        const path = comptime if (prefix.len == 0) field_name else prefix ++ "/" ++ field_name;
+        const value = @field(w, field_name);
 
-        if (@typeInfo(f.type) == .optional) {
+        if (@typeInfo(field_type) == .optional) {
             // A null field means the model simply does not have that parameter or
             // sub-layer, so it contributes no entries and every lookup misses it.
             if (value) |v| {
                 if (@TypeOf(v) == Tensor) out.push(path, v) else appendLeaves(@TypeOf(v), v, path, out);
             }
-        } else if (f.type == Tensor) {
+        } else if (field_type == Tensor) {
             out.push(path, value);
         } else {
-            appendLeaves(f.type, value, path, out);
+            appendLeaves(field_type, value, path, out);
         }
     }
 }
@@ -306,21 +307,22 @@ fn coerce(comptime W: type, v: anytype) W {
         "expected a `" ++ @typeName(W) ++ "` literal, got " ++ @typeName(V),
     );
 
-    inline for (@typeInfo(V).@"struct".fields) |f| {
-        if (!@hasField(W, f.name)) @compileError(
-            @typeName(W) ++ " has no parameter `" ++ f.name ++ "` (fields: " ++ fieldList(W) ++ ")",
+    inline for (@typeInfo(V).@"struct".field_names) |field_name| {
+        if (!@hasField(W, field_name)) @compileError(
+            @typeName(W) ++ " has no parameter `" ++ field_name ++ "` (fields: " ++ fieldList(W) ++ ")",
         );
     }
 
     var out: W = undefined;
-    inline for (@typeInfo(W).@"struct".fields) |wf| {
-        if (@hasField(V, wf.name)) {
-            @field(out, wf.name) = coerceField(wf.type, @field(v, wf.name));
-        } else if (wf.default_value_ptr) |dp| {
-            @field(out, wf.name) = @as(*const wf.type, @ptrCast(@alignCast(dp))).*;
+    const w_info = @typeInfo(W).@"struct";
+    inline for (w_info.field_names, w_info.field_types, w_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (@hasField(V, field_name)) {
+            @field(out, field_name) = coerceField(field_type, @field(v, field_name));
+        } else if (field_attrs.defaultValue(field_type)) |default_value| {
+            @field(out, field_name) = default_value;
         } else {
             // No default means the layer cannot run without it.
-            @compileError(@typeName(W) ++ " requires `" ++ wf.name ++ "`");
+            @compileError(@typeName(W) ++ " requires `" ++ field_name ++ "`");
         }
     }
     return out;
@@ -339,8 +341,8 @@ fn coerceField(comptime F: type, v: anytype) F {
 
 fn fieldList(comptime W: type) []const u8 {
     var out: []const u8 = "";
-    for (@typeInfo(W).@"struct".fields, 0..) |f, i| {
-        out = out ++ (if (i == 0) "" else ", ") ++ f.name;
+    for (@typeInfo(W).@"struct".field_names, 0..) |field_name, i| {
+        out = out ++ (if (i == 0) "" else ", ") ++ field_name;
     }
     return out;
 }
@@ -436,8 +438,8 @@ pub fn forEachParam(
     const info = @typeInfo(T);
     if (info != .@"struct") return;
 
-    inline for (info.@"struct".fields) |field| {
-        try visitValue(field.type, &@field(module, field.name), bld, context, visit);
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
+        try visitValue(field_type, &@field(module, field_name), bld, context, visit);
     }
 }
 

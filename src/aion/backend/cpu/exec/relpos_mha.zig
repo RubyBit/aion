@@ -355,7 +355,7 @@ fn computeSlice(
 
     // Layout [B, T, H, D]: dims 1 (T) and 3 (D) are the single full tile; the slice
     // is selected by the size-1 tiles on dim 0 (B) and dim 2 (H).
-    var coords4: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var coords4: [MAX_RANK]usize = @splat(0);
     coords4[0] = b;
     coords4[2] = h;
 
@@ -367,12 +367,12 @@ fn computeSlice(
     const v_t = try store.acquireTileConstLinear(s.v, try tileIndex((try store.meta(s.v)), &coords4));
     defer store.releaseConst(v_t.token);
 
-    var pe_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var pe_coords: [MAX_RANK]usize = @splat(0);
     pe_coords[0] = h;
     const pe_t = try store.acquireTileConstLinear(s.pos_emb, try tileIndex((try store.meta(s.pos_emb)), &pe_coords));
     defer store.releaseConst(pe_t.token);
 
-    var bias_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var bias_coords: [MAX_RANK]usize = @splat(0);
     const bu_t = try store.acquireTileConstLinear(s.pos_bias_u, try tileIndex((try store.meta(s.pos_bias_u)), &bias_coords));
     defer store.releaseConst(bu_t.token);
     const bv_t = try store.acquireTileConstLinear(s.pos_bias_v, try tileIndex((try store.meta(s.pos_bias_v)), &bias_coords));
@@ -409,7 +409,7 @@ fn computeSlice(
     var mask_buf: ?[]align(1) const f32 = null;
     var mask_tok: ?usize = null;
     if (s.mask) |mask_id| {
-        var m_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var m_coords: [MAX_RANK]usize = @splat(0);
         const m_t = try store.acquireTileConstLinear(mask_id, try tileIndex((try store.meta(mask_id)), &m_coords));
         mask_tok = m_t.token;
         mask_buf = simd.bytesAsSliceConstUnaligned(f32, m_t.bufferView().bytes);

@@ -140,7 +140,7 @@ test "api.nn: the Builder shares one identity constant across same-width norms" 
     defer fx.deinit(allocator);
 
     const d: usize = 8;
-    const g = try fx.ctx.fromF32(&[_]usize{d}, &([_]f32{1.0} ** d));
+    const g = try fx.ctx.fromF32(&[_]usize{d}, &@as([d]f32, @splat(1.0)));
 
     const n1 = try nn.RMSNorm.bind(&fx.bld, .{ .weight = g }, .{});
     const n2 = try nn.RMSNorm.bind(&fx.bld, .{ .weight = g }, .{});
@@ -365,7 +365,7 @@ test "api.nn: fusing a split GatedMLP reclaims the weights it replaced" {
 
     // And swapping it writes through to the fused tensor's sub-region. Zeroing the
     // gate must change the output, or the write went somewhere unread.
-    const zeros: api.Tensor = try ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 0, &([_]f32{0.0} ** (in * ffn)));
+    const zeros: api.Tensor = try ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 0, &@as([in * ffn]f32, @splat(0.0)));
     try model.overwriteInitializerByDebugName("mlp/gate_proj/weight", zeros);
     try model.run();
 

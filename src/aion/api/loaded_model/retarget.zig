@@ -64,8 +64,8 @@ fn retargetTensorIdsInValue(comptime T: type, value: *T, old_tid: types_mod.Tens
             }
         },
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                retargetTensorIdsInValue(field.type, &@field(value.*, field.name), old_tid, new_tid);
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
+                retargetTensorIdsInValue(field_type, &@field(value.*, field_name), old_tid, new_tid);
             }
         },
         .@"union" => {
@@ -115,8 +115,8 @@ fn valueReferencesTensorId(comptime T: type, value: *const T, tid: types_mod.Ten
             return false;
         },
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                if (valueReferencesTensorId(field.type, &@field(value.*, field.name), tid)) return true;
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
+                if (valueReferencesTensorId(field_type, &@field(value.*, field_name), tid)) return true;
             }
             return false;
         },

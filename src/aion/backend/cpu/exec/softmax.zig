@@ -230,12 +230,12 @@ fn softmaxAxisStridedND(
                     if (start >= end) return;
                     if (t.stop.load(.acquire)) return;
 
-                    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-                    var row_sizes: [MAX_RANK]usize = .{0} ** MAX_RANK;
-                    var row_local_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
-                    var row_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-                    var row_offsets_in: [256]usize = .{0} ** 256;
-                    var row_offsets_out: [256]usize = .{0} ** 256;
+                    var coords: [MAX_RANK]usize = @splat(0);
+                    var row_sizes: [MAX_RANK]usize = @splat(0);
+                    var row_local_strides: [MAX_RANK]usize = @splat(0);
+                    var row_coords: [MAX_RANK]usize = @splat(0);
+                    var row_offsets_in: [256]usize = @splat(0);
+                    var row_offsets_out: [256]usize = @splat(0);
 
                     var row_idx: usize = start;
                     while (row_idx < end) : (row_idx += 1) {
@@ -492,12 +492,12 @@ fn softmaxAxisStridedND(
     }
 
     // Sequential fallback.
-    var coords_seq: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var row_sizes_seq: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var row_strides_seq: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var row_coords_seq: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var row_offsets_in_seq: [256]usize = .{0} ** 256;
-    var row_offsets_out_seq: [256]usize = .{0} ** 256;
+    var coords_seq: [MAX_RANK]usize = @splat(0);
+    var row_sizes_seq: [MAX_RANK]usize = @splat(0);
+    var row_strides_seq: [MAX_RANK]usize = @splat(0);
+    var row_coords_seq: [MAX_RANK]usize = @splat(0);
+    var row_offsets_in_seq: [256]usize = @splat(0);
+    var row_offsets_out_seq: [256]usize = @splat(0);
 
     var row_idx_seq: usize = 0;
     while (row_idx_seq < row_tile_total) : (row_idx_seq += 1) {
@@ -727,7 +727,7 @@ fn softmaxAxisLastND(
                     if (start >= end) return;
                     if (t.stop.load(.acquire)) return;
 
-                    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                    var coords: [MAX_RANK]usize = @splat(0);
 
                     var row_idx: usize = start;
                     while (row_idx < end) : (row_idx += 1) {
@@ -868,7 +868,7 @@ fn softmaxAxisLastND(
     }
 
     // Sequential fallback.
-    var coords_seq: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var coords_seq: [MAX_RANK]usize = @splat(0);
     var row_idx_seq: usize = 0;
     while (row_idx_seq < row_tile_total) : (row_idx_seq += 1) {
         var rem: usize = row_idx_seq;

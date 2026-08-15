@@ -173,7 +173,7 @@ pub fn execGatherRowsTiled(
         idx_vals: []align(1) const i32,
 
         fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
-            var out_tile_coords: [8]usize = .{0} ** 8;
+            var out_tile_coords: [8]usize = @splat(0);
 
             var table_cached: bool = false;
             var table_cached_ti0: usize = 0;

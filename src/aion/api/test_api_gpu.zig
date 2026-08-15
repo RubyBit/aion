@@ -126,7 +126,7 @@ fn runKvCacheSteps(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
     defer model.deinit();
 
     // Seed the cache once with zeros; the io-alias then carries it across runs.
-    const cache0 = try ctx.fromF32(&[_]usize{ 1, 4, 1, 2 }, &([_]f32{0} ** 8));
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 4, 1, 2 }, &@as([8]f32, @splat(0)));
     try model.bindInput("cache", cache0);
 
     const steps = [_]struct { end: i32, kv: [2]f32 }{
@@ -241,7 +241,7 @@ fn runGrowableDecode(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &@as([2]f32, @splat(0)));
     try model.bindInput("cache", cache0);
 
     var pos: i32 = 0;
@@ -315,7 +315,7 @@ test "api: device growth is frame-safe with an in-frame cache read" {
         .max_capacity_tokens = 8,
     } });
 
-    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &([_]f32{0} ** 2));
+    const cache0 = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &@as([2]f32, @splat(0)));
     try model.bindInput("cache", cache0);
 
     var pos: i32 = 0;

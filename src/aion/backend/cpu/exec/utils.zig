@@ -323,7 +323,7 @@ pub const TileCacheConstND = struct {
     tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefConst = undefined,
-    strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+    strides: [MAX_RANK]usize = @splat(0),
 
     pub fn deinit(self: *TileCacheConstND, store: tensor_store.TensorStore) void {
         if (self.valid) {
@@ -338,7 +338,7 @@ pub const TileCacheMutND = struct {
     tensor_id: tensor_store.TensorId = 0,
     tile_index: usize = 0,
     tile: tensor_store.TileRefMut = undefined,
-    strides: [MAX_RANK]usize = .{0} ** MAX_RANK,
+    strides: [MAX_RANK]usize = @splat(0),
 
     pub fn deinit(self: *TileCacheMutND, store: tensor_store.TensorStore) void {
         if (self.valid) {
@@ -403,7 +403,7 @@ pub fn readScalarF32At(
     if (coords.len != rank) return BackendError.InvalidArgument;
     if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
 
-    var tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var tile_coords: [MAX_RANK]usize = @splat(0);
 
     var d: usize = 0;
     while (d < rank) : (d += 1) {
@@ -449,7 +449,7 @@ pub fn writeScalarFromF32At(
     if (coords.len != rank) return BackendError.InvalidArgument;
     if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
 
-    var tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var tile_coords: [MAX_RANK]usize = @splat(0);
 
     var d: usize = 0;
     while (d < rank) : (d += 1) {
@@ -694,8 +694,8 @@ pub fn reshapeCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
     const src_last_dim: usize = src_rank - 1;
     const dst_last_dim: usize = dst_rank - 1;
 
-    var src_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var dst_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var src_coords: [MAX_RANK]usize = @splat(0);
+    var dst_coords: [MAX_RANK]usize = @splat(0);
 
     var src_tile_coords: [MAX_RANK]usize = undefined;
     var dst_tile_coords: [MAX_RANK]usize = undefined;
@@ -894,18 +894,18 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
     }
     const outer_dims: usize = rank - run_dims;
 
-    var outer_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var outer_shape: [MAX_RANK]usize = @splat(0);
     d = 0;
     while (d < outer_dims) : (d += 1) outer_shape[d] = dst_meta.shape[d];
-    var outer_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var outer_strides: [MAX_RANK]usize = @splat(0);
     if (outer_dims > 0) try computePackedStrides(outer_shape[0..outer_dims], outer_strides[0..outer_dims]);
 
-    var dst_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var src_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var dst_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var dst_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var src_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var src_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var dst_coords: [MAX_RANK]usize = @splat(0);
+    var src_coords: [MAX_RANK]usize = @splat(0);
+    var dst_tile_coords: [MAX_RANK]usize = @splat(0);
+    var dst_local_coords: [MAX_RANK]usize = @splat(0);
+    var src_tile_coords: [MAX_RANK]usize = @splat(0);
+    var src_local_coords: [MAX_RANK]usize = @splat(0);
 
     var src_cache: TileCacheConstND = .{};
     defer if (src_cache.valid) store.releaseConst(src_cache.tile.token);
@@ -925,7 +925,7 @@ pub fn sliceNDCopyScalar(store: tensor_store.TensorStore, dst_id: tensor_store.T
     if (run_dims == 0 and rank >= 1) {
         const last: usize = rank - 1;
         const o_dims: usize = rank - 1; // outer = all dims except the last
-        var o_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var o_strides: [MAX_RANK]usize = @splat(0);
         if (o_dims > 0) try computePackedStrides(dst_meta.shape[0..o_dims], o_strides[0..o_dims]);
         const o_total: usize = if (o_dims == 0) 1 else try elemCountFromShape(dst_meta.shape[0..o_dims]);
         const n_last: usize = dst_meta.shape[last];
@@ -1021,18 +1021,18 @@ pub fn concatScalar(step: executable.StepConcatScalar, store: tensor_store.Tenso
 
     const elem_bytes: usize = try scalarElemBytes(out_meta.dtype);
 
-    var out_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var in_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var out_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var out_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var in_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var in_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var out_coords: [MAX_RANK]usize = @splat(0);
+    var in_coords: [MAX_RANK]usize = @splat(0);
+    var out_tile_coords: [MAX_RANK]usize = @splat(0);
+    var out_local_coords: [MAX_RANK]usize = @splat(0);
+    var in_tile_coords: [MAX_RANK]usize = @splat(0);
+    var in_local_coords: [MAX_RANK]usize = @splat(0);
 
-    var in_axis_offsets: [16]usize = .{0} ** 16;
+    var in_axis_offsets: [16]usize = @splat(0);
     var in_metas: [16]tensor_store.TensorMeta = undefined;
-    var non_axis_dims: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var non_axis_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var non_axis_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var non_axis_dims: [MAX_RANK]usize = @splat(0);
+    var non_axis_shape: [MAX_RANK]usize = @splat(0);
+    var non_axis_strides: [MAX_RANK]usize = @splat(0);
     var non_axis_count: usize = 0;
 
     var axis_sum: usize = 0;
@@ -1088,8 +1088,8 @@ pub fn concatScalar(step: executable.StepConcatScalar, store: tensor_store.Tenso
         }
 
         const pre_count: usize = step.axis;
-        var pre_shape: [MAX_RANK]usize = .{0} ** MAX_RANK;
-        var pre_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var pre_shape: [MAX_RANK]usize = @splat(0);
+        var pre_strides: [MAX_RANK]usize = @splat(0);
         var dd: usize = 0;
         while (dd < pre_count) : (dd += 1) pre_shape[dd] = out_meta.shape[dd];
         if (pre_count >= 1) try computePackedStrides(pre_shape[0..pre_count], pre_strides[0..pre_count]);
@@ -1376,7 +1376,7 @@ pub fn reduceAxisScalar(
         out_tile_total = std.math.mul(usize, out_tile_total, out_meta.tile_counts[d_tot]) catch return BackendError.InvalidArgument;
     }
 
-    var out_tile_count_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var out_tile_count_strides: [MAX_RANK]usize = @splat(0);
     try computePackedStrides(out_meta.tile_counts[0..out_rank_expected], out_tile_count_strides[0..out_rank_expected]);
 
     const maybe_parallel: bool = pool != null and thread_count > 1 and scratch_f32.len >= thread_count and out_tile_total >= 2 and shouldParallelTiles(thread_count, out_tile_total, tileByteSize(out_meta), 256 * 1024);
@@ -1412,12 +1412,12 @@ pub fn reduceAxisScalar(
             if (start >= end) return;
             if (t.stop.load(.acquire)) return;
 
-            var out_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-            var out_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-            var out_global_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-            var in_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-            var in_tile_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-            var in_local_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+            var out_tile_coords: [MAX_RANK]usize = @splat(0);
+            var out_local_coords: [MAX_RANK]usize = @splat(0);
+            var out_global_coords: [MAX_RANK]usize = @splat(0);
+            var in_coords: [MAX_RANK]usize = @splat(0);
+            var in_tile_coords: [MAX_RANK]usize = @splat(0);
+            var in_local_coords: [MAX_RANK]usize = @splat(0);
 
             var in_cache: TileCacheConstND = .{};
             defer if (in_cache.valid) t.store.releaseConst(in_cache.tile.token);
@@ -1440,7 +1440,7 @@ pub fn reduceAxisScalar(
                 const out_view = out_tile.bufferView();
                 const tile_shape: []const usize = out_view.layout.shape;
 
-                var out_local_strides: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                var out_local_strides: [MAX_RANK]usize = @splat(0);
                 computePackedStrides(tile_shape, out_local_strides[0..t.out_rank]) catch |e| {
                     t.fail(e);
                     return;

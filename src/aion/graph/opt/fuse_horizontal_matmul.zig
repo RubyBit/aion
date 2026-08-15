@@ -237,7 +237,7 @@ fn fuseSet(
         const out_v = graph.values.items[@intCast(c.out_id)];
         const slice_vid = try newValue(graph, out_v.dtype.?, out_v.shape, null);
 
-        var starts: [MAX_RANK]usize = .{0} ** MAX_RANK;
+        var starts: [MAX_RANK]usize = @splat(0);
         starts[out_rank - 1] = offset;
         nodes[idx + 1] = .{
             .op = .{ .ViewSliceND = .{

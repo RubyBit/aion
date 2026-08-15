@@ -79,7 +79,7 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
         _ = try readBytes(bytes, &cursor, 32);
         if (file_size != bytes.len) return PackageError.InvalidFormat;
 
-        var refs: [section_slot_count]?SectionRef = .{null} ** section_slot_count;
+        var refs: [section_slot_count]?SectionRef = @splat(null);
         try readSectionDirectory(bytes, dir_offset, section_count, &refs);
         try ensureRequiredSections(refs);
 
@@ -832,7 +832,7 @@ fn readIntCursor(bytes: []const u8, cursor: *usize, comptime T: type) PackageErr
     return switch (@typeInfo(T)) {
         .int => std.mem.readInt(T, slice[0..@sizeOf(T)], .little),
         .float => |float_info| blk: {
-            const IntT = std.meta.Int(.unsigned, float_info.bits);
+            const IntT = @Int(.unsigned, float_info.bits);
             const bits = std.mem.readInt(IntT, @ptrCast(slice[0..@sizeOf(T)]), .little);
             break :blk @bitCast(bits);
         },

@@ -93,6 +93,12 @@ const quant_table: [3]matmul_q_registry.QuantKernels = if (quant_enc_raw == 0) .
 const tier_target = cpu_target.Target{
     .simd_width = cpu_target.simdWidthFromF32Lanes(lanes),
     .preferred_f32_lanes = lanes,
+    .quant_dot = switch (quant_enc_raw) {
+        1 => .vex,
+        2 => .evex,
+        3, 4 => .sdot,
+        else => .f32,
+    },
     .caches = .{},
 };
 

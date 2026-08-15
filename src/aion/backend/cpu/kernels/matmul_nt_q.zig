@@ -40,22 +40,30 @@ fn matmulNtQ8_0Impl(
     const VF = @Vector(LANES, f32);
     const VI8 = @Vector(LANES, i8);
 
-    const blockDot = struct {
-        fn run(block_ptr: [*]const u8, a_base: [*]align(1) const f32) f32 {
-            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-            const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-            const v_scale: VF = @splat(scale);
-
-            var acc: f32 = 0.0;
-            inline for (0..chunks_per_block) |chunk| {
-                const lane_off: usize = chunk * LANES;
-                const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
-                const av: VF = @as(*align(1) const VF, @ptrCast(a_base + lane_off)).*;
-                const qf: VF = @floatFromInt(qv);
-                const prod: VF = qf * (av * v_scale);
-                acc += @reduce(.Add, prod);
+    const rowDot = struct {
+        fn run(b_row: [*]const u8, a_row: [*]align(1) const f32, block_count: usize) f32 {
+            // Keep one independent vector chain per SIMD chunk across the whole K
+            // row, then reduce only once.  A scalar reduction per q8 block creates
+            // a long dependency chain (48 reductions at K=1536); lane positions
+            // are freely additive across blocks, so no intermediate horizontal
+            // sum is required.
+            var acc: [chunks_per_block]VF = @splat(@as(VF, @splat(0.0)));
+            var b: usize = 0;
+            while (b < block_count) : (b += 1) {
+                const block_ptr = b_row + b * Q8_0_BLOCK_BYTES;
+                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
+                const v_scale: VF = @splat(@as(f32, @as(f16, @bitCast(scale_bits))));
+                inline for (0..chunks_per_block) |chunk| {
+                    const lane_off: usize = chunk * LANES;
+                    const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
+                    const av: VF = @as(*align(1) const VF, @ptrCast(a_row + b * Q8_0_BLOCK_ELEMS + lane_off)).*;
+                    const qf: VF = @floatFromInt(qv);
+                    acc[chunk] = @mulAdd(VF, qf, av * v_scale, acc[chunk]);
+                }
             }
-            return acc;
+            var total: VF = acc[0];
+            inline for (1..chunks_per_block) |chunk| total += acc[chunk];
+            return @reduce(.Add, total);
         }
     }.run;
 
@@ -70,12 +78,7 @@ fn matmulNtQ8_0Impl(
                 @prefetch(b_ptr + (j + 1) * row_bytes, .{ .rw = .read, .locality = 3, .cache = .data });
             }
 
-            var acc: f32 = 0.0;
-            var b: usize = 0;
-            while (b < blocks_per_row) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
-            }
+            const acc = rowDot(b_row_base, a_row, blocks_per_row);
 
             if (beta == 0.0) {
                 c_ptr[j] = alpha * acc;
@@ -94,12 +97,7 @@ fn matmulNtQ8_0Impl(
         while (m < m_total) : (m += 1) {
             const a_row: [*]align(1) const f32 = a_ptr + m * k;
 
-            var acc: f32 = 0.0;
-            var b: usize = 0;
-            while (b < blocks_per_row) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                acc += blockDot(b_row_base + block_off, a_row + b * Q8_0_BLOCK_ELEMS);
-            }
+            const acc = rowDot(b_row_base, a_row, blocks_per_row);
 
             const c_idx: usize = m * n_count + j;
             if (beta == 0.0) {

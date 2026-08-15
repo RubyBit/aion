@@ -44,7 +44,7 @@ pub const ThreadPool = struct {
 
     const WorkerSlot = struct {
         job_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-        _padding: [worker_slot_padding_bytes]u8 = [_]u8{0} ** worker_slot_padding_bytes,
+        _padding: [worker_slot_padding_bytes]u8 = @splat(0),
     };
 
     comptime {
@@ -422,8 +422,8 @@ test "thread pool: deterministic partitioning across shapes" {
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
     defer pool.deinit();
 
-    var values: [2048]u32 = .{0} ** 2048;
-    var tids: [2048]usize = .{std.math.maxInt(usize)} ** 2048;
+    var values: [2048]u32 = @splat(0);
+    var tids: [2048]usize = @splat(std.math.maxInt(usize));
 
     const Ctx = struct {
         values: []u32,
@@ -506,7 +506,7 @@ test "thread pool: repeated init and deinit remains stable" {
             var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
             defer pool.deinit();
 
-            var buf: [64]u32 = .{0} ** 64;
+            var buf: [64]u32 = @splat(0);
             var ctx: Ctx = .{ .buf = buf[0..] };
             pool.parallelForAny(@ptrCast(&ctx), ctx.buf.len, 4, fn_ptr);
 
@@ -571,8 +571,8 @@ test "thread pool: concurrent submissions serialize" {
     var submit_entered_b = std.atomic.Value(bool).init(false);
     var callback_count_a = std.atomic.Value(u32).init(0);
     var callback_count_b = std.atomic.Value(u32).init(0);
-    var buf_a: [64]u32 = .{0} ** 64;
-    var buf_b: [64]u32 = .{0} ** 64;
+    var buf_a: [64]u32 = @splat(0);
+    var buf_b: [64]u32 = @splat(0);
 
     var ctx_a: JobCtx = .{
         .buf = buf_a[0..],
@@ -658,8 +658,8 @@ test "thread pool: nested same-pool submission runs inline on caller tid" {
         }
     }.run;
 
-    var outer_tids: [outer_n]usize = .{std.math.maxInt(usize)} ** outer_n;
-    var inner_tids: [outer_n * inner_n]usize = .{std.math.maxInt(usize)} ** (outer_n * inner_n);
+    var outer_tids: [outer_n]usize = @splat(std.math.maxInt(usize));
+    var inner_tids: [outer_n * inner_n]usize = @splat(std.math.maxInt(usize));
     var outer_ctx: OuterCtx = .{
         .pool = &pool,
         .outer_tids = outer_tids[0..],

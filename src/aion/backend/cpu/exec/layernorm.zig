@@ -266,8 +266,8 @@ fn execNormTiledND(
                     if (start >= end) return;
                     if (t.stop.load(.acquire)) return;
 
-                    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-                    var norm_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+                    var coords: [MAX_RANK]usize = @splat(0);
+                    var norm_coords: [MAX_RANK]usize = @splat(0);
 
                     var row_idx: usize = start;
                     while (row_idx < end) : (row_idx += 1) {
@@ -533,8 +533,8 @@ fn execNormTiledND(
     }
 
     // Sequential fallback.
-    var coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
-    var norm_coords: [MAX_RANK]usize = .{0} ** MAX_RANK;
+    var coords: [MAX_RANK]usize = @splat(0);
+    var norm_coords: [MAX_RANK]usize = @splat(0);
 
     var row_idx: usize = 0;
     while (row_idx < row_tile_total) : (row_idx += 1) {

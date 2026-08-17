@@ -34,10 +34,11 @@ pub const gpu = if (@import("build_options").enable_gpu)
     @import("aion/backend/gpu/backend.zig")
 else
     struct {};
-/// Device-memory abstraction + residency decorator. The seam a GPU backend
-/// implements (`DeviceMemory`) and the host<->device staging layer.
-pub const device_memory = @import("aion/runtime/residency/device_memory.zig");
-pub const resident_store = @import("aion/runtime/residency/resident_store.zig");
+/// Device-memory abstraction: the seam a GPU backend implements
+/// (`DeviceMemory`) to allocate device buffers and transfer bytes across the
+/// host boundary. Crossings themselves are explicit `Transfer` steps chosen by
+/// the compiler's placement pass — there is no residency or staging layer.
+pub const device_memory = @import("aion/runtime/device_memory.zig");
 
 /// Publicly exposed backend types and helpers.
 ///

@@ -24,9 +24,6 @@ pub const TensorMeta = struct {
     tile_shape: []const usize,
     tile_counts: []const usize,
     tile_strides: []const usize,
-    /// Monotonic host-write counter (see `TiledTensor.host_seq`). A residency
-    /// layer compares this to detect out-of-band host writes and re-upload.
-    host_seq: u64 = 0,
 };
 
 pub const INLINE_RANK: usize = 8;
@@ -107,8 +104,7 @@ pub const TileRefMut = struct {
 /// stage tiles host<->device behind these methods. Two contracts the residency
 /// layer relies on, and that callers MUST uphold:
 ///   - Lease discipline: every `acquireTile*` is paired with exactly one
-///     matching `release*` (no leak, no double-release). Validated by
-///     `runtime/checked_store.zig`'s `CheckedTensorStore`.
+///     matching `release*` (no leak, no double-release).
 ///   - Read/write intent: `acquireTileConst` signals read-only access;
 ///     `acquireTileMut` signals a write. A device store uses this to decide
 ///     when a host->device upload is needed and when a tile must be marked

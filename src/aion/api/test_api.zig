@@ -3459,6 +3459,12 @@ test "api: symbolic input dim lets one compiled model serve multiple shapes" {
     try runFor(&ctx, &model, 2, &wv);
     try runFor(&ctx, &model, 5, &wv);
     try runFor(&ctx, &model, 1, &wv);
+    const warm = model.planCacheStats();
+    try std.testing.expectEqual(@as(u64, 3), warm.builds);
+    try std.testing.expectEqual(@as(usize, 3), warm.entries);
+    try runFor(&ctx, &model, 2, &wv);
+    const reused = model.planCacheStats();
+    try std.testing.expectEqual(warm.builds, reused.builds);
 }
 
 test "api: symbolic compile still optimizes (parallel projections fuse) across shapes" {

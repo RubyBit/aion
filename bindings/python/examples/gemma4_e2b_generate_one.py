@@ -17,6 +17,19 @@ import aion
 from _common import add_device_args, load_model_with_device
 
 
+def _read_next_token(model, position: int) -> int:
+    """Greedy token id from the model's device-side `next_token` output.
+
+    Shaped [B, T] like the logits it reduces, so `position` selects the same
+    row `np.argmax(logits[0, position])` would have.
+    """
+    t = model.output_tensor("next_token")
+    try:
+        return int(t.numpy()[0, position])
+    finally:
+        t.close()
+
+
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
     repo_root = Path(__file__).resolve().parents[3]
@@ -347,17 +360,11 @@ def main() -> None:
             # No cache bookkeeping: the shared aliased slots already hold prefill's
             # K/V and carry it into the decode loop automatically.
 
-            t0_logits_ns = time.perf_counter_ns()
-            logits_t = model.output_tensor("logits")
-            try:
-                logits = logits_t.numpy()  # [1, S, V]
-            finally:
-                logits_t.close()
-            logits_copy_ns = time.perf_counter_ns() - t0_logits_ns
-
-            # Greedy next token from last position.
+            # Greedy next token from the last position, picked on the execution
+            # device. Outputs are mirrored to the host lazily, so leaving the
+            # [1, S, vocab] logits unread is what skips copying them back.
             t0_argmax_ns = time.perf_counter_ns()
-            next_id = int(np.argmax(logits[0, -1]))
+            next_id = _read_next_token(model, -1)
             argmax_ns = time.perf_counter_ns() - t0_argmax_ns
 
             # Generated token ids (excluding stop tokens for readability).
@@ -389,7 +396,6 @@ def main() -> None:
             model.bind_input("tokens", tokens_step)
 
             decode_total_run_ns: int = 0
-            decode_total_logits_ns: int = 0
             decode_total_argmax_ns: int = 0
             decode_steps_executed: int = 0
             for _ in range(args.max_new_tokens - 1):
@@ -403,16 +409,8 @@ def main() -> None:
                 decode_steps_executed += 1
                 decode_total_run_ns += time.perf_counter_ns() - t0_step_run_ns
 
-                t0_step_logits_ns = time.perf_counter_ns()
-                logits_t = model.output_tensor("logits")
-                try:
-                    logits = logits_t.numpy()  # [1, 1, V]
-                finally:
-                    logits_t.close()
-                decode_total_logits_ns += time.perf_counter_ns() - t0_step_logits_ns
-
                 t0_step_argmax_ns = time.perf_counter_ns()
-                next_id = int(np.argmax(logits[0, 0]))
+                next_id = _read_next_token(model, 0)
                 decode_total_argmax_ns += time.perf_counter_ns() - t0_step_argmax_ns
 
                 if tokenizer is not None and (next_id in stop_tokens):
@@ -437,11 +435,19 @@ def main() -> None:
                 if decode_steps_executed > 0 and decode_total_run_ns > 0:
                     decode_tps = decode_steps_executed / (float(decode_total_run_ns) / 1.0e9)
 
+                # `model.run()` submits without waiting, so on a device backend the
+                # token is not ready when it returns — reading it is where the GPU
+                # wait lands. Tokens/s therefore has to count run + read, or it
+                # reports the rate at which steps are ISSUED, not tokens produced.
+                decode_e2e_ns = decode_total_run_ns + decode_total_argmax_ns
+                decode_e2e_tps = 0.0
+                if decode_steps_executed > 0 and decode_e2e_ns > 0:
+                    decode_e2e_tps = decode_steps_executed / (float(decode_e2e_ns) / 1.0e9)
+
                 if args.timing:
                     print("\n--- timing ---")
                     print(f"tokenize:          {_ns_to_ms(tok_ns):9.3f} ms  (prompt_tokens={s0})")
                     print(f"prefill.run:       {_ns_to_ms(prefill_run_ns):9.3f} ms")
-                    print(f"prefill.logits:    {_ns_to_ms(logits_copy_ns):9.3f} ms  (numpy copy)")
                     print(f"prefill.argmax:    {_ns_to_ms(argmax_ns):9.3f} ms")
                     print(f"generated kept:    {kept_new:9d} tok")
                     if stopped_by is not None:
@@ -449,9 +455,9 @@ def main() -> None:
 
                     if decode_steps_executed > 0:
                         print(f"decode.run total:  {_ns_to_ms(decode_total_run_ns):9.3f} ms  ({decode_steps_executed} steps)")
-                        print(f"decode.logits tot: {_ns_to_ms(decode_total_logits_ns):9.3f} ms")
                         print(f"decode.argmax tot: {_ns_to_ms(decode_total_argmax_ns):9.3f} ms")
                         print(f"decode throughput: {decode_tps:9.2f} tok/s (model.run only)")
+                        print(f"decode e2e:        {decode_e2e_tps:9.2f} tok/s (run + token read)")
                     print(f"total wall:        {_ns_to_ms(t_all_ns):9.3f} ms")
 
                 if args.timing_json:
@@ -464,12 +470,11 @@ def main() -> None:
                         "decode_steps": decode_steps_executed,
                         "tokenize_ns": tok_ns,
                         "prefill_run_ns": prefill_run_ns,
-                        "prefill_logits_ns": logits_copy_ns,
                         "prefill_argmax_ns": argmax_ns,
                         "decode_run_ns": decode_total_run_ns,
-                        "decode_logits_ns": decode_total_logits_ns,
                         "decode_argmax_ns": decode_total_argmax_ns,
                         "decode_tokens_per_second": decode_tps,
+                        "decode_e2e_tokens_per_second": decode_e2e_tps,
                         "total_wall_ns": t_all_ns,
                         "instrumentation": [
                             name

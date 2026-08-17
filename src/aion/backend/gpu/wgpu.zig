@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const env_util = @import("../../env.zig");
 
 /// The translate-c'd wgpu.h: **types, enums and constants only** (`c.WGPU…`).
 /// These are header-level declarations, so referencing them creates no link
@@ -25,6 +26,8 @@ pub const Error = error{
     MapFailed,
     BufferCreate,
     BadAdapterIndex,
+    /// The adapter lacks `shader-f16`; f16 tensors are stored and addressed natively.
+    NoShaderF16,
     /// wgpu-native could not be loaded (no `aion-wgpu` package / system library).
     Unavailable,
 };
@@ -50,7 +53,7 @@ pub const Error = error{
 /// — `ensureLoaded` resolves exactly these fields by name, and calling a wgpu
 /// function that is not a field here is a COMPILE error, which keeps the set
 /// exhaustive by construction. Call through it as `fns.wgpuXxx(args)`.
-/// Handrolled because std.DynLib is @compileError on win 
+/// Handrolled because std.DynLib is @compileError on win
 const Procs = struct {
     wgpuAdapterGetInfo: *const @TypeOf(c.wgpuAdapterGetInfo),
     wgpuAdapterGetLimits: *const @TypeOf(c.wgpuAdapterGetLimits),
@@ -141,8 +144,9 @@ const default_names: []const [:0]const u8 = switch (builtin.os.tag) {
 };
 
 fn openLibrary() ?LibHandle {
-    if (std.c.getenv("AION_WGPU_LIB")) |env| {
-        const path = std.mem.span(env);
+    const override = env_util.getOwned(std.heap.page_allocator, "AION_WGPU_LIB");
+    defer if (override) |path| std.heap.page_allocator.free(path);
+    if (override) |path| {
         if (path.len != 0) {
             if (dlOpen(path)) |h| return h;
         }
@@ -403,16 +407,20 @@ pub const Gpu = struct {
         var adapter_limits: c.WGPULimits = std.mem.zeroes(c.WGPULimits);
         const have_adapter_limits = fns.wgpuAdapterGetLimits(adapter, &adapter_limits) == c.WGPUStatus_Success;
 
+        // shader-f16 is required, not probed: f16 tensors are bound as `array<f16>`.
+        if (fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_ShaderF16) == 0) return Error.NoShaderF16;
+
         const want_timestamps = fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0;
         var timestamp_query = want_timestamps;
-        const device = requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, timestamp_query) orelse
+        const lim: ?*const c.WGPULimits = if (have_adapter_limits) &adapter_limits else null;
+        const device = requestDevice(instance, adapter, lim, timestamp_query) orelse
             requestDevice(instance, adapter, null, timestamp_query) orelse fallback: {
-                // A buggy adapter may advertise TimestampQuery but reject it at
-                // device creation. Profiling is optional; device execution is not.
-                timestamp_query = false;
-                break :fallback requestDevice(instance, adapter, if (have_adapter_limits) &adapter_limits else null, false) orelse
-                    (requestDevice(instance, adapter, null, false) orelse return Error.NoDevice);
-            };
+            // A buggy adapter may advertise TimestampQuery but reject it at
+            // device creation. Profiling is optional; device execution is not.
+            timestamp_query = false;
+            break :fallback requestDevice(instance, adapter, lim, false) orelse
+                (requestDevice(instance, adapter, null, false) orelse return Error.NoDevice);
+        };
         errdefer fns.wgpuDeviceRelease(device);
 
         // Re-query the GRANTED limits (may be the requested ones, or defaults).
@@ -431,11 +439,9 @@ pub const Gpu = struct {
     fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits, timestamps: bool) ?c.WGPUDevice {
         var desc: c.WGPUDeviceDescriptor = std.mem.zeroes(c.WGPUDeviceDescriptor);
         desc.requiredLimits = required;
-        var required_features = [_]c.WGPUFeatureName{c.WGPUFeatureName_TimestampQuery};
-        if (timestamps) {
-            desc.requiredFeatureCount = required_features.len;
-            desc.requiredFeatures = &required_features;
-        }
+        var required_features = [_]c.WGPUFeatureName{ c.WGPUFeatureName_ShaderF16, c.WGPUFeatureName_TimestampQuery };
+        desc.requiredFeatureCount = if (timestamps) required_features.len else 1;
+        desc.requiredFeatures = &required_features;
         // Shrink the allocator's suballocation blocks. wgpu's default hint
         // (Performance) commits 128 MiB device + 64 MiB host blocks for the
         // handful of tiny internal allocations made at device open (~200 MiB
@@ -518,6 +524,13 @@ pub const Gpu = struct {
     }
 
     /// Synchronously map `buffer` (blocks via the event loop).
+    /// Map `buffer` and block until the callback fires.
+    ///
+    /// The wait is a blocking device poll, not an event-pump spin: a map callback
+    /// cannot fire until the queue work the buffer depends on completes, so polling
+    /// with wait=true is both the cheapest way to get there (no busy loop) and
+    /// robust to an arbitrarily long queue ahead of it. That is why callers need no
+    /// separate drain before mapping — this single wait covers both.
     pub fn mapBlocking(self: *Gpu, buffer: c.WGPUBuffer, mode: c.WGPUMapMode, offset: usize, size: usize) Error!void {
         var mreq: MapReq = .{};
         _ = fns.wgpuBufferMapAsync(buffer, mode, offset, size, .{
@@ -527,7 +540,12 @@ pub const Gpu = struct {
             .userdata1 = &mreq,
             .userdata2 = null,
         });
-        if (!pumpUntil(self.instance, &mreq.done)) return Error.MapTimeout;
+        var i: usize = 0;
+        while (!mreq.done) : (i += 1) {
+            if (i > 1024) return Error.MapTimeout;
+            _ = fns.wgpuDevicePoll(self.device, 1, null); // wait = true
+            fns.wgpuInstanceProcessEvents(self.instance);
+        }
         if (mreq.status != c.WGPUMapAsyncStatus_Success) return Error.MapFailed;
     }
 
@@ -546,14 +564,8 @@ pub const Gpu = struct {
         fns.wgpuQueueSubmit(self.queue, 1, &cmd);
         fns.wgpuCommandBufferRelease(cmd);
 
-        // Block until all submitted work (the compute that produced `src`, then the
-        // copy above) is done. Without this, `mapBlocking`'s bounded event-pump can
-        // give up before a long compute finishes (a heavy batched submit can run
-        // longer than the pump's iteration budget), surfacing as a spurious map
-        // timeout. Polling with wait=true makes readback robust regardless of how
-        // much work was queued.
-        _ = fns.wgpuDevicePoll(self.device, 1, null);
-
+        // `mapBlocking` waits on the device, so it also covers the compute that
+        // produced `src` and the copy above — no separate drain.
         try self.mapBlocking(staging, c.WGPUMapMode_Read, 0, dst.len);
         const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return Error.MapFailed;
         @memcpy(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);

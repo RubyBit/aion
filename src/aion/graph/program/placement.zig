@@ -1,0 +1,202 @@
+//! Placement pass for lowered executable programs.
+//!
+//! Assigns one placement per tensor, inserts explicit device-to-host transfers
+//! for control-flow reads, and records sequence-cache growth sites. Physical
+//! allocation is deliberately left to workspace/materialization.
+
+const std = @import("std");
+const executable = @import("../../runtime/executable.zig");
+const manager_mod = @import("../../storage/manager.zig");
+const plan_mod = @import("../plan.zig");
+
+const StorageManager = manager_mod.StorageManager;
+const TensorId = manager_mod.TensorId;
+const Program = executable.ExecutableProgram;
+const PlacedStep = executable.PlacedStep;
+
+pub const Error = error{ InvalidArgument, OutOfMemory };
+
+/// Assign placements and make every host read explicit.
+///
+/// Every non-transfer step executes at the compile target. A control operand
+/// interpreted by the CPU receives a host mirror and an explicit Transfer.
+pub fn place(
+    allocator: std.mem.Allocator,
+    mgr: *StorageManager,
+    prog: *Program,
+    owned: *std.ArrayList(TensorId),
+    policy: plan_mod.TilePolicy,
+) Error!void {
+    const target: executable.Placement = .{ .kind = policy.target_kind };
+    prog.target = target;
+    for (prog.steps) |*placed| placed.placement = target;
+    for (prog.blocks) |block| {
+        for (block.steps) |*placed| placed.placement = target;
+    }
+
+    // Collect before rewriting so growth requests name graph-produced operands
+    // and can still be matched to runtime input slots.
+    prog.growth_requests = try collectGrowthRequests(allocator, prog);
+
+    var mirrors: std.AutoHashMap(TensorId, TensorId) = .init(allocator);
+    defer mirrors.deinit();
+    var refreshes: std.ArrayList(LoopCondRefresh) = .empty;
+    defer refreshes.deinit(allocator);
+
+    var ctx: HoistCtx = .{
+        .allocator = allocator,
+        .mgr = mgr,
+        .owned = owned,
+        .mirrors = &mirrors,
+        .refreshes = &refreshes,
+        .target = target,
+    };
+    for (prog.blocks) |*block| block.steps = try ctx.hoist(block.steps);
+    prog.steps = try ctx.hoist(prog.steps);
+
+    for (refreshes.items) |request| {
+        const idx: usize = @intCast(request.block);
+        if (idx >= prog.blocks.len) return error.InvalidArgument;
+        var list = std.ArrayList(PlacedStep).fromOwnedSlice(prog.blocks[idx].steps);
+        list.append(allocator, .{ .op = .{ .Transfer = request.transfer } }) catch return error.OutOfMemory;
+        prog.blocks[idx].steps = list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
+    try collectPlacements(allocator, prog, &mirrors, target);
+}
+
+const LoopCondRefresh = struct {
+    block: executable.BlockId,
+    transfer: executable.StepTransfer,
+};
+
+const HoistCtx = struct {
+    allocator: std.mem.Allocator,
+    mgr: *StorageManager,
+    owned: *std.ArrayList(TensorId),
+    mirrors: *std.AutoHashMap(TensorId, TensorId),
+    refreshes: *std.ArrayList(LoopCondRefresh),
+    target: executable.Placement,
+
+    fn hoist(self: *HoistCtx, old_steps: []PlacedStep) Error![]PlacedStep {
+        var out: std.ArrayList(PlacedStep) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        for (old_steps) |original| {
+            var placed = original;
+            const mask = executable.controlHostOperands(&placed.op);
+            if (mask != 0) {
+                const uses = executable.tensorUses(&placed.op);
+                const loop_cond: ?*const TensorId = if (placed.op == .Loop and placed.op.Loop.cond != null)
+                    &placed.op.Loop.cond.?
+                else
+                    null;
+                for (uses.slice(), 0..) |use, i| {
+                    if (mask & (@as(u64, 1) << @intCast(i)) == 0) continue;
+                    const source = use.id.*;
+                    if (self.target.kind == .cpu) continue;
+                    const mirror = try self.transferToHost(&out, source);
+                    use.id.* = mirror;
+                    if (loop_cond) |field| if (use.id == field) {
+                        self.refreshes.append(self.allocator, .{
+                            .block = placed.op.Loop.body_block,
+                            .transfer = .{ .dst = mirror, .src = source, .source = self.target, .destination = .{} },
+                        }) catch return error.OutOfMemory;
+                    };
+                }
+                placed.host_operands = mask;
+            }
+            out.append(self.allocator, placed) catch return error.OutOfMemory;
+        }
+        const new_steps = out.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        self.allocator.free(old_steps);
+        return new_steps;
+    }
+
+    fn transferToHost(self: *HoistCtx, out: *std.ArrayList(PlacedStep), source: TensorId) Error!TensorId {
+        const dst = self.mirrors.get(source) orelse blk: {
+            const src = self.mgr.getConst(source) catch return error.InvalidArgument;
+            const mirror = self.mgr.createTiledTensor(src.dtype, src.shape, src.tile_shape, .{
+                .tile_alignment = src.tile_alignment,
+                .quant_axis = src.quant_axis,
+            }) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidArgument,
+            };
+            self.owned.append(self.allocator, mirror) catch {
+                self.mgr.releaseTensorData(mirror) catch {};
+                return error.OutOfMemory;
+            };
+            self.mirrors.put(source, mirror) catch return error.OutOfMemory;
+            break :blk mirror;
+        };
+        out.append(self.allocator, .{
+            .op = .{ .Transfer = .{ .dst = dst, .src = source, .source = self.target, .destination = .{} } },
+        }) catch return error.OutOfMemory;
+        return dst;
+    }
+};
+
+fn collectGrowthRequests(allocator: std.mem.Allocator, prog: *const Program) Error![]executable.GrowthRequest {
+    var out: std.ArrayList(executable.GrowthRequest) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (prog.steps) |placed| try noteGrowthRequest(allocator, &out, placed);
+    for (prog.blocks) |block| {
+        for (block.steps) |placed| try noteGrowthRequest(allocator, &out, placed);
+    }
+    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+fn noteGrowthRequest(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(executable.GrowthRequest),
+    placed: PlacedStep,
+) Error!void {
+    const append = switch (placed.op) {
+        .SequenceAppendTiled => |s| s,
+        else => return,
+    };
+    out.append(allocator, .{
+        .cache = append.cache,
+        .new_kv = append.new_kv,
+        .end_index = append.end_index,
+    }) catch return error.OutOfMemory;
+}
+
+fn collectPlacements(
+    allocator: std.mem.Allocator,
+    prog: *Program,
+    mirrors: *const std.AutoHashMap(TensorId, TensorId),
+    target: executable.Placement,
+) Error!void {
+    var host_side: std.AutoHashMap(TensorId, void) = .init(allocator);
+    defer host_side.deinit();
+    var it_mirror = mirrors.valueIterator();
+    while (it_mirror.next()) |mirror| host_side.put(mirror.*, {}) catch return error.OutOfMemory;
+    var seen: std.AutoHashMap(TensorId, void) = .init(allocator);
+    defer seen.deinit();
+
+    for (prog.steps) |*placed| try noteTensors(&seen, placed);
+    for (prog.blocks) |block| {
+        for (block.steps) |*placed| try noteTensors(&seen, placed);
+    }
+
+    const list = allocator.alloc(executable.TensorPlacement, seen.count()) catch return error.OutOfMemory;
+    var i: usize = 0;
+    var it = seen.keyIterator();
+    while (it.next()) |id| : (i += 1) {
+        list[i] = .{ .id = id.*, .placement = if (host_side.contains(id.*)) .{} else target };
+    }
+    std.mem.sort(executable.TensorPlacement, list, {}, struct {
+        fn lt(_: void, a: executable.TensorPlacement, b: executable.TensorPlacement) bool {
+            return a.id < b.id;
+        }
+    }.lt);
+    prog.tensor_placements = list;
+}
+
+fn noteTensors(seen: *std.AutoHashMap(TensorId, void), placed: *PlacedStep) Error!void {
+    const uses = executable.tensorUses(&placed.op);
+    for (uses.slice()) |use| seen.put(use.id.*, {}) catch return error.OutOfMemory;
+}

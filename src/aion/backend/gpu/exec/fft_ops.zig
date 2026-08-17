@@ -59,7 +59,7 @@ fn fftCoopEligible(n: u32, groups: u32, limits: wgpu.Limits) bool {
 }
 
 pub fn execRFFT(ctx: Ctx, frame: *Frame, s: executable.StepRFFT) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
 
@@ -70,8 +70,8 @@ pub fn execRFFT(ctx: Ctx, frame: *Frame, s: executable.StepRFFT) ExecuteProgramE
     if (n_fft < 4 or (n_fft & (n_fft - 1)) != 0) return error.Unsupported;
     const bins = n_fft / 2 + 1;
 
-    const dx = ctx.rstore.acquireTileDeviceConstLinear(s.x, 0) catch return error.ExecutionFailed;
-    const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+    const dx = ctx.store.acquireTileDeviceConstLinear(s.x, 0) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
     defer {
         hs.releaseConst(dx.token);
         hs.releaseMut(dout.token);
@@ -109,7 +109,7 @@ pub fn execRFFT(ctx: Ctx, frame: *Frame, s: executable.StepRFFT) ExecuteProgramE
 }
 
 pub fn execSTFT(ctx: Ctx, frame: *Frame, s: executable.StepSTFT) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const sig_meta = hs.meta(s.signal) catch return error.ExecutionFailed;
     const win_meta = hs.meta(s.window) catch return error.ExecutionFailed;
@@ -127,9 +127,9 @@ pub fn execSTFT(ctx: Ctx, frame: *Frame, s: executable.StepSTFT) ExecuteProgramE
     if (batch == 0 or frames == 0) return;
     if (win_meta.shape[0] != n_fft) return error.Unsupported;
 
-    const dsig = ctx.rstore.acquireTileDeviceConstLinear(s.signal, 0) catch return error.ExecutionFailed;
-    const dwin = ctx.rstore.acquireTileDeviceConstLinear(s.window, 0) catch return error.ExecutionFailed;
-    const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+    const dsig = ctx.store.acquireTileDeviceConstLinear(s.signal, 0) catch return error.ExecutionFailed;
+    const dwin = ctx.store.acquireTileDeviceConstLinear(s.window, 0) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
     defer {
         hs.releaseConst(dsig.token);
         hs.releaseConst(dwin.token);

@@ -150,7 +150,6 @@ pub const Tensor = struct {
         const src_tensor = try src.store.getConst(src.id);
         if (canRawCopyTiled(dst_tensor, src_tensor)) {
             @memcpy(dst_tensor.data, src_tensor.data);
-            dst_tensor.host_seq +%= 1; // host mutation: invalidate any device copy
             return;
         }
 

@@ -23,7 +23,7 @@ const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
-const resident_mod = @import("../../../runtime/residency/resident_store.zig");
+const device_store = @import("../../../runtime/device_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 
 const c = wgpu.c;
@@ -139,6 +139,12 @@ const CachedParams = extern struct {
     has_lengths: u32,
     rl: u32,
     rh: u32,
+    /// The bound k/v tile's physical time range, and which partial slots this
+    /// dispatch owns. A single-tile cache is `{0, t_cap, 0, segs}`.
+    kv_t0: u32 = 0,
+    kv_tile_t: u32 = 0,
+    seg_base: u32 = 0,
+    segs_local: u32 = 1,
 };
 
 /// Field order matches `struct Params` in attention_merge.wgsl.
@@ -165,7 +171,7 @@ const packedElemsSized = context.packedElemsSized;
 /// The compile contract tiles q/k/v/out `[B, T, H, D]` as `[1, T, 1, D]`, so
 /// each slice is one contiguous `[T, D]` panel.
 pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const q_meta = hs.meta(s.q) catch return error.ExecutionFailed;
     const k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
@@ -196,13 +202,13 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
     const built = try ctx.pipes.get(relpos_kernel, "relpos_mha_row");
 
     // Mask: single packed tile, bound once (dummy = q when absent).
-    var mask_tile: ?resident_mod.TileRefDevice = null;
+    var mask_tile: ?device_store.TileRef = null;
     defer if (mask_tile) |mt| hs.releaseConst(mt.token);
     if (s.mask) |mid| {
         const m_meta = hs.meta(mid) catch return error.ExecutionFailed;
         if (m_meta.rank != 2 or m_meta.dtype != .f32) return error.Unsupported;
         if (context.totalTiles(m_meta) != 1) return error.Unsupported;
-        const mt = ctx.rstore.acquireTileDeviceConstLinear(mid, 0) catch return error.ExecutionFailed;
+        const mt = ctx.store.acquireTileDeviceConstLinear(mid, 0) catch return error.ExecutionFailed;
         mask_tile = mt;
         const mn = context.packedElems(mt.rank, mt.shape_mem[0..2], mt.strides_mem[0..2]) orelse return error.Unsupported;
         if (mn < t_q * t_kv) return error.Unsupported;
@@ -214,17 +220,17 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
         while (h < heads) : (h += 1) {
             const qkv_coords = [4]usize{ b, 0, h, 0 };
             const q_lin = tensor_store_mod.encodeTileIndex(q_meta, &qkv_coords) catch return error.ExecutionFailed;
-            const dq = ctx.rstore.acquireTileDeviceConstLinear(s.q, q_lin) catch return error.ExecutionFailed;
-            const dk_t = ctx.rstore.acquireTileDeviceConstLinear(s.k, q_lin) catch return error.ExecutionFailed;
-            const dv_t = ctx.rstore.acquireTileDeviceConstLinear(s.v, q_lin) catch return error.ExecutionFailed;
-            const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, q_lin) catch return error.ExecutionFailed;
+            const dq = ctx.store.acquireTileDeviceConstLinear(s.q, q_lin) catch return error.ExecutionFailed;
+            const dk_t = ctx.store.acquireTileDeviceConstLinear(s.k, q_lin) catch return error.ExecutionFailed;
+            const dv_t = ctx.store.acquireTileDeviceConstLinear(s.v, q_lin) catch return error.ExecutionFailed;
+            const dout = ctx.store.acquireTileDeviceMutLinear(s.out, q_lin) catch return error.ExecutionFailed;
 
             const pe_ts0 = pe_meta.tile_shape[0];
-            const dpe = ctx.rstore.acquireTileDeviceConstLinear(s.pos_emb, h / pe_ts0) catch return error.ExecutionFailed;
+            const dpe = ctx.store.acquireTileDeviceConstLinear(s.pos_emb, h / pe_ts0) catch return error.ExecutionFailed;
             const bu_ts0 = bu_meta.tile_shape[0];
-            const dbu = ctx.rstore.acquireTileDeviceConstLinear(s.pos_bias_u, h / bu_ts0) catch return error.ExecutionFailed;
+            const dbu = ctx.store.acquireTileDeviceConstLinear(s.pos_bias_u, h / bu_ts0) catch return error.ExecutionFailed;
             const bv_ts0 = bv_meta.tile_shape[0];
-            const dbv = ctx.rstore.acquireTileDeviceConstLinear(s.pos_bias_v, h / bv_ts0) catch return error.ExecutionFailed;
+            const dbv = ctx.store.acquireTileDeviceConstLinear(s.pos_bias_v, h / bv_ts0) catch return error.ExecutionFailed;
             defer {
                 hs.releaseConst(dq.token);
                 hs.releaseConst(dk_t.token);
@@ -288,13 +294,13 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
 /// operands, a plain sequence otherwise. One dispatch per out/q tile with a
 /// workgroup per (b, l, hq); everything except cache growth stays on-device.
 pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const has_pos: bool = s.query_positions != null;
     const has_lengths: bool = s.kv_lengths != null;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const q_meta = hs.meta(s.q) catch return error.ExecutionFailed;
-    var k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
-    var v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
+    const k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
+    const v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
     const pos_meta = if (s.query_positions) |t| hs.meta(t) catch return error.ExecutionFailed else null;
     const lengths_meta = if (s.kv_lengths) |t| hs.meta(t) catch return error.ExecutionFailed else null;
 
@@ -312,9 +318,16 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     if (has_lengths and lengths_meta.?.dtype != .i32) return error.Unsupported;
 
     if (out_meta.tile_counts[3] != 1 or q_meta.tile_counts[3] != 1) return error.Unsupported;
-    // v1: each cache is ONE device buffer (decode caches are created that way);
+    // A cache may be split across bindings along TIME only: every other axis
+    // must be whole, since a key row must live entirely in one tile. K and V
+    // must be split identically so one segment covers the same range of both.
     // K/V lengths are a single tiny tile.
-    if (context.totalTiles(k_meta) != 1 or context.totalTiles(v_meta) != 1) return error.Unsupported;
+    for ([_]usize{ 0, 2, 3 }) |axis| {
+        if (k_meta.tile_counts[axis] != 1 or v_meta.tile_counts[axis] != 1) return error.Unsupported;
+    }
+    const kv_tiles = context.totalTiles(k_meta);
+    if (context.totalTiles(v_meta) != kv_tiles) return error.Unsupported;
+    if (k_meta.tile_shape[1] != v_meta.tile_shape[1]) return error.Unsupported;
     if (has_lengths and context.totalTiles(lengths_meta.?) != 1) return error.Unsupported;
 
     const batch = q_meta.shape[0];
@@ -330,26 +343,9 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     if (kv_f16 and (d_k % 2 != 0 or d_v % 2 != 0)) return error.Unsupported; // word-aligned rows
     if (has_lengths and lengths_meta.?.shape[0] < batch) return error.Unsupported;
 
-    // Pre-touch cache growth on the host (growable policies may reallocate), then
-    // re-fetch metadata — same protocol as the CPU executor. Only a cache can grow,
-    // so a plain sequence skips the host round-trip entirely.
-    if (has_lengths) {
-        const tile = hs.acquireTileConstLinear(s.kv_lengths.?, 0) catch return error.ExecutionFailed;
-        defer hs.releaseConst(tile.token);
-        const ptr: [*]align(1) const i32 = @ptrCast(tile.bytes.ptr);
-        const vals = ptr[0 .. tile.bytes.len / @sizeOf(i32)];
-        if (vals.len < batch) return error.ExecutionFailed;
-        var b: usize = 0;
-        while (b < batch) : (b += 1) {
-            if (vals[b] < 0) return error.ExecutionFailed;
-            const valid_end: usize = @intCast(vals[b]);
-            if (valid_end == 0) continue;
-            _ = hs.mapSequenceStep(s.k, valid_end - 1, k_meta.shape[1]) catch return error.ExecutionFailed;
-            _ = hs.mapSequenceStep(s.v, valid_end - 1, v_meta.shape[1]) catch return error.ExecutionFailed;
-        }
-    }
-    k_meta = hs.meta(s.k) catch return error.ExecutionFailed;
-    v_meta = hs.meta(s.v) catch return error.ExecutionFailed;
+    // Attention is a read of K/V state, not an allocator. Sequence append (or
+    // the model boundary for growable state) establishes capacity before this
+    // frame is recorded.
     const t_cap = k_meta.shape[1];
     if (v_meta.shape[1] != t_cap or t_cap == 0) return error.Unsupported;
 
@@ -366,24 +362,17 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     const built = try ctx.pipes.get(attn_kernel, "attn_row");
 
     const kv_elem: usize = if (kv_f16) 2 else 4;
-    const dk_c = ctx.rstore.acquireTileDeviceConstLinear(s.k, 0) catch return error.ExecutionFailed;
-    const dv_c = ctx.rstore.acquireTileDeviceConstLinear(s.v, 0) catch return error.ExecutionFailed;
+    const kv_tile_t = k_meta.tile_shape[1];
     // WGSL has no optional binding, so slots 3/4 must be filled even when the
     // kernel never reads them: `dq` stands in, gated off by `has_idx`. Same
     // dummy-operand idiom `execRelPosMHA` uses for its optional mask.
-    const dend_opt: ?resident_mod.TileRefDevice = if (s.kv_lengths) |t|
-        ctx.rstore.acquireTileDeviceConstLinear(t, 0) catch return error.ExecutionFailed
+    const dend_opt: ?device_store.TileRef = if (s.kv_lengths) |t|
+        ctx.store.acquireTileDeviceConstLinear(t, 0) catch return error.ExecutionFailed
     else
         null;
     defer {
-        hs.releaseConst(dk_c.token);
-        hs.releaseConst(dv_c.token);
         if (dend_opt) |d| hs.releaseConst(d.token);
     }
-    if (!context.storageBindingFits(ctx, dk_c.len) or !context.storageBindingFits(ctx, dv_c.len)) return error.Unsupported;
-    if (packedElemsSized(dk_c.rank, dk_c.shape_mem[0..4], dk_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
-    if (packedElemsSized(dv_c.rank, dv_c.shape_mem[0..4], dv_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
-    if (dk_c.shape_mem[1] != t_cap or dv_c.shape_mem[1] != t_cap) return error.Unsupported;
 
     const total = context.totalTiles(out_meta);
     var ti: usize = 0;
@@ -391,12 +380,12 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
         var coords: [tensor_store_mod.INLINE_RANK]usize = @splat(0);
         tensor_store_mod.decodeTileCoords(out_meta, ti, coords[0..4]) catch return error.ExecutionFailed;
 
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         const q_lin = tensor_store_mod.encodeTileIndex(q_meta, coords[0..4]) catch return error.ExecutionFailed;
-        const dq = ctx.rstore.acquireTileDeviceConstLinear(s.q, q_lin) catch return error.ExecutionFailed;
-        const dpos_opt: ?resident_mod.TileRefDevice = if (s.query_positions) |pid| blk: {
+        const dq = ctx.store.acquireTileDeviceConstLinear(s.q, q_lin) catch return error.ExecutionFailed;
+        const dpos_opt: ?device_store.TileRef = if (s.query_positions) |pid| blk: {
             const pos_lin = tensor_store_mod.encodeTileIndex(pos_meta.?, coords[0..2]) catch return error.ExecutionFailed;
-            break :blk ctx.rstore.acquireTileDeviceConstLinear(pid, pos_lin) catch return error.ExecutionFailed;
+            break :blk ctx.store.acquireTileDeviceConstLinear(pid, pos_lin) catch return error.ExecutionFailed;
         } else null;
         defer {
             hs.releaseMut(dout.token);
@@ -481,7 +470,9 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             .kv_f16 = @intFromBool(kv_f16),
             .scale = s.scale,
             .soft_cap = s.attn_logits_soft_cap,
-            .segs = @intCast(segs),
+            .segs = @intCast(kv_tiles * segs),
+            .kv_tile_t = std.math.cast(u32, kv_tile_t) orelse return error.Unsupported,
+            .segs_local = @intCast(segs),
             // Without explicit query positions, a query's position is its GLOBAL row, so the
             // kernel needs this tile's offset along L.
             .base_l = @intCast(coords[1] * out_meta.tile_shape[1]),
@@ -491,12 +482,33 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             .rh = @intCast(rh),
         };
 
-        if (segs > 1) {
+        // Split path whenever there is more than one partial slot in total: an
+        // adaptive key split, a cache split across bindings, or both. Each k/v
+        // tile is its own dispatch (a tile is a distinct buffer), writing the
+        // slots `[tile * segs, (tile + 1) * segs)`; `attn_merge` then combines
+        // every slot exactly as it combines ordinary split-K segments.
+        if (kv_tiles * segs > 1) {
             const stride: usize = d_v + 2;
-            const part_bytes: u64 = @as(u64, rows_total) * segs * stride * @sizeOf(f32);
+            const part_bytes: u64 = @as(u64, rows_total) * kv_tiles * segs * stride * @sizeOf(f32);
             const scratch = ctx.scratch.ensure(ctx.gpu, part_bytes) catch return error.ExecutionFailed;
-            {
-                const b1 = try ctx.pipes.get(attn_kernel, "attn_split");
+            const b1 = try ctx.pipes.get(attn_kernel, "attn_split");
+
+            var kv_i: usize = 0;
+            while (kv_i < kv_tiles) : (kv_i += 1) {
+                const dk_c = ctx.store.acquireTileDeviceConstLinear(s.k, kv_i) catch return error.ExecutionFailed;
+                defer hs.releaseConst(dk_c.token);
+                const dv_c = ctx.store.acquireTileDeviceConstLinear(s.v, kv_i) catch return error.ExecutionFailed;
+                defer hs.releaseConst(dv_c.token);
+                if (!context.storageBindingFits(ctx, dk_c.len) or !context.storageBindingFits(ctx, dv_c.len)) return error.Unsupported;
+                if (packedElemsSized(dk_c.rank, dk_c.shape_mem[0..4], dk_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
+                if (packedElemsSized(dv_c.rank, dv_c.shape_mem[0..4], dv_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
+                if (dk_c.shape_mem[1] != dv_c.shape_mem[1]) return error.Unsupported;
+
+                var tile_params = params;
+                tile_params.kv_t0 = std.math.cast(u32, kv_i * kv_tile_t) orelse return error.Unsupported;
+                tile_params.kv_tile_t = std.math.cast(u32, dk_c.shape_mem[1]) orelse return error.Unsupported;
+                tile_params.seg_base = std.math.cast(u32, kv_i * segs) orelse return error.Unsupported;
+
                 const bufs = [_]c.WGPUBuffer{
                     ctx.devmem.bufferFor(dq.handle).?,
                     ctx.devmem.bufferFor(dk_c.handle).?,
@@ -506,7 +518,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
                     scratch,
                 };
                 const sizes = [_]u64{ dq.len, dk_c.len, dv_c.len, idx_sizes[0], idx_sizes[1], part_bytes };
-                try frame.recordCompute(b1, &bufs, &sizes, std.mem.asBytes(&params), .{
+                try frame.recordCompute(b1, &bufs, &sizes, std.mem.asBytes(&tile_params), .{
                     @intCast(grid_h),
                     @intCast(grid_l),
                     @intCast(tb * segs),
@@ -516,7 +528,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
                 const b2 = try ctx.pipes.get(merge_kernel, "attn_merge");
                 const mp: MergeParams = .{
                     .rows = @intCast(rows_total),
-                    .segs = @intCast(segs),
+                    .segs = @intCast(kv_tiles * segs),
                     .dv = @intCast(d_v),
                     .stride = @intCast(stride),
                 };
@@ -530,6 +542,17 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             }
             continue;
         }
+
+        // One partial slot means one k/v tile and no key split: bind it directly
+        // and let the kernel normalize in place.
+        const dk_c = ctx.store.acquireTileDeviceConstLinear(s.k, 0) catch return error.ExecutionFailed;
+        defer hs.releaseConst(dk_c.token);
+        const dv_c = ctx.store.acquireTileDeviceConstLinear(s.v, 0) catch return error.ExecutionFailed;
+        defer hs.releaseConst(dv_c.token);
+        if (!context.storageBindingFits(ctx, dk_c.len) or !context.storageBindingFits(ctx, dv_c.len)) return error.Unsupported;
+        if (packedElemsSized(dk_c.rank, dk_c.shape_mem[0..4], dk_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
+        if (packedElemsSized(dv_c.rank, dv_c.shape_mem[0..4], dv_c.strides_mem[0..4], kv_elem) == null) return error.Unsupported;
+        if (dk_c.shape_mem[1] != t_cap or dv_c.shape_mem[1] != t_cap) return error.Unsupported;
 
         const bufs = [_]c.WGPUBuffer{
             ctx.devmem.bufferFor(dq.handle).?,

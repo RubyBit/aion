@@ -79,6 +79,11 @@ pub const LoadModelOptions = struct {
     /// tokens-role input. Ignored when the package declares no such roles.
     /// A manual `bindInput` on a role input always overrides its auto value.
     auto_positions: bool = true,
+
+    /// Maximum physical bytes retained by exact-shape compiled
+    /// specializations. Eviction is LRU and an individual specialization may
+    /// exceed the budget (in which case it is retained alone).
+    plan_cache_budget_bytes: usize = 256 * 1024 * 1024,
 };
 
 pub const invalid_alias_index: u32 = std.math.maxInt(u32);

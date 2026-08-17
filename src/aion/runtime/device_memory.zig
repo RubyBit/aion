@@ -2,12 +2,10 @@
 //
 //! `DeviceMemory` — an API-agnostic device-buffer allocator + host<->device
 //! transfer interface. WebGPU/Vulkan/Metal/CUDA each implement this vtable; the
-//! residency layer (`resident_store.zig`) is written against it and never names
-//! a concrete GPU API.
+//! storage migration and transfer code use it without naming a concrete GPU API.
 //!
 //! `MockDeviceMemory` is a host-backed implementation (a second allocation +
-//! `@memcpy`) that lets the residency staging/dirty/swap logic be exercised in
-//! ordinary CPU tests with no GPU present.
+//! `@memcpy`) used to test placement and explicit copies without a GPU.
 
 const std = @import("std");
 
@@ -42,6 +40,11 @@ pub const DeviceMemory = struct {
         copyH2D: *const fn (ctx: *anyopaque, handle: DeviceHandle, dst_offset: usize, src: []const u8) DeviceError!void,
         /// Device -> host copy from `handle` at `src_offset` into `dst`.
         copyD2H: *const fn (ctx: *anyopaque, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void,
+        /// Device -> device copy of `bytes` between two buffers of this device.
+        /// Every target API has this (WebGPU `copyBufferToBuffer`, CUDA
+        /// `cudaMemcpyDeviceToDevice`, Metal blit, `vkCmdCopyBuffer`), so
+        /// reallocation never has to route a tensor through host memory.
+        copyD2D: *const fn (ctx: *anyopaque, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void,
         /// Unified-memory only: register an existing host allocation as a
         /// device-bindable buffer with NO copy (the handle aliases `host`). Null
         /// on discrete devices. Mirrors Vulkan VK_EXT_external_memory_host /
@@ -71,6 +74,9 @@ pub const DeviceMemory = struct {
     }
     pub fn copyD2H(self: DeviceMemory, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void {
         return self.vtable.copyD2H(self.ctx, dst, handle, src_offset);
+    }
+    pub fn copyD2D(self: DeviceMemory, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void {
+        return self.vtable.copyD2D(self.ctx, dst, dst_offset, src, src_offset, bytes);
     }
     pub fn importHost(self: DeviceMemory, host: []u8) DeviceError!DeviceHandle {
         if (self.vtable.importHost) |f| return f(self.ctx, host);
@@ -200,6 +206,14 @@ pub const MockDeviceMemory = struct {
         self.bytes_d2h += dst.len;
     }
 
+    fn copyD2D(ctx: *anyopaque, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const dst_buf = bufFor(self, dst) orelse return DeviceError.InvalidArgument;
+        const src_buf = bufFor(self, src) orelse return DeviceError.InvalidArgument;
+        if (dst_offset + bytes > dst_buf.len or src_offset + bytes > src_buf.len) return DeviceError.InvalidArgument;
+        @memcpy(dst_buf[dst_offset .. dst_offset + bytes], src_buf[src_offset .. src_offset + bytes]);
+    }
+
     fn maxBindingBytes(ctx: *anyopaque) u64 {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.max_binding_bytes;
@@ -211,6 +225,7 @@ pub const MockDeviceMemory = struct {
         .free = free,
         .copyH2D = copyH2D,
         .copyD2H = copyD2H,
+        .copyD2D = copyD2D,
         .importHost = importHost,
         .maxBindingBytes = maxBindingBytes,
     };

@@ -9,7 +9,7 @@ const std = @import("std");
 const gpu_backend = @import("../backend/gpu/backend.zig");
 const plan_mod = @import("../graph/plan.zig");
 const device = @import("device.zig");
-const dm = @import("../runtime/residency/device_memory.zig");
+const dm = @import("../runtime/device_memory.zig");
 
 /// Re-export so callers can enumerate adapters (`gpu_device.wgpu.listAdapters`).
 pub const wgpu = gpu_backend.wgpu;

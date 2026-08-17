@@ -6,8 +6,8 @@ const utils = @import("../backend/utils.zig");
 const small_vec = @import("../small_vec.zig");
 // Device-memory vtable + handle type. This module is std-only (no wgpu), so
 // importing it keeps `storage.zig` GPU-API-agnostic and introduces no import
-// cycle: the dependency edge is storage -> runtime/residency/device_memory -> std.
-const dm = @import("../runtime/residency/device_memory.zig");
+// cycle: the dependency edge is storage -> runtime/device_memory -> std.
+const dm = @import("../runtime/device_memory.zig");
 
 const SmallVec = small_vec.SmallVec;
 const INLINE_RANK: usize = 8;
@@ -215,14 +215,12 @@ pub const TiledTensor = struct {
     tile_handles: []dm.DeviceHandle = &[_]dm.DeviceHandle{},
     /// Borrowed (non-owning) device-memory interface for `tile_handles`.
     dev: ?dm.DeviceMemory = null,
-
-    /// Monotonic host-write counter. Bumped on every host-side mutation of the
-    /// bytes (packed writes, `copyFrom`, zero-init). A device-residency layer
-    /// (`ResidentTensorStore`) records the value it last uploaded and re-uploads
-    /// when it changes — so host writes made out-of-band (the C ABI, a model's
-    /// per-run input seeding / io-alias write-back) correctly invalidate the
-    /// device copy across runs. D2H flushes deliberately do NOT bump it.
-    host_seq: u64 = 0,
+    /// Workspace-only physical alias. Logical layout remains on this tensor;
+    /// bytes and device handles are resolved through the canonical owner.
+    backing_owner: ?u32 = null,
+    /// Bytes reserved by this canonical physical backing.
+    backing_bytes: usize = 0,
+    workspace_owned: bool = false,
 
     const Self = @This();
 
@@ -381,6 +379,7 @@ pub const TiledTensor = struct {
         self.tile_lens = tile_lens;
         self.data = data;
         self.owns_data = true;
+        self.backing_bytes = data.len;
         return;
     }
 
@@ -499,6 +498,7 @@ pub const TiledTensor = struct {
         self.meta = meta;
         self.tile_offsets = tile_offsets;
         self.tile_lens = tile_lens;
+        self.backing_bytes = data_in.len;
     }
 
     /// Frees the (large) tile-backing buffer while keeping shape/tiling metadata,
@@ -506,9 +506,29 @@ pub const TiledTensor = struct {
     /// shape/dtype validation) but holds no data. Used to reclaim a weight that an
     /// optimization pass has fused away; executing against it afterward is a bug.
     /// Idempotent.
+    /// Free this tensor's HOST bytes, keeping metadata (and any device backing)
+    /// so the id stays valid.
+    ///
+    /// Deliberately does not free device buffers: a tensor id can be shared by
+    /// more than one compiled specialization (weight retargeting rewrites ids
+    /// across cached programs), so releasing one entry's view must not pull the
+    /// backing out from under another. Device memory is reclaimed at `deinit`.
+    /// Freeing here made an evicted specialization's workspace reusable — and
+    /// crashed a model whose entries share tensors.
     pub fn releaseData(self: *Self) void {
+        if (self.backing_owner != null) return;
+        if (self.tile_handles.len != 0) {
+            if (self.dev) |d| {
+                for (self.tile_handles) |h| d.free(h);
+            }
+            self.allocator.free(self.tile_handles);
+            self.tile_handles = &[_]dm.DeviceHandle{};
+        }
+        self.dev = null;
+        self.device = .{};
         if (self.data.len != 0 and self.owns_data) self.allocator.free(self.data);
         self.data = &[_]u8{};
+        self.backing_bytes = 0;
     }
 
     pub fn deinit(self: *Self) void {
@@ -534,6 +554,8 @@ pub const TiledTensor = struct {
         }
         self.data = &[_]u8{};
         self.owns_data = true;
+        self.backing_owner = null;
+        self.backing_bytes = 0;
         self.shape_storage.deinit();
         self.tile_shape_storage.deinit();
         self.tile_counts_storage.deinit();
@@ -587,7 +609,8 @@ pub const TiledTensor = struct {
         const rank_usize: usize = @as(usize, self.rank);
         if (rank_usize == 0 or axis >= rank_usize) return StorageError.InvalidArgument;
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
-        // Growable KV caches stay cpu-resident (v1): device-side growth is unsupported.
+        // Host-bytes only. A device tensor grows through
+        // `StorageManager.ensureTensorAxisCapacity`, which stays on the device.
         if (self.onDevice()) return StorageError.InvalidArgument;
 
         const old_size: usize = self.shape[axis];
@@ -705,19 +728,27 @@ pub const TiledTensor = struct {
     }
 
     pub fn acquireTileConst(self: *const Self, ti0: usize, ti1: usize) StorageError!TileViewConst {
+        return self.acquireTileConstFrom(self.data, ti0, ti1);
+    }
+
+    pub fn acquireTileConstFrom(self: *const Self, data: []const u8, ti0: usize, ti1: usize) StorageError!TileViewConst {
         if (self.rank > 2) return StorageError.InvalidArgument;
         const idx: usize = try self.tileIndex(ti0, ti1);
         const off: usize = self.tile_offsets[idx];
         const len: usize = self.tile_lens[idx];
-        if (off + len > self.data.len) return StorageError.InvalidArgument;
+        if (off + len > data.len) return StorageError.InvalidArgument;
 
         const dims: [2]usize = try self.tileDims(ti0, ti1);
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
+        return TileViewConst.init(data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
     }
 
     pub fn acquireTileConstLinear(self: *const Self, tile_index: usize) StorageError!TileViewConst {
+        return self.acquireTileConstLinearFrom(self.data, tile_index);
+    }
+
+    pub fn acquireTileConstLinearFrom(self: *const Self, data: []const u8, tile_index: usize) StorageError!TileViewConst {
         if (tile_index >= self.tile_offsets.len) return StorageError.InvalidArgument;
         if (@as(usize, self.rank) > INLINE_RANK) return StorageError.InvalidArgument;
 
@@ -732,11 +763,11 @@ pub const TiledTensor = struct {
 
         const off: usize = self.tile_offsets[tile_index];
         const len: usize = self.tile_lens[tile_index];
-        if (off + len > self.data.len) return StorageError.InvalidArgument;
+        if (off + len > data.len) return StorageError.InvalidArgument;
 
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewConst.init(self.data[off .. off + len], self.dtype, self.rank, tile_dims, elem_bytes);
+        return TileViewConst.init(data[off .. off + len], self.dtype, self.rank, tile_dims, elem_bytes);
     }
 
     /// Per-tile logical layout (dtype/rank/shape/strides) WITHOUT touching `data`.
@@ -761,19 +792,27 @@ pub const TiledTensor = struct {
     }
 
     pub fn acquireTileMut(self: *Self, ti0: usize, ti1: usize) StorageError!TileViewMut {
+        return self.acquireTileMutFrom(self.data, ti0, ti1);
+    }
+
+    pub fn acquireTileMutFrom(self: *const Self, data: []u8, ti0: usize, ti1: usize) StorageError!TileViewMut {
         if (self.rank > 2) return StorageError.InvalidArgument;
         const idx: usize = try self.tileIndex(ti0, ti1);
         const off: usize = self.tile_offsets[idx];
         const len: usize = self.tile_lens[idx];
-        if (off + len > self.data.len) return StorageError.InvalidArgument;
+        if (off + len > data.len) return StorageError.InvalidArgument;
 
         const dims: [2]usize = try self.tileDims(ti0, ti1);
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewMut.init(self.data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
+        return TileViewMut.init(data[off .. off + len], self.dtype, self.rank, dims[0..@as(usize, self.rank)], elem_bytes);
     }
 
     pub fn acquireTileMutLinear(self: *Self, tile_index: usize) StorageError!TileViewMut {
+        return self.acquireTileMutLinearFrom(self.data, tile_index);
+    }
+
+    pub fn acquireTileMutLinearFrom(self: *const Self, data: []u8, tile_index: usize) StorageError!TileViewMut {
         if (tile_index >= self.tile_offsets.len) return StorageError.InvalidArgument;
         if (@as(usize, self.rank) > INLINE_RANK) return StorageError.InvalidArgument;
 
@@ -788,11 +827,11 @@ pub const TiledTensor = struct {
 
         const off: usize = self.tile_offsets[tile_index];
         const len: usize = self.tile_lens[tile_index];
-        if (off + len > self.data.len) return StorageError.InvalidArgument;
+        if (off + len > data.len) return StorageError.InvalidArgument;
 
         const di = self.dtype.info();
         const elem_bytes: usize = if (di.is_quantized) 0 else di.block_bytes;
-        return TileViewMut.init(self.data[off .. off + len], self.dtype, self.rank, tile_dims, elem_bytes);
+        return TileViewMut.init(data[off .. off + len], self.dtype, self.rank, tile_dims, elem_bytes);
     }
 
     /// Writes a packed row-major scalar tensor into this tiled storage.
@@ -802,7 +841,6 @@ pub const TiledTensor = struct {
     pub fn writeFromPackedScalar(self: *Self, packed_bytes: []const u8) StorageError!void {
         if (self.onDevice()) return StorageError.InvalidArgument; // host bytes freed; migrate with .to(.cpu) first
         if (self.dtype.info().is_quantized) return StorageError.InvalidArgument;
-        self.host_seq +%= 1;
 
         const need_total: usize = self.requiredBytesPackedScalar();
         if (packed_bytes.len < need_total) return StorageError.InvalidArgument;
@@ -991,7 +1029,6 @@ pub const TiledTensor = struct {
     ///   `shape` with `shape[quant_axis]` replaced by `shape[quant_axis] / block_elems`.
     /// - `packed_bytes` is row-major over that block-space shape, each element being one block.
     pub fn writeFromPackedQuant(self: *Self, packed_bytes: []const u8) StorageError!void {
-        self.host_seq +%= 1;
         return self.forEachQuantBlock(packed_bytes, null);
     }
 

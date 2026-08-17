@@ -11,6 +11,20 @@ const manager_mod = @import("../storage/manager.zig");
 const graph_mod = @import("graph.zig");
 const infer_mod = @import("infer.zig");
 const plan_mod = @import("plan.zig");
+
+test "gpu general and matmul tile caps are independent" {
+    var policy = plan_mod.tilePolicyForTarget(.{ .kind = .webgpu });
+    policy.base_square_2d = 32;
+    policy.matmul_mn_tile_cap = 512;
+    policy.matmul_k_tile_cap = 128;
+
+    try std.testing.expectEqual([2]usize{ 32, 32 }, plan_mod.chooseTileShape2DSquare(policy, 1024, 1024));
+    const mm = plan_mod.chooseMatMulTiles(policy, 1024, 1024, 1024, .f32);
+    try std.testing.expectEqual(@as(usize, 512), mm.tm);
+    try std.testing.expectEqual(@as(usize, 512), mm.tn);
+    try std.testing.expectEqual(@as(usize, 128), mm.tk);
+    try std.testing.expectEqual(@as(usize, 512), plan_mod.matMulMHint(policy));
+}
 const program = @import("program.zig");
 
 test "plan: chooseTileShape2DSquare handles skinny matrices" {
@@ -215,7 +229,7 @@ test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
     // The lowered step must see whole head-dim vectors on both x and out.
     var saw_rope: bool = false;
     for (prog.steps) |step| {
-        switch (step) {
+        switch (step.op) {
             .RoPE1DTiled => |s| {
                 saw_rope = true;
                 for ([_]manager_mod.TensorId{ s.x, s.out }) |tid| {
@@ -228,4 +242,70 @@ test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
         }
     }
     try std.testing.expect(saw_rope);
+}
+
+const executable = @import("../runtime/executable.zig");
+const types = @import("../backend/types.zig");
+
+// The invariant the placement pass exists for: when the device writes a value
+// the runtime must read on the host, the compiler emits the transfer and
+// rewrites the consumer, rather than leaving the executor to notice at record
+// time. A control-flow predicate is the only thing that asks for this — kernels
+// either consume an operand on the device or the op is unsupported there.
+test "placement: a device-written control predicate gets a transfer" {
+    const allocator = std.testing.allocator;
+
+    for ([_]types.BackendKind{ .webgpu, .cpu }) |target| {
+        var sm = manager_mod.StorageManager.init(allocator);
+        defer sm.deinit();
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const a = try g.addInput(.i32, &.{1});
+        try g.bindExternal(a, try sm.createTiledTensor(.i32, &.{1}, &.{1}, .{}));
+        const b = try g.addInput(.i32, &.{1});
+        try g.bindExternal(b, try sm.createTiledTensor(.i32, &.{1}, &.{1}, .{}));
+        const x = try g.addInput(.f32, &.{4});
+        try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{4}, &.{4}, .{}));
+
+        // The predicate is computed by a step, so the device owns it.
+        const cond = try g.addElemwiseBinary(.add, a, b);
+        try g.beginRegion();
+        const then_v = try g.addUnary(.relu, x);
+        const then_r = try g.endRegion(&.{then_v});
+        try g.beginRegion();
+        const else_v = try g.addUnary(.relu, x);
+        const else_r = try g.endRegion(&.{else_v});
+        const out = try g.addIf(cond, then_r, else_r);
+        try g.setOutputs(&.{out});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
+        defer prog.deinit();
+
+        var transfers: usize = 0;
+        for (prog.steps) |step| {
+            if (step.op == .Transfer) transfers += 1;
+        }
+        // On CPU the value is already host-placed, so the transfer elides and the
+        // schedule comes out unchanged — the pass is a no-op there by construction.
+        try std.testing.expectEqual(@as(usize, if (target == .webgpu) 1 else 0), transfers);
+
+        for (prog.steps) |step| {
+            switch (step.op) {
+                .If => |s| {
+                    // The predicate is always a declared host read; only its
+                    // placement differs between targets.
+                    try std.testing.expect(step.host_operands != 0);
+                    try std.testing.expectEqual(
+                        executable.Placement{},
+                        prog.placementOf(s.cond).?,
+                    );
+                },
+                else => {},
+            }
+        }
+
+        try prog.validatePlacements();
+    }
 }

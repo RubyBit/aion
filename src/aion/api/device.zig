@@ -10,7 +10,7 @@ const std = @import("std");
 const backend_mod = @import("../backend/backend.zig");
 const plan_mod = @import("../graph/plan.zig");
 const storage_mod = @import("../storage/storage.zig");
-const dm = @import("../runtime/residency/device_memory.zig");
+const dm = @import("../runtime/device_memory.zig");
 
 pub const DeviceRef = storage_mod.DeviceRef;
 

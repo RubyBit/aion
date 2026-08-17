@@ -4,7 +4,7 @@ const std = @import("std");
 const package_file = @import("aion_file.zig");
 const manager_mod = @import("manager.zig");
 const storage = @import("storage.zig");
-const dm = @import("../runtime/residency/device_memory.zig");
+const dm = @import("../runtime/device_memory.zig");
 const tensor_store = @import("../runtime/tensor_store.zig");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
@@ -121,6 +121,36 @@ test "storage: device-aware copy/zero round-trip via mock device memory" {
     try sm.copyTensorData(mirror, dst);
     try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got));
     try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 0, 0 }, &got);
+}
+
+// A multi-tile host tensor migrated to a device must arrive byte-identical whether
+// the target tiling matches its own (the copy-free upload placement uses) or forces
+// a re-tile (the gather/scatter path).
+test "storage: multi-tile host->device migration preserves bytes, matched and re-tiled" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const shape = [_]usize{ 4, 6 };
+    var vals: [24]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+
+    for ([_][2]usize{ .{ 2, 6 }, .{ 4, 3 } }) |target_tile| {
+        var mock = dm.MockDeviceMemory.init(allocator);
+        defer mock.deinit();
+        var sm = manager_mod.StorageManager.init(allocator);
+        defer sm.deinit();
+
+        const src_tile = [_]usize{ 2, 6 }; // 2 tiles along dim 0
+        const t = try sm.createTiledTensor(.f32, &shape, &src_tile, .{ .tile_alignment = 64 });
+        try sm.writeFromPackedScalar(t, std.mem.sliceAsBytes(&vals));
+        try sm.moveTensor(t, .{ .kind = .gpu, .index = 0 }, mock.device(), &target_tile, 64);
+        try std.testing.expect((try sm.tensorDevice(t)).kind == .gpu);
+        try std.testing.expect(mock.h2d_count > 0);
+
+        const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+        try sm.copyTensorData(mirror, t);
+        var got: [24]f32 = undefined;
+        try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got));
+        try std.testing.expectEqualSlices(f32, &vals, &got);
+    }
 }
 
 test "storage: swap carries heterogeneous host and device backings without copies" {

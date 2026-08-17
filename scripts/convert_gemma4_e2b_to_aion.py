@@ -425,6 +425,12 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
               k_cache_in: Dict[int, TensorRef], v_cache_in: Dict[int, TensorRef], caches) -> None:
     b.mark_output(logits, "logits")
 
+    # Greedy next token, picked on the execution device. Outputs are mirrored to
+    # the host lazily (only when read), so a caller that wants greedy decoding
+    # reads 4 bytes here instead of copying the whole [B, T, vocab] logits back
+    # every step; a caller that samples still has `logits`.
+    b.mark_output(b.argmax(logits, axis=-1), "next_token")
+
     # next_*_cache outputs io-aliased back to the cache inputs.
     for src, (k_in, k_out, v_in, v_out) in caches.items():
         b.mark_output(k_out, f"next_k_cache.layer{src}")

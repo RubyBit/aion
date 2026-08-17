@@ -123,6 +123,7 @@ typedef struct AionLoadModelOptions {
     uint64_t cache_initial_capacity_tokens;
     uint64_t cache_growth_numerator;
     uint64_t cache_growth_denominator;
+    uint64_t plan_cache_budget_bytes;
 } AionLoadModelOptions;
 
 AionStatus aion_loaded_model_load_path(AionContext* ctx, const char* path, const AionLoadModelOptions* opts, AionLoadedModel** out_model);

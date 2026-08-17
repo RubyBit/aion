@@ -75,6 +75,15 @@ struct Params {
     has_lengths: u32,
     rl: u32, // rows per block along L
     rh: u32, // heads per block (within one GQA group)
+    // A cache too large for one storage binding is split along time, and k/v bind
+    // ONE tile: `[kv_t0, kv_t0 + kv_tile_t)` of the physical axis. Each tile is a
+    // separate dispatch writing its own partial slots (`seg_base` .. +`segs_local`),
+    // which `attn_merge` combines exactly as it combines ordinary split-K segments.
+    // A single-tile cache is `kv_t0 = 0`, `kv_tile_t = t_cap`.
+    kv_t0: u32,
+    kv_tile_t: u32,
+    seg_base: u32,
+    segs_local: u32,
 };
 
 const WG: u32 = 256u;
@@ -137,7 +146,7 @@ fn reduceSumRows(lidx: u32, rows: u32) {
     }
 }
 
-fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: bool) {
+fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: bool) {
     let b = p.base_b + b_local;
     // Every row in the block shares this kv head: `rh` divides `gqa` and the tile's
     // head base is a multiple of `rh`, so the block never straddles a group.
@@ -179,12 +188,23 @@ fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: 
     }
 
     // --- this workgroup's slice of the block's key range ---
+    //
+    // Under the identity time map a tile owns a CONTIGUOUS logical range, so the
+    // scan is narrowed to it. A ring map scatters logical times across tiles, so
+    // there the full span is scanned and the membership test below filters —
+    // correct, at the cost of re-scoring keys other tiles own.
+    var lo = span_lo;
+    var hi = span_hi;
+    if (p.ring == 0u) {
+        lo = max(span_lo, p.kv_t0);
+        hi = min(span_hi, p.kv_t0 + p.kv_tile_t);
+    }
     var t_start = 0u;
     var t_end = 0u;
-    if (span_hi > span_lo) {
-        let seg_len = (span_hi - span_lo + p.segs - 1u) / p.segs;
-        t_start = span_lo + seg * seg_len;
-        t_end = min(t_start + seg_len, span_hi);
+    if (hi > lo) {
+        let seg_len = (hi - lo + p.segs_local - 1u) / p.segs_local;
+        t_start = lo + seg_local * seg_len;
+        t_end = min(t_start + seg_len, hi);
     }
 
     // --- stage the block's q rows (zero-filled for out-of-range rows) ---
@@ -225,7 +245,8 @@ fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: 
         if (okk) {
             t_phys = tj;
             if (p.ring != 0u) { t_phys = tj % p.ring_window; }
-            okk = t_phys < p.t_cap;
+            // Bound by the cache AND by the tile actually bound here.
+            okk = t_phys < p.t_cap && t_phys >= p.kv_t0 && t_phys - p.kv_t0 < p.kv_tile_t;
         }
 
         // --- scores: one K row read, fanned into every row of the block ---
@@ -236,7 +257,7 @@ fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: 
             vr[r] = false;
         }
         if (okk) {
-            let kb = ((b * p.t_cap + t_phys) * p.h_kv + hkv) * p.dk;
+            let kb = ((b * p.kv_tile_t + (t_phys - p.kv_t0)) * p.h_kv + hkv) * p.dk;
             var dots: array<f32, 4>;
             for (var r = 0u; r < rows; r += 1u) { dots[r] = 0.0; }
             if (p.kv_f16 != 0u) {
@@ -291,7 +312,7 @@ fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: 
         let cnt = min(WG, t_end - t0);
         if (kg < kgc) {
             for (var jj = kg; jj < cnt; jj += kgc) {
-                let vb = ((b * p.t_cap + t_sh[jj]) * p.h_kv + hkv) * p.dv;
+                let vb = ((b * p.kv_tile_t + (t_sh[jj] - p.kv_t0)) * p.h_kv + hkv) * p.dv;
                 for (var i = 0u; i < dsteps; i += 1u) {
                     let d = d0 + i * dv_eff;
                     if (d < p.dv) {
@@ -344,7 +365,7 @@ fn attnCore(b_local: u32, seg: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: 
         let row = (b_local * p.tl + l_local) * p.th + h_local;
 
         if (partial) {
-            let e = (row * p.segs + seg) * (p.dv + 2u);
+            let e = (row * p.segs + p.seg_base + seg_local) * (p.dv + 2u);
             if (kg == 0u) {
                 for (var i = 0u; i < dsteps; i += 1u) {
                     let d = d0 + i * dv_eff;
@@ -387,6 +408,6 @@ fn attn_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 //   entry = ((b_local * tl + l) * th + h) * segs + seg.
 @compute @workgroup_size(256)
 fn attn_split(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    attnCore(wid.z / p.segs, wid.z % p.segs, wid.y * p.rl, wid.x * p.rh, lidx, true);
+    attnCore(wid.z / p.segs_local, wid.z % p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx, true);
 }
 

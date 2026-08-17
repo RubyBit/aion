@@ -76,7 +76,7 @@ pub const MatmulNt = struct {
     }
 
     pub fn exec(self: *MatmulNt, ctx: Ctx, frame: *Frame, s: executable.StepMatMulNTTiled, generated: []const Generated) ExecuteProgramError!void {
-        const hs = ctx.rstore.tensorStore();
+        const hs = ctx.store;
         const c_meta = hs.meta(s.c) catch return error.ExecutionFailed;
         const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
         const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
@@ -95,7 +95,7 @@ pub const MatmulNt = struct {
         const n_tiles = b_meta.tile_counts[0];
         if (n_tiles != c_meta.tile_counts[@as(usize, c_meta.rank) - 1]) return error.Unsupported;
 
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
         defer hs.releaseConst(da.token);
         if (!context.storageBindingFits(ctx, da.len)) return error.Unsupported;
         const av = context.rowView(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
@@ -104,8 +104,8 @@ pub const MatmulNt = struct {
 
         var nt: usize = 0;
         while (nt < n_tiles) : (nt += 1) {
-            const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, nt) catch return error.ExecutionFailed;
-            const dc = ctx.rstore.acquireTileDeviceMutLinear(s.c, nt) catch return error.ExecutionFailed;
+            const db = ctx.store.acquireTileDeviceConstLinear(s.b, nt) catch return error.ExecutionFailed;
+            const dc = ctx.store.acquireTileDeviceMutLinear(s.c, nt) catch return error.ExecutionFailed;
             defer {
                 hs.releaseConst(db.token);
                 hs.releaseMut(dc.token);

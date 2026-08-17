@@ -232,7 +232,7 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
         cpu_ns = try timeBackend(cpu.backend(), &built.prog, mgr.tensorStore(), a.iters);
-        try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(cpu_out.?));
+        try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(cpu_out.?));
     }
 
     // Each op gets a fresh StorageManager and its own Session; residency lives
@@ -241,7 +241,7 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
     defer mgr.deinit();
     var built = try buildOp(alloc, &mgr, gpu_policy, kind, a.m, a.n);
     defer built.prog.deinit();
-    var session = try gb.backend().createSession(mgr.tensorStore());
+    var session = try gpuSession(gb, &mgr, &built.prog);
     defer session.deinit();
     const kernel_ns = try timeGpuKernel(gb, session, &built.prog, a.iters);
     const gpu_ns = try timeSession(session, &built.prog, a.iters);
@@ -256,7 +256,7 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
     if (cpu_out) |cref| {
         const gpu_out = try alloc.alloc(f32, a.m * a.n);
         defer alloc.free(gpu_out);
-        try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(gpu_out));
+        try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(gpu_out));
         var max_abs: f32 = 0;
         for (cref, gpu_out) |cv, gv| max_abs = @max(max_abs, @abs(cv - gv));
         sample.ref_ns = cpu_ns;
@@ -372,14 +372,14 @@ fn benchNt(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, q8: bool, m: 
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
         cpu_ns = try timeBackend(cpu.backend(), &built.prog, mgr.tensorStore(), a.iters);
-        try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(cpu_out.?));
+        try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(cpu_out.?));
     }
 
     var mgr = StorageManager.init(alloc);
     defer mgr.deinit();
     var built = try buildNt(alloc, &mgr, q8, m, n, k, n); // GPU: single N tile
     defer built.prog.deinit();
-    var session = try gb.backend().createSession(mgr.tensorStore());
+    var session = try gpuSession(gb, &mgr, &built.prog);
     defer session.deinit();
     const kernel_ns = try timeGpuKernel(gb, session, &built.prog, a.iters);
     const gpu_ns = try timeSession(session, &built.prog, a.iters);
@@ -398,7 +398,7 @@ fn benchNt(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, q8: bool, m: 
     if (cpu_out) |cref| {
         const gpu_out = try alloc.alloc(f32, m * n);
         defer alloc.free(gpu_out);
-        try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(gpu_out));
+        try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(gpu_out));
         var max_abs: f32 = 0;
         for (cref, gpu_out) |cv2, gv| max_abs = @max(max_abs, @abs(cv2 - gv));
         sample.ref_ns = cpu_ns;
@@ -472,7 +472,7 @@ fn buildDecode(alloc: std.mem.Allocator, mgr: *StorageManager, n: usize, k: usiz
     defer alloc.free(packed_b);
     // Match the tile the GPU policy will choose for a quant B (else the quant
     // tensor can't be retiled at compile → InvalidArgument).
-    const tiles = plan.chooseMatMulTiles(gpu_policy, @max(@as(usize, 1), gpu_policy.base_square_2d), n, k, .q8_0);
+    const tiles = plan.chooseMatMulTiles(gpu_policy, plan.matMulMHint(gpu_policy), n, k, .q8_0);
     const b_id = try mgr.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = 64, .quant_axis = 0 });
     try mgr.writeFromPackedQuant(b_id, packed_b);
     const bv = try g.addInput(.q8_0, &[_]usize{ k, n });
@@ -492,7 +492,7 @@ fn benchDecode(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize,
     defer mgr.deinit();
     var built = try buildDecode(alloc, &mgr, n, k);
     defer built.prog.deinit();
-    var session = try gb.backend().createSession(mgr.tensorStore());
+    var session = try gpuSession(gb, &mgr, &built.prog);
     defer session.deinit();
     const kernel_ns = try timeGpuKernel(gb, session, &built.prog, a.iters);
     const gpu_ns = try timeSession(session, &built.prog, a.iters);
@@ -524,7 +524,7 @@ fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: u
     }
     const packed_b = try packQ8Kmajor(alloc, b_vals, k, n);
     defer alloc.free(packed_b);
-    const tiles = plan.chooseMatMulTiles(gpu_policy, @max(@as(usize, 1), gpu_policy.base_square_2d), n, k, .q8_0);
+    const tiles = plan.chooseMatMulTiles(gpu_policy, plan.matMulMHint(gpu_policy), n, k, .q8_0);
 
     var outputs: std.ArrayList(aion.graph.ValueId) = .empty;
     defer outputs.deinit(alloc);
@@ -540,7 +540,7 @@ fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: u
 
     var prog = try aion.program.compileGraphOpt(alloc, &g, &mgr, gpu_policy, .{ .fuse_horizontal_matmul = false });
     defer prog.deinit();
-    var session = try gb.backend().createSession(mgr.tensorStore());
+    var session = try gpuSession(gb, &mgr, &prog);
     defer session.deinit();
     const ns = try timeGpuKernel(gb, session, &prog, a.iters);
     const b_bytes = @as(f64, @floatFromInt((k / 32) * n * 34 * count));
@@ -595,7 +595,7 @@ fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) 
         defer cpu.deinit();
         cpu_ns = timeBackend(cpu.backend(), &built.prog, mgr.tensorStore(), a.iters) catch break :cpu;
         const buf = try alloc.alloc(u8, info.out_elems * 4);
-        mgr.readToPackedScalar(built.out, buf) catch {
+        mgr.readPackedAtPlacement(built.out, buf) catch {
             alloc.free(buf);
             break :cpu;
         };
@@ -609,7 +609,7 @@ fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) 
         return;
     };
     defer built.prog.deinit();
-    var session = try gb.backend().createSession(mgr.tensorStore());
+    var session = try gpuSession(gb, &mgr, &built.prog);
     defer session.deinit();
     const kernel_ns = timeGpuKernel(gb, session, &built.prog, a.iters) catch |e| {
         out.print("  {s:<16} gpu execute failed: {s}\n", .{ info.label, @errorName(e) });
@@ -628,7 +628,7 @@ fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) 
     if (cpu_out) |cref| {
         const gpu_buf = try alloc.alloc(u8, info.out_elems * 4);
         defer alloc.free(gpu_buf);
-        try mgr.readToPackedScalar(built.out, gpu_buf);
+        try mgr.readPackedAtPlacement(built.out, gpu_buf);
         sample.ref_ns = cpu_ns;
         if (info.out_i32) {
             const ci: []align(1) const i32 = @alignCast(std.mem.bytesAsSlice(i32, cref));
@@ -683,6 +683,14 @@ fn warmUp(session: aion.backend.Session, prog: *const aion.program.Program, ms: 
     }
 }
 
+/// Session over a store whose tensors have been moved to the device. The backend
+/// has no host-staging fallback, so a placed program must be materialized before
+/// it executes -- see `program.materializePlacements`.
+fn gpuSession(gb: *gpu.GpuBackend, mgr: *StorageManager, prog: *const aion.program.Program) !aion.backend.Session {
+    try aion.program.materializePlacements(mgr, prog, .{ .kind = .gpu, .index = 0 }, gb.devmem.device());
+    return gb.backend().createSession(mgr.tensorStore());
+}
+
 /// Pure GPU kernel time: submit the compute `iters` times with NO per-iteration
 /// output readback, then block once on completion. Isolates kernel (+ CPU submit)
 /// throughput from the full-output D2H readback that `timeBackend` includes.
@@ -691,8 +699,6 @@ fn timeGpuKernel(gb: *gpu.GpuBackend, session: aion.backend.Session, prog: *cons
     // loop of a row, so without a real warmup it pays the ramp and can read
     // slower than the e2e loop that runs after it on a hot device.
     try warmUp(session, prog, 200);
-    gb.flush_outputs = false;
-    defer gb.flush_outputs = true;
     try session.execute(prog);
     gb.sync();
     const start = nowNs();
@@ -772,7 +778,7 @@ fn run(args: std.process.Args) !void {
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
         cpu_ns = try timeBackend(cpu.backend(), &built.prog, mgr.tensorStore(), a.iters);
-        try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(cpu_out.?));
+        try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(cpu_out.?));
         reportMatMul("cpu", a.m, a.n, a.k, a.iters, cpu_ns);
     }
 
@@ -794,11 +800,11 @@ fn run(args: std.process.Args) !void {
         defer mgr.deinit();
         var built = try buildMatMul(alloc, &mgr, gpu_policy, a.m, a.n, a.k);
         defer built.prog.deinit();
-        var session = try gb.backend().createSession(mgr.tensorStore());
+        var session = try gpuSession(&gb, &mgr, &built.prog);
         defer session.deinit();
         const kernel_ns = try timeGpuKernel(&gb, session, &built.prog, a.iters);
         gpu_ns = try timeSession(session, &built.prog, a.iters);
-        if (!a.gpu_only) try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(gpu_out.?));
+        if (!a.gpu_only) try mgr.readPackedAtPlacement(built.out, std.mem.sliceAsBytes(gpu_out.?));
         if (gb.matmul.lastChoiceEntry()) |entry| {
             out.print("  gpu cfg:  {s}  threads={d} shared={d}B\n", .{
                 entry,

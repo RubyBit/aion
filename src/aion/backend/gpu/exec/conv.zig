@@ -24,7 +24,7 @@ const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
-const resident_mod = @import("../../../runtime/residency/resident_store.zig");
+const device_store = @import("../../../runtime/device_store.zig");
 
 const c = wgpu.c;
 const Ctx = context.Ctx;
@@ -126,7 +126,7 @@ const MaterializedX = struct { buf: c.WGPUBuffer, len: u64 };
 /// packed order, so this is `n_tiles * outer` buffer copies. Returns the scratch
 /// buffer + its byte length.
 fn materializeX(ctx: Ctx, frame: *Frame, x_id: executable.TensorId, x_meta: TensorMetaT, rank: usize) ExecuteProgramError!MaterializedX {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const elem: usize = 4;
 
     // Find the single split dim.
@@ -156,7 +156,7 @@ fn materializeX(ctx: Ctx, frame: *Frame, x_id: executable.TensorId, x_meta: Tens
     while (t < n_tiles) : (t += 1) {
         const lo = t * ts;
         const this_ts = @min(ts, dim - lo);
-        const xt = ctx.rstore.acquireTileDeviceConstLinear(x_id, t) catch return error.ExecutionFailed;
+        const xt = ctx.store.acquireTileDeviceConstLinear(x_id, t) catch return error.ExecutionFailed;
         defer hs.releaseConst(xt.token);
         if (!context.storageBindingFits(ctx, xt.len)) return error.Unsupported;
         const xt_buf = ctx.devmem.bufferFor(xt.handle).?;
@@ -173,7 +173,7 @@ fn materializeX(ctx: Ctx, frame: *Frame, x_id: executable.TensorId, x_meta: Tens
 }
 
 pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 3) return error.Unsupported;
     const geo: Geometry = .{
@@ -195,7 +195,7 @@ pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) Execut
 }
 
 pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2DTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 4) return error.Unsupported;
     const geo: Geometry = .{
@@ -226,7 +226,7 @@ fn execConv(
     geo_in: Geometry,
     rank: usize,
 ) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(out_id) catch return error.ExecutionFailed;
     const x_meta = hs.meta(x_id) catch return error.ExecutionFailed;
     const w_meta = hs.meta(w_id) catch return error.ExecutionFailed;
@@ -261,18 +261,18 @@ fn execConv(
         null;
     // w / bias: single packed tiles.
     if (context.totalTiles(w_meta) != 1) return error.Unsupported;
-    var bias_tile: ?resident_mod.TileRefDevice = null;
+    var bias_tile: ?device_store.TileRef = null;
     defer if (bias_tile) |bt| hs.releaseConst(bt.token);
     if (bias_id) |bid| {
         const b_meta = hs.meta(bid) catch return error.ExecutionFailed;
         if (b_meta.rank != 1 or b_meta.dtype != .f32) return error.Unsupported;
         if (b_meta.shape[0] < c_out or context.totalTiles(b_meta) != 1) return error.Unsupported;
-        const bt = ctx.rstore.acquireTileDeviceConstLinear(bid, 0) catch return error.ExecutionFailed;
+        const bt = ctx.store.acquireTileDeviceConstLinear(bid, 0) catch return error.ExecutionFailed;
         bias_tile = bt;
         if (context.packedElems(bt.rank, bt.shape_mem[0..1], bt.strides_mem[0..1]) == null) return error.Unsupported;
     }
 
-    const dw = ctx.rstore.acquireTileDeviceConstLinear(w_id, 0) catch return error.ExecutionFailed;
+    const dw = ctx.store.acquireTileDeviceConstLinear(w_id, 0) catch return error.ExecutionFailed;
     defer hs.releaseConst(dw.token);
     if (!context.storageBindingFits(ctx, dw.len)) return error.Unsupported;
     if (context.packedElems(dw.rank, dw.shape_mem[0..rank], dw.strides_mem[0..rank]) == null) return error.Unsupported;
@@ -288,7 +288,7 @@ fn execConv(
 
     // Cached x device tile (out tiles for the same batch group reuse it).
     var x_cached: ?usize = null;
-    var x_tile: resident_mod.TileRefDevice = undefined;
+    var x_tile: device_store.TileRef = undefined;
     defer if (x_cached != null) hs.releaseConst(x_tile.token);
 
     const total = context.totalTiles(out_meta);
@@ -312,7 +312,7 @@ fn execConv(
             if (x_cached == null or x_cached.? != x_lin) {
                 if (x_cached != null) hs.releaseConst(x_tile.token);
                 x_cached = null;
-                x_tile = ctx.rstore.acquireTileDeviceConstLinear(x_id, x_lin) catch return error.ExecutionFailed;
+                x_tile = ctx.store.acquireTileDeviceConstLinear(x_id, x_lin) catch return error.ExecutionFailed;
                 x_cached = x_lin;
                 if (!context.storageBindingFits(ctx, x_tile.len)) return error.Unsupported;
                 if (context.packedElems(x_tile.rank, x_tile.shape_mem[0..rank], x_tile.strides_mem[0..rank]) == null) return error.Unsupported;
@@ -326,7 +326,7 @@ fn execConv(
             x_base = (b % x_meta.tile_shape[0]) * x_batch_elems;
         }
 
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(out_id, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(out_id, ti) catch return error.ExecutionFailed;
         defer hs.releaseMut(dout.token);
         if (!context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
         if (context.packedElems(dout.rank, dout.shape_mem[0..rank], dout.strides_mem[0..rank]) == null) return error.Unsupported;

@@ -151,6 +151,11 @@ pub const Model = struct {
     run_input_shapes: []usize,
     run_direct_input_ids: []TensorId,
     cache_entries: std.ArrayList(CacheEntry) = .empty,
+    cache_workspace_budget_bytes: usize,
+    cache_workspace_bytes: usize = 0,
+    cache_clock: u64 = 0,
+    cache_build_count: u64 = 0,
+    cache_eviction_count: u64 = 0,
     last_run_cache_index: ?usize = null,
     package_hash: u64,
     trace_runs: bool = false,
@@ -179,17 +184,10 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Release device residency first — device buffers free through the still-alive
-        // backend/device (Context must outlive its models; see Context.deinit ordering).
-        self.session.deinit();
-        for (self.cache_entries.items) |*entry| {
-            entry.program.deinit();
-            self.allocator.free(entry.symbol_values);
-            self.allocator.free(entry.input_shapes);
-            self.allocator.free(entry.input_slots);
-            self.allocator.free(entry.direct_input_ids);
-        }
+        self.session.retireResources();
+        for (self.cache_entries.items) |*entry| self.destroyCacheEntry(entry);
         self.cache_entries.deinit(self.allocator);
+        self.session.deinit();
         self.allocator.free(self.initializer_tids);
         self.allocator.free(self.input_signatures);
         self.allocator.free(self.output_signatures);
@@ -308,9 +306,7 @@ pub const Model = struct {
         }
 
         if (tid == src.id) return;
-        const meta = try self.store.getConst(tid);
-        const dst: Tensor = .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
-        try dst.copyFrom(self.allocator, src);
+        try self.copyTensorInto(tid, src);
     }
 
     pub fn overwriteInitializerByDebugName(self: *Self, debug_name: []const u8, src: Tensor) api_errors.ApiError!void {
@@ -363,6 +359,7 @@ pub const Model = struct {
         const old_tid: TensorId = self.initializer_tids[init_idx];
         const new_tid: TensorId = new_tensor.id;
         if (old_tid == new_tid) return;
+        if (self.store.tensorIsWorkspace(new_tid) catch true) return api_errors.ApiError.InvalidArgument;
 
         // A fused weight isn't referenced by the program (the combined tensor is), so
         // retargeting its id would patch nothing. Write the new contents through to
@@ -378,6 +375,10 @@ pub const Model = struct {
         for (self.cache_entries.items) |*entry| {
             retarget.retargetProgramTensorIds(&entry.program, old_tid, new_tid);
         }
+        // The compiled programs now name a tensor the caller supplied, and their
+        // placement table still says the weight is device-placed. Honor that
+        // table rather than leaving a host tensor wired into a device program.
+        try self.placeTensorOnDevice(new_tid);
     }
 
     pub fn retargetInitializerByDebugName(self: *Self, debug_name: []const u8, new_tensor: Tensor) api_errors.ApiError!void {
@@ -387,6 +388,24 @@ pub const Model = struct {
 
     pub fn cacheEntryCount(self: *const Self) usize {
         return self.cache_entries.items.len;
+    }
+
+    pub const PlanCacheStats = struct {
+        entries: usize,
+        workspace_bytes: usize,
+        budget_bytes: usize,
+        builds: u64,
+        evictions: u64,
+    };
+
+    pub fn planCacheStats(self: *const Self) PlanCacheStats {
+        return .{
+            .entries = self.cache_entries.items.len,
+            .workspace_bytes = self.cache_workspace_bytes,
+            .budget_bytes = self.cache_workspace_budget_bytes,
+            .builds = self.cache_build_count,
+            .evictions = self.cache_eviction_count,
+        };
     }
 
     /// Introspection (debug/tests): whether the named io-aliased input's recurrent
@@ -546,7 +565,7 @@ pub const Model = struct {
             if (self.inputAliasOutputIndex(i) != null) {
                 const bind_version = self.aliased_input_bind_versions[i];
                 if (bind_version != 0 and self.aliased_state_synced_versions[i] != bind_version) {
-                    if (src.id != dst.id) self.copyIntoStateSlot(dst, src) catch |e| {
+                    if (src.id != dst.id) self.copyTensorInto(dst.id, src) catch |e| {
                         if (trace) {
                             std.debug.print(
                                 "[aion][run] seed copy failed for aliased input {s} (src_id={d} dst_id={d}): {s}\n",
@@ -559,7 +578,7 @@ pub const Model = struct {
                 }
                 continue;
             }
-            if (src.id != dst.id) dst.copyFrom(self.allocator, src) catch |e| {
+            if (src.id != dst.id) self.copyTensorInto(dst.id, src) catch |e| {
                 if (trace) {
                     std.debug.print(
                         "[aion][run] copyFrom failed for input {s} (src_id={d} dst_id={d}): {s}\n",
@@ -569,6 +588,11 @@ pub const Model = struct {
                 return e;
             };
         }
+
+        // After input seeding (which settles the append index) and before the
+        // frame is recorded — the only window in which capacity can change
+        // without synchronizing against device work. See `prepareGrowableCaches`.
+        try self.prepareGrowableCaches(entry);
 
         if (trace) {
             std.debug.print("[aion][run] executing\n", .{});
@@ -590,6 +614,9 @@ pub const Model = struct {
             const src_tid = entry.program.outputs[alias.output_index];
             if (dst_tid == src_tid) continue;
 
+            // GPU model outputs are read back lazily. A non-in-place alias is an
+            // internal consumer, so materialize a staged source before copying
+            // it into the persistent state slot.
             const dst_meta = self.store.getConst(dst_tid) catch |e| {
                 if (trace) {
                     std.debug.print(
@@ -614,7 +641,7 @@ pub const Model = struct {
             // must be copied back into their state slot.  The slot may be
             // device-exclusive, so use the residency-aware path; in-place aliases
             // were skipped above and incur no copy at all.
-            self.copyIntoStateSlot(dst, src) catch |e| {
+            self.copyTensorInto(dst.id, src) catch |e| {
                 if (trace) {
                     std.debug.print(
                         "[aion][run] output alias state copy failed (input={s} output={s}): {s}\n",
@@ -635,6 +662,84 @@ pub const Model = struct {
         }
 
         self.last_run_cache_index = cache_index;
+    }
+
+    /// Grow device-resident sequence caches to fit this run's append, using the
+    /// host-side write position. Capacity is the one piece of model state the
+    /// compiler cannot own, so placement hands over a `GrowthRequest` list and
+    /// this walks that — never the schedule. Append and attention then stay
+    /// device-only for the whole frame.
+    ///
+    /// A cache only reaches this path when the host can know the write position
+    /// ahead of the run; `appendPositionsAreExternal` refuses lazy growth at
+    /// load time otherwise, so no case here has to synchronize to find a size.
+    fn prepareGrowableCaches(self: *Self, entry: *const CacheEntry) api_errors.ExecuteError!void {
+        if (self.device.kind == .cpu) return;
+
+        for (entry.program.growth_requests) |request| {
+            if (self.store.sequenceCachePolicyInfo(request.cache).kind != .growable) continue;
+
+            const cache_meta = self.store.getConst(request.cache) catch return error.InvalidArgument;
+            const new_meta = self.store.getConst(request.new_kv) catch return error.InvalidArgument;
+            if (cache_meta.rank != 4 or new_meta.rank != 4 or cache_meta.shape[0] == 0) return error.InvalidArgument;
+            const new_len = new_meta.shape[1];
+            if (new_len == 0) continue;
+
+            var input_index: ?usize = null;
+            for (entry.input_slots, 0..) |tid, i| {
+                if (tid == request.end_index) {
+                    input_index = i;
+                    break;
+                }
+            }
+            // A growable cache's position is an external input by construction
+            // (see `appendPositionsAreExternal`), so a miss here is a bug.
+            const idx = input_index orelse return error.InvalidArgument;
+            const required: usize = if (self.role_write_index_index == idx and self.role_auto_bound[idx])
+                std.math.add(usize, @intCast(self.position_tokens), new_len) catch return error.InvalidArgument
+            else
+                try self.appendEndFromBoundIndex(idx, cache_meta.shape[0], new_len);
+
+            if (required <= cache_meta.shape[1]) continue;
+            _ = self.store.tensorStore().mapSequenceStep(request.cache, required - 1, cache_meta.shape[1]) catch return error.InvalidArgument;
+        }
+    }
+
+    /// Furthest append end implied by the caller-bound start-index input, read
+    /// off the host. Stack-buffered for realistic batch counts so a growable
+    /// cache costs no allocation per token.
+    fn appendEndFromBoundIndex(
+        self: *Self,
+        input_index: usize,
+        batch: usize,
+        new_len: usize,
+    ) api_errors.ExecuteError!usize {
+        const src = self.bound_inputs[input_index] orelse return error.InvalidArgument;
+        if (src.dtype != .i32) return error.InvalidArgument;
+        const total = src.elemCount() catch return error.InvalidArgument;
+        if (total < batch) return error.InvalidArgument;
+
+        var stack_starts: [64]i32 = undefined;
+        var heap_starts: ?[]i32 = null;
+        defer if (heap_starts) |buf| self.allocator.free(buf);
+
+        const starts: []i32 = if (total <= stack_starts.len) blk: {
+            const buf = stack_starts[0..total];
+            src.read(buf) catch return error.InvalidArgument;
+            break :blk buf;
+        } else blk: {
+            const buf = src.readAlloc(self.allocator, i32) catch return error.InvalidArgument;
+            heap_starts = buf;
+            break :blk buf;
+        };
+
+        var end_max: usize = 0;
+        for (starts[0..batch]) |raw| {
+            if (raw < 0) return error.InvalidArgument;
+            const end = std.math.add(usize, @intCast(raw), new_len) catch return error.InvalidArgument;
+            end_max = @max(end_max, end);
+        }
+        return end_max;
     }
 
     pub fn outputTensor(self: *Self, name: []const u8) api_errors.ApiError!Tensor {
@@ -662,24 +767,14 @@ pub const Model = struct {
         return self.resolveOutputTensor(cache_index, index);
     }
 
-    /// Resolve output `output_index` of cache entry `cache_index` to a Tensor
-    /// handle whose host bytes are current. Recurrent-state outputs `execute`
-    /// leaves device-resident (see `ExecutableProgram.output_device_resident`)
-    /// take one of two on-demand paths so a host read still sees correct data:
-    ///   - staged (host-backed, discrete-GPU cache): flush the device copy to the
-    ///     host store (`syncToHost`) and return the tensor itself;
-    ///   - device-exclusive (migrated via `moveTensor`, no host bytes): gather it
-    ///     (D2H) into a host mirror and return the mirror.
-    /// Decode never reads its own carried state, so both stay off the hot path;
-    /// everything else (genuine outputs, CPU) returns the tensor directly.
+    /// Resolve an output to a host-readable tensor. Device outputs are copied
+    /// explicitly into a lazy host mirror; CPU outputs are returned directly.
     fn resolveOutputTensor(self: *Self, cache_index: usize, output_index: usize) api_errors.ApiError!Tensor {
         const entry: *const CacheEntry = &self.cache_entries.items[cache_index];
         const tid = entry.program.outputs[output_index];
-        if (entry.program.outputStaysResident(output_index)) {
-            const on_device = (self.store.tensorDevice(tid) catch DeviceRef{}).kind != .cpu;
-            if (on_device) return self.mirrorOutputToHost(output_index, tid);
-            try self.session.syncToHost(tid);
-        }
+        const on_device = (self.store.tensorDevice(tid) catch DeviceRef{}).kind != .cpu;
+        const evictable = self.store.tensorIsWorkspace(tid) catch false;
+        if (on_device or evictable) return self.mirrorOutputToHost(output_index, tid);
         const t = try self.store.getConst(tid);
         return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
@@ -699,6 +794,8 @@ pub const Model = struct {
             break :blk m.dtype != src_meta.dtype or !signatures.sameUsize(m.shape, src_meta.shape);
         };
         if (need_new) {
+            const old = self.output_host_mirror_tids[output_index];
+            if (old != types_mod.invalid_tensor_id) self.store.releaseTensorData(old) catch {};
             self.output_host_mirror_tids[output_index] =
                 try initializers.createTensorSingleTile(self.store, self.policy, src_meta.dtype, src_meta.shape);
         }
@@ -745,6 +842,50 @@ pub const Model = struct {
     /// On success the returned `Model` owns `source`, `initializer_tids`,
     /// `input_signatures`, `output_signatures`, and the outer `input_shape_terms`
     /// array; on error the caller's `errdefer`s free them.
+    /// Whether every `SequenceAppend` takes its write position from outside the
+    /// graph rather than computing it in one.
+    ///
+    /// Lazy growth needs the host to know the furthest write before the run
+    /// starts (see `prepareGrowableCaches`). A position computed in-graph — a
+    /// decode loop's own counter — is unknowable until the frame executes, and
+    /// on a device the only way to learn it mid-frame is a synchronization per
+    /// append. Such a model gets its cache pre-allocated at the declared
+    /// capacity instead: the same fallback an unsupported layout takes, and the
+    /// reason the growth path needs no in-graph case at all.
+    fn appendPositionsAreExternal(source: GraphSource) bool {
+        switch (source) {
+            .package => |*pkg| {
+                for (pkg.nodes) |node| {
+                    if (node.op != .SequenceAppend) continue;
+                    if (node.inputs.len < 3) continue;
+                    if (pkg.values[node.inputs[2]].source == .produced) return false;
+                }
+                for (pkg.regions) |region| {
+                    for (region.nodes) |node| {
+                        if (node.op != .SequenceAppend) continue;
+                        if (node.inputs.len < 3) continue;
+                        if (pkg.values[node.inputs[2]].source == .produced) return false;
+                    }
+                }
+            },
+            .builder => |*b| {
+                for (b.graph.nodes.items) |node| {
+                    if (node.op != .SequenceAppend) continue;
+                    if (node.inputs.len < 3) continue;
+                    if (b.graph.values.items[@intCast(node.inputs[2])].producer != null) return false;
+                }
+                for (b.graph.regions.items) |region| {
+                    for (region.nodes) |node| {
+                        if (node.op != .SequenceAppend) continue;
+                        if (node.inputs.len < 3) continue;
+                        if (b.graph.values.items[@intCast(node.inputs[2])].producer != null) return false;
+                    }
+                }
+            },
+        }
+        return true;
+    }
+
     fn initCommon(
         allocator: std.mem.Allocator,
         backend: backend_mod.Backend,
@@ -876,13 +1017,15 @@ pub const Model = struct {
                     if (opts.cache.capacity_tokens == 0) continue;
                     const cap: usize = opts.cache.capacity_tokens;
                     // Grow-on-demand needs the runtime-supported layout (rank-4,
-                    // sequence axis 1 — see `stateSlotCompatible`/`mapSequenceStep`)
-                    // and the package's blessing; otherwise fall back to a full
+                    // sequence axis 1 — see `stateSlotCompatible`/`mapSequenceStep`),
+                    // the package's blessing, and a write position the host can
+                    // read before a run; otherwise fall back to a full
                     // pre-allocation rather than failing the load.
                     const growable: ?types_mod.CacheGrowth = opts.cache.growable;
                     if (growable != null and
                         (role.flags & package_file.InputRoleFlags.allow_growable) != 0 and
-                        input_signatures[i].rank == 4 and role.axis == 1)
+                        input_signatures[i].rank == 4 and role.axis == 1 and
+                        appendPositionsAreExternal(source))
                     {
                         const g = growable.?;
                         const initial: usize = @max(1, @min(g.initial_capacity_tokens, cap));
@@ -961,6 +1104,7 @@ pub const Model = struct {
             .run_symbol_values = run_symbol_values,
             .run_input_shapes = run_input_shapes,
             .run_direct_input_ids = run_direct_input_ids,
+            .cache_workspace_budget_bytes = opts.plan_cache_budget_bytes,
             .package_hash = package_hash,
             .trace_runs = traceEnabled(),
         };
@@ -1343,14 +1487,171 @@ pub const Model = struct {
     ) api_errors.ExecuteError!usize {
         for (self.cache_entries.items, 0..) |*entry, idx| {
             if (signatures.sameU64(entry.symbol_values, symbol_values) and signatures.sameUsize(entry.input_shapes, input_shapes)) {
-                if (try self.prepareCacheEntryInputs(entry, direct_input_ids)) return idx;
+                if (try self.prepareCacheEntryInputs(entry, direct_input_ids)) {
+                    self.cache_clock +%= 1;
+                    entry.last_used = self.cache_clock;
+                    return idx;
+                }
             }
         }
 
-        const entry = try self.buildCacheEntry(symbol_values, input_shapes, direct_input_ids);
+        var entry = try self.buildCacheEntry(symbol_values, input_shapes, direct_input_ids);
+        errdefer self.destroyCacheEntry(&entry);
+        self.cache_build_count +%= 1;
+        self.cache_clock +%= 1;
+        entry.last_used = self.cache_clock;
+
+        // Protect the actual resource, not an arbitrary entry count. Keep one
+        // oversized specialization rather than creating a compile-on-every-run
+        // cliff for a shape whose workspace alone exceeds the configured budget.
+        if (self.cache_entries.items.len != 0 and
+            self.cache_workspace_bytes + entry.workspace_bytes > self.cache_workspace_budget_bytes)
+        {
+            self.session.retireResources();
+        }
+        while (self.cache_entries.items.len != 0 and
+            self.cache_workspace_bytes + entry.workspace_bytes > self.cache_workspace_budget_bytes)
+        {
+            var oldest_index: usize = 0;
+            var oldest_tick = self.cache_entries.items[0].last_used;
+            for (self.cache_entries.items[1..], 1..) |candidate, idx| {
+                if (candidate.last_used < oldest_tick) {
+                    oldest_tick = candidate.last_used;
+                    oldest_index = idx;
+                }
+            }
+            var evicted = self.cache_entries.orderedRemove(oldest_index);
+            if (self.last_run_cache_index) |last| {
+                self.last_run_cache_index = if (last == oldest_index)
+                    null
+                else if (last > oldest_index)
+                    last - 1
+                else
+                    last;
+            }
+            self.cache_workspace_bytes -= evicted.workspace_bytes;
+            self.destroyCacheEntry(&evicted);
+            self.cache_eviction_count +%= 1;
+        }
+
+        try self.placeProgram(&entry.program);
+
         try self.cache_entries.append(self.allocator, entry);
+        self.cache_workspace_bytes += entry.workspace_bytes;
         self.reclaimFusedInitializers();
+        self.traceDeviceBreakdown(&self.cache_entries.items[self.cache_entries.items.len - 1]);
         return self.cache_entries.items.len - 1;
+    }
+
+    /// Give `tid` its physical backing on this model's execution device,
+    /// preserving its tile geometry. No-op on a CPU model or when it is already
+    /// there. Unified-memory devices keep the host allocation and lower GPU
+    /// access to an alias inside the device-memory implementation.
+    fn placeTensorOnDevice(self: *Self, tid: TensorId) api_errors.ExecuteError!void {
+        if (self.device.kind == .cpu) return;
+        const mem = self.store.deviceMemoryFor(self.device) orelse return error.InvalidArgument;
+        const t = self.store.getConst(tid) catch return error.InvalidArgument;
+        if (t.device.eql(self.device)) return;
+
+        var tile_shape: [8]usize = undefined;
+        const rank: usize = @intCast(t.rank);
+        @memcpy(tile_shape[0..rank], t.tile_shape);
+        const alignment = self.store.policyFor(self.device).tile_alignment;
+        self.store.moveTensor(tid, self.device, mem, tile_shape[0..rank], alignment) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidArgument,
+        };
+    }
+
+    /// Materialize the compiler's placement table: every tensor the program
+    /// declared device-placed gets its backing on this model's device.
+    ///
+    /// The table is built from every operand of every step, so parameters, fused
+    /// weights, workspace, input slots, and `Builder.param` tensors are one loop
+    /// over one source of truth — the same table `validatePlacements` checked.
+    /// The executor never falls back to staging a CPU backing, so a declared
+    /// placement that cannot be materialized is an error, not a downgrade.
+    fn placeProgram(self: *Self, program: *const program_mod.Program) api_errors.ExecuteError!void {
+        if (self.device.kind == .cpu) return;
+
+        const mem = self.store.deviceMemoryFor(self.device) orelse return error.InvalidArgument;
+        program_mod.materializePlacements(self.store, program, self.device, mem) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidArgument,
+        };
+
+        // A derived weight built for an earlier specialization is absent from
+        // this program's table when this program does not reference it, but it
+        // must still follow its sources onto the device.
+        for (self.initializer_tids) |tid| {
+            self.store.moveDerivedWeightsForSource(tid, self.device) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidArgument,
+            };
+        }
+
+        traceStorageTotals(self, "placed");
+    }
+
+    /// `AION_TRACE_MEMORY` accounting: host bytes still held vs device bytes.
+    fn traceStorageTotals(self: *const Self, phase: []const u8) void {
+        if (!env_util.flagEnabled("AION_TRACE_MEMORY")) return;
+        var cpu_bytes: usize = 0;
+        var gpu_bytes: usize = 0;
+        for (self.store.tensors.items) |tensor| {
+            if (tensor.backing_owner != null) continue;
+            if (tensor.device.kind == .cpu) {
+                cpu_bytes +|= tensor.backing_bytes;
+            } else {
+                gpu_bytes +|= tensor.backing_bytes;
+            }
+        }
+        std.debug.print("[aion][storage] {s} cpu_backing={d} gpu_backing={d}\n", .{ phase, cpu_bytes, gpu_bytes });
+    }
+
+    fn idIn(ids: []const TensorId, id: TensorId) bool {
+        for (ids) |x| if (x == id) return true;
+        return false;
+    }
+
+    /// Device bytes split by role, so a growth in one is not mistaken for another.
+    fn traceDeviceBreakdown(self: *const Self, entry: *const CacheEntry) void {
+        if (!env_util.flagEnabled("AION_TRACE_MEMORY")) return;
+        var init_b: usize = 0;
+        var ws_b: usize = 0;
+        var slot_b: usize = 0;
+        var other_b: usize = 0;
+        var ws_n: usize = 0;
+        for (self.store.tensors.items, 0..) |tensor, idx| {
+            if (tensor.backing_owner != null) continue;
+            if (tensor.device.kind == .cpu) continue;
+            const b = tensor.backing_bytes;
+            const id: TensorId = @intCast(idx);
+            if (idIn(self.initializer_tids, id)) {
+                init_b +|= b;
+            } else if (idIn(entry.program.owned_tensors, id)) {
+                ws_b +|= b;
+                ws_n += 1;
+            } else if (idIn(entry.owned_input_slots, id)) {
+                slot_b +|= b;
+            } else {
+                other_b +|= b;
+            }
+        }
+        std.debug.print("[aion][storage] breakdown init={d} workspace={d} (n={d}) slots={d} other={d}\n", .{ init_b, ws_b, ws_n, slot_b, other_b });
+    }
+
+    fn destroyCacheEntry(self: *Self, entry: *CacheEntry) void {
+        for (entry.owned_input_slots) |tid| self.store.releaseTensorData(tid) catch {};
+        if (entry.owned_input_slots.len != 0) self.allocator.free(entry.owned_input_slots);
+        for (entry.program.owned_tensors) |tid| {
+            self.store.releaseTensorData(tid) catch {};
+        }
+        entry.program.deinit();
+        self.allocator.free(entry.symbol_values);
+        self.allocator.free(entry.input_shapes);
+        self.allocator.free(entry.input_slots);
+        self.allocator.free(entry.direct_input_ids);
     }
 
     /// Reclaim weights that an optimization pass fused into a combined tensor: their
@@ -1371,6 +1672,7 @@ pub const Model = struct {
             }
             if (!referenced) self.store.releaseTensorData(tid) catch {};
         }
+        traceStorageTotals(self, "after_reclaim");
     }
 
     /// Produce a concrete graph for the requested shapes (source-specific), then
@@ -1498,6 +1800,11 @@ pub const Model = struct {
         errdefer self.allocator.free(input_slots);
         const entry_direct_input_ids = try self.allocator.dupe(TensorId, direct_input_ids);
         errdefer self.allocator.free(entry_direct_input_ids);
+        var owned_input_slots: std.ArrayList(TensorId) = .empty;
+        errdefer {
+            for (owned_input_slots.items) |tid| self.store.releaseTensorData(tid) catch {};
+            owned_input_slots.deinit(self.allocator);
+        }
 
         var input_shape_cursor: usize = 0;
         for (self.input_signatures, 0..) |_, sig_idx| {
@@ -1508,7 +1815,19 @@ pub const Model = struct {
                 // different input shapes (prefill vs decode). Single-tile (SequenceAppend
                 // needs a contiguous last axis; the default tiler would split it).
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
-            else blk: {
+            else if (self.device.kind != .cpu) blk: {
+                // A GPU program binds a stable device slot, never the caller's
+                // host tensor. `run()` performs the explicit H2D copy into this
+                // slot, so execution has one backing and no staged-input cache.
+                const tid = try initializers.createTensorSingleTile(self.store, self.policy, self.input_signatures[sig_idx].dtype, concrete_shape);
+                owned_input_slots.append(self.allocator, tid) catch {
+                    self.store.releaseTensorData(tid) catch {};
+                    return error.OutOfMemory;
+                };
+                self.migrateStateSlotToDevice(tid, self.input_signatures[sig_idx].dtype, concrete_shape);
+                if ((self.store.tensorDevice(tid) catch DeviceRef{}).kind == .cpu) return error.InvalidArgument;
+                break :blk tid;
+            } else blk: {
                 const tid = direct_input_ids[sig_idx];
                 if (tid == types_mod.invalid_tensor_id) return error.InvalidArgument;
                 break :blk tid;
@@ -1520,44 +1839,25 @@ pub const Model = struct {
         try graph.setOutputs(out_ids);
 
         var program = try program_mod.compileGraph(self.allocator, graph, self.store, self.policy);
-        errdefer program.deinit();
+        errdefer {
+            for (program.owned_tensors) |tid| self.store.releaseTensorData(tid) catch {};
+            program.deinit();
+        }
 
-        try self.markDeviceResidentOutputs(&program, input_slots);
-
+        var workspace_bytes: usize = program.workspace_bytes;
+        for (owned_input_slots.items) |tid| {
+            const bytes = self.store.tensorBackingBytes(tid) catch return error.InvalidArgument;
+            workspace_bytes = std.math.add(usize, workspace_bytes, bytes) catch return error.InvalidArgument;
+        }
         return .{
             .symbol_values = try self.allocator.dupe(u64, symbol_values),
             .input_shapes = try self.allocator.dupe(usize, input_shapes),
             .input_slots = input_slots,
             .direct_input_ids = entry_direct_input_ids,
+            .owned_input_slots = try owned_input_slots.toOwnedSlice(self.allocator),
             .program = program,
+            .workspace_bytes = workspace_bytes,
         };
-    }
-
-    /// Flag the program outputs that are recurrent state aliased *in place* to an
-    /// input, so a device backend keeps them resident instead of flushing them to
-    /// the host each run (see `ExecutableProgram.output_device_resident`). "In
-    /// place" is exactly the condition under which `run()`'s io-alias write-back is
-    /// a no-op: the output's compiled tensor id equals the input slot it feeds back
-    /// into (e.g. SequenceAppend, whose output aliases the cache storage). Non-in-
-    /// place aliases still need the flush — their host write-back reads the output
-    /// bytes — so they are deliberately left flushable. No allocation when nothing
-    /// qualifies, keeping non-recurrent models allocation-free.
-    fn markDeviceResidentOutputs(self: *Self, program: *program_mod.Program, input_slots: []const TensorId) api_errors.ExecuteError!void {
-        var any = false;
-        for (self.output_aliases) |alias| {
-            if (program.outputs[alias.output_index] == input_slots[alias.input_index]) {
-                any = true;
-                break;
-            }
-        }
-        if (!any) return;
-
-        const mask = self.allocator.alloc(bool, program.outputs.len) catch return error.OutOfMemory;
-        @memset(mask, false);
-        for (self.output_aliases) |alias| {
-            if (program.outputs[alias.output_index] == input_slots[alias.input_index]) mask[alias.output_index] = true;
-        }
-        program.output_device_resident = mask;
     }
 
     /// Return the model-level backing slot for io-aliased input `input_index`,
@@ -1626,7 +1926,6 @@ pub const Model = struct {
     fn migrateStateSlotToDevice(self: *Self, tid: TensorId, dtype: DType, shape: []const usize) void {
         if (self.device.kind == .cpu) return;
         const mem = self.store.deviceMemoryFor(self.device) orelse return;
-        if (mem.model() == .unified) return;
 
         const info = dtype.info();
         if (info.is_quantized) return; // createTensorSingleTile already rejects these
@@ -1643,9 +1942,14 @@ pub const Model = struct {
     /// Seed recurrent-state slot `dst` from a caller-bound source, honoring the
     /// slot's residency: a device-exclusive slot is written through the store's
     /// device-aware copy (H2D scatter), a host slot via the fast in-place copy.
-    fn copyIntoStateSlot(self: *Self, dst: Tensor, src: Tensor) api_errors.ExecuteError!void {
-        const on_device = (self.store.tensorDevice(dst.id) catch DeviceRef{}).kind != .cpu;
-        if (on_device) return self.store.copyTensorData(dst.id, src.id);
+    /// Copy `src`'s logical contents into the tensor `dst_tid` names, at
+    /// whatever placement that tensor currently has. A host destination takes
+    /// the packed fast path; a device one stages through `copyTensorData`.
+    fn copyTensorInto(self: *Self, dst_tid: TensorId, src: Tensor) api_errors.ExecuteError!void {
+        const on_device = (self.store.tensorDevice(dst_tid) catch DeviceRef{}).kind != .cpu;
+        if (on_device) return self.store.copyTensorData(dst_tid, src.id);
+        const meta = try self.store.getConst(dst_tid);
+        const dst: Tensor = .{ .store = self.store, .id = dst_tid, .dtype = meta.dtype, .shape = meta.shape };
         return dst.copyFrom(self.allocator, src);
     }
 
@@ -1666,7 +1970,11 @@ pub const Model = struct {
     fn findStaticCacheEntry(self: *Self, desired_direct_input_ids: []const TensorId) api_errors.ExecuteError!?usize {
         if (self.dim_symbol_count != 0) return null;
         for (self.cache_entries.items, 0..) |*entry, idx| {
-            if (try self.prepareCacheEntryInputs(entry, desired_direct_input_ids)) return idx;
+            if (try self.prepareCacheEntryInputs(entry, desired_direct_input_ids)) {
+                self.cache_clock +%= 1;
+                entry.last_used = self.cache_clock;
+                return idx;
+            }
         }
         return null;
     }
@@ -1694,6 +2002,11 @@ pub const Model = struct {
             const current_tid = entry.direct_input_ids[idx];
             if (current_tid == types_mod.invalid_tensor_id) return false;
             if (current_tid == desired_tid) continue;
+            if (self.device.kind != .cpu) {
+                if (!try signatures.tensorsHaveCompatibleLayout(self.store, entry.input_slots[idx], desired_tid)) return false;
+                entry.direct_input_ids[idx] = desired_tid;
+                continue;
+            }
             if (!try signatures.tensorsHaveCompatibleLayout(self.store, current_tid, desired_tid)) return false;
             retarget.retargetProgramTensorIds(&entry.program, current_tid, desired_tid);
             entry.direct_input_ids[idx] = desired_tid;
@@ -1725,7 +2038,10 @@ const CacheEntry = struct {
     input_shapes: []usize,
     input_slots: []TensorId,
     direct_input_ids: []TensorId,
+    owned_input_slots: []TensorId,
     program: program_mod.Program,
+    workspace_bytes: usize,
+    last_used: u64 = 0,
 };
 
 /// Build one control-flow region's body into the graph, lazily. Sub-regions

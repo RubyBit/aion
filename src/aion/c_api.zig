@@ -623,6 +623,7 @@ pub const AionLoadModelOptions = extern struct {
     cache_initial_capacity_tokens: u64 = 0,
     cache_growth_numerator: u64 = 0,
     cache_growth_denominator: u64 = 0,
+    plan_cache_budget_bytes: u64 = 0,
 };
 
 fn loadOptionsFromC(c_opts: ?*const AionLoadModelOptions) ?api.LoadModelOptions {
@@ -645,6 +646,7 @@ fn loadOptionsFromC(c_opts: ?*const AionLoadModelOptions) ?api.LoadModelOptions 
             opts.cache.growable = growth;
         }
     }
+    if (c.plan_cache_budget_bytes > 0) opts.plan_cache_budget_bytes = @intCast(c.plan_cache_budget_bytes);
     return opts;
 }
 

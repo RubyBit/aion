@@ -1620,7 +1620,7 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     defer sm.deinit();
 
     const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const quant_m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const quant_m_hint = plan_mod.matMulMHint(policy);
     const tiles = plan_mod.chooseMatMulTiles(policy, quant_m_hint, n, k, b_dtype);
 
     const a: []f32 = try allocator.alloc(f32, m * k);
@@ -1712,7 +1712,7 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     // base_square_2d=64) so this reproduces the model's actual decode tiling — NOT
     // the bench-wide defaultTilePolicy() which bumps base_square_2d to 256.
     const policy: plan_mod.TilePolicy = .{};
-    const m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const m_hint = plan_mod.matMulMHint(policy);
     const tiles = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, .q8_0);
 
     const a: []f32 = try allocator.alloc(f32, k);

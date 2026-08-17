@@ -134,7 +134,7 @@ fn makeQ8Weight(allocator: std.mem.Allocator, sm: *manager_mod.StorageManager, p
     defer allocator.free(buf);
 
     // Tile exactly as the MatMul lowering tiles a quant B, so no retile is needed.
-    const m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const m_hint = plan_mod.matMulMHint(policy);
     const t = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, .q8_0);
     const tid = try sm.createTiledTensor(.q8_0, &[_]usize{ 1, k, n }, &[_]usize{ 1, t.tk, t.tn }, .{ .tile_alignment = 64, .quant_axis = 1 });
     try sm.writeFromPackedQuant(tid, buf);

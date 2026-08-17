@@ -110,7 +110,7 @@ test "api: gpu batched matmul broadcasts rank-2 weight (matches cpu)" {
 /// This is the path the device-resident-state change touches: on the GPU the
 /// cache is a program output aliased in place to an input, so `execute` keeps it
 /// device-resident across steps instead of flushing it each run, and reading it
-/// back below goes through the on-demand `syncToHost`.
+/// back below performs an explicit D2H copy into a host mirror.
 fn runKvCacheSteps(ctx: *api.Context, dev: api.DeviceSelector) ![8]f32 {
     var bld = api.Builder.init(ctx);
     defer bld.deinit();

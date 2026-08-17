@@ -49,13 +49,13 @@ fn serialize(a: std.mem.Allocator, prog: *const program.Program, mgr: *manager_m
 
     try app(&list, a, "steps={d}\n", .{prog.steps.len});
     for (prog.steps, 0..) |step, i| {
-        try app(&list, a, "  [{d}] {s}\n", .{ i, @tagName(step) });
+        try app(&list, a, "  [{d}] {s}\n", .{ i, @tagName(step.op) });
     }
     try app(&list, a, "blocks={d}\n", .{prog.blocks.len});
     for (prog.blocks, 0..) |block, bi| {
         try app(&list, a, " block {d} steps={d}\n", .{ bi, block.steps.len });
         for (block.steps, 0..) |step, i| {
-            try app(&list, a, "   [{d}] {s}\n", .{ i, @tagName(step) });
+            try app(&list, a, "   [{d}] {s}\n", .{ i, @tagName(step.op) });
         }
     }
     try app(&list, a, "outputs=[", .{});

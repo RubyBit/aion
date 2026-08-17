@@ -13,7 +13,7 @@ const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const backend_mod = @import("../../backend.zig");
 const executable = @import("../../../runtime/executable.zig");
-const resident_mod = @import("../../../runtime/residency/resident_store.zig");
+const device_store = @import("../../../runtime/device_store.zig");
 
 const c = wgpu.c;
 const Ctx = context.Ctx;
@@ -39,11 +39,11 @@ const LstmParams = extern struct {
 
 /// Acquire tensor `id`'s single packed f32 tile (Unsupported otherwise).
 /// Caller releases via `hs.releaseConst(tile.token)`.
-fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize) ExecuteProgramError!resident_mod.TileRefDevice {
-    const hs = ctx.rstore.tensorStore();
+fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize) ExecuteProgramError!device_store.TileRef {
+    const hs = ctx.store;
     const meta = hs.meta(id) catch return error.ExecutionFailed;
     if (meta.dtype != .f32 or context.totalTiles(meta) != 1) return error.Unsupported;
-    const t = ctx.rstore.acquireTileDeviceConstLinear(id, 0) catch return error.ExecutionFailed;
+    const t = ctx.store.acquireTileDeviceConstLinear(id, 0) catch return error.ExecutionFailed;
     errdefer hs.releaseConst(t.token);
     const rank: usize = @as(usize, t.rank);
     const n = context.packedElems(t.rank, t.shape_mem[0..rank], t.strides_mem[0..rank]) orelse return error.Unsupported;
@@ -53,7 +53,7 @@ fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize) Execu
 }
 
 pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(s.out_state) catch return error.ExecutionFailed;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     const h_meta = hs.meta(s.h_prev) catch return error.ExecutionFailed;
@@ -81,8 +81,8 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     const dwhh = try acquirePackedConst(ctx, s.w_hh, hidden * gate_dim);
     defer hs.releaseConst(dwhh.token);
 
-    var dbih: ?resident_mod.TileRefDevice = null;
-    var dbhh: ?resident_mod.TileRefDevice = null;
+    var dbih: ?device_store.TileRef = null;
+    var dbhh: ?device_store.TileRef = null;
     defer {
         if (dbih) |t| hs.releaseConst(t.token);
         if (dbhh) |t| hs.releaseConst(t.token);
@@ -92,7 +92,7 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         dbhh = try acquirePackedConst(ctx, s.b_hh.?, gate_dim);
     }
 
-    const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out_state, 0) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireTileDeviceMutLinear(s.out_state, 0) catch return error.ExecutionFailed;
     defer hs.releaseMut(dout.token);
     const out_n = context.packedElems(dout.rank, dout.shape_mem[0..2], dout.strides_mem[0..2]) orelse return error.Unsupported;
     if (out_n < batch * hidden * 2) return error.Unsupported;

@@ -107,11 +107,17 @@ pub const BindGroupCache = struct {
         self.cursor = 0;
     }
 
-    pub fn deinit(self: *BindGroupCache) void {
+    pub fn clear(self: *BindGroupCache) void {
         for (self.entries.items) |e| {
             fns.wgpuBindGroupRelease(e.bind_group);
             fns.wgpuBufferRelease(e.uniform_buf);
         }
+        self.entries.clearRetainingCapacity();
+        self.cursor = 0;
+    }
+
+    pub fn deinit(self: *BindGroupCache) void {
+        self.clear();
         self.entries.deinit(self.allocator);
         self.* = undefined;
     }
@@ -124,6 +130,12 @@ pub const BindGroupCache = struct {
         return std.mem.eql(u8, e.ubytes[0..e.ulen], ubytes);
     }
 
+    /// Callers pass a tile's logical byte length; bindings cover whole u32 words,
+    /// which is what lets the u16 kernels write an odd tile's last element.
+    fn bindingSize(bytes: u64) u64 {
+        return (bytes + 3) / 4 * 4;
+    }
+
     fn buildEntry(self: *BindGroupCache, built: Built, buffers: []const c.WGPUBuffer, sizes: []const u64, ubytes: []const u8, ub_size: u64) FrameError!Entry {
         const ub = wgpu.createUniformBuffer(self.gpu.device, UniformPool.SLOT_BYTES) catch return error.ExecutionFailed;
         errdefer fns.wgpuBufferRelease(ub);
@@ -134,7 +146,7 @@ pub const BindGroupCache = struct {
             entries[i] = std.mem.zeroes(c.WGPUBindGroupEntry);
             entries[i].binding = @intCast(i);
             entries[i].buffer = buf;
-            entries[i].size = sizes[i];
+            entries[i].size = bindingSize(sizes[i]);
         }
         entries[buffers.len] = std.mem.zeroes(c.WGPUBindGroupEntry);
         entries[buffers.len].binding = @intCast(buffers.len);
@@ -303,7 +315,7 @@ pub const Frame = struct {
             entries[i].binding = @intCast(i);
             entries[i].buffer = buf;
             entries[i].offset = 0;
-            entries[i].size = buf_sizes[i];
+            entries[i].size = BindGroupCache.bindingSize(buf_sizes[i]);
         }
         entries[buffers.len] = std.mem.zeroes(c.WGPUBindGroupEntry);
         entries[buffers.len].binding = @intCast(buffers.len);

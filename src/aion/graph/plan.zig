@@ -2,6 +2,8 @@
 const std = @import("std");
 
 const types = @import("../backend/types.zig");
+const executable = @import("../runtime/executable.zig");
+const tensor_store = @import("../runtime/tensor_store.zig");
 
 pub const DType = types.DType;
 pub const BackendKind = types.BackendKind;
@@ -27,6 +29,15 @@ pub const TilePolicy = struct {
     ///
     /// Note: transpose materialization is simplest when tiles are square.
     base_square_2d: usize = 64,
+
+    /// GPU matmul output-tile cap along M and N. This is deliberately separate
+    /// from `base_square_2d`: changing general activation tiling must not also
+    /// change matmul dispatch geometry or fused-weight planning.
+    matmul_mn_tile_cap: usize = 4096,
+
+    /// GPU matmul K-tile cap. Keeping K whole when practical avoids an extra
+    /// global-memory accumulation round trip for every split-K dispatch.
+    matmul_k_tile_cap: usize = 4096,
 
     /// Default tile length for rank-1 tensors.
     base_1d: usize = 256,
@@ -97,18 +108,19 @@ pub const TilePolicy = struct {
 /// Macro tile-side cap for GPU targets. GPU wants FEW, LARGE tiles (the opposite
 /// of the CPU's many-small-tiles-for-thread-parallelism heuristic): one large tile
 /// per output collapses a matmul to a single dispatch with K accumulated in-kernel.
-const GPU_MACRO_TILE_CAP: usize = 4096;
+const GPU_GENERAL_TILE_CAP: usize = 4096;
+const GPU_MATMUL_MN_TILE_CAP: usize = 4096;
 /// K-tile cap for GPU targets — full-K in one tile when K is moderate, so there is
 /// one dispatch per output tile (no per-k-tile global-memory C round-trip).
 ///
-/// `GPU_MACRO_TILE_CAP * GPU_K_TILE_CAP * 4 bytes` is the largest f32 tile we
-/// emit (2048*2048*4 = 16 MiB). Kept conservative: WebGPU's default
+/// `GPU_MATMUL_MN_TILE_CAP * GPU_MATMUL_K_TILE_CAP * 4 bytes` is the largest
+/// f32 operand tile we emit (4096*4096*4 = 64 MiB). Kept conservative.
 /// `maxStorageBufferBindingSize` is 128 MiB, but a discrete NVIDIA adapter under
 /// wgpu-native rejected a 32 MiB binding here, so we stay well below until the
 /// backend queries the real device limit (a planned follow-up) and can size tiles
 /// to it. Until then, square shapes ≤2048 stay a single dispatch; larger ones tile
 /// into ≤16 MiB pieces (still far fewer/larger than the CPU policy).
-const GPU_K_TILE_CAP: usize = 4096;
+const GPU_MATMUL_K_TILE_CAP: usize = 4096;
 
 /// Default tiling policy for a compile target. CPU returns the historical
 /// defaults; GPU targets get large base tile sizes so typical tensors land in a
@@ -123,7 +135,9 @@ pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
         // defaults for now (matmul + elementwise are the realized GPU paths).
         .cuda, .metal, .vulkan, .webgpu => .{
             .target_kind = target.kind,
-            .base_square_2d = GPU_MACRO_TILE_CAP,
+            .base_square_2d = GPU_GENERAL_TILE_CAP,
+            .matmul_mn_tile_cap = GPU_MATMUL_MN_TILE_CAP,
+            .matmul_k_tile_cap = GPU_MATMUL_K_TILE_CAP,
             .base_1d = 1 << 24, // 16M elems → typical vectors are a single tile
             // Attention on GPU streams keys inside one kernel (shared-memory
             // online softmax), so a slice's whole q/k/v/out should land in ONE
@@ -236,12 +250,19 @@ pub fn roundUpToMultiple(x: usize, m: usize) usize {
     return x + (m - r);
 }
 
+/// Representative M used when planning a fused or initializer-only matmul for
+/// which the runtime activation shape is not available yet.
+pub fn matMulMHint(policy: TilePolicy) usize {
+    const cap = if (policy.target_kind == .cpu) policy.base_square_2d else policy.matmul_mn_tile_cap;
+    return @max(@as(usize, 1), cap);
+}
+
 pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
     // GPU: keep K in a single (large, bounded) tile so the kernel accumulates all
     // of K within one dispatch instead of round-tripping C through global memory
     // per k-tile. Respect quant block alignment.
     if (policy.target_kind != .cpu) {
-        const cap: usize = @min(k, GPU_K_TILE_CAP);
+        const cap: usize = @min(k, policy.matmul_k_tile_cap);
         if (!b_dtype.info().is_quantized) return @max(@as(usize, 1), cap);
         const be: usize = b_dtype.info().block_elems;
         return @max(be, roundDownToMultiple(cap, be));
@@ -282,8 +303,8 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     // moderate shapes → one dispatch) with full-or-large K. No CPU 128-cap (that
     // exists to spread work across cores; the GPU parallelizes within a dispatch).
     if (policy.target_kind != .cpu) {
-        const tm: usize = @max(@as(usize, 1), @min(m, GPU_MACRO_TILE_CAP));
-        const tn: usize = @max(@as(usize, 1), @min(n, GPU_MACRO_TILE_CAP));
+        const tm: usize = @max(@as(usize, 1), @min(m, policy.matmul_mn_tile_cap));
+        const tn: usize = @max(@as(usize, 1), @min(n, policy.matmul_mn_tile_cap));
         const tk: usize = chooseMatMulTk(policy, k, b_dtype);
         return .{ .tm = tm, .tn = tn, .tk = tk };
     }

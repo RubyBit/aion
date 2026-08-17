@@ -2,8 +2,7 @@
 //
 //! `WgpuDeviceMemory` — the WebGPU implementation of Aion's `DeviceMemory`
 //! interface (`runtime/device_memory.zig`, reached here via `@import("aion")`).
-//! Drop-in for `MockDeviceMemory`, so the residency layer (`ResidentTensorStore`)
-//! and its tests run unchanged against real GPU buffers.
+//! Drop-in for `MockDeviceMemory`, used by placement and explicit transfers.
 //!
 //! WebGPU exposes explicit buffers even on unified hardware, so this reports
 //! `.discrete`: H2D is `wgpuQueueWriteBuffer`; D2H stages through a temporary
@@ -34,7 +33,16 @@ const PARALLEL_MEMCPY_MIN_BYTES: usize = 8 * 1024 * 1024;
 /// next to the copies themselves.
 const H2D_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 
-const dm = @import("../../runtime/residency/device_memory.zig");
+/// WebGPU copy sizes/offsets and storage bindings are whole u32 words, so a tile
+/// with an odd byte length (odd-element f16) is backed rounded up — every tile is
+/// its own buffer, so the padding belongs to no one else.
+const COPY_ALIGN: usize = 4;
+
+fn alignUp(n: usize) usize {
+    return (n + COPY_ALIGN - 1) / COPY_ALIGN * COPY_ALIGN;
+}
+
+const dm = @import("../../runtime/device_memory.zig");
 const DeviceMemory = dm.DeviceMemory;
 const DeviceHandle = dm.DeviceHandle;
 const DeviceError = dm.DeviceError;
@@ -134,7 +142,7 @@ pub const WgpuDeviceMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // Resident tiles are uploaded to, copied from, and bound as storage.
         const usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc | c.WGPUBufferUsage_CopyDst;
-        const buf = wgpu.createBuffer(self.gpu.device, @intCast(bytes), usage) catch return DeviceError.OutOfDeviceMemory;
+        const buf = wgpu.createBuffer(self.gpu.device, @intCast(alignUp(bytes)), usage) catch return DeviceError.OutOfDeviceMemory;
         self.buffers.append(self.allocator, buf) catch {
             fns.wgpuBufferRelease(buf);
             return DeviceError.OutOfDeviceMemory;
@@ -156,7 +164,15 @@ pub const WgpuDeviceMemory = struct {
     fn copyH2D(ctx: *anyopaque, handle: DeviceHandle, dst_offset: usize, src: []const u8) DeviceError!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
-        fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, src.len);
+        if (dst_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
+        // A trailing 1..3 bytes go as one zero-padded word (`alloc` left room).
+        const head = src.len / COPY_ALIGN * COPY_ALIGN;
+        if (head != 0) fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, head);
+        if (head != src.len) {
+            var word: [COPY_ALIGN]u8 = @splat(0);
+            @memcpy(word[0 .. src.len - head], src[head..]);
+            fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset + head), &word, word.len);
+        }
         // Bound wgpu's write-staging: an empty submit flushes the pending
         // writes, the wait lets wgpu recycle their staging buffers. Ordering is
         // unaffected (writeBuffer data was already ordered before any later
@@ -173,22 +189,41 @@ pub const WgpuDeviceMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (dst.len == 0) return;
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
-        const staging = try self.ensureStaging(dst.len);
+        if (src_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
+        // Stage whole words (`alloc` rounded the source up); hand back `dst.len`.
+        const staged = alignUp(dst.len);
+        const staging = try self.ensureStaging(staged);
 
-        // Copy device->staging on the queue, then block until all prior submits
-        // (the compute that produced `buf`) and this copy have completed.
+        // Copy device->staging on the queue. `mapBlocking`'s wait covers both the
+        // prior submits (the compute that produced `buf`) and this copy, so the
+        // readback costs ONE device round trip, not a drain plus a map.
         const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
-        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, dst.len);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, staged);
         const cmd = fns.wgpuCommandEncoderFinish(enc, null);
         fns.wgpuCommandEncoderRelease(enc);
         fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
         fns.wgpuCommandBufferRelease(cmd);
-        _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
 
-        self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, dst.len) catch return DeviceError.InvalidArgument;
-        const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, dst.len) orelse return DeviceError.InvalidArgument;
+        self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, staged) catch return DeviceError.InvalidArgument;
+        const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, staged) orelse return DeviceError.InvalidArgument;
         self.copyHostBytes(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);
         fns.wgpuBufferUnmap(staging);
+    }
+
+    fn copyD2D(ctx: *anyopaque, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (bytes == 0) return;
+        const dst_buf = self.bufFor(dst) orelse return DeviceError.InvalidArgument;
+        const src_buf = self.bufFor(src) orelse return DeviceError.InvalidArgument;
+
+        // Ordered after any prior submit, so a caller that just wrote `src`
+        // through the queue sees those bytes without an explicit wait.
+        const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
+        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, src_buf, @intCast(src_offset), dst_buf, @intCast(dst_offset), bytes);
+        const cmd = fns.wgpuCommandEncoderFinish(enc, null);
+        fns.wgpuCommandEncoderRelease(enc);
+        fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
+        fns.wgpuCommandBufferRelease(cmd);
     }
 
     fn maxBindingBytes(ctx: *anyopaque) u64 {
@@ -204,6 +239,7 @@ pub const WgpuDeviceMemory = struct {
         .free = free,
         .copyH2D = copyH2D,
         .copyD2H = copyD2H,
+        .copyD2D = copyD2D,
         // importHost stays null: discrete memory has no host aliasing.
         .maxBindingBytes = maxBindingBytes,
     };

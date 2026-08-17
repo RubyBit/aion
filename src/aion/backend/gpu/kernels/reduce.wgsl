@@ -8,7 +8,7 @@
 @group(0) @binding(1) var<storage, read_write> o: array<f32>;
 @group(0) @binding(2) var<uniform>             p: Params;
 
-struct Params { rows: u32, cols: u32, x_row: u32 };
+struct Params { rows: u32, cols: u32, x_row: u32, o_base: u32 };
 
 const WG: u32 = 256u;
 var<workgroup> scratch: array<f32, 256>;
@@ -37,13 +37,36 @@ fn row_sum(wid: vec3<u32>, lidx: u32) -> f32 {
 @compute @workgroup_size(256)
 fn reduce_sum_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let total = row_sum(wid, lidx);
-    if (lidx == 0u) { o[wid.x] = total; }
+    if (lidx == 0u) { o[p.o_base + wid.x] = total; }
 }
 
 @compute @workgroup_size(256)
 fn reduce_mean_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let total = row_sum(wid, lidx);
-    if (lidx == 0u) { o[wid.x] = total / f32(p.cols); }
+    if (lidx == 0u) { o[p.o_base + wid.x] = total / f32(p.cols); }
+}
+
+// Fold column-tile partials. Scratch is part-major:
+// x[part * rows + row]. For mean, `o_base` carries the full logical row width;
+// the final output tile itself always begins at element zero.
+fn parts_sum(wid: vec3<u32>, lidx: u32) -> f32 {
+    var value = 0.0;
+    for (var part = lidx; part < p.cols; part += WG) {
+        value += x[part * p.x_row + wid.x];
+    }
+    return wg_reduce_sum(lidx, value);
+}
+
+@compute @workgroup_size(256)
+fn reduce_parts_sum(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let total = parts_sum(wid, lidx);
+    if (lidx == 0u) { o[wid.x] = total; }
+}
+
+@compute @workgroup_size(256)
+fn reduce_parts_mean(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let total = parts_sum(wid, lidx);
+    if (lidx == 0u) { o[wid.x] = total / f32(p.o_base); }
 }
 
 // ---- two-stage whole-tensor reduction --------------------------------------
@@ -64,7 +87,7 @@ fn reduce_all_partial(
     var s = 0.0;
     for (var i = wid.x * WG + lidx; i < p.cols; i += step) { s += x[i]; }
     let total = wg_reduce_sum(lidx, s);
-    if (lidx == 0u) { o[wid.x] = total; }
+    if (lidx == 0u) { o[p.o_base + wid.x] = total; }
 }
 
 // Stage-2 mean finish: sums the partials in x[0..cols) and divides by the

@@ -19,16 +19,8 @@ pub const ExecuteProgramError = BackendError || tensor_store.StoreError;
 
 /// An execution session bound to a single `TensorStore`.
 ///
-/// A session is the unit that owns whatever per-store execution state a backend
-/// needs to persist across programs — most notably device residency on the GPU
-/// backend (weights upload once and stay device-resident for the session's
-/// lifetime). The session object IS the identity of that state: there is no
-/// pointer-comparison cache and no manual invalidation. Create one per logical
-/// consumer (e.g. a `Model`), execute many programs against it, then `deinit`.
-///
-/// CPU is stateless per store, so its session is a trivial wrapper; GPU's owns a
-/// `ResidentTensorStore`. Sessions borrow the backend's device-global caches
-/// (pipelines, autotune) — those stay shared across all sessions of a backend.
+/// A session binds a backend to one tensor store for repeated execution. Tensor
+/// backing ownership remains in the store; sessions own only backend bookkeeping.
 pub const Session = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -40,17 +32,11 @@ pub const Session = struct {
         /// - `prog` has been validated end-to-end by the compiler (Graph -> ExecutableProgram).
         /// - Implementation must not perform per-op argument checking; only backend/storage errors can occur.
         execute: *const fn (ctx: *anyopaque, prog: *const executable.ExecutableProgram) ExecuteProgramError!void,
-        /// Release the session and any per-store state it owns (device buffers, etc.).
+        /// Wait for submitted work and drop backend resources that may retain
+        /// tensor backings. Called only before storage eviction.
+        retireResources: *const fn (ctx: *anyopaque) void,
+        /// Release backend-local session bookkeeping.
         deinit: *const fn (ctx: *anyopaque) void,
-
-        /// Ensure a tensor's host bytes are current, flushing a device-newer copy
-        /// (D2H) if one exists. Null on a stateless session (CPU: the store is
-        /// always host-coherent) and a no-op for a host-resident tensor. The
-        /// runtime calls this before a host read of an output that `execute`
-        /// intentionally left device-resident (recurrent state — see
-        /// `ExecutableProgram.output_device_resident`), so such reads stay correct
-        /// while the per-run eager flush is skipped.
-        syncToHost: ?*const fn (ctx: *anyopaque, id: tensor_store.TensorId) ExecuteProgramError!void = null,
     };
 
     pub fn execute(self: Session, prog: *const executable.ExecutableProgram) ExecuteProgramError!void {
@@ -61,10 +47,8 @@ pub const Session = struct {
         self.vtable.deinit(self.ctx);
     }
 
-    /// Flush `id` to the host if the session tracks device residency; otherwise a
-    /// no-op. See `VTable.syncToHost`.
-    pub fn syncToHost(self: Session, id: tensor_store.TensorId) ExecuteProgramError!void {
-        if (self.vtable.syncToHost) |f| return f(self.ctx, id);
+    pub fn retireResources(self: Session) void {
+        self.vtable.retireResources(self.ctx);
     }
 };
 

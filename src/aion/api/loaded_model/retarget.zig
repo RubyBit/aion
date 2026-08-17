@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+const std = @import("std");
 const program_mod = @import("../../graph/program.zig");
+const executable = @import("../../runtime/executable.zig");
 const types_mod = @import("types.zig");
 
 /// In-place patching of `TensorId`s inside a compiled `ExecutableProgram`.
@@ -17,66 +19,33 @@ const types_mod = @import("types.zig");
 /// on it if callers are willing to rebuild cache entries or copy into the
 /// originally-compiled tensors.
 ///
-/// Maintenance note:
-/// This implementation walks step payload fields recursively and patches any
-/// `TensorId` / `?TensorId` fields it finds. That keeps it resilient to new
-/// step variants and new tensor-id fields without per-variant boilerplate.
+/// `executable.tensorUses` is the singular operand walk used here and by
+/// placement/liveness, so new step variants cannot silently diverge.
 pub fn retargetProgramTensorIds(program: *program_mod.Program, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
     if (old_tid == new_tid) return;
-    for (program.steps) |*step| retargetStepTensorIds(step, old_tid, new_tid);
+    for (program.steps) |*step| retargetStepTensorIds(&step.op, old_tid, new_tid);
     for (program.blocks) |*block| {
-        for (block.steps) |*step| retargetStepTensorIds(step, old_tid, new_tid);
+        for (block.steps) |*step| retargetStepTensorIds(&step.op, old_tid, new_tid);
     }
     for (program.outputs) |*tid| retargetTensorId(tid, old_tid, new_tid);
+    for (program.growth_requests) |*request| {
+        retargetTensorId(&request.cache, old_tid, new_tid);
+        retargetTensorId(&request.new_kv, old_tid, new_tid);
+        retargetTensorId(&request.end_index, old_tid, new_tid);
+    }
+    for (program.tensor_placements) |*placement| {
+        retargetTensorId(&placement.id, old_tid, new_tid);
+    }
+    std.mem.sort(executable.TensorPlacement, program.tensor_placements, {}, struct {
+        fn lessThan(_: void, a: executable.TensorPlacement, b: executable.TensorPlacement) bool {
+            return a.id < b.id;
+        }
+    }.lessThan);
 }
 
 fn retargetStepTensorIds(step: *program_mod.Step, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
-    switch (step.*) {
-        inline else => |*payload| {
-            retargetTensorIdsInValue(@TypeOf(payload.*), payload, old_tid, new_tid);
-        },
-    }
-}
-
-fn retargetTensorIdsInValue(comptime T: type, value: *T, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
-    switch (@typeInfo(T)) {
-        .int => {
-            if (T == types_mod.TensorId) {
-                retargetTensorId(@ptrCast(value), old_tid, new_tid);
-            }
-        },
-        .optional => |opt| {
-            if (opt.child == types_mod.TensorId) {
-                if (value.*) |tid| {
-                    if (tid == old_tid) value.* = new_tid;
-                }
-                return;
-            }
-
-            if (value.*) |*child| {
-                retargetTensorIdsInValue(opt.child, child, old_tid, new_tid);
-            }
-        },
-        .array => |arr| {
-            var i: usize = 0;
-            while (i < arr.len) : (i += 1) {
-                retargetTensorIdsInValue(arr.child, &value.*[i], old_tid, new_tid);
-            }
-        },
-        .@"struct" => |s| {
-            inline for (s.field_names, s.field_types) |field_name, field_type| {
-                retargetTensorIdsInValue(field_type, &@field(value.*, field_name), old_tid, new_tid);
-            }
-        },
-        .@"union" => {
-            switch (value.*) {
-                inline else => |*payload| {
-                    retargetTensorIdsInValue(@TypeOf(payload.*), payload, old_tid, new_tid);
-                },
-            }
-        },
-        else => {},
-    }
+    const uses = executable.tensorUses(step);
+    for (uses.slice()) |use| retargetTensorId(use.id, old_tid, new_tid);
 }
 
 fn retargetTensorId(slot: *types_mod.TensorId, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
@@ -86,43 +55,16 @@ fn retargetTensorId(slot: *types_mod.TensorId, old_tid: types_mod.TensorId, new_
 /// Read-only counterpart: does any step/output of `program` reference `tid`?
 /// Used to confirm a fused-away weight is safe to reclaim (nothing still reads it).
 pub fn programReferencesTensorId(program: *const program_mod.Program, tid: types_mod.TensorId) bool {
-    for (program.steps) |*step| if (stepReferencesTensorId(step, tid)) return true;
+    for (program.steps) |*step| if (stepReferencesTensorId(&step.op, tid)) return true;
     for (program.blocks) |*block| {
-        for (block.steps) |*step| if (stepReferencesTensorId(step, tid)) return true;
+        for (block.steps) |*step| if (stepReferencesTensorId(&step.op, tid)) return true;
     }
     for (program.outputs) |out| if (out == tid) return true;
     return false;
 }
 
 fn stepReferencesTensorId(step: *const program_mod.Step, tid: types_mod.TensorId) bool {
-    switch (step.*) {
-        inline else => |*payload| return valueReferencesTensorId(@TypeOf(payload.*), payload, tid),
-    }
-}
-
-fn valueReferencesTensorId(comptime T: type, value: *const T, tid: types_mod.TensorId) bool {
-    switch (@typeInfo(T)) {
-        .int => return (T == types_mod.TensorId and value.* == tid),
-        .optional => |opt| {
-            if (value.*) |*child| return valueReferencesTensorId(opt.child, child, tid);
-            return false;
-        },
-        .array => |arr| {
-            var i: usize = 0;
-            while (i < arr.len) : (i += 1) {
-                if (valueReferencesTensorId(arr.child, &value.*[i], tid)) return true;
-            }
-            return false;
-        },
-        .@"struct" => |s| {
-            inline for (s.field_names, s.field_types) |field_name, field_type| {
-                if (valueReferencesTensorId(field_type, &@field(value.*, field_name), tid)) return true;
-            }
-            return false;
-        },
-        .@"union" => switch (value.*) {
-            inline else => |*payload| return valueReferencesTensorId(@TypeOf(payload.*), payload, tid),
-        },
-        else => return false,
-    }
+    const uses = executable.tensorUses(@constCast(step));
+    for (uses.slice()) |use| if (use.id.* == tid) return true;
+    return false;
 }

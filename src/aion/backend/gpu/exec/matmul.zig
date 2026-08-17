@@ -18,6 +18,7 @@ const configs = @import("../matmul/configs.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
+const env_util = @import("../../../env.zig");
 
 const c = wgpu.c;
 const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
@@ -116,8 +117,8 @@ fn fullTileCompatible(cfg: MatmulConfig, c_meta: TensorMeta, a_meta: TensorMeta,
 }
 
 fn forcedConfigIndex(generated: []const Generated, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!?usize {
-    const env = std.c.getenv("AION_MATMUL_CONFIG") orelse return null;
-    const raw = std.mem.span(env);
+    const raw = env_util.getOwned(std.heap.page_allocator, "AION_MATMUL_CONFIG") orelse return null;
+    defer std.heap.page_allocator.free(raw);
 
     const maybe_idx = std.fmt.parseInt(usize, raw, 10) catch null;
     if (maybe_idx) |idx| {
@@ -205,7 +206,7 @@ pub const Matmul = struct {
     }
 
     pub fn exec(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul) ExecuteProgramError!void {
-        const hs = ctx.rstore.tensorStore();
+        const hs = ctx.store;
         const c_meta = hs.meta(s.c) catch return error.ExecutionFailed;
         const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
         const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
@@ -352,10 +353,10 @@ pub const Matmul = struct {
         beta: f32,
         rank: usize,
     ) ExecuteProgramError!void {
-        const hs = ctx.rstore.tensorStore();
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-        const dc = ctx.rstore.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
+        const hs = ctx.store;
+        const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
+        const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
+        const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
         defer {
             hs.releaseConst(da.token);
             hs.releaseConst(db.token);
@@ -449,12 +450,12 @@ pub const Matmul = struct {
         }
 
         // Row strides (bytes) of tile (0,0) drive vec4 eligibility.
-        const da0 = ctx.rstore.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
+        const da0 = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
         const a_row_bytes = da0.strides_mem[0];
-        ctx.rstore.tensorStore().releaseConst(da0.token);
-        const db0 = ctx.rstore.acquireTileDeviceConstLinear(s.b, 0) catch return error.ExecutionFailed;
+        ctx.store.releaseConst(da0.token);
+        const db0 = ctx.store.acquireTileDeviceConstLinear(s.b, 0) catch return error.ExecutionFailed;
         const b_row_bytes = db0.strides_mem[0];
-        ctx.rstore.tensorStore().releaseConst(db0.token);
+        ctx.store.releaseConst(db0.token);
 
         if (try forcedConfigIndex(self.generated, ctx.gpu.limits, a_row_bytes, b_row_bytes, c_meta, a_meta, b_meta)) |idx| {
             self.last_choice = idx;
@@ -518,7 +519,7 @@ fn recordOutputTile(
     a_meta: TensorMeta,
     b_meta: TensorMeta,
 ) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const k_tiles = a_meta.tile_counts[1];
     const c_lin = tensor_store_mod.encodeTileIndex(c_meta, &[_]usize{ ti_m, ti_n }) catch return error.ExecutionFailed;
     var ti_k: usize = 0;
@@ -527,9 +528,9 @@ fn recordOutputTile(
         const a_lin = tensor_store_mod.encodeTileIndex(a_meta, &[_]usize{ ti_m, ti_k }) catch return error.ExecutionFailed;
         const b_lin = tensor_store_mod.encodeTileIndex(b_meta, &[_]usize{ ti_k, ti_n }) catch return error.ExecutionFailed;
 
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-        const dc = ctx.rstore.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
+        const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
+        const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
         if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dc.len)) {
             hs.releaseConst(da.token);
             hs.releaseConst(db.token);
@@ -585,10 +586,10 @@ fn recordTileGemmLinear(
     beta: f32,
     rank: usize,
 ) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
-    const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-    const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-    const dc = ctx.rstore.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
+    const hs = ctx.store;
+    const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
+    const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
+    const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
     defer {
         hs.releaseConst(da.token);
         hs.releaseConst(db.token);

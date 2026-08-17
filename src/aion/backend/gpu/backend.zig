@@ -10,18 +10,12 @@
 //! handle: `gb.backend().executeProgram(prog, store)`.
 //!
 //! Execution model:
-//!   - Device residency (`ResidentTensorStore` over `WgpuDeviceMemory`) lives on
-//!     a `Session` (`GpuSession`) bound to one host store, NOT on the backend.
-//!     Residency PERSISTS for the session's lifetime across `session.execute`
-//!     calls: weights are never host-written, so they upload once and stay
-//!     device-resident across decode steps; inputs re-upload when the host
-//!     rewrites them. The session object is the residency's identity — no
-//!     pointer-keyed cache. Device-global caches (pipelines, autotune, scratch)
-//!     stay on the backend and are shared by all its sessions. (The v0 backend
-//!     rebuilt residency every call, so every tensor re-uploaded each run.)
-//!   - Each `executeProgram` records all its dispatches into a single `Frame`
-//!     (one command encoder) and submits ONCE, then flushes program outputs back
-//!     to the host store (D2H).
+//!   - Every tensor has one physical placement. Model preparation migrates GPU
+//!     values before execution; the executor has no host-staging fallback.
+//!   - Transfers are explicit executable steps. Host control reads can only see
+//!     CPU mirrors produced by those steps, while kernels only see device tiles.
+//!   - Each `executeProgram` records dispatches into a `Frame` and submits once
+//!     except where an explicit control transfer requires synchronization.
 //!   - WGSL kernels are cached via `Pipelines` (module per kernel, pipeline +
 //!     bind-group layout per entry point -- reflected once, not per dispatch).
 //!
@@ -61,9 +55,10 @@ const backend_mod = @import("../backend.zig");
 const types = @import("../types.zig");
 const executable = @import("../../runtime/executable.zig");
 const tensor_store_mod = @import("../../runtime/tensor_store.zig");
-const resident_mod = @import("../../runtime/residency/resident_store.zig");
+const device_store_mod = @import("../../runtime/device_store.zig");
 const thread_pool_mod = @import("../../runtime/thread_pool.zig");
 const profile_mod = @import("../../profile.zig");
+const env_util = @import("../../env.zig");
 
 const c = wgpu.c;
 const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
@@ -77,7 +72,6 @@ const ExecutableProgram = executable.ExecutableProgram;
 const TensorStore = tensor_store_mod.TensorStore;
 const TensorId = tensor_store_mod.TensorId;
 const TensorMeta = tensor_store_mod.TensorMeta;
-const ResidentTensorStore = resident_mod.ResidentTensorStore;
 const Frame = frame_mod.Frame;
 
 pub const GpuBackend = struct {
@@ -85,11 +79,6 @@ pub const GpuBackend = struct {
     gpu: *wgpu.Gpu,
     devmem: wgpu_dm.WgpuDeviceMemory,
     pipes: pipelines_mod.Pipelines,
-
-    /// When false, `executeProgram` records + submits the compute but skips the
-    /// device->host flush of outputs. Used by benchmarks to time pure kernel
-    /// throughput without paying a full-output D2H readback every iteration.
-    flush_outputs: bool = true,
 
     /// Matmul executor owns the per-shape autotune cache.
     matmul: matmul_exec.Matmul,
@@ -163,15 +152,16 @@ pub const GpuBackend = struct {
         return .{ .ctx = @ptrCast(self), .vtable = &vtable };
     }
 
-    /// Block until all submitted GPU work has completed. Benchmarks call this once
-    /// after a batch of `flush_outputs == false` runs to time pure compute.
+    /// Block until all submitted GPU work has completed. Benchmarks call this
+    /// once after a batch of un-read runs to time pure compute — `execute` never
+    /// reads outputs back, so not calling `outputTensor` is what excludes D2H.
     pub fn sync(self: *Self) void {
         _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
     }
 
-    /// Build a `Session` bound to `store`: a `GpuSession` owning a fresh
-    /// `ResidentTensorStore` over this backend's device memory. Residency lives
-    /// and dies with the returned session (no pointer-keyed cache, no reset).
+    /// Build a session over an already-placed store. GPU operation code receives
+    /// only opaque device tiles; host values are reachable solely through
+    /// explicit transfer/control paths.
     pub fn createSession(self: *Self, store: TensorStore) tensor_store_mod.StoreError!Session {
         // Wire the D2H memcpy pool now that `self` is at its final address (the
         // backend is passed by pointer through the vtable). Idempotent.
@@ -179,7 +169,7 @@ pub const GpuBackend = struct {
         const s = self.allocator.create(GpuSession) catch return error.OutOfMemory;
         s.* = .{
             .gb = self,
-            .resident = ResidentTensorStore.init(self.allocator, store, self.devmem.device()),
+            .host = store,
         };
         return .{ .ctx = @ptrCast(s), .vtable = &GpuSession.session_vtable };
     }
@@ -189,36 +179,76 @@ pub const GpuBackend = struct {
         return self.createSession(store);
     }
 
-    /// A GPU execution session: owns the device residency for one host store.
-    /// `execute` records a whole program into one `Frame` and submits once,
-    /// reusing the session's resident device buffers across calls.
+    /// A GPU execution session bound to one placed tensor store.
     pub const GpuSession = struct {
         gb: *Self,
-        resident: ResidentTensorStore,
+        host: TensorStore,
 
         fn execute(ctx: *anyopaque, prog: *const ExecutableProgram) ExecuteProgramError!void {
             const s: *GpuSession = @ptrCast(@alignCast(ctx));
-            return s.gb.runProgram(&s.resident, prog);
+            return s.gb.runProgram(s, prog);
         }
 
-        /// Flush `id` back to the host store (D2H) if the device copy is newer.
-        /// Lets the runtime host-read an output that `execute` kept device-resident
-        /// (recurrent state) without the per-run eager flush; see `flushToHost`.
-        fn syncToHost(ctx: *anyopaque, id: TensorId) ExecuteProgramError!void {
+        fn deviceMeta(ctx: *anyopaque, id: TensorId) tensor_store_mod.StoreError!TensorMeta {
             const s: *GpuSession = @ptrCast(@alignCast(ctx));
-            return flushToHost(&s.resident, id);
+            return s.host.meta(id);
+        }
+
+        fn deviceAcquire(ctx: *anyopaque, id: TensorId, tile_index: usize) tensor_store_mod.StoreError!device_store_mod.TileRef {
+            const s: *GpuSession = @ptrCast(@alignCast(ctx));
+            const tile = (try s.host.deviceTile(id, tile_index)) orelse return error.InvalidArgument;
+            return .{
+                .handle = tile.handle,
+                .offset = 0,
+                .len = tile.len,
+                .dtype = tile.dtype,
+                .rank = tile.rank,
+                .shape_mem = tile.shape_mem,
+                .strides_mem = tile.strides_mem,
+            };
+        }
+
+        fn deviceRelease(_: *anyopaque, _: usize) void {}
+
+        fn sequenceCachePolicyInfo(ctx: *anyopaque, id: TensorId) tensor_store_mod.SequenceCachePolicyInfo {
+            const s: *GpuSession = @ptrCast(@alignCast(ctx));
+            return s.host.sequenceCachePolicyInfo(id);
+        }
+
+        fn mapSequenceStep(ctx: *anyopaque, id: TensorId, logical: usize, capacity: usize) tensor_store_mod.StoreError!usize {
+            const s: *GpuSession = @ptrCast(@alignCast(ctx));
+            return s.host.mapSequenceStep(id, logical, capacity);
+        }
+
+        fn deviceStore(s: *GpuSession) device_store_mod.DeviceStore {
+            return .{ .ctx = @ptrCast(s), .vtable = &device_vtable };
         }
 
         fn deinitSession(ctx: *anyopaque) void {
             const s: *GpuSession = @ptrCast(@alignCast(ctx));
-            s.resident.deinit();
             s.gb.allocator.destroy(s);
         }
 
+        fn retireResources(ctx: *anyopaque) void {
+            const s: *GpuSession = @ptrCast(@alignCast(ctx));
+            _ = fns.wgpuDevicePoll(s.gb.gpu.device, 1, null);
+            s.gb.bind_cache.clear();
+        }
+
+        const device_vtable = device_store_mod.DeviceStore.VTable{
+            .meta = deviceMeta,
+            .acquireConst = deviceAcquire,
+            .acquireMut = deviceAcquire,
+            .releaseConst = deviceRelease,
+            .releaseMut = deviceRelease,
+            .sequenceCachePolicyInfo = sequenceCachePolicyInfo,
+            .mapSequenceStep = mapSequenceStep,
+        };
+
         const session_vtable = Session.VTable{
             .execute = execute,
+            .retireResources = retireResources,
             .deinit = deinitSession,
-            .syncToHost = syncToHost,
         };
     };
 
@@ -228,29 +258,14 @@ pub const GpuBackend = struct {
         return total;
     }
 
-    /// Force device->host flush of every tile of `id` so the host store holds the
-    /// computed result (a host read through the resident store triggers D2H).
-    fn flushToHost(rstore: *ResidentTensorStore, id: TensorId) ExecuteProgramError!void {
-        const hs = rstore.tensorStore();
-        const meta = hs.meta(id) catch return error.ExecutionFailed;
-        const total = totalTiles(meta);
-        var i: usize = 0;
-        while (i < total) : (i += 1) {
-            const t = hs.acquireTileConstLinear(id, i) catch return error.ExecutionFailed;
-            hs.releaseConst(t.token);
-        }
-    }
-
     // ---- vtable ----
 
     /// Per-`executeProgram` execution state. Most steps just record into the
-    /// current frame; control flow (If/Loop) needs host-visible predicates.
-    /// Reading a predicate costs a CPU<->GPU round-trip ONLY when the value was
-    /// produced on device (see `readPredicate`): a host-resident predicate is
-    /// read directly with no stall, and a device-produced one pays exactly one
-    /// device poll (inside the D2H readback), not two. `Frame.records` lets a
-    /// fixed-trip Loop record its whole unrolled body into one frame and submit
-    /// once, with zero syncs.
+    /// current frame; control flow (If/Loop) needs host-visible predicates, which
+    /// the compiler has already placed on the CPU — a `Transfer` step pays the one
+    /// device poll, and only when the device actually produced the value.
+    /// `Frame.records` lets a fixed-trip Loop record its whole unrolled body into
+    /// one frame and submit once, with zero syncs.
     const Runner = struct {
         gb: *Self,
         op_ctx: context.Ctx,
@@ -273,36 +288,22 @@ pub const GpuBackend = struct {
             r.frame.flushInPlace() catch return error.ExecutionFailed;
         }
 
-        /// Read an i32 control-flow predicate to the host with the minimum GPU
-        /// stall. If the value was produced on device, submit the pending frame
-        /// (so the producing dispatch — which may still sit unsubmitted in the
-        /// current frame — is queued) and pull it down; the D2H readback polls
-        /// exactly once. If it is host-resident, read it directly: no submit, no
-        /// device poll, and the current frame keeps batching.
-        fn readPredicate(r: *Runner, id: TensorId) ExecuteProgramError!i32 {
-            if (r.op_ctx.rstore.tileDeviceDirty(id, 0)) try r.submitPending();
-            return r.readI32Scalar(id);
-        }
-
-        /// Host-read an i32 scalar (element 0 of tile 0). When the tile is
-        /// device-dirty this triggers a D2H readback (a single device poll);
-        /// otherwise it reads current host bytes with no GPU work.
+        /// Host-read an i32 control value (element 0 of tile 0). `id` is always
+        /// CPU-placed — the compiler transferred it if the device wrote it — so
+        /// this is a plain read with no submit and no device poll.
         fn readI32Scalar(r: *Runner, id: TensorId) ExecuteProgramError!i32 {
-            const hs = r.op_ctx.rstore.tensorStore();
-            const meta = hs.meta(id) catch return error.ExecutionFailed;
-            if (meta.dtype != .i32) return error.ExecutionFailed;
-            const tile = hs.acquireTileConstLinear(id, 0) catch return error.ExecutionFailed;
-            defer hs.releaseConst(tile.token);
-            if (tile.bytes.len < 4) return error.ExecutionFailed;
-            const ptr: *align(1) const i32 = @ptrCast(tile.bytes.ptr);
-            return ptr.*;
+            const lease = try r.op_ctx.control.readI32(id);
+            defer lease.release();
+            if (lease.vals.len == 0) return error.ExecutionFailed;
+            return lease.vals[0];
         }
 
         /// Device-side equivalent of the CPU's `copyTensorLists`: same-layout
         /// tensors, tile-for-tile buffer copies (stays in-frame, no sync).
         fn copyLists(r: *Runner, dst: []const TensorId, src: []const TensorId) ExecuteProgramError!void {
-            const hs = r.op_ctx.rstore.tensorStore();
+            const hs = r.op_ctx.store;
             for (dst, src) |dst_id, src_id| {
+                if (dst_id == src_id) continue;
                 const dst_meta = hs.meta(dst_id) catch return error.ExecutionFailed;
                 const src_meta = hs.meta(src_id) catch return error.ExecutionFailed;
                 if (dst_meta.dtype != src_meta.dtype or dst_meta.rank != src_meta.rank) return error.ExecutionFailed;
@@ -313,8 +314,8 @@ pub const GpuBackend = struct {
                 const total = totalTiles(dst_meta);
                 var ti: usize = 0;
                 while (ti < total) : (ti += 1) {
-                    const st = r.op_ctx.rstore.acquireTileDeviceConstLinear(src_id, ti) catch return error.ExecutionFailed;
-                    const dt = r.op_ctx.rstore.acquireTileDeviceMutLinear(dst_id, ti) catch return error.ExecutionFailed;
+                    const st = r.op_ctx.store.acquireTileDeviceConstLinear(src_id, ti) catch return error.ExecutionFailed;
+                    const dt = r.op_ctx.store.acquireTileDeviceMutLinear(dst_id, ti) catch return error.ExecutionFailed;
                     defer {
                         hs.releaseConst(st.token);
                         hs.releaseMut(dt.token);
@@ -331,24 +332,12 @@ pub const GpuBackend = struct {
             }
         }
 
-        /// Store-level swaps (the resident store migrates device residency with
-        /// the swap, so this is zero-copy and safe mid-frame: already-recorded
-        /// commands hold their buffer references; future acquires resolve to
-        /// the swapped buffers).
-        fn swapLists(r: *Runner, a: []const TensorId, b: []const TensorId) ExecuteProgramError!void {
-            const hs = r.op_ctx.rstore.tensorStore();
-            for (a, b) |a_id, b_id| {
-                if (a_id == b_id) continue;
-                hs.swapTensors(a_id, b_id) catch return error.ExecutionFailed;
-            }
-        }
-
         fn runBlock(r: *Runner, block_id: executable.BlockId) ExecuteProgramError!void {
             const idx: usize = @intCast(block_id);
             if (idx >= r.prog.blocks.len) return error.ExecutionFailed;
             r.depth += 1;
             defer r.depth -= 1;
-            for (r.prog.blocks[idx].steps) |step| try r.runStep(step);
+            for (r.prog.blocks[idx].steps) |step| try r.runStep(step.op);
         }
 
         fn runStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
@@ -358,12 +347,43 @@ pub const GpuBackend = struct {
             const generic_profile = r.profiler != null and r.depth == 0;
             const t0: u64 = if (generic_profile) profile_mod.nowNs() else 0;
             r.dispatchStep(step) catch |e| {
-                if (std.c.getenv("AION_GPU_TRACE") != null)
+                if (env_util.flagEnabled("AION_GPU_TRACE"))
                     std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
                 return e;
             };
             if (generic_profile) {
                 if (r.cpu_track) |track| r.profiler.?.recordSpan(track, .operation, @tagName(step), t0, profile_mod.nowNs());
+            }
+        }
+
+        fn runTransfer(r: *Runner, transfer: executable.StepTransfer) ExecuteProgramError!void {
+            // A transfer is an ordering point. Source and destination each have
+            // one physical placement; lowering chooses the concrete copy.
+            try r.frame.flushInPlace();
+            const hs = r.op_ctx.control.host;
+            const src_meta = hs.meta(transfer.src) catch return error.ExecutionFailed;
+            const dst_meta = hs.meta(transfer.dst) catch return error.ExecutionFailed;
+            if (src_meta.dtype != dst_meta.dtype or totalTiles(src_meta) != totalTiles(dst_meta)) return error.ExecutionFailed;
+            const count = totalTiles(src_meta);
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                if (transfer.source.kind == .webgpu and transfer.destination.kind == .cpu) {
+                    const src = r.op_ctx.store.acquireTileDeviceConstLinear(transfer.src, i) catch return error.ExecutionFailed;
+                    defer r.op_ctx.store.releaseConst(src.token);
+                    const dst = hs.acquireTileMutLinear(transfer.dst, i) catch return error.ExecutionFailed;
+                    defer hs.releaseMut(dst.token);
+                    if (src.len != dst.bytes.len) return error.ExecutionFailed;
+                    r.op_ctx.devmem.device().copyD2H(dst.bytes, src.handle, src.offset) catch return error.ExecutionFailed;
+                } else if (transfer.source.kind == .cpu and transfer.destination.kind == .webgpu) {
+                    const src = hs.acquireTileConstLinear(transfer.src, i) catch return error.ExecutionFailed;
+                    defer hs.releaseConst(src.token);
+                    const dst = r.op_ctx.store.acquireTileDeviceMutLinear(transfer.dst, i) catch return error.ExecutionFailed;
+                    defer r.op_ctx.store.releaseMut(dst.token);
+                    if (src.bytes.len != dst.len) return error.ExecutionFailed;
+                    r.op_ctx.devmem.device().copyH2D(dst.handle, dst.offset, src.bytes) catch return error.ExecutionFailed;
+                } else {
+                    return error.Unsupported;
+                }
             }
         }
 
@@ -401,11 +421,10 @@ pub const GpuBackend = struct {
                 .ReTileCopyScalar => |s| try view_ops.execPackedCopy(op_ctx, frame, s.dst, s.src),
                 .Transpose2DScalar => |s| try view_ops.execTranspose2D(op_ctx, frame, s),
                 .SliceNDScalar => |s| try view_ops.execSliceND(op_ctx, frame, s),
+                .Transfer => |s| try r.runTransfer(s),
 
                 .If => |s| {
-                    // Read the predicate to the host, stalling only if it was
-                    // produced on device (see `readPredicate`).
-                    const take_then = (try r.readPredicate(s.cond)) != 0;
+                    const take_then = (try r.readI32Scalar(s.cond)) != 0;
                     const count: usize = @intCast(s.output_count);
                     if (count > executable.MAX_CONTROL_OUTPUTS) return error.ExecutionFailed;
                     if (take_then) {
@@ -422,7 +441,7 @@ pub const GpuBackend = struct {
                     if (carried_count > executable.MAX_LOOP_CARRIED) return error.ExecutionFailed;
                     var requested: usize = s.static_max_trip_count;
                     if (s.trip_count) |tid| {
-                        const raw = try r.readPredicate(tid);
+                        const raw = try r.readI32Scalar(tid);
                         if (raw < 0) return error.ExecutionFailed;
                         requested = @intCast(raw);
                     }
@@ -432,15 +451,18 @@ pub const GpuBackend = struct {
                     while (iter < max_iters) : (iter += 1) {
                         if (s.check_before) {
                             if (s.cond) |cid| {
-                                const p = try r.readPredicate(cid);
+                                const p = try r.readI32Scalar(cid);
                                 if (p == 0) break;
                             }
                         }
                         try r.runBlock(s.body_block);
-                        try r.swapLists(s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
+                        // A logical tensor keeps its backing and placement across
+                        // the handoff. Swapping complete storage records here made
+                        // caller-bound state change ownership after execution.
+                        try r.copyLists(s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
                         if (!s.check_before) {
                             if (s.cond) |cid| {
-                                const p = try r.readPredicate(cid);
+                                const p = try r.readI32Scalar(cid);
                                 if (p == 0) break;
                             }
                         }
@@ -450,7 +472,17 @@ pub const GpuBackend = struct {
         }
     };
 
-    fn runProgram(self: *Self, rstore: *ResidentTensorStore, prog: *const ExecutableProgram) ExecuteProgramError!void {
+    fn runProgram(self: *Self, session: *GpuSession, prog: *const ExecutableProgram) ExecuteProgramError!void {
+        // A program carries the placement it was compiled for, and its host reads
+        // were made explicit against that placement. Executing one compiled for
+        // somewhere else would silently reintroduce undeclared host reads, so
+        // refuse rather than run it.
+        if (prog.target.kind != .webgpu) {
+            if (env_util.flagEnabled("AION_GPU_TRACE"))
+                std.debug.print("[gpu] placement guard rejected target {s}\n", .{@tagName(prog.target.kind)});
+            return error.Unsupported;
+        }
+
         const invocation = self.profile_invocations;
         self.profile_invocations +|= 1;
         const profile_config = self.profile_config;
@@ -464,8 +496,10 @@ pub const GpuBackend = struct {
         if (generic_profile and gpu_track != null) {
             if (self.gpu.timestamp_query) {
                 const query_capacity: u32 = @intCast(@min(@as(usize, 4096), profile_config.event_capacity *| 2));
-                const timestamp_mode: timestamp_profile.Mode = if (std.c.getenv("AION_PROFILE_GPU")) |raw|
-                    if (std.mem.eql(u8, std.mem.span(raw), "pass")) .pass else .dispatch
+                const profile_gpu = env_util.getOwned(std.heap.page_allocator, "AION_PROFILE_GPU");
+                defer if (profile_gpu) |raw| std.heap.page_allocator.free(raw);
+                const timestamp_mode: timestamp_profile.Mode = if (profile_gpu) |raw|
+                    if (std.mem.eql(u8, raw, "pass")) .pass else .dispatch
                 else
                     .dispatch;
                 timestamp_profiler = TimestampProfiler.init(self.allocator, self.gpu, query_capacity, &profile_session.?, gpu_track.?, timestamp_mode) catch null;
@@ -482,7 +516,8 @@ pub const GpuBackend = struct {
                 .devmem = &self.devmem,
                 .pipes = &self.pipes,
                 .allocator = self.allocator,
-                .rstore = rstore,
+                .store = session.deviceStore(),
+                .control = .{ .host = session.host },
                 .scratch = &self.scratch,
             },
             .prog = prog,
@@ -499,7 +534,7 @@ pub const GpuBackend = struct {
         self.uniform_pool.reset();
         self.bind_cache.reset();
         runner.frame.uniform_pool = &self.uniform_pool;
-        if (std.c.getenv("AION_GPU_NO_CACHE") == null) runner.frame.bind_cache = &self.bind_cache;
+        if (!env_util.flagEnabled("AION_GPU_NO_CACHE")) runner.frame.bind_cache = &self.bind_cache;
 
         const t_start: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
@@ -511,19 +546,25 @@ pub const GpuBackend = struct {
         // back-to-back. For a program with control flow the inner submitPending
         // calls already split frames; this just adds periodic flushes.
         var submit_chunk: usize = 32;
-        if (std.c.getenv("AION_GPU_CHUNK")) |e| {
-            if (std.fmt.parseInt(usize, std.mem.span(e), 10)) |v| {
+        const gpu_chunk = env_util.getOwned(std.heap.page_allocator, "AION_GPU_CHUNK");
+        defer if (gpu_chunk) |raw| std.heap.page_allocator.free(raw);
+        if (gpu_chunk) |raw| {
+            if (std.fmt.parseInt(usize, raw, 10)) |v| {
                 if (v > 0) submit_chunk = v;
             } else |_| {}
         }
         const SUBMIT_CHUNK = submit_chunk;
         var since_submit: usize = 0;
         for (prog.steps) |step| {
-            try runner.runStep(step);
+            try runner.runStep(step.op);
             since_submit += 1;
             if (since_submit >= SUBMIT_CHUNK) {
                 const t_chunk_submit: u64 = if (generic_profile) profile_mod.nowNs() else 0;
-                try runner.submitPending();
+                runner.submitPending() catch |e| {
+                    if (env_util.flagEnabled("AION_GPU_TRACE"))
+                        std.debug.print("[gpu] chunk submit failed: {s}\n", .{@errorName(e)});
+                    return e;
+                };
                 if (generic_profile) {
                     if (cpu_track) |track| profile_session.?.recordSpan(track, .phase, "chunk submit", t_chunk_submit, profile_mod.nowNs());
                 }
@@ -536,16 +577,6 @@ pub const GpuBackend = struct {
         runner.frame.submit();
         const t_final_submitted: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
-        if (self.flush_outputs) {
-            // Recurrent state aliased in place to an input (KV caches, LSTM h/c)
-            // stays device-resident across `execute` calls — the host never reads
-            // it between runs, so skipping its D2H removes a per-step flush that
-            // otherwise scales with context length. See `outputStaysResident`.
-            for (prog.outputs, 0..) |oid, i| {
-                if (prog.outputStaysResident(i)) continue;
-                try flushToHost(rstore, oid);
-            }
-        }
         const t_outputs_finished: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
         if (timestamp_profiler) |*p| {

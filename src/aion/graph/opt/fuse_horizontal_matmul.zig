@@ -38,7 +38,7 @@ const MAX_RANK: usize = 8;
 
 /// This pass's discriminator for `StorageManager.derived_weight_cache`. Must be
 /// unique across passes — see the registry in `optimize.zig`.
-const DERIVED_KIND: u32 = @intFromEnum(@import("../optimize.zig").DerivedWeightKind.horizontal_matmul_concat);
+const DERIVED_KIND: u32 = @backingInt(@import("../optimize.zig").DerivedWeightKind.horizontal_matmul_concat);
 
 /// A fusable matmul: `out = A @ B` where B is a bound quantized weight.
 const Cand = struct {
@@ -312,7 +312,7 @@ pub fn concatQuantMatmulB(
         const src_bytes: usize = rows * n_i * bb;
         const src_buf = allocator.alloc(u8, src_bytes) catch return Error.OutOfMemory;
         defer allocator.free(src_buf);
-        try mgr.readToPackedQuant(sid, src_buf);
+        try mgr.readPackedAtPlacement(sid, src_buf);
 
         var r: usize = 0;
         while (r < rows) : (r += 1) {
@@ -325,7 +325,7 @@ pub fn concatQuantMatmulB(
 
     // Tile the fused weight exactly as the MatMul lowering tiles a quant B
     // (fixed M-hint), so no (impossible) quant retile is demanded downstream.
-    const m_hint: usize = @max(@as(usize, 1), policy.base_square_2d);
+    const m_hint = plan.matMulMHint(policy);
     const tiles = plan.chooseMatMulTiles(policy, m_hint, sum_n, k, dtype);
 
     var shape_buf: [MAX_RANK]usize = undefined;
@@ -344,7 +344,7 @@ pub fn concatQuantMatmulB(
         .tile_alignment = policy.tile_alignment,
         .quant_axis = @intCast(rank - 2),
     });
-    try mgr.writeFromPackedQuant(out_tid, out_buf);
+    try mgr.writePackedAtPlacement(out_tid, out_buf);
     try mgr.recordDerivedWeight(DERIVED_KIND, sources, out_tid);
     return out_tid;
 }
@@ -406,8 +406,8 @@ pub fn overwriteFusedColumns(
     const src_buf = allocator.alloc(u8, reg.rows * reg.n_i * reg.bb) catch return Error.OutOfMemory;
     defer allocator.free(src_buf);
 
-    try mgr.readToPackedQuant(ref.result, fused_buf);
-    try mgr.readToPackedQuant(src_tid, src_buf);
+    try mgr.readPackedAtPlacement(ref.result, fused_buf);
+    try mgr.readPackedAtPlacement(src_tid, src_buf);
 
     var r: usize = 0;
     while (r < reg.rows) : (r += 1) {
@@ -416,7 +416,7 @@ pub fn overwriteFusedColumns(
         @memcpy(fused_buf[dst_off .. dst_off + reg.n_i * reg.bb], src_buf[src_off .. src_off + reg.n_i * reg.bb]);
     }
 
-    try mgr.writeFromPackedQuant(ref.result, fused_buf);
+    try mgr.writePackedAtPlacement(ref.result, fused_buf);
 }
 
 /// Read a fused-away weight's current bytes back out of the fused weight into
@@ -436,7 +436,7 @@ pub fn readFusedColumns(
     const dst_buf = allocator.alloc(u8, reg.rows * reg.n_i * reg.bb) catch return Error.OutOfMemory;
     defer allocator.free(dst_buf);
 
-    try mgr.readToPackedQuant(ref.result, fused_buf);
+    try mgr.readPackedAtPlacement(ref.result, fused_buf);
 
     var r: usize = 0;
     while (r < reg.rows) : (r += 1) {
@@ -445,7 +445,7 @@ pub fn readFusedColumns(
         @memcpy(dst_buf[dst_off .. dst_off + reg.n_i * reg.bb], fused_buf[src_off .. src_off + reg.n_i * reg.bb]);
     }
 
-    try mgr.writeFromPackedQuant(dst_tid, dst_buf);
+    try mgr.writePackedAtPlacement(dst_tid, dst_buf);
 }
 
 fn newValue(graph: *Graph, dtype: DType, shape: []const usize, external: ?graph_mod.ExternalId) Error!ValueId {

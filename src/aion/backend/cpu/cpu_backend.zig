@@ -298,8 +298,11 @@ pub const CpuBackend = struct {
             s.cpu.allocator.destroy(s);
         }
 
+        fn retireResources(_: *anyopaque) void {}
+
         const session_vtable = Session.VTable{
             .execute = execute,
+            .retireResources = retireResources,
             .deinit = deinitSession,
         };
     };
@@ -380,7 +383,7 @@ pub const CpuBackend = struct {
         const idx: usize = @intCast(block_id);
         if (idx >= prog.blocks.len) return error.InvalidArgument;
         for (prog.blocks[idx].steps) |block_step| {
-            try self.execStep(prog, block_step, store);
+            try self.execStep(prog, block_step.op, store);
         }
     }
 
@@ -535,6 +538,12 @@ pub const CpuBackend = struct {
                 }
             },
 
+            .Transfer => |s| {
+                const dst = [_]tensor_store.TensorId{s.dst};
+                const src = [_]tensor_store.TensorId{s.src};
+                try copyTensorLists(store, &dst, &src);
+            },
+
             .ReduceAll => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_utils.reduceAllScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, store);
@@ -611,18 +620,18 @@ pub const CpuBackend = struct {
         for (prog.steps, 0..) |step, step_i| {
             const t0: u64 = if (do_profile) profile.nowNs() else 0;
             if (trace_exec) {
-                std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step) });
+                std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step.op) });
             }
-            self.execStep(prog, step, store) catch |e| {
+            self.execStep(prog, step.op, store) catch |e| {
                 if (trace_exec) {
-                    std.debug.print("[aion][exec] step {d} failed: {s} err={s}\n", .{ step_i, @tagName(step), @errorName(e) });
+                    std.debug.print("[aion][exec] step {d} failed: {s} err={s}\n", .{ step_i, @tagName(step.op), @errorName(e) });
                 }
                 return e;
             };
 
             if (do_profile) {
                 const t1 = profile.nowNs();
-                if (cpu_track) |track| profiler.?.recordSpan(track, .operation, @tagName(step), t0, t1);
+                if (cpu_track) |track| profiler.?.recordSpan(track, .operation, @tagName(step.op), t0, t1);
             }
         }
 

@@ -64,7 +64,7 @@ fn requireF32(meta: types.DType) ExecuteProgramError!void {
 }
 
 pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBinaryTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
     const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
@@ -119,9 +119,9 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
         const a_ti = tensor_store_mod.projectTileIndex(a_meta, coords[0..@as(usize, meta.rank)], &.{}, s.broadcast.a_broadcast_axes) catch return error.ExecutionFailed;
         const b_ti = tensor_store_mod.projectTileIndex(b_meta, coords[0..@as(usize, meta.rank)], &.{}, s.broadcast.b_broadcast_axes) catch return error.ExecutionFailed;
 
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, a_ti) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, b_ti) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_ti) catch return error.ExecutionFailed;
+        const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         defer {
             hs.releaseConst(da.token);
             hs.releaseConst(db.token);
@@ -192,16 +192,16 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
 }
 
 pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
     try requireF32(meta.dtype);
     const built = try ctx.pipes.get(elementwise_kernel, "mul_gelu_a");
     const total = context.totalTiles(meta);
     var ti: usize = 0;
     while (ti < total) : (ti += 1) {
-        const da = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const db = ctx.rstore.acquireTileDeviceConstLinear(s.b, ti) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
+        const db = ctx.store.acquireTileDeviceConstLinear(s.b, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         defer hs.releaseConst(da.token);
         defer hs.releaseConst(db.token);
         defer hs.releaseMut(dout.token);
@@ -218,7 +218,7 @@ pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) Exec
 /// f16 bindings — tiles must pack an even element count); f32 <-> i32 is one
 /// element per work item with the i32 side smuggled through bitcasts.
 pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
 
@@ -238,8 +238,8 @@ pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecutePro
     const total = context.totalTiles(out_meta);
     var ti: usize = 0;
     while (ti < total) : (ti += 1) {
-        const dx = ctx.rstore.acquireTileDeviceConstLinear(s.x, ti) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        const dx = ctx.store.acquireTileDeviceConstLinear(s.x, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         defer {
             hs.releaseConst(dx.token);
             hs.releaseMut(dout.token);
@@ -248,12 +248,12 @@ pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecutePro
 
         var elems: u64 = 1;
         for (dout.shape_mem[0..@as(usize, dout.rank)]) |dim| elems *= dim;
-        if (has_f16 and elems % 2 != 0) return error.Unsupported; // 2 f16 per u32 word
         const src_need: u64 = elems * (if (x_meta.dtype == .f16) @as(u64, 2) else 4);
         const dst_need: u64 = elems * (if (out_meta.dtype == .f16) @as(u64, 2) else 4);
         if (dx.len < src_need or dout.len < dst_need) return error.Unsupported;
 
-        const work: u64 = if (has_f16) elems / 2 else elems;
+        // 2 f16 per u32 word; an odd tail's second lane is the tile's padding.
+        const work: u64 = if (has_f16) (elems + 1) / 2 else elems;
         const count = std.math.cast(u32, work) orelse return error.Unsupported;
         const bufs = [_]c.WGPUBuffer{
             ctx.devmem.bufferFor(dx.handle).?,
@@ -269,14 +269,14 @@ pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecutePro
 /// as buffer-to-buffer copies in the frame — no kernel, and dtype-agnostic (works
 /// for quantized tiles too). WebGPU requires copy sizes be 4-byte multiples.
 pub fn execCopy(ctx: Ctx, frame: *Frame, s: executable.StepCopyTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const meta = hs.meta(s.dst) catch return error.ExecutionFailed;
 
     const total = context.totalTiles(meta);
     var ti: usize = 0;
     while (ti < total) : (ti += 1) {
-        const src = ctx.rstore.acquireTileDeviceConstLinear(s.src, ti) catch return error.ExecutionFailed;
-        const dst = ctx.rstore.acquireTileDeviceMutLinear(s.dst, ti) catch return error.ExecutionFailed;
+        const src = ctx.store.acquireTileDeviceConstLinear(s.src, ti) catch return error.ExecutionFailed;
+        const dst = ctx.store.acquireTileDeviceMutLinear(s.dst, ti) catch return error.ExecutionFailed;
         defer {
             hs.releaseConst(src.token);
             hs.releaseMut(dst.token);
@@ -293,7 +293,7 @@ pub fn execCopy(ctx: Ctx, frame: *Frame, s: executable.StepCopyTiled) ExecutePro
 }
 
 pub fn execUnary(ctx: Ctx, frame: *Frame, s: executable.StepUnaryTiled) ExecuteProgramError!void {
-    const hs = ctx.rstore.tensorStore();
+    const hs = ctx.store;
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
     try requireF32(meta.dtype);
 
@@ -311,8 +311,8 @@ pub fn execUnary(ctx: Ctx, frame: *Frame, s: executable.StepUnaryTiled) ExecuteP
     const total = context.totalTiles(meta);
     var ti: usize = 0;
     while (ti < total) : (ti += 1) {
-        const dx = ctx.rstore.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const dout = ctx.rstore.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        const dx = ctx.store.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
         if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, dout.len)) {
             hs.releaseConst(dx.token);
             hs.releaseMut(dout.token);

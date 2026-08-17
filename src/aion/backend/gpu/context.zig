@@ -9,7 +9,7 @@ const std = @import("std");
 const wgpu = @import("wgpu.zig");
 const wgpu_dm = @import("device_memory.zig");
 const pipelines = @import("pipelines.zig");
-const resident = @import("../../runtime/residency/resident_store.zig");
+const device_store = @import("../../runtime/device_store.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 const Frame = @import("frame.zig").Frame;
 
@@ -18,26 +18,59 @@ pub const Ctx = struct {
     devmem: *wgpu_dm.WgpuDeviceMemory,
     pipes: *pipelines.Pipelines,
     allocator: std.mem.Allocator,
-    rstore: *resident.ResidentTensorStore,
+    /// Device-only data capability. It cannot return host byte slices.
+    store: device_store.DeviceStore,
+    /// Explicit bridge for the few control values consumed while recording.
+    control: ControlTransfers,
     /// Shared grow-only device scratch for multi-stage kernels (two-stage
     /// reductions, split-K attention partials). Safe to reuse across steps in
     /// one frame: dispatches in a pass are ordered, and each multi-stage op
     /// consumes its partials before the next op overwrites them.
     scratch: *ScratchPool,
+};
 
-    /// Submit the pending frame before an imminent record-time HOST read of
-    /// tile `(id, 0)`, but ONLY when that tile is device-dirty (a GPU write not
-    /// yet flushed to host). This is the single invariant that keeps
-    /// control-flow-driven decode correct: any op that resolves an index/offset
-    /// on the host at record time (gather/scatter/kv-append fallbacks) must call
-    /// this immediately before it reads that value, so a producer still sitting
-    /// in the unsubmitted frame is queued and the following D2H poll waits for
-    /// it. Co-locating it with the host read (rather than blanket-syncing before
-    /// the op) means device-path ops — which read their index on-device — pay
-    /// nothing, and no future host-read site can silently reintroduce the stale-
-    /// index (token-doubling) hazard. No-op for host-resident indices.
-    pub fn submitPendingIfDeviceDirty(ctx: Ctx, frame: *Frame, id: tensor_store.TensorId) error{ExecutionFailed}!void {
-        if (ctx.rstore.tileDeviceDirty(id, 0)) try frame.flushInPlace();
+pub const I32Lease = struct {
+    vals: []align(1) const i32,
+    token: usize,
+    host: tensor_store.TensorStore,
+
+    pub fn release(self: I32Lease) void {
+        self.host.releaseConst(self.token);
+    }
+};
+
+/// Narrow host-value capability. Host bytes never appear on `Ctx.store`, so an
+/// operation that consumes one must name that crossing by calling this API.
+///
+/// There is no residency check here: the compiler has already placed every
+/// operand read through this on the CPU, inserting a `Transfer` when the device
+/// writes it. Reading is therefore just a read — if a value could be stale, the
+/// program would not have compiled.
+pub const ControlTransfers = struct {
+    host: tensor_store.TensorStore,
+
+    /// Whether `id` is host-placed. The gate for an op carrying both a device
+    /// kernel and a host-index fallback: placement already chose which applies,
+    /// so read that choice instead of re-deriving it from shapes — a CPU mirror
+    /// has the source's exact geometry and would fool any such test.
+    pub fn isHostPlaced(self: ControlTransfers, id: tensor_store.TensorId) bool {
+        return (self.host.deviceTile(id, 0) catch null) == null;
+    }
+
+    pub fn readI32(self: ControlTransfers, id: tensor_store.TensorId) error{ExecutionFailed}!I32Lease {
+        // The compiler placed this on the host; a device backing here means a
+        // record-time gate disagreed with the compile-time declaration that is
+        // supposed to mirror it, and the bytes below would be stale. Cheap
+        // enough to keep in release: control reads are already off the hot path.
+        if (!self.isHostPlaced(id)) return error.ExecutionFailed;
+
+        const tile = self.host.acquireTileConstLinear(id, 0) catch return error.ExecutionFailed;
+        if (tile.dtype != .i32 or tile.bytes.len % @sizeOf(i32) != 0) {
+            self.host.releaseConst(tile.token);
+            return error.ExecutionFailed;
+        }
+        const ptr: [*]align(1) const i32 = @ptrCast(tile.bytes.ptr);
+        return .{ .vals = ptr[0 .. tile.bytes.len / @sizeOf(i32)], .token = tile.token, .host = self.host };
     }
 };
 

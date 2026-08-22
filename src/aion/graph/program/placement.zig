@@ -196,6 +196,44 @@ fn collectPlacements(
     prog.tensor_placements = list;
 }
 
+/// Drop placement entries for tensors no longer named by any step.
+///
+/// `tensor_placements` is a snapshot of the schedule taken when placement ran, and a
+/// later pass that deletes steps can orphan an entry. That is not cosmetic:
+/// `workspace.materializePlacements` requires every listed tensor to still have backing,
+/// while `workspace.plan` releases anything with no remaining use, so an orphan turns
+/// into `InvalidArgument` at materialize time. Any pass that removes steps between
+/// `place` and `plan` must call this.
+///
+/// Filtering preserves the id ordering the binary search in `Program.placementOf`
+/// depends on, and each surviving entry keeps the placement it was given.
+pub fn pruneOrphaned(allocator: std.mem.Allocator, prog: *Program) Error!void {
+    if (prog.tensor_placements.len == 0) return;
+
+    var live: std.AutoHashMap(TensorId, void) = .init(allocator);
+    defer live.deinit();
+    for (prog.steps) |*placed| try noteTensors(&live, placed);
+    for (prog.blocks) |block| {
+        for (block.steps) |*placed| try noteTensors(&live, placed);
+    }
+
+    var keep: usize = 0;
+    for (prog.tensor_placements) |entry| {
+        if (live.contains(entry.id)) keep += 1;
+    }
+    if (keep == prog.tensor_placements.len) return;
+
+    const list = allocator.alloc(executable.TensorPlacement, keep) catch return error.OutOfMemory;
+    var w: usize = 0;
+    for (prog.tensor_placements) |entry| {
+        if (!live.contains(entry.id)) continue;
+        list[w] = entry;
+        w += 1;
+    }
+    allocator.free(prog.tensor_placements);
+    prog.tensor_placements = list;
+}
+
 fn noteTensors(seen: *std.AutoHashMap(TensorId, void), placed: *PlacedStep) Error!void {
     const uses = executable.tensorUses(&placed.op);
     for (uses.slice()) |use| seen.put(use.id.*, {}) catch return error.OutOfMemory;

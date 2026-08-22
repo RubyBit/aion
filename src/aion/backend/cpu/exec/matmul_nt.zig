@@ -13,9 +13,9 @@ const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const DType = types.DType;
 
-/// q8_0 block: 2-byte f16 scale + 32 i8 values, 34 bytes total.
+/// Elements per q8_0 block (2-byte f16 scale + 32 i8 values on disk). Only the element
+/// count matters here; the kernels own the byte layout.
 const Q8_0_BLOCK_ELEMS: usize = 32;
-const Q8_0_BLOCK_BYTES: usize = 34;
 
 pub const MatMulNtExecCtx = struct {
     matmul_nt: matmul_nt_registry.Kernels,
@@ -73,7 +73,6 @@ pub fn execMatMulNTTiled(
     // retiles to `[...leading_full, K]` which is a single tile).
     const expected_a_bytes: usize = m_total * k * @sizeOf(f32);
     if (a_view.bytes.len < expected_a_bytes) return BackendError.InvalidArgument;
-    const a_ptr: [*]align(1) const f32 = @ptrCast(a_view.bytes.ptr);
 
     // C's last-axis tile size is aligned to B's axis-0 tile size by the compile step,
     // so B-tile `nt` covers C's N range [nt*tile_size .. min((nt+1)*tile_size, N)].
@@ -87,7 +86,7 @@ pub fn execMatMulNTTiled(
         store: tensor_store.TensorStore,
         c: tensor_store.TensorId,
         b: tensor_store.TensorId,
-        a_ptr: [*]align(1) const f32,
+        a_bytes: []const u8,
         m_total: usize,
         k: usize,
         n_total: usize,
@@ -112,43 +111,20 @@ pub fn execMatMulNTTiled(
 
                 const n_start: usize = nt * self.n_tile_size;
                 const n_count: usize = @min(self.n_tile_size, self.n_total - n_start);
-                const c_ptr: [*]align(1) f32 = @ptrCast(c_view.bytes.ptr);
-                if (c_view.bytes.len < self.m_total * n_count * @sizeOf(f32)) return BackendError.InvalidArgument;
 
+                // The kernels take the tile, not the whole matrix: `params.n` is this
+                // tile's column count and B/C are already narrowed to it. They range-check
+                // the slices against these dims themselves.
+                const params: types.MatMulParams = .{
+                    .m = self.m_total,
+                    .n = n_count,
+                    .k = self.k,
+                    .alpha = self.alpha,
+                    .beta = self.beta,
+                };
                 switch (self.b_dtype) {
-                    .q8_0 => {
-                        const expected_b_tile_bytes: usize = n_count * (self.k / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES;
-                        if (b_view.bytes.len < expected_b_tile_bytes) return BackendError.InvalidArgument;
-                        try self.matmul_nt_q8_0(
-                            self.a_ptr,
-                            b_view.bytes.ptr,
-                            c_ptr,
-                            self.m_total,
-                            self.k,
-                            self.n_total,
-                            n_start,
-                            n_count,
-                            self.alpha,
-                            self.beta,
-                        );
-                    },
-                    .f32 => {
-                        const expected_b_tile_bytes: usize = n_count * self.k * @sizeOf(f32);
-                        if (b_view.bytes.len < expected_b_tile_bytes) return BackendError.InvalidArgument;
-                        const b_ptr: [*]align(1) const f32 = @ptrCast(b_view.bytes.ptr);
-                        try self.matmul_nt_f32(
-                            self.a_ptr,
-                            b_ptr,
-                            c_ptr,
-                            self.m_total,
-                            self.k,
-                            self.n_total,
-                            n_start,
-                            n_count,
-                            self.alpha,
-                            self.beta,
-                        );
-                    },
+                    .q8_0 => try self.matmul_nt_q8_0(params, c_view.bytes, self.a_bytes, b_view.bytes),
+                    .f32 => try self.matmul_nt_f32(params, c_view.bytes, self.a_bytes, b_view.bytes),
                     else => return BackendError.Unsupported,
                 }
             }
@@ -159,7 +135,7 @@ pub fn execMatMulNTTiled(
         .store = store,
         .c = s.c,
         .b = s.b,
-        .a_ptr = a_ptr,
+        .a_bytes = a_view.bytes,
         .m_total = m_total,
         .k = k,
         .n_total = n_total,

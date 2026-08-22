@@ -24,6 +24,7 @@ const aion = @import("aion");
 const gpu = aion.gpu; // feature-gated GPU backend (root.zig exposes it when -Dgpu)
 const wgpu = gpu.wgpu;
 const bk = @import("bench_kernels"); // shared op list + unified reporter + timing
+const bm = @import("bench_models"); // shared whole-model decode graphs
 
 const Backend = aion.backend.Backend;
 const StorageManager = aion.storage_manager.StorageManager;
@@ -41,7 +42,7 @@ const nowNs = bk.nowNs;
 
 const out = std.debug;
 
-const Suite = enum { matmul, ops, nt, kernels, decode };
+const Suite = enum { matmul, ops, nt, kernels, decode, token, roofline, attn };
 
 const Args = struct {
     m: usize = 1024,
@@ -55,6 +56,17 @@ const Args = struct {
     op_filter: ?[]const u8 = null,
     /// `matmul` (default) or `ops` (row-wise + elementwise kernel sweep).
     suite: Suite = .matmul,
+    /// --suite token knobs (whole Gemma-4 E2B decode step).
+    model: bm.DecodeOptions = .{},
+    /// Print the lowered step histogram (the fidelity gate against the real model).
+    show_steps: bool = false,
+    /// Print the first N lowered steps in order (--dump-steps N).
+    dump_steps: usize = 0,
+    /// Override the matmul tile caps (0 = policy default). The N cap decides how
+    /// many dispatches a wide projection becomes, and whether the splits that
+    /// horizontal fusion introduces land inside one tile or across several.
+    mn_cap: usize = 0,
+    k_cap: usize = 0,
     // GPU selection. Defaults to high-power so the discrete GPU is benched (the
     // default adapter is often the weak integrated one). Override: --low,
     // --adapter=N, --backend=vulkan|d3d12|metal.
@@ -80,8 +92,32 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (std.mem.eql(u8, arg, "--gpu-only")) a.gpu_only = true;
     if (valueFor(arg, "--op", it)) |v| a.op_filter = v;
     if (valueFor(arg, "--suite", it)) |v| {
-        a.suite = if (std.mem.eql(u8, v, "ops")) .ops else if (std.mem.eql(u8, v, "nt")) .nt else if (std.mem.eql(u8, v, "kernels")) .kernels else if (std.mem.eql(u8, v, "decode")) .decode else .matmul;
+        // Derived from the enum, so adding a suite cannot silently fall through to
+        // `matmul` -- and an unknown name is reported instead of quietly running the
+        // wrong benchmark, which has already wasted one run.
+        a.suite = std.meta.stringToEnum(Suite, v) orelse {
+            out.print("unknown --suite '{s}'; valid:", .{v});
+            for (std.enums.values(Suite)) |sv| out.print(" {s}", .{@tagName(sv)});
+            out.print("\n", .{});
+            std.process.exit(2);
+        };
     }
+    if (valueFor(arg, "--ctx", it)) |v| a.model.ctx = std.fmt.parseInt(usize, v, 10) catch a.model.ctx;
+    if (valueFor(arg, "--layers", it)) |v| a.model.layers = std.fmt.parseInt(usize, v, 10) catch a.model.layers;
+    if (valueFor(arg, "--pli-vocab", it)) |v| a.model.pli_vocab = std.fmt.parseInt(usize, v, 10) catch a.model.pli_vocab;
+    if (valueFor(arg, "--seq", it)) |v| a.model.seq = std.fmt.parseInt(usize, v, 10) catch a.model.seq;
+    if (std.mem.eql(u8, arg, "--no-head")) a.model.head = false;
+    if (std.mem.eql(u8, arg, "--steps")) a.show_steps = true;
+    if (valueFor(arg, "--dump-steps", it)) |v| a.dump_steps = std.fmt.parseInt(usize, v, 10) catch 0;
+    if (std.mem.eql(u8, arg, "--ablate-attn")) a.model.ablate.attn = true;
+    if (std.mem.eql(u8, arg, "--ablate-norms")) a.model.ablate.norms = true;
+    if (std.mem.eql(u8, arg, "--ablate-norms-compute")) a.model.ablate.norms_compute = true;
+    if (std.mem.eql(u8, arg, "--ablate-scales")) a.model.ablate.scales = true;
+    if (std.mem.eql(u8, arg, "--ablate-rope")) a.model.ablate.rope = true;
+    if (std.mem.eql(u8, arg, "--ablate-kv")) a.model.ablate.kv_write = true;
+    if (std.mem.eql(u8, arg, "--no-hfuse")) a.model.opt.fuse_horizontal_matmul = false;
+    if (valueFor(arg, "--mn-cap", it)) |v| a.mn_cap = std.fmt.parseInt(usize, v, 10) catch 0;
+    if (valueFor(arg, "--k-cap", it)) |v| a.k_cap = std.fmt.parseInt(usize, v, 10) catch 0;
     if (std.mem.eql(u8, arg, "--high")) a.opts.power = .high;
     if (std.mem.eql(u8, arg, "--low")) a.opts.power = .low;
     if (valueFor(arg, "--adapter", it)) |v| a.opts.adapter_index = std.fmt.parseInt(usize, v, 10) catch null;
@@ -90,8 +126,13 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     }
 }
 
-const gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.{ .kind = .webgpu });
-// Representative CPU tiling (matches src/bench.zig's defaultTilePolicy): the CPU
+// Mutable because a tile policy is only correct for a SPECIFIC device: the model
+// loader sets max_binding_bytes from the opened adapter, and without it a multi-GB
+// quantized table stays one unbindable tile -- the bench then measures a tiling
+// production never uses (and, for the 2.5 GB per-layer table, fails outright).
+// `openDevice` fills it in; nothing may build a program before that runs.
+var gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.{ .kind = .webgpu });
+// Representative CPU tiling (matches bench_cpu.zig's defaultTilePolicy): the CPU
 // kernels are cache-blocked and reject GPU-sized tiles, so each backend is timed on
 // its own appropriate tiling — the fair comparison.
 const cpu_policy: plan.TilePolicy = .{ .base_square_2d = 256, .base_1d = 256, .quant_k_block = 32, .tile_alignment = 64 };
@@ -268,13 +309,11 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
 fn runOps(alloc: std.mem.Allocator, a: Args) !void {
     out.print("ops f32: M={d} N={d}, iters={d}\n", .{ a.m, a.n, a.iters });
 
-    var device = wgpu.Gpu.init(a.opts) catch |e| {
-        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
         return;
     };
     defer device.deinit();
-    const d = device.describe();
-    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
 
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
@@ -410,13 +449,11 @@ fn benchNt(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, q8: bool, m: 
 fn runNt(alloc: std.mem.Allocator, a: Args) !void {
     out.print("matmul NT: N={d} K={d}, iters={d}  (C[M,N] = A[M,K] @ B[N,K]^T)\n", .{ a.n, a.k, a.iters });
 
-    var device = wgpu.Gpu.init(a.opts) catch |e| {
-        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
         return;
     };
     defer device.deinit();
-    const d = device.describe();
-    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
 
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
@@ -546,19 +583,21 @@ fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: u
     const b_bytes = @as(f64, @floatFromInt((k / 32) * n * 34 * count));
     const flops = 2.0 * @as(f64, @floatFromInt(n * k * count));
     var lbuf: [64]u8 = undefined;
-    const label = std.fmt.bufPrint(&lbuf, "gemv-chain x{d} K={d} N={d}", .{ count, k, n }) catch "gemv-chain";
+    // Label by WORKING SET, not just count: the whole point of the sweep is to find
+    // where the set stops fitting in L2, and MiB is the axis that shows it.
+    const label = std.fmt.bufPrint(&lbuf, "ws={d}MiB x{d} N={d}", .{
+        @as(usize, @intFromFloat(b_bytes / (1024.0 * 1024.0))), count, n,
+    }) catch "gemv-chain";
     bk.report(.{ .label = label, .iters = a.iters, .ns = ns, .bytes = b_bytes, .flops = flops });
 }
 
 fn runDecode(alloc: std.mem.Allocator, a: Args) !void {
     out.print("decode GEMV (plain MatMul, K-major q8_0 B, M=1): iters={d}\n", .{a.iters});
-    var device = wgpu.Gpu.init(a.opts) catch |e| {
-        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
         return;
     };
     defer device.deinit();
-    const d = device.describe();
-    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
 
@@ -577,6 +616,224 @@ fn runDecode(alloc: std.mem.Allocator, a: Args) !void {
     };
     for (shapes) |s| try benchDecode(alloc, &gb, a, s[1], s[0]);
     if (a.chain > 0) try benchDecodeChain(alloc, &gb, a, 4096, 1536, a.chain);
+}
+
+// ---- token suite (a whole Gemma-4 E2B decode step) --------------------------
+
+/// Open the GPU and print what we're measuring on. Every model-scale suite needs
+/// the same preamble, and the device identity belongs in the log beside the numbers.
+fn openDevice(a: Args) !wgpu.Gpu {
+    var device = try wgpu.Gpu.init(a.opts);
+    // Same rule as api/gpu_device.zig: cap tiles to what this adapter can bind.
+    gpu_policy.max_binding_bytes = device.limits.max_storage_binding_bytes;
+    if (a.mn_cap > 0) gpu_policy.matmul_mn_tile_cap = a.mn_cap;
+    if (a.k_cap > 0) gpu_policy.matmul_k_tile_cap = a.k_cap;
+    const d = device.describe();
+    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
+    return device;
+}
+
+/// One full decode step of Gemma-4 E2B, built in Zig at the model's real shapes and
+/// real weight footprint. This is the fast reward loop: seconds per iteration, no
+/// 5 GB model load, no Python, and no per-session autotune inside the timed window.
+///
+/// The reported GB/s is over the bytes the MODEL streams (`stats.stream_bytes`), so
+/// it is directly comparable to the device's DRAM peak. A figure above that peak
+/// means weights are being served from L2 and the run is not measuring decode.
+fn runToken(alloc: std.mem.Allocator, a: Args) !void {
+    out.print("gemma4-e2b decode step: layers={d} ctx={d} seq={d} head={} iters={d}\n", .{
+        a.model.layers, a.model.ctx, a.model.seq, a.model.head, a.iters,
+    });
+
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
+        return;
+    };
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+
+    const target: aion.storage_manager.DeviceRef = .{ .kind = .gpu, .index = 0 };
+    const build_start = nowNs();
+    var built = try bm.gemma4E2BDecode(alloc, &mgr, gpu_policy, a.model, target, gb.devmem.device());
+    defer built.prog.deinit();
+    const build_ms = @as(f64, @floatFromInt(nowNs() - build_start)) / 1.0e6;
+
+    out.print("  weights:  {d} tensors, stream {d:.3} GB/token, resident {d:.2} GiB, build {d:.0} ms\n", .{
+        built.stats.weight_tensors,
+        @as(f64, @floatFromInt(built.stats.stream_bytes)) / 1.0e9,
+        @as(f64, @floatFromInt(built.stats.resident_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        build_ms,
+    });
+    // Any reduced knob makes the totals non-comparable to the model. Say so loudly
+    // rather than letting a scaled-down run be quoted as a headline number.
+    if (built.stats.layers_emitted != bm.G4.num_layers)
+        out.print("  NOTE:     {d}/{d} layers emitted -- kinds covered, totals NOT model-scale\n", .{ built.stats.layers_emitted, bm.G4.num_layers });
+    if (!a.model.head)
+        out.print("  NOTE:     tied logits head OFF -- 17.7% of the real byte stream is missing\n", .{});
+    if (a.model.pli_vocab != bm.G4.vocab_size)
+        out.print("  NOTE:     pli table {d}/{d} rows -- footprint and that gather's tiling differ\n", .{ a.model.pli_vocab, bm.G4.vocab_size });
+
+    var session = try gpuSession(&gb, &mgr, &built.prog);
+    defer session.deinit();
+
+    const kernel_ns = try timeGpuKernel(&gb, session, &built.prog, a.iters);
+    // NOT timeSession: this program's only output is next_token, and outputs mirror
+    // to the host lazily, so nothing there would ever block on the GPU -- it would
+    // time CPU submits and report a per-token figure FASTER than the kernel itself.
+    // A greedy decode loop reads the token every step, so read it every step.
+    const e2e_ns = try timeDecodeLoop(session, &built.prog, &mgr, built.out, a.iters);
+
+    bk.report(.{
+        .label = "decode/token",
+        .iters = a.iters,
+        .ns = kernel_ns,
+        .bytes = @floatFromInt(built.stats.stream_bytes),
+        .e2e_ns = e2e_ns,
+    });
+
+    const iters_f: f64 = @floatFromInt(@max(a.iters, 1));
+    const per_tok_ms = @as(f64, @floatFromInt(kernel_ns)) / iters_f / 1.0e6;
+    const e2e_ms = @as(f64, @floatFromInt(e2e_ns)) / iters_f / 1.0e6;
+    out.print("  ==> {d:.2} ms/token = {d:.1} tok/s (kernel)  |  {d:.2} ms = {d:.1} tok/s (e2e)\n", .{
+        per_tok_ms, 1000.0 / per_tok_ms, e2e_ms, 1000.0 / e2e_ms,
+    });
+
+    if (a.show_steps) try bm.printStepHistogram(alloc, &built.prog);
+    if (a.show_steps) {
+        const nv = bm.countNoopViews(&mgr, &built.prog);
+        out.print("  no-op views: {d} of {d} view steps copy between byte-identical layouts" ++ "\n", .{ nv.noop, nv.total });
+    }
+    if (a.dump_steps > 0) bm.printStepSequence(&mgr, &built.prog, a.dump_steps);
+
+    // The fidelity gate. Only meaningful at full scale -- any reduced knob changes
+    // the counts legitimately, so a scaled run reports that it skipped the check
+    // rather than pretending to have passed it.
+    const full_scale = built.stats.layers_emitted == bm.G4.num_layers and
+        a.model.head and a.model.pli_vocab == bm.G4.vocab_size and a.model.seq == 1;
+    if (!full_scale) {
+        out.print("  fidelity: SKIPPED (reduced run; full scale is --layers 35, head on, full --pli-vocab, --seq 1)\n", .{});
+    } else if (try bm.verifyGemma4Steps(alloc, &built.prog)) {
+        out.print("  fidelity: OK -- step histogram matches models/gemma/gemma4_e2b_q8.aion exactly\n", .{});
+    } else {
+        out.print("  fidelity: FAILED -- this bench is no longer measuring the model (see mismatches above)\n", .{});
+    }
+}
+
+// ---- attn suite (attention alone, at the model's exact decode shapes) --------
+
+/// Time `Attention` on its own at both Gemma-4 decode shapes, then scale by how many
+/// layers use each, to get attention's real share of a token.
+///
+/// Needed because in-step attribution requires `AION_PROFILE_GPU=dispatch`, which
+/// isolates every dispatch in its own compute pass and therefore inflates short
+/// kernels -- the very ones under suspicion. Here the op runs alone for `iters`
+/// iterations, so the number is the kernel's.
+fn runAttn(alloc: std.mem.Allocator, a: Args) !void {
+    out.print("attention alone at Gemma-4 decode shapes: ctx={d} iters={d}\n", .{ a.model.ctx, a.iters });
+    out.print("  sweeping --repeat to separate the ~0.7ms/execute harness floor (intercept)\n", .{});
+    out.print("  from the per-op cost (slope); the model runs 28 local + 7 global per token\n", .{});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
+        return;
+    };
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    var total_ms: f64 = 0;
+    for ([_]bm.AttnKind{ .local, .global }) |kind| {
+        const count = bm.attnKindCount(kind);
+        // Two points are enough for a slope, but three guards against a bad one.
+        const reps = [_]usize{ 1, 16, 64 };
+        var ms: [reps.len]f64 = @splat(0);
+        for (reps, 0..) |rep, ri| {
+            var mgr = StorageManager.init(alloc);
+            defer mgr.deinit();
+            const target: aion.storage_manager.DeviceRef = .{ .kind = .gpu, .index = 0 };
+            var built = bm.gemma4Attention(alloc, &mgr, gpu_policy, kind, a.model.ctx, rep, target, gb.devmem.device()) catch |e| {
+                out.print("  {s:<8} rep={d} build failed: {s}\n", .{ @tagName(kind), rep, @errorName(e) });
+                continue;
+            };
+            defer built.prog.deinit();
+
+            var session = try gpuSession(&gb, &mgr, &built.prog);
+            defer session.deinit();
+            const ns = timeGpuKernel(&gb, session, &built.prog, a.iters) catch |e| {
+                out.print("  {s:<8} rep={d} exec failed: {s}\n", .{ @tagName(kind), rep, @errorName(e) });
+                continue;
+            };
+            ms[ri] = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(a.iters, 1))) / 1.0e6;
+
+            var lbuf: [40]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbuf, "attn-{s} x{d}", .{ @tagName(kind), rep }) catch "attn";
+            bk.report(.{
+                .label = label,
+                .iters = a.iters,
+                .ns = ns,
+                .bytes = @floatFromInt(built.stats.stream_bytes),
+            });
+        }
+        // Slope between the widest two points: per-op cost with the fixed cost gone.
+        const d_ms = ms[reps.len - 1] - ms[1];
+        const d_rep: f64 = @floatFromInt(reps[reps.len - 1] - reps[1]);
+        const per_op_us = if (d_rep > 0) d_ms * 1000.0 / d_rep else 0;
+        const share_ms = per_op_us * @as(f64, @floatFromInt(count)) / 1000.0;
+        total_ms += share_ms;
+        out.print("       {s}: intercept {d:.3} ms/execute, per-op {d:.1} us, x{d} layers = {d:.2} ms/token\n", .{
+            @tagName(kind), ms[0] - per_op_us / 1000.0, per_op_us, count, share_ms,
+        });
+    }
+    out.print("  ==> attention total {d:.2} ms/token\n", .{total_ms});
+}
+
+// ---- roofline suite (where does the working set stop fitting in cache?) ------
+
+/// Sweep the GEMV working set from L2-resident to far past it, then sweep N at a
+/// fixed cold working set.
+///
+/// Both curves exist to settle questions that have already produced wrong
+/// conclusions here:
+///   * the first shows the **L2 knee** -- any row reading above the device's DRAM
+///     peak is measuring cache, which is how a past autotuner came to pick configs
+///     for a regime decode never runs in;
+///   * the second shows **bandwidth vs workgroup count**, i.e. whether the narrow
+///     projections are slow simply because they cannot fill the SMs.
+fn runRoofline(alloc: std.mem.Allocator, a: Args) !void {
+    out.print("roofline sweep (q8_0 K-major GEMV, M=1), iters={d}\n", .{a.iters});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
+        return;
+    };
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    // (a) Working-set sweep at a fixed wide shape. One weight is ~19 MiB, so this
+    // spans roughly 19 MiB -> 2.4 GiB and crosses any plausible L2 size.
+    const k_fixed: usize = 1536;
+    const n_fixed: usize = 12288;
+    out.print("  -- working set sweep (K={d} N={d}); GB/s above DRAM peak == reading L2 --\n", .{ k_fixed, n_fixed });
+    for ([_]usize{ 1, 2, 3, 4, 6, 8, 16, 32, 64, 128 }) |count| {
+        benchDecodeChain(alloc, &gb, a, n_fixed, k_fixed, count) catch |e| {
+            out.print("  ws x{d:<3} failed: {s}\n", .{ count, @errorName(e) });
+        };
+    }
+
+    // (b) N sweep at a cold (~1.2 GiB) working set, so occupancy is what varies and
+    // cache residency is held out of it.
+    out.print("  -- N sweep at a cold ~1.2GiB working set (occupancy, not cache) --\n", .{});
+    const target_bytes: f64 = 1.2 * 1024.0 * 1024.0 * 1024.0;
+    for ([_]usize{ 256, 1536, 2048, 4096, 8192, 12288 }) |n| {
+        const per = @as(f64, @floatFromInt((k_fixed / 32) * n * 34));
+        const count: usize = @max(@as(usize, 2), @as(usize, @intFromFloat(target_bytes / per)));
+        benchDecodeChain(alloc, &gb, a, n, k_fixed, count) catch |e| {
+            out.print("  N={d:<6} failed: {s}\n", .{ n, @errorName(e) });
+        };
+    }
 }
 
 fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) !void {
@@ -650,13 +907,11 @@ fn benchKernel(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, op: KOp) 
 fn runKernels(alloc: std.mem.Allocator, a: Args) !void {
     out.print("kernel sweep (fixed shapes), iters={d}\n", .{a.iters});
 
-    var device = wgpu.Gpu.init(a.opts) catch |e| {
-        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
         return;
     };
     defer device.deinit();
-    const d = device.describe();
-    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
 
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
@@ -708,6 +963,29 @@ fn timeGpuKernel(gb: *gpu.GpuBackend, session: aion.backend.Session, prog: *cons
     return nowNs() - start;
 }
 
+/// Time a real greedy-decode loop: execute, then READ the sampled token, which is
+/// what forces a wait for the GPU. `timeSession` cannot be used for a decode program
+/// whose only output is an argmax index -- outputs mirror lazily, so it would never
+/// block and would report a per-token time faster than the kernel time.
+fn timeDecodeLoop(
+    session: aion.backend.Session,
+    prog: *const aion.program.Program,
+    mgr: *StorageManager,
+    out_id: TensorId,
+    iters: usize,
+) !u64 {
+    var scratch: [16]u8 = undefined;
+    try session.execute(prog); // warmup
+    try mgr.readPackedAtPlacement(out_id, scratch[0..4]);
+    const start = nowNs();
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        try session.execute(prog);
+        try mgr.readPackedAtPlacement(out_id, scratch[0..4]);
+    }
+    return nowNs() - start;
+}
+
 /// End-to-end warmup + timed loop over one persistent session (outputs flushed
 /// to host each iteration). Session is created once by the caller, so residency
 /// stays warm across the loop.
@@ -751,6 +1029,9 @@ fn run(args: std.process.Args) !void {
     if (a.suite == .nt) return runNt(alloc, a);
     if (a.suite == .kernels) return runKernels(alloc, a);
     if (a.suite == .decode) return runDecode(alloc, a);
+    if (a.suite == .token) return runToken(alloc, a);
+    if (a.suite == .roofline) return runRoofline(alloc, a);
+    if (a.suite == .attn) return runAttn(alloc, a);
 
     const tiles = plan.chooseMatMulTiles(gpu_policy, a.m, a.n, a.k, .f32);
     out.print("matmul f32: M={d} N={d} K={d}, iters={d}\n", .{ a.m, a.n, a.k, a.iters });
@@ -783,13 +1064,11 @@ fn run(args: std.process.Args) !void {
     }
 
     // --- GPU ---
-    var device = wgpu.Gpu.init(a.opts) catch |e| {
-        out.print("  gpu:      unavailable ({s}) — skipped\n", .{@errorName(e)});
+    var device = openDevice(a) catch |e| {
+        out.print("  gpu:      unavailable ({s}) -- skipped\n", .{@errorName(e)});
         return;
     };
     defer device.deinit();
-    const d = device.describe();
-    out.print("  gpu dev:  {s} ({s}) \"{s}\"\n", .{ d.backendName(), d.kindName(), d.nameSlice() });
     out.print("  limits:   shared={d}B storage_binding={d}MiB invocations={d} wg_x={d}\n", .{ device.limits.max_shared_bytes, device.limits.max_storage_binding_bytes / (1024 * 1024), device.limits.max_invocations, device.limits.max_workgroup_size_x });
 
     var gb = gpu.GpuBackend.init(alloc, &device);

@@ -3315,7 +3315,7 @@ test "api: fromF32Quantized authors a q8_0 matmul matching the dequant reference
     }
 }
 
-test "api: builder op-parity wrappers compile and run (cast / geluMul / elemwiseBinary)" {
+test "api: builder op-parity wrappers compile and run (cast / gate / elemwiseBinary)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const N: usize = 4;
 
@@ -3325,14 +3325,14 @@ test "api: builder op-parity wrappers compile and run (cast / geluMul / elemwise
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
 
-    // a (f16 input, cast to f32), b, c: y = (a_f32 - b) * c, then gelu(y)*c.
+    // a (f16 input, cast to f32), b, c: y = (a_f32 - b) * c, then gate(gelu, y, c).
     const A = try bld.name(try bld.input(.f16, &[_]usize{ 1, N }), "a");
     const B = try bld.name(try bld.input(.f32, &[_]usize{ 1, N }), "b");
     const C = try bld.name(try bld.input(.f32, &[_]usize{ 1, N }), "c");
     const a_f32 = try bld.cast(A, .f32);
     const diff = try bld.elemwiseBinary(.sub, a_f32, B);
     const scaled = try bld.mul(diff, C);
-    const Y = try bld.geluMul(scaled, C);
+    const Y = try bld.gate(.gelu, scaled, C);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();

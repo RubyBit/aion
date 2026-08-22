@@ -208,7 +208,7 @@ test "api.nn: Embedding lookup and a tied output head share one table" {
 
 // --------------------------------------------------------------- blocks -----
 
-test "api.nn: GatedMLP gelu path routes through the fused geluMul op" {
+test "api.nn: GatedMLP gelu path routes through one gate op" {
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);

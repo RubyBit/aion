@@ -13,35 +13,29 @@ const cpu_target = @import("cpu_target.zig");
 /// NT-specific blocking/prefetch tuning without coupling this registry to packed GEMM.
 pub const Tuning = matmul_nt.Tuning;
 
-/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
-/// where A is M×K f32 and B is N×K f32 (row-major, contiguous along K). No packing step.
+/// One N-tile of `C = alpha * A @ B^T + beta * C`, with A `[m, k]` f32 and B `[n, k]`
+/// f32 (row-major over K, i.e. already transposed w.r.t. a standard matmul). No pack
+/// step: B's rows are already in the access order the kernel wants.
+///
+/// The slices are the tile, not the whole matrix — the caller (`exec/matmul_nt.zig`)
+/// splits N into tiles and hands each worker `b_bytes`/`c_bytes` for its own tile, so
+/// `params.n` is that tile's column count and there is no tile offset in the ABI.
+/// `params.ldc` is C's row stride (defaulting to `params.n`); every current caller
+/// passes a contiguous `[m, n]` tile.
 pub const MatMulNtF32Fn = *const fn (
-    a_ptr: [*]align(1) const f32,
-    b_ptr: [*]align(1) const f32,
-    c_ptr: [*]align(1) f32,
-    m_total: usize,
-    k: usize,
-    n_total: usize,
-    n_start: usize,
-    n_count: usize,
-    alpha: f32,
-    beta: f32,
+    params: types.MatMulParams,
+    c_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
 ) types.BackendError!void;
 
-/// Compute C[:, n_start..n_start+n_count] = alpha * A @ B[n_start..n_start+n_count, :]^T + beta*C[...]
-/// where A is M×K f32, B is N×K q8_0 (row-major, contiguous along K), and C is M×n_count f32.
-/// No pre-pack: B's rows are already in the natural access order for A @ B^T.
+/// Same contract as `MatMulNtF32Fn`, with `b_bytes` holding B `[n, k]` as q8_0 in its
+/// on-disk layout: one contiguous run of `k / 32` blocks per row, no pre-pack.
 pub const MatMulNtQ8_0Fn = *const fn (
-    a_ptr: [*]align(1) const f32,
-    b_ptr: [*]const u8,
-    c_ptr: [*]align(1) f32,
-    m_total: usize,
-    k: usize,
-    n_total: usize,
-    n_start: usize,
-    n_count: usize,
-    alpha: f32,
-    beta: f32,
+    params: types.MatMulParams,
+    c_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
 ) types.BackendError!void;
 
 pub const Kernels = struct {

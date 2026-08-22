@@ -21,6 +21,11 @@ pub const program = @import("aion/graph/program.zig");
 /// High-level, user-friendly API (graph-first under the hood, but graph-hidden).
 pub const api = @import("aion/api/api.zig");
 
+/// Tile-shape choosers the model loader uses. Exposed so a benchmark can tile a
+/// synthetic weight exactly the way a loaded model would, instead of re-deriving
+/// (and drifting from) the rule.
+pub const tiling = @import("aion/api/tiling.zig");
+
 pub const runtime = @import("aion/runtime/executable.zig");
 pub const tensor_store = @import("aion/runtime/tensor_store.zig");
 pub const profile = @import("aion/profile.zig");
@@ -43,7 +48,7 @@ pub const device_memory = @import("aion/runtime/device_memory.zig");
 /// Publicly exposed backend types and helpers.
 ///
 /// These are kept as separate modules so consumers (and our own tooling like
-/// `src/bench.zig`) can access core ABI types without importing internal files
+/// `src/bench/`, `bench_cpu.zig`) can access core ABI types without importing internal files
 /// into multiple Zig modules (which Zig disallows).
 pub const types = @import("aion/backend/types.zig");
 pub const utils = @import("aion/backend/utils.zig");

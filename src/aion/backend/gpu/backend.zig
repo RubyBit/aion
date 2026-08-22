@@ -392,14 +392,19 @@ pub const GpuBackend = struct {
             const frame = &r.frame;
             switch (step) {
                 .ElemwiseBinaryTiled => |s| try simple_ops.execElemwiseBinary(op_ctx, frame, s),
-                .GeluMulTiled => |s| try simple_ops.execGeluMul(op_ctx, frame, s),
                 .UnaryTiled => |s| try simple_ops.execUnary(op_ctx, frame, s),
                 .CopyTiled => |s| try simple_ops.execCopy(op_ctx, frame, s),
                 .CastTiled => |s| try simple_ops.execCast(op_ctx, frame, s),
                 .MatMulTiled => |s| try r.gb.matmul.exec(op_ctx, frame, s),
                 .MatMulNTTiled => |s| try r.gb.nt.exec(op_ctx, frame, s, r.gb.matmul.generated),
                 .SoftmaxTiled => |s| try rowwise.execSoftmax(op_ctx, frame, s),
-                .RMSNormTiled => |s| try rowwise.execNorm(op_ctx, frame, .rmsnorm, s),
+                // The residual is a configuration of the norm, so the kernel choice is
+                // made here rather than by a step tag: `add_norm.wgsl` when one is
+                // present, the plain rowwise/cross-tile paths otherwise.
+                .RMSNormTiled => |s| if (s.residual != null)
+                    try rowwise.execAddNorm(op_ctx, frame, s)
+                else
+                    try rowwise.execNorm(op_ctx, frame, .rmsnorm, s),
                 .LayerNormTiled => |s| try rowwise.execNorm(op_ctx, frame, .layernorm, s),
                 .ReduceAll => |s| try rowwise.execReduceAll(op_ctx, frame, s),
                 .ReduceAxis => |s| try rowwise.execReduceAxis(op_ctx, frame, s),
@@ -534,7 +539,7 @@ pub const GpuBackend = struct {
         self.uniform_pool.reset();
         self.bind_cache.reset();
         runner.frame.uniform_pool = &self.uniform_pool;
-        if (!env_util.flagEnabled("AION_GPU_NO_CACHE")) runner.frame.bind_cache = &self.bind_cache;
+        runner.frame.bind_cache = &self.bind_cache;
 
         const t_start: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
@@ -545,15 +550,10 @@ pub const GpuBackend = struct {
         // per-dispatch record cost with the GPU execution instead of paying them
         // back-to-back. For a program with control flow the inner submitPending
         // calls already split frames; this just adds periodic flushes.
-        var submit_chunk: usize = 32;
-        const gpu_chunk = env_util.getOwned(std.heap.page_allocator, "AION_GPU_CHUNK");
-        defer if (gpu_chunk) |raw| std.heap.page_allocator.free(raw);
-        if (gpu_chunk) |raw| {
-            if (std.fmt.parseInt(usize, raw, 10)) |v| {
-                if (v > 0) submit_chunk = v;
-            } else |_| {}
-        }
-        const SUBMIT_CHUNK = submit_chunk;
+        //
+        // 32 was swept on device against 8/16/64/128/unbounded: larger chunks lose the
+        // record/execute overlap and smaller ones submit too often.
+        const SUBMIT_CHUNK: usize = 32;
         var since_submit: usize = 0;
         for (prog.steps) |step| {
             try runner.runStep(step.op);

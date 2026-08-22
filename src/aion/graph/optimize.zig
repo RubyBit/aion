@@ -13,7 +13,6 @@ const graph_mod = @import("graph.zig");
 const plan = @import("plan.zig");
 const manager_mod = @import("../storage/manager.zig");
 const fuse_horizontal_matmul = @import("opt/fuse_horizontal_matmul.zig");
-const fuse_gpu_decode = @import("opt/fuse_gpu_decode.zig");
 const lower_pointwise_conv = @import("opt/lower_pointwise_conv.zig");
 
 const Graph = graph_mod.Graph;
@@ -59,6 +58,4 @@ pub fn run(
     if (opt.fuse_horizontal_matmul) {
         try fuse_horizontal_matmul.run(allocator, graph, mgr, policy);
     }
-    // Vertical fusion example
-    try fuse_gpu_decode.run(allocator, graph, policy);
 }

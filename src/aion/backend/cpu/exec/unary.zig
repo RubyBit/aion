@@ -129,7 +129,7 @@ pub fn execUnaryTiled(
     }
 }
 
-fn dispatchF32(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) BackendError!void {
+pub fn dispatchF32(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) BackendError!void {
     return switch (op) {
         .relu => relu_k.reluF32(out_bytes, a_bytes, n),
         .gelu => gelu_k.geluF32(out_bytes, a_bytes, n),
@@ -141,7 +141,7 @@ fn dispatchF32(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) Back
     };
 }
 
-fn dispatchF16(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) BackendError!void {
+pub fn dispatchF16(op: UnaryOp, out_bytes: []u8, a_bytes: []const u8, n: usize) BackendError!void {
     return switch (op) {
         .relu => relu_k.reluF16(out_bytes, a_bytes, n),
         .gelu => gelu_k.geluF16(out_bytes, a_bytes, n),

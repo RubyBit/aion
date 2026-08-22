@@ -102,6 +102,11 @@ pub const ElemwiseBinaryOp = enum(u8) {
     gt,
     le,
     ge,
+    /// Gated activation: `gate(a, b) = act(a) * b`, where `act` is the `UnaryOp`
+    /// carried alongside the op. GEGLU (`gelu`), SwiGLU (`silu`), GLU (`sigmoid`) and
+    /// ReGLU (`relu`) are all this one op — gating is a parameter, not ten op tags.
+    /// Same shapes on both sides, f32 only, no broadcast. Appended for on-disk stability.
+    gate,
 
     pub fn isComparison(self: ElemwiseBinaryOp) bool {
         return switch (self) {

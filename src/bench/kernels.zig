@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-//! Shared benchmark core for the CPU (`src/bench.zig`) and GPU
+//! Shared benchmark core for the CPU (`backend/cpu/bench_cpu.zig`) and GPU
 //! (`src/aion/backend/gpu/bench_gpu.zig`) benches. Owns the two things that must
 //! stay in lockstep between them: the **op list** (`KOp`/`kInfo`/`buildK`, so the
 //! two benches test the same kernels at the same shapes) and the **report format**

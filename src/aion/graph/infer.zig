@@ -282,15 +282,6 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
 
     switch (node.op) {
-        .GeluMul => {
-            const a = try getValue(graph, node.inputs[0]);
-            const b = try getValue(graph, node.inputs[1]);
-            try require(a.dtype != null and b.dtype != null);
-            if (a.dtype.? != .f32 or b.dtype.? != .f32) return InferError.Unsupported;
-            if (a.shape.len != b.shape.len) return InferError.ShapeMismatch;
-            for (a.shape, 0..) |d, i| if (d != b.shape[i]) return InferError.ShapeMismatch;
-            try setInferred(graph, node.output, .f32, a.shape, .{ .like = node.inputs[0] });
-        },
         .MatMul => |mm| {
             const a = try getValue(graph, node.inputs[0]);
             const b = try getValue(graph, node.inputs[1]);
@@ -371,6 +362,17 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (a.dtype.? != b.dtype.?) return InferError.DTypeMismatch;
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
             if (a.dtype.? != .f32 and a.dtype.? != .f16 and a.dtype.? != .i32) return InferError.Unsupported;
+
+            // A gate is one fused kernel over matching buffers: f32, same shape on both
+            // sides, no broadcast. Anything else stays a unary and a multiply, which
+            // broadcast freely.
+            if (eb.op == .gate) {
+                if (a.dtype.? != .f32) return InferError.Unsupported;
+                if (a.shape.len != b.shape.len) return InferError.ShapeMismatch;
+                for (a.shape, 0..) |d, i| if (d != b.shape[i]) return InferError.ShapeMismatch;
+                try setInferred(graph, node.output, .f32, a.shape, .{ .like = node.inputs[0] });
+                return;
+            }
 
             const rank = @max(a.shape.len, b.shape.len);
             const out_shape = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;

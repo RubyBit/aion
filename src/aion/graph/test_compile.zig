@@ -309,3 +309,120 @@ test "placement: a device-written control predicate gets a transfer" {
         try prog.validatePlacements();
     }
 }
+
+
+// `x + rmsnorm(y)` is a SCHEDULE, not a meaning. There is no graph op for it: nobody
+// authors a "residual norm", so `program/fuse_steps.zig` recovers it from the lowered
+// step list for a device target, and leaves the pair alone on CPU where the unfused form
+// is the numerical oracle the fused kernel is checked against
+// (`backend/gpu/test_gpu_backend.zig`). Asserting it here costs no device.
+test "fuse_steps: residual + rmsnorm is one step on device and a pair on cpu" {
+    const allocator = std.testing.allocator;
+
+    for ([_]types.BackendKind{ .webgpu, .cpu }) |target| {
+        var sm = manager_mod.StorageManager.init(allocator);
+        defer sm.deinit();
+
+        var g = graph_mod.Graph.init(allocator);
+        defer g.deinit();
+
+        const M = 2;
+        const N = 8;
+        const res = try g.addInput(.f32, &.{ M, N });
+        try g.bindExternal(res, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
+        const x = try g.addInput(.f32, &.{ M, N });
+        try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
+        const gamma = try g.addInput(.f32, &.{N});
+        try g.bindExternal(gamma, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
+        const beta = try g.addInput(.f32, &.{N});
+        try g.bindExternal(beta, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
+
+        const normed = try g.addRMSNorm(x, gamma, beta, 1e-6, &.{N});
+        const out = try g.addElemwiseBinary(.add, res, normed);
+        try g.setOutputs(&.{out});
+
+        var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
+        defer prog.deinit();
+
+        var norms: usize = 0;
+        var adds: usize = 0;
+        var fused: usize = 0;
+        for (prog.steps) |step| switch (step.op) {
+            // The residual is a field, not a tag, so what distinguishes a fused norm from
+            // a plain one is the operand being there — assert on that, not on a name.
+            .RMSNormTiled => |s| if (s.residual != null) {
+                fused += 1;
+            } else {
+                norms += 1;
+            },
+            .ElemwiseBinaryTiled => adds += 1,
+            else => {},
+        };
+
+        const device = target != .cpu;
+        try std.testing.expectEqual(@as(usize, if (device) 0 else 1), norms);
+        try std.testing.expectEqual(@as(usize, if (device) 0 else 1), adds);
+        try std.testing.expectEqual(@as(usize, if (device) 1 else 0), fused);
+
+        // The pass runs after placement, so the entry for the intermediate it killed has
+        // to be gone too: `materializePlacements` demands backing for everything listed,
+        // while `workspace.plan` releases anything with no remaining use.
+        try prog.validatePlacements();
+        for (prog.tensor_placements) |entry| {
+            try std.testing.expect(try sm.tensorHasBacking(entry.id));
+        }
+    }
+}
+
+
+// The other half of the tiering rule: a gate IS a named primitive, so it is graph
+// vocabulary — but as a PARAMETER of the generic elementwise op, not a tag of its own.
+// `nn.GatedMLP` emits it directly; this asserts the step-level peephole still recovers it
+// from a graph that spells it out, for every activation, and still leaves CPU alone.
+test "fuse_steps: unary + mul becomes one gate step on device, stays a pair on cpu" {
+    const allocator = std.testing.allocator;
+
+    for ([_]types.BackendKind{ .webgpu, .cpu }) |target| {
+        for ([_]types.UnaryOp{ .gelu, .silu, .relu }) |act| {
+            var sm = manager_mod.StorageManager.init(allocator);
+            defer sm.deinit();
+
+            var g = graph_mod.Graph.init(allocator);
+            defer g.deinit();
+
+            const N = 8;
+            const x = try g.addInput(.f32, &.{ 2, N });
+            try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
+            const y = try g.addInput(.f32, &.{ 2, N });
+            try g.bindExternal(y, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
+
+            const out = try g.addElemwiseBinary(.mul, try g.addUnary(act, x), y);
+            try g.setOutputs(&.{out});
+
+            var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
+            defer prog.deinit();
+
+            var unaries: usize = 0;
+            var muls: usize = 0;
+            var gates: usize = 0;
+            for (prog.steps) |step| switch (step.op) {
+                .UnaryTiled => unaries += 1,
+                .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+                    gates += 1;
+                    // The activation has to survive the rewrite, or every gate would be
+                    // a GEGLU regardless of what the graph asked for.
+                    try std.testing.expectEqual(act, s.act);
+                } else {
+                    muls += 1;
+                },
+                else => {},
+            };
+
+            const device = target != .cpu;
+            try std.testing.expectEqual(@as(usize, if (device) 0 else 1), unaries);
+            try std.testing.expectEqual(@as(usize, if (device) 0 else 1), muls);
+            try std.testing.expectEqual(@as(usize, if (device) 1 else 0), gates);
+            try prog.validatePlacements();
+        }
+    }
+}

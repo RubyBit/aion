@@ -13,6 +13,8 @@ const plan_mod = @import("../plan.zig");
 const optimize_mod = @import("../optimize.zig");
 const placement = @import("placement.zig");
 const workspace = @import("workspace.zig");
+const alias_views = @import("alias_views.zig");
+const fuse_steps = @import("fuse_steps.zig");
 const allocation = @import("allocation.zig");
 const reachability = @import("reachability.zig");
 const manager_mod = @import("../../storage/manager.zig");
@@ -337,20 +339,19 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                     }
                 }
             }
-            _ = s.op;
-        },
-        .GeluMulTiled => |s| {
-            const out = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
-            const a = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
-            const b = mgr.getConst(s.b) catch return CompileError.InvalidArgument;
-            try compileRequire(out.dtype == .f32 and a.dtype == .f32 and b.dtype == .f32);
-            try compileRequire(out.rank == a.rank and out.rank == b.rank);
-            try requireSameShape(out.shape, a.shape);
-            try requireSameShape(out.shape, b.shape);
-            try requireSameTileShape(out, a);
-            try requireSameTileShape(out, b);
-            try requireSameTileCounts(out, a);
-            try requireSameTileCounts(out, b);
+            // A gate fuses an activation into the multiply, so it is one kernel over
+            // three matching buffers: f32, identical shape and tiling, no broadcast.
+            if (s.op == .gate) {
+                try compileRequire(out.dtype == .f32);
+                try compileRequire(s.broadcast.kind == .identical);
+                try compileRequire(out.rank == a.rank and out.rank == b.rank);
+                try requireSameShape(out.shape, a.shape);
+                try requireSameShape(out.shape, b.shape);
+                try requireSameTileShape(out, a);
+                try requireSameTileShape(out, b);
+                try requireSameTileCounts(out, a);
+                try requireSameTileCounts(out, b);
+            }
         },
 
         .UnaryTiled => |s| {
@@ -662,6 +663,22 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
                 try compileRequire(beta.tile_counts[d] == out.tile_counts[rank - norm_rank + d]);
             }
             try compileRequire(s.eps > 0.0);
+
+            // A residual is a configuration of this step, so its contract is checked here
+            // rather than by a tag of its own: the fused kernel is one workgroup per row,
+            // so the normalized axis must be the whole last dim inside a single tile, and
+            // the residual must match `out` byte for byte in shape and tiling.
+            if (s.residual) |res| {
+                const r: *const TiledTensor = mgr.getConst(res) catch return CompileError.InvalidArgument;
+                try compileRequire(out.dtype == .f32 and r.dtype == .f32);
+                try compileRequire(r.rank == out.rank);
+                try requireSameShape(out.shape, r.shape);
+                try requireSameTileShape(out, r);
+                try requireSameTileCounts(out, r);
+                try compileRequire(norm_rank == 1);
+                try compileRequire(gamma.tile_shape[0] == out.shape[rank - 1]);
+                try compileRequire(out.tile_shape[rank - 1] == out.shape[rank - 1]);
+            }
         },
 
         .RelPosMHATiled => |s| {
@@ -1351,7 +1368,24 @@ pub fn compileGraphOpt(
     }
 
     try placement.place(allocator, mgr, &compiled, &owned_tensors, policy);
-    try workspace.plan(allocator, mgr, &compiled, owned_tensors.items);
+    // Schedule-level fusion, after placement (so the target and the host-operand masks
+    // are known) and before workspace planning (so the intermediates it kills are never
+    // given a slot). Nothing here is expressible in the graph, by design: see
+    // fuse_steps.zig.
+    _ = fuse_steps.run(allocator, mgr, &compiled, owned_tensors.items, policy) catch |e| switch (e) {
+        error.OutOfMemory => return CompileError.OutOfMemory,
+        else => return CompileError.InvalidArgument,
+    };
+    // Drop view steps that only copy between byte-identical layouts, then let
+    // workspace planning hand each such destination the source's backing instead of a
+    // slot of its own. Both halves are needed: the step is what costs critical path,
+    // and the shared backing is what keeps the destination's bytes correct.
+    var view_alias = alias_views.elideNoopViews(allocator, mgr, &compiled, owned_tensors.items) catch |e| switch (e) {
+        error.OutOfMemory => return CompileError.OutOfMemory,
+        else => return CompileError.InvalidArgument,
+    };
+    defer view_alias.deinit();
+    try workspace.plan(allocator, mgr, &compiled, owned_tensors.items, &view_alias);
     compiled.owned_tensors = try owned_tensors.toOwnedSlice(allocator);
     compiled.validatePlacements() catch return CompileError.InvalidArgument;
     return compiled;
@@ -1480,9 +1514,22 @@ fn lowerNode(
             d = 0;
             while (d + 2 < b_rank) : (d += 1) b_tile[d] = 1;
 
-            c_tile[rank - 2] = tiles.tm;
+            // `tiles.tm` may come from the M-hint above, which exists only to keep
+            // QUANTIZED B's tiling stable across dynamic M. B's tiling is `tk`/`tn`;
+            // `tm` describes A and C, which are scalar and freely retileable, so
+            // taking the hint there buys nothing and costs a lot: it stamps a
+            // 4096-row tile on a 1-row decode activation, so every neighbouring
+            // elementwise/norm tensor (tiled at the real extent) disagrees and the
+            // compiler inserts a ReTileCopy on both sides.
+            //
+            // Those copies are physically pointless — a tile extent clamps to the
+            // shape, so `[1,4096,1536]` and `[1,1,1536]` are the SAME single tile —
+            // and they were 353 of the 1460 steps in a Gemma-4 E2B decode step.
+            // Use the real M for A and C; B still gets the hint.
+            const tm_real: usize = @min(m, tiles.tm);
+            c_tile[rank - 2] = tm_real;
             c_tile[rank - 1] = tiles.tn;
-            a_tile[rank - 2] = tiles.tm;
+            a_tile[rank - 2] = tm_real;
             a_tile[rank - 1] = tiles.tk;
             b_tile[b_rank - 2] = tiles.tk;
             b_tile[b_rank - 1] = tiles.tn;
@@ -1564,29 +1611,13 @@ fn lowerNode(
             );
             try appendStepChecked(allocator, mgr, steps, .{ .ElemwiseBinaryTiled = .{
                 .op = eb.op,
+                .act = eb.act,
                 .out = out_tid,
                 .a = a_tid,
                 .b = b_tid,
                 .broadcast = try makeElementwiseBroadcastPlan(a_v.shape, b_v.shape, out_shape),
             } });
         },
-        .GeluMul => {
-            const a_id: usize = @intCast(node.inputs[0]);
-            const b_id: usize = @intCast(node.inputs[1]);
-            const a_v = graph.values.items[a_id];
-            const b_v = graph.values.items[b_id];
-            var tile_buf: [MAX_RANK]usize = undefined;
-            const tile = tile_buf[0..out_shape.len];
-            if (ctx.value_has_tensor[a_id]) {
-                const a_t = try mgr.getConst(ctx.value_tensor[a_id]);
-                @memcpy(tile, a_t.tile_shape);
-            } else try fillTileShapeDefault(policy, out_dt, out_shape, tile);
-            const out_tid = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, tile);
-            const a_tid = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, a_id, a_v.dtype.?, a_v.shape, tile);
-            const b_tid = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, b_id, b_v.dtype.?, b_v.shape, tile);
-            try appendStepChecked(allocator, mgr, steps, .{ .GeluMulTiled = .{ .out = out_tid, .a = a_tid, .b = b_tid } });
-        },
-
         .Unary => |u| {
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];

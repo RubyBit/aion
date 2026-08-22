@@ -1093,10 +1093,13 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    /// Fused gate: `gelu(a) * b`.
-    pub fn geluMul(self: *Self, a: TensorRef, b: TensorRef) Error!TensorRef {
-        const out: ValueId = try self.graph.addGeluMul(a.value, b.value);
-        try self.autoNameIfUnnamed(out, "gelu_mul");
+    /// Gated activation `act(a) * b`: GEGLU (`.gelu`), SwiGLU (`.silu`), GLU
+    /// (`.sigmoid`), ReGLU (`.relu`). One node, so the graph keeps the author's intent
+    /// instead of leaving a unary-then-multiply pair for a peephole to reconstruct.
+    /// Same shape on both sides, f32 — a broadcast multiply is `unary` then `mul`.
+    pub fn gate(self: *Self, act: types.UnaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
+        const out: ValueId = try self.graph.addGate(act, a.value, b.value);
+        try self.autoNameIfUnnamed(out, "gate");
         return .{ .value = out };
     }
 

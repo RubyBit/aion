@@ -16,7 +16,7 @@ const std = @import("std");
 /// Shape-key → chosen candidate index.
 pub const Cache = std.AutoHashMap(u64, usize);
 
-/// Monotonic nanoseconds (matches src/bench.zig's clock).
+/// Monotonic nanoseconds (matches bench_cpu.zig's clock).
 pub fn nowNs() u64 {
     const ts: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);
     const ns: i96 = ts.toNanoseconds();

@@ -35,6 +35,10 @@ const gather_kernel: KernelDesc = .{ .name = "gather", .wgsl = @embedFile("../ke
 
 const Q8_BLOCK_ELEMS: usize = 32;
 const Q8_BLOCK_BYTES: usize = 34;
+/// Must match @workgroup_size in the rope / gather / sequence-append / scatter-row
+/// shaders. Stays at 64. Widening to 256 was tried with the pointwise ops (which it
+/// helped a lot) and measured a REGRESSION here: 12.62 -> 13.24 ms/token. These move
+/// real bytes per dispatch, so they want workgroups, not wider ones.
 const WG_1D: u32 = 64;
 
 /// Matches dequant.wgsl `Params`; the q8_row entry reuses the fields as

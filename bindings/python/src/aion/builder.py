@@ -561,9 +561,9 @@ class Builder:
             AionOp.AION_OP_MATMUL_NT, (a, b), MatmulAttrs(alpha, beta)
         )
 
-    def _elemwise(self, op: AionBinaryOp, a: TensorRef, b: TensorRef) -> TensorRef:
+    def _elemwise(self, op: AionBinaryOp, a: TensorRef, b: TensorRef, act: int = 1) -> TensorRef:
         return self._emit(
-            AionOp.AION_OP_ELEMWISE, (a, b), ElemwiseAttrs(int(op))
+            AionOp.AION_OP_ELEMWISE, (a, b), ElemwiseAttrs(int(op), act)
         )
 
     def add(self, a: TensorRef, b: TensorRef) -> TensorRef:
@@ -578,8 +578,14 @@ class Builder:
     def div(self, a: TensorRef, b: TensorRef) -> TensorRef:
         return self._elemwise(AionBinaryOp.AION_BINARY_DIV, a, b)
 
-    def gelu_mul(self, a: TensorRef, b: TensorRef) -> TensorRef:
-        return self._emit(AionOp.AION_OP_GELU_MUL, (a, b))
+    def gate(self, act: str, a: TensorRef, b: TensorRef) -> TensorRef:
+        """Gated activation `act(a) * b` — GEGLU/SwiGLU/GLU/ReGLU in one op.
+
+        Same shape on both sides, f32. A broadcast gate is `mul(unary(...), ...)`.
+        """
+        return self._elemwise(
+            AionBinaryOp.AION_BINARY_GATE, a, b, int(self._UNARY[act])
+        )
 
     _UNARY = {
         "relu": AionUnaryOp.AION_UNARY_RELU,

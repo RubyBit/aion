@@ -9,6 +9,7 @@ const executable = @import("../../../runtime/executable.zig");
 
 const exec_utils = @import("utils.zig");
 const layernorm_kernels = @import("../kernels/layernorm.zig");
+const elemwise = @import("../kernels/elemwise.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -49,7 +50,62 @@ pub fn execRMSNormTiled(
     s: executable.StepRMSNormTiled,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
-    return execNormTiled(pool, thread_count, .rmsnorm, s.out, s.x, s.gamma, s.beta, s.eps, store);
+    try execNormTiled(pool, thread_count, .rmsnorm, s.out, s.x, s.gamma, s.beta, s.eps, store);
+    if (s.residual) |res| try addResidualInPlace(s.out, res, store);
+}
+
+/// The residual half of `StepRMSNormTiled`, deliberately DECOMPOSED: the ordinary norm
+/// has already run, and this adds the residual into `out` in place.
+///
+/// This arm exists for correctness, not speed, and a genuinely fused CPU kernel is not
+/// worth writing — measured, not assumed. Profiling one CPU decode step of Gemma-4 E2B
+/// (2026-08-19, `AION_PROFILE=summary`, 400.5 ms total):
+///
+///     MatMulTiled          369.3 ms   92.2%
+///     MatMulNTTiled         27.1 ms    6.8%
+///     ElemwiseBinaryTiled    0.763 ms  0.19%   <- ALL 182 of them
+///     RMSNormTiled           0.495 ms  0.12%
+///
+/// So the entire elementwise category is under 0.2% of a CPU step, the 105 residual
+/// adds are a subset of it, and fusing merges the add into the norm's apply pass rather
+/// than removing its arithmetic — so the recoverable share is a fraction of 0.2%. CPU
+/// decode is a q8 GEMV problem, full stop. (On GPU the same fusion is worth +1.1%,
+/// because there the cost being removed is a dispatch launch, which has no CPU analogue.)
+///
+/// Keeping it decomposed has a second benefit: `program/fuse_steps.zig` fires only for GPU
+/// targets, so a GPU-vs-CPU comparison pits the fused kernel against the unfused pair and
+/// the test asserts "fusing changed nothing".
+///
+/// If this ever DOES need fusing, the work is to thread an optional residual through
+/// `execNormTiledND`'s apply pass (and `normTi0`'s) and add a vectorized
+/// `applyRMSNormAdd` beside `applyNorm` — not to reuse the loop below, which is serial
+/// where `exec/elementwise.zig` is thread-pooled.
+///
+/// f32 addition commutes exactly, so the operand order the fusion pass picked cannot
+/// change the result either.
+fn addResidualInPlace(
+    out_id: tensor_store.TensorId,
+    residual: tensor_store.TensorId,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    const out_meta = try store.meta(out_id);
+    var tile_total: usize = 1;
+    var d: usize = 0;
+    while (d < @as(usize, out_meta.rank)) : (d += 1) tile_total *= out_meta.tile_counts[d];
+
+    var ti: usize = 0;
+    while (ti < tile_total) : (ti += 1) {
+        const out_tile = try store.acquireTileMutLinear(out_id, ti);
+        defer store.releaseMut(out_tile.token);
+        const a_tile = try store.acquireTileConstLinear(residual, ti);
+        defer store.releaseConst(a_tile.token);
+
+        const out_view = out_tile.bufferView();
+        const a_view = a_tile.bufferView();
+        if (out_view.dtype != .f32 or a_view.dtype != .f32) return BackendError.InvalidArgument;
+        const n: usize = exec_utils.elemCountFromTileView(out_view);
+        try elemwise.elemwiseBinaryF32(.add, out_view.bytes, out_view.bytes, a_view.bytes, n);
+    }
 }
 
 fn execNormTiled(

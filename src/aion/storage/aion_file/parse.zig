@@ -490,12 +490,18 @@ fn parseRegionsSection(allocator: std.mem.Allocator, bytes: []const u8) PackageE
     return out;
 }
 
+/// The activation byte follows the op byte only for a gate — see `types.NodeOp`.
+fn parseElemwiseBinary(bytes: []const u8, cursor: *usize) PackageError!NodeOp {
+    const op = try readEnumCursor(bytes, cursor, ElemwiseBinaryOp);
+    const act: UnaryOp = if (op == .gate) try readEnumCursor(bytes, cursor, UnaryOp) else .gelu;
+    return .{ .ElemwiseBinary = .{ .op = op, .act = act } };
+}
+
 fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8) PackageError!NodeOp {
     var cursor: usize = 0;
     const op: NodeOp = switch (kind) {
-        .GeluMul => .GeluMul,
         .MatMul => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
-        .ElemwiseBinary => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
+        .ElemwiseBinary => try parseElemwiseBinary(bytes, &cursor),
         .Unary => .{ .Unary = .{ .op = try readEnumCursor(bytes, &cursor, UnaryOp) } },
         .Softmax => .{ .Softmax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .If => .{ .If = .{ .then_region = try readIntCursor(bytes, &cursor, u32), .else_region = try readIntCursor(bytes, &cursor, u32) } },

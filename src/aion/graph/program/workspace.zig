@@ -10,6 +10,7 @@ const env = @import("../../env.zig");
 const executable = @import("../../runtime/executable.zig");
 const device_memory = @import("../../runtime/device_memory.zig");
 const manager_mod = @import("../../storage/manager.zig");
+const alias_views = @import("alias_views.zig");
 
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
@@ -54,6 +55,10 @@ pub fn plan(
     mgr: *StorageManager,
     prog: *Program,
     owned: []const TensorId,
+    /// destination -> source pairs from `alias_views.elideNoopViews`. Each
+    /// destination borrows the source's backing instead of getting a slot, because
+    /// the copy that would have filled it was removed as a no-op.
+    alias: ?*const alias_views.AliasMap,
 ) PlanError!void {
     if (owned.len == 0) return;
 
@@ -164,6 +169,29 @@ pub fn plan(
         }
     }
 
+    // An aliased destination reads bytes the source produced, and it reads them AFTER
+    // the source's own last use. So the source's slot must stay alive that long and
+    // must never be handed to another tensor -- otherwise a later reuse would
+    // overwrite the bytes the destination is about to read. Extend and pin it here,
+    // before slots are assigned.
+    if (alias) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            const dst_i = by_id.get(entry.key_ptr.*) orelse continue;
+            const src_i = by_id.get(entry.value_ptr.*) orelse continue;
+            intervals[src_i].reusable = false;
+            if (intervals[dst_i].seen) {
+                intervals[src_i].last = @max(intervals[src_i].last, intervals[dst_i].last);
+                if (!intervals[src_i].seen) {
+                    intervals[src_i].seen = true;
+                    intervals[src_i].first = intervals[dst_i].first;
+                }
+            }
+            // The destination owns nothing; skip it in slot assignment below.
+            intervals[dst_i].seen = false;
+        }
+    }
+
     std.mem.sort(Interval, intervals, {}, struct {
         fn lessThan(_: void, a: Interval, b: Interval) bool {
             if (a.first != b.first) return a.first < b.first;
@@ -234,6 +262,36 @@ pub fn plan(
             slot.members.append(allocator, interval.id) catch return error.OutOfMemory;
             slot.capacities.appendSlice(allocator, tensor.tile_lens) catch return error.OutOfMemory;
             slots.append(allocator, slot) catch return error.OutOfMemory;
+        }
+    }
+
+    // Join each aliased destination to the slot that holds its source, as an ordinary
+    // extra member. That reuses the existing member machinery — the loop below aliases
+    // every non-owner member to the owner and `validateAliases` sees it — instead of
+    // bolting on a second aliasing path.
+    if (alias) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            const dst_id = entry.key_ptr.*;
+            const src_id = entry.value_ptr.*;
+            const slot_index = blk: {
+                for (slots.items, 0..) |slot, i| {
+                    for (slot.members.items) |member| if (member == src_id) break :blk i;
+                }
+                // The source never got a slot (not compiler workspace, or unused).
+                // Leaving the destination unaliased would leave it with no bytes, and
+                // its copy is already gone, so this must not happen.
+                return error.InvalidArgument;
+            };
+            const slot = &slots.items[slot_index];
+            const tensor = mgr.getConst(dst_id) catch return error.InvalidArgument;
+            slot.members.append(allocator, dst_id) catch return error.OutOfMemory;
+            if (slot.capacities.items.len < tensor.tile_lens.len) {
+                const old_len = slot.capacities.items.len;
+                slot.capacities.resize(allocator, tensor.tile_lens.len) catch return error.OutOfMemory;
+                @memset(slot.capacities.items[old_len..], 0);
+            }
+            for (tensor.tile_lens, 0..) |len, tile| slot.capacities.items[tile] = @max(slot.capacities.items[tile], len);
         }
     }
 
@@ -386,7 +444,7 @@ test "workspace planner grows capacity for disjoint lifetimes in one domain" {
         allocator.free(prog.workspace_slots);
     }
 
-    try plan(allocator, &mgr, &prog, &owned);
+    try plan(allocator, &mgr, &prog, &owned, null);
     try std.testing.expectEqual(@as(usize, 3), prog.workspace_slots.len);
     try std.testing.expect((try mgr.physicalBackingId(b)) != b);
     try std.testing.expect((try mgr.physicalBackingId(c)) != try mgr.physicalBackingId(b));
@@ -447,7 +505,7 @@ test "workspace planner isolates loop-body reuse from the enclosing schedule" {
         allocator.free(prog.workspace_slots);
     }
 
-    try plan(allocator, &mgr, &prog, &owned);
+    try plan(allocator, &mgr, &prog, &owned, null);
     try std.testing.expectEqual(@as(usize, 3), prog.workspace_slots.len);
     try std.testing.expect((try mgr.physicalBackingId(outer_tmp)) != try mgr.physicalBackingId(body_a));
     const c_backing = try mgr.physicalBackingId(body_c);

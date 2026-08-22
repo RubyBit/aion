@@ -925,6 +925,8 @@ pub const AionBinaryOp = enum(c_int) {
     AION_BINARY_GT = 7,
     AION_BINARY_LE = 8,
     AION_BINARY_GE = 9,
+    /// Gated activation: `elemwise.act`(a) * b — GEGLU/SwiGLU/GLU/ReGLU.
+    AION_BINARY_GATE = 10,
 };
 
 pub const AionReduceOp = enum(c_int) {
@@ -976,7 +978,8 @@ pub const AionOp = enum(c_int) {
     AION_OP_CAST = 24,
     AION_OP_ARGMAX = 25,
     AION_OP_SCATTER_ROW = 26,
-    AION_OP_GELU_MUL = 27,
+    // 27 was AION_OP_GELU_MUL, retired: a gated activation is AION_OP_ELEMWISE with
+    // `elemwise.op = AION_BINARY_GATE` and `elemwise.act` naming the activation.
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
@@ -985,7 +988,7 @@ pub const AionOp = enum(c_int) {
 /// Per-op attributes. Only the member matching `AionOpSpec.op` is read.
 pub const AionOpAttr = extern union {
     matmul: extern struct { alpha: f32, beta: f32 },
-    elemwise: extern struct { op: AionBinaryOp },
+    elemwise: extern struct { op: AionBinaryOp, act: AionUnaryOp = .AION_UNARY_GELU },
     unary: extern struct { op: AionUnaryOp },
     softmax: extern struct { axis: i32 },
     norm: extern struct { eps: f32, normalized_shape: [*c]const usize, normalized_shape_len: usize },
@@ -1088,6 +1091,7 @@ fn binaryFromC(op: AionBinaryOp) types.ElemwiseBinaryOp {
         .AION_BINARY_GT => .gt,
         .AION_BINARY_LE => .le,
         .AION_BINARY_GE => .ge,
+        .AION_BINARY_GATE => .gate,
     };
 }
 
@@ -1482,7 +1486,11 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
         },
         .AION_OP_ELEMWISE => blk: {
             try need(n, 2, spec.inputs);
-            break :blk try bld.elemwiseBinary(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
+            // `act` is read only for a gate, so every other op ignores whatever is there.
+            break :blk if (spec.attr.elemwise.op == .AION_BINARY_GATE)
+                try bld.gate(unaryFromC(spec.attr.elemwise.act), in(spec, 0), in(spec, 1))
+            else
+                try bld.elemwiseBinary(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
         },
         .AION_OP_UNARY => blk: {
             try need(n, 1, spec.inputs);
@@ -1675,10 +1683,6 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
         .AION_OP_SCATTER_ROW => blk: {
             try need(n, 3, spec.inputs);
             break :blk try bld.scatterRow(in(spec, 0), in(spec, 1), in(spec, 2));
-        },
-        .AION_OP_GELU_MUL => blk: {
-            try need(n, 2, spec.inputs);
-            break :blk try bld.geluMul(in(spec, 0), in(spec, 1));
         },
         .AION_OP_GATHER => blk: {
             try need(n, 2, spec.inputs);

@@ -312,13 +312,16 @@ const golden_attention =
     \\
 ;
 
+// No ReshapeScalar step: `[1,1,128]` -> `[1,128]` is one 128-float tile either way,
+// so `alias_views.elideNoopViews` drops the copy and #6 borrows #5's backing. Both
+// tensors still exist below — the destination keeps its own shape metadata, which is
+// the whole reason the pass aliases instead of rewriting operands to the source id.
 const golden_decode_chain =
-    \\steps=5
+    \\steps=4
     \\  [0] GatherRowsTiled
-    \\  [1] ReshapeScalar
-    \\  [2] RMSNormTiled
-    \\  [3] MatMulTiled
-    \\  [4] SoftmaxTiled
+    \\  [1] RMSNormTiled
+    \\  [2] MatMulTiled
+    \\  [3] SoftmaxTiled
     \\blocks=0
     \\outputs=[9]
     \\tensors:

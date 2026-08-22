@@ -112,7 +112,9 @@ pub const OpTag = enum(u8) {
 
     /// In-place scatter of one row: buf[idx] = src. Output aliases buf.
     ScatterRow = 28,
-    GeluMul = 29,
+    // 29 was GeluMul, retired: a gated activation is `ElemwiseBinary{ .op = .gate }`
+    // parameterized by its `UnaryOp`, which covers GEGLU/SwiGLU/GLU/ReGLU instead of
+    // one tag for one of them. Ids are stable on disk, so 29 stays unused.
     /// General gather with TensorFlow-style `axis` / `batch_dims` semantics.
     Gather = 30,
     /// One input extent reified as an i32 one-element tensor.
@@ -125,7 +127,9 @@ pub const Op = union(OpTag) {
     /// out = alpha * (a @ b) + beta * out
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 
-    ElemwiseBinary: struct { op: ElemwiseBinaryOp },
+    /// `act` is read only when `op == .gate` (`gate(a, b) = act(a) * b`); for every
+    /// other op it is ignored and its value is meaningless.
+    ElemwiseBinary: struct { op: ElemwiseBinaryOp, act: UnaryOp = .gelu },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
 
@@ -346,7 +350,6 @@ pub const Op = union(OpTag) {
     /// In-place row scatter: buf[idx] = src. Inputs (buf, idx[1] i32, src). The
     /// "row" is buf[1:] flattened (scalar for rank-1 buf). Output aliases buf.
     ScatterRow: void,
-    GeluMul: void,
     Gather: struct { axis: i32, batch_dims: usize },
     Dim: struct { axis: i32 },
     Iota: struct { axis: i32 },
@@ -402,7 +405,6 @@ pub fn opInputArity(op: Op) InputArity {
         .RelPosMHA => |r| .{ .exact = if (r.has_mask) 7 else 6 },
         .ArgMax => .{ .exact = 1 },
         .ScatterRow => .{ .exact = 3 },
-        .GeluMul => .{ .exact = 2 },
         .Gather => .{ .exact = 2 },
         .Dim => .{ .exact = 1 },
         .Iota => .{ .exact = 1 },
@@ -710,11 +712,15 @@ pub const Graph = struct {
         return self.addNodeInternal(.{ .ElemwiseBinary = .{ .op = op } }, &[_]ValueId{ a, b });
     }
 
+    /// Gated activation `act(a) * b` — GEGLU/SwiGLU/GLU/ReGLU by choice of `act`.
+    /// One node, so the graph records the gate the author meant instead of leaving a
+    /// unary-then-multiply pair for a peephole to guess back.
+    pub fn addGate(self: *Self, act: UnaryOp, a: ValueId, b: ValueId) GraphError!ValueId {
+        return self.addNodeInternal(.{ .ElemwiseBinary = .{ .op = .gate, .act = act } }, &[_]ValueId{ a, b });
+    }
+
     pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.{ .Unary = .{ .op = op } }, &[_]ValueId{a});
-    }
-    pub fn addGeluMul(self: *Self, a: ValueId, b: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.GeluMul, &[_]ValueId{ a, b });
     }
 
     /// Softmax over the specified axis (negative axes are allowed).

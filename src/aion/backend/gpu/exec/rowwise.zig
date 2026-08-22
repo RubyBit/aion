@@ -28,6 +28,7 @@ const TileRefDevice = device_store.TileRef;
 
 const softmax_kernel: KernelDesc = .{ .name = "softmax", .wgsl = @embedFile("../kernels/softmax.wgsl") };
 const norm_kernel: KernelDesc = .{ .name = "norm", .wgsl = @embedFile("../kernels/norm.wgsl") };
+const add_norm_kernel: KernelDesc = .{ .name = "add_norm", .wgsl = @embedFile("../kernels/add_norm.wgsl") };
 const reduce_kernel: KernelDesc = .{ .name = "reduce", .wgsl = @embedFile("../kernels/reduce.wgsl") };
 const reduce_i32_kernel: KernelDesc = .{ .name = "reduce_i32", .wgsl = @embedFile("../kernels/reduce_i32.wgsl") };
 const argmax_kernel: KernelDesc = .{ .name = "argmax", .wgsl = @embedFile("../kernels/argmax.wgsl") };
@@ -41,6 +42,10 @@ const norm_cross_apply_kernel: KernelDesc = .{ .name = "norm_cross_apply", .wgsl
 /// reduce (`rows/cols/x_row`). Field order matches the WGSL structs.
 const RowParams = extern struct { rows: u32, cols: u32, x_row: u32, o_row: u32 = 0 };
 const NormParams = extern struct { rows: u32, cols: u32, x_row: u32, o_row: u32, eps: f32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
+/// Field order matches `Params` in add_norm.wgsl. Pads are scalar `u32` on purpose: a
+/// `vec3<u32>` pad forces 16-byte alignment in WGSL and the struct sizes then disagree,
+/// which surfaces only as a bare wgpu uncaptured error.
+const AddNormParams = extern struct { rows: u32, cols: u32, x_row: u32, o_row: u32, a_row: u32, eps: f32, _p0: u32 = 0, _p1: u32 = 0 };
 const CrossParams = extern struct {
     rows: u32,
     cols: u32,
@@ -175,6 +180,77 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
         };
         const sizes = [_]u64{ dx.len, dg.len, db.len, dout.len };
         const params: NormParams = .{ .rows = xv.rows, .cols = xv.cols, .x_row = xv.row_stride, .o_row = ov.row_stride, .eps = s.eps };
+        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ xv.rows, 1, 1 });
+    }
+}
+
+/// `StepRMSNormTiled` WITH a residual: o = residual + rmsnorm(x)·gamma + beta, one
+/// workgroup per row. Same contract as `execNorm` plus a residual of identical shape AND
+/// tiling.
+///
+/// There is deliberately no cross-tile fallback: `validateStep` only accepts a residual
+/// when the last dim is whole in one tile, and `fuse_steps` only sets one then. A split row
+/// would need the two-stage reduce, and at that point the pair is not worth fusing.
+pub fn execAddNorm(ctx: Ctx, frame: *Frame, s: executable.StepRMSNormTiled) ExecuteProgramError!void {
+    const hs = ctx.store;
+    const meta = hs.meta(s.out) catch return error.ExecutionFailed;
+    const g_meta = hs.meta(s.gamma) catch return error.ExecutionFailed;
+    const b_meta = hs.meta(s.beta) catch return error.ExecutionFailed;
+    try requireF32(meta.dtype);
+    try requireF32(g_meta.dtype);
+    try requireF32(b_meta.dtype);
+
+    const rank: usize = @as(usize, meta.rank);
+    if (rank < 2) return error.Unsupported;
+    if (g_meta.rank != 1 or b_meta.rank != 1) return error.Unsupported;
+    if (meta.tile_counts[rank - 1] != 1) return error.Unsupported;
+    if (g_meta.tile_counts[0] != 1 or b_meta.tile_counts[0] != 1) return error.Unsupported;
+
+    const built = try ctx.pipes.get(add_norm_kernel, "add_rmsnorm_row");
+    const residual = s.residual orelse return error.Unsupported;
+
+    const total = context.totalTiles(meta);
+    var ti: usize = 0;
+    while (ti < total) : (ti += 1) {
+        const dx = ctx.store.acquireTileDeviceConstLinear(s.x, ti) catch return error.ExecutionFailed;
+        const dg = ctx.store.acquireTileDeviceConstLinear(s.gamma, 0) catch return error.ExecutionFailed;
+        const db = ctx.store.acquireTileDeviceConstLinear(s.beta, 0) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireTileDeviceConstLinear(residual, ti) catch return error.ExecutionFailed;
+        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
+        defer {
+            hs.releaseConst(dx.token);
+            hs.releaseConst(dg.token);
+            hs.releaseConst(db.token);
+            hs.releaseConst(da.token);
+            hs.releaseMut(dout.token);
+        }
+        if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, da.len) or
+            !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
+
+        const xv = try deviceRowView(dx);
+        const av = try deviceRowView(da);
+        const ov = try deviceRowView(dout);
+        if (xv.rows != ov.rows or xv.cols != ov.cols) return error.Unsupported;
+        if (av.rows != ov.rows or av.cols != ov.cols) return error.Unsupported;
+        if (xv.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
+        if (dg.shape_mem[0] < xv.cols or db.shape_mem[0] < xv.cols) return error.Unsupported;
+
+        const bufs = [_]c.WGPUBuffer{
+            ctx.devmem.bufferFor(dx.handle).?,
+            ctx.devmem.bufferFor(dg.handle).?,
+            ctx.devmem.bufferFor(db.handle).?,
+            ctx.devmem.bufferFor(da.handle).?,
+            ctx.devmem.bufferFor(dout.handle).?,
+        };
+        const sizes = [_]u64{ dx.len, dg.len, db.len, da.len, dout.len };
+        const params: AddNormParams = .{
+            .rows = xv.rows,
+            .cols = xv.cols,
+            .x_row = xv.row_stride,
+            .o_row = ov.row_stride,
+            .a_row = av.row_stride,
+            .eps = s.eps,
+        };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ xv.rows, 1, 1 });
     }
 }

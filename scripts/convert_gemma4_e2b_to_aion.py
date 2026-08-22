@@ -388,8 +388,8 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
             x = x + _rms(lw.post_attn_ln, "post_attention_layernorm")(o_out)
 
             ff_in = _rms(lw.pre_ffn_ln, "pre_feedforward_layernorm")(x)
-            # Split gate/up: the compiler fuses the pair and routes gelu through the
-            # fused `gelu_mul`, so there is nothing to pre-concatenate or slice here.
+            # Split gate/up: the compiler fuses the matmul pair, and the GEGLU is one
+            # `gate` op, so there is nothing to pre-concatenate or slice here.
             ff = nn.GatedMLP(lw.gate_proj, lw.up_proj, lw.down_proj,
                 act="gelu", dtype=aion.q8_0, name="mlp")(ff_in)
             x = x + _rms(lw.post_ffn_ln, "post_feedforward_layernorm")(ff)

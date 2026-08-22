@@ -6,7 +6,7 @@ The defaults match the NeMo / Parakeet FastConformer streaming front-end
 (AudioToMelSpectrogramPreprocessor): 16 kHz, n_fft=512, win_length=400 (25 ms
 Hann), hop_length=160 (10 ms), center=True, reflect pad. The mel projection
 (80 or 128 filters) is a separate matmul and is NOT included here — this benches
-the STFT/FFT only, matching the Aion `program stft f32` line in `src/bench.zig`.
+the STFT/FFT only, matching the Aion `program stft f32` line in `src/aion/backend/cpu/bench_cpu.zig`.
 
 The same FLOP estimate is used so the reported GFLOP/s are directly comparable:
 

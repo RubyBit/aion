@@ -165,6 +165,10 @@ pub fn contiguousSuffixBinaryI32Packed(
     const b: []align(1) const i32 = simd.bytesAsSliceConstUnaligned(i32, b_bytes);
     if (out.len < elem_count or a.len < elem_count or b.len < col_count) return BackendError.InvalidArgument;
     return switch (op) {
+        // A gate is an activation fused into a multiply: f32 only, and handled before
+        // any of this. Excluding it here also keeps `inline else` from instantiating an
+        // integer specialization for it.
+        .gate => BackendError.InvalidArgument,
         inline else => |comptime_op| contiguousSuffixBinaryI32Comptime(comptime_op, out, a, b, elem_count, col_count),
     };
 }
@@ -201,6 +205,7 @@ fn contiguousSuffixBinaryI32Comptime(
                     .le => @select(i32, av <= bv, ones, zeros),
                     .ge => @select(i32, av >= bv, ones, zeros),
                     .div => unreachable,
+                    .gate => unreachable, // f32 only; excluded by the caller
                 };
                 @as(*align(1) Vec, @ptrCast(out.ptr + base + col)).* = rv;
             }
@@ -225,6 +230,7 @@ inline fn scalarBinaryI32(comptime op: ElemwiseBinaryOp, a: i32, b: i32) i32 {
         .gt => @intFromBool(a > b),
         .le => @intFromBool(a <= b),
         .ge => @intFromBool(a >= b),
+        .gate => unreachable, // f32 only; excluded by the caller
     };
 }
 
@@ -338,6 +344,7 @@ pub fn elemwiseBroadcastI32(
             .gt => @intFromBool(av > bv),
             .le => @intFromBool(av <= bv),
             .ge => @intFromBool(av >= bv),
+            .gate => unreachable, // f32 only; excluded by the caller
         };
     }
 }
@@ -410,6 +417,7 @@ pub fn elemwiseBinaryI32(
         return BackendError.InvalidArgument;
     }
     return switch (op) {
+        .gate => BackendError.InvalidArgument, // f32 only; see contiguousSuffixBinaryI32Packed
         inline else => |comptime_op| elemwiseBinaryI32Comptime(comptime_op, out, a, b, elem_count),
     };
 }
@@ -442,6 +450,7 @@ fn elemwiseBinaryI32Comptime(
                 .le => @select(i32, av <= bv, ones, zeros),
                 .ge => @select(i32, av >= bv, ones, zeros),
                 .div => unreachable,
+                .gate => unreachable, // f32 only; excluded by the caller
             };
             @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
         }

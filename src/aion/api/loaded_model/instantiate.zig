@@ -29,9 +29,11 @@ pub fn instantiateNode(
     const optional_symbols: []?u64 = optionalizeSymbols(graph.arenaAlloc(), symbol_values) catch return error.OutOfMemory;
 
     return switch (node.op) {
-        .GeluMul => try graph.addGeluMul(mapped_inputs[0], mapped_inputs[1]),
         .MatMul => |mm| try graph.addMatMul(mapped_inputs[0], mapped_inputs[1], mm.alpha, mm.beta),
-        .ElemwiseBinary => |eb| try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
+        .ElemwiseBinary => |eb| if (eb.op == .gate)
+            try graph.addGate(eb.act, mapped_inputs[0], mapped_inputs[1])
+        else
+            try graph.addElemwiseBinary(eb.op, mapped_inputs[0], mapped_inputs[1]),
         .Unary => |u| try graph.addUnary(u.op, mapped_inputs[0]),
         .Softmax => |s| try graph.addSoftmax(mapped_inputs[0], s.axis),
         .Conv1D => |cv| try graph.addConv1DWithPadMode(

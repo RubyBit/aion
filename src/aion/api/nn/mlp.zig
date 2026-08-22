@@ -70,8 +70,8 @@ pub const FeedForward = struct {
 /// numerically identically. So there is nothing to choose here and nothing to
 /// probe for — one shape, one code path.
 ///
-/// The gelu case routes through the fused `geluMul` op rather than a separate
-/// unary and multiply.
+/// The gate is one `gate` op whatever the activation, so the graph records the gated
+/// unit the author meant instead of a unary and a multiply for a pass to recognise.
 pub const GatedMLP = struct {
     gate: Linear,
     up: Linear,
@@ -119,12 +119,9 @@ pub const GatedMLP = struct {
         const gate_v: TensorRef = try self.gate.forward(bld, x);
         const up_v: TensorRef = try self.up.forward(bld, x);
 
-        // `geluMul` fuses gelu(a)*b; the converters hand-rolled the pair and missed
-        // this op entirely.
-        const gated: TensorRef = if (self.act == .gelu)
-            try bld.geluMul(gate_v, up_v)
-        else
-            try bld.mul(try activation.apply(bld, self.act, gate_v), up_v);
+        // One `gate` node for every activation: the block IS a gated unit, so it says so
+        // rather than emitting a unary and a multiply for a pass to fuse back together.
+        const gated: TensorRef = try bld.gate(self.act.toUnaryOp(), gate_v, up_v);
 
         return self.down.forward(bld, gated);
     }

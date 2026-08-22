@@ -42,11 +42,11 @@ fn divide(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) 
     for (var i = g.x; i < p.n; i += step) { o[i] = a[i] / b[i]; }
 }
 
-// Fused GeGLU multiply: o = gelu(a) * b — the `GeluMulTiled` step, compiled by
-// the `fuse_gpu_decode` graph pass from a gelu whose ONLY consumer is the
-// multiply. One dispatch instead of two for every gated-FFN block. The
-// approximations replicate unary.wgsl (which replicates the CPU fast_math), so
-// the fused result is bit-identical to the two-dispatch sequence.
+// Gated activations: o = act(a) * b — `ElemwiseBinaryOp.gate`, one entry point per
+// `UnaryOp`. GEGLU/SwiGLU/GLU/ReGLU are all this, so one dispatch replaces two for
+// every gated-FFN block whichever activation the model uses. The approximations
+// replicate unary.wgsl (which replicates the CPU fast_math), so a gate is
+// bit-identical to the unary-then-multiply pair it stands in for.
 
 fn expApprox(x_in: f32) -> f32 {
     let x = clamp(x_in, -80.0, 80.0);
@@ -71,7 +71,43 @@ fn geluf(v: f32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn mul_gelu_a(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn gate_relu(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = max(a[i], 0.0) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_gelu(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     for (var i = g.x; i < p.n; i += step) { o[i] = geluf(a[i]) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_silu(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = a[i] * sigmoidf(a[i]) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_sigmoid(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = sigmoidf(a[i]) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_tanh(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = tanhApprox(a[i]) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_sqrt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = sqrt(a[i]) * b[i]; }
+}
+
+@compute @workgroup_size(64)
+fn gate_log(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.n; i += step) { o[i] = log(a[i]) * b[i]; }
 }

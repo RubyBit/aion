@@ -39,6 +39,20 @@ pub const TilePolicy = struct {
     /// global-memory accumulation round trip for every split-K dispatch.
     matmul_k_tile_cap: usize = 4096,
 
+    /// GPU cap along N and K for a **quantized** B. Separate from the f32 caps
+    /// because the two paths have opposite constraints: an f32 GEMM stages its tile
+    /// through shared memory and a bigger tile costs occupancy, while a quantized
+    /// GEMV streams B straight from global memory, so a bigger tile only means fewer
+    /// and fatter dispatches.
+    ///
+    /// It is worth its own field because splitting a quantized matmul is expensive in
+    /// a way splitting an f32 one is not: k-tiles accumulate into C through global
+    /// memory with `beta=1`, so they are strictly serialized. `down_proj` (K=12288)
+    /// became three dependent dispatches at the 4096 cap. Measured on Gemma-4 E2B
+    /// decode (min-of-4, interleaved): raising the K cap alone −1.06 ms, the N cap
+    /// alone −0.94 ms, both −1.42 ms.
+    matmul_quant_tile_cap: usize = 4096,
+
     /// Default tile length for rank-1 tensors.
     base_1d: usize = 256,
 
@@ -121,6 +135,12 @@ const GPU_MATMUL_MN_TILE_CAP: usize = 4096;
 /// to it. Until then, square shapes ≤2048 stay a single dispatch; larger ones tile
 /// into ≤16 MiB pieces (still far fewer/larger than the CPU policy).
 const GPU_MATMUL_K_TILE_CAP: usize = 4096;
+/// Quantized-B cap (see `TilePolicy.matmul_quant_tile_cap`). A quantized GEMV reads B
+/// once from global memory and never stages it, so the f32 reasoning above does not
+/// apply; what matters is not splitting the matmul. `chooseQuantTileCap` still shrinks
+/// this to fit the device's real binding limit, so raising it cannot make a tile
+/// unbindable — the previous cap was doing that job by being small.
+const GPU_MATMUL_QUANT_TILE_CAP: usize = 16384;
 
 /// Default tiling policy for a compile target. CPU returns the historical
 /// defaults; GPU targets get large base tile sizes so typical tensors land in a
@@ -138,6 +158,7 @@ pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
             .base_square_2d = GPU_GENERAL_TILE_CAP,
             .matmul_mn_tile_cap = GPU_MATMUL_MN_TILE_CAP,
             .matmul_k_tile_cap = GPU_MATMUL_K_TILE_CAP,
+            .matmul_quant_tile_cap = GPU_MATMUL_QUANT_TILE_CAP,
             .base_1d = 1 << 24, // 16M elems → typical vectors are a single tile
             // Attention on GPU streams keys inside one kernel (shared-memory
             // online softmax), so a slice's whole q/k/v/out should land in ONE
@@ -257,13 +278,31 @@ pub fn matMulMHint(policy: TilePolicy) usize {
     return @max(@as(usize, 1), cap);
 }
 
+/// Largest quantized-B tile extent that still binds on this device.
+///
+/// `capTileToBinding` in `api/tiling.zig` deliberately no-ops for quantized dtypes —
+/// quant paths must pick bindable tiles themselves — so this is where that duty lives
+/// for matmul weights. A tile spans `(k/block_elems) * extent` blocks; shrink `extent`
+/// (halving, so quant block alignment survives) until it fits the limit. With no
+/// declared limit the cap passes through unchanged.
+fn chooseQuantTileCap(policy: TilePolicy, k: usize, b_dtype: DType) usize {
+    var cap: usize = @max(@as(usize, 1), policy.matmul_quant_tile_cap);
+    if (policy.max_binding_bytes == 0) return cap;
+    const info = b_dtype.info();
+    const blocks_per_extent: usize = @max(@as(usize, 1), k / info.block_elems);
+    while (cap > 1 and blocks_per_extent * cap * info.block_bytes > policy.max_binding_bytes) cap /= 2;
+    return cap;
+}
+
 pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
     // GPU: keep K in a single (large, bounded) tile so the kernel accumulates all
     // of K within one dispatch instead of round-tripping C through global memory
     // per k-tile. Respect quant block alignment.
     if (policy.target_kind != .cpu) {
-        const cap: usize = @min(k, policy.matmul_k_tile_cap);
-        if (!b_dtype.info().is_quantized) return @max(@as(usize, 1), cap);
+        if (!b_dtype.info().is_quantized) return @max(@as(usize, 1), @min(k, policy.matmul_k_tile_cap));
+        // A split quantized K is strictly serial (each k-tile accumulates into C with
+        // beta=1), so it gets the larger, binding-aware cap.
+        const cap: usize = @min(k, chooseQuantTileCap(policy, k, b_dtype));
         const be: usize = b_dtype.info().block_elems;
         return @max(be, roundDownToMultiple(cap, be));
     }
@@ -303,8 +342,14 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     // moderate shapes → one dispatch) with full-or-large K. No CPU 128-cap (that
     // exists to spread work across cores; the GPU parallelizes within a dispatch).
     if (policy.target_kind != .cpu) {
+        // N cap follows the same split: an f32 GEMM's tile is staged, a quantized
+        // GEMV's is streamed, so only the latter wants to be wide.
+        const n_cap: usize = if (b_dtype.info().is_quantized)
+            chooseQuantTileCap(policy, k, b_dtype)
+        else
+            policy.matmul_mn_tile_cap;
         const tm: usize = @max(@as(usize, 1), @min(m, policy.matmul_mn_tile_cap));
-        const tn: usize = @max(@as(usize, 1), @min(n, policy.matmul_mn_tile_cap));
+        const tn: usize = @max(@as(usize, 1), @min(n, n_cap));
         const tk: usize = chooseMatMulTk(policy, k, b_dtype);
         return .{ .tm = tm, .tn = tn, .tk = tk };
     }

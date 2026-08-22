@@ -419,6 +419,55 @@ test "gpu backend: rmsnorm matches CPU" {
     try expectGpuMatchesCpu(buildRMSNorm, RW_M * RW_N, 1e-4);
 }
 
+/// Residual + RMSNorm, the pattern `program/fuse_steps.zig` fuses into one step.
+///
+/// This is a stronger check than it looks. The pass is GPU-only, so the CPU side
+/// of the comparison runs the UNFUSED norm-then-add pair while the GPU runs the single
+/// fused kernel — the assertion is exactly "fusing changed nothing". Multiple row tiles
+/// (16 of 48 rows) so the per-tile residual indexing is covered too.
+fn buildResidualRMSNorm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const res = try makeInput(&g, mgr, &.{ RW_M, RW_N }, &.{ 16, RW_N }, 7);
+    const xv = try makeInput(&g, mgr, &.{ RW_M, RW_N }, &.{ 16, RW_N }, 2);
+    const gv = try makeInput(&g, mgr, &.{RW_N}, &.{RW_N}, 3);
+    const bv = try makeInput(&g, mgr, &.{RW_N}, &.{RW_N}, 4);
+    const normed = try g.addRMSNorm(xv, gv, bv, 1e-6, &.{RW_N});
+    const out = try g.addElemwiseBinary(.add, res, normed);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: residual + rmsnorm (step-fused) matches CPU" {
+    try expectGpuMatchesCpu(buildResidualRMSNorm, RW_M * RW_N, 1e-4);
+}
+
+/// Gated activation `act(a) * b`, spelled out as a unary and a multiply.
+///
+/// Two things at once. `program/fuse_steps.zig` is GPU-only, so the GPU runs the single
+/// fused `gate_*` kernel while the CPU runs the unfused `UnaryTiled` + `mul` pair — the
+/// assertion is "fusing changed nothing". And the activation is a parameter of the op, so
+/// the same test covers every gate by varying it: GEGLU here, SwiGLU below.
+fn buildGatePattern(comptime act: aion.types.UnaryOp) fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg {
+    return struct {
+        fn build(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+            var g = Graph.init(alloc);
+            defer g.deinit();
+            const xv = try makeInput(&g, mgr, &.{ RW_M, RW_N }, &.{ 16, RW_N }, 11);
+            const yv = try makeInput(&g, mgr, &.{ RW_M, RW_N }, &.{ 16, RW_N }, 12);
+            const out = try g.addElemwiseBinary(.mul, try g.addUnary(act, xv), yv);
+            return finishProg(alloc, &g, mgr, out);
+        }
+    }.build;
+}
+
+test "gpu backend: gelu gate (step-fused) matches CPU" {
+    try expectGpuMatchesCpu(buildGatePattern(.gelu), RW_M * RW_N, 1e-4);
+}
+
+test "gpu backend: silu gate (step-fused) matches CPU" {
+    try expectGpuMatchesCpu(buildGatePattern(.silu), RW_M * RW_N, 1e-4);
+}
+
 fn buildRMSNormCrossTile(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();

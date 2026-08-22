@@ -41,14 +41,14 @@ pub const ElementwiseBroadcastPlan = struct {
 };
 pub const StepElemwiseBinaryTiled = struct {
     op: types.ElemwiseBinaryOp,
+    /// Read only when `op == .gate`: the activation applied to `a` before the multiply
+    /// (`gate(a, b) = act(a) * b`). Meaningless for every other op.
+    act: types.UnaryOp = .gelu,
     out: TensorId,
     a: TensorId,
     b: TensorId,
     broadcast: ElementwiseBroadcastPlan,
 };
-// Transitional source alias while the obsolete backend helper is removed. It
-// is not an executable Step tag and cannot occur in a compiled Program.
-pub const StepGeluMulTiled = struct { out: TensorId, a: TensorId, b: TensorId };
 pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
 pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId, axis: i32 };
 pub const StepConv1DTiled = struct {
@@ -80,7 +80,24 @@ pub const StepConv2DTiled = struct {
     groups: usize,
 };
 pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
-pub const StepRMSNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+/// `residual` folds a residual add into the apply pass: `out = residual + rmsnorm(x)*gamma
+/// + beta`. It is a SCHEDULE, not a meaning — `program/fuse_steps.zig` sets it from a
+/// lowered norm-then-add pair, and no graph op or on-disk record mentions it, so one
+/// `.aion` can still compile to a different schedule per backend.
+///
+/// When present, residual / x / out are identically shaped AND identically tiled, and the
+/// last dim is whole in one tile: the rowwise kernel contract, enforced by `validateStep`
+/// rather than by the step being its own tag. A configuration of the norm, not a second
+/// norm — which is what keeps residual, scale and the LayerNorm variants from becoming a
+/// tag per combination.
+pub const StepRMSNormTiled = struct {
+    out: TensorId,
+    x: TensorId,
+    gamma: TensorId,
+    beta: TensorId,
+    eps: f32,
+    residual: ?TensorId = null,
+};
 /// Grouped-query attention; see `graph.Op.Attention`.
 ///
 /// Optional query positions and K/V lengths are independent.
@@ -274,7 +291,6 @@ pub const StepTransfer = struct {
 pub const Step = union(enum) {
     MatMulTiled: StepMatMulTiled,
     ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
-    GeluMulTiled: StepGeluMulTiled,
     UnaryTiled: StepUnaryTiled,
     SoftmaxTiled: StepSoftmaxTiled,
     Conv1DTiled: StepConv1DTiled,
@@ -379,11 +395,6 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.a, .read);
             out.add(&s.b, .read);
         },
-        .GeluMulTiled => |*s| {
-            out.add(&s.out, .write);
-            out.add(&s.a, .read);
-            out.add(&s.b, .read);
-        },
         .UnaryTiled => |*s| {
             out.add(&s.out, .write);
             out.add(&s.a, .read);
@@ -415,6 +426,9 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.x, .read);
             out.add(&s.gamma, .read);
             out.add(&s.beta, .read);
+            // Appended last on purpose: `host_operands` is a positional mask, so an
+            // optional operand may not shift the index of any operand before it.
+            out.addOptional(&s.residual, .read);
         },
         .AttentionTiled => |*s| {
             out.add(&s.out, .write);

@@ -3,6 +3,7 @@
 const std = @import("std");
 const aion = @import("aion");
 const bk = @import("bench_kernels"); // shared op list + unified reporter (parity with gpu-bench)
+const bm = @import("bench_models"); // shared model-shaped decode graphs (same parity)
 
 const Backend = aion.backend.Backend;
 const CpuBackend = aion.cpu.CpuBackend;
@@ -23,12 +24,15 @@ const Q4_0_BLOCK_BYTES: usize = types.DType.q4_0.info().block_bytes;
 const Q8_0_BLOCK_ELEMS: usize = types.DType.q8_0.info().block_elems;
 const Q8_0_BLOCK_BYTES: usize = types.DType.q8_0.info().block_bytes;
 
+/// Tag names ARE the CLI names (see `parseBenchSuite`). `kernels` and `token` are shared
+/// with gpu-bench so the two benches report the same workloads.
 const BenchSuite = enum {
     all,
     matmul,
-    matmul_q,
+    quant_matmul,
     decode,
-    kernels, // shared fixed-shape sweep, in parity with gpu-bench --suite kernels
+    kernels,
+    token,
 };
 
 const BenchDTypeMode = enum {
@@ -80,6 +84,13 @@ const BenchOptions = struct {
 
     // Optional label filter for the kernels suite (--op <label>).
     op_filter: ?[]const u8 = null,
+
+    // Model-shaped decode knobs for the `token` suite, shared with gpu-bench.
+    model: bm.DecodeOptions = .{},
+    show_steps: bool = false,
+    /// Whether --iters was given. A CPU token is ~0.4 s, so the token suite defaults far
+    /// lower than the microbenchmarks instead of running for half a minute.
+    iters_set: bool = false,
 };
 
 fn printUsage() void {
@@ -90,8 +101,14 @@ fn printUsage() void {
             "Options:\n" ++
             "  --iters N        Iterations per benchmark (default: 50)\n" ++
             "  --threads N      CPU backend thread count (default: 1)\n" ++
-            "  --suite NAME     Bench suite: all|matmul|quant-matmul|decode|kernels (default: all)\n" ++
+            "  --suite NAME     all|matmul|quant_matmul|decode|kernels|token (default: all)\n" ++
             "  --op LABEL       kernels suite: run only the op with this label\n" ++
+            "  --ctx N          token suite: KV length (default: 512)\n" ++
+            "  --layers N       token suite: layers emitted, one of each kind (default: 35)\n" ++
+            "  --seq N          token suite: query rows per step (default: 1)\n" ++
+            "  --pli-vocab N    token suite: per-layer-input table rows (default: full)\n" ++
+            "  --no-head        token suite: skip the tied logits head\n" ++
+            "  --steps          token suite: print the step histogram\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
             "  --n-elem N       Elemwise/Reduce logical element count (default: 8388608)\n" ++
@@ -125,13 +142,19 @@ fn parseBenchDTypeMode(arg: []const u8) !BenchDTypeMode {
     return error.InvalidArgument;
 }
 
+/// Derived from the enum instead of a hand-written table, so a new suite cannot be added
+/// and silently not be selectable -- which has happened here before. Dashes normalize to
+/// underscores, so `--suite quant-matmul` still works.
 fn parseBenchSuite(arg: []const u8) !BenchSuite {
-    if (std.mem.eql(u8, arg, "all")) return .all;
-    if (std.mem.eql(u8, arg, "matmul")) return .matmul;
-    if (std.mem.eql(u8, arg, "quant-matmul")) return .matmul_q;
-    if (std.mem.eql(u8, arg, "decode")) return .decode;
-    if (std.mem.eql(u8, arg, "kernels")) return .kernels;
-    return error.InvalidArgument;
+    var buf: [64]u8 = undefined;
+    if (arg.len > buf.len) return error.InvalidArgument;
+    for (arg, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
+    return std.meta.stringToEnum(BenchSuite, buf[0..arg.len]) orelse {
+        std.debug.print("unknown --suite '{s}'; valid:", .{arg});
+        for (std.enums.values(BenchSuite)) |sv| std.debug.print(" {s}", .{@tagName(sv)});
+        std.debug.print("\n", .{});
+        return error.InvalidArgument;
+    };
 }
 
 fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions {
@@ -159,6 +182,23 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
         } else if (std.mem.eql(u8, a, "--iters")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.iters = try parseUsize(v);
+            opts.iters_set = true;
+        } else if (std.mem.eql(u8, a, "--ctx")) {
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.model.ctx = try parseUsize(v);
+        } else if (std.mem.eql(u8, a, "--layers")) {
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.model.layers = try parseUsize(v);
+        } else if (std.mem.eql(u8, a, "--seq")) {
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.model.seq = try parseUsize(v);
+        } else if (std.mem.eql(u8, a, "--pli-vocab")) {
+            const v = it.next() orelse return error.InvalidArgument;
+            opts.model.pli_vocab = try parseUsize(v);
+        } else if (std.mem.eql(u8, a, "--no-head")) {
+            opts.model.head = false;
+        } else if (std.mem.eql(u8, a, "--steps")) {
+            opts.show_steps = true;
         } else if (std.mem.eql(u8, a, "--threads")) {
             const v = it.next() orelse return error.InvalidArgument;
             opts.threads = try parseUsize(v);
@@ -2053,6 +2093,66 @@ fn benchKernelCpu(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend,
     bk.report(.{ .label = info.label, .iters = opts.iters, .ns = ns, .bytes = info.bytes, .flops = info.flops, .chk = chk });
 }
 
+/// The model-shaped decode step, from the same `bench_models` graph builder gpu-bench
+/// uses. That sharing is the point: a CPU-vs-GPU token comparison is only meaningful if
+/// both sides build the SAME graph, at the real Gemma-4 E2B shapes, with the real weight
+/// footprint -- so the graph lives in `src/bench/models.zig` and neither bench owns it.
+///
+/// No fidelity gate here. The step fixture in `bench_models` records the GPU SCHEDULE
+/// (`program/fuse_steps.zig` is device-only), so a CPU run legitimately has 242 plain
+/// norms and 217 elementwise where the GPU has 242 norms carrying 106 residuals and 111
+/// elementwise. Comparing the two against one fixture would only teach the fixture to be
+/// vague. The target-independent facts -- layer count and streamed bytes -- are printed
+/// instead, and those DO have to match the GPU run.
+fn runTokenSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) !void {
+    // ~0.4 s per CPU token at full scale, so 50 iterations is 20 seconds of waiting for a
+    // number that has already converged. Explicit --iters always wins.
+    const iters: usize = if (opts.iters_set) opts.iters else 5;
+
+    std.debug.print("gemma4-e2b decode step: layers={d} ctx={d} seq={d} head={} iters={d}{s}", .{
+        opts.model.layers, opts.model.ctx, opts.model.seq, opts.model.head, iters, "\n",
+    });
+
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const cpu_policy = plan_mod.tilePolicyForTarget(.{ .kind = .cpu });
+    const build_start = nowNs();
+    var built = try bm.gemma4E2BDecode(allocator, &sm, cpu_policy, opts.model, .{ .kind = .cpu, .index = 0 }, null);
+    defer built.prog.deinit();
+    const build_ms = @as(f64, @floatFromInt(nowNs() - build_start)) / 1.0e6;
+
+    std.debug.print("  weights:  {d} tensors, stream {d:.3} GB/token, resident {d:.2} GiB, build {d:.0} ms{s}", .{
+        built.stats.weight_tensors,
+        @as(f64, @floatFromInt(built.stats.stream_bytes)) / 1.0e9,
+        @as(f64, @floatFromInt(built.stats.resident_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        build_ms,
+        "\n",
+    });
+    // Any reduced knob makes the totals non-comparable to the model. Say so loudly rather
+    // than letting a scaled-down run be quoted as a headline number.
+    if (built.stats.layers_emitted != bm.G4.num_layers)
+        std.debug.print("  NOTE:     {d}/{d} layers emitted -- kinds covered, totals NOT model-scale{s}", .{ built.stats.layers_emitted, bm.G4.num_layers, "\n" });
+    if (!opts.model.head)
+        std.debug.print("  NOTE:     tied logits head OFF -- 17.7% of the real byte stream is missing{s}", .{"\n"});
+
+    // One number, not the kernel/e2e pair gpu-bench reports: `session.execute` is
+    // synchronous on CPU and the outputs are already host-resident, so there is no
+    // submit/readback split to separate.
+    const ns = try benchProgram(iters, be, &sm, &built.prog);
+    bk.report(.{
+        .label = "decode/token",
+        .iters = iters,
+        .ns = ns,
+        .bytes = @floatFromInt(built.stats.stream_bytes),
+    });
+
+    const per_tok_ms = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(iters, 1))) / 1.0e6;
+    std.debug.print("  ==> {d:.2} ms/token = {d:.1} tok/s{s}", .{ per_tok_ms, 1000.0 / per_tok_ms, "\n" });
+
+    if (opts.show_steps) try bm.printStepHistogram(allocator, &built.prog);
+}
+
 fn runKernelsSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) void {
     std.debug.print("kernel sweep (fixed shapes), iters={d}\n", .{opts.iters});
     for (std.enums.values(bk.KOp)) |op| {
@@ -2085,7 +2185,7 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
         return;
     }
 
-    if (opts.suite == .matmul_q) {
+    if (opts.suite == .quant_matmul) {
         if (!opts.quant) {
             std.debug.print("(skipping quant matmul suite: --no-quant specified)\n", .{});
             return;
@@ -2186,7 +2286,7 @@ fn runF16Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
         std.debug.print("(skipping quant matmul in f16 mode: quant benches currently use f32 activations)\n", .{});
         return;
     }
-    if (opts.suite == .matmul_q) {
+    if (opts.suite == .quant_matmul) {
         std.debug.print("(skipping quant matmul suite in f16 mode: quant benches currently use f32 activations)\n", .{});
         return;
     }
@@ -2252,11 +2352,13 @@ fn mainImpl(args: std.process.Args) !void {
 
     std.debug.print("Aion bench (threads={}, iters={}, dtype={s})\n", .{ opts.threads, opts.iters, @tagName(opts.dtype_mode) });
 
-    // The kernels sweep is f32-only and shared with gpu-bench; run it directly.
+    // Both shared-with-gpu-bench suites are f32-only and pick their own shapes, so they
+    // bypass the dtype sweep below and run directly.
     if (opts.suite == .kernels) {
         runKernelsSuite(allocator, opts, be);
         return;
     }
+    if (opts.suite == .token) return runTokenSuite(allocator, opts, be);
 
     switch (opts.dtype_mode) {
         .f32 => try runF32Benches(allocator, rnd, opts, be),

@@ -337,6 +337,8 @@ typedef enum AionBinaryOp {
     AION_BINARY_GT = 7,
     AION_BINARY_LE = 8,
     AION_BINARY_GE = 9,
+    /* Gated activation: elemwise.act(a) * b — GEGLU/SwiGLU/GLU/ReGLU. */
+    AION_BINARY_GATE = 10,
 } AionBinaryOp;
 
 typedef enum AionReduceOp {
@@ -386,7 +388,8 @@ typedef enum AionOp {
     AION_OP_CAST = 24,
     AION_OP_ARGMAX = 25,
     AION_OP_SCATTER_ROW = 26,
-    AION_OP_GELU_MUL = 27,
+    /* 27 was AION_OP_GELU_MUL, retired: use AION_OP_ELEMWISE with
+       elemwise.op = AION_BINARY_GATE and elemwise.act naming the activation. */
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
@@ -395,7 +398,7 @@ typedef enum AionOp {
 // Per-op attributes. Only the member matching AionOpSpec.op is read.
 typedef union AionOpAttr {
     struct { float alpha; float beta; } matmul;
-    struct { AionBinaryOp op; } elemwise;
+    struct { AionBinaryOp op; AionUnaryOp act; } elemwise;
     struct { AionUnaryOp op; } unary;
     struct { int32_t axis; } softmax;
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;

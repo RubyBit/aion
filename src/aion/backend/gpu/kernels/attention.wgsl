@@ -263,7 +263,62 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
             if (p.kv_f16 != 0u) {
                 // D even -> the row starts word-aligned; walk element pairs.
                 let wb = kb / 2u;
-                for (var i = 0u; i < p.dk; i += 2u) {
+                var i = 0u;
+                // Unrolled to 8 words = 32 bytes = one full L1 sector per thread per
+                // iteration. This phase is KEY-parallel, so a thread walks its OWN key's
+                // row and consecutive threads sit dk*2 bytes apart (512 for Gemma): the
+                // access is inherently uncoalesced and what costs is the NUMBER of
+                // memory transactions. Every load instruction touches 32 cache lines
+                // whatever its width, so consuming a whole sector per thread is what
+                // stops 7/8 of each fetch being wasted.
+                //
+                // Measured: 1 word -> 4 words -> 8 words took local decode attention
+                // 44.3 -> 36.4 -> 31.9 us/op, i.e. attention 2.52 -> 1.42 ms/token.
+                // Going wider does not help (32 bytes is the sector), and making the
+                // phase cooperative/coalesced instead gained only 0.05 ms more for a
+                // large rewrite -- past this point the kernel is launch- and
+                // barrier-bound, not memory-bound. Reducing BYTES does nothing either:
+                // sharing the K read across all 8 query heads (rh=4) cuts traffic 8x and
+                // measures SLOWER, because it costs workgroups.
+                let d16 = p.dk & ~15u;
+                for (; i < d16; i += 16u) {
+                    let w = wb + i / 2u;
+                    let a0 = unpack2x16float(kc[w]);
+                    let a1 = unpack2x16float(kc[w + 1u]);
+                    let a2 = unpack2x16float(kc[w + 2u]);
+                    let a3 = unpack2x16float(kc[w + 3u]);
+                    let a4 = unpack2x16float(kc[w + 4u]);
+                    let a5 = unpack2x16float(kc[w + 5u]);
+                    let a6 = unpack2x16float(kc[w + 6u]);
+                    let a7 = unpack2x16float(kc[w + 7u]);
+                    for (var r = 0u; r < rows; r += 1u) {
+                        let qb = r * p.dk + i;
+                        dots[r] += q_s[qb] * a0.x + q_s[qb + 1u] * a0.y +
+                            q_s[qb + 2u] * a1.x + q_s[qb + 3u] * a1.y +
+                            q_s[qb + 4u] * a2.x + q_s[qb + 5u] * a2.y +
+                            q_s[qb + 6u] * a3.x + q_s[qb + 7u] * a3.y +
+                            q_s[qb + 8u] * a4.x + q_s[qb + 9u] * a4.y +
+                            q_s[qb + 10u] * a5.x + q_s[qb + 11u] * a5.y +
+                            q_s[qb + 12u] * a6.x + q_s[qb + 13u] * a6.y +
+                            q_s[qb + 14u] * a7.x + q_s[qb + 15u] * a7.y;
+                    }
+                }
+                let d8 = p.dk & ~7u;
+                for (; i < d8; i += 8u) {
+                    let w = wb + i / 2u;
+                    let a0 = unpack2x16float(kc[w]);
+                    let a1 = unpack2x16float(kc[w + 1u]);
+                    let a2 = unpack2x16float(kc[w + 2u]);
+                    let a3 = unpack2x16float(kc[w + 3u]);
+                    for (var r = 0u; r < rows; r += 1u) {
+                        let qb = r * p.dk + i;
+                        dots[r] += q_s[qb] * a0.x + q_s[qb + 1u] * a0.y +
+                            q_s[qb + 2u] * a1.x + q_s[qb + 3u] * a1.y +
+                            q_s[qb + 4u] * a2.x + q_s[qb + 5u] * a2.y +
+                            q_s[qb + 6u] * a3.x + q_s[qb + 7u] * a3.y;
+                    }
+                }
+                for (; i < p.dk; i += 2u) {
                     let both = unpack2x16float(kc[wb + i / 2u]);
                     for (var r = 0u; r < rows; r += 1u) {
                         dots[r] += q_s[r * p.dk + i] * both.x + q_s[r * p.dk + i + 1u] * both.y;

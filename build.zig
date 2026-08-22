@@ -408,7 +408,7 @@ pub fn build(b: *std.Build) void {
     // Shared benchmark core (op list + unified reporter), imported by both the
     // CPU `bench` and the GPU `gpu-bench` so their ops and output stay in parity.
     const bench_kernels_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench_kernels.zig"),
+        .root_source_file = b.path("src/bench/kernels.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -416,26 +416,22 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
+    // Whole-model decode graphs (Gemma-4 E2B), shared for the same reason: a
+    // model-shaped benchmark is only trustworthy if both benches build the SAME
+    // graph, at the real shapes, with the real weight footprint.
+    const bench_models_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/models.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "aion", .module = aion_mod },
-            .{ .name = "bench_kernels", .module = bench_kernels_mod },
         },
     });
 
-    const bench_exe = b.addExecutable(.{
-        .name = "aion-bench",
-        .root_module = bench_mod,
-    });
-    const run_bench = b.addRunArtifact(bench_exe);
-    if (wgpu_dep) |wd| wd.prepareRun(b, run_bench);
-    run_bench.addPassthruArgs();
-
-    const bench_step = b.step("bench", "Run microbenchmarks");
-    bench_step.dependOn(&run_bench.step);
+    const cpu_bench_run = addCpuBench(b, target, optimize, aion_mod, bench_kernels_mod, bench_models_mod, wgpu_dep);
+    cpu_bench_run.addPassthruArgs();
+    const bench_step = b.step("bench", "Build and run the CPU benchmark");
+    bench_step.dependOn(&cpu_bench_run.step);
 
     // ---------------------------------------------------------------------
     // GPU backend test (the in-tree backend already compiled into `aion_mod`):
@@ -466,7 +462,7 @@ pub fn build(b: *std.Build) void {
 
         // CPU-vs-GPU benchmark (separate artifact for GPU-specific workloads).
         //   zig build gpu-bench -Doptimize=ReleaseFast -- --m 1024 --n 1024 --k 1024
-        const gpu_bench_run = addGpuBench(b, target, optimize, aion_mod, bench_kernels_mod, wd, gpu_check);
+        const gpu_bench_run = addGpuBench(b, target, optimize, aion_mod, bench_kernels_mod, bench_models_mod, wd, gpu_check);
         gpu_bench_run.addPassthruArgs();
         const gpu_bench_step = b.step("gpu-bench", "Build and run the CPU-vs-GPU benchmark");
         gpu_bench_step.dependOn(&gpu_bench_run.step);
@@ -659,6 +655,34 @@ fn addApiGpuTest(
 }
 
 /// The CPU-vs-GPU benchmark exe (`zig build gpu-bench`). Like the test, it imports
+/// The CPU benchmark artifact, living beside the backend it measures
+/// (`backend/cpu/bench_cpu.zig`) exactly as `bench_gpu.zig` does, and sharing the op list
+/// and the model graphs with it through `src/bench/`. Same shape as `addGpuBench` so the
+/// two stay in parity; it takes the optional wgpu dep only because `aion_mod` may link it.
+fn addCpuBench(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    aion_mod: *std.Build.Module,
+    bench_kernels_mod: *std.Build.Module,
+    bench_models_mod: *std.Build.Module,
+    wgpu_dep: ?WgpuDep,
+) *std.Build.Step.Run {
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/aion/backend/cpu/bench_cpu.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("aion", aion_mod);
+    bench_mod.addImport("bench_kernels", bench_kernels_mod);
+    bench_mod.addImport("bench_models", bench_models_mod);
+
+    const bench = b.addExecutable(.{ .name = "aion-bench", .root_module = bench_mod });
+    const run = b.addRunArtifact(bench);
+    if (wgpu_dep) |wd| wd.prepareRun(b, run);
+    return run;
+}
+
 /// `aion` and gets wgpu transitively from that module; kept separate from the main
 /// `bench` exe because it runs GPU-specific workloads.
 fn addGpuBench(
@@ -667,6 +691,7 @@ fn addGpuBench(
     optimize: std.builtin.OptimizeMode,
     aion_mod: *std.Build.Module,
     bench_kernels_mod: *std.Build.Module,
+    bench_models_mod: *std.Build.Module,
     wd: WgpuDep,
     check_step: *std.Build.Step,
 ) *std.Build.Step.Run {
@@ -678,6 +703,7 @@ fn addGpuBench(
     });
     bench_mod.addImport("aion", aion_mod);
     bench_mod.addImport("bench_kernels", bench_kernels_mod);
+    bench_mod.addImport("bench_models", bench_models_mod);
 
     const bench = b.addExecutable(.{ .name = "aion-gpu-bench", .root_module = bench_mod });
     const run = b.addRunArtifact(bench);

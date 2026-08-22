@@ -9,13 +9,24 @@
 // fold the dequant INTO the dot product so B is read exactly once and no f32
 // scratch is written/re-read (the previous path did both, ~8x the traffic).
 //
-// Work shape: a 256-thread workgroup is COLS (=32) column-pairs × LANES (=8)
+// Work shape: a 1024-thread workgroup is COLS (=32) column-pairs × LANES (=32)
 // K-lanes. `pair` is the FAST index (lidx % COLS) so a warp (32 consecutive
 // lanes) reads 32 ADJACENT column-pairs at the SAME K-block-row — 32 contiguous
 // 17-word blocks → fully coalesced. `klane` (lidx / COLS) K-splits the block-row
-// reduction across 8 threads per column, an 8x thread multiplier over one
+// reduction across 32 threads per column, a 32x thread multiplier over one
 // thread per column, which is what gives the launch enough warps for occupancy
 // (a plain thread-per-column GEMV bottoms out at N/512 workgroups).
+//
+// `WG` MUST equal the `@workgroup_size` below: `klane` is derived from it and the
+// reduction strides by `LANES * COLS`, so a mismatch silently sums uninitialized
+// shared memory (and still produces plausible-looking numbers).
+//
+// LANES=8/WG=256 was tried on 2026-08-19 — more block-rows per thread, a shallower
+// reduce, 4 blocks/SM instead of 2. At matched temperature it measured the same:
+// 13.91 ms/token vs 13.88 for this config. NOT a win either way, so this stays.
+// (First read looked like a 1.2 ms regression; that was the GPU being ~1 ms slower
+// hot than cold, which is larger than the effect. Compare only same-temperature
+// runs, interleaved.)
 //
 // A single 34-byte q8_0 block is only 2-byte aligned, so a thread reads its two
 // adjacent columns' blocks as a word-aligned 68-byte PAIR (17 u32) — the same
@@ -77,6 +88,13 @@ fn gemv_q8_kmajor(
 
             var sA = 0.0;
             var prev = w0;
+            // The shift-combine below (and its serial prev/cur carry) is the whole cost
+            // a two-plane q8 layout — separate scale and quant planes, enabling
+            // vec4 loads — would remove. Measured 2026-08-19 by replacing this loop
+            // with plain aligned loads (numerically wrong, identical traffic): the
+            // WHOLE token gained 0.29 ms of 13.09. So the 34-byte block's odd stride is
+            // NOT what limits this kernel, and splitting the planes is not worth the
+            // derived-weight machinery or the weight duplication it would cost.
             for (var j = 0u; j < 8u; j += 1u) {
                 let cur = b[base + 1u + j];
                 sA += dot(i8x4f((prev >> 16u) | (cur << 16u)), a[av + j]);

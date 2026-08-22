@@ -30,7 +30,17 @@ const elementwise_suffix_kernel: KernelDesc = .{ .name = "elementwise_suffix", .
 const elementwise_suffix_i32_kernel: KernelDesc = .{ .name = "elementwise_suffix_i32", .wgsl = @embedFile("../kernels/elementwise_suffix_i32.wgsl") };
 const dequant_kernel: KernelDesc = .{ .name = "dequant", .wgsl = @embedFile("../kernels/dequant.wgsl") };
 
-const WORKGROUP_1D: u32 = 64; // must match @workgroup_size in the 1-D elementwise and unary shaders
+/// Must match `@workgroup_size` in the 1-D elementwise and unary shaders.
+///
+/// Do NOT widen this to chase decode latency. It looks tempting — a `[1,1,1536]`
+/// residual add is 24 workgroups of 64 threads, one element each, and the token runs
+/// 105 of those plus 36 suffix multiplies and 70 gelu·mul — but measured 2026-08-19,
+/// 256 threads is a severe regression at real sizes: large elementwise fell from
+/// 350/374/380 GB/s (add/silu/suffix at 8192x8192) to 123/119/120, about 3x. Decode
+/// showed no end-to-end gain to trade against that, because mid-size ops like the
+/// 12288-wide geglu regress too. The small-shape launch overhead has to be removed by
+/// FUSING these ops away, not by making each dispatch wider.
+const WORKGROUP_1D: u32 = 64;
 
 /// Uniform params for the 1D elementwise/unary kernels (16-byte aligned).
 const ScalarParams = extern struct { n: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
@@ -69,11 +79,15 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
     const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
     const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
     const broadcast = s.broadcast.kind != .identical;
-    const fast_suffix = (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) and !s.op.isComparison();
+    const fast_suffix = (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) and !s.op.isComparison() and s.op != .gate;
 
     // Comparisons are i32-in/i32-out (infer enforces it); arithmetic is
     // dtype-preserving f32 or i32. Both element sizes are 4 bytes, so the
     // dispatch math below is dtype-agnostic — only the kernel module differs.
+    // A gate carries an activation and exists only as a same-shape f32 kernel; the
+    // compiler refuses anything else, so a mismatch here is a compiler bug, not input.
+    if (s.op == .gate and (broadcast or meta.dtype != .f32)) return error.Unsupported;
+
     const kernel: KernelDesc = switch (meta.dtype) {
         .f32 => if (s.op.isComparison())
             return error.Unsupported
@@ -108,6 +122,17 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
         .gt => "gt",
         .le => "le",
         .ge => "ge",
+        // One entry point per activation, named for it, so adding an activation to
+        // `UnaryOp` is a one-line kernel and nothing else.
+        .gate => switch (s.act) {
+            .relu => "gate_relu",
+            .gelu => "gate_gelu",
+            .silu => "gate_silu",
+            .sigmoid => "gate_sigmoid",
+            .tanh => "gate_tanh",
+            .sqrt => "gate_sqrt",
+            .log => "gate_log",
+        },
     };
     const built = try ctx.pipes.get(kernel, entry);
 
@@ -188,28 +213,6 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
             const params: ScalarParams = .{ .n = n };
             try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
         }
-    }
-}
-
-pub fn execGeluMul(ctx: Ctx, frame: *Frame, s: executable.StepGeluMulTiled) ExecuteProgramError!void {
-    const hs = ctx.store;
-    const meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
-    const built = try ctx.pipes.get(elementwise_kernel, "mul_gelu_a");
-    const total = context.totalTiles(meta);
-    var ti: usize = 0;
-    while (ti < total) : (ti += 1) {
-        const da = ctx.store.acquireTileDeviceConstLinear(s.a, ti) catch return error.ExecutionFailed;
-        const db = ctx.store.acquireTileDeviceConstLinear(s.b, ti) catch return error.ExecutionFailed;
-        const dout = ctx.store.acquireTileDeviceMutLinear(s.out, ti) catch return error.ExecutionFailed;
-        defer hs.releaseConst(da.token);
-        defer hs.releaseConst(db.token);
-        defer hs.releaseMut(dout.token);
-        const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(da.handle).?, ctx.devmem.bufferFor(db.handle).?, ctx.devmem.bufferFor(dout.handle).? };
-        const sizes = [_]u64{ da.len, db.len, dout.len };
-        const n: u32 = @intCast(dout.len / @sizeOf(f32));
-        const params: ScalarParams = .{ .n = n };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
     }
 }
 

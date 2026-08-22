@@ -35,6 +35,10 @@ const view_kernel: KernelDesc = .{ .name = "view", .wgsl = @embedFile("../kernel
 /// Element-addressed twins, for f16 layouts with no word view (see view_f16.wgsl).
 const view_f16_kernel: KernelDesc = .{ .name = "view_f16", .wgsl = @embedFile("../kernels/view_f16.wgsl") };
 
+/// Must match @workgroup_size in the view shaders. Stays at 64: unlike the tiny
+/// pointwise ops (see WORKGROUP_1D in exec/simple_ops.zig) a view copy moves real
+/// bytes -- a fused-projection slice is ~48 KiB -- so it wants MORE workgroups, not
+/// fewer. Measured: widening these to 256 cost 0.7 ms/token.
 const WG_1D: u32 = 64;
 const MAX_RANK: usize = 8;
 

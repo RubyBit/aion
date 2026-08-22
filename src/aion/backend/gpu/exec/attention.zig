@@ -73,9 +73,41 @@ const MIN_BLOCKS: usize = 128;
 /// toward `MIN_SEG_KEYS` only as far as needed to fill the device.
 const SEG_KEYS: usize = 512;
 /// Floor on segment length — below this the score phase idles most of its threads.
-const MIN_SEG_KEYS: usize = 64;
+///
+/// 64 was tuned when attention was measured on prefill-ish shapes, where the block
+/// grid is large and split-K never engages. At DECODE it is the binding constraint:
+/// one query row over 8 heads with gqa=8 leaves only heads x segments as parallelism,
+/// and 64 caps a 512-key span at 8 segments, so 4 head-blocks x 8 = 32 workgroups on
+/// a 58-SM part.
+///
+/// Swept on device 2026-08-19 (`gpu-bench --suite attn --ctx 512`, per-op cost taken
+/// as the slope of a --repeat sweep so the ~0.65 ms/execute harness floor drops out):
+///
+///   min_seg_keys   local us/op   global us/op   ms/token
+///   64 (was)          57.1          132.2         2.52
+///   32 (now)          44.3           91.4         1.88   <-- best
+///   16                52.1           95.5         2.13
+///    8                75.5           95.6         2.78
+///
+/// So it is a genuine optimum, not a floor to keep lowering: below 32 the segments
+/// get too short and the score phase idles again. Confirmed on the full step:
+/// 15.61 -> 14.99 ms/token, matching the isolated prediction of -0.64 ms.
+/// Re-sweep by editing this constant; `gpu-bench --suite attn` reports the per-op cost.
+const MIN_SEG_KEYS: usize = 32;
 /// Cap on segments, keeping the partials buffer and the merge loop small.
-const MAX_SEGS: usize = 64;
+const MAX_SEGS_DEFAULT: usize = 64;
+
+// The three split-K parameters above were swept on device via `gpu-bench --suite attn`
+// (the sweep table is in the MIN_SEG_KEYS doc comment) and are constants again now that
+// it has concluded. They are decode-shaped, not prefill-shaped: with one query row, 8
+// heads and gqa=8 the only parallelism left is heads x segments, and the old
+// MIN_SEG_KEYS = 64 capped a 512-key span at 8 segments -> 4 head-blocks x 8 = 32
+// workgroups on 58 SMs, measured at 63 us for a 0.5 MiB read (8.4 GB/s, ~2 % of peak).
+//
+// Also swept and rejected: forcing the head-rows per workgroup. `rh` is how many query
+// heads share one read of the single KV head, so raising it cuts traffic 8x — and
+// measured SLOWER (rh=1 1.84 ms vs rh=4 2.79 ms), because at decode it costs workgroups.
+// `chooseRowBlock` derives it, and nothing overrides that.
 
 fn ceilDiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
@@ -95,7 +127,7 @@ const RowBlock = struct { rh: usize, rl: usize };
 /// there simply isn't enough work — hedge at two rows rather than one: half the
 /// traffic reduction for double the blocks measured best on that shape.
 fn chooseRowBlock(gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize, d_k: usize) RowBlock {
-    const max_segs: usize = @min(@max(@as(usize, 1), span_hint / MIN_SEG_KEYS), MAX_SEGS);
+    const max_segs: usize = @min(@max(@as(usize, 1), span_hint / MIN_SEG_KEYS), MAX_SEGS_DEFAULT);
     const rows_cap: usize = @min(MAX_ROWS, @max(@as(usize, 1), Q_STAGE_FLOATS / @max(d_k, 1)));
 
     var hedge: ?RowBlock = null;
@@ -448,7 +480,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             while (seg_keys > MIN_SEG_KEYS and blocks * ceilDiv(span_hint, seg_keys) < MIN_BLOCKS) {
                 seg_keys /= 2;
             }
-            segs = @min(ceilDiv(span_hint, seg_keys), MAX_SEGS);
+            segs = @min(ceilDiv(span_hint, seg_keys), MAX_SEGS_DEFAULT);
             segs = @min(segs, @as(usize, context.MAX_GROUPS_PER_DIM) / @max(tb, 1));
             if (segs < 2) segs = 1;
         }

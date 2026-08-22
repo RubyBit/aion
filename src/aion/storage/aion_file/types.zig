@@ -167,7 +167,9 @@ pub const InputRole = struct {
 
 pub const NodeOp = union(graph_mod.OpTag) {
     MatMul: struct { alpha: f32, beta: f32 },
-    ElemwiseBinary: struct { op: ElemwiseBinaryOp },
+    /// `act` is present on disk ONLY when `op == .gate`, so appending the gate op cost
+    /// no record-layout change: a file written before it never carries the extra byte.
+    ElemwiseBinary: struct { op: ElemwiseBinaryOp, act: UnaryOp = .gelu },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
     Conv1D: struct {
@@ -245,7 +247,6 @@ pub const NodeOp = union(graph_mod.OpTag) {
     ArgMax: struct { axis: i32 },
 
     ScatterRow: void,
-    GeluMul: void,
     Gather: struct { axis: i32, batch_dims: u64 },
     Dim: struct { axis: i32 },
     Iota: struct { axis: i32 },

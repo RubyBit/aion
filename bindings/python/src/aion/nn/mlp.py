@@ -37,7 +37,7 @@ class FeedForward(Module):
 
 
 class GatedMLP(Module):
-    """`down(act(gate(x)) * up(x))` — SwiGLU (`silu`) / GeGLU (`gelu`).
+    """`down(gate(act, gate_proj(x), up(x)))` — SwiGLU (`silu`) / GeGLU (`gelu`).
 
     `gate` and `up` are two separate projections, the way every checkpoint ships
     them. Pre-concatenating the pair into one `[in, 2*ffn]` weight is a *fusion*,
@@ -45,8 +45,9 @@ class GatedMLP(Module):
     rewrites matmuls sharing an operand into one wide matmul plus a slice each,
     numerically identically. So there is nothing to choose here.
 
-    The gelu case routes through the fused `gelu_mul` op rather than a separate
-    unary and multiply.
+    The gate is one `gate` op whatever the activation, so the graph records the
+    gated unit the author meant instead of a unary and a multiply for a compiler
+    pass to recognise.
     """
 
     def __init__(
@@ -75,7 +76,7 @@ class GatedMLP(Module):
         with self._scoped(b):
             g = self.gate_proj(x)
             u = self.up_proj(x)
-            gated = b.gelu_mul(g, u) if self.act == "gelu" else b.mul(b.unary(self.act, g), u)
+            gated = b.gate(self.act, g, u)
             return self.down_proj(gated)
 
 
@@ -103,7 +104,7 @@ class GLU(Module):
             both = self.proj(x)
             a = b.slice_last_dim(both, 0, self.half)
             g = b.slice_last_dim(both, self.half, self.half)
-            return b.mul(a, b.unary("sigmoid", g))
+            return b.gate("sigmoid", g, a)
 
 
 def _last_dim(data: WeightData) -> int:

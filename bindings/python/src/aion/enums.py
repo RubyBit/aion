@@ -64,6 +64,8 @@ class AionBinaryOp(IntEnum):
     AION_BINARY_GT = 7
     AION_BINARY_LE = 8
     AION_BINARY_GE = 9
+    # Gated activation: act(a) * b, with the activation in ElemwiseAttrs.act.
+    AION_BINARY_GATE = 10
 
 
 class AionReduceOp(IntEnum):
@@ -113,7 +115,8 @@ class AionOp(IntEnum):
     AION_OP_CAST = 24
     AION_OP_ARGMAX = 25
     AION_OP_SCATTER_ROW = 26
-    AION_OP_GELU_MUL = 27
+    # 27 was AION_OP_GELU_MUL, retired: a gated activation is AION_OP_ELEMWISE with
+    # op=AION_BINARY_GATE and act naming the activation.
     AION_OP_GATHER = 28
     AION_OP_DIM = 29
     AION_OP_IOTA = 30

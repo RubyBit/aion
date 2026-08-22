@@ -418,8 +418,8 @@ def _emit_forward(
             x = x + _rms(lw.post_attn_ln, "post_attention_layernorm")(o)
 
             ff_in = _rms(lw.pre_ffn_ln, "pre_feedforward_layernorm")(x)
-            # Split gate/up: the compiler fuses the pair and routes gelu through
-            # the fused `gelu_mul` (the tanh approximation, i.e. this model's
+            # Split gate/up: the compiler fuses the matmul pair, and the GEGLU is one
+            # `gate` op with the tanh gelu approximation (i.e. this model's
             # `gelu_pytorch_tanh`), so there is nothing to pre-concatenate here.
             ff = nn.GatedMLP(lw.gate_proj, lw.up_proj, lw.down_proj,
                              act="gelu", dtype=weight_dtype, name="mlp")(ff_in)

@@ -347,8 +347,24 @@ pub const GpuBackend = struct {
             const generic_profile = r.profiler != null and r.depth == 0;
             const t0: u64 = if (generic_profile) profile_mod.nowNs() else 0;
             r.dispatchStep(step) catch |e| {
-                if (env_util.flagEnabled("AION_GPU_TRACE"))
+                if (env_util.flagEnabled("AION_GPU_TRACE")) {
                     std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
+                    switch (step) {
+                        .ReduceAxis => |s| {
+                            const input = r.op_ctx.store.meta(s.a) catch null;
+                            const output = r.op_ctx.store.meta(s.out) catch null;
+                            if (input) |m| std.debug.print(
+                                "[gpu]   input id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
+                                .{ s.a, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                            );
+                            if (output) |m| std.debug.print(
+                                "[gpu]   output id={} dtype={s} shape={any} tile_shape={any} tile_counts={any} axis={} op={s}\n",
+                                .{ s.out, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts, s.axis, @tagName(s.op) },
+                            );
+                        },
+                        else => {},
+                    }
+                }
                 return e;
             };
             if (generic_profile) {

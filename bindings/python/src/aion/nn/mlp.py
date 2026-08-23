@@ -76,7 +76,9 @@ class GatedMLP(Module):
         with self._scoped(b):
             g = self.gate_proj(x)
             u = self.up_proj(x)
-            gated = b.gate(self.act, g, u)
+            # The activation and the multiply a gated FFN is; the compiler fuses
+            # them into one kernel where a fused kernel applies.
+            gated = b.mul(b.unary(self.act, g), u)
             return self.down_proj(gated)
 
 
@@ -104,7 +106,7 @@ class GLU(Module):
             both = self.proj(x)
             a = b.slice_last_dim(both, 0, self.half)
             g = b.slice_last_dim(both, self.half, self.half)
-            return b.gate("sigmoid", g, a)
+            return b.mul(b.unary("sigmoid", g), a)
 
 
 def _last_dim(data: WeightData) -> int:

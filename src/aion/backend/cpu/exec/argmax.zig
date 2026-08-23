@@ -23,7 +23,7 @@ pub fn execArgMax(
     const out_meta = try store.meta(s.out);
 
     if (in_meta.rank == 0) return BackendError.InvalidArgument;
-    if (in_meta.dtype != .f32) return BackendError.InvalidArgument;
+    if (in_meta.dtype != .f32 and in_meta.dtype != .f16) return BackendError.InvalidArgument;
     if (out_meta.dtype != .i32) return BackendError.InvalidArgument;
 
     const in_rank: usize = @as(usize, in_meta.rank);
@@ -51,21 +51,40 @@ pub fn execArgMax(
     const out_tile = try store.acquireTileMutLinear(s.out, 0);
     defer store.releaseMut(out_tile.token);
 
-    const in_buf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, in_tile.bufferView().bytes);
+    const in_bytes = in_tile.bufferView().bytes;
     const out_bytes = out_tile.bufferView().bytes;
-    if (in_buf.len < outer * n) return BackendError.InvalidArgument;
     if (out_bytes.len < outer * 4) return BackendError.InvalidArgument;
     const out_buf: []align(1) i32 = simd.bytesAsSliceMutUnaligned(i32, out_bytes);
+
+    // f16 compares on the widened value, which is order-preserving, so the index
+    // picked is the one the f32 path would pick for the same logical row.
+    switch (in_meta.dtype) {
+        .f32 => try argmaxRows(f32, in_bytes, out_buf, outer, n),
+        .f16 => try argmaxRows(f16, in_bytes, out_buf, outer, n),
+        else => return BackendError.InvalidArgument,
+    }
+}
+
+fn argmaxRows(
+    comptime T: type,
+    in_bytes: []const u8,
+    out_buf: []align(1) i32,
+    outer: usize,
+    n: usize,
+) ExecuteProgramError!void {
+    const in_buf: []align(1) const T = simd.bytesAsSliceConstUnaligned(T, in_bytes);
+    if (in_buf.len < outer * n) return BackendError.InvalidArgument;
 
     var o: usize = 0;
     while (o < outer) : (o += 1) {
         const row = in_buf[o * n .. o * n + n];
         var best_i: usize = 0;
-        var best_v: f32 = row[0];
+        var best_v: f32 = @floatCast(row[0]);
         var j: usize = 1;
         while (j < n) : (j += 1) {
-            if (row[j] > best_v) {
-                best_v = row[j];
+            const v: f32 = @floatCast(row[j]);
+            if (v > best_v) {
+                best_v = v;
                 best_i = j;
             }
         }

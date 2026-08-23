@@ -3332,7 +3332,7 @@ test "api: builder op-parity wrappers compile and run (cast / gate / elemwiseBin
     const a_f32 = try bld.cast(A, .f32);
     const diff = try bld.elemwiseBinary(.sub, a_f32, B);
     const scaled = try bld.mul(diff, C);
-    const Y = try bld.gate(.gelu, scaled, C);
+    const Y = try bld.elemwiseBinary(.mul, try bld.unary(.gelu, scaled), C);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();

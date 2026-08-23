@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> stats: array<f32>;
 @group(0) @binding(2) var<storage, read_write> o: array<f32>;
+// f16 twins of the entry points below. Only the ELEMENT buffers change type:
+// `stats` stays f32, because a partial row statistic is an accumulator and must
+// not be rounded between the reduce and the apply stage.
+@group(0) @binding(0) var<storage, read> xh: array<f16>;
+@group(0) @binding(2) var<storage, read_write> oh: array<f16>;
 @group(0) @binding(3) var<uniform> p: Params;
 
 struct Params {
@@ -30,5 +37,16 @@ fn softmax_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     let ob = wid.x * p.o_row;
     for (var col = lidx; col < p.cols; col += WG) {
         o[ob + col] = expApprox(clamp(x[xb + col] - row_max, -20.0, 0.0)) * inv_sum;
+    }
+}
+
+@compute @workgroup_size(256)
+fn softmax_apply_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let row_max = stats[p.stat_base + wid.x * 2u];
+    let inv_sum = 1.0 / stats[p.stat_base + wid.x * 2u + 1u];
+    let xb = wid.x * p.x_row;
+    let ob = wid.x * p.o_row;
+    for (var col = lidx; col < p.cols; col += WG) {
+        oh[ob + col] = f16(expApprox(clamp(f32(xh[xb + col]) - row_max, -20.0, 0.0)) * inv_sum);
     }
 }

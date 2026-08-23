@@ -5,7 +5,7 @@ const graph_mod = @import("../../graph/graph.zig");
 pub fn convertOp(allocator: anytype, op: graph_mod.Op) !package_file.NodeOp {
     const out: package_file.NodeOp = switch (op) {
         .MatMul => |mm| .{ .MatMul = .{ .alpha = mm.alpha, .beta = mm.beta } },
-        .ElemwiseBinary => |eb| .{ .ElemwiseBinary = .{ .op = eb.op, .act = eb.act } },
+        .ElemwiseBinary => |eb| .{ .ElemwiseBinary = .{ .op = eb.op } },
         .Unary => |u| .{ .Unary = .{ .op = u.op } },
         .Softmax => |s| .{ .Softmax = .{ .axis = s.axis } },
         .Conv1D => |cv| .{ .Conv1D = .{

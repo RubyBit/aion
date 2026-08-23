@@ -64,8 +64,6 @@ class AionBinaryOp(IntEnum):
     AION_BINARY_GT = 7
     AION_BINARY_LE = 8
     AION_BINARY_GE = 9
-    # Gated activation: act(a) * b, with the activation in ElemwiseAttrs.act.
-    AION_BINARY_GATE = 10
 
 
 class AionReduceOp(IntEnum):

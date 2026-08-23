@@ -14,8 +14,17 @@
 // the 17-word layout); the backend requires K % 64 == 0 for the q8_0 path.
 // Grid-stride dispatch (see elementwise.wgsl).
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read>       src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+// Native f16 views of the same two bindings. `shader-f16` is a required device
+// feature, so a cast addresses ELEMENTS and no longer has to pack pairs into u32
+// words — which is what forced the old even-element-count restriction on the
+// tile. An odd tile now casts as-is.
+@group(0) @binding(0) var<storage, read>       src_h: array<f16>;
+@group(0) @binding(1) var<storage, read_write> dst_h: array<f16>;
 @group(0) @binding(2) var<uniform>             p: Params;
 
 // n/k: B tile rows/cols. src_wpr = u32 words per source row. dst_row = f32
@@ -208,4 +217,19 @@ fn f32_to_f16(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
         let v = vec2<f32>(bitcast<f32>(src[i * 2u]), bitcast<f32>(src[i * 2u + 1u]));
         dst[i] = bitcast<f32>(pack2x16float(v));
     }
+}
+
+// One work item = one ELEMENT (see the f16 bindings above). These supersede the
+// word-pair `f16_to_f32` / `f32_to_f16` entry points, which are kept only for
+// reference; the backend dispatches these.
+@compute @workgroup_size(64)
+fn f16_to_f32_elem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) { dst[i] = f32(src_h[i]); }
+}
+
+@compute @workgroup_size(64)
+fn f32_to_f16_elem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let step = nwg.x * 64u;
+    for (var i = g.x; i < p.count; i += step) { dst_h[i] = f16(bitcast<f32>(src[i])); }
 }

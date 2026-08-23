@@ -30,8 +30,6 @@ class MatmulAttrs:
 @dataclass(frozen=True)
 class ElemwiseAttrs:
     op: int
-    # Read only when op is AION_BINARY_GATE: the activation applied to `a`.
-    act: int = 1  # AION_UNARY_GELU
 
 
 @dataclass(frozen=True)
@@ -419,7 +417,6 @@ def emit_op(
         spec.attr.matmul.beta = float(attrs.beta)
     elif isinstance(attrs, ElemwiseAttrs):
         spec.attr.elemwise.op = int(attrs.op)
-        spec.attr.elemwise.act = int(attrs.act)
     elif isinstance(attrs, UnaryAttrs):
         spec.attr.unary.op = int(attrs.op)
     elif isinstance(attrs, AxisAttrs):

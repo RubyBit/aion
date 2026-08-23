@@ -177,7 +177,6 @@ typedef enum AionBinaryOp {
     AION_BINARY_GT = 7,
     AION_BINARY_LE = 8,
     AION_BINARY_GE = 9,
-    AION_BINARY_GATE = 10,
 } AionBinaryOp;
 
 typedef enum AionReduceOp {
@@ -234,7 +233,7 @@ typedef enum AionOp {
 
 typedef union AionOpAttr {
     struct { float alpha; float beta; } matmul;
-    struct { AionBinaryOp op; AionUnaryOp act; } elemwise;
+    struct { AionBinaryOp op; } elemwise;
     struct { AionUnaryOp op; } unary;
     struct { int32_t axis; } softmax;
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;

@@ -227,9 +227,6 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .ElemwiseBinary => |eb| {
             try appendInt(out, allocator, u8, @intFromEnum(eb.op));
-            // Value-conditioned field: only a gate has an activation, so every op that
-            // existed before `gate` writes exactly the byte it always wrote.
-            if (eb.op == .gate) try appendInt(out, allocator, u8, @intFromEnum(eb.act));
         },
         .Unary => |u| {
             try appendInt(out, allocator, u8, @intFromEnum(u.op));

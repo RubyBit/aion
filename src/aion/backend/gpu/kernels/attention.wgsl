@@ -41,8 +41,11 @@
 //   * The per-row workgroup reductions (max, then sum) share ONE barrier chain
 //     across the block, so a block of rows costs the same barriers as a single row.
 //
-// Both entry points share `attnCore`; `attn_split` differs only in writing an
+// All four entry points share `attnCore` (the `_qf16` pair only stages q from the
+// f16 view); `attn_split*` differs only in writing an
 // unnormalized (acc, m, l) partial for `attention_merge.wgsl` to combine.
+
+enable f16;
 
 @group(0) @binding(0) var<storage, read>       q: array<f32>;
 @group(0) @binding(1) var<storage, read>       kc: array<u32>;
@@ -50,6 +53,10 @@
 @group(0) @binding(3) var<storage, read>       pos: array<i32>;
 @group(0) @binding(4) var<storage, read>       endi: array<i32>;
 @group(0) @binding(5) var<storage, read_write> o: array<f32>;
+// f16 query alias of binding 0, read only by the `*_qf16` entry points. The CPU
+// attention takes any mix of f16/f32 for q/k/v (exec/attention.zig), so this is
+// what lets the GPU accept the same graphs instead of demanding a Cast on q.
+@group(0) @binding(0) var<storage, read>       qh: array<f16>;
 @group(0) @binding(6) var<uniform>             p: Params;
 
 struct Params {
@@ -146,6 +153,42 @@ fn reduceSumRows(lidx: u32, rows: u32) {
     }
 }
 
+// --- q staging -------------------------------------------------------------
+//
+// The block's q rows are copied into the f32 shared array `q_s` (zero-filled for
+// out-of-range rows), and this is the ONLY place q is read. It lives in the entry
+// points rather than in `attnCore` for a validation reason: a resource interface
+// is per entry point, so `q` (f32) and `qh` (f16) may share binding 0 only while
+// no single entry point names both. A runtime dtype flag branching inside the
+// shared core names both and fails shader validation ("Entry point attn_row at
+// Compute is invalid") — hence two staging functions and two entry points per
+// dispatch shape rather than one flag.
+//
+// `flatIndex` is the shared half, so the addressing exists once.
+fn qFlatIndex(b_local: u32, blk_l: u32, blk_h: u32, i: u32) -> i32 {
+    let r = i / p.dk;
+    let l_local = blk_l + r / p.rh;
+    let h_local = blk_h + r % p.rh;
+    if (l_local >= p.tl || h_local >= p.th) { return -1; }
+    return i32(((b_local * p.tl + l_local) * p.th + h_local) * p.dk + (i % p.dk));
+}
+
+fn stageQF32(b_local: u32, blk_l: u32, blk_h: u32, lidx: u32) {
+    let rows_dk = p.rl * p.rh * p.dk;
+    for (var i = lidx; i < rows_dk; i += WG) {
+        let qi = qFlatIndex(b_local, blk_l, blk_h, i);
+        if (qi < 0) { q_s[i] = 0.0; } else { q_s[i] = q[u32(qi)]; }
+    }
+}
+
+fn stageQF16(b_local: u32, blk_l: u32, blk_h: u32, lidx: u32) {
+    let rows_dk = p.rl * p.rh * p.dk;
+    for (var i = lidx; i < rows_dk; i += WG) {
+        let qi = qFlatIndex(b_local, blk_l, blk_h, i);
+        if (qi < 0) { q_s[i] = 0.0; } else { q_s[i] = f32(qh[u32(qi)]); }
+    }
+}
+
 fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: bool) {
     let b = p.base_b + b_local;
     // Every row in the block shares this kv head: `rh` divides `gqa` and the tile's
@@ -207,19 +250,9 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         t_end = min(t_start + seg_len, hi);
     }
 
-    // --- stage the block's q rows (zero-filled for out-of-range rows) ---
-    let rows_dk = rows * p.dk;
-    for (var i = lidx; i < rows_dk; i += WG) {
-        let r = i / p.dk;
-        let l_local = blk_l + r / p.rh;
-        let h_local = blk_h + r % p.rh;
-        var val = 0.0;
-        if (l_local < p.tl && h_local < p.th) {
-            val = q[((b_local * p.tl + l_local) * p.th + h_local) * p.dk + (i % p.dk)];
-        }
-        q_s[i] = val;
-    }
-    workgroupBarrier();
+    // q was staged into `q_s` by the entry point (see `stageQF32` / `stageQF16`)
+    // and barriered there, so `attnCore` itself never names a q binding — which is
+    // what lets the f32 and f16 queries alias binding 0.
 
     // V-phase thread mapping: `dv_eff` consecutive dims per key group, key groups
     // rounded down to a power of two so the tail reduction is a clean tree.
@@ -449,6 +482,15 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
 
 @compute @workgroup_size(256)
 fn attn_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    stageQF32(wid.z, wid.y * p.rl, wid.x * p.rh, lidx);
+    workgroupBarrier();
+    attnCore(wid.z, 0u, wid.y * p.rl, wid.x * p.rh, lidx, false);
+}
+
+@compute @workgroup_size(256)
+fn attn_row_qf16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    stageQF16(wid.z, wid.y * p.rl, wid.x * p.rh, lidx);
+    workgroupBarrier();
     attnCore(wid.z, 0u, wid.y * p.rl, wid.x * p.rh, lidx, false);
 }
 
@@ -463,6 +505,15 @@ fn attn_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 //   entry = ((b_local * tl + l) * th + h) * segs + seg.
 @compute @workgroup_size(256)
 fn attn_split(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    stageQF32(wid.z / p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx);
+    workgroupBarrier();
+    attnCore(wid.z / p.segs_local, wid.z % p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx, true);
+}
+
+@compute @workgroup_size(256)
+fn attn_split_qf16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    stageQF16(wid.z / p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx);
+    workgroupBarrier();
     attnCore(wid.z / p.segs_local, wid.z % p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx, true);
 }
 

@@ -82,14 +82,24 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
     const fast_suffix = (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) and !s.op.isComparison() and s.op != .gate;
 
     // Comparisons are i32-in/i32-out (infer enforces it); arithmetic is
-    // dtype-preserving f32 or i32. Both element sizes are 4 bytes, so the
-    // dispatch math below is dtype-agnostic — only the kernel module differs.
+    // dtype-preserving f32, f16 or i32. f32/i32 are both 4-byte, f16 is 2-byte, so
+    // the dispatch math below is parameterized by `elem_bytes`.
     // A gate carries an activation and exists only as a same-shape f32 kernel; the
     // compiler refuses anything else, so a mismatch here is a compiler bug, not input.
     if (s.op == .gate and (broadcast or meta.dtype != .f32)) return error.Unsupported;
 
+    const elem_bytes: usize = switch (meta.dtype) {
+        .f32, .i32 => 4,
+        .f16 => 2,
+        else => return error.Unsupported,
+    };
+
+    // f16 shares each module with its f32 twin, differing only in entry point.
+    const is_f16 = meta.dtype == .f16;
+    if (is_f16 and (a_meta.dtype != .f16 or b_meta.dtype != .f16)) return error.Unsupported;
+
     const kernel: KernelDesc = switch (meta.dtype) {
-        .f32 => if (s.op.isComparison())
+        .f32, .f16 => if (s.op.isComparison())
             return error.Unsupported
         else if (fast_suffix)
             elementwise_suffix_kernel
@@ -105,12 +115,24 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
             elementwise_i32_kernel,
         else => return error.Unsupported,
     };
-    const entry: [:0]const u8 = if (fast_suffix) switch (s.op) {
+    const entry: [:0]const u8 = if (fast_suffix and is_f16) switch (s.op) {
+        .add => "suffix_add_f16",
+        .sub => "suffix_sub_f16",
+        .mul => "suffix_mul_f16",
+        .div => "suffix_div_f16",
+        else => unreachable,
+    } else if (fast_suffix) switch (s.op) {
         .add => "suffix_add",
         .sub => "suffix_sub",
         .mul => "suffix_mul",
         .div => "suffix_div",
         else => unreachable,
+    } else if (is_f16) switch (s.op) {
+        .add => "add_f16",
+        .sub => "sub_f16",
+        .mul => "mul_f16",
+        .div => "divide_f16",
+        else => return error.Unsupported,
     } else switch (s.op) {
         .add => "add",
         .sub => "sub",
@@ -162,13 +184,15 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
             ctx.devmem.bufferFor(dout.handle).?,
         };
         const sizes = [_]u64{ da.len, db.len, dout.len };
-        const n = context.packedElems(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)]) orelse {
+        const n_usize = context.packedElemsSized(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)], elem_bytes) orelse {
             return error.Unsupported;
         };
+        const n = std.math.cast(u32, n_usize) orelse return error.Unsupported;
         if (fast_suffix) {
-            const cols = context.packedElems(db.rank, db.shape_mem[0..@as(usize, db.rank)], db.strides_mem[0..@as(usize, db.rank)]) orelse return error.Unsupported;
-            const a_n = context.packedElems(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
-            if (a_n != n or cols == 0 or n % cols != 0) return error.Unsupported;
+            const cols_usize = context.packedElemsSized(db.rank, db.shape_mem[0..@as(usize, db.rank)], db.strides_mem[0..@as(usize, db.rank)], elem_bytes) orelse return error.Unsupported;
+            const a_n = context.packedElemsSized(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)], elem_bytes) orelse return error.Unsupported;
+            const cols = std.math.cast(u32, cols_usize) orelse return error.Unsupported;
+            if (a_n != n_usize or cols == 0 or n % cols != 0) return error.Unsupported;
             const params: SuffixParams = .{ .n = n, .cols = cols };
             try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
         } else if (broadcast) {
@@ -194,16 +218,18 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
                 if (axis >= out_rank - a_rank) {
                     const aa = axis - (out_rank - a_rank);
                     if ((s.broadcast.a_broadcast_axes & (@as(u8, 1) << @intCast(axis))) == 0) {
-                        if (da.strides_mem[aa] < 0 or @rem(da.strides_mem[aa], @sizeOf(u32)) != 0) return error.Unsupported;
-                        const stride = std.math.cast(u32, @divExact(da.strides_mem[aa], @sizeOf(u32))) orelse return error.Unsupported;
+                        const eb: isize = @intCast(elem_bytes);
+                        if (da.strides_mem[aa] < 0 or @rem(da.strides_mem[aa], eb) != 0) return error.Unsupported;
+                        const stride = std.math.cast(u32, @divExact(da.strides_mem[aa], eb)) orelse return error.Unsupported;
                         if (high) params.a_stride1[lane] = stride else params.a_stride0[lane] = stride;
                     }
                 }
                 if (axis >= out_rank - b_rank) {
                     const ba = axis - (out_rank - b_rank);
                     if ((s.broadcast.b_broadcast_axes & (@as(u8, 1) << @intCast(axis))) == 0) {
-                        if (db.strides_mem[ba] < 0 or @rem(db.strides_mem[ba], @sizeOf(u32)) != 0) return error.Unsupported;
-                        const stride = std.math.cast(u32, @divExact(db.strides_mem[ba], @sizeOf(u32))) orelse return error.Unsupported;
+                        const eb: isize = @intCast(elem_bytes);
+                        if (db.strides_mem[ba] < 0 or @rem(db.strides_mem[ba], eb) != 0) return error.Unsupported;
+                        const stride = std.math.cast(u32, @divExact(db.strides_mem[ba], eb)) orelse return error.Unsupported;
                         if (high) params.b_stride1[lane] = stride else params.b_stride0[lane] = stride;
                     }
                 }
@@ -216,20 +242,23 @@ pub fn execElemwiseBinary(ctx: Ctx, frame: *Frame, s: executable.StepElemwiseBin
     }
 }
 
-/// Scalar dtype casts (kernels/dequant.wgsl). f16 <-> f32 works on word pairs
-/// (the f16 side is bound as u32/f32 words since WGSL needs shader-f16 for real
-/// f16 bindings — tiles must pack an even element count); f32 <-> i32 is one
-/// element per work item with the i32 side smuggled through bitcasts.
+/// Scalar dtype casts (kernels/dequant.wgsl). Every pair is ONE ELEMENT per work
+/// item: `shader-f16` is a required device feature, so the f16 side binds as a
+/// native `array<f16>` instead of being packed two-per-u32-word. That packing
+/// used to round the dispatch up to `(elems + 1) / 2` and let an odd tile's last
+/// work item write a whole word — half of it past the logical extent, into
+/// whatever padding the tile happened to have. Addressing elements removes both
+/// the rounding and the constraint. f32 <-> i32 smuggles the i32 side through
+/// bitcasts on the f32 binding.
 pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecuteProgramError!void {
     const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
 
-    const has_f16 = (x_meta.dtype == .f16 or out_meta.dtype == .f16);
     const entry: [:0]const u8 = if (x_meta.dtype == .f16 and out_meta.dtype == .f32)
-        "f16_to_f32"
+        "f16_to_f32_elem"
     else if (x_meta.dtype == .f32 and out_meta.dtype == .f16)
-        "f32_to_f16"
+        "f32_to_f16_elem"
     else if (x_meta.dtype == .f32 and out_meta.dtype == .i32)
         "f32_to_i32"
     else if (x_meta.dtype == .i32 and out_meta.dtype == .f32)
@@ -255,9 +284,7 @@ pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecutePro
         const dst_need: u64 = elems * (if (out_meta.dtype == .f16) @as(u64, 2) else 4);
         if (dx.len < src_need or dout.len < dst_need) return error.Unsupported;
 
-        // 2 f16 per u32 word; an odd tail's second lane is the tile's padding.
-        const work: u64 = if (has_f16) (elems + 1) / 2 else elems;
-        const count = std.math.cast(u32, work) orelse return error.Unsupported;
+        const count = std.math.cast(u32, elems) orelse return error.Unsupported;
         const bufs = [_]c.WGPUBuffer{
             ctx.devmem.bufferFor(dx.handle).?,
             ctx.devmem.bufferFor(dout.handle).?,
@@ -270,7 +297,16 @@ pub fn execCast(ctx: Ctx, frame: *Frame, s: executable.StepCastTiled) ExecutePro
 
 /// Tile-for-tile device copy (same tiling + dtype, compile-validated), recorded
 /// as buffer-to-buffer copies in the frame — no kernel, and dtype-agnostic (works
-/// for quantized tiles too). WebGPU requires copy sizes be 4-byte multiples.
+/// for quantized tiles too).
+///
+/// WebGPU requires copy sizes be 4-byte multiples, and a tile's LOGICAL length is
+/// not always one: an f16 tensor with an odd element count (`tile_lens` holds
+/// `requiredBytesForElems`, storage.zig) is 2 mod 4. The copy is therefore rounded
+/// up to the same 4-byte granularity the allocator already applied
+/// (`alignUp` in device_memory.zig). That is safe here specifically because each
+/// tile owns its device buffer (`tile_handles` is index-parallel to the tiles, and
+/// these copies pass offset 0), and src and dst have equal `len` and so equal
+/// allocations — the extra bytes are padding on both sides that nothing reads.
 pub fn execCopy(ctx: Ctx, frame: *Frame, s: executable.StepCopyTiled) ExecuteProgramError!void {
     const hs = ctx.store;
     const meta = hs.meta(s.dst) catch return error.ExecutionFailed;
@@ -284,13 +320,14 @@ pub fn execCopy(ctx: Ctx, frame: *Frame, s: executable.StepCopyTiled) ExecutePro
             hs.releaseConst(src.token);
             hs.releaseMut(dst.token);
         }
-        if (src.len != dst.len or src.len % 4 != 0) return error.Unsupported;
+        if (src.len != dst.len) return error.Unsupported;
+        const copy_len = (src.len + 3) / 4 * 4;
         frame.recordCopy(
             ctx.devmem.bufferFor(src.handle).?,
             0,
             ctx.devmem.bufferFor(dst.handle).?,
             0,
-            src.len,
+            copy_len,
         );
     }
 }
@@ -298,9 +335,25 @@ pub fn execCopy(ctx: Ctx, frame: *Frame, s: executable.StepCopyTiled) ExecutePro
 pub fn execUnary(ctx: Ctx, frame: *Frame, s: executable.StepUnaryTiled) ExecuteProgramError!void {
     const hs = ctx.store;
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
+    // f16 runs the same math widened to f32 and rounds on store (unary.wgsl), so
+    // it only picks a different entry point in the same module.
+    const elem_bytes: u64 = switch (meta.dtype) {
+        .f32 => 4,
+        .f16 => 2,
+        else => return error.Unsupported,
+    };
+    const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
+    if (a_meta.dtype != meta.dtype) return error.Unsupported;
 
-    const entry: [:0]const u8 = switch (s.op) {
+    const entry: [:0]const u8 = if (meta.dtype == .f16) switch (s.op) {
+        .relu => "relu_f16",
+        .gelu => "gelu_f16",
+        .silu => "silu_f16",
+        .sigmoid => "sigmoid_f16",
+        .tanh => "tanh__f16",
+        .sqrt => "sqrt__f16",
+        .log => "log__f16",
+    } else switch (s.op) {
         .relu => "relu",
         .gelu => "gelu",
         .silu => "silu",
@@ -327,7 +380,7 @@ pub fn execUnary(ctx: Ctx, frame: *Frame, s: executable.StepUnaryTiled) ExecuteP
             ctx.devmem.bufferFor(dout.handle).?,
         };
         const sizes = [_]u64{ dx.len, dout.len };
-        const n: u32 = @intCast(dout.len / @sizeOf(f32));
+        const n: u32 = @intCast(dout.len / elem_bytes);
         const params: ScalarParams = .{ .n = n };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(n), 1, 1 });
 

@@ -13,7 +13,15 @@
 //     then one workgroup per row folds the partials. Global column indexes are
 //     stored, so the fold's index tie-break preserves the lowest-index rule.
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
+
+// f16 input twin. Only the DATA side changes: the output is i32 indices either
+// way, and the split path keeps its partial VALUES in f32 scratch, so stage 2
+// (`argmax_finish`) is shared verbatim. Comparing widened f32 preserves f16
+// ordering and the lowest-index tie-break, so the chosen index is identical.
+@group(0) @binding(0) var<storage, read>       xh: array<f16>;
 @group(0) @binding(1) var<storage, read_write> o: array<i32>;
 @group(0) @binding(2) var<uniform>             p: Params;
 
@@ -124,4 +132,55 @@ fn argmax_finish(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     wg_argmax_reduce(lidx);
 
     if (lidx == 0u) { o[r] = i32(idxs[0]); }
+}
+
+@compute @workgroup_size(256)
+fn argmax_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let xb = wid.x * p.x_row;
+
+    var best_v = FMIN;
+    var best_i = 0xffffffffu;
+    for (var j = lidx; j < p.cols; j += WG) {
+        let v = f32(xh[xb + j]);
+        if (v > best_v || (v == best_v && j < best_i)) {
+            best_v = v;
+            best_i = j;
+        }
+    }
+    vals[lidx] = best_v;
+    idxs[lidx] = best_i;
+    wg_argmax_reduce(lidx);
+
+    if (lidx == 0u) { o[wid.x] = i32(idxs[0]); }
+}
+
+@compute @workgroup_size(256)
+fn argmax_partial_f16(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+) {
+    let r = wid.y;
+    let xb = r * p.x_row;
+    let c0 = wid.x * p.o_row;
+    let c1 = min(c0 + p.o_row, p.cols);
+
+    var best_v = FMIN;
+    var best_i = 0xffffffffu;
+    for (var j = c0 + lidx; j < c1; j += WG) {
+        let v = f32(xh[xb + j]);
+        if (v > best_v || (v == best_v && j < best_i)) {
+            best_v = v;
+            best_i = j;
+        }
+    }
+    vals[lidx] = best_v;
+    idxs[lidx] = best_i;
+    wg_argmax_reduce(lidx);
+
+    if (lidx == 0u) {
+        let e = r * nwg.x + wid.x;
+        o[2u * e] = bitcast<i32>(vals[0]);
+        o[2u * e + 1u] = i32(idxs[0]);
+    }
 }

@@ -14,8 +14,28 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const MAX_HIDDEN: usize = 1024;
 const MAX_INPUT: usize = 2048;
 
-fn loadRowF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
-    if (meta.dtype != .f32) return BackendError.InvalidArgument;
+// Every operand is read into (and written from) f32 scratch, so the gate math
+// below runs in f32 whatever the tensors are stored as. That is what makes the
+// f16 cell bit-identical to the f32 one for the same widened inputs, and what
+// keeps it in step with the GPU kernel — only these four helpers know the dtype.
+
+/// Dispatch a dtype-generic helper over the scalar float types the cell accepts.
+/// `else` is unreachable for a validated step; it stays a hard error rather than
+/// a silent f32 read of f16 bytes.
+fn floatDispatch(comptime name: []const u8, dtype: types.DType, args: anytype) ExecuteProgramError!void {
+    return switch (dtype) {
+        .f32 => @call(.auto, @field(@This(), name), .{f32} ++ args),
+        .f16 => @call(.auto, @field(@This(), name), .{f16} ++ args),
+        else => BackendError.InvalidArgument,
+    };
+}
+
+fn loadRowAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
+    return floatDispatch("loadRowT", meta.dtype, .{ store, meta, id, row, out });
+}
+
+fn loadRowT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
+    const elem: usize = @sizeOf(T);
     if (meta.rank != 2) return BackendError.InvalidArgument;
     if (row >= meta.shape[0]) return BackendError.InvalidArgument;
     if (out.len != meta.shape[1]) return BackendError.InvalidArgument;
@@ -30,7 +50,7 @@ fn loadRowF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id
         defer store.releaseConst(tile.token);
 
         const view = tile.bufferView();
-        if (view.dtype != .f32) return BackendError.InvalidArgument;
+        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
         if (view.layout.rank != 2) return BackendError.InvalidArgument;
 
         const m_tile: usize = view.layout.shape[0];
@@ -41,23 +61,28 @@ fn loadRowF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id
         const stride0_bytes_i: isize = view.layout.strides_bytes[0];
         const stride1_bytes_i: isize = view.layout.strides_bytes[1];
         if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-        if (stride1_bytes_i != 4) return BackendError.InvalidArgument;
+        if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
         const stride0_bytes: usize = @intCast(stride0_bytes_i);
 
-        const row_bytes: usize = n_tile * 4;
+        const row_bytes: usize = n_tile * elem;
         const src_off: usize = in0 * stride0_bytes;
         if (src_off + row_bytes > view.bytes.len) return BackendError.InvalidArgument;
 
-        const dst: []u8 = std.mem.sliceAsBytes(out[col_off .. col_off + n_tile]);
-        @memcpy(dst, view.bytes[src_off .. src_off + row_bytes]);
+        const src: [*]align(1) const T = @ptrCast(view.bytes.ptr + src_off);
+        var j: usize = 0;
+        while (j < n_tile) : (j += 1) out[col_off + j] = @floatCast(src[j]);
         col_off += n_tile;
     }
 
     if (col_off != out.len) return BackendError.InvalidArgument;
 }
 
-fn loadVecF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
-    if (meta.dtype != .f32) return BackendError.InvalidArgument;
+fn loadVecAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
+    return floatDispatch("loadVecT", meta.dtype, .{ store, meta, id, out });
+}
+
+fn loadVecT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
+    const elem: usize = @sizeOf(T);
     if (meta.rank != 1) return BackendError.InvalidArgument;
     if (out.len != meta.shape[0]) return BackendError.InvalidArgument;
 
@@ -68,25 +93,26 @@ fn loadVecF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id
         defer store.releaseConst(tile.token);
 
         const view = tile.bufferView();
-        if (view.dtype != .f32) return BackendError.InvalidArgument;
+        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
         if (view.layout.rank != 1) return BackendError.InvalidArgument;
         const stride0_bytes_i: isize = view.layout.strides_bytes[0];
-        if (stride0_bytes_i != 4) return BackendError.InvalidArgument;
+        if (stride0_bytes_i != elem) return BackendError.InvalidArgument;
         const n_tile: usize = view.layout.shape[0];
         if (off + n_tile > out.len) return BackendError.InvalidArgument;
 
-        const bytes: usize = n_tile * 4;
+        const bytes: usize = n_tile * elem;
         if (bytes > view.bytes.len) return BackendError.InvalidArgument;
 
-        const dst: []u8 = std.mem.sliceAsBytes(out[off .. off + n_tile]);
-        @memcpy(dst, view.bytes[0..bytes]);
+        const src: [*]align(1) const T = @ptrCast(view.bytes.ptr);
+        var j: usize = 0;
+        while (j < n_tile) : (j += 1) out[off + j] = @floatCast(src[j]);
         off += n_tile;
     }
 
     if (off != out.len) return BackendError.InvalidArgument;
 }
 
-fn storeRowStateF32(
+fn storeRowState(
     store: tensor_store.TensorStore,
     meta: tensor_store.TensorMeta,
     id: tensor_store.TensorId,
@@ -94,7 +120,19 @@ fn storeRowStateF32(
     h: []const f32,
     c: []const f32,
 ) ExecuteProgramError!void {
-    if (meta.dtype != .f32) return BackendError.InvalidArgument;
+    return floatDispatch("storeRowStateT", meta.dtype, .{ store, meta, id, row, h, c });
+}
+
+fn storeRowStateT(
+    comptime T: type,
+    store: tensor_store.TensorStore,
+    meta: tensor_store.TensorMeta,
+    id: tensor_store.TensorId,
+    row: usize,
+    h: []const f32,
+    c: []const f32,
+) ExecuteProgramError!void {
+    const elem: usize = @sizeOf(T);
     if (meta.rank != 2) return BackendError.InvalidArgument;
     if (row >= meta.shape[0]) return BackendError.InvalidArgument;
     if (meta.shape[1] != h.len + c.len) return BackendError.InvalidArgument;
@@ -109,7 +147,7 @@ fn storeRowStateF32(
         defer store.releaseMut(tile.token);
 
         const view = tile.bufferView();
-        if (view.dtype != .f32) return BackendError.InvalidArgument;
+        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
         if (view.layout.rank != 2) return BackendError.InvalidArgument;
 
         const m_tile: usize = view.layout.shape[0];
@@ -119,25 +157,21 @@ fn storeRowStateF32(
         const stride0_bytes_i: isize = view.layout.strides_bytes[0];
         const stride1_bytes_i: isize = view.layout.strides_bytes[1];
         if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-        if (stride1_bytes_i != 4) return BackendError.InvalidArgument;
+        if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
         const stride0_bytes: usize = @intCast(stride0_bytes_i);
 
-        const row_bytes: usize = n_tile * 4;
+        const row_bytes: usize = n_tile * elem;
         const dst_off: usize = in0 * stride0_bytes;
         if (dst_off + row_bytes > view.bytes.len) return BackendError.InvalidArgument;
+        if (n_tile > MAX_HIDDEN * 2) return BackendError.InvalidArgument;
 
         // Fill the output row segment from either h or c depending on position.
-        var tmp: [MAX_HIDDEN * 2]f32 = undefined;
-        if (n_tile > tmp.len) return BackendError.InvalidArgument;
-
+        const dst: [*]align(1) T = @ptrCast(view.bytes.ptr + dst_off);
         var j: usize = 0;
         while (j < n_tile) : (j += 1) {
             const g: usize = col_off + j;
-            tmp[j] = if (g < h.len) h[g] else c[g - h.len];
+            dst[j] = @floatCast(if (g < h.len) h[g] else c[g - h.len]);
         }
-
-        const src: []const u8 = std.mem.sliceAsBytes(tmp[0..n_tile]);
-        @memcpy(view.bytes[dst_off .. dst_off + row_bytes], src);
         col_off += n_tile;
     }
 
@@ -151,7 +185,18 @@ fn accumMatVecTiled(
     x: []const f32,
     out: []f32,
 ) ExecuteProgramError!void {
-    if (w_meta.dtype != .f32) return BackendError.InvalidArgument;
+    return floatDispatch("accumMatVecTiledT", w_meta.dtype, .{ store, w_meta, w_id, x, out });
+}
+
+fn accumMatVecTiledT(
+    comptime T: type,
+    store: tensor_store.TensorStore,
+    w_meta: tensor_store.TensorMeta,
+    w_id: tensor_store.TensorId,
+    x: []const f32,
+    out: []f32,
+) ExecuteProgramError!void {
+    const elem: usize = @sizeOf(T);
     if (w_meta.rank != 2) return BackendError.InvalidArgument;
     if (x.len != w_meta.shape[0]) return BackendError.InvalidArgument;
     if (out.len != w_meta.shape[1]) return BackendError.InvalidArgument;
@@ -164,13 +209,13 @@ fn accumMatVecTiled(
             defer store.releaseConst(tile.token);
 
             const view = tile.bufferView();
-            if (view.dtype != .f32) return BackendError.InvalidArgument;
+            if (view.dtype != w_meta.dtype) return BackendError.InvalidArgument;
             if (view.layout.rank != 2) return BackendError.InvalidArgument;
 
             const stride0_bytes_i: isize = view.layout.strides_bytes[0];
             const stride1_bytes_i: isize = view.layout.strides_bytes[1];
             if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-            if (stride1_bytes_i != 4) return BackendError.InvalidArgument;
+            if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
             const stride0_bytes: usize = @intCast(stride0_bytes_i);
             const stride1_bytes: usize = @intCast(stride1_bytes_i);
 
@@ -181,7 +226,7 @@ fn accumMatVecTiled(
             const n_tile: usize = view.layout.shape[1];
             if (base_c + n_tile > out.len) return BackendError.InvalidArgument;
 
-            const needed_bytes: usize = (m_tile - 1) * stride0_bytes + (n_tile - 1) * stride1_bytes + 4;
+            const needed_bytes: usize = (m_tile - 1) * stride0_bytes + (n_tile - 1) * stride1_bytes + elem;
             if (needed_bytes > view.bytes.len) return BackendError.InvalidArgument;
 
             var lr: usize = 0;
@@ -195,8 +240,8 @@ fn accumMatVecTiled(
                 var lc: usize = 0;
                 while (lc < n_tile) : (lc += 1) {
                     const off_bytes: usize = row_base_off + lc * stride1_bytes;
-                    const p: *align(1) const f32 = @ptrCast(view.bytes.ptr + off_bytes);
-                    out[base_c + lc] += xv * p.*;
+                    const p: *align(1) const T = @ptrCast(view.bytes.ptr + off_bytes);
+                    out[base_c + lc] += xv * @as(f32, @floatCast(p.*));
                 }
             }
         }
@@ -219,8 +264,11 @@ pub fn execLSTMCellFused(
     const wih_meta = try store.meta(s.w_ih);
     const whh_meta = try store.meta(s.w_hh);
 
-    // v0: only f32 fused implementation.
-    if (out_meta.dtype != .f32) return BackendError.Unsupported;
+    // f32 and f16 storage; the cell itself always computes in f32 (see the
+    // helpers above). `infer` already requires every operand to share this dtype.
+    if (out_meta.dtype != .f32 and out_meta.dtype != .f16) return BackendError.Unsupported;
+    if (x_meta.dtype != out_meta.dtype or h_meta.dtype != out_meta.dtype or c_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
+    if (wih_meta.dtype != out_meta.dtype or whh_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
 
     if (out_meta.rank != 2 or x_meta.rank != 2 or h_meta.rank != 2 or c_meta.rank != 2) return BackendError.InvalidArgument;
     if (wih_meta.rank != 2 or whh_meta.rank != 2) return BackendError.InvalidArgument;
@@ -251,12 +299,12 @@ pub fn execLSTMCellFused(
         const bhh_id: tensor_store.TensorId = s.b_hh.?;
         const bih_meta = try store.meta(bih_id);
         const bhh_meta = try store.meta(bhh_id);
-        if (bih_meta.dtype != .f32 or bhh_meta.dtype != .f32) return BackendError.InvalidArgument;
+        if (bih_meta.dtype != out_meta.dtype or bhh_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
         if (bih_meta.rank != 1 or bhh_meta.rank != 1) return BackendError.InvalidArgument;
         if (bih_meta.shape[0] != gate_dim or bhh_meta.shape[0] != gate_dim) return BackendError.InvalidArgument;
 
-        try loadVecF32(store, bih_meta, bih_id, b_ih_buf[0..gate_dim]);
-        try loadVecF32(store, bhh_meta, bhh_id, b_hh_buf[0..gate_dim]);
+        try loadVecAsF32(store, bih_meta, bih_id, b_ih_buf[0..gate_dim]);
+        try loadVecAsF32(store, bhh_meta, bhh_id, b_hh_buf[0..gate_dim]);
     }
 
     var x_row_buf: [MAX_INPUT]f32 = undefined;
@@ -268,9 +316,9 @@ pub fn execLSTMCellFused(
 
     var b: usize = 0;
     while (b < batch) : (b += 1) {
-        try loadRowF32(store, x_meta, s.x, b, x_row_buf[0..input_size]);
-        try loadRowF32(store, h_meta, s.h_prev, b, h_row_buf[0..hidden]);
-        try loadRowF32(store, c_meta, s.c_prev, b, c_row_buf[0..hidden]);
+        try loadRowAsF32(store, x_meta, s.x, b, x_row_buf[0..input_size]);
+        try loadRowAsF32(store, h_meta, s.h_prev, b, h_row_buf[0..hidden]);
+        try loadRowAsF32(store, c_meta, s.c_prev, b, c_row_buf[0..hidden]);
 
         // gates = bias (optional)
         var j: usize = 0;
@@ -308,6 +356,6 @@ pub fn execLSTMCellFused(
             h_out_buf[j] = h_t;
         }
 
-        try storeRowStateF32(store, out_meta, s.out_state, b, h_out_buf[0..hidden], c_out_buf[0..hidden]);
+        try storeRowState(store, out_meta, s.out_state, b, h_out_buf[0..hidden], c_out_buf[0..hidden]);
     }
 }

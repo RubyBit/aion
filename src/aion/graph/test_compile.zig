@@ -375,10 +375,14 @@ test "fuse_steps: residual + rmsnorm is one step on device and a pair on cpu" {
 }
 
 
-// The other half of the tiering rule: a gate IS a named primitive, so it is graph
-// vocabulary — but as a PARAMETER of the generic elementwise op, not a tag of its own.
-// `nn.GatedMLP` emits it directly; this asserts the step-level peephole still recovers it
-// from a graph that spells it out, for every activation, and still leaves CPU alone.
+// The tiering rule applied to a gate: an author writes `act(a) * b` — that is how every
+// SwiGLU/GEGLU in the wild is written — so folding it into one kernel is a SCHEDULE, and
+// schedules never reach the graph or the file. There is no gate op and no gate helper:
+// this peephole is the only thing in the codebase that knows about gates.
+//
+// These asserts ARE the guard against a silent regression: with the fusion at step level
+// a shape it cannot take no longer errors, it just stays a pair, and the bench histogram
+// keys on step tag names so `ElemwiseBinaryTiled` alone cannot tell fused from plain.
 test "fuse_steps: unary + mul becomes one gate step on device, stays a pair on cpu" {
     const allocator = std.testing.allocator;
 
@@ -425,4 +429,87 @@ test "fuse_steps: unary + mul becomes one gate step on device, stays a pair on c
             try prog.validatePlacements();
         }
     }
+}
+
+// The shape a real gated FFN has: rank-3 [B, L, ffn], authored the way `nn.GatedMLP`
+// authors it. Before the gate moved to step
+// level this was one node and could not be anything else; now it has to actually fuse,
+// and nothing else in the suite would notice if it stopped.
+test "fuse_steps: a rank-3 gated FFN fuses" {
+    const allocator = std.testing.allocator;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const shape = [_]usize{ 1, 4, 16 };
+    const gate_v = try g.addInput(.f32, &shape);
+    try g.bindExternal(gate_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
+    const up_v = try g.addInput(.f32, &shape);
+    try g.bindExternal(up_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
+
+    const out = try g.addElemwiseBinary(.mul, try g.addUnary(.silu, gate_v), up_v);
+    try g.setOutputs(&.{out});
+
+    var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = .webgpu });
+    defer prog.deinit();
+
+    var unaries: usize = 0;
+    var gates: usize = 0;
+    for (prog.steps) |step| switch (step.op) {
+        .UnaryTiled => unaries += 1,
+        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+            gates += 1;
+            try std.testing.expectEqual(types.UnaryOp.silu, s.act);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), gates);
+    try std.testing.expectEqual(@as(usize, 0), unaries);
+}
+
+// The point of moving the gate out of the graph: a dtype the fused kernel does not take
+// is no longer a REJECTED GRAPH, it is an unfused pair that runs. `infer` used to refuse
+// f16 here, which made `nn.GatedMLP` unusable in f16 even though `act(a) * b` is
+// perfectly well defined there and both halves have had f16 kernels all along.
+test "fuse_steps: an f16 gate compiles and runs as an unfused pair" {
+    const allocator = std.testing.allocator;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const shape = [_]usize{ 2, 8 };
+    const a = try g.addInput(.f16, &shape);
+    try g.bindExternal(a, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
+    const b = try g.addInput(.f16, &shape);
+    try g.bindExternal(b, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
+
+    const out = try g.addElemwiseBinary(.mul, try g.addUnary(.silu, a), b);
+    try g.setOutputs(&.{out});
+
+    var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = .webgpu });
+    defer prog.deinit();
+
+    var unaries: usize = 0;
+    var muls: usize = 0;
+    var gates: usize = 0;
+    for (prog.steps) |step| switch (step.op) {
+        .UnaryTiled => unaries += 1,
+        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+            gates += 1;
+        } else if (s.op == .mul) {
+            muls += 1;
+        },
+        else => {},
+    };
+    // No f16 gate kernel exists, so `fusableGate` declines and the pair survives —
+    // the graceful degradation a residual add already had against RMSNorm.
+    try std.testing.expectEqual(@as(usize, 0), gates);
+    try std.testing.expectEqual(@as(usize, 1), unaries);
+    try std.testing.expectEqual(@as(usize, 1), muls);
 }

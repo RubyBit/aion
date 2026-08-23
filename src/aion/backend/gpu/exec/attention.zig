@@ -339,7 +339,14 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     if (out_meta.rank != 4 or q_meta.rank != 4 or k_meta.rank != 4 or v_meta.rank != 4) return error.Unsupported;
     if (has_pos and pos_meta.?.rank != 2) return error.Unsupported;
     if (has_lengths and lengths_meta.?.rank != 1) return error.Unsupported;
-    if (out_meta.dtype != .f32 or q_meta.dtype != .f32) return error.Unsupported; // f16 q later
+    // The output is always f32 (the CPU exec requires it too); q may be f16
+    // independently of the cache dtype, matching the CPU's mixed q/k/v support.
+    if (out_meta.dtype != .f32) return error.Unsupported;
+    const q_f16 = switch (q_meta.dtype) {
+        .f32 => false,
+        .f16 => true,
+        else => return error.Unsupported,
+    };
     if (k_meta.dtype != v_meta.dtype) return error.Unsupported;
     const kv_f16 = switch (k_meta.dtype) {
         .f32 => false,
@@ -391,7 +398,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     } else 0;
     if (is_ring and ring_window == 0) return error.Unsupported;
 
-    const built = try ctx.pipes.get(attn_kernel, "attn_row");
+    const built = try ctx.pipes.get(attn_kernel, if (q_f16) "attn_row_qf16" else "attn_row");
 
     const kv_elem: usize = if (kv_f16) 2 else 4;
     const kv_tile_t = k_meta.tile_shape[1];
@@ -428,7 +435,8 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
 
         // Packed tiles: the kernel computes flat offsets from tile-local dims.
         if (context.packedElems(dout.rank, dout.shape_mem[0..4], dout.strides_mem[0..4]) == null) return error.Unsupported;
-        if (context.packedElems(dq.rank, dq.shape_mem[0..4], dq.strides_mem[0..4]) == null) return error.Unsupported;
+        // Packedness in q's OWN scalar size: an f16 query has a 2-byte innermost stride.
+        if (context.packedElemsSized(dq.rank, dq.shape_mem[0..4], dq.strides_mem[0..4], if (q_f16) 2 else 4) == null) return error.Unsupported;
         if (dpos_opt) |dpos| {
             if (packedElemsSized(dpos.rank, dpos.shape_mem[0..2], dpos.strides_mem[0..2], 4) == null) return error.Unsupported;
         }
@@ -523,7 +531,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             const stride: usize = d_v + 2;
             const part_bytes: u64 = @as(u64, rows_total) * kv_tiles * segs * stride * @sizeOf(f32);
             const scratch = ctx.scratch.ensure(ctx.gpu, part_bytes) catch return error.ExecutionFailed;
-            const b1 = try ctx.pipes.get(attn_kernel, "attn_split");
+            const b1 = try ctx.pipes.get(attn_kernel, if (q_f16) "attn_split_qf16" else "attn_split");
 
             var kv_i: usize = 0;
             while (kv_i < kv_tiles) : (kv_i += 1) {

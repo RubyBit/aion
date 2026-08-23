@@ -460,7 +460,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
             // v0: f32 only (fast + stable).
-            try compileRequire(out.dtype == .f32 and a.dtype == .f32);
+            try compileRequire((out.dtype == .f32 or out.dtype == .f16) and a.dtype == out.dtype);
             try compileRequire(out.rank == a.rank);
             const rank: usize = @as(usize, out.rank);
             try compileRequire(rank >= 1 and rank <= MAX_RANK);
@@ -738,7 +738,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
         .ArgMax => |s| {
             const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
-            try compileRequire(a.dtype == .f32 and out.dtype == .i32);
+            try compileRequire((a.dtype == .f32 or a.dtype == .f16) and out.dtype == .i32);
             try compileRequire(@as(usize, a.rank) >= 1);
             try compileRequire(s.axis == @as(usize, a.rank) - 1);
             var d: usize = 0;
@@ -1611,7 +1611,6 @@ fn lowerNode(
             );
             try appendStepChecked(allocator, mgr, steps, .{ .ElemwiseBinaryTiled = .{
                 .op = eb.op,
-                .act = eb.act,
                 .out = out_tid,
                 .a = a_tid,
                 .b = b_tid,
@@ -1647,8 +1646,8 @@ fn lowerNode(
             const a_id: usize = @intCast(node.inputs[0]);
             const a_v = graph.values.items[a_id];
 
-            // v0: softmax only for f32.
-            if (a_v.dtype.? != .f32) return CompileError.InvalidArgument;
+            // Scalar floats only; the executors accumulate max/sum in f32 for both.
+            if (a_v.dtype.? != .f32 and a_v.dtype.? != .f16) return CompileError.InvalidArgument;
             const rank: usize = out_shape.len;
             _ = try normalizeAxis(sm.axis, rank);
 

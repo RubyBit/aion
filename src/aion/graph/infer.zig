@@ -25,6 +25,14 @@ fn isPowerOfTwoUsize(n: usize) bool {
     return n != 0 and (n & (n - 1)) == 0;
 }
 
+/// The float dtypes an elementwise/normalizing op can actually run on. These ops
+/// are defined by transcendentals or by a mean/variance, so `i32` is not an
+/// unimplemented case to fall back on — it has no meaning here, and admitting it
+/// only produced graphs that compiled and then failed inside a backend.
+fn isScalarFloat(dt: DType) bool {
+    return dt == .f32 or dt == .f16;
+}
+
 fn require(cond: bool) InferError!void {
     if (!cond) return InferError.InvalidGraph;
 }
@@ -363,16 +371,11 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
             if (a.dtype.? != .f32 and a.dtype.? != .f16 and a.dtype.? != .i32) return InferError.Unsupported;
 
-            // A gate is one fused kernel over matching buffers: f32, same shape on both
-            // sides, no broadcast. Anything else stays a unary and a multiply, which
-            // broadcast freely.
-            if (eb.op == .gate) {
-                if (a.dtype.? != .f32) return InferError.Unsupported;
-                if (a.shape.len != b.shape.len) return InferError.ShapeMismatch;
-                for (a.shape, 0..) |d, i| if (d != b.shape[i]) return InferError.ShapeMismatch;
-                try setInferred(graph, node.output, .f32, a.shape, .{ .like = node.inputs[0] });
-                return;
-            }
+            // `gate` is a step-level schedule, not graph vocabulary: it is what
+            // `fuse_steps.zig` turns a `Unary` + `mul` INTO, never something a graph
+            // carries. Author `mul(unary(act, a), b)` and let the
+            // compiler fuse it where a fused kernel applies.
+            if (eb.op == .gate) return InferError.Unsupported;
 
             const rank = @max(a.shape.len, b.shape.len);
             const out_shape = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
@@ -401,7 +404,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
         .Unary => |u| {
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
-            if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (!isScalarFloat(a.dtype.?)) return InferError.Unsupported;
             try setInferred(graph, node.output, a.dtype.?, a.shape, .{ .like = node.inputs[0] });
 
             _ = u.op;
@@ -410,7 +413,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
         .Softmax => |sm| {
             const a = try getValue(graph, node.inputs[0]);
             try require(a.dtype != null and a.shape.len != 0);
-            if (a.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (!isScalarFloat(a.dtype.?)) return InferError.Unsupported;
             _ = try normalizeAxis(sm.axis, a.shape.len);
             try setInferred(graph, node.output, a.dtype.?, a.shape, .{ .like = node.inputs[0] });
         },
@@ -524,7 +527,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             try require(gamma.shape.len != 0 and beta.shape.len != 0);
 
             if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
-            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (!isScalarFloat(x.dtype.?)) return InferError.Unsupported;
 
             if (ln.normalized_shape.len == 0) return InferError.InvalidGraph;
             if (gamma.shape.len != ln.normalized_shape.len or beta.shape.len != ln.normalized_shape.len) return InferError.ShapeMismatch;
@@ -551,7 +554,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             try require(gamma.shape.len != 0 and beta.shape.len != 0);
 
             if (x.dtype.? != gamma.dtype.? or x.dtype.? != beta.dtype.?) return InferError.DTypeMismatch;
-            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            if (!isScalarFloat(x.dtype.?)) return InferError.Unsupported;
 
             if (rn.normalized_shape.len == 0) return InferError.InvalidGraph;
             if (gamma.shape.len != rn.normalized_shape.len or beta.shape.len != rn.normalized_shape.len) return InferError.ShapeMismatch;
@@ -1192,7 +1195,9 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
         .ArgMax => |am| {
             const x = try getValue(graph, node.inputs[0]);
             try require(x.dtype != null and x.shape.len >= 1);
-            if (x.dtype.?.info().is_quantized) return InferError.Unsupported;
+            // f32/f16 only: an i32 argmax is meaningful but no backend implements it,
+            // and admitting it here just defers the failure to execute time.
+            if (!isScalarFloat(x.dtype.?)) return InferError.Unsupported;
             const rank: usize = x.shape.len;
             var axis: usize = undefined;
             if (am.axis < 0) {

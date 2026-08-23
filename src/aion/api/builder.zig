@@ -1093,16 +1093,6 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    /// Gated activation `act(a) * b`: GEGLU (`.gelu`), SwiGLU (`.silu`), GLU
-    /// (`.sigmoid`), ReGLU (`.relu`). One node, so the graph keeps the author's intent
-    /// instead of leaving a unary-then-multiply pair for a peephole to reconstruct.
-    /// Same shape on both sides, f32 — a broadcast multiply is `unary` then `mul`.
-    pub fn gate(self: *Self, act: types.UnaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
-        const out: ValueId = try self.graph.addGate(act, a.value, b.value);
-        try self.autoNameIfUnnamed(out, "gate");
-        return .{ .value = out };
-    }
-
     /// Chunked-limited attention window: a query attends to its own chunk of
     /// `size` keys plus `left` keys before that chunk's start. `size = 0` (the
     /// default) means every key. Prefer this over an additive mask — it is two

@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -58,8 +59,41 @@ def _static_lib_name(system: str) -> str:
 
 
 def _run(cmd: list[str], cwd: Path) -> None:
-    # Keep output visible for build logs (pip/cibuildwheel), but do not spam by default.
-    subprocess.check_call(cmd, cwd=str(cwd))
+    """Run Zig, retrying its transient Windows child-spawn failure once.
+
+    Zig's build runner launches compiler children with ``--listen=-``. On
+    Windows, the pinned development snapshot can occasionally report one of
+    those children as exiting with code 5 (``ERROR_ACCESS_DENIED``), especially
+    while the shared local/global caches are active. The identical invocation
+    succeeds immediately afterward. Capture stderr so that exact signature can
+    be distinguished from a real compiler error; all output is replayed for
+    pip/uv build logs either way.
+    """
+    max_attempts = 2 if platform.system().lower().startswith("win") else 1
+    for attempt in range(max_attempts):
+        completed = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            check=False,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.stderr:
+            sys.stderr.write(completed.stderr)
+        if completed.returncode == 0:
+            return
+
+        transient_spawn_failure = "process exited with code 5" in completed.stderr.lower()
+        if not transient_spawn_failure or attempt + 1 == max_attempts:
+            raise subprocess.CalledProcessError(
+                completed.returncode, cmd, stderr=completed.stderr
+            )
+
+        print(
+            "aion build: Zig child exited with Windows code 5; retrying once",
+            file=sys.stderr,
+        )
+        time.sleep(0.25)
 
 
 def _truthy(v: str) -> bool:

@@ -23,9 +23,23 @@
 //                   while `o` is written tile-locally.
 // Single-tile operands are just the cases `[0, v)` and `0`.
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read>       table: array<u32>;
 @group(0) @binding(1) var<storage, read>       idx: array<i32>;
 @group(0) @binding(2) var<storage, read_write> o: array<f32>;
+
+// f16 element-addressed aliases of bindings 0 and 2 (`idx` is i32 either way).
+//
+// The word kernels above move 4 bytes per work item, which is the right unit for
+// f32/i32 and for an f16 row of EVEN width. It cannot address an f16 row of odd
+// width at all: row `v` of an f16 [V, 37] table starts at byte 74*v, which is
+// 2 mod 4 on odd `v`, so it has no u32 word offset. `shader-f16` gives 2-byte
+// addressing, so the twins below take that case by counting ELEMENTS where their
+// word originals count words. They are chosen ONLY when the row is odd — an even
+// f16 row keeps the word path and its half-as-many invocations.
+@group(0) @binding(0) var<storage, read>       table_h: array<f16>;
+@group(0) @binding(2) var<storage, read_write> oh: array<f16>;
 @group(0) @binding(3) var<uniform>             p: Params;
 
 struct Params {
@@ -192,5 +206,78 @@ fn gather_batched_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(
         if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
         let src = u32(clamp(idx[gb * p.wpr + gg], 0, i32(p.v) - 1));
         o[i] = bitcast<f32>(table[((gb - p.p0) * p.v + src) * p.d + w]);
+    }
+}
+
+// ---- f16 element-addressed twins -------------------------------------------
+//
+// Each is its f32/word original with `p.d` / `p.total` reinterpreted as ELEMENTS
+// per row / total elements, and the bitcast move replaced by a direct f16 one.
+
+@compute @workgroup_size(64)
+fn gather_rows_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    for (var i = gid.x; i < p.total; i += stride) {
+        let r = i / p.d;
+        let col = i % p.d;
+        let src_row = u32(clamp(idx[p.p2 + r], 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        oh[i] = table_h[(src_row - p.p0) * p.d + col];
+    }
+}
+
+@compute @workgroup_size(64)
+fn scatter_row_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    let row = u32(clamp(idx[0], 0, i32(p.v) - 1));
+    if (row < p.p0 || row >= p.p1) { return; } // row lives in another buf tile
+    let dst0 = (row - p.p0) * p.d;
+    for (var i = gid.x; i < p.total; i += stride) {
+        oh[dst0 + i] = table_h[i];
+    }
+}
+
+@compute @workgroup_size(64)
+fn sequence_append_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let batch = p.rows;
+    let tile_t = p.d;
+    let tile_t0 = p.p2;
+    let new_t = p.v;
+    let heads = p.wpr;
+    let row_elems = p.total;
+    let ring_window = p.p0;
+    let total_elems = p.p1;
+    let stride = nwg.x * WG;
+    for (var i = gid.x; i < total_elems; i += stride) {
+        let elem = i % row_elems;
+        let row = i / row_elems;
+        let h = row % heads;
+        let l = (row / heads) % new_t;
+        let b = row / (heads * new_t);
+        if (b >= batch) { continue; }
+        var dst_t = u32(max(idx[b], 0)) + l;
+        if (ring_window != 0u) { dst_t = dst_t % ring_window; }
+        // Tiles partition [0, cache_t), so this also drops a position past the end.
+        if (dst_t >= tile_t0 && dst_t - tile_t0 < tile_t) {
+            let dst = (((b * tile_t + (dst_t - tile_t0)) * heads + h) * row_elems) + elem;
+            oh[dst] = table_h[i];
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn gather_batched_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    let per_batch = p.total / p.rows; // elements per batch in THIS tile
+    for (var i = gid.x; i < p.total; i += stride) {
+        let b = i / per_batch;
+        let rem = i % per_batch;
+        let g = rem / p.d;
+        let w = rem % p.d;
+        let gb = p.p2 + b;  // batch index in the full tensor
+        let gg = p.p3 + g;  // gathered row in the full tensor
+        if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
+        let src = u32(clamp(idx[gb * p.wpr + gg], 0, i32(p.v) - 1));
+        oh[i] = table_h[((gb - p.p0) * p.v + src) * p.d + w];
     }
 }

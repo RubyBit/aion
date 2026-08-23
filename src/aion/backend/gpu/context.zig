@@ -129,25 +129,33 @@ pub fn totalTiles(meta: tensor_store.TensorMeta) usize {
     return total;
 }
 
-/// A device tile's memory seen as `rows` packed-leading rows of `cols` f32
+/// A device tile's memory seen as `rows` packed-leading rows of `cols` scalar
 /// elements, `row_stride` elements apart. Row-wise kernels (softmax, norms,
-/// reductions) index `base = row * row_stride` and sweep `cols`.
+/// reductions) index `base = row * row_stride` and sweep `cols`. Counts are in
+/// ELEMENTS, so the same view serves an f32 and an f16 tile alike.
 pub const RowView = struct { rows: u32, cols: u32, row_stride: u32 };
 
-/// Collapse a device tile view (rank/shape_mem/strides_mem from `TileRefDevice`)
-/// into a `RowView`. Returns null when the layout can't be described that way:
-/// non-f32-contiguous last dim, negative strides, or leading dims that aren't
-/// row-contiguous (so a flat row index would not address them uniformly).
+/// `rowViewSized` for the 4-byte scalars (f32/i32) that most kernels bind.
 pub fn rowView(rank: u8, shape_mem: []const usize, strides_mem: []const isize) ?RowView {
+    return rowViewSized(rank, shape_mem, strides_mem, @sizeOf(f32));
+}
+
+/// Collapse a device tile view (rank/shape_mem/strides_mem from `TileRefDevice`)
+/// into a `RowView` of `elem_bytes` scalars. Returns null when the layout can't
+/// be described that way: a last dim that is not contiguous in `elem_bytes`,
+/// negative strides, or leading dims that aren't row-contiguous (so a flat row
+/// index would not address them uniformly).
+pub fn rowViewSized(rank: u8, shape_mem: []const usize, strides_mem: []const isize, elem_bytes: usize) ?RowView {
     const r: usize = rank;
     if (r == 0 or r > shape_mem.len) return null;
-    if (strides_mem[r - 1] != @sizeOf(f32)) return null;
+    const eb: isize = @intCast(elem_bytes);
+    if (strides_mem[r - 1] != eb) return null;
     const cols = std.math.cast(u32, shape_mem[r - 1]) orelse return null;
     if (r == 1) return .{ .rows = 1, .cols = cols, .row_stride = 0 };
 
     const rs = strides_mem[r - 2];
-    if (rs < 0 or @rem(rs, @sizeOf(f32)) != 0) return null;
-    const row_stride = std.math.cast(u32, @divExact(@as(usize, @intCast(rs)), @sizeOf(f32))) orelse return null;
+    if (rs < 0 or @rem(rs, eb) != 0) return null;
+    const row_stride = std.math.cast(u32, @divExact(@as(usize, @intCast(rs)), elem_bytes)) orelse return null;
 
     var rows: usize = 1;
     var expect: isize = rs;

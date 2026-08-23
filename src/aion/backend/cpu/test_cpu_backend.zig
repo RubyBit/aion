@@ -5298,3 +5298,333 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     }
     try std.testing.expect(max_abs <= 1.5e-1);
 }
+
+// --- f16 coverage for ops whose `infer` rule always allowed f16 -------------
+//
+// Softmax, ArgMax and LSTMCell were blessed by graph/infer.zig for f16 but
+// rejected by their executors, so an f16 graph compiled fine and then failed at
+// run time. These pin the wired paths.
+
+/// f64 softmax reference over f16 inputs, widened exactly as the kernels do.
+fn softmaxRefRowF16(out: []f32, x: []align(1) const f16) void {
+    std.debug.assert(out.len == x.len);
+    var maxv: f64 = -std.math.inf(f64);
+    for (x) |v| maxv = @max(maxv, @as(f64, @floatCast(v)));
+    var sum: f64 = 0.0;
+    for (x, 0..) |v, i| {
+        const e: f64 = std.math.exp(@as(f64, @floatCast(v)) - maxv);
+        out[i] = @floatCast(e);
+        sum += e;
+    }
+    const inv: f64 = 1.0 / sum;
+    for (out) |*v| v.* = @floatCast(@as(f64, @floatCast(v.*)) * inv);
+}
+
+test "cpu backend: softmax rank-1 (f16) normalizes without an f16 intermediate" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const n: usize = 257;
+    const x_buf: []u8 = try allocator.alloc(u8, n * 2);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f16 = asF16Slice(x_buf);
+
+    // A deliberately wide spread: the low tail sits far enough below the max
+    // that exp(x - max) lands in (and under) f16 subnormals. Parking that
+    // intermediate in f16 is exactly what the wired path refuses to do.
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 128));
+        x_vals[i] = @floatCast(t / 8.0); // ~[-16, 16]
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Awkward tiling so the multi-tile max/sum/normalize passes all run.
+    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{17}, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    const x_in = try g.addInput(.f16, &[_]usize{n});
+    try g.bindExternal(x_in, @intCast(x_tid));
+    const y = try g.addSoftmax(x_in, -1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, n * 2);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f16 = asF16Slice(out_buf);
+
+    const ref: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(ref);
+    softmaxRefRowF16(ref, x_vals);
+
+    var sum: f32 = 0.0;
+    for (out_vals) |v| {
+        const f: f32 = @floatCast(v);
+        try std.testing.expect(std.math.isFinite(f));
+        try std.testing.expect(f >= 0.0 and f <= 1.0);
+        sum += f;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 5e-3);
+
+    // f16 storage dominates the error budget; the fast exp adds far less.
+    var max_abs: f32 = 0.0;
+    for (out_vals, ref) |g0, r0| max_abs = @max(max_abs, @abs(@as(f32, @floatCast(g0)) - r0));
+    try std.testing.expect(max_abs <= 3e-3);
+
+    // The largest input must still carry the largest probability.
+    var best: usize = 0;
+    for (out_vals, 0..) |v, k| {
+        if (@as(f32, @floatCast(v)) > @as(f32, @floatCast(out_vals[best]))) best = k;
+    }
+    try std.testing.expectEqual(@as(usize, n - 1), best);
+}
+
+test "cpu backend: softmax rank-2 (f16) matches reference per row" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const m: usize = 5;
+    const n: usize = 9;
+    const x_buf: []u8 = try allocator.alloc(u8, m * n * 2);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f16 = asF16Slice(x_buf);
+
+    var r: usize = 0;
+    while (r < m) : (r += 1) {
+        var c: usize = 0;
+        while (c < n) : (c += 1) {
+            const t: f32 = @floatFromInt(@as(i32, @intCast(r * n + c)));
+            x_vals[r * n + c] = @floatCast((t / 7.0) - 3.0);
+        }
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, n }, &[_]usize{ 2, 4 }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f16, &[_]usize{ m, n });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    const y = try g.addSoftmax(x_in, -1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, m * n * 2);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) f16 = asF16Slice(out_buf);
+
+    const ref_row: []f32 = try allocator.alloc(f32, n);
+    defer allocator.free(ref_row);
+
+    r = 0;
+    while (r < m) : (r += 1) {
+        softmaxRefRowF16(ref_row, x_vals[r * n .. r * n + n]);
+        var row_sum: f32 = 0.0;
+        var c: usize = 0;
+        while (c < n) : (c += 1) {
+            const got: f32 = @floatCast(out_vals[r * n + c]);
+            row_sum += got;
+            try std.testing.expect(@abs(got - ref_row[c]) <= 3e-3);
+        }
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), row_sum, 5e-3);
+    }
+}
+
+test "cpu backend: argmax (f16) picks the same index as f32" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const rows: usize = 3;
+    const n: usize = 11;
+    const x_buf: []u8 = try allocator.alloc(u8, rows * n * 2);
+    defer allocator.free(x_buf);
+    const x_vals: []align(1) f16 = asF16Slice(x_buf);
+
+    // One distinct winner per row, at a different column each time.
+    const winners = [_]usize{ 0, 7, 10 };
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        var c: usize = 0;
+        while (c < n) : (c += 1) x_vals[r * n + c] = @floatCast(@as(f32, @floatFromInt(c)) * 0.25 - 3.0);
+        x_vals[r * n + winners[r]] = 9.5;
+    }
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    const backend: Backend = cpu.backend();
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ rows, n }, &[_]usize{ rows, n }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f16, &[_]usize{ rows, n });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    const y = try g.addArgMax(x_in, -1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try backend.executeProgram(&prog, sm.tensorStore());
+
+    const out_buf: []u8 = try allocator.alloc(u8, rows * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    const out_vals: []align(1) const i32 = @alignCast(std.mem.bytesAsSlice(i32, out_buf));
+
+    r = 0;
+    while (r < rows) : (r += 1) {
+        try std.testing.expectEqual(@as(i32, @intCast(winners[r])), out_vals[r]);
+    }
+}
+
+/// Build + run one LSTMCell whose operands all carry `dt`, returning the output
+/// state widened to f32. Values are the same regardless of `dt`: they are chosen
+/// to be exactly representable in f16, so the only difference between a f32 and
+/// a f16 run is the storage the cell reads and writes through.
+fn runLSTMCellAsF32(
+    allocator: std.mem.Allocator,
+    dt: types.DType,
+    batch: usize,
+    input_size: usize,
+    hidden: usize,
+    out: []f32,
+) !void {
+    const gate_dim: usize = hidden * 4;
+    const elem: usize = if (dt == .f16) 2 else 4;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    // Deterministic, f16-exact values: k/16 over a small range has an exact
+    // binary representation in both dtypes, so neither run rounds its inputs.
+    const Fill = struct {
+        fn go(dtype: types.DType, buf: []u8, seed: usize) void {
+            const count: usize = buf.len / (if (dtype == .f16) @as(usize, 2) else 4);
+            var k: usize = 0;
+            while (k < count) : (k += 1) {
+                const raw: f32 = @as(f32, @floatFromInt((k * 7 + seed) % 33)) / 16.0 - 1.0;
+                if (dtype == .f16) {
+                    @as(*align(1) f16, @ptrCast(buf.ptr + k * 2)).* = @floatCast(raw);
+                } else {
+                    @as(*align(1) f32, @ptrCast(buf.ptr + k * 4)).* = raw;
+                }
+            }
+        }
+    };
+
+    const specs = [_]struct { shape: []const usize, seed: usize }{
+        .{ .shape = &[_]usize{ batch, input_size }, .seed = 1 },
+        .{ .shape = &[_]usize{ batch, hidden }, .seed = 5 },
+        .{ .shape = &[_]usize{ batch, hidden }, .seed = 9 },
+        .{ .shape = &[_]usize{ input_size, gate_dim }, .seed = 13 },
+        .{ .shape = &[_]usize{ hidden, gate_dim }, .seed = 17 },
+        .{ .shape = &[_]usize{gate_dim}, .seed = 21 },
+        .{ .shape = &[_]usize{gate_dim}, .seed = 25 },
+    };
+
+    var tids: [specs.len]manager_mod.TensorId = undefined;
+    inline for (specs, 0..) |spec, si| {
+        var n: usize = 1;
+        for (spec.shape) |d| n *= d;
+        const buf: []u8 = try allocator.alloc(u8, n * elem);
+        defer allocator.free(buf);
+        Fill.go(dt, buf, spec.seed);
+        tids[si] = try sm.createTiledTensor(dt, spec.shape, spec.shape, .{ .tile_alignment = 64 });
+        try sm.writeFromPackedScalar(tids[si], buf);
+    }
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+
+    var ids: [specs.len]graph_mod.ValueId = undefined;
+    inline for (specs, 0..) |spec, si| {
+        ids[si] = try g.addInput(dt, spec.shape);
+        try g.bindExternal(ids[si], @intCast(tids[si]));
+    }
+
+    const y = try g.addLSTMCell(ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6]);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    defer prog.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_elems: usize = batch * hidden * 2;
+    std.debug.assert(out.len == out_elems);
+    const out_buf: []u8 = try allocator.alloc(u8, out_elems * elem);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+
+    var k: usize = 0;
+    while (k < out_elems) : (k += 1) {
+        out[k] = if (dt == .f16)
+            @floatCast(@as(*align(1) const f16, @ptrCast(out_buf.ptr + k * 2)).*)
+        else
+            @as(*align(1) const f32, @ptrCast(out_buf.ptr + k * 4)).*;
+    }
+}
+
+test "cpu backend: lstm cell (f16) tracks the f32 cell" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    const batch: usize = 3;
+    const input_size: usize = 6;
+    const hidden: usize = 8;
+    const out_elems: usize = batch * hidden * 2;
+
+    const got_f32: []f32 = try allocator.alloc(f32, out_elems);
+    defer allocator.free(got_f32);
+    const got_f16: []f32 = try allocator.alloc(f32, out_elems);
+    defer allocator.free(got_f16);
+
+    try runLSTMCellAsF32(allocator, .f32, batch, input_size, hidden, got_f32);
+    try runLSTMCellAsF32(allocator, .f16, batch, input_size, hidden, got_f16);
+
+    // The gate math is f32 in both runs (only the I/O helpers know the dtype), so
+    // the f16 result is the f32 result rounded once on store -- nothing more.
+    var max_abs: f32 = 0.0;
+    for (got_f32, got_f16) |a, b| {
+        try std.testing.expect(std.math.isFinite(b));
+        max_abs = @max(max_abs, @abs(a - b));
+    }
+    try std.testing.expect(max_abs <= 1e-3);
+
+    // Guard against a degenerate all-zero comparison.
+    var any_nonzero = false;
+    for (got_f32) |v| {
+        if (@abs(v) > 1e-4) any_nonzero = true;
+    }
+    try std.testing.expect(any_nonzero);
+}

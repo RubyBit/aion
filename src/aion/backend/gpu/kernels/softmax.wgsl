@@ -9,8 +9,22 @@
 // Three column sweeps per row (max, exp+sum, normalize); x is read twice, o is
 // written then rescaled in place — same structure as the CPU three-pass kernel.
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+
+// f16 twin. NOTE the different pass structure: the f32 kernel parks exp(x - max)
+// in `o` and rescales it in place, which an f16 output must not do — exp spans
+// [2.06e-9, 1] after the -20 clamp, and f16 goes subnormal below 6.10e-5 and
+// flushes to zero below 5.96e-8, so the un-normalized intermediate would be
+// quantized before it could be divided. Instead the sum pass stores nothing and
+// the final pass recomputes exp, so each probability is rounded to f16 exactly
+// once, on its finished value. `sumExpF16` / `expNormalizeStoreF16` in
+// cpu/kernels/softmax.zig do precisely the same, for the same reason.
+@group(0) @binding(0) var<storage, read>       xh: array<f16>;
+@group(0) @binding(1) var<storage, read_write> oh: array<f16>;
+
 @group(0) @binding(2) var<uniform>             p: Params;
 
 // Row strides are in elements (tiles may pad rows; the backend passes both).
@@ -77,4 +91,24 @@ fn softmax_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let inv = 1.0 / wg_reduce_sum(lidx, s);
 
     for (var c = lidx; c < p.cols; c += WG) { o[ob + c] = o[ob + c] * inv; }
+}
+
+@compute @workgroup_size(256)
+fn softmax_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let xb = wid.x * p.x_row;
+    let ob = wid.x * p.o_row;
+
+    var m = -3.4028235e38;
+    for (var c = lidx; c < p.cols; c += WG) { m = max(m, f32(xh[xb + c])); }
+    let row_max = wg_reduce_max(lidx, m);
+
+    var s = 0.0;
+    for (var c = lidx; c < p.cols; c += WG) {
+        s += expApprox(clamp(f32(xh[xb + c]) - row_max, -20.0, 0.0));
+    }
+    let inv = 1.0 / wg_reduce_sum(lidx, s);
+
+    for (var c = lidx; c < p.cols; c += WG) {
+        oh[ob + c] = f16(expApprox(clamp(f32(xh[xb + c]) - row_max, -20.0, 0.0)) * inv);
+    }
 }

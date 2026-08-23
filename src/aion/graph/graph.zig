@@ -127,9 +127,11 @@ pub const Op = union(OpTag) {
     /// out = alpha * (a @ b) + beta * out
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 
-    /// `act` is read only when `op == .gate` (`gate(a, b) = act(a) * b`); for every
-    /// other op it is ignored and its value is meaningless.
-    ElemwiseBinary: struct { op: ElemwiseBinaryOp, act: UnaryOp = .gelu },
+    /// `ElemwiseBinaryOp.gate` is NOT graph vocabulary — it is a step-level schedule
+    /// that `program/fuse_steps.zig` produces from a `Unary` feeding a `mul`. A gated
+    /// activation is authored as exactly that pair, so no `act`
+    /// parameter is carried here or serialized.
+    ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
 
@@ -710,13 +712,6 @@ pub const Graph = struct {
 
     pub fn addElemwiseBinary(self: *Self, op: ElemwiseBinaryOp, a: ValueId, b: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.{ .ElemwiseBinary = .{ .op = op } }, &[_]ValueId{ a, b });
-    }
-
-    /// Gated activation `act(a) * b` — GEGLU/SwiGLU/GLU/ReGLU by choice of `act`.
-    /// One node, so the graph records the gate the author meant instead of leaving a
-    /// unary-then-multiply pair for a peephole to guess back.
-    pub fn addGate(self: *Self, act: UnaryOp, a: ValueId, b: ValueId) GraphError!ValueId {
-        return self.addNodeInternal(.{ .ElemwiseBinary = .{ .op = .gate, .act = act } }, &[_]ValueId{ a, b });
     }
 
     pub fn addUnary(self: *Self, op: UnaryOp, a: ValueId) GraphError!ValueId {

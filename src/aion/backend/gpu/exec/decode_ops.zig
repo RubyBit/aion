@@ -92,7 +92,7 @@ pub fn gatherRowsOnDevice(out_meta: TensorMeta, table_meta: TensorMeta, idx_meta
     // other dtype is a pure word copy and needs only whole 4-byte words per row.
     if (table_meta.dtype == .q8_0) return out_meta.dtype == .f32 and d_total % 64 == 0;
     if (out_meta.dtype != table_meta.dtype) return false;
-    return rowWords(out_meta.dtype, d_total) != null;
+    return rowAddressable(out_meta.dtype, d_total);
 }
 
 /// 4-byte words spanned by `elems` of `dtype`, or null when a row is not a whole
@@ -104,6 +104,24 @@ fn rowWords(dtype: types.DType, elems: usize) ?usize {
     return if (bytes % 4 == 0) bytes / 4 else null;
 }
 
+/// Whether a row of `elems` can be addressed by SOME kernel in gather.wgsl.
+///
+/// The word kernels need whole 4-byte words per row. f16 additionally has
+/// element-addressed twins (`shader-f16` is a required device feature), so an
+/// f16 row is always addressable however odd its width — which is what removes
+/// the old "odd f16 row" cliff from gather / scatter / sequence-append.
+fn rowAddressable(dtype: types.DType, elems: usize) bool {
+    if (dtype == .f16) return true;
+    return rowWords(dtype, elems) != null;
+}
+
+/// True when this row must take the f16 element-addressed twin. An EVEN f16 row
+/// keeps the word path: it moves 4 bytes per work item instead of 2, so it runs
+/// half the invocations. Only the odd case has no word offset to use.
+fn needsF16Elems(dtype: types.DType, elems: usize) bool {
+    return dtype == .f16 and rowWords(dtype, elems) == null;
+}
+
 /// Whether the row scatter lowers to the device dispatch that reads its index
 /// on-device (4-byte scalars, single tiles). See `gatherRowsOnDevice`.
 pub fn scatterRowOnDevice(buf_meta: TensorMeta, idx_meta: TensorMeta, src_meta: TensorMeta) bool {
@@ -112,7 +130,7 @@ pub fn scatterRowOnDevice(buf_meta: TensorMeta, idx_meta: TensorMeta, src_meta: 
     // A pure word copy: any dtype whose row is a whole number of 4-byte words.
     var row_elems: usize = 1;
     for (buf_meta.shape[1..]) |d| row_elems *= d;
-    if (rowWords(buf_meta.dtype, row_elems) == null) return false;
+    if (!rowAddressable(buf_meta.dtype, row_elems)) return false;
     // `buf` may be split across bindings, but only along the row axis, so a row
     // is wholly inside one tile. `src` is that row and `idx` a scalar.
     for (buf_meta.tile_counts[1..]) |n| {
@@ -156,8 +174,20 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRowsTiled
         const wpr = (d_total / 64) * 17; // u32 words per q8_0 table row
         // The copying kernel addresses words so it serves any non-quantized
         // dtype; the q8 kernel addresses elements because it dequantizes.
-        const row_unit = if (table_is_quant) d_total else rowWords(out_meta.dtype, d_total) orelse return error.Unsupported;
-        const built = try ctx.pipes.get(gather_kernel, if (table_is_quant) "gather_q8_rows_f32" else "gather_rows_words");
+        // The q8 kernel addresses elements because it dequantizes; the copying
+        // kernels address words, except an ODD f16 row which has no word offset
+        // and takes the element-addressed twin.
+        const f16_elems = needsF16Elems(out_meta.dtype, d_total);
+        const row_unit = if (table_is_quant or f16_elems)
+            d_total
+        else
+            rowWords(out_meta.dtype, d_total) orelse return error.Unsupported;
+        const built = try ctx.pipes.get(gather_kernel, if (table_is_quant)
+            "gather_q8_rows_f32"
+        else if (f16_elems)
+            "gather_rows_f16"
+        else
+            "gather_rows_words");
         const idx_buf = ctx.devmem.bufferFor(di.handle).?;
         const table_tiles = context.totalTiles(table_meta);
         const out_tiles = context.totalTiles(out_meta);
@@ -237,7 +267,7 @@ pub fn gatherOnDevice(out_meta: TensorMeta, data_meta: TensorMeta, idx_meta: Ten
     if (axis != 1 or batch_dims != 1) return false;
     if (out_meta.rank != 3 or data_meta.rank != 3 or idx_meta.rank != 2) return false;
     if (idx_meta.dtype != .i32 or out_meta.dtype != data_meta.dtype) return false;
-    if (rowWords(out_meta.dtype, out_meta.shape[2]) == null) return false;
+    if (!rowAddressable(out_meta.dtype, out_meta.shape[2])) return false;
     // `idx` is globally indexed so it must be one binding; `data` and the output
     // may be split, but only along batch (checked per tile at record time).
     return context.totalTiles(idx_meta) == 1;
@@ -269,7 +299,10 @@ pub fn execGather(ctx: Ctx, frame: *Frame, s: executable.StepGatherTiled) Execut
         return error.Unsupported;
     }
     const row_bytes = width * elem_bytes;
-    if (row_bytes % 4 != 0 or data_meta.tile_counts[2] != 1 or out_meta.tile_counts[2] != 1) return error.Unsupported;
+    // An odd f16 row (a per-token scalar gather is `width == 1`) has no word
+    // offset, so it takes the element-addressed twin instead of being rejected.
+    const f16_elems = needsF16Elems(out_meta.dtype, width);
+    if ((!f16_elems and row_bytes % 4 != 0) or data_meta.tile_counts[2] != 1 or out_meta.tile_counts[2] != 1) return error.Unsupported;
 
     // Device path: one dispatch per output tile, one work item per output
     // element, index read on-device. `data` and `idx` stay globally indexed
@@ -281,8 +314,8 @@ pub fn execGather(ctx: Ctx, frame: *Frame, s: executable.StepGatherTiled) Execut
         const i_n = context.packedElemsSized(di.rank, di.shape_mem[0..2], di.strides_mem[0..2], @sizeOf(i32)) orelse return error.Unsupported;
         if (i_n < batch * gathered) return error.Unsupported;
 
-        const row_unit = rowWords(out_meta.dtype, width) orelse return error.Unsupported;
-        const built = try ctx.pipes.get(gather_kernel, "gather_batched_words");
+        const row_unit = if (f16_elems) width else rowWords(out_meta.dtype, width) orelse return error.Unsupported;
+        const built = try ctx.pipes.get(gather_kernel, if (f16_elems) "gather_batched_f16" else "gather_batched_words");
         const idx_buf = ctx.devmem.bufferFor(di.handle).?;
         const data_tiles = context.totalTiles(data_meta);
         const out_tiles = context.totalTiles(out_meta);
@@ -365,7 +398,15 @@ pub fn execRoPE(ctx: Ctx, frame: *Frame, s: executable.StepRoPE1DTiled) ExecuteP
     const pos_meta = hs.meta(s.positions) catch return error.ExecutionFailed;
 
     if (out_meta.rank != 4 or x_meta.rank != 4 or pos_meta.rank != 2) return error.Unsupported;
-    if (out_meta.dtype != .f32 or x_meta.dtype != .f32) return error.Unsupported; // f16 later
+    // f32 and f16, the latter natively addressed (`shader-f16` is a required
+    // device feature). The angle, the sincos and the rotation are f32 in both,
+    // matching the CPU kernel; only the load widens and the store rounds.
+    const elem_bytes: usize = switch (out_meta.dtype) {
+        .f32 => 4,
+        .f16 => 2,
+        else => return error.Unsupported,
+    };
+    if (x_meta.dtype != out_meta.dtype) return error.Unsupported;
     if (pos_meta.dtype != .i32) return error.Unsupported;
     if (out_meta.tile_counts[3] != 1) return error.Unsupported;
 
@@ -375,7 +416,7 @@ pub fn execRoPE(ctx: Ctx, frame: *Frame, s: executable.StepRoPE1DTiled) ExecuteP
     const rope_pairs: usize = @min(pairs_total, @as(usize, @intFromFloat(@max(rope_pairs_f, 0))));
     const freq_step: f32 = @floatCast(std.math.pow(f64, @as(f64, s.base_frequency), -2.0 / @as(f64, @floatFromInt(head_dim))));
 
-    const built = try ctx.pipes.get(rope_kernel, "rope_f32");
+    const built = try ctx.pipes.get(rope_kernel, if (out_meta.dtype == .f16) "rope_f16" else "rope_f32");
 
     const total = context.totalTiles(out_meta);
     var ti: usize = 0;
@@ -394,10 +435,11 @@ pub fn execRoPE(ctx: Ctx, frame: *Frame, s: executable.StepRoPE1DTiled) ExecuteP
         }
         if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
-        const count = context.packedElems(dout.rank, dout.shape_mem[0..4], dout.strides_mem[0..4]) orelse return error.Unsupported;
-        const x_count = context.packedElems(dx.rank, dx.shape_mem[0..4], dx.strides_mem[0..4]) orelse return error.Unsupported;
+        const count_usize = context.packedElemsSized(dout.rank, dout.shape_mem[0..4], dout.strides_mem[0..4], elem_bytes) orelse return error.Unsupported;
+        const x_count = context.packedElemsSized(dx.rank, dx.shape_mem[0..4], dx.strides_mem[0..4], elem_bytes) orelse return error.Unsupported;
         if (context.packedElems(dpos.rank, dpos.shape_mem[0..2], dpos.strides_mem[0..2]) == null) return error.Unsupported;
-        if (x_count != count) return error.Unsupported;
+        if (x_count != count_usize) return error.Unsupported;
+        const count = std.math.cast(u32, count_usize) orelse return error.Unsupported;
         if (dpos.shape_mem[0] != dout.shape_mem[0] or dpos.shape_mem[1] != dout.shape_mem[1]) return error.Unsupported;
 
         const params: RopeParams = .{
@@ -431,8 +473,7 @@ pub fn sequenceAppendOnDevice(cache: TensorMeta, new_kv: TensorMeta, end_index: 
         if (cache.tile_counts[axis] != 1) return false;
     }
     if (context.totalTiles(new_kv) != 1 or context.totalTiles(end_index) != 1) return false;
-    const elem_bytes: usize = if (cache.dtype == .f32) 4 else 2;
-    return (cache.shape[3] * elem_bytes) % 4 == 0;
+    return rowAddressable(cache.dtype, cache.shape[3]);
 }
 
 /// cache[b, end[b] + t, h, :] = new_kv[b, t, h, :], in place. Mirrors the CPU
@@ -461,13 +502,17 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
     const head_dim = cache_meta.shape[3];
     const new_len = new_meta.shape[1];
     const row_bytes = head_dim * elem_bytes;
-    if (row_bytes % 4 != 0) return error.Unsupported;
+    // An odd f16 head dim has no word offset and takes the element-addressed
+    // twin. This gate sits ahead of BOTH the device and the record-time path, so
+    // before the twin existed an odd head dim had no way through at all.
+    const f16_elems = needsF16Elems(cache_meta.dtype, head_dim);
+    if (!f16_elems and row_bytes % 4 != 0) return error.Unsupported;
     if (end_meta.dtype != .i32 or end_meta.shape[0] < batch) return error.Unsupported;
 
     const policy = hs.sequenceCachePolicyInfo(s.cache);
     if (!ctx.control.isHostPlaced(s.end_index) and sequenceAppendOnDevice(cache_meta, new_meta, end_meta)) {
-        const row_words = (head_dim * elem_bytes) / 4;
-        const total_words = batch * new_len * heads * row_words;
+        const row_units = if (f16_elems) head_dim else (head_dim * elem_bytes) / 4;
+        const total_words = batch * new_len * heads * row_units;
         if (total_words == 0) return;
         const dnew = ctx.store.acquireTileDeviceConstLinear(s.new_kv, 0) catch return error.ExecutionFailed;
         defer hs.releaseConst(dnew.token);
@@ -475,7 +520,7 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
         defer hs.releaseConst(dend.token);
         if (!context.storageBindingFits(ctx, dnew.len) or !context.storageBindingFits(ctx, dend.len)) return error.Unsupported;
 
-        const built = try ctx.pipes.get(gather_kernel, "sequence_append_u32");
+        const built = try ctx.pipes.get(gather_kernel, if (f16_elems) "sequence_append_f16" else "sequence_append_u32");
         const ring_window: usize = if (policy.kind == .ring) @min(policy.ring_window_tokens, cache_meta.shape[1]) else 0;
 
         // One dispatch per cache tile: an appended row lands in exactly one, and
@@ -494,7 +539,7 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
                 .d = @intCast(tile_times),
                 .v = @intCast(new_len),
                 .wpr = @intCast(heads),
-                .total = @intCast(row_words),
+                .total = @intCast(row_units),
                 ._p0 = @intCast(ring_window),
                 ._p1 = @intCast(total_words),
                 ._p2 = @intCast(t_begin),
@@ -544,7 +589,10 @@ pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) Exe
     var d: usize = 1;
     while (d < @as(usize, buf_meta.rank)) : (d += 1) row_size *= buf_meta.shape[d];
     const row_bytes = row_size * elem_bytes;
-    if (row_bytes % 4 != 0) return error.Unsupported; // device copy granularity
+    // An odd f16 row takes the element-addressed twin; every other dtype still
+    // needs whole 4-byte words (device copy granularity).
+    const f16_elems = needsF16Elems(buf_meta.dtype, row_size);
+    if (!f16_elems and row_bytes % 4 != 0) return error.Unsupported;
 
     const dsrc = ctx.store.acquireTileDeviceConstLinear(s.src, 0) catch return error.ExecutionFailed;
     defer hs.releaseConst(dsrc.token);
@@ -561,8 +609,8 @@ pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) Exe
         const di = ctx.store.acquireTileDeviceConstLinear(s.idx, 0) catch return error.ExecutionFailed;
         defer hs.releaseConst(di.token);
         if (!context.storageBindingFits(ctx, dsrc.len)) return error.Unsupported;
-        const row_words = std.math.cast(u32, row_bytes / 4) orelse return error.Unsupported;
-        const built = try ctx.pipes.get(gather_kernel, "scatter_row_u32");
+        const row_units = std.math.cast(u32, if (f16_elems) row_size else row_bytes / 4) orelse return error.Unsupported;
+        const built = try ctx.pipes.get(gather_kernel, if (f16_elems) "scatter_row_f16" else "scatter_row_u32");
         const src_buf = ctx.devmem.bufferFor(dsrc.handle).?;
 
         var row_begin: usize = 0;
@@ -577,15 +625,15 @@ pub fn execScatterRow(ctx: Ctx, frame: *Frame, s: executable.StepScatterRow) Exe
 
             const params: GatherParams = .{
                 .rows = 1,
-                .d = row_words,
+                .d = row_units,
                 .v = @intCast(m),
-                .total = row_words,
+                .total = row_units,
                 ._p0 = @intCast(row_begin),
                 ._p1 = @intCast(row_begin + tile_rows),
             };
             const bufs = [_]c.WGPUBuffer{ src_buf, ctx.devmem.bufferFor(di.handle).?, ctx.devmem.bufferFor(dtile.handle).? };
             const sizes = [_]u64{ dsrc.len, di.len, dtile.len };
-            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(row_words), 1, 1 });
+            try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(row_units), 1, 1 });
             row_begin += tile_rows;
         }
         if (row_begin != m) return error.Unsupported; // tiles did not cover the buffer

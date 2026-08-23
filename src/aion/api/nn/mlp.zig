@@ -70,8 +70,9 @@ pub const FeedForward = struct {
 /// numerically identically. So there is nothing to choose here and nothing to
 /// probe for — one shape, one code path.
 ///
-/// The gate is one `gate` op whatever the activation, so the graph records the gated
-/// unit the author meant instead of a unary and a multiply for a pass to recognise.
+/// The gate is emitted as the activation-and-multiply pair it is; `fuse_steps.zig`
+/// folds it into one kernel where one exists. Keeping that decision out of the graph
+/// is what lets an f16 or broadcasting gated block work at all.
 pub const GatedMLP = struct {
     gate: Linear,
     up: Linear,
@@ -119,9 +120,10 @@ pub const GatedMLP = struct {
         const gate_v: TensorRef = try self.gate.forward(bld, x);
         const up_v: TensorRef = try self.up.forward(bld, x);
 
-        // One `gate` node for every activation: the block IS a gated unit, so it says so
-        // rather than emitting a unary and a multiply for a pass to fuse back together.
-        const gated: TensorRef = try bld.gate(self.act.toUnaryOp(), gate_v, up_v);
+        // The activation and the multiply, which is what a gated FFN is. Folding them
+        // into one kernel is a schedule, decided per backend at compile time by
+        // `fuse_steps.fuseGate`.
+        const gated: TensorRef = try bld.elemwiseBinary(.mul, try bld.unary(self.act.toUnaryOp(), gate_v), up_v);
 
         return self.down.forward(bld, gated);
     }

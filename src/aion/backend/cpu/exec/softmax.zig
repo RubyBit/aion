@@ -16,6 +16,10 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
 const MAX_RANK: usize = 8;
 
+/// Both strided max kernels share one signature, so the dtype pick is a pointer
+/// selection rather than a branch duplicated around each call.
+const UpdateMaxStridedFn = *const fn ([]f32, []const u8, usize, usize, []const usize) BackendError!void;
+
 fn normalizeAxis(axis: i32, rank: usize) ExecuteProgramError!usize {
     if (rank == 0) return BackendError.InvalidArgument;
     const r_i32: i32 = @intCast(rank);
@@ -49,7 +53,8 @@ pub fn execSoftmaxTiled(
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const out_meta = try store.meta(s.out);
-    if (out_meta.dtype != .f32) return BackendError.InvalidArgument;
+    if (out_meta.dtype != .f32 and out_meta.dtype != .f16) return BackendError.InvalidArgument;
+    if ((try store.meta(s.a)).dtype != out_meta.dtype) return BackendError.InvalidArgument;
     const rank: usize = @as(usize, out_meta.rank);
     if (rank == 0 or rank > MAX_RANK) return BackendError.InvalidArgument;
     const axis: usize = try normalizeAxis(s.axis, rank);
@@ -317,7 +322,11 @@ fn softmaxAxisStridedND(
                                 return;
                             };
 
-                            softmax_kernels.updateMaxStridedRowsF32(
+                            const upd: UpdateMaxStridedFn = if (t.out_meta.dtype == .f16)
+                                softmax_kernels.updateMaxStridedRowsF16
+                            else
+                                softmax_kernels.updateMaxStridedRowsF32;
+                            upd(
                                 max_buf[0..rows],
                                 in_view.bytes,
                                 axis_len,
@@ -394,6 +403,23 @@ fn softmaxAxisStridedND(
                                 return;
                             };
 
+                            // f16 sums without storing the exponential (see
+                            // kernels/softmax.zig); pass 3 recomputes and writes it.
+                            if (t.out_meta.dtype == .f16) {
+                                softmax_kernels.sumExpStridedRowsF16(
+                                    sum_buf[0..rows],
+                                    in_view.bytes,
+                                    axis_len,
+                                    stride_axis,
+                                    row_offsets_in[0..rows],
+                                    max_buf[0..rows],
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                continue;
+                            }
+
                             softmax_kernels.expSumStoreStridedRowsF32(
                                 sum_buf[0..rows],
                                 out_view.bytes,
@@ -457,6 +483,47 @@ fn softmaxAxisStridedND(
                                 t.fail(e);
                                 return;
                             };
+
+                            if (t.out_meta.dtype == .f16) {
+                                const in_tile = t.store.acquireTileConstLinear(t.a, tile_index) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(in_tile.token);
+                                const in_view = in_tile.bufferView();
+                                const in_stride_isize: isize = in_view.layout.strides_bytes[t.axis];
+                                if (in_stride_isize < 0) {
+                                    t.fail(BackendError.InvalidArgument);
+                                    return;
+                                }
+                                computeRowOffsets(
+                                    row_offsets_in[0..rows],
+                                    row_coords[0..t.row_dim_count],
+                                    rows,
+                                    t.row_dim_count,
+                                    t.row_dims[0..t.row_dim_count],
+                                    row_local_strides[0..t.row_dim_count],
+                                    in_view.layout.strides_bytes,
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                softmax_kernels.expNormalizeStoreStridedRowsF16(
+                                    out_view.bytes,
+                                    in_view.bytes,
+                                    axis_len,
+                                    @intCast(in_stride_isize),
+                                    out_stride_axis,
+                                    row_offsets_in[0..rows],
+                                    row_offsets_out[0..rows],
+                                    max_buf[0..rows],
+                                    sum_buf[0..rows],
+                                ) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                continue;
+                            }
 
                             softmax_kernels.normalizeStridedRowsF32(
                                 out_view.bytes,
@@ -550,7 +617,11 @@ fn softmaxAxisStridedND(
                 in_view.layout.strides_bytes,
             );
 
-            try softmax_kernels.updateMaxStridedRowsF32(
+            const upd: UpdateMaxStridedFn = if (out_meta.dtype == .f16)
+                softmax_kernels.updateMaxStridedRowsF16
+            else
+                softmax_kernels.updateMaxStridedRowsF32;
+            try upd(
                 max_buf[0..rows],
                 in_view.bytes,
                 axis_len,
@@ -599,6 +670,19 @@ fn softmaxAxisStridedND(
                 out_view.layout.strides_bytes,
             );
 
+            // f16 sums without storing the exponential; pass 3 recomputes it.
+            if (out_meta.dtype == .f16) {
+                try softmax_kernels.sumExpStridedRowsF16(
+                    sum_buf[0..rows],
+                    in_view.bytes,
+                    axis_len,
+                    stride_axis,
+                    row_offsets_in_seq[0..rows],
+                    max_buf[0..rows],
+                );
+                continue;
+            }
+
             try softmax_kernels.expSumStoreStridedRowsF32(
                 sum_buf[0..rows],
                 out_view.bytes,
@@ -640,6 +724,35 @@ fn softmaxAxisStridedND(
                 row_strides_seq[0..row_dim_count],
                 out_view.layout.strides_bytes,
             );
+
+            if (out_meta.dtype == .f16) {
+                const in_tile = try store.acquireTileConstLinear(a, tile_index);
+                defer store.releaseConst(in_tile.token);
+                const in_view = in_tile.bufferView();
+                const in_stride_isize: isize = in_view.layout.strides_bytes[axis];
+                if (in_stride_isize < 0) return BackendError.InvalidArgument;
+                try computeRowOffsets(
+                    row_offsets_in_seq[0..rows],
+                    row_coords_seq[0..row_dim_count],
+                    rows,
+                    row_dim_count,
+                    row_dims[0..row_dim_count],
+                    row_strides_seq[0..row_dim_count],
+                    in_view.layout.strides_bytes,
+                );
+                try softmax_kernels.expNormalizeStoreStridedRowsF16(
+                    out_view.bytes,
+                    in_view.bytes,
+                    axis_len,
+                    @intCast(in_stride_isize),
+                    out_stride_axis,
+                    row_offsets_in_seq[0..rows],
+                    row_offsets_out_seq[0..rows],
+                    max_buf[0..rows],
+                    sum_buf[0..rows],
+                );
+                continue;
+            }
 
             try softmax_kernels.normalizeStridedRowsF32(
                 out_view.bytes,
@@ -783,11 +896,15 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            const elem_bytes: usize = 4;
+                            const dt = t.out_meta.dtype;
+                            const elem_bytes: usize = if (dt == .f16) 2 else 4;
                             var shape_mem: [2]usize = .{ rows, cols };
                             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-                            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-                            softmax_kernels.updateMaxF32(max_buf[0..rows], in_view, 2);
+                            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                            if (dt == .f16)
+                                softmax_kernels.updateMaxF16(max_buf[0..rows], in_view, 2)
+                            else
+                                softmax_kernels.updateMaxF32(max_buf[0..rows], in_view, 2);
                         }
 
                         ti_axis = 0;
@@ -798,11 +915,7 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseMut(out_tile.token);
+                            const dt = t.out_meta.dtype;
                             const in_tile = t.store.acquireTileConstLinear(t.a, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
@@ -813,11 +926,23 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            const elem_bytes: usize = 4;
+                            const elem_bytes: usize = if (dt == .f16) 2 else 4;
                             var shape_mem: [2]usize = .{ rows, cols };
                             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-                            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-                            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+
+                            // f16 only sums here; the store happens in the pass below.
+                            if (dt == .f16) {
+                                softmax_kernels.sumExpF16(sum_buf[0..rows], in_view, max_buf[0..rows], 2);
+                                continue;
+                            }
+
+                            const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseMut(out_tile.token);
+                            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
                             softmax_kernels.expSumStoreF32(sum_buf[0..rows], out_view, in_view, max_buf[0..rows], 2);
                         }
 
@@ -829,6 +954,7 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
+                            const dt = t.out_meta.dtype;
                             const out_tile = t.store.acquireTileMutLinear(t.out, tile_index) catch |e| {
                                 t.fail(e);
                                 return;
@@ -839,11 +965,22 @@ fn softmaxAxisLastND(
                                 t.fail(e);
                                 return;
                             };
-                            const elem_bytes: usize = 4;
+                            const elem_bytes: usize = if (dt == .f16) 2 else 4;
                             var shape_mem: [2]usize = .{ rows, cols };
                             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-                            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-                            softmax_kernels.normalizeF32(out_view, sum_buf[0..rows], 2);
+                            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+
+                            if (dt == .f16) {
+                                const in_tile = t.store.acquireTileConstLinear(t.a, tile_index) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(in_tile.token);
+                                const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                                softmax_kernels.expNormalizeStoreF16(out_view, in_view, max_buf[0..rows], sum_buf[0..rows], 2);
+                            } else {
+                                softmax_kernels.normalizeF32(out_view, sum_buf[0..rows], 2);
+                            }
                         }
                     }
                 }
@@ -888,6 +1025,9 @@ fn softmaxAxisLastND(
             rows = std.math.mul(usize, rows, dim_len) catch return BackendError.InvalidArgument;
         }
         if (rows == 0 or rows > 256) return BackendError.InvalidArgument;
+        // Declared in the loop, not at function scope: the threaded Task above is
+        // lexically nested in this function and binds its own `dt`.
+        const dt = out_meta.dtype;
 
         var max_buf: [256]f32 = undefined;
         var sum_buf: [256]f32 = undefined;
@@ -902,28 +1042,38 @@ fn softmaxAxisLastND(
             defer store.releaseConst(in_tile.token);
 
             const cols: usize = try tileDim(out_meta.shape, out_meta.tile_shape, ti_axis_seq, axis);
-            const elem_bytes: usize = 4;
+            const elem_bytes: usize = if (dt == .f16) 2 else 4;
             var shape_mem: [2]usize = .{ rows, cols };
             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-            softmax_kernels.updateMaxF32(max_buf[0..rows], in_view, 2);
+            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+            if (dt == .f16)
+                softmax_kernels.updateMaxF16(max_buf[0..rows], in_view, 2)
+            else
+                softmax_kernels.updateMaxF32(max_buf[0..rows], in_view, 2);
         }
 
         ti_axis_seq = 0;
         while (ti_axis_seq < axis_tiles) : (ti_axis_seq += 1) {
             coords_seq[axis] = ti_axis_seq;
             const tile_index: usize = try tensor_store.encodeTileIndex(out_meta, coords_seq[0..out_meta.tile_counts.len]);
-            const out_tile = try store.acquireTileMutLinear(out, tile_index);
-            defer store.releaseMut(out_tile.token);
             const in_tile = try store.acquireTileConstLinear(a, tile_index);
             defer store.releaseConst(in_tile.token);
 
             const cols: usize = try tileDim(out_meta.shape, out_meta.tile_shape, ti_axis_seq, axis);
-            const elem_bytes: usize = 4;
+            const elem_bytes: usize = if (dt == .f16) 2 else 4;
             var shape_mem: [2]usize = .{ rows, cols };
             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+            const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+
+            // f16 only sums here; the store happens in the pass below.
+            if (dt == .f16) {
+                softmax_kernels.sumExpF16(sum_buf[0..rows], in_view, max_buf[0..rows], 2);
+                continue;
+            }
+
+            const out_tile = try store.acquireTileMutLinear(out, tile_index);
+            defer store.releaseMut(out_tile.token);
+            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
             softmax_kernels.expSumStoreF32(sum_buf[0..rows], out_view, in_view, max_buf[0..rows], 2);
         }
 
@@ -935,11 +1085,19 @@ fn softmaxAxisLastND(
             defer store.releaseMut(out_tile.token);
 
             const cols: usize = try tileDim(out_meta.shape, out_meta.tile_shape, ti_axis_seq, axis);
-            const elem_bytes: usize = 4;
+            const elem_bytes: usize = if (dt == .f16) 2 else 4;
             var shape_mem: [2]usize = .{ rows, cols };
             var strides_mem: [2]isize = .{ @intCast(cols * elem_bytes), @intCast(elem_bytes) };
-            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = .f32, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
-            softmax_kernels.normalizeF32(out_view, sum_buf[0..rows], 2);
+            const out_view: types.BufferViewMut = .{ .bytes = out_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+
+            if (dt == .f16) {
+                const in_tile = try store.acquireTileConstLinear(a, tile_index);
+                defer store.releaseConst(in_tile.token);
+                const in_view: types.BufferViewConst = .{ .bytes = in_tile.bytes, .dtype = dt, .layout = .{ .rank = 2, .shape = shape_mem[0..2], .strides_bytes = strides_mem[0..2] } };
+                softmax_kernels.expNormalizeStoreF16(out_view, in_view, max_buf[0..rows], sum_buf[0..rows], 2);
+            } else {
+                softmax_kernels.normalizeF32(out_view, sum_buf[0..rows], 2);
+            }
         }
     }
 }
@@ -1007,11 +1165,14 @@ fn softmaxRank1(
                             };
                             defer t.store.releaseConst(in_tile.token);
                             const in_view = in_tile.bufferView();
-                            if (in_view.dtype != .f32) {
+                            if (in_view.dtype != t.out_meta.dtype) {
                                 t.fail(BackendError.InvalidArgument);
                                 return;
                             }
-                            softmax_kernels.updateMaxF32(max_buf[0..1], in_view, 1);
+                            if (in_view.dtype == .f16)
+                                softmax_kernels.updateMaxF16(max_buf[0..1], in_view, 1)
+                            else
+                                softmax_kernels.updateMaxF32(max_buf[0..1], in_view, 1);
                         }
                     }
                     if (tid < t.scratch_max.len) t.scratch_max[tid] = max_buf[0];
@@ -1059,24 +1220,36 @@ fn softmaxRank1(
                         if (t.stop.load(.acquire)) return;
                         var ti1: usize = 0;
                         while (ti1 < t.tc1) : (ti1 += 1) {
+                            const is_f16 = t.out_meta.dtype == .f16;
                             if (ti1 + 1 < t.tc1) {
                                 t.store.prefetch(t.a, ti0, ti1 + 1);
-                                t.store.prefetch(t.out, ti0, ti1 + 1);
+                                if (!is_f16) t.store.prefetch(t.out, ti0, ti1 + 1);
                             }
-                            const out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseMut(out_tile.token);
                             const in_tile = t.store.acquireTileConst(t.a, ti0, ti1) catch |e| {
                                 t.fail(e);
                                 return;
                             };
                             defer t.store.releaseConst(in_tile.token);
-
-                            const out_view = out_tile.bufferView();
                             const in_view = in_tile.bufferView();
-                            if (out_view.dtype != .f32 or in_view.dtype != .f32) {
+                            if (in_view.dtype != t.out_meta.dtype) {
+                                t.fail(BackendError.InvalidArgument);
+                                return;
+                            }
+
+                            // f16 sums without storing; the exponential is recomputed
+                            // in the normalize pass (see kernels/softmax.zig).
+                            if (is_f16) {
+                                softmax_kernels.sumExpF16(sum_buf[0..1], in_view, max_buf[0..1], 1);
+                                continue;
+                            }
+
+                            const out_tile = t.store.acquireTileMut(t.out, ti0, ti1) catch |e| {
+                                t.fail(e);
+                                return;
+                            };
+                            defer t.store.releaseMut(out_tile.token);
+                            const out_view = out_tile.bufferView();
+                            if (out_view.dtype != .f32) {
                                 t.fail(BackendError.InvalidArgument);
                                 return;
                             }
@@ -1102,6 +1275,10 @@ fn softmaxRank1(
                 store: tensor_store.TensorStore,
                 out_meta: tensor_store.TensorMeta,
                 out: tensor_store.TensorId,
+                // f16 re-reads the input and re-exponentiates here rather than
+                // scaling a parked intermediate, so it needs both of these.
+                a: tensor_store.TensorId,
+                global_max: f32,
                 inv: f32,
                 tc1: usize,
 
@@ -1138,10 +1315,28 @@ fn softmaxRank1(
                             };
                             defer t.store.releaseMut(out_tile.token);
                             const out_view = out_tile.bufferView();
-                            if (out_view.dtype != .f32) {
+                            if (out_view.dtype != t.out_meta.dtype) {
                                 t.fail(BackendError.InvalidArgument);
                                 return;
                             }
+
+                            if (out_view.dtype == .f16) {
+                                const in_tile = t.store.acquireTileConst(t.a, ti0, ti1) catch |e| {
+                                    t.fail(e);
+                                    return;
+                                };
+                                defer t.store.releaseConst(in_tile.token);
+                                const in_view = in_tile.bufferView();
+                                if (in_view.dtype != .f16) {
+                                    t.fail(BackendError.InvalidArgument);
+                                    return;
+                                }
+                                const max_buf: [1]f32 = .{t.global_max};
+                                const sum_buf: [1]f32 = .{1.0 / t.inv};
+                                softmax_kernels.expNormalizeStoreF16(out_view, in_view, max_buf[0..1], sum_buf[0..1], 1);
+                                continue;
+                            }
+
                             var out_slice: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, out_view.bytes);
                             var i: usize = 0;
                             const vec_end: usize = out_slice.len - (out_slice.len % lanes);
@@ -1155,7 +1350,7 @@ fn softmaxRank1(
                 }
             };
 
-            var task_norm: TaskNorm = .{ .store = store, .out_meta = out_meta, .out = out, .inv = inv, .tc1 = tc1 };
+            var task_norm: TaskNorm = .{ .store = store, .out_meta = out_meta, .out = out, .a = a, .global_max = global_max, .inv = inv, .tc1 = tc1 };
             p.parallelForAny(@ptrCast(&task_norm), ti0_total, 1, TaskNorm.runTi0);
             if (task_norm.err_any) |e| return @errorCast(e);
             return;
@@ -1171,9 +1366,12 @@ fn softmaxRank1(
             const in_tile = try store.acquireTileConst(a, ti0, ti1);
             defer store.releaseConst(in_tile.token);
             const in_view = in_tile.bufferView();
-            if (in_view.dtype != .f32) return BackendError.InvalidArgument;
+            if (in_view.dtype != out_meta.dtype) return BackendError.InvalidArgument;
             var max_buf: [1]f32 = .{global_max};
-            softmax_kernels.updateMaxF32(max_buf[0..1], in_view, 1);
+            if (in_view.dtype == .f16)
+                softmax_kernels.updateMaxF16(max_buf[0..1], in_view, 1)
+            else
+                softmax_kernels.updateMaxF32(max_buf[0..1], in_view, 1);
             global_max = max_buf[0];
         }
     }
@@ -1183,21 +1381,27 @@ fn softmaxRank1(
     while (ti0 < ti0_total) : (ti0 += 1) {
         var ti1: usize = 0;
         while (ti1 < tc1) : (ti1 += 1) {
+            const is_f16 = out_meta.dtype == .f16;
             if (ti1 + 1 < tc1) {
                 store.prefetch(a, ti0, ti1 + 1);
-                store.prefetch(out, ti0, ti1 + 1);
+                if (!is_f16) store.prefetch(out, ti0, ti1 + 1);
             }
-            const out_tile = try store.acquireTileMut(out, ti0, ti1);
-            defer store.releaseMut(out_tile.token);
             const in_tile = try store.acquireTileConst(a, ti0, ti1);
             defer store.releaseConst(in_tile.token);
-
-            const out_view = out_tile.bufferView();
             const in_view = in_tile.bufferView();
-            if (out_view.dtype != .f32 or in_view.dtype != .f32) return BackendError.InvalidArgument;
+            if (in_view.dtype != out_meta.dtype) return BackendError.InvalidArgument;
+
             var sum_buf: [1]f32 = .{global_sum};
             const max_buf: [1]f32 = .{global_max};
-            softmax_kernels.expSumStoreF32(sum_buf[0..1], out_view, in_view, max_buf[0..1], 1);
+            if (is_f16) {
+                softmax_kernels.sumExpF16(sum_buf[0..1], in_view, max_buf[0..1], 1);
+            } else {
+                const out_tile = try store.acquireTileMut(out, ti0, ti1);
+                defer store.releaseMut(out_tile.token);
+                const out_view = out_tile.bufferView();
+                if (out_view.dtype != .f32) return BackendError.InvalidArgument;
+                softmax_kernels.expSumStoreF32(sum_buf[0..1], out_view, in_view, max_buf[0..1], 1);
+            }
             global_sum = sum_buf[0];
         }
     }
@@ -1208,11 +1412,25 @@ fn softmaxRank1(
     while (ti0 < ti0_total) : (ti0 += 1) {
         var ti1: usize = 0;
         while (ti1 < tc1) : (ti1 += 1) {
-            if (ti1 + 1 < tc1) store.prefetch(out, ti0, ti1 + 1);
+            if (ti1 + 1 < tc1) {
+                store.prefetch(out, ti0, ti1 + 1);
+                if (out_meta.dtype == .f16) store.prefetch(a, ti0, ti1 + 1);
+            }
             const out_tile = try store.acquireTileMut(out, ti0, ti1);
             defer store.releaseMut(out_tile.token);
             const out_view = out_tile.bufferView();
-            if (out_view.dtype != .f32) return BackendError.InvalidArgument;
+            if (out_view.dtype != out_meta.dtype) return BackendError.InvalidArgument;
+
+            if (out_view.dtype == .f16) {
+                const in_tile = try store.acquireTileConst(a, ti0, ti1);
+                defer store.releaseConst(in_tile.token);
+                const in_view = in_tile.bufferView();
+                if (in_view.dtype != .f16) return BackendError.InvalidArgument;
+                const max_buf: [1]f32 = .{global_max};
+                const sum_buf: [1]f32 = .{global_sum};
+                softmax_kernels.expNormalizeStoreF16(out_view, in_view, max_buf[0..1], sum_buf[0..1], 1);
+                continue;
+            }
 
             var out_slice: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, out_view.bytes);
             const lanes: usize = comptime simd.lanesF32();
@@ -1246,6 +1464,8 @@ fn softmaxTi0(
     @memset(sum_buf[0..tm], 0.0);
 
     const tc1: usize = out_meta.tile_counts[1];
+    const dt = out_meta.dtype;
+    const is_f16: bool = dt == .f16;
 
     // Pass 1: max per row.
     var ti1: usize = 0;
@@ -1254,36 +1474,59 @@ fn softmaxTi0(
         const in_tile = try store.acquireTileConst(a, ti0, ti1);
         defer store.releaseConst(in_tile.token);
         const in_view = in_tile.bufferView();
-        if (in_view.dtype != .f32) return BackendError.InvalidArgument;
-        softmax_kernels.updateMaxF32(max_buf[0..tm], in_view, out_meta.rank);
+        if (in_view.dtype != dt) return BackendError.InvalidArgument;
+        if (is_f16)
+            softmax_kernels.updateMaxF16(max_buf[0..tm], in_view, out_meta.rank)
+        else
+            softmax_kernels.updateMaxF32(max_buf[0..tm], in_view, out_meta.rank);
     }
 
-    // Pass 2: exp(x-max), store to out, accumulate sum.
+    // Pass 2: accumulate sum(exp(x-max)). f32 parks the exponential in `out` on
+    // the way through; f16 must not (see kernels/softmax.zig) and only sums.
     ti1 = 0;
     while (ti1 < tc1) : (ti1 += 1) {
         if (ti1 + 1 < tc1) {
             store.prefetch(a, ti0, ti1 + 1);
-            store.prefetch(out, ti0, ti1 + 1);
+            if (!is_f16) store.prefetch(out, ti0, ti1 + 1);
         }
-        const out_tile = try store.acquireTileMut(out, ti0, ti1);
-        defer store.releaseMut(out_tile.token);
         const in_tile = try store.acquireTileConst(a, ti0, ti1);
         defer store.releaseConst(in_tile.token);
-
-        const out_view = out_tile.bufferView();
         const in_view = in_tile.bufferView();
-        if (out_view.dtype != .f32 or in_view.dtype != .f32) return BackendError.InvalidArgument;
+        if (in_view.dtype != dt) return BackendError.InvalidArgument;
+
+        if (is_f16) {
+            softmax_kernels.sumExpF16(sum_buf[0..tm], in_view, max_buf[0..tm], out_meta.rank);
+            continue;
+        }
+
+        const out_tile = try store.acquireTileMut(out, ti0, ti1);
+        defer store.releaseMut(out_tile.token);
+        const out_view = out_tile.bufferView();
+        if (out_view.dtype != dt) return BackendError.InvalidArgument;
         softmax_kernels.expSumStoreF32(sum_buf[0..tm], out_view, in_view, max_buf[0..tm], out_meta.rank);
     }
 
-    // Pass 3: normalize.
+    // Pass 3: f32 scales the parked exponential in place; f16 recomputes it and
+    // writes the finished probability, rounding to f16 exactly once.
     ti1 = 0;
     while (ti1 < tc1) : (ti1 += 1) {
-        if (ti1 + 1 < tc1) store.prefetch(out, ti0, ti1 + 1);
+        if (ti1 + 1 < tc1) {
+            store.prefetch(out, ti0, ti1 + 1);
+            if (is_f16) store.prefetch(a, ti0, ti1 + 1);
+        }
         const out_tile = try store.acquireTileMut(out, ti0, ti1);
         defer store.releaseMut(out_tile.token);
         const out_view = out_tile.bufferView();
-        if (out_view.dtype != .f32) return BackendError.InvalidArgument;
-        softmax_kernels.normalizeF32(out_view, sum_buf[0..tm], out_meta.rank);
+        if (out_view.dtype != dt) return BackendError.InvalidArgument;
+
+        if (is_f16) {
+            const in_tile = try store.acquireTileConst(a, ti0, ti1);
+            defer store.releaseConst(in_tile.token);
+            const in_view = in_tile.bufferView();
+            if (in_view.dtype != dt) return BackendError.InvalidArgument;
+            softmax_kernels.expNormalizeStoreF16(out_view, in_view, max_buf[0..tm], sum_buf[0..tm], out_meta.rank);
+        } else {
+            softmax_kernels.normalizeF32(out_view, sum_buf[0..tm], out_meta.rank);
+        }
     }
 }

@@ -337,8 +337,8 @@ typedef enum AionBinaryOp {
     AION_BINARY_GT = 7,
     AION_BINARY_LE = 8,
     AION_BINARY_GE = 9,
-    /* Gated activation: elemwise.act(a) * b — GEGLU/SwiGLU/GLU/ReGLU. */
-    AION_BINARY_GATE = 10,
+    /* 10 was AION_BINARY_GATE, retired: a gated activation is the unary and the
+       multiply the author writes; fusing them is a compile-time schedule. */
 } AionBinaryOp;
 
 typedef enum AionReduceOp {
@@ -388,8 +388,8 @@ typedef enum AionOp {
     AION_OP_CAST = 24,
     AION_OP_ARGMAX = 25,
     AION_OP_SCATTER_ROW = 26,
-    /* 27 was AION_OP_GELU_MUL, retired: use AION_OP_ELEMWISE with
-       elemwise.op = AION_BINARY_GATE and elemwise.act naming the activation. */
+    /* 27 was AION_OP_GELU_MUL, retired: a gated activation is an AION_OP_UNARY and
+       an AION_OP_ELEMWISE multiply, fused at compile time where a kernel applies. */
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
@@ -398,7 +398,7 @@ typedef enum AionOp {
 // Per-op attributes. Only the member matching AionOpSpec.op is read.
 typedef union AionOpAttr {
     struct { float alpha; float beta; } matmul;
-    struct { AionBinaryOp op; AionUnaryOp act; } elemwise;
+    struct { AionBinaryOp op; } elemwise;
     struct { AionUnaryOp op; } unary;
     struct { int32_t axis; } softmax;
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;

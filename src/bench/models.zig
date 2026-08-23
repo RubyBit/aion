@@ -567,7 +567,7 @@ pub fn gemma4E2BDecode(
         const ff_in = try ctx.rms(x, embed);
         const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
         const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
-        const act = try g.addGate(.gelu, gate, up);
+        const act = try g.addElemwiseBinary(.mul, try g.addUnary(.gelu, gate), up);
         const ff = try g.addMatMul(act, try ctx.weight(ffn, embed), 1.0, 0.0);
         x = try g.addElemwiseBinary(.add, x, try ctx.rms(ff, embed));
 

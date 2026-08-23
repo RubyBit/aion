@@ -2,7 +2,9 @@
 //
 //! Fused LSTM cell execution for the GPU backend (kernels/lstm.wgsl): one
 //! thread per (batch, hidden) element computes all four gates and writes the
-//! [h_t | c_t] state row. v1: f32, every operand a single packed tile.
+//! [h_t | c_t] state row. f32 or f16 storage — the gates, the activations and
+//! the cell update are f32 either way, so the dtype only picks an entry point.
+//! Every operand must be a single packed tile and share the cell's dtype.
 //!
 //! Numerics note: the CPU exec uses sigmoid/tanh fast approximations; the GPU
 //! uses exact builtins — CPU-vs-GPU comparisons need a ~1e-3 tolerance.
@@ -12,6 +14,7 @@ const wgpu = @import("../wgpu.zig");
 const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const backend_mod = @import("../../backend.zig");
+const types = @import("../../types.zig");
 const executable = @import("../../../runtime/executable.zig");
 const device_store = @import("../../../runtime/device_store.zig");
 
@@ -20,6 +23,11 @@ const Ctx = context.Ctx;
 const Frame = @import("../frame.zig").Frame;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const KernelDesc = pipelines.KernelDesc;
+
+/// Scalar size of the cell's storage dtype. Only `.f32` and `.f16` reach here.
+fn elemBytes(dtype: types.DType) usize {
+    return if (dtype == .f16) 2 else 4;
+}
 
 const lstm_kernel: KernelDesc = .{ .name = "lstm", .wgsl = @embedFile("../kernels/lstm.wgsl") };
 
@@ -37,16 +45,18 @@ const LstmParams = extern struct {
     _p2: u32 = 0,
 };
 
-/// Acquire tensor `id`'s single packed f32 tile (Unsupported otherwise).
+/// Acquire tensor `id`'s single packed tile of `dtype` (Unsupported otherwise).
 /// Caller releases via `hs.releaseConst(tile.token)`.
-fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize) ExecuteProgramError!device_store.TileRef {
+fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize, dtype: types.DType) ExecuteProgramError!device_store.TileRef {
     const hs = ctx.store;
     const meta = hs.meta(id) catch return error.ExecutionFailed;
-    if (meta.dtype != .f32 or context.totalTiles(meta) != 1) return error.Unsupported;
+    // Every operand shares the cell's dtype — `infer` requires it, so a mismatch
+    // here is a compiler bug rather than input.
+    if (meta.dtype != dtype or context.totalTiles(meta) != 1) return error.Unsupported;
     const t = ctx.store.acquireTileDeviceConstLinear(id, 0) catch return error.ExecutionFailed;
     errdefer hs.releaseConst(t.token);
     const rank: usize = @as(usize, t.rank);
-    const n = context.packedElems(t.rank, t.shape_mem[0..rank], t.strides_mem[0..rank]) orelse return error.Unsupported;
+    const n = context.packedElemsSized(t.rank, t.shape_mem[0..rank], t.strides_mem[0..rank], elemBytes(dtype)) orelse return error.Unsupported;
     if (n < min_elems) return error.Unsupported;
     if (!context.storageBindingFits(ctx, t.len)) return error.Unsupported;
     return t;
@@ -58,7 +68,9 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     const h_meta = hs.meta(s.h_prev) catch return error.ExecutionFailed;
 
-    if (out_meta.dtype != .f32 or out_meta.rank != 2 or x_meta.rank != 2 or h_meta.rank != 2) return error.Unsupported;
+    // f32 and f16 both run the cell in f32 and differ only in storage (lstm.wgsl).
+    const dt = out_meta.dtype;
+    if ((dt != .f32 and dt != .f16) or out_meta.rank != 2 or x_meta.rank != 2 or h_meta.rank != 2) return error.Unsupported;
     if (context.totalTiles(out_meta) != 1) return error.Unsupported;
 
     const batch = x_meta.shape[0];
@@ -70,15 +82,15 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     const has_bias = s.b_ih != null;
     if (has_bias != (s.b_hh != null)) return error.Unsupported;
 
-    const dx = try acquirePackedConst(ctx, s.x, batch * input_size);
+    const dx = try acquirePackedConst(ctx, s.x, batch * input_size, dt);
     defer hs.releaseConst(dx.token);
-    const dh = try acquirePackedConst(ctx, s.h_prev, batch * hidden);
+    const dh = try acquirePackedConst(ctx, s.h_prev, batch * hidden, dt);
     defer hs.releaseConst(dh.token);
-    const dc = try acquirePackedConst(ctx, s.c_prev, batch * hidden);
+    const dc = try acquirePackedConst(ctx, s.c_prev, batch * hidden, dt);
     defer hs.releaseConst(dc.token);
-    const dwih = try acquirePackedConst(ctx, s.w_ih, input_size * gate_dim);
+    const dwih = try acquirePackedConst(ctx, s.w_ih, input_size * gate_dim, dt);
     defer hs.releaseConst(dwih.token);
-    const dwhh = try acquirePackedConst(ctx, s.w_hh, hidden * gate_dim);
+    const dwhh = try acquirePackedConst(ctx, s.w_hh, hidden * gate_dim, dt);
     defer hs.releaseConst(dwhh.token);
 
     var dbih: ?device_store.TileRef = null;
@@ -88,13 +100,13 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         if (dbhh) |t| hs.releaseConst(t.token);
     }
     if (has_bias) {
-        dbih = try acquirePackedConst(ctx, s.b_ih.?, gate_dim);
-        dbhh = try acquirePackedConst(ctx, s.b_hh.?, gate_dim);
+        dbih = try acquirePackedConst(ctx, s.b_ih.?, gate_dim, dt);
+        dbhh = try acquirePackedConst(ctx, s.b_hh.?, gate_dim, dt);
     }
 
     const dout = ctx.store.acquireTileDeviceMutLinear(s.out_state, 0) catch return error.ExecutionFailed;
     defer hs.releaseMut(dout.token);
-    const out_n = context.packedElems(dout.rank, dout.shape_mem[0..2], dout.strides_mem[0..2]) orelse return error.Unsupported;
+    const out_n = context.packedElemsSized(dout.rank, dout.shape_mem[0..2], dout.strides_mem[0..2], elemBytes(dt)) orelse return error.Unsupported;
     if (out_n < batch * hidden * 2) return error.Unsupported;
 
     const total = std.math.cast(u32, batch * hidden) orelse return error.Unsupported;
@@ -105,7 +117,7 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         .has_bias = @intFromBool(has_bias),
         .total = total,
     };
-    const built = try ctx.pipes.get(lstm_kernel, "lstm_cell");
+    const built = try ctx.pipes.get(lstm_kernel, if (dt == .f16) "lstm_cell_f16" else "lstm_cell");
 
     // Dummy bias bindings when absent (never read: has_bias == 0).
     const bih_buf = if (dbih) |t| ctx.devmem.bufferFor(t.handle).? else ctx.devmem.bufferFor(dwih.handle).?;

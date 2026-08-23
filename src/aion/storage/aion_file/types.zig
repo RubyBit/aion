@@ -167,9 +167,9 @@ pub const InputRole = struct {
 
 pub const NodeOp = union(graph_mod.OpTag) {
     MatMul: struct { alpha: f32, beta: f32 },
-    /// `act` is present on disk ONLY when `op == .gate`, so appending the gate op cost
-    /// no record-layout change: a file written before it never carries the extra byte.
-    ElemwiseBinary: struct { op: ElemwiseBinaryOp, act: UnaryOp = .gelu },
+    /// No `act`: `gate` is a step-level schedule (see `graph.Op.ElemwiseBinary`), so a
+    /// gated activation is stored as the `Unary` + `mul` pair the author wrote.
+    ElemwiseBinary: struct { op: ElemwiseBinaryOp },
     Unary: struct { op: UnaryOp },
     Softmax: struct { axis: i32 },
     Conv1D: struct {

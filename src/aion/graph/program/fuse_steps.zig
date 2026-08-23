@@ -8,8 +8,10 @@
 //!
 //!   * A fusion that changes what the model MEANS belongs in the GRAPH, is authored
 //!     directly, and is serialized. It should also be expressible by widening an
-//!     existing op — a gated activation is `ElemwiseBinary{ .op = .gate, .act }`, not an
-//!     op tag of its own.
+//!     existing op — an optional operand or an enum variant, not an
+//!     op tag of its own. A gated activation is NOT one of these: an author writes
+//!     `act(a) * b`, so folding it into one kernel changes nothing about meaning and
+//!     belongs below, not in the graph.
 //!   * A fusion that leaves the meaning alone and changes only HOW it is scheduled
 //!     belongs HERE, and must never reach the graph or the file — otherwise a `.aion`
 //!     stops being target-neutral and one file could no longer compile to a different
@@ -185,10 +187,12 @@ fn fuseAddNorm(
 /// `UnaryTiled(act)` whose only reader is an identical-shape `mul` ⇒ the mul becomes
 /// `ElemwiseBinaryTiled{ .op = .gate, .act }` and the unary is dropped.
 ///
-/// A gated FFN block authored through `nn.GatedMLP` already emits one `gate` node, so
-/// this fires only for graphs that spell the gate out — hand-built ones, and any converter
-/// that writes `mul(unary(g), u)` directly. It generalizes over the activation because
-/// `gate` does: GEGLU, SwiGLU, GLU and ReGLU are one op with one parameter.
+/// This is the ONLY place a gate exists. There is no gate op and no gate helper:
+/// `nn.GatedMLP` writes the activation and the multiply, which is what the author
+/// writes and what the `.aion` stores. It generalizes over the activation because the
+/// STEP does: GEGLU, SwiGLU, GLU
+/// and ReGLU are one step with one parameter. Where `fusableGate` declines — an f16 or
+/// a broadcasting gate — the pair simply survives and runs.
 fn fuseGate(
     mgr: *StorageManager,
     prog: *Program,

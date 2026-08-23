@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 
+enable f16;
+
 @group(0) @binding(0) var<storage, read> x: array<f32>;
+// f16 twins of the entry points below. Only the ELEMENT buffers change type:
+// `stats` stays f32, because a partial row statistic is an accumulator and must
+// not be rounded between the reduce and the apply stage.
+@group(0) @binding(0) var<storage, read> xh: array<f16>;
 @group(0) @binding(1) var<storage, read_write> stats: array<f32>;
 @group(0) @binding(2) var<uniform> p: Params;
 
@@ -78,6 +84,46 @@ fn norm_moments_partial(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_in
     var sumsq = 0.0;
     for (var col = lidx; col < p.cols; col += WG) {
         let value = x[base + col];
+        sum += value;
+        sumsq += value * value;
+    }
+    let total = reduce_sum(lidx, sum);
+    let total_sq = reduce_sum(lidx, sumsq);
+    if (lidx == 0u) {
+        let dst = (p.part * p.rows + wid.x) * 2u;
+        stats[dst] = total;
+        stats[dst + 1u] = total_sq;
+    }
+}
+
+@compute @workgroup_size(256)
+fn softmax_max_partial_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    var value = -3.4028235e38;
+    let base = wid.x * p.x_row;
+    for (var col = lidx; col < p.cols; col += WG) { value = max(value, f32(xh[base + col])); }
+    let result = reduce_max(lidx, value);
+    if (lidx == 0u) { stats[p.part * p.rows + wid.x] = result; }
+}
+
+@compute @workgroup_size(256)
+fn softmax_exp_partial_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let row_max = stats[p.stat_base + wid.x * 2u];
+    let base = wid.x * p.x_row;
+    var value = 0.0;
+    for (var col = lidx; col < p.cols; col += WG) {
+        value += expApprox(clamp(f32(xh[base + col]) - row_max, -20.0, 0.0));
+    }
+    let result = reduce_sum(lidx, value);
+    if (lidx == 0u) { stats[p.part * p.rows + wid.x] = result; }
+}
+
+@compute @workgroup_size(256)
+fn norm_moments_partial_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let base = wid.x * p.x_row;
+    var sum = 0.0;
+    var sumsq = 0.0;
+    for (var col = lidx; col < p.cols; col += WG) {
+        let value = f32(xh[base + col]);
         sum += value;
         sumsq += value * value;
     }

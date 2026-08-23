@@ -81,8 +81,35 @@ fn deviceRowView(t: TileRefDevice) ExecuteProgramError!context.RowView {
     return context.rowView(t.rank, t.shape_mem[0..@as(usize, t.rank)], t.strides_mem[0..@as(usize, t.rank)]) orelse error.Unsupported;
 }
 
+/// Row view in the tile's own scalar size, so an f16 tile reports element counts
+/// rather than being rejected for a 2-byte innermost stride.
+fn deviceRowViewDt(t: TileRefDevice, dtype: types.DType) ExecuteProgramError!context.RowView {
+    return context.rowViewSized(t.rank, t.shape_mem[0..@as(usize, t.rank)], t.strides_mem[0..@as(usize, t.rank)], try scalarBytes(dtype)) orelse error.Unsupported;
+}
+
+/// The scalar float dtypes the row-wise kernels accept. Each f16 kernel is an
+/// entry point in the SAME module as its f32 twin, keeps its row statistics in
+/// f32, and rounds only on store — matching the CPU kernels exactly.
+fn scalarBytes(dtype: types.DType) ExecuteProgramError!usize {
+    return switch (dtype) {
+        .f32 => 4,
+        .f16 => 2,
+        else => error.Unsupported,
+    };
+}
+
+fn requireScalarFloat(dtype: types.DType) ExecuteProgramError!void {
+    _ = try scalarBytes(dtype);
+}
+
 fn devicePackedElems(t: TileRefDevice) ExecuteProgramError!u32 {
     return context.packedElems(t.rank, t.shape_mem[0..@as(usize, t.rank)], t.strides_mem[0..@as(usize, t.rank)]) orelse error.Unsupported;
+}
+
+/// `devicePackedElems` in the tile's own scalar size (see `deviceRowViewDt`).
+fn devicePackedElemsDt(t: TileRefDevice, dtype: types.DType) ExecuteProgramError!u32 {
+    const n = context.packedElemsSized(t.rank, t.shape_mem[0..@as(usize, t.rank)], t.strides_mem[0..@as(usize, t.rank)], try scalarBytes(dtype)) orelse return error.Unsupported;
+    return std.math.cast(u32, n) orelse error.Unsupported;
 }
 
 /// Softmax over the last axis. Negative axes were normalized by the graph API;
@@ -90,7 +117,8 @@ fn devicePackedElems(t: TileRefDevice) ExecuteProgramError!u32 {
 pub fn execSoftmax(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled) ExecuteProgramError!void {
     const hs = ctx.store;
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
+    try requireScalarFloat(meta.dtype);
+    if ((hs.meta(s.a) catch return error.ExecutionFailed).dtype != meta.dtype) return error.Unsupported;
 
     const rank: usize = @as(usize, meta.rank);
     var axis: i32 = s.axis;
@@ -98,7 +126,7 @@ pub fn execSoftmax(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled) Exec
     if (axis < 0 or axis != @as(i32, @intCast(rank - 1))) return error.Unsupported; // v1: last axis only
     if (meta.tile_counts[rank - 1] != 1) return execSoftmaxCrossTile(ctx, frame, s, meta, rank);
 
-    const built = try ctx.pipes.get(softmax_kernel, "softmax_row");
+    const built = try ctx.pipes.get(softmax_kernel, if (meta.dtype == .f16) "softmax_row_f16" else "softmax_row");
 
     const total = context.totalTiles(meta);
     var ti: usize = 0;
@@ -111,8 +139,8 @@ pub fn execSoftmax(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled) Exec
         }
         if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
-        const xv = try deviceRowView(dx);
-        const ov = try deviceRowView(dout);
+        const xv = try deviceRowViewDt(dx, meta.dtype);
+        const ov = try deviceRowViewDt(dout, meta.dtype);
         if (xv.rows != ov.rows or xv.cols != ov.cols) return error.Unsupported;
         if (xv.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
 
@@ -133,9 +161,8 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
     const meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const g_meta = hs.meta(s.gamma) catch return error.ExecutionFailed;
     const b_meta = hs.meta(s.beta) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
-    try requireF32(g_meta.dtype);
-    try requireF32(b_meta.dtype);
+    try requireScalarFloat(meta.dtype);
+    if (g_meta.dtype != meta.dtype or b_meta.dtype != meta.dtype) return error.Unsupported;
 
     const rank: usize = @as(usize, meta.rank);
     if (rank < 2) return error.Unsupported;
@@ -145,7 +172,10 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
     if (meta.tile_counts[rank - 1] != 1) return execNormCrossTile(ctx, frame, mode, s, meta, g_meta, b_meta, rank);
     if (g_meta.tile_counts[0] != 1 or b_meta.tile_counts[0] != 1) return error.Unsupported;
 
-    const entry: [:0]const u8 = switch (mode) {
+    const entry: [:0]const u8 = if (meta.dtype == .f16) switch (mode) {
+        .rmsnorm => "rmsnorm_row_f16",
+        .layernorm => "layernorm_row_f16",
+    } else switch (mode) {
         .rmsnorm => "rmsnorm_row",
         .layernorm => "layernorm_row",
     };
@@ -166,8 +196,8 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
         }
         if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
-        const xv = try deviceRowView(dx);
-        const ov = try deviceRowView(dout);
+        const xv = try deviceRowViewDt(dx, meta.dtype);
+        const ov = try deviceRowViewDt(dout, meta.dtype);
         if (xv.rows != ov.rows or xv.cols != ov.cols) return error.Unsupported;
         if (xv.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
         if (dg.shape_mem[0] < xv.cols or db.shape_mem[0] < xv.cols) return error.Unsupported;
@@ -285,16 +315,17 @@ fn execSoftmaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled,
     const hs = ctx.store;
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     const layout = try crossRowLayout(meta, out_meta, rank);
-    const partial_max = try ctx.pipes.get(rowwise_partial_kernel, "softmax_max_partial");
+    const f16_rows = meta.dtype == .f16;
+    const partial_max = try ctx.pipes.get(rowwise_partial_kernel, if (f16_rows) "softmax_max_partial_f16" else "softmax_max_partial");
     const finish_max = try ctx.pipes.get(rowwise_finish_kernel, "softmax_max_finish");
-    const partial_exp = try ctx.pipes.get(rowwise_partial_kernel, "softmax_exp_partial");
+    const partial_exp = try ctx.pipes.get(rowwise_partial_kernel, if (f16_rows) "softmax_exp_partial_f16" else "softmax_exp_partial");
     const finish_sum = try ctx.pipes.get(rowwise_finish_kernel, "softmax_sum_finish");
-    const apply = try ctx.pipes.get(softmax_cross_apply_kernel, "softmax_apply");
+    const apply = try ctx.pipes.get(softmax_cross_apply_kernel, if (f16_rows) "softmax_apply_f16" else "softmax_apply");
 
     var group: usize = 0;
     while (group < layout.groups) : (group += 1) {
         const first = ctx.store.acquireTileDeviceConstLinear(s.a, group * layout.parts) catch return error.ExecutionFailed;
-        const first_view = try deviceRowView(first);
+        const first_view = try deviceRowViewDt(first, meta.dtype);
         hs.releaseConst(first.token);
         const rows = first_view.rows;
         if (rows == 0 or rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
@@ -309,7 +340,7 @@ fn execSoftmaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled,
         while (part < layout.parts) : (part += 1) {
             const dx = ctx.store.acquireTileDeviceConstLinear(s.a, group * layout.parts + part) catch return error.ExecutionFailed;
             defer hs.releaseConst(dx.token);
-            const xv = try deviceRowView(dx);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
             if (xv.rows != rows) return error.Unsupported;
             const params = try crossParams(rows, xv.cols, xv.row_stride, layout.parts, part, part * meta.tile_shape[rank - 1], meta.shape[rank - 1], stat_base);
             const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(dx.handle).?, scratch };
@@ -324,7 +355,7 @@ fn execSoftmaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled,
         while (part < layout.parts) : (part += 1) {
             const dx = ctx.store.acquireTileDeviceConstLinear(s.a, group * layout.parts + part) catch return error.ExecutionFailed;
             defer hs.releaseConst(dx.token);
-            const xv = try deviceRowView(dx);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
             const params = try crossParams(rows, xv.cols, xv.row_stride, layout.parts, part, part * meta.tile_shape[rank - 1], meta.shape[rank - 1], stat_base);
             const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(dx.handle).?, scratch };
             const sizes = [_]u64{ dx.len, scratch_bytes };
@@ -342,8 +373,8 @@ fn execSoftmaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepSoftmaxTiled,
                 hs.releaseConst(dx.token);
                 hs.releaseMut(dout.token);
             }
-            const xv = try deviceRowView(dx);
-            const ov = try deviceRowView(dout);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
+            const ov = try deviceRowViewDt(dout, meta.dtype);
             if (xv.rows != rows or ov.rows != rows or xv.cols != ov.cols) return error.Unsupported;
             var params = try crossParams(rows, xv.cols, xv.row_stride, layout.parts, part, part * meta.tile_shape[rank - 1], meta.shape[rank - 1], stat_base);
             params.o_row = ov.row_stride;
@@ -365,13 +396,14 @@ fn execNormCrossTile(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype, meta: 
     if (!beta_single and b_meta.tile_counts[0] != layout.parts) return error.Unsupported;
     if (g_meta.shape[0] < meta.shape[rank - 1] or b_meta.shape[0] < meta.shape[rank - 1]) return error.Unsupported;
 
-    const partial = try ctx.pipes.get(rowwise_partial_kernel, "norm_moments_partial");
+    const f16_rows = meta.dtype == .f16;
+    const partial = try ctx.pipes.get(rowwise_partial_kernel, if (f16_rows) "norm_moments_partial_f16" else "norm_moments_partial");
     const finish = try ctx.pipes.get(rowwise_finish_kernel, "norm_finish");
-    const apply = try ctx.pipes.get(norm_cross_apply_kernel, "norm_apply");
+    const apply = try ctx.pipes.get(norm_cross_apply_kernel, if (f16_rows) "norm_apply_f16" else "norm_apply");
     var group: usize = 0;
     while (group < layout.groups) : (group += 1) {
         const first = ctx.store.acquireTileDeviceConstLinear(s.x, group * layout.parts) catch return error.ExecutionFailed;
-        const first_view = try deviceRowView(first);
+        const first_view = try deviceRowViewDt(first, meta.dtype);
         hs.releaseConst(first.token);
         const rows = first_view.rows;
         if (rows == 0 or rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
@@ -385,7 +417,7 @@ fn execNormCrossTile(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype, meta: 
         while (part < layout.parts) : (part += 1) {
             const dx = ctx.store.acquireTileDeviceConstLinear(s.x, group * layout.parts + part) catch return error.ExecutionFailed;
             defer hs.releaseConst(dx.token);
-            const xv = try deviceRowView(dx);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
             if (xv.rows != rows) return error.Unsupported;
             const params = try crossParams(rows, xv.cols, xv.row_stride, layout.parts, part, part * meta.tile_shape[rank - 1], meta.shape[rank - 1], stat_base);
             const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(dx.handle).?, scratch };
@@ -411,8 +443,8 @@ fn execNormCrossTile(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype, meta: 
                 hs.releaseConst(db.token);
                 hs.releaseMut(dout.token);
             }
-            const xv = try deviceRowView(dx);
-            const ov = try deviceRowView(dout);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
+            const ov = try deviceRowViewDt(dout, meta.dtype);
             if (xv.rows != rows or ov.rows != rows or xv.cols != ov.cols) return error.Unsupported;
             var params = try crossParams(rows, xv.cols, xv.row_stride, layout.parts, part, if (gamma_single) part * meta.tile_shape[rank - 1] else 0, meta.shape[rank - 1], stat_base);
             params.o_row = ov.row_stride;
@@ -431,10 +463,12 @@ fn execNormCrossTile(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype, meta: 
     }
 }
 
-fn reduceEntry(op: types.ReduceOp) [:0]const u8 {
+/// Entry point for a single-dispatch row reduce: data in, result out, same dtype.
+fn reduceEntry(op: types.ReduceOp, dtype: types.DType) [:0]const u8 {
+    const f16_data = dtype == .f16;
     return switch (op) {
-        .sum => "reduce_sum_row",
-        .mean => "reduce_mean_row",
+        .sum => if (f16_data) "reduce_sum_row_h2h" else "reduce_sum_row",
+        .mean => if (f16_data) "reduce_mean_row_h2h" else "reduce_mean_row",
     };
 }
 
@@ -446,9 +480,12 @@ fn reduceEntry(op: types.ReduceOp) [:0]const u8 {
 pub fn execReduceAll(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll) ExecuteProgramError!void {
     const hs = ctx.store;
     const meta = hs.meta(s.a) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
+    try requireScalarFloat(meta.dtype);
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
-    try requireF32(out_meta.dtype);
+    if (out_meta.dtype != meta.dtype) return error.Unsupported;
+    // Staged reductions keep their partials in f32 whatever the data dtype, so
+    // stage 1 is data->f32 (`_h2f`) and the fold is f32->data (`_f2h`).
+    const f16_data = meta.dtype == .f16;
     const tile_count = context.totalTiles(meta);
     if (context.totalTiles(out_meta) != 1) return error.Unsupported;
     if (tile_count != 1) return execReduceAllCrossTile(ctx, frame, s, tile_count);
@@ -461,7 +498,7 @@ pub fn execReduceAll(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll) Execu
     }
     if (!context.storageBindingFits(ctx, dx.len)) return error.Unsupported;
 
-    const n = try devicePackedElems(dx);
+    const n = try devicePackedElemsDt(dx, meta.dtype);
     const x_buf = ctx.devmem.bufferFor(dx.handle).?;
     const o_buf = ctx.devmem.bufferFor(dout.handle).?;
     const sizes_xo = [_]u64{ dx.len, dout.len };
@@ -472,7 +509,7 @@ pub fn execReduceAll(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll) Execu
     const PER_THREAD: u32 = 32;
     const groups: u32 = @min(context.ceilDiv(n, WG * PER_THREAD), 1024);
     if (groups <= 2) {
-        const built = try ctx.pipes.get(reduce_kernel, reduceEntry(s.op));
+        const built = try ctx.pipes.get(reduce_kernel, reduceEntry(s.op, meta.dtype));
         const bufs = [_]c.WGPUBuffer{ x_buf, o_buf };
         const params: RowParams = .{ .rows = 1, .cols = n, .x_row = 0 };
         try frame.recordCompute(built, &bufs, &sizes_xo, std.mem.asBytes(&params), .{ 1, 1, 1 });
@@ -483,7 +520,7 @@ pub fn execReduceAll(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll) Execu
 
     // Stage 1: partial sums, one f32 per workgroup.
     {
-        const built = try ctx.pipes.get(reduce_kernel, "reduce_all_partial");
+        const built = try ctx.pipes.get(reduce_kernel, if (f16_data) "reduce_all_partial_h2f" else "reduce_all_partial");
         const bufs = [_]c.WGPUBuffer{ x_buf, scratch };
         const sizes = [_]u64{ dx.len, @as(u64, groups) * @sizeOf(f32) };
         const params: RowParams = .{ .rows = 1, .cols = n, .x_row = 0 };
@@ -491,7 +528,10 @@ pub fn execReduceAll(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll) Execu
     }
     // Stage 2: fold the partials; mean divides by the ORIGINAL n (in x_row).
     {
-        const entry: [:0]const u8 = switch (s.op) {
+        const entry: [:0]const u8 = if (f16_data) switch (s.op) {
+            .sum => "reduce_sum_row_f2h",
+            .mean => "reduce_mean_finish_f2h",
+        } else switch (s.op) {
             .sum => "reduce_sum_row",
             .mean => "reduce_mean_finish",
         };
@@ -507,13 +547,17 @@ fn execReduceAllCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll, 
     const hs = ctx.store;
     const WG: u32 = 256;
     const PER_THREAD: u32 = 32;
+    // Partials are f32 for either data dtype (see reduce.wgsl), so stage 1 is
+    // data->f32 and the fold is f32->data.
+    const data_dtype = (hs.meta(s.a) catch return error.ExecutionFailed).dtype;
+    const f16_data = data_dtype == .f16;
 
     var partial_count: usize = 0;
     var logical_count: usize = 0;
     var tile_index: usize = 0;
     while (tile_index < tile_count) : (tile_index += 1) {
         const dx = ctx.store.acquireTileDeviceConstLinear(s.a, tile_index) catch return error.ExecutionFailed;
-        const n = try devicePackedElems(dx);
+        const n = try devicePackedElemsDt(dx, data_dtype);
         hs.releaseConst(dx.token);
         partial_count = std.math.add(usize, partial_count, @min(context.ceilDiv(n, WG * PER_THREAD), 1024)) catch return error.Unsupported;
         logical_count = std.math.add(usize, logical_count, n) catch return error.Unsupported;
@@ -523,14 +567,14 @@ fn execReduceAllCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll, 
     const scratch_bytes: u64 = @as(u64, @intCast(partial_count)) * @sizeOf(f32);
     if (!context.storageBindingFits(ctx, scratch_bytes)) return error.Unsupported;
     const scratch = try ctx.scratch.ensure(ctx.gpu, scratch_bytes);
-    const partial_kernel = try ctx.pipes.get(reduce_kernel, "reduce_all_partial");
+    const partial_kernel = try ctx.pipes.get(reduce_kernel, if (f16_data) "reduce_all_partial_h2f" else "reduce_all_partial");
 
     var partial_base: usize = 0;
     tile_index = 0;
     while (tile_index < tile_count) : (tile_index += 1) {
         const dx = ctx.store.acquireTileDeviceConstLinear(s.a, tile_index) catch return error.ExecutionFailed;
         defer hs.releaseConst(dx.token);
-        const n = try devicePackedElems(dx);
+        const n = try devicePackedElemsDt(dx, data_dtype);
         const groups = @min(context.ceilDiv(n, WG * PER_THREAD), 1024);
         const params: RowParams = .{
             .rows = 1,
@@ -546,7 +590,10 @@ fn execReduceAllCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll, 
 
     const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
     defer hs.releaseMut(dout.token);
-    const finish_entry: [:0]const u8 = switch (s.op) {
+    const finish_entry: [:0]const u8 = if (f16_data) switch (s.op) {
+        .sum => "reduce_sum_row_f2h",
+        .mean => "reduce_mean_finish_f2h",
+    } else switch (s.op) {
         .sum => "reduce_sum_row",
         .mean => "reduce_mean_finish",
     };
@@ -566,7 +613,9 @@ fn execReduceAllCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepReduceAll, 
 pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProgramError!void {
     const hs = ctx.store;
     const meta = hs.meta(s.a) catch return error.ExecutionFailed;
-    try requireF32(meta.dtype);
+    // f32 or f16 in, i32 index out. Widened comparison preserves f16 ordering and
+    // the lowest-index tie-break, so both dtypes pick the same column.
+    try requireScalarFloat(meta.dtype);
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     if (out_meta.dtype != .i32) return error.Unsupported;
 
@@ -577,7 +626,7 @@ pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProg
     if (input_tiles != 1) return execArgMaxCrossTile(ctx, frame, s, meta, out_meta, rank, input_tiles, output_tiles);
     if (output_tiles != 1) return error.Unsupported;
 
-    const built = try ctx.pipes.get(argmax_kernel, "argmax_row");
+    const built = try ctx.pipes.get(argmax_kernel, if (meta.dtype == .f16) "argmax_row_f16" else "argmax_row");
 
     const dx = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
     const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
@@ -587,7 +636,7 @@ pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProg
     }
     if (!context.storageBindingFits(ctx, dx.len)) return error.Unsupported;
 
-    const xv = try deviceRowView(dx);
+    const xv = try deviceRowViewDt(dx, meta.dtype);
     const out_rank: usize = @as(usize, dout.rank);
     const out_n = context.packedElemsSized(dout.rank, dout.shape_mem[0..out_rank], dout.strides_mem[0..out_rank], @sizeOf(i32)) orelse return error.Unsupported;
     if (out_n != xv.rows) return error.Unsupported;
@@ -605,7 +654,7 @@ pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProg
         const entries: u64 = @as(u64, xv.rows) * segs;
         const scratch = try ctx.scratch.ensure(ctx.gpu, entries * 2 * @sizeOf(f32));
         {
-            const b1 = try ctx.pipes.get(argmax_kernel, "argmax_partial");
+            const b1 = try ctx.pipes.get(argmax_kernel, if (meta.dtype == .f16) "argmax_partial_f16" else "argmax_partial");
             const bufs = [_]c.WGPUBuffer{ x_buf, scratch };
             const sizes = [_]u64{ dx.len, entries * 2 * @sizeOf(f32) };
             const params: RowParams = .{ .rows = xv.rows, .cols = xv.cols, .x_row = xv.row_stride, .o_row = SEG_COLS };
@@ -658,7 +707,7 @@ fn execArgMaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepArgMax, meta: 
         while (part < parts) : (part += 1) {
             const dx = ctx.store.acquireTileDeviceConstLinear(s.a, group * parts + part) catch return error.ExecutionFailed;
             defer hs.releaseConst(dx.token);
-            const xv = try deviceRowView(dx);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
             if (xv.rows != rows) return error.Unsupported;
             const params: ArgmaxCrossParams = .{
                 .rows = rows,
@@ -692,7 +741,7 @@ pub fn execReduceAxis(ctx: Ctx, frame: *Frame, s: executable.StepReduceAxis) Exe
     const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
     if (meta.dtype != out_meta.dtype) return error.Unsupported;
     switch (meta.dtype) {
-        .f32 => {},
+        .f32, .f16 => {},
         .i32 => if (s.op != .sum) return error.Unsupported,
         else => return error.Unsupported,
     }
@@ -702,7 +751,9 @@ pub fn execReduceAxis(ctx: Ctx, frame: *Frame, s: executable.StepReduceAxis) Exe
     const input_tiles = context.totalTiles(meta);
     const output_tiles = context.totalTiles(out_meta);
     if (input_tiles != 1) {
-        if (meta.dtype != .f32) return error.Unsupported;
+        // i32 has no staged path (its partials would need an i32 scratch); f32 and
+        // f16 both stage through f32 partials.
+        if (meta.dtype == .i32) return error.Unsupported;
         return execReduceAxisCrossTile(ctx, frame, s, meta, out_meta, rank, input_tiles, output_tiles);
     }
     if (output_tiles != 1) return error.Unsupported;
@@ -710,7 +761,7 @@ pub fn execReduceAxis(ctx: Ctx, frame: *Frame, s: executable.StepReduceAxis) Exe
     const built = if (meta.dtype == .i32)
         try ctx.pipes.get(reduce_i32_kernel, "reduce_sum_row")
     else
-        try ctx.pipes.get(reduce_kernel, reduceEntry(s.op));
+        try ctx.pipes.get(reduce_kernel, reduceEntry(s.op, meta.dtype));
 
     const dx = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
     const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
@@ -720,8 +771,12 @@ pub fn execReduceAxis(ctx: Ctx, frame: *Frame, s: executable.StepReduceAxis) Exe
     }
     if (!context.storageBindingFits(ctx, dx.len)) return error.Unsupported;
 
-    const xv = try deviceRowView(dx);
-    const out_n = try devicePackedElems(dout);
+    const xv = if (meta.dtype == .i32) try deviceRowView(dx) else try deviceRowViewDt(dx, meta.dtype);
+    // i32 sum uses the same 4-byte row layout as f32. Keep it out of
+    // `scalarBytes`, which intentionally accepts only floating-point dtypes for
+    // the f16/f32 row-wise kernels above.
+    const out_elem_bytes: usize = if (out_meta.dtype == .i32) @sizeOf(i32) else try scalarBytes(out_meta.dtype);
+    const out_n = context.packedElemsSized(dout.rank, dout.shape_mem[0..@as(usize, dout.rank)], dout.strides_mem[0..@as(usize, dout.rank)], out_elem_bytes) orelse return error.Unsupported;
     if (out_n != xv.rows) return error.Unsupported;
     if (xv.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
 
@@ -760,8 +815,14 @@ fn execReduceAxisCrossTile(
         if (out_meta.tile_counts[d] != meta.tile_counts[d]) return error.Unsupported;
     }
 
-    const partial = try ctx.pipes.get(reduce_kernel, "reduce_sum_row");
-    const finish = try ctx.pipes.get(reduce_kernel, switch (s.op) {
+    // Stage 1 writes f32 partials whatever the data dtype; the fold writes back in
+    // the tensor dtype.
+    const f16_data = meta.dtype == .f16;
+    const partial = try ctx.pipes.get(reduce_kernel, if (f16_data) "reduce_sum_row_h2f" else "reduce_sum_row");
+    const finish = try ctx.pipes.get(reduce_kernel, if (f16_data) switch (s.op) {
+        .sum => "reduce_parts_sum_f2h",
+        .mean => "reduce_parts_mean_f2h",
+    } else switch (s.op) {
         .sum => "reduce_parts_sum",
         .mean => "reduce_parts_mean",
     });
@@ -770,7 +831,7 @@ fn execReduceAxisCrossTile(
     while (group < row_groups) : (group += 1) {
         const dout = ctx.store.acquireTileDeviceMutLinear(s.out, group) catch return error.ExecutionFailed;
         defer hs.releaseMut(dout.token);
-        const rows = try devicePackedElems(dout);
+        const rows = try devicePackedElemsDt(dout, meta.dtype);
         if (rows == 0 or rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
 
         const scratch_bytes: u64 = @as(u64, rows) * @as(u64, @intCast(parts)) * @sizeOf(f32);
@@ -783,7 +844,7 @@ fn execReduceAxisCrossTile(
             const dx = ctx.store.acquireTileDeviceConstLinear(s.a, input_index) catch return error.ExecutionFailed;
             defer hs.releaseConst(dx.token);
             if (!context.storageBindingFits(ctx, dx.len)) return error.Unsupported;
-            const xv = try deviceRowView(dx);
+            const xv = try deviceRowViewDt(dx, meta.dtype);
             if (xv.rows != rows) return error.Unsupported;
 
             const params: RowParams = .{

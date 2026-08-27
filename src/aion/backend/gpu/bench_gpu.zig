@@ -115,7 +115,7 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (std.mem.eql(u8, arg, "--ablate-scales")) a.model.ablate.scales = true;
     if (std.mem.eql(u8, arg, "--ablate-rope")) a.model.ablate.rope = true;
     if (std.mem.eql(u8, arg, "--ablate-kv")) a.model.ablate.kv_write = true;
-    if (std.mem.eql(u8, arg, "--no-hfuse")) a.model.opt.fuse_horizontal_matmul = false;
+    if (std.mem.eql(u8, arg, "--no-hfuse")) a.model.disable.insert(.horizontal_matmul);
     if (valueFor(arg, "--mn-cap", it)) |v| a.mn_cap = std.fmt.parseInt(usize, v, 10) catch 0;
     if (valueFor(arg, "--k-cap", it)) |v| a.k_cap = std.fmt.parseInt(usize, v, 10) catch 0;
     if (std.mem.eql(u8, arg, "--high")) a.opts.power = .high;
@@ -131,7 +131,7 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
 // quantized table stays one unbindable tile -- the bench then measures a tiling
 // production never uses (and, for the 2.5 GB per-layer table, fails outright).
 // `openDevice` fills it in; nothing may build a program before that runs.
-var gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.{ .kind = .webgpu });
+var gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.webgpu);
 // Representative CPU tiling (matches bench_cpu.zig's defaultTilePolicy): the CPU
 // kernels are cache-blocked and reject GPU-sized tiles, so each backend is timed on
 // its own appropriate tiling — the fair comparison.
@@ -139,10 +139,10 @@ const cpu_policy: plan.TilePolicy = .{ .base_square_2d = 256, .base_1d = 256, .q
 
 /// Build `C = A @ B` over [m,k] @ [k,n] f32 with the given tile policy. Returns the
 /// compiled program + the output tensor id.
-fn buildMatMul(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePolicy, m: usize, n: usize, k: usize) !struct { prog: aion.program.Program, out: TensorId } {
-    const tiles = plan.chooseMatMulTiles(policy, m, n, k, .f32);
-    const a_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const b_id = try mgr.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+fn buildMatMul(alloc: std.mem.Allocator, mgr: *StorageManager, target: aion.program.Target, m: usize, n: usize, k: usize) !struct { prog: aion.program.Program, out: TensorId } {
+    const tiles = plan.chooseMatMulTiles(target.tiles, m, n, k, .f32);
+    const a_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = target.tiles.tile_alignment });
+    const b_id = try mgr.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = target.tiles.tile_alignment });
 
     const a_data = try alloc.alloc(f32, m * k);
     defer alloc.free(a_data);
@@ -162,7 +162,7 @@ fn buildMatMul(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.Tile
     const cv = try g.addMatMul(av, bv, 1.0, 0.0);
     try g.setOutputs(&[_]aion.graph.ValueId{cv});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -198,29 +198,29 @@ fn opBytes(kind: OpKind, m: usize, n: usize) f64 {
 /// Build one benchmark op over an [m,n] input with `policy`-appropriate tiling
 /// (softmax/norm lowering inherits the bound input's tiles, so the input must be
 /// created with the same chooser the compiler would use).
-fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePolicy, kind: OpKind, m: usize, n: usize) !struct { prog: aion.program.Program, out: TensorId } {
+fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, target: aion.program.Target, kind: OpKind, m: usize, n: usize) !struct { prog: aion.program.Program, out: TensorId } {
     var g = Graph.init(alloc);
     defer g.deinit();
 
     const tile2: [2]usize = switch (kind) {
         .softmax => blk: {
-            const t = plan.chooseSoftmaxTiles(policy, m, n);
+            const t = plan.chooseSoftmaxTiles(target.tiles, m, n);
             break :blk .{ t.tm, t.tn };
         },
         .rmsnorm, .layernorm => blk: {
-            const t = plan.chooseNormTiles(policy, m, n);
+            const t = plan.chooseNormTiles(target.tiles, m, n);
             break :blk .{ t.tm, t.tn };
         },
-        else => plan.chooseTileShape2DSquare(policy, m, n),
+        else => plan.chooseTileShape2DSquare(target.tiles, m, n),
     };
-    const x_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, n }, &tile2, .{ .tile_alignment = policy.tile_alignment });
+    const x_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, n }, &tile2, .{ .tile_alignment = target.tiles.tile_alignment });
     try fillTensor(alloc, mgr, x_id, m * n, 1);
     const xv = try g.addInput(.f32, &[_]usize{ m, n });
     try g.bindExternal(xv, x_id);
 
     const out_v = switch (kind) {
         .add => blk: {
-            const y_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, n }, &tile2, .{ .tile_alignment = policy.tile_alignment });
+            const y_id = try mgr.createTiledTensor(.f32, &[_]usize{ m, n }, &tile2, .{ .tile_alignment = target.tiles.tile_alignment });
             try fillTensor(alloc, mgr, y_id, m * n, 2);
             const yv = try g.addInput(.f32, &[_]usize{ m, n });
             try g.bindExternal(yv, y_id);
@@ -228,7 +228,7 @@ fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePoli
         },
         .silu => try g.addUnary(.silu, xv),
         .suffix_mul => blk: {
-            const b_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{tile2[1]}, .{ .tile_alignment = policy.tile_alignment });
+            const b_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{tile2[1]}, .{ .tile_alignment = target.tiles.tile_alignment });
             try fillTensor(alloc, mgr, b_id, n, 3);
             const bv = try g.addInput(.f32, &[_]usize{n});
             try g.bindExternal(bv, b_id);
@@ -236,9 +236,9 @@ fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePoli
         },
         .softmax => try g.addSoftmax(xv, -1),
         .rmsnorm, .layernorm => blk: {
-            const t1 = plan.chooseTileShape1D(policy, n);
-            const g_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &t1, .{ .tile_alignment = policy.tile_alignment });
-            const b_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &t1, .{ .tile_alignment = policy.tile_alignment });
+            const t1 = plan.chooseTileShape1D(target.tiles, n);
+            const g_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &t1, .{ .tile_alignment = target.tiles.tile_alignment });
+            const b_id = try mgr.createTiledTensor(.f32, &[_]usize{n}, &t1, .{ .tile_alignment = target.tiles.tile_alignment });
             try fillTensor(alloc, mgr, g_id, n, 4);
             try fillTensor(alloc, mgr, b_id, n, 5);
             const gv = try g.addInput(.f32, &[_]usize{n});
@@ -253,7 +253,7 @@ fn buildOp(alloc: std.mem.Allocator, mgr: *StorageManager, policy: plan.TilePoli
     };
     try g.setOutputs(&[_]aion.graph.ValueId{out_v});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -268,7 +268,7 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
         cpu_out = try alloc.alloc(f32, a.m * a.n);
         var mgr = StorageManager.init(alloc);
         defer mgr.deinit();
-        var built = try buildOp(alloc, &mgr, cpu_policy, kind, a.m, a.n);
+        var built = try buildOp(alloc, &mgr, .cpu(cpu_policy), kind, a.m, a.n);
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
@@ -280,7 +280,7 @@ fn benchOp(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, kind: OpKind)
     // and dies with the session, so there's no stale-pointer hazard to reset.
     var mgr = StorageManager.init(alloc);
     defer mgr.deinit();
-    var built = try buildOp(alloc, &mgr, gpu_policy, kind, a.m, a.n);
+    var built = try buildOp(alloc, &mgr, .init(.{ .kind = .gpu }, gpu_policy), kind, a.m, a.n);
     defer built.prog.deinit();
     var session = try gpuSession(gb, &mgr, &built.prog);
     defer session.deinit();
@@ -385,7 +385,7 @@ fn buildNt(alloc: std.mem.Allocator, mgr: *StorageManager, q8: bool, m: usize, n
 
     const cv = try g.addMatMulNT(av, bv, 1.0, 0.0);
     try g.setOutputs(&[_]aion.graph.ValueId{cv});
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -517,7 +517,7 @@ fn buildDecode(alloc: std.mem.Allocator, mgr: *StorageManager, n: usize, k: usiz
 
     const cv = try g.addMatMul(av, bv, 1.0, 0.0);
     try g.setOutputs(&[_]aion.graph.ValueId{cv});
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -575,7 +575,7 @@ fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: u
     }
     try g.setOutputs(outputs.items);
 
-    var prog = try aion.program.compileGraphOpt(alloc, &g, &mgr, gpu_policy, .{ .fuse_horizontal_matmul = false });
+    var prog = try aion.program.compileGraph(alloc, &g, &mgr, aion.program.Target.init(.{ .kind = .gpu }, gpu_policy).withPasses(.empty));
     defer prog.deinit();
     var session = try gpuSession(gb, &mgr, &prog);
     defer session.deinit();
@@ -685,7 +685,7 @@ fn runToken(alloc: std.mem.Allocator, a: Args) !void {
     // to the host lazily, so nothing there would ever block on the GPU -- it would
     // time CPU submits and report a per-token figure FASTER than the kernel itself.
     // A greedy decode loop reads the token every step, so read it every step.
-    const e2e_ns = try timeDecodeLoop(session, &built.prog, &mgr, built.out, a.iters);
+    const e2e_ns = try timeDecodeLoop(alloc, session, &built.prog, &mgr, built.out, a.iters);
 
     bk.report(.{
         .label = "decode/token",
@@ -968,20 +968,23 @@ fn timeGpuKernel(gb: *gpu.GpuBackend, session: aion.backend.Session, prog: *cons
 /// whose only output is an argmax index -- outputs mirror lazily, so it would never
 /// block and would report a per-token time faster than the kernel time.
 fn timeDecodeLoop(
+    alloc: std.mem.Allocator,
     session: aion.backend.Session,
     prog: *const aion.program.Program,
     mgr: *StorageManager,
     out_id: TensorId,
     iters: usize,
 ) !u64 {
-    var scratch: [16]u8 = undefined;
+    // Sized from the tensor: with --seq N the sampled output is N tokens, not one.
+    const buf = try alloc.alloc(u8, try mgr.tensorLogicalBackingBytes(out_id));
+    defer alloc.free(buf);
     try session.execute(prog); // warmup
-    try mgr.readPackedAtPlacement(out_id, scratch[0..4]);
+    try mgr.readPackedAtPlacement(out_id, buf);
     const start = nowNs();
     var i: usize = 0;
     while (i < iters) : (i += 1) {
         try session.execute(prog);
-        try mgr.readPackedAtPlacement(out_id, scratch[0..4]);
+        try mgr.readPackedAtPlacement(out_id, buf);
     }
     return nowNs() - start;
 }
@@ -1054,7 +1057,7 @@ fn run(args: std.process.Args) !void {
     if (!a.gpu_only) {
         var mgr = StorageManager.init(alloc);
         defer mgr.deinit();
-        var built = try buildMatMul(alloc, &mgr, cpu_policy, a.m, a.n, a.k);
+        var built = try buildMatMul(alloc, &mgr, .cpu(cpu_policy), a.m, a.n, a.k);
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
@@ -1077,7 +1080,7 @@ fn run(args: std.process.Args) !void {
     {
         var mgr = StorageManager.init(alloc);
         defer mgr.deinit();
-        var built = try buildMatMul(alloc, &mgr, gpu_policy, a.m, a.n, a.k);
+        var built = try buildMatMul(alloc, &mgr, .init(.{ .kind = .gpu }, gpu_policy), a.m, a.n, a.k);
         defer built.prog.deinit();
         var session = try gpuSession(&gb, &mgr, &built.prog);
         defer session.deinit();

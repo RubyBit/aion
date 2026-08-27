@@ -17,6 +17,7 @@ pub const graph = @import("aion/graph/graph.zig");
 pub const infer = @import("aion/graph/infer.zig");
 pub const plan = @import("aion/graph/plan.zig");
 pub const program = @import("aion/graph/program.zig");
+pub const opt = @import("aion/graph/opt.zig");
 
 /// High-level, user-friendly API (graph-first under the hood, but graph-hidden).
 pub const api = @import("aion/api/api.zig");

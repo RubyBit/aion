@@ -81,7 +81,10 @@ pub const Builder = struct {
     // `tensor` is the view op's *output* value; `axis` indexes the attr dim; the
     // concrete attr value at that axis is the authoring placeholder. Emitted as a
     // dim-symbol expr term at export (the symbol must also be an input dim symbol).
-    view_dim_symbols: std.ArrayList(DimSymbol) = .empty,
+    /// Declared dim-symbol names, deduplicated. An op's free axis stores an INDEX into
+    /// this, which is also the index of its `dim_expr` once the graph is collected — so a
+    /// symbolic attribute needs no side table to travel with it.
+    symbol_names: std.ArrayList([]const u8) = .empty,
 
     const Self = @This();
 
@@ -124,7 +127,7 @@ pub const Builder = struct {
             .root_counter = 0,
             .auto_scope_counts = .{},
             .dim_symbols = .empty,
-            .view_dim_symbols = .empty,
+            .symbol_names = .empty,
         };
     }
 
@@ -138,7 +141,7 @@ pub const Builder = struct {
         self.scope_counters.deinit(self.allocator);
         self.value_names.deinit(self.allocator);
         self.dim_symbols.deinit(self.allocator);
-        self.view_dim_symbols.deinit(self.allocator);
+        self.symbol_names.deinit(self.allocator);
         self.graph.deinit();
         self.* = undefined;
     }
@@ -149,6 +152,7 @@ pub const Builder = struct {
     pub fn symbolicDim(self: *Self, t: TensorRef, axis: usize, sym_name: []const u8) Error!void {
         const name_copy: []u8 = self.graph.arenaAlloc().alloc(u8, sym_name.len) catch return Error.OutOfMemory;
         @memcpy(name_copy, sym_name);
+        _ = try self.internSymbol(name_copy);
         self.dim_symbols.append(self.allocator, .{ .tensor = t, .axis = axis, .name = name_copy }) catch return Error.OutOfMemory;
         // Also record it on the value itself, which is what carries the symbol down
         // the graph: inference propagates a value's symbols to everything derived
@@ -218,21 +222,43 @@ pub const Builder = struct {
         return self.dim_symbols.items;
     }
 
-    /// Symbolic dims used in view-op attributes (read by `export`).
-    pub fn viewDimSymbols(self: *const Self) []const DimSymbol {
-        return self.view_dim_symbols.items;
+    /// The index of `name` in the interned list, adding it if new. Declaration order, so
+    /// it matches the `dim_exprs` table the collector emits.
+    fn internSymbol(self: *Self, sym_name: []const u8) Error!u32 {
+        if (self.symbolIndex(sym_name)) |idx| return idx;
+        const idx: u32 = @intCast(self.symbol_names.items.len);
+        self.symbol_names.append(self.allocator, sym_name) catch return Error.OutOfMemory;
+        return idx;
     }
 
-    fn recordViewSymbols(self: *Self, out: TensorRef, symbols: []const ?[]const u8) Error!void {
-        for (symbols, 0..) |maybe_name, axis| {
-            const sym_name = maybe_name orelse continue;
-            const name_copy: []u8 = self.graph.arenaAlloc().alloc(u8, sym_name.len) catch return Error.OutOfMemory;
-            @memcpy(name_copy, sym_name);
-            self.view_dim_symbols.append(self.allocator, .{ .tensor = out, .axis = axis, .name = name_copy }) catch return Error.OutOfMemory;
-            // A view's sizes come from its attribute, so inference cannot re-derive
-            // which of them are free and leaves the value's symbols alone (`.keep`).
-            // Recording them here is what keeps the chain unbroken across a reshape.
-            try self.setValueDimSymbol(out, axis, name_copy);
+    pub fn symbolIndex(self: *const Self, sym_name: []const u8) ?u32 {
+        for (self.symbol_names.items, 0..) |existing, idx| {
+            if (std.mem.eql(u8, existing, sym_name)) return @intCast(idx);
+        }
+        return null;
+    }
+
+    pub fn symbolNames(self: *const Self) []const []const u8 {
+        return self.symbol_names.items;
+    }
+
+    /// Resolve an attribute's per-axis symbol NAMES to the dim-expression indices an op
+    /// stores, and propagate each name onto the output value.
+    ///
+    ///
+    /// A view's sizes come from its attribute, so inference cannot re-derive which of them
+    /// are free and leaves the value's symbols alone (`.keep`). Recording them on the
+    /// value is what keeps the chain unbroken across a reshape.
+    fn attrSymbols(self: *Self, out: TensorRef, names: []const ?[]const u8, dst: []?u32) Error!void {
+        for (names, 0..) |maybe_name, axis| {
+            const sym_name = maybe_name orelse {
+                dst[axis] = null;
+                continue;
+            };
+            // Only a name some input axis already declared: a view cannot introduce a free
+            // dim out of nothing, because nothing would bind it at run time.
+            dst[axis] = self.symbolIndex(sym_name) orelse return Error.InvalidArgument;
+            try self.setValueDimSymbol(out, axis, sym_name);
         }
     }
 
@@ -952,9 +978,25 @@ pub const Builder = struct {
     /// authoring placeholder; `symbols[i]`, if non-null, names a dim symbol that
     /// axis takes at runtime (emitted as a symbolic term at export).
     pub fn reshapeSym(self: *Self, a: TensorRef, new_shape: []const usize, symbols: []const ?[]const u8) Error!TensorRef {
-        const ref = try self.reshape(a, new_shape);
-        try self.recordViewSymbols(ref, symbols);
+        if (symbols.len != new_shape.len) return Error.InvalidArgument;
+        var idx_buf: [graph_mod.Graph.MAX_RANK]?u32 = @splat(null);
+        if (new_shape.len > idx_buf.len) return Error.InvalidArgument;
+        const out: ValueId = try self.graph.addViewReshapeSym(a.value, new_shape, idx_buf[0..new_shape.len]);
+        const ref: TensorRef = .{ .value = out };
+        // Name (and so infer) first: attaching a symbol to an axis reads the value's
+        // shape, which the placeholder sizes have not produced yet.
+        try self.autoNameIfUnnamed(out, "reshape");
+        try self.attrSymbols(ref, symbols, idx_buf[0..new_shape.len]);
+        try self.setViewFreeDims(out, idx_buf[0..new_shape.len]);
         return ref;
+    }
+
+    /// Copy the resolved expression indices into the op the graph now owns.
+    fn setViewFreeDims(self: *Self, out: ValueId, free_dims: []const ?u32) Error!void {
+        const node = self.graph.mutableNodeFor(out) orelse return Error.InvalidArgument;
+        const attr = graph_mod.symbolicAttr(&node.op) orelse return Error.InvalidArgument;
+        if (attr.free_dims.len != free_dims.len) return Error.InvalidArgument;
+        @memcpy(@constCast(attr.free_dims), free_dims);
     }
 
     /// Reshape to a mix of fixed and free axes.
@@ -1025,8 +1067,14 @@ pub const Builder = struct {
     /// placeholder; `symbols[i]`, if non-null, names a dim symbol that length
     /// takes at runtime (emitted as a symbolic term at export).
     pub fn sliceSym(self: *Self, a: TensorRef, starts: []const usize, lens: []const usize, symbols: []const ?[]const u8) Error!TensorRef {
-        const ref = try self.slice(a, starts, lens);
-        try self.recordViewSymbols(ref, symbols);
+        if (symbols.len != lens.len) return Error.InvalidArgument;
+        var idx_buf: [graph_mod.Graph.MAX_RANK]?u32 = @splat(null);
+        if (lens.len > idx_buf.len) return Error.InvalidArgument;
+        const out: ValueId = try self.graph.addViewSliceNDSym(a.value, starts, lens, idx_buf[0..lens.len]);
+        const ref: TensorRef = .{ .value = out };
+        try self.autoNameIfUnnamed(out, "slice");
+        try self.attrSymbols(ref, symbols, idx_buf[0..lens.len]);
+        try self.setViewFreeDims(out, idx_buf[0..lens.len]);
         return ref;
     }
 

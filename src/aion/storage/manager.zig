@@ -7,6 +7,10 @@ const types = @import("../backend/types.zig");
 const tensor_store = @import("../runtime/tensor_store.zig");
 const dm = @import("../runtime/device_memory.zig");
 const plan = @import("../graph/plan.zig");
+const derived_mod = @import("derived.zig");
+const store_view = @import("manager/store_view.zig");
+const fold = @import("manager/fold.zig");
+const grow = @import("manager/grow.zig");
 
 pub const StorageError = storage_mod.StorageError;
 pub const TiledTensor = storage_mod.TiledTensor;
@@ -17,11 +21,13 @@ pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
 pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
 pub const SequenceCachePolicyInfo = cache_mod.SequenceCachePolicyInfo;
+pub const Derived = derived_mod;
 
 /// Opaque handle to a tensor owned by `StorageManager`.
 ///
 /// Stable across internal resizes because it is an index into a pointer table.
 pub const TensorId = u32;
+
 
 /// RAM-only storage manager.
 ///
@@ -31,22 +37,16 @@ pub const StorageManager = struct {
     tensors: std.ArrayList(*TiledTensor) = .empty,
     cache: ?Cache = null,
 
-    /// Memoizes weight tensors derived from a set of source tensors by an
-    /// optimization pass — concatenated, bias-folded, norm-folded, or otherwise
-    /// fused weights. Keyed by an opaque pass-defined `kind` (so distinct
-    /// derivations don't alias over the same sources) plus the ordered source ids.
-    /// Model weights are shape-independent, so a derived weight is identical across
-    /// the per-shape recompiles that hit the same store; without this memo each
-    /// recompile would re-derive and leak (tensors are only freed on `deinit`).
-    derived_weight_cache: std.ArrayList(DerivedWeight) = .empty,
+    /// Weights an optimization pass derived from other weights (see `derived.zig`).
+    /// Memoized because model weights are shape-independent: without it every
+    /// per-shape recompile would re-derive and leak (tensors free only on `deinit`).
+    derived: derived_mod.Table = .{},
 
     /// Device registry for tensor migration (`moveTensor` / `Tensor.to`). Set by the
     /// owning `Context` via `setDeviceRegistry`. `device_registry[i]` is gpu[i]; the
     /// slice is borrowed (Context owns the backing). `cpu_policy` retiles on `.to(.cpu)`.
     device_registry: []const DeviceEntry = &[_]DeviceEntry{},
     cpu_policy: plan.TilePolicy = .{},
-
-    const DerivedWeight = struct { kind: u32, sources: []TensorId, result: TensorId };
 
     /// One registered non-cpu device: how to (de)allocate/transfer its buffers, plus
     /// the tile policy used when a tensor is migrated onto it.
@@ -61,7 +61,9 @@ pub const StorageManager = struct {
         };
     }
 
-    fn growTarget(current: usize, num: usize, den: usize) StorageError!usize {
+    /// The next capacity a geometric growth schedule asks for. Public because both the
+    /// growth path and the store view's `mapSequenceStep` need the same schedule.
+    pub fn growTarget(current: usize, num: usize, den: usize) StorageError!usize {
         if (current == 0 or num == 0 or den == 0) return StorageError.InvalidArgument;
         const prod: usize = std.math.mul(usize, current, num) catch return StorageError.InvalidArgument;
         const rounded: usize = std.math.add(usize, prod, den - 1) catch return StorageError.InvalidArgument;
@@ -82,8 +84,7 @@ pub const StorageManager = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.cache) |*c| c.deinit();
-        for (self.derived_weight_cache.items) |entry| self.allocator.free(entry.sources);
-        self.derived_weight_cache.deinit(self.allocator);
+        self.derived.deinit(self.allocator);
         for (self.tensors.items) |t| {
             t.deinit();
             self.allocator.destroy(t);
@@ -92,37 +93,98 @@ pub const StorageManager = struct {
         self.* = undefined;
     }
 
-    /// Look up a previously derived weight for `(kind, sources)`. `kind` namespaces
-    /// distinct derivations so they don't alias over the same sources. Null on miss.
-    pub fn lookupDerivedWeight(self: *const Self, kind: u32, sources: []const TensorId) ?TensorId {
-        for (self.derived_weight_cache.items) |entry| {
-            if (entry.kind != kind or entry.sources.len != sources.len) continue;
-            if (std.mem.eql(TensorId, entry.sources, sources)) return entry.result;
-        }
-        return null;
+    /// A derived weight already built for these sources, at this tiling, on this device.
+    pub fn derivedFind(
+        self: *const Self,
+        kind: derived_mod.Kind,
+        tiles: []const usize,
+        device: DeviceRef,
+        sources: []const TensorId,
+    ) ?TensorId {
+        return self.derived.find(kind, tiles, device, sources);
     }
 
-    /// Record a derived weight, taking an owned copy of `sources` as the key.
-    pub fn recordDerivedWeight(self: *Self, kind: u32, sources: []const TensorId, result: TensorId) StorageError!void {
-        const ids_copy: []TensorId = self.allocator.dupe(TensorId, sources) catch return StorageError.OutOfMemory;
-        errdefer self.allocator.free(ids_copy);
-        self.derived_weight_cache.append(self.allocator, .{ .kind = kind, .sources = ids_copy, .result = result }) catch return StorageError.OutOfMemory;
+    pub fn derivedRecord(
+        self: *Self,
+        kind: derived_mod.Kind,
+        tiles: []const usize,
+        device: DeviceRef,
+        result: TensorId,
+        sources: []const derived_mod.Source,
+    ) StorageError!void {
+        return self.derived.record(self.allocator, kind, tiles, device, result, sources);
     }
 
-    /// A derived-weight entry seen from one of its sources: the fused `result`, the
-    /// full ordered `sources`, and the queried source's `index` within them.
-    /// Lets a weight-swap resolve "this logical weight is region `index` of `result`".
-    pub const DerivedSourceRef = struct { kind: u32, result: TensorId, sources: []const TensorId, index: usize };
+    /// Where `id`'s bytes live, if a pass folded it into a derived weight.
+    pub fn derivedLocate(self: *const Self, id: TensorId) ?derived_mod.Located {
+        return self.derived.locate(id);
+    }
 
-    /// Find the derived weight `source_tid` was folded into (if any), so a swap can
-    /// write through to the fused tensor. Returns the first match.
-    pub fn findDerivedWeightBySource(self: *const Self, source_tid: TensorId) ?DerivedSourceRef {
-        for (self.derived_weight_cache.items) |entry| {
-            for (entry.sources, 0..) |sid, i| {
-                if (sid == source_tid) return .{ .kind = entry.kind, .result = entry.result, .sources = entry.sources, .index = i };
-            }
-        }
-        return null;
+    // Operations over the derived table live in `manager/fold.zig`; these keep them
+    // reachable as `mgr.<op>` because that is how every caller reads.
+
+    pub fn writeDerivedSource(self: *Self, id: TensorId, src: TensorId) StorageError!void {
+        return fold.writeDerivedSource(self, id, src);
+    }
+
+    pub fn readDerivedSource(self: *Self, id: TensorId, dst: TensorId) StorageError!void {
+        return fold.readDerivedSource(self, id, dst);
+    }
+
+    pub fn unfoldTensor(self: *Self, id: TensorId) StorageError!void {
+        return fold.unfoldTensor(self, id);
+    }
+
+    pub fn collectDerived(self: *Self) void {
+        return fold.collectDerived(self);
+    }
+
+
+
+
+
+
+
+
+    /// Give `id` its physical backing on `target`, preserving its tile geometry.
+    ///
+    /// The one way anything says "this tensor belongs on that device": placement,
+    /// weight retargeting and the fusion passes all want exactly this, and each
+    /// reimplementing the tile-shape/alignment plumbing is how they drift apart.
+    /// No-op for a cpu target or a tensor already there. Unified-memory devices keep
+    /// the host allocation and alias it inside the device-memory implementation.
+    pub fn placeTensor(self: *Self, id: TensorId, target: DeviceRef) StorageError!void {
+        if (target.kind == .cpu) return;
+        const t = try self.getConst(id);
+        if (t.device.eql(target)) return;
+        const dev = self.deviceMemoryFor(target) orelse return StorageError.InvalidArgument;
+        var tile_shape: [tensor_store.INLINE_RANK]usize = undefined;
+        const rank: usize = @intCast(t.rank);
+        @memcpy(tile_shape[0..rank], t.tile_shape);
+        return self.moveTensor(id, target, dev, tile_shape[0..rank], self.policyFor(target).tile_alignment);
+    }
+
+    /// Count one live compiled program as naming `id`.
+    ///
+    /// Tensor liveness has to be a store-wide fact: a `Context` shares one store between
+    /// models, so "does anything still read this weight" is not a question one model can
+    /// answer by walking its own specializations. `graph/program/lease.zig` is the only
+    /// caller; `collectDerived` is what reads the result. Both halves ignore an id the
+    /// store does not hold, so a partly applied batch can only under-count a tensor
+    /// nothing named.
+    pub fn retainTensor(self: *Self, id: TensorId) void {
+        const t = self.getMut(id) catch return;
+        t.program_refs += 1;
+    }
+
+    pub fn releaseTensor(self: *Self, id: TensorId) void {
+        const t = self.getMut(id) catch return;
+        if (t.program_refs > 0) t.program_refs -= 1;
+    }
+
+    pub fn tensorProgramRefs(self: *const Self, id: TensorId) u32 {
+        const t = self.getConst(id) catch return 0;
+        return t.program_refs;
     }
 
     pub fn configureCache(self: *Self, cfg: CacheConfig) StorageError!void {
@@ -140,116 +202,13 @@ pub const StorageManager = struct {
         cache_ptr.registerTensorPolicy(id, policy) catch |e| return mapCacheError(e);
     }
 
-    /// Zero `bytes` of `handle` from `offset`, in bounded chunks so zeroing a
-    /// large buffer never needs an equally large host staging allocation.
-    fn zeroDeviceRange(self: *Self, dev: dm.DeviceMemory, handle: dm.DeviceHandle, offset: usize, bytes: usize) StorageError!void {
-        if (bytes == 0) return;
-        const chunk_cap: usize = @min(bytes, 4 << 20);
-        const zeros: []u8 = self.allocator.alloc(u8, chunk_cap) catch return StorageError.OutOfMemory;
-        defer self.allocator.free(zeros);
-        @memset(zeros, 0);
 
-        var done: usize = 0;
-        while (done < bytes) {
-            const n = @min(chunk_cap, bytes - done);
-            dev.copyH2D(handle, offset + done, zeros[0..n]) catch return StorageError.InvalidArgument;
-            done += n;
-        }
-    }
 
-    /// Grow a device-resident tensor without leaving the device: allocate the
-    /// new backing, zero it, and move the old contents across with `copyD2D`.
-    ///
-    /// Applies to the single, unpadded tile that role-declared sequence caches
-    /// use — there the two backings differ only in the stride of `axis`, so the
-    /// move is `outer` contiguous runs. Returns false for any other layout,
-    /// leaving the caller its host round-trip.
-    fn growAxisOnDevice(self: *Self, id: TensorId, axis: usize, new_size: usize, dev: dm.DeviceMemory) StorageError!bool {
-        const t: *TiledTensor = try self.getMut(id);
-        if (t.dtype.info().is_quantized) return false;
-        if (t.tile_handles.len != 1 or !std.mem.eql(usize, t.tile_shape, t.shape)) return false;
 
-        const rank: usize = @intCast(t.rank);
-        var new_shape_mem: [8]usize = undefined;
-        @memcpy(new_shape_mem[0..rank], t.shape);
-        new_shape_mem[axis] = new_size;
-        const new_shape: []const usize = new_shape_mem[0..rank];
-
-        // Bytes spanned by one index of `axis`, and the runs on each side of it.
-        var trailing: usize = t.dtype.info().block_bytes;
-        for (t.shape[axis + 1 ..]) |d| trailing = std.math.mul(usize, trailing, d) catch return StorageError.InvalidArgument;
-        var outer: usize = 1;
-        for (t.shape[0..axis]) |d| outer = std.math.mul(usize, outer, d) catch return StorageError.InvalidArgument;
-        const old_run = std.math.mul(usize, t.shape[axis], trailing) catch return StorageError.InvalidArgument;
-        const new_run = std.math.mul(usize, new_size, trailing) catch return StorageError.InvalidArgument;
-        // Device copies move whole 4-byte words; odd runs (f16) take the host path.
-        if (old_run % 4 != 0 or new_run % 4 != 0) return false;
-
-        // Built host-backed for its geometry, then immediately released: the
-        // bytes live on the device, same handoff `moveTensor` performs.
-        var staging: TiledTensor = undefined;
-        try staging.init(self.allocator, t.dtype, new_shape, new_shape, .{ .tile_alignment = t.tile_alignment });
-        errdefer staging.deinit();
-        const total = staging.tile_lens[0];
-        staging.releaseData();
-
-        const handle = dev.alloc(total, 64) catch return StorageError.OutOfMemory;
-        errdefer dev.free(handle);
-        try self.zeroDeviceRange(dev, handle, 0, total);
-        var i: usize = 0;
-        while (i < outer) : (i += 1) {
-            dev.copyD2D(handle, i * new_run, t.tile_handles[0], i * old_run, old_run) catch return StorageError.InvalidArgument;
-        }
-
-        const handles: []dm.DeviceHandle = self.allocator.alloc(dm.DeviceHandle, 1) catch return StorageError.OutOfMemory;
-        handles[0] = handle;
-        staging.device = t.device;
-        staging.tile_handles = handles;
-        staging.dev = dev;
-        staging.owns_data = false;
-
-        // Frees the old device buffer, which the submitted copy above keeps
-        // alive until it retires.
-        t.deinit();
-        t.* = staging;
-        t.shape = t.shape_storage.constSlice();
-        t.tile_shape = t.tile_shape_storage.constSlice();
-        t.tile_counts = t.tile_counts_storage.constSlice();
-        t.tile_strides = t.tile_strides_storage.constSlice();
-        return true;
-    }
-
+    /// Grow `id`'s axis `axis` to at least `min_size`, following its cache policy.
+    /// Executed in `manager/grow.zig`.
     pub fn ensureTensorAxisCapacity(self: *Self, id: TensorId, axis: usize, min_size: usize) StorageError!void {
-        const t0: *const TiledTensor = try self.getConst(id);
-        if (axis >= @as(usize, t0.rank)) return StorageError.InvalidArgument;
-        if (t0.shape[axis] >= min_size) return;
-        if (t0.device.kind == .cpu) {
-            return (try self.getMut(id)).growAxisPreserveScalar(axis, min_size);
-        }
-
-        const target: DeviceRef = t0.device;
-        if (t0.dev) |d| {
-            if (try self.growAxisOnDevice(id, axis, min_size, d)) return;
-        }
-
-        // Layouts device growth does not cover round-trip through the host (D2H
-        // gather -> host grow -> H2D re-migrate), reusing `moveTensor`. Growth is
-        // geometric, so this amortizes to O(final size) and never touches the
-        // fixed/ring fast path. `moveTensor` frees the old device buffer only
-        // after the re-upload, and the tensor id is preserved.
-        const dev: dm.DeviceMemory = t0.dev orelse return StorageError.InvalidArgument;
-        const tile_align: usize = t0.tile_alignment;
-        const rank: usize = @as(usize, t0.rank);
-        var shape_buf: [8]usize = undefined;
-        @memcpy(shape_buf[0..rank], t0.shape);
-
-        try self.moveTensor(id, .{ .kind = .cpu }, null, shape_buf[0..rank], tile_align);
-        try (try self.getMut(id)).growAxisPreserveScalar(axis, min_size);
-
-        const grown: *const TiledTensor = try self.getConst(id);
-        var grown_shape: [8]usize = undefined;
-        @memcpy(grown_shape[0..rank], grown.shape);
-        try self.moveTensor(id, target, dev, grown_shape[0..rank], tile_align);
+        return grow.ensureTensorAxisCapacity(self, id, axis, min_size);
     }
 
     pub fn sequenceCachePolicy(self: *const Self, id: TensorId) SequenceCachePolicy {
@@ -328,11 +287,13 @@ pub const StorageManager = struct {
         return (try self.getConst(id)).workspace_owned;
     }
 
-    fn backingConst(self: *const Self, id: TensorId) StorageError!*const TiledTensor {
+    /// The tensor holding `id`'s bytes: itself, or the workspace slot it aliases.
+    /// Public for `manager/store_view.zig`, which resolves every tile through it.
+    pub fn backingConst(self: *const Self, id: TensorId) StorageError!*const TiledTensor {
         return self.getConst(try self.backingId(id));
     }
 
-    fn backingMut(self: *Self, id: TensorId) StorageError!*TiledTensor {
+    pub fn backingMut(self: *Self, id: TensorId) StorageError!*TiledTensor {
         return self.getMut(try self.backingId(id));
     }
 
@@ -398,29 +359,6 @@ pub const StorageManager = struct {
         return if (t.device.kind == .cpu) t.data.len != 0 else t.tile_handles.len != 0;
     }
 
-    /// Place every cached derived weight involving `source` on `target`.
-    pub fn moveDerivedWeightsForSource(self: *Self, source: TensorId, target: DeviceRef) StorageError!void {
-        if (target.kind == .cpu) return;
-        const dev = self.deviceMemoryFor(target) orelse return StorageError.InvalidArgument;
-        const policy = self.policyFor(target);
-        for (self.derived_weight_cache.items) |entry| {
-            var contains = false;
-            for (entry.sources) |id| {
-                if (id == source) {
-                    contains = true;
-                    break;
-                }
-            }
-            if (!contains) continue;
-            const t = try self.getConst(entry.result);
-            if (t.device.eql(target)) continue;
-            var tile_shape: [8]usize = undefined;
-            const rank: usize = @intCast(t.rank);
-            @memcpy(tile_shape[0..rank], t.tile_shape);
-            try self.moveTensor(entry.result, target, dev, tile_shape[0..rank], policy.tile_alignment);
-        }
-    }
-
     pub fn writeFromPackedScalar(self: *Self, id: TensorId, packed_bytes: []const u8) StorageError!void {
         if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
         var t: *TiledTensor = try self.getMut(id);
@@ -449,8 +387,16 @@ pub const StorageManager = struct {
     /// `Tensor.read`/`write`, whose move semantics require `.to(.cpu)` first.
     /// This pair is for internals that must reach a value at its actual
     /// placement — weight write-through being the motivating case.
+    ///
+    /// "Wherever it lives" includes inside a derived weight: a weight a pass folded away
+    /// keeps its metadata and loses its bytes, and a read of it has to find them anyway.
+    /// The write direction is deliberately NOT symmetric — a write has to reach every
+    /// copy, which is `writeDerivedSource`, not one buffer.
     pub fn readPackedAtPlacement(self: *Self, id: TensorId, out: []u8) StorageError!void {
         const t: *const TiledTensor = try self.getConst(id);
+        if (!try self.tensorHasBacking(id)) {
+            if (self.derivedLocate(id)) |at| return fold.readDerivedPacked(self, at, out);
+        }
         return self.gatherPacked(t, out);
     }
 
@@ -563,7 +509,7 @@ pub const StorageManager = struct {
             return;
         }
         const d = t.dev orelse return StorageError.InvalidArgument;
-        for (t.tile_handles, 0..) |h, i| try self.zeroDeviceRange(d, h, 0, t.tile_lens[i]);
+        for (t.tile_handles, 0..) |h, i| try grow.zeroDeviceRange(self, d, h, 0, t.tile_lens[i]);
     }
 
     /// Materialize one compiler-planned workspace slot directly at its final
@@ -718,315 +664,10 @@ pub const StorageManager = struct {
         t.tile_strides = t.tile_strides_storage.constSlice();
     }
 
+    /// The store as the runtime's `TensorStore` interface — how an executor reaches
+    /// tiles without depending on this layer (see `manager/store_view.zig`).
     pub fn tensorStore(self: *Self) tensor_store.TensorStore {
-        const Vt = struct {
-            fn shouldLease(policy: SequenceCachePolicy) bool {
-                return switch (policy) {
-                    .none => false,
-                    else => true,
-                };
-            }
-
-            fn toStorePolicyInfo(info: cache_mod.SequenceCachePolicyInfo) tensor_store.SequenceCachePolicyInfo {
-                const kind: tensor_store.SequenceCachePolicyKind = switch (info.kind) {
-                    .none => .none,
-                    .growable => .growable,
-                    .ring => .ring,
-                };
-                return .{ .kind = kind, .ring_window_tokens = info.ring_window_tokens };
-            }
-
-            fn meta(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.StoreError!tensor_store.TensorMeta {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                return .{
-                    .dtype = t.dtype,
-                    .rank = t.rank,
-                    .shape = t.shape,
-                    .tile_shape = t.tile_shape,
-                    .tile_counts = t.tile_counts,
-                    .tile_strides = t.tile_strides,
-                };
-            }
-
-            fn acquireTileConst(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) tensor_store.StoreError!tensor_store.TileRefConst {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const tile = t.acquireTileConstFrom(backing.data, ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
-
-                var token: usize = 0;
-                if (sm.cache) |*cache| {
-                    if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                        token = cache.acquireLease(@intCast(id), t.tileIndex(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument, false) catch |e| {
-                            return switch (e) {
-                                error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                else => tensor_store.StoreError.InvalidArgument,
-                            };
-                        };
-                    }
-                }
-
-                return .{
-                    .bytes = tile.bytes,
-                    .dtype = tile.dtype,
-                    .rank = tile.rank,
-                    .shape_mem = tile.shape_mem,
-                    .strides_mem = tile.strides_mem,
-                    .token = token,
-                };
-            }
-
-            fn acquireTileMut(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) tensor_store.StoreError!tensor_store.TileRefMut {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const backing = sm.backingMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const tile = t.acquireTileMutFrom(backing.data, ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
-
-                var token: usize = 0;
-                if (sm.cache) |*cache| {
-                    if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                        token = cache.acquireLease(@intCast(id), t.tileIndex(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument, true) catch |e| {
-                            return switch (e) {
-                                error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                else => tensor_store.StoreError.InvalidArgument,
-                            };
-                        };
-                    }
-                }
-
-                return .{
-                    .bytes = tile.bytes,
-                    .dtype = tile.dtype,
-                    .rank = tile.rank,
-                    .shape_mem = tile.shape_mem,
-                    .strides_mem = tile.strides_mem,
-                    .token = token,
-                };
-            }
-
-            fn acquireTileConstLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefConst {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const tile = t.acquireTileConstLinearFrom(backing.data, tile_index) catch return tensor_store.StoreError.InvalidArgument;
-
-                var token: usize = 0;
-                if (sm.cache) |*cache| {
-                    if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                        token = cache.acquireLease(@intCast(id), tile_index, false) catch |e| {
-                            return switch (e) {
-                                error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                else => tensor_store.StoreError.InvalidArgument,
-                            };
-                        };
-                    }
-                }
-
-                return .{
-                    .bytes = tile.bytes,
-                    .dtype = tile.dtype,
-                    .rank = tile.rank,
-                    .shape_mem = tile.shape_mem,
-                    .strides_mem = tile.strides_mem,
-                    .token = token,
-                };
-            }
-
-            fn acquireTileMutLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefMut {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const backing = sm.backingMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const tile = t.acquireTileMutLinearFrom(backing.data, tile_index) catch return tensor_store.StoreError.InvalidArgument;
-
-                var token: usize = 0;
-                if (sm.cache) |*cache| {
-                    if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                        token = cache.acquireLease(@intCast(id), tile_index, true) catch |e| {
-                            return switch (e) {
-                                error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                else => tensor_store.StoreError.InvalidArgument,
-                            };
-                        };
-                    }
-                }
-
-                return .{
-                    .bytes = tile.bytes,
-                    .dtype = tile.dtype,
-                    .rank = tile.rank,
-                    .shape_mem = tile.shape_mem,
-                    .strides_mem = tile.strides_mem,
-                    .token = token,
-                };
-            }
-
-            fn releaseConst(ctx: *anyopaque, token: usize) void {
-                if (token == 0) return;
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                if (sm.cache) |*cache| cache.releaseLease(token);
-            }
-
-            fn releaseMut(ctx: *anyopaque, token: usize) void {
-                if (token == 0) return;
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                if (sm.cache) |*cache| cache.releaseLease(token);
-            }
-
-            fn sequenceCachePolicyInfo(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.SequenceCachePolicyInfo {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const info: cache_mod.SequenceCachePolicyInfo = sm.sequenceCachePolicyInfo(@intCast(id));
-                return toStorePolicyInfo(info);
-            }
-
-            fn mapSequenceStep(ctx: *anyopaque, id: tensor_store.TensorId, logical_t: usize, physical_capacity_tokens: usize) tensor_store.StoreError!usize {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const tid: TensorId = @intCast(id);
-
-                // Default identity mapping without policy support.
-                if (sm.cache == null) {
-                    if (logical_t >= physical_capacity_tokens) return tensor_store.StoreError.InvalidArgument;
-                    return logical_t;
-                }
-
-                const policy: SequenceCachePolicy = sm.sequenceCachePolicy(tid);
-                switch (policy) {
-                    .growable => |g| {
-                        // Grow along the canonical time axis (axis 1).
-                        const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
-                        if (t_const.rank != 4) return tensor_store.StoreError.InvalidArgument;
-                        const current_cap: usize = t_const.shape[1];
-
-                        if (logical_t >= current_cap) {
-                            // Past the growth ceiling (the caller's max bound) is an error,
-                            // not an unbounded grow.
-                            if (g.max_capacity_tokens != 0 and logical_t >= g.max_capacity_tokens) return tensor_store.StoreError.InvalidArgument;
-                            var target: usize = current_cap;
-                            if (g.initial_capacity_tokens > target) target = g.initial_capacity_tokens;
-                            while (target <= logical_t) {
-                                target = growTarget(target, g.growth_numerator, g.growth_denominator) catch return tensor_store.StoreError.InvalidArgument;
-                            }
-                            // Never overshoot the ceiling.
-                            if (g.max_capacity_tokens != 0 and target > g.max_capacity_tokens) target = g.max_capacity_tokens;
-                            sm.ensureTensorAxisCapacity(tid, 1, target) catch return tensor_store.StoreError.InvalidArgument;
-                        }
-
-                        // Update cache policy internal state bookkeeping.
-                        if (sm.cache) |*cache| {
-                            const latest_cap: usize = (sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument).shape[1];
-                            _ = cache.mapLogicalTime(tid, logical_t, latest_cap) catch |e| {
-                                return switch (e) {
-                                    error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                    else => tensor_store.StoreError.InvalidArgument,
-                                };
-                            };
-                        }
-
-                        return logical_t;
-                    },
-                    else => {
-                        if (sm.cache) |*cache| {
-                            const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
-                            var cap: usize = physical_capacity_tokens;
-                            if (@as(usize, t_const.rank) > 1) cap = t_const.shape[1];
-                            if (cap == 0) return tensor_store.StoreError.InvalidArgument;
-                            return cache.mapLogicalTime(tid, logical_t, cap) catch |e| {
-                                return switch (e) {
-                                    error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                                    else => tensor_store.StoreError.InvalidArgument,
-                                };
-                            };
-                        }
-
-                        if (logical_t >= physical_capacity_tokens) return tensor_store.StoreError.InvalidArgument;
-                        return logical_t;
-                    },
-                }
-            }
-
-            fn prefetch(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) void {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
-                const backing = sm.backingConst(@intCast(id)) catch return;
-                const tile = t.acquireTileConstFrom(backing.data, ti0, ti1) catch return;
-                @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
-            }
-
-            fn prefetchLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) void {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
-                const backing = sm.backingConst(@intCast(id)) catch return;
-                const tile = t.acquireTileConstLinearFrom(backing.data, tile_index) catch return;
-                @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
-            }
-
-            fn sameShape(a: []const usize, b: []const usize) bool {
-                if (a.len != b.len) return false;
-                for (a, 0..) |v, i| if (v != b[i]) return false;
-                return true;
-            }
-
-            fn deviceTile(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!?tensor_store.DeviceTileRef {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-                if (backing.device.kind == .cpu) return null;
-                if (tile_index >= backing.tile_handles.len) return tensor_store.StoreError.InvalidArgument;
-                const layout = t.tileLayoutLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
-                return .{
-                    .handle = backing.tile_handles[tile_index],
-                    .len = t.tile_lens[tile_index],
-                    .dtype = layout.dtype,
-                    .rank = layout.rank,
-                    .shape_mem = layout.shape_mem,
-                    .strides_mem = layout.strides_mem,
-                };
-            }
-
-            fn swapTensors(ctx: *anyopaque, a_id: tensor_store.TensorId, b_id: tensor_store.TensorId) tensor_store.StoreError!void {
-                const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-                var a: *TiledTensor = sm.getMut(@intCast(a_id)) catch return tensor_store.StoreError.InvalidArgument;
-                var b: *TiledTensor = sm.getMut(@intCast(b_id)) catch return tensor_store.StoreError.InvalidArgument;
-
-                if (a.dtype != b.dtype) return tensor_store.StoreError.InvalidArgument;
-                if (a.rank != b.rank) return tensor_store.StoreError.InvalidArgument;
-                if (a.quant_axis != b.quant_axis) return tensor_store.StoreError.InvalidArgument;
-                if (!sameShape(a.shape, b.shape)) return tensor_store.StoreError.InvalidArgument;
-                if (!sameShape(a.tile_shape, b.tile_shape)) return tensor_store.StoreError.InvalidArgument;
-                if (!sameShape(a.tile_counts, b.tile_counts)) return tensor_store.StoreError.InvalidArgument;
-                if (!sameShape(a.tile_strides, b.tile_strides)) return tensor_store.StoreError.InvalidArgument;
-                if (a.tile_offsets.len != b.tile_offsets.len or a.tile_lens.len != b.tile_lens.len) return tensor_store.StoreError.InvalidArgument;
-                if (a.tile_alignment != b.tile_alignment) return tensor_store.StoreError.InvalidArgument;
-                // Zero-copy carried-variable swap for CPU loop execution. Move
-                // the complete backing record between the logical tensor ids.
-                std.mem.swap([]align(64) u8, &a.data, &b.data);
-                std.mem.swap(bool, &a.owns_data, &b.owns_data);
-                std.mem.swap(DeviceRef, &a.device, &b.device);
-                std.mem.swap([]dm.DeviceHandle, &a.tile_handles, &b.tile_handles);
-                std.mem.swap(?dm.DeviceMemory, &a.dev, &b.dev);
-                // The host-write counter travels with the bytes so a residency
-                // layer's per-tile `uploaded_seq` (which the resident store swaps
-                // alongside) stays consistent and avoids a spurious re-upload.
-            }
-        };
-
-        return .{
-            .ctx = @ptrCast(self),
-            .vtable = &.{
-                .meta = Vt.meta,
-                .acquireTileConst = Vt.acquireTileConst,
-                .acquireTileMut = Vt.acquireTileMut,
-                .acquireTileConstLinear = Vt.acquireTileConstLinear,
-                .acquireTileMutLinear = Vt.acquireTileMutLinear,
-                .releaseConst = Vt.releaseConst,
-                .releaseMut = Vt.releaseMut,
-                .sequenceCachePolicyInfo = Vt.sequenceCachePolicyInfo,
-                .mapSequenceStep = Vt.mapSequenceStep,
-                .prefetch = Vt.prefetch,
-                .prefetchLinear = Vt.prefetchLinear,
-                .swapTensors = Vt.swapTensors,
-                .deviceTile = Vt.deviceTile,
-            },
-        };
+        return store_view.of(self);
     }
+
 };

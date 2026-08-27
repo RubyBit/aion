@@ -108,6 +108,7 @@ fn printUsage() void {
             "  --seq N          token suite: query rows per step (default: 1)\n" ++
             "  --pli-vocab N    token suite: per-layer-input table rows (default: full)\n" ++
             "  --no-head        token suite: skip the tied logits head\n" ++
+            "  --no-hfuse       token suite: disable horizontal MatMul fusion (A/B a pass)\n" ++
             "  --steps          token suite: print the step histogram\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
@@ -197,6 +198,8 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
             opts.model.pli_vocab = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--no-head")) {
             opts.model.head = false;
+        } else if (std.mem.eql(u8, a, "--no-hfuse")) {
+            opts.model.disable.insert(.horizontal_matmul);
         } else if (std.mem.eql(u8, a, "--steps")) {
             opts.show_steps = true;
         } else if (std.mem.eql(u8, a, "--threads")) {
@@ -325,7 +328,7 @@ fn benchProgramConv1D(
     const y = try g.addConv1DWithPadMode(x_in, w_in, b_in, stride, dilation, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -416,7 +419,7 @@ fn benchProgramConv2D(
     const y = try g.addConv2DWithPadMode(x_in, w_val, b_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -523,7 +526,7 @@ fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters:
     const out = try g.addElemwiseBinary(.add, a_in, b_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -569,7 +572,7 @@ fn benchProgramUnary(
     const out = try g.addUnary(op, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -604,7 +607,7 @@ fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addReduce(.sum, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -645,7 +648,7 @@ fn benchProgramReduceAxisF32(
     const out = try g.addReduceAxis(.mean, a_in, axis);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -696,7 +699,7 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -745,7 +748,7 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -795,7 +798,7 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -926,7 +929,7 @@ fn benchProgramAttentionF32(
     const y = try g.addAttention(q_in, k_in, v_in, p_in, e_in, scale, causal, sliding_window, attn_logits_soft_cap);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1016,7 +1019,7 @@ fn benchProgramSTFTF32(
     const y = try g.addSTFT(sig_in, win_in, n_fft, hop, true);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1097,7 +1100,7 @@ fn benchProgramRoPE1DF32(
     const y = try g.addRoPE1D(x_in, p_in, 10000.0, 1.0, 1.0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1147,7 +1150,7 @@ fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, ite
     const out = try g.addElemwiseBinary(.add, a_in, b_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1189,7 +1192,7 @@ fn benchProgramUnaryF16(
     const out = try g.addUnary(op, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1223,7 +1226,7 @@ fn benchProgramReduceSumF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     const out = try g.addReduce(.sum, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1264,7 +1267,7 @@ fn benchProgramReduceAxisF16(
     const out = try g.addReduceAxis(.mean, a_in, axis);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1327,7 +1330,7 @@ fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1376,7 +1379,7 @@ fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1449,7 +1452,7 @@ fn benchProgramRoPE1DF16(
     const y = try g.addRoPE1D(x_in, p_in, 10000.0, 1.0, 1.0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1498,7 +1501,7 @@ fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1540,7 +1543,7 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1591,7 +1594,7 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1633,7 +1636,7 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1690,7 +1693,7 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1776,7 +1779,7 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1819,7 +1822,7 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
     const out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -2099,7 +2102,7 @@ fn benchKernelCpu(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend,
 /// footprint -- so the graph lives in `src/bench/models.zig` and neither bench owns it.
 ///
 /// No fidelity gate here. The step fixture in `bench_models` records the GPU SCHEDULE
-/// (`program/fuse_steps.zig` is device-only), so a CPU run legitimately has 242 plain
+/// (`opt/fuse_steps.zig` is device-only), so a CPU run legitimately has 242 plain
 /// norms and 217 elementwise where the GPU has 242 norms carrying 106 residuals and 111
 /// elementwise. Comparing the two against one fixture would only teach the fixture to be
 /// vague. The target-independent facts -- layer count and streamed bytes -- are printed
@@ -2116,7 +2119,7 @@ fn runTokenSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) 
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cpu_policy = plan_mod.tilePolicyForTarget(.{ .kind = .cpu });
+    const cpu_policy = plan_mod.tilePolicyForTarget(.cpu);
     const build_start = nowNs();
     var built = try bm.gemma4E2BDecode(allocator, &sm, cpu_policy, opts.model, .{ .kind = .cpu, .index = 0 }, null);
     defer built.prog.deinit();

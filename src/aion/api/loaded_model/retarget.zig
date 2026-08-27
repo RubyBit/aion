@@ -51,20 +51,3 @@ fn retargetStepTensorIds(step: *program_mod.Step, old_tid: types_mod.TensorId, n
 fn retargetTensorId(slot: *types_mod.TensorId, old_tid: types_mod.TensorId, new_tid: types_mod.TensorId) void {
     if (slot.* == old_tid) slot.* = new_tid;
 }
-
-/// Read-only counterpart: does any step/output of `program` reference `tid`?
-/// Used to confirm a fused-away weight is safe to reclaim (nothing still reads it).
-pub fn programReferencesTensorId(program: *const program_mod.Program, tid: types_mod.TensorId) bool {
-    for (program.steps) |*step| if (stepReferencesTensorId(&step.op, tid)) return true;
-    for (program.blocks) |*block| {
-        for (block.steps) |*step| if (stepReferencesTensorId(&step.op, tid)) return true;
-    }
-    for (program.outputs) |out| if (out == tid) return true;
-    return false;
-}
-
-fn stepReferencesTensorId(step: *const program_mod.Step, tid: types_mod.TensorId) bool {
-    const uses = executable.tensorUses(@constCast(step));
-    for (uses.slice()) |use| if (use.id.* == tid) return true;
-    return false;
-}

@@ -120,7 +120,7 @@ fn checkGraph(
     const out = try build(&b);
     try g.setOutputs(&[_]ValueId{out});
 
-    var prog = try program.compileGraph(a, &g, &mgr, .{});
+    var prog = try program.compileGraph(a, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
 
     const dump = try serialize(a, &prog, &mgr);
@@ -195,7 +195,7 @@ fn buildDecodeChain(b: *B) anyerror!ValueId {
 }
 
 test "tilePolicyForTarget: cpu == default, kind is tagged" {
-    const cpu = plan_mod.tilePolicyForTarget(.{ .kind = .cpu });
+    const cpu = plan_mod.tilePolicyForTarget(.cpu);
     const def = plan_mod.TilePolicy{};
     // CPU-derived policy must be byte-identical to the historical default.
     try std.testing.expectEqual(def, cpu);
@@ -203,7 +203,7 @@ test "tilePolicyForTarget: cpu == default, kind is tagged" {
 
     // A GPU target threads its kind through so lowering can branch on it later;
     // tile sizes/caps are unchanged until GPU heuristics are added.
-    const vk = plan_mod.tilePolicyForTarget(.{ .kind = .vulkan });
+    const vk = plan_mod.tilePolicyForTarget(.vulkan);
     try std.testing.expectEqual(plan_mod.BackendKind.vulkan, vk.target_kind);
     try std.testing.expectEqual(def.softmax_row_cap, vk.softmax_row_cap);
 }

@@ -29,6 +29,12 @@ pub const LoadModelOptions = @import("context.zig").LoadModelOptions;
 pub const CacheOptions = @import("context.zig").CacheOptions;
 pub const CacheGrowth = @import("context.zig").CacheGrowth;
 pub const ExportModelOptions = @import("context.zig").ExportModelOptions;
+pub const CompileOptions = @import("context.zig").CompileOptions;
+/// Which optional rewrite passes a compile runs (`LoadModelOptions.passes`,
+/// `ExportModelOptions.passes`). Build one with `.empty`, `.full`, `.initOne(.<pass>)`.
+pub const OptPolicy = @import("../graph/opt.zig").Policy;
+pub const OptPass = @import("../graph/opt.zig").Pass;
+pub const Target = @import("../graph/target.zig").Target;
 pub const DimSymbol = @import("builder.zig").DimSymbol;
 pub const ExportMetadata = @import("context.zig").ExportMetadata;
 pub const OutputAlias = @import("context.zig").OutputAlias;

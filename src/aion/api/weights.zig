@@ -6,7 +6,7 @@ const package_file = @import("../storage/aion_file.zig");
 const api_errors = @import("errors.zig");
 
 const types_mod = @import("loaded_model/types.zig");
-const initializers = @import("loaded_model/initializers.zig");
+const params_mod = @import("loaded_model/params.zig");
 
 pub const Tensor = types_mod.Tensor;
 pub const StorageManager = types_mod.StorageManager;
@@ -14,6 +14,7 @@ pub const TensorId = types_mod.TensorId;
 pub const DType = types_mod.DType;
 pub const TilePolicy = types_mod.TilePolicy;
 pub const Package = types_mod.Package;
+pub const Params = params_mod.Params;
 
 /// Weights-only view over an AION package.
 ///
@@ -28,13 +29,13 @@ pub const Weights = struct {
     store: *StorageManager,
     policy: TilePolicy,
     package: Package,
-    initializer_tids: []TensorId,
+    params: Params,
     package_hash: u64,
 
     const Self = @This();
 
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.initializer_tids);
+        self.params.deinit(self.allocator);
         self.package.deinit();
         self.* = undefined;
     }
@@ -51,13 +52,7 @@ pub const Weights = struct {
     }
 
     pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
-        if (value_index >= self.package.values.len) return api_errors.ApiError.InvalidArgument;
-        const value = self.package.values[value_index];
-        if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
-        const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
-        if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
-
-        const tid: TensorId = self.initializer_tids[init_idx];
+        const tid: TensorId = self.params.get(value_index) orelse return api_errors.ApiError.InvalidArgument;
         const meta = try self.store.getConst(tid);
         return .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
     }
@@ -72,7 +67,7 @@ pub const Weights = struct {
         store: *StorageManager,
         policy: TilePolicy,
         package: Package,
-        initializer_tids: []TensorId,
+        params: Params,
         package_hash: u64,
     ) Self {
         return .{
@@ -80,18 +75,8 @@ pub const Weights = struct {
             .store = store,
             .policy = policy,
             .package = package,
-            .initializer_tids = initializer_tids,
+            .params = params,
             .package_hash = package_hash,
         };
     }
 };
-
-pub fn importInitializersForWeights(
-    allocator: std.mem.Allocator,
-    store: *StorageManager,
-    policy: TilePolicy,
-    package: *const Package,
-) api_errors.LoadError![]TensorId {
-    // Reuse the same initializer importer as LoadedModel.
-    return initializers.importInitializersForLoadedModel(allocator, store, policy, package);
-}

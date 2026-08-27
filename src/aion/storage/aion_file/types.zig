@@ -165,95 +165,16 @@ pub const InputRole = struct {
     capacity_symbol: u32 = invalid_index,
 };
 
-pub const NodeOp = union(graph_mod.OpTag) {
-    MatMul: struct { alpha: f32, beta: f32 },
-    /// No `act`: `gate` is a step-level schedule (see `graph.Op.ElemwiseBinary`), so a
-    /// gated activation is stored as the `Unary` + `mul` pair the author wrote.
-    ElemwiseBinary: struct { op: ElemwiseBinaryOp },
-    Unary: struct { op: UnaryOp },
-    Softmax: struct { axis: i32 },
-    Conv1D: struct {
-        stride: u64,
-        dilation: u64,
-        pad_left: u64,
-        pad_right: u64,
-        pad_mode: PadMode,
-        groups: u64,
-    },
-    Conv2D: struct {
-        stride_h: u64,
-        stride_w: u64,
-        dilation_h: u64,
-        dilation_w: u64,
-        pad_top: u64,
-        pad_bottom: u64,
-        pad_left: u64,
-        pad_right: u64,
-        pad_mode: PadMode,
-        groups: u64,
-    },
-    LayerNorm: struct { eps: f32, normalized_shape: []const ShapeTerm },
-    RMSNorm: struct { eps: f32, normalized_shape: []const ShapeTerm },
-    Reduce: struct { op: ReduceOp, axis: ?i32 },
-    Concat: struct { axis: i32 },
-    LSTMCell: struct { has_bias: bool },
-    Copy: void,
-    ViewReshape: struct { new_shape: []const ShapeTerm },
-    ViewSqueeze: struct { axis: ?i32 },
-    ViewUnsqueeze: struct { axis: i32 },
-    ViewTranspose2D: void,
-    ViewSliceND: struct { starts: []const u64, lens: []const ShapeTerm },
+/// The graph's own op, which is what a package stores.
+///
+/// There is deliberately no second op type. The two used to differ in integer widths, in
+/// whether a free axis was a `ShapeTerm` or a size plus a symbol, and in whether a Loop's
+/// extra outputs sat on the op or the node — twelve of thirty-two arms — and each
+/// difference cost a 32-arm conversion in both directions. `graph.Op` absorbed all three,
+/// so `parse` and `write` are the only places that know an op field by name, which is
+/// what a serializer is for.
+pub const NodeOp = graph_mod.Op;
 
-    RoPE1D: struct {
-        base_frequency: f32,
-        scale_factor: f32,
-        rope_proportion: f32,
-    },
-
-    SequenceAppend: void,
-
-    /// Grouped-query attention. Bit 0 = query_positions, bit 1 = kv_lengths.
-    Attention: struct {
-        scale: f32,
-        causal: bool,
-        sliding_window: u64,
-        attn_logits_soft_cap: f32,
-        controls: u8,
-    },
-
-    Cast: struct { to_dtype: DType },
-    MatMulNT: struct { alpha: f32, beta: f32 },
-
-    If: struct { then_region: u32, else_region: u32 },
-    /// Loop with N carried values (N = body-region output count = input count).
-    /// `extra_outputs` holds outputs 1..N (output 0 is the record's `output`);
-    /// `cond_carry`, if set, names the i32 [1] carry used as the continue
-    /// predicate for early exit.
-    Loop: struct {
-        body_region: u32,
-        static_max_trip_count: u64,
-        cond_carry: ?u32 = null,
-        check_before: bool = true,
-        extra_outputs: []const u32 = &[_]u32{},
-    },
-
-    RFFT: void,
-    STFT: struct { n_fft: u64, hop_length: u64, center: bool },
-
-    /// No head count: it is q's dim 2. `chunk_size`/`chunk_left` are the
-    /// chunked-limited window (0 = full attention).
-    RelPosMHA: struct { scale: f32, has_mask: bool, chunk_size: u64 = 0, chunk_left: u64 = 0 },
-
-    ArgMax: struct { axis: i32 },
-
-    ScatterRow: void,
-    Gather: struct { axis: i32, batch_dims: u64 },
-    Dim: struct { axis: i32 },
-    Iota: struct { axis: i32 },
-};
-
-/// Stable on-disk op ids are sourced from `graph.OpTag` so graph/runtime and
-/// package serialization share one canonical opcode definition.
 pub const NodeOpKind = graph_mod.OpTag;
 
 pub fn nodeOpKind(op: NodeOp) NodeOpKind {
@@ -264,16 +185,10 @@ pub fn parseNodeOpKind(raw: u8) ?NodeOpKind {
     return std.enums.fromInt(NodeOpKind, raw);
 }
 
-pub const NodeRecord = struct {
-    inputs: []const u32,
-    output: u32,
-    op: NodeOp,
-};
+/// A stored node, which is the graph's own node.
+pub const NodeRecord = graph_mod.Node;
 
-pub const RegionRecord = struct {
-    nodes: []NodeRecord,
-    outputs: []const u32,
-};
+pub const RegionRecord = graph_mod.Region;
 
 pub const GraphMeta = struct {
     value_count: u32,
@@ -448,6 +363,16 @@ pub fn validate(pkg: *const Package) PackageError!void {
     try pkg.validate();
 }
 
+/// An op attribute's free axes: one slot per axis (or none at all), each naming a dim
+/// expression the package declares.
+fn validateAttrFreeDims(pkg: *const Package, rank: usize, free_dims: []const ?u32) PackageError!void {
+    if (free_dims.len == 0) return;
+    if (free_dims.len != rank) return PackageError.InvalidFormat;
+    for (free_dims) |free_dim| {
+        if (free_dim) |expr| if (expr >= pkg.dim_exprs.len) return PackageError.InvalidFormat;
+    }
+}
+
 fn validateShapeTerm(pkg: *const Package, term: ShapeTerm) PackageError!void {
     switch (term) {
         .constant => |value| if (value == 0) return PackageError.InvalidFormat,
@@ -612,11 +537,9 @@ fn validateRegionLazy(
 
 /// Outputs of a node beyond the primary `output` (multi-carry `Loop` only).
 pub fn nodeExtraOutputs(node: NodeRecord) []const u32 {
-    return switch (node.op) {
-        .Loop => |lp| lp.extra_outputs,
-        else => &[_]u32{},
-    };
+    return node.extra_outputs;
 }
+
 
 fn validateNodeRefs(pkg: *const Package, node: NodeRecord, producer_counts: *[]u8, available: []const bool) PackageError!void {
     if (node.output >= pkg.values.len) return PackageError.InvalidFormat;
@@ -639,21 +562,20 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
     switch (node.op) {
         .LayerNorm => |ln| {
             if (ln.normalized_shape.len == 0 or ln.normalized_shape.len > max_rank) return PackageError.InvalidFormat;
-            for (ln.normalized_shape) |term| try validateShapeTerm(pkg, term);
+            try validateAttrFreeDims(pkg, ln.normalized_shape.len, ln.free_dims);
         },
         .RMSNorm => |ln| {
             if (ln.normalized_shape.len == 0 or ln.normalized_shape.len > max_rank) return PackageError.InvalidFormat;
-            for (ln.normalized_shape) |term| try validateShapeTerm(pkg, term);
+            try validateAttrFreeDims(pkg, ln.normalized_shape.len, ln.free_dims);
         },
         .RelPosMHA => |attn| {
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
             if (attn.chunk_size == 0 and attn.chunk_left != 0) return PackageError.InvalidFormat;
         },
         .Attention => |attn| {
-            if ((attn.controls & ~@as(u8, 0x3)) != 0) return PackageError.InvalidFormat;
             const expected_inputs: usize = 3 +
-                @as(usize, @intFromBool((attn.controls & 1) != 0)) +
-                @as(usize, @intFromBool((attn.controls & 2) != 0));
+                @as(usize, @intFromBool(attn.has_query_positions)) +
+                @as(usize, @intFromBool(attn.has_kv_lengths));
             if (node.inputs.len != expected_inputs) return PackageError.InvalidFormat;
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
@@ -669,17 +591,17 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             const ncar = pkg.regions[lp.body_region].outputs.len;
             if (ncar == 0) return PackageError.InvalidFormat;
             // N carried inits, N body outputs, N node outputs (primary + extras).
-            if (node.inputs.len != ncar or lp.extra_outputs.len + 1 != ncar) return PackageError.InvalidFormat;
+            if (node.inputs.len != ncar or node.extra_outputs.len + 1 != ncar) return PackageError.InvalidFormat;
             if (lp.cond_carry) |c| if (c >= ncar) return PackageError.InvalidFormat;
-            for (lp.extra_outputs) |e| if (e >= pkg.values.len) return PackageError.InvalidFormat;
+            for (node.extra_outputs) |e| if (e >= pkg.values.len) return PackageError.InvalidFormat;
         },
         .ViewReshape => |vr| {
             if (vr.new_shape.len == 0 or vr.new_shape.len > max_rank) return PackageError.InvalidFormat;
-            for (vr.new_shape) |term| try validateShapeTerm(pkg, term);
+            try validateAttrFreeDims(pkg, vr.new_shape.len, vr.free_dims);
         },
         .ViewSliceND => |sl| {
             if (sl.starts.len == 0 or sl.starts.len != sl.lens.len or sl.starts.len > max_rank) return PackageError.InvalidFormat;
-            for (sl.lens) |term| try validateShapeTerm(pkg, term);
+            try validateAttrFreeDims(pkg, sl.lens.len, sl.free_dims);
         },
         else => {},
     }
@@ -719,6 +641,7 @@ fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
 fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
     for (nodes) |node| {
         allocator.free(node.inputs);
+        if (node.extra_outputs.len != 0) allocator.free(@constCast(node.extra_outputs));
         deinitNodeOp(allocator, node.op);
     }
     allocator.free(nodes);
@@ -748,15 +671,14 @@ fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
 }
 
 pub fn deinitNodeOp(allocator: std.mem.Allocator, op: NodeOp) void {
+    var mutable = op;
+    if (graph_mod.symbolicAttr(&mutable)) |attr| {
+        allocator.free(attr.sizes);
+        if (attr.free_dims.len != 0) allocator.free(@constCast(attr.free_dims));
+    }
+    // `starts` is the one slice attribute that is never symbolic.
     switch (op) {
-        .LayerNorm => |ln| allocator.free(ln.normalized_shape),
-        .RMSNorm => |ln| allocator.free(ln.normalized_shape),
-        .ViewReshape => |vr| allocator.free(vr.new_shape),
-        .ViewSliceND => |sl| {
-            allocator.free(sl.starts);
-            allocator.free(sl.lens);
-        },
-        .Loop => |lp| if (lp.extra_outputs.len != 0) allocator.free(lp.extra_outputs),
+        .ViewSliceND => |sl| allocator.free(sl.starts),
         else => {},
     }
 }

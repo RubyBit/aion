@@ -47,6 +47,7 @@ pub const Package = types.Package;
 
 pub const makeConstantShapeTerms = shape.makeConstantShapeTerms;
 pub const evaluateShapeTerm = shape.evaluateShapeTerm;
+pub const evaluateDimExpr = shape.evaluateDimExpr;
 pub const resolveShapeTerms = shape.resolveShapeTerms;
 pub const resolveShapeTermsExprs = shape.resolveShapeTermsExprs;
 pub const readAlloc = io.readAlloc;

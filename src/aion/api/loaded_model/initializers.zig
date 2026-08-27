@@ -4,16 +4,54 @@ const std = @import("std");
 const manager_mod = @import("../../storage/manager.zig");
 const package_file = @import("../../storage/aion_file.zig");
 const types_mod = @import("types.zig");
+const params_mod = @import("params.zig");
 const api_tiling = @import("../tiling.zig");
 const api_errors = @import("../errors.zig");
 
-pub fn importInitializersForLoadedModel(
+/// Import every initializer of `package` into `store`, returning the parameters keyed by
+/// graph value. The `initializer_index` that names a slot in the file's weight section
+/// does not survive this call.
+pub fn importParams(
     allocator: std.mem.Allocator,
     store: *types_mod.StorageManager,
     policy: types_mod.TilePolicy,
     package: *const types_mod.Package,
-) api_errors.LoadError![]types_mod.TensorId {
-    return initInitializerTensors(allocator, store, policy, package);
+) api_errors.LoadError!params_mod.Params {
+    var out = try params_mod.Params.init(allocator, package.values.len);
+    errdefer out.deinit(allocator);
+    for (package.values, 0..) |value, value_idx| {
+        if (value.source != .initializer) continue;
+        const init_idx: u32 = value.initializer_index orelse return error.InvalidArgument;
+        if (init_idx >= package.initializers.len) return error.InvalidArgument;
+        const init = package.initializers[init_idx];
+        const tid = try createInitializerTensor(allocator, store, policy, package, value, init);
+        const meta = try store.getConst(tid);
+        const tensor = types_mod.Tensor{ .store = store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
+        switch (init.encoding) {
+            .plain => try tensor.writePackedScalar(init.data),
+            .quantized => try tensor.writePackedQuant(init.data),
+        }
+        out.set(@intCast(value_idx), tid);
+    }
+    return out;
+}
+
+/// The store tensor for one initializer value, sized and tiled from its record.
+fn createInitializerTensor(
+    allocator: std.mem.Allocator,
+    store: *types_mod.StorageManager,
+    policy: types_mod.TilePolicy,
+    package: *const types_mod.Package,
+    value: package_file.ValueRecord,
+    init: package_file.Initializer,
+) api_errors.LoadError!types_mod.TensorId {
+    const shape = try resolveConstShape(allocator, package, value);
+    defer allocator.free(shape);
+    const quant_axis: u8 = switch (init.encoding) {
+        .plain => 0,
+        .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
+    };
+    return createTensorForShapeWithQuantAxis(store, policy, value.dtype, shape, quant_axis);
 }
 
 /// Like `importInitializersForLoadedModel`, but streams each initializer's bytes
@@ -31,14 +69,14 @@ pub fn importInitializersForLoadedModel(
 /// `source_bytes` must be the exact buffer the package's initializer slices borrow
 /// into (i.e. the full file image starting at file offset 0). `package.source_bytes`
 /// is consumed (freed) by this call.
-pub fn importInitializersStreaming(
+pub fn importParamsStreaming(
     allocator: std.mem.Allocator,
     store: *types_mod.StorageManager,
     policy: types_mod.TilePolicy,
     package: *types_mod.Package,
     file: std.Io.File,
     source_bytes: []const u8,
-) api_errors.LoadError![]types_mod.TensorId {
+) api_errors.LoadError!params_mod.Params {
     const n: usize = package.initializers.len;
 
     // 1. Capture each initializer's (file offset, len) while the borrowed data
@@ -53,7 +91,7 @@ pub fn importInitializersStreaming(
         if (ptr < base or (ptr + init.data.len) > base + source_bytes.len) {
             // Initializer doesn't borrow into the file buffer (shouldn't happen for a
             // freshly parsed package); fall back to the in-memory copy path.
-            return initInitializerTensors(allocator, store, policy, package);
+            return importParams(allocator, store, policy, package);
         }
         spans[i] = .{ .off = @intCast(ptr - base), .len = init.data.len };
         max_len = @max(max_len, init.data.len);
@@ -70,20 +108,14 @@ pub fn importInitializersStreaming(
     var io_backend: std.Io.Threaded = .init_single_threaded;
     const io = io_backend.io();
 
-    const tids = try allocator.alloc(types_mod.TensorId, n);
-    errdefer allocator.free(tids);
-    for (tids, 0..) |*slot, init_idx| {
-        const value_idx = findInitializerValueIndex(package, @intCast(init_idx)) orelse return error.InvalidArgument;
-        const value = package.values[value_idx];
-        const shape = try resolveConstShape(allocator, package, value);
-        defer allocator.free(shape);
-
+    var out = try params_mod.Params.init(allocator, package.values.len);
+    errdefer out.deinit(allocator);
+    for (package.values, 0..) |value, value_idx| {
+        if (value.source != .initializer) continue;
+        const init_idx: u32 = value.initializer_index orelse return error.InvalidArgument;
+        if (init_idx >= n) return error.InvalidArgument;
         const init = package.initializers[init_idx];
-        const quant_axis: u8 = switch (init.encoding) {
-            .plain => 0,
-            .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
-        };
-        slot.* = try createTensorForShapeWithQuantAxis(store, policy, value.dtype, shape, quant_axis);
+        const tid = try createInitializerTensor(allocator, store, policy, package, value, init);
 
         // Read this initializer's packed bytes back from disk (OS page cache) into scratch.
         const span = spans[init_idx];
@@ -91,14 +123,15 @@ pub fn importInitializersStreaming(
         const got = file.readPositionalAll(io, buf, span.off) catch return error.IoFailure;
         if (got != span.len) return error.IoFailure;
 
-        const meta = try store.getConst(slot.*);
-        const tensor = types_mod.Tensor{ .store = store, .id = slot.*, .dtype = meta.dtype, .shape = meta.shape };
+        const meta = try store.getConst(tid);
+        const tensor = types_mod.Tensor{ .store = store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
         switch (init.encoding) {
             .plain => try tensor.writePackedScalar(buf),
             .quantized => try tensor.writePackedQuant(buf),
         }
+        out.set(@intCast(value_idx), tid);
     }
-    return tids;
+    return out;
 }
 
 pub fn createTensorForShape(
@@ -194,37 +227,6 @@ fn resolveConstShape(
     return package_file.resolveShapeTerms(allocator, pkg, value.shape_terms, zero_symbols);
 }
 
-fn initInitializerTensors(
-    allocator: std.mem.Allocator,
-    store: *types_mod.StorageManager,
-    policy: types_mod.TilePolicy,
-    package: *const types_mod.Package,
-) api_errors.LoadError![]types_mod.TensorId {
-    const tids = try allocator.alloc(types_mod.TensorId, package.initializers.len);
-    errdefer allocator.free(tids);
-    for (tids, 0..) |*slot, init_idx| {
-        const value_idx = findInitializerValueIndex(package, @intCast(init_idx)) orelse return error.InvalidArgument;
-        const value = package.values[value_idx];
-        const shape = try resolveConstShape(allocator, package, value);
-        defer allocator.free(shape);
-
-        const init = package.initializers[init_idx];
-        const quant_axis: u8 = switch (init.encoding) {
-            .plain => 0,
-            .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
-        };
-        slot.* = try createTensorForShapeWithQuantAxis(store, policy, value.dtype, shape, quant_axis);
-
-        const meta = try store.getConst(slot.*);
-        const tensor = types_mod.Tensor{ .store = store, .id = slot.*, .dtype = meta.dtype, .shape = meta.shape };
-        switch (init.encoding) {
-            .plain => try tensor.writePackedScalar(init.data),
-            .quantized => try tensor.writePackedQuant(init.data),
-        }
-    }
-    return tids;
-}
-
 fn quantAxisToU8(raw: i32, rank: usize) error{InvalidArgument}!u8 {
     if (raw < 0) return error.InvalidArgument;
     const as_usize: usize = @intCast(raw);
@@ -233,9 +235,3 @@ fn quantAxisToU8(raw: i32, rank: usize) error{InvalidArgument}!u8 {
     return @intCast(as_usize);
 }
 
-fn findInitializerValueIndex(package: *const types_mod.Package, initializer_index: u32) ?usize {
-    for (package.values, 0..) |value, idx| {
-        if (value.initializer_index == initializer_index) return idx;
-    }
-    return null;
-}

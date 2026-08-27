@@ -1,9 +1,9 @@
 //! Public graph-program facade.
 //!
-//! The implementation follows the compilation pipeline in sibling modules:
-//! reachability selects requested work, compiler orchestrates lowering,
-//! allocation owns graph-value-to-logical-tensor mapping, placement makes
-//! crossings explicit, and workspace assigns/materializes physical storage.
+//! The pipeline: `reachability` selects requested work, `compiler` orchestrates
+//! lowering, `allocation` owns graph-value-to-logical-tensor mapping, `placement`
+//! makes crossings explicit, and `workspace` assigns/materializes physical storage.
+//! Optional rewrites at both ends live in `graph/opt.zig`.
 
 const compiler = @import("program/compiler.zig");
 
@@ -16,7 +16,8 @@ pub const PlacedStep = compiler.PlacedStep;
 pub const Program = compiler.Program;
 pub const CompileError = compiler.CompileError;
 pub const OptPolicy = compiler.OptPolicy;
+pub const optDefaults = @import("opt.zig").defaults;
 
 pub const compileGraph = compiler.compileGraph;
-pub const compileGraphOpt = compiler.compileGraphOpt;
+pub const Target = compiler.Target;
 pub const materializePlacements = compiler.materializePlacements;

@@ -23,7 +23,7 @@ const gpu = aion.gpu; // feature-gated GPU backend (root.zig exposes it when -Dg
 /// These tests execute on the GPU, so their programs must be compiled for it:
 /// placement decides where each step runs and which reads cross back to the host.
 /// The CPU reference run replays the same program — a transfer is just a copy there.
-const gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.{ .kind = .webgpu });
+const gpu_policy: plan.TilePolicy = plan.tilePolicyForTarget(.webgpu);
 const wgpu = gpu.wgpu; // the wgpu helper, re-exported by the backend
 
 const StorageManager = aion.storage_manager.StorageManager;
@@ -61,7 +61,7 @@ fn buildProgram(alloc: std.mem.Allocator, mgr: *StorageManager) !struct { prog: 
     const res = try g.addUnary(.silu, sum);
     try g.setOutputs(&[_]aion.graph.ValueId{res});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -176,7 +176,7 @@ fn buildMatMulProgram(alloc: std.mem.Allocator, mgr: *StorageManager) !struct { 
     const cv = try g.addMatMul(av, bv, 1.0, 0.0);
     try g.setOutputs(&[_]aion.graph.ValueId{cv});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -369,9 +369,9 @@ fn finishProg(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, out_v: 
     try g.setOutputs(&[_]aion.graph.ValueId{out_v});
     // GPU placement with the default (small) tile sizes: these tests deliberately
     // exercise multi-tile paths. Placement and tiling are independent knobs.
-    const prog = try aion.program.compileGraph(alloc, g, mgr, .{
+    const prog = try aion.program.compileGraph(alloc, g, mgr, .init(.{ .kind = .gpu }, .{
         .target_kind = .webgpu,
-    });
+    }));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -419,7 +419,7 @@ test "gpu backend: rmsnorm matches CPU" {
     try expectGpuMatchesCpu(buildRMSNorm, RW_M * RW_N, 1e-4);
 }
 
-/// Residual + RMSNorm, the pattern `program/fuse_steps.zig` fuses into one step.
+/// Residual + RMSNorm, the pattern `opt/fuse_steps.zig` fuses into one step.
 ///
 /// This is a stronger check than it looks. The pass is GPU-only, so the CPU side
 /// of the comparison runs the UNFUSED norm-then-add pair while the GPU runs the single
@@ -443,7 +443,7 @@ test "gpu backend: residual + rmsnorm (step-fused) matches CPU" {
 
 /// Gated activation `act(a) * b`, spelled out as a unary and a multiply.
 ///
-/// Two things at once. `program/fuse_steps.zig` is GPU-only, so the GPU runs the single
+/// Two things at once. `opt/fuse_steps.zig` is GPU-only, so the GPU runs the single
 /// fused `gate_*` kernel while the CPU runs the unfused `UnaryTiled` + `mul` pair — the
 /// assertion is "fusing changed nothing". And the activation is a parameter of the op, so
 /// the same test covers every gate by varying it: GEGLU here, SwiGLU below.
@@ -1178,8 +1178,8 @@ test "gpu backend: cast f32->f16->f32 matches CPU" {
 /// so the CPU backend can execute the identical program as the reference.
 fn finishProgGpuTiled(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, out_v: aion.graph.ValueId) !BuiltProg {
     try g.setOutputs(&[_]aion.graph.ValueId{out_v});
-    const policy = plan.tilePolicyForTarget(.{ .kind = .webgpu });
-    const prog = try aion.program.compileGraph(alloc, g, mgr, policy);
+    const policy = plan.tilePolicyForTarget(.webgpu);
+    const prog = try aion.program.compileGraph(alloc, g, mgr, .init(.{ .kind = .gpu }, policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -2234,7 +2234,7 @@ fn buildIfDeviceCond(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg 
     const out = try g.addIf(cond, then_region, else_region);
     try g.setOutputs(&[_]aion.graph.ValueId{out});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -2273,7 +2273,7 @@ fn buildIfHostCond(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const out = try g.addIf(cond, then_region, else_region);
     try g.setOutputs(&[_]aion.graph.ValueId{out});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -2303,7 +2303,7 @@ fn buildFixedTripLoop(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg
     const out = try g.addLoop(carried, body, 4);
     try g.setOutputs(&[_]aion.graph.ValueId{out});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 
@@ -2359,7 +2359,7 @@ fn buildEarlyExitLoop(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg
     );
     try g.setOutputs(&[_]aion.graph.ValueId{outs[1]}); // acc
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, gpu_policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, gpu_policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }
 

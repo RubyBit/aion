@@ -443,9 +443,15 @@ fn parseNodeRecords(allocator: std.mem.Allocator, bytes: []const u8, cursor: *us
         for (inputs) |*input| input.* = try readIntCursor(bytes, cursor, u32);
         const attr_bytes = try readBytes(bytes, cursor, attr_len);
         const op_kind: NodeOpKind = types.parseNodeOpKind(op_kind_raw) orelse return PackageError.InvalidFormat;
-        const op = try parseNodeOp(allocator, op_kind, attr_bytes);
-        errdefer types.deinitNodeOp(allocator, op);
-        slot.* = .{ .inputs = inputs, .output = output, .op = op };
+        const parsed = try parseNodeOp(allocator, op_kind, attr_bytes);
+        errdefer types.deinitNodeOp(allocator, parsed.op);
+        errdefer if (parsed.extra_outputs.len != 0) allocator.free(parsed.extra_outputs);
+        slot.* = .{
+            .inputs = inputs,
+            .output = output,
+            .op = parsed.op,
+            .extra_outputs = parsed.extra_outputs,
+        };
     }
     return out;
 }
@@ -491,8 +497,13 @@ fn parseRegionsSection(allocator: std.mem.Allocator, bytes: []const u8) PackageE
 }
 
 
-fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8) PackageError!NodeOp {
+/// One node's attribute blob. A Loop's extra outputs are stored in it, but they belong to
+/// the NODE (`graph.Node.extra_outputs`), so they come back alongside the op.
+const ParsedOp = struct { op: NodeOp, extra_outputs: []const u32 = &.{} };
+
+fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8) PackageError!ParsedOp {
     var cursor: usize = 0;
+    var extra_outputs: []const u32 = &.{};
     const op: NodeOp = switch (kind) {
         .MatMul => .{ .MatMul = .{ .alpha = try readIntCursor(bytes, &cursor, f32), .beta = try readIntCursor(bytes, &cursor, f32) } },
         .ElemwiseBinary => .{ .ElemwiseBinary = .{ .op = try readEnumCursor(bytes, &cursor, ElemwiseBinaryOp) } },
@@ -501,7 +512,7 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .If => .{ .If = .{ .then_region = try readIntCursor(bytes, &cursor, u32), .else_region = try readIntCursor(bytes, &cursor, u32) } },
         .Loop => blk: {
             const body_region = try readIntCursor(bytes, &cursor, u32);
-            const static_max = try readIntCursor(bytes, &cursor, u64);
+            const static_max = try readSizeCursor(bytes, &cursor);
             const cond_raw = try readIntCursor(bytes, &cursor, i32);
             const check_before = (try readIntCursor(bytes, &cursor, u8)) != 0;
             const n_extra = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
@@ -512,43 +523,61 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
                 for (buf) |*e| e.* = try readIntCursor(bytes, &cursor, u32);
                 break :ex buf;
             };
+            extra_outputs = extra;
             break :blk .{ .Loop = .{
                 .body_region = body_region,
                 .static_max_trip_count = static_max,
                 .cond_carry = if (cond_raw < 0) null else @intCast(cond_raw),
                 .check_before = check_before,
-                .extra_outputs = extra,
             } };
         },
         .Conv1D => .{ .Conv1D = .{
-            .stride = try readIntCursor(bytes, &cursor, u64),
-            .dilation = try readIntCursor(bytes, &cursor, u64),
-            .pad_left = try readIntCursor(bytes, &cursor, u64),
-            .pad_right = try readIntCursor(bytes, &cursor, u64),
+            .stride = try readSizeCursor(bytes, &cursor),
+            .dilation = try readSizeCursor(bytes, &cursor),
+            .pad_left = try readSizeCursor(bytes, &cursor),
+            .pad_right = try readSizeCursor(bytes, &cursor),
             .pad_mode = try readEnumCursor(bytes, &cursor, PadMode),
-            .groups = try readIntCursor(bytes, &cursor, u64),
+            .groups = try readSizeCursor(bytes, &cursor),
         } },
         .Conv2D => .{ .Conv2D = .{
-            .stride_h = try readIntCursor(bytes, &cursor, u64),
-            .stride_w = try readIntCursor(bytes, &cursor, u64),
-            .dilation_h = try readIntCursor(bytes, &cursor, u64),
-            .dilation_w = try readIntCursor(bytes, &cursor, u64),
-            .pad_top = try readIntCursor(bytes, &cursor, u64),
-            .pad_bottom = try readIntCursor(bytes, &cursor, u64),
-            .pad_left = try readIntCursor(bytes, &cursor, u64),
-            .pad_right = try readIntCursor(bytes, &cursor, u64),
+            .stride_h = try readSizeCursor(bytes, &cursor),
+            .stride_w = try readSizeCursor(bytes, &cursor),
+            .dilation_h = try readSizeCursor(bytes, &cursor),
+            .dilation_w = try readSizeCursor(bytes, &cursor),
+            .pad_top = try readSizeCursor(bytes, &cursor),
+            .pad_bottom = try readSizeCursor(bytes, &cursor),
+            .pad_left = try readSizeCursor(bytes, &cursor),
+            .pad_right = try readSizeCursor(bytes, &cursor),
             .pad_mode = try readEnumCursor(bytes, &cursor, PadMode),
-            .groups = try readIntCursor(bytes, &cursor, u64),
+            .groups = try readSizeCursor(bytes, &cursor),
         } },
-        .LayerNorm => .{ .LayerNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        .RMSNorm => .{ .RMSNorm = .{ .eps = try readIntCursor(bytes, &cursor, f32), .normalized_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
-        .Attention => .{ .Attention = .{
-            .scale = try readIntCursor(bytes, &cursor, f32),
-            .causal = (try readIntCursor(bytes, &cursor, u8)) != 0,
-            .sliding_window = try readIntCursor(bytes, &cursor, u64),
-            .attn_logits_soft_cap = try readIntCursor(bytes, &cursor, f32),
-            .controls = try readIntCursor(bytes, &cursor, u8),
-        } },
+        .LayerNorm => blk: {
+            const eps = try readIntCursor(bytes, &cursor, f32);
+            const attr = try readSymbolicAttr(allocator, bytes, &cursor);
+            break :blk .{ .LayerNorm = .{ .eps = eps, .normalized_shape = attr.sizes, .free_dims = attr.free_dims } };
+        },
+        .RMSNorm => blk: {
+            const eps = try readIntCursor(bytes, &cursor, f32);
+            const attr = try readSymbolicAttr(allocator, bytes, &cursor);
+            break :blk .{ .RMSNorm = .{ .eps = eps, .normalized_shape = attr.sizes, .free_dims = attr.free_dims } };
+        },
+        .Attention => blk: {
+            const scale = try readIntCursor(bytes, &cursor, f32);
+            const causal = (try readIntCursor(bytes, &cursor, u8)) != 0;
+            const sliding_window = try readSizeCursor(bytes, &cursor);
+            const soft_cap = try readIntCursor(bytes, &cursor, f32);
+            // The file packs the two optional control operands into one byte.
+            const controls = try readIntCursor(bytes, &cursor, u8);
+            if ((controls & ~@as(u8, 0x3)) != 0) return PackageError.InvalidFormat;
+            break :blk .{ .Attention = .{
+                .scale = scale,
+                .causal = causal,
+                .sliding_window = sliding_window,
+                .attn_logits_soft_cap = soft_cap,
+                .has_query_positions = (controls & 1) != 0,
+                .has_kv_lengths = (controls & 2) != 0,
+            } };
+        },
         .Reduce => .{ .Reduce = .{
             .op = try readEnumCursor(bytes, &cursor, ReduceOp),
             .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null,
@@ -557,21 +586,21 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .LSTMCell => .{ .LSTMCell = .{ .has_bias = (try readIntCursor(bytes, &cursor, u8)) != 0 } },
         .RFFT => .RFFT,
         .STFT => .{ .STFT = .{
-            .n_fft = try readIntCursor(bytes, &cursor, u64),
-            .hop_length = try readIntCursor(bytes, &cursor, u64),
+            .n_fft = try readSizeCursor(bytes, &cursor),
+            .hop_length = try readSizeCursor(bytes, &cursor),
             .center = (try readIntCursor(bytes, &cursor, u8)) != 0,
         } },
         .RelPosMHA => .{ .RelPosMHA = .{
             .scale = try readIntCursor(bytes, &cursor, f32),
             .has_mask = (try readIntCursor(bytes, &cursor, u8)) != 0,
-            .chunk_size = try readIntCursor(bytes, &cursor, u64),
-            .chunk_left = try readIntCursor(bytes, &cursor, u64),
+            .chunk_size = try readSizeCursor(bytes, &cursor),
+            .chunk_left = try readSizeCursor(bytes, &cursor),
         } },
         .ArgMax => .{ .ArgMax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .ScatterRow => .ScatterRow,
         .Gather => .{ .Gather = .{
             .axis = try readIntCursor(bytes, &cursor, i32),
-            .batch_dims = try readIntCursor(bytes, &cursor, u64),
+            .batch_dims = try readSizeCursor(bytes, &cursor),
         } },
         .Dim => .{ .Dim = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .Iota => .{ .Iota = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
@@ -587,17 +616,21 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .alpha = try readIntCursor(bytes, &cursor, f32),
             .beta = try readIntCursor(bytes, &cursor, f32),
         } },
-        .ViewReshape => .{ .ViewReshape = .{ .new_shape = try readShapeTermArray(allocator, bytes, &cursor) } },
+        .ViewReshape => blk: {
+            const attr = try readSymbolicAttr(allocator, bytes, &cursor);
+            break :blk .{ .ViewReshape = .{ .new_shape = attr.sizes, .free_dims = attr.free_dims } };
+        },
         .ViewSqueeze => .{ .ViewSqueeze = .{ .axis = if ((try readIntCursor(bytes, &cursor, u8)) != 0) try readIntCursor(bytes, &cursor, i32) else null } },
         .ViewUnsqueeze => .{ .ViewUnsqueeze = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .ViewTranspose2D => .ViewTranspose2D,
-        .ViewSliceND => .{ .ViewSliceND = .{
-            .starts = try readU64Array(allocator, bytes, &cursor),
-            .lens = try readShapeTermArray(allocator, bytes, &cursor),
-        } },
+        .ViewSliceND => blk: {
+            const starts = try readSizeArray(allocator, bytes, &cursor);
+            const attr = try readSymbolicAttr(allocator, bytes, &cursor);
+            break :blk .{ .ViewSliceND = .{ .starts = starts, .lens = attr.sizes, .free_dims = attr.free_dims } };
+        },
     };
     if (cursor != bytes.len) return PackageError.InvalidFormat;
-    return op;
+    return .{ .op = op, .extra_outputs = extra_outputs };
 }
 
 fn parseSignaturesSection(allocator: std.mem.Allocator, strings: [][]u8, bytes: []const u8) PackageError!struct { inputs: []NamedValue, outputs: []NamedValue } {
@@ -783,21 +816,57 @@ fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
     allocator.free(symbols);
 }
 
-fn readShapeTermArray(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize) PackageError![]ShapeTerm {
+
+/// An op's shape attribute, read as the (sizes, symbols) pair `graph.Op` carries.
+///
+/// The file stores each axis as a `ShapeTerm`: a constant, or an expression index for a
+/// free axis. A free axis therefore has no recorded size, and its placeholder is 0 —
+/// `Template.specialize` overwrites it before inference (see `graph.Op`'s `symbols`).
+/// `free_dims` comes back empty when every axis is fixed, which is the common case.
+fn readSymbolicAttr(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize) PackageError!struct {
+    sizes: []const usize,
+    free_dims: []const ?u32,
+} {
     const count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
-    const out = allocator.alloc(ShapeTerm, count) catch return PackageError.OutOfMemory;
+    const sizes = allocator.alloc(usize, count) catch return PackageError.OutOfMemory;
+    errdefer allocator.free(sizes);
+    const free_dims = allocator.alloc(?u32, count) catch return PackageError.OutOfMemory;
+    errdefer allocator.free(free_dims);
+
+    var any_free = false;
+    for (sizes, free_dims) |*size, *free_dim| {
+        switch (try readShapeTerm(bytes, cursor)) {
+            .constant => |c| {
+                size.* = std.math.cast(usize, c) orelse return PackageError.InvalidFormat;
+                free_dim.* = null;
+            },
+            .expr => |e| {
+                size.* = 0;
+                free_dim.* = e;
+                any_free = true;
+            },
+        }
+    }
+    if (!any_free) {
+        allocator.free(free_dims);
+        return .{ .sizes = sizes, .free_dims = &.{} };
+    }
+    return .{ .sizes = sizes, .free_dims = free_dims };
+}
+
+/// A size stored as u64 and held as `usize`, which is what the graph's ops use.
+fn readSizeCursor(bytes: []const u8, cursor: *usize) PackageError!usize {
+    return std.math.cast(usize, try readIntCursor(bytes, cursor, u64)) orelse PackageError.InvalidFormat;
+}
+
+fn readSizeArray(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize) PackageError![]usize {
+    const count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
+    const out = allocator.alloc(usize, count) catch return PackageError.OutOfMemory;
     errdefer allocator.free(out);
-    for (out) |*term| term.* = try readShapeTerm(bytes, cursor);
+    for (out) |*value| value.* = try readSizeCursor(bytes, cursor);
     return out;
 }
 
-fn readU64Array(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize) PackageError![]u64 {
-    const count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
-    const out = allocator.alloc(u64, count) catch return PackageError.OutOfMemory;
-    errdefer allocator.free(out);
-    for (out) |*value| value.* = try readIntCursor(bytes, cursor, u64);
-    return out;
-}
 
 fn readShapeTerm(bytes: []const u8, cursor: *usize) PackageError!ShapeTerm {
     const kind = try readIntCursor(bytes, cursor, u8);

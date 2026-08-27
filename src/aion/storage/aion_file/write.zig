@@ -188,7 +188,7 @@ fn appendNodeRecords(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node
     for (nodes) |node| {
         var attr: std.ArrayList(u8) = .empty;
         defer attr.deinit(allocator);
-        const kind = try encodeNodeOp(&attr, allocator, node.op);
+        const kind = try encodeNodeOp(&attr, allocator, node);
         try appendInt(out, allocator, u8, @intFromEnum(kind));
         try out.appendNTimes(allocator, 0, 3);
         try appendInt(out, allocator, u32, node.output);
@@ -218,7 +218,10 @@ fn encodeRegionsSection(allocator: std.mem.Allocator, regions: []const RegionRec
     return out.toOwnedSlice(allocator);
 }
 
-fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeOp) PackageError!NodeOpKind {
+/// One node's attribute blob. Takes the NODE, not just the op: a Loop's extra outputs
+/// live in its payload but belong to the node (see `parse.ParsedOp`).
+fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: NodeRecord) PackageError!NodeOpKind {
+    const op = node.op;
     const kind: NodeOpKind = types.nodeOpKind(op);
     switch (op) {
         .MatMul => |mm| {
@@ -235,39 +238,42 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
             try appendInt(out, allocator, i32, s.axis);
         },
         .Conv1D => |cv| {
-            try appendInt(out, allocator, u64, cv.stride);
-            try appendInt(out, allocator, u64, cv.dilation);
-            try appendInt(out, allocator, u64, cv.pad_left);
-            try appendInt(out, allocator, u64, cv.pad_right);
+            try appendSize(out, allocator, cv.stride);
+            try appendSize(out, allocator, cv.dilation);
+            try appendSize(out, allocator, cv.pad_left);
+            try appendSize(out, allocator, cv.pad_right);
             try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
-            try appendInt(out, allocator, u64, cv.groups);
+            try appendSize(out, allocator, cv.groups);
         },
         .Conv2D => |cv| {
-            try appendInt(out, allocator, u64, cv.stride_h);
-            try appendInt(out, allocator, u64, cv.stride_w);
-            try appendInt(out, allocator, u64, cv.dilation_h);
-            try appendInt(out, allocator, u64, cv.dilation_w);
-            try appendInt(out, allocator, u64, cv.pad_top);
-            try appendInt(out, allocator, u64, cv.pad_bottom);
-            try appendInt(out, allocator, u64, cv.pad_left);
-            try appendInt(out, allocator, u64, cv.pad_right);
+            try appendSize(out, allocator, cv.stride_h);
+            try appendSize(out, allocator, cv.stride_w);
+            try appendSize(out, allocator, cv.dilation_h);
+            try appendSize(out, allocator, cv.dilation_w);
+            try appendSize(out, allocator, cv.pad_top);
+            try appendSize(out, allocator, cv.pad_bottom);
+            try appendSize(out, allocator, cv.pad_left);
+            try appendSize(out, allocator, cv.pad_right);
             try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
-            try appendInt(out, allocator, u64, cv.groups);
+            try appendSize(out, allocator, cv.groups);
         },
         .LayerNorm => |ln| {
             try appendInt(out, allocator, f32, ln.eps);
-            try appendShapeTermArray(out, allocator, ln.normalized_shape);
+            try appendSymbolicAttr(out, allocator, ln.normalized_shape, ln.free_dims);
         },
         .RMSNorm => |ln| {
             try appendInt(out, allocator, f32, ln.eps);
-            try appendShapeTermArray(out, allocator, ln.normalized_shape);
+            try appendSymbolicAttr(out, allocator, ln.normalized_shape, ln.free_dims);
         },
         .Attention => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
-            try appendInt(out, allocator, u64, attn.sliding_window);
+            try appendSize(out, allocator, attn.sliding_window);
             try appendInt(out, allocator, f32, attn.attn_logits_soft_cap);
-            try appendInt(out, allocator, u8, attn.controls);
+            // Packed back into the one control byte the file stores.
+            const controls: u8 = (if (attn.has_query_positions) @as(u8, 1) else 0) |
+                (if (attn.has_kv_lengths) @as(u8, 2) else 0);
+            try appendInt(out, allocator, u8, controls);
         },
         .Reduce => |rr| {
             try appendInt(out, allocator, u8, @intFromEnum(rr.op));
@@ -282,15 +288,15 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .RFFT => {},
         .STFT => |st| {
-            try appendInt(out, allocator, u64, st.n_fft);
-            try appendInt(out, allocator, u64, st.hop_length);
+            try appendSize(out, allocator, st.n_fft);
+            try appendSize(out, allocator, st.hop_length);
             try appendInt(out, allocator, u8, if (st.center) 1 else 0);
         },
         .RelPosMHA => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.has_mask) 1 else 0);
-            try appendInt(out, allocator, u64, attn.chunk_size);
-            try appendInt(out, allocator, u64, attn.chunk_left);
+            try appendSize(out, allocator, attn.chunk_size);
+            try appendSize(out, allocator, attn.chunk_left);
         },
         .ArgMax => |am| {
             try appendInt(out, allocator, i32, am.axis);
@@ -298,7 +304,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         .ScatterRow => {},
         .Gather => |gg| {
             try appendInt(out, allocator, i32, gg.axis);
-            try appendInt(out, allocator, u64, gg.batch_dims);
+            try appendSize(out, allocator, gg.batch_dims);
         },
         .Dim => |dd| try appendInt(out, allocator, i32, dd.axis),
         .Iota => |io| try appendInt(out, allocator, i32, io.axis),
@@ -322,14 +328,14 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .Loop => |lp| {
             try appendInt(out, allocator, u32, lp.body_region);
-            try appendInt(out, allocator, u64, lp.static_max_trip_count);
+            try appendSize(out, allocator, lp.static_max_trip_count);
             try appendInt(out, allocator, i32, if (lp.cond_carry) |c| @intCast(c) else -1);
             try appendInt(out, allocator, u8, @intFromBool(lp.check_before));
-            try appendInt(out, allocator, u32, @intCast(lp.extra_outputs.len));
-            for (lp.extra_outputs) |e| try appendInt(out, allocator, u32, e);
+            try appendInt(out, allocator, u32, @intCast(node.extra_outputs.len));
+            for (node.extra_outputs) |e| try appendInt(out, allocator, u32, e);
         },
         .ViewReshape => |vr| {
-            try appendShapeTermArray(out, allocator, vr.new_shape);
+            try appendSymbolicAttr(out, allocator, vr.new_shape, vr.free_dims);
         },
         .ViewSqueeze => |vs| {
             try appendInt(out, allocator, u8, if (vs.axis != null) 1 else 0);
@@ -340,8 +346,8 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, op: NodeO
         },
         .ViewTranspose2D => {},
         .ViewSliceND => |sl| {
-            try appendU64Array(out, allocator, sl.starts);
-            try appendShapeTermArray(out, allocator, sl.lens);
+            try appendSizeArray(out, allocator, sl.starts);
+            try appendSymbolicAttr(out, allocator, sl.lens, sl.free_dims);
         },
     }
 
@@ -453,15 +459,37 @@ fn appendShapeTerm(out: *std.ArrayList(u8), allocator: std.mem.Allocator, term: 
     }
 }
 
-fn appendShapeTermArray(out: *std.ArrayList(u8), allocator: std.mem.Allocator, terms: []const ShapeTerm) PackageError!void {
-    try appendInt(out, allocator, u32, @intCast(terms.len));
-    for (terms) |term| try appendShapeTerm(out, allocator, term);
+/// An op's shape attribute, written back as the `ShapeTerm` list the file stores: a free
+/// axis becomes its expression index, a fixed one its size. The inverse of
+/// `parse.readSymbolicAttr`.
+fn appendSymbolicAttr(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    sizes: []const usize,
+    free_dims: []const ?u32,
+) !void {
+    try appendInt(out, allocator, u32, @intCast(sizes.len));
+    for (sizes, 0..) |size, i| {
+        const free_dim: ?u32 = if (i < free_dims.len) free_dims[i] else null;
+        if (free_dim) |expr| {
+            try appendShapeTerm(out, allocator, .{ .expr = expr });
+        } else {
+            try appendShapeTerm(out, allocator, .{ .constant = @intCast(size) });
+        }
+    }
 }
 
-fn appendU64Array(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const u64) PackageError!void {
-    try appendInt(out, allocator, u32, @intCast(values.len));
-    for (values) |value| try appendInt(out, allocator, u64, value);
+/// A `usize` field, stored as u64.
+fn appendSize(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) PackageError!void {
+    return appendInt(out, allocator, u64, @intCast(value));
 }
+
+fn appendSizeArray(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const usize) PackageError!void {
+    try appendInt(out, allocator, u32, @intCast(values.len));
+    for (values) |value| try appendSize(out, allocator, value);
+}
+
+
 
 fn collectPackageStrings(interner: *StringInterner, pkg: *const Package) PackageError!void {
     for (pkg.initializers) |init| {

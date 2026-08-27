@@ -16,6 +16,7 @@ const infer_mod = @import("../graph/infer.zig");
 const api_builder = @import("builder.zig");
 const api_loaded_model = @import("loaded_model.zig");
 const api_weights = @import("weights.zig");
+const api_initializers = @import("loaded_model/initializers.zig");
 const api_package_export = @import("package_export.zig");
 const api_tensor = @import("tensor.zig");
 const api_tiling = @import("tiling.zig");
@@ -41,6 +42,7 @@ pub const OutputAlias = api_package_export.OutputAlias;
 pub const InputRoleDecl = api_package_export.InputRoleDecl;
 pub const InputRoleKind = package_file.InputRoleKind;
 pub const ExportModelOptions = api_package_export.ExportModelOptions;
+pub const CompileOptions = api_package_export.CompileOptions;
 pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
 pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
@@ -104,7 +106,7 @@ pub const Context = struct {
             .allocator = allocator,
             .cpu = cpu,
             .store = sm,
-            .policy = opts.tile_policy_override orelse plan_mod.tilePolicyForTarget(.{ .kind = .cpu }),
+            .policy = opts.tile_policy_override orelse plan_mod.tilePolicyForTarget(.cpu),
             .gpu_devices = if (build_options.enable_gpu) &.{} else {},
             .device_entries = &.{},
         };
@@ -295,9 +297,9 @@ pub const Context = struct {
         // store never coexist). `importInitializersStreaming` consumes `bytes` via
         // `pkg.releaseSourceBytes()`, so the `bytes` errdefer above is now a no-op
         // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
-        const initializer_tids = try api_loaded_model.importInitializersStreaming(self.allocator, &self.store, dev.policy, &pkg, file, bytes);
-        errdefer self.allocator.free(initializer_tids);
-        return api_loaded_model.LoadedModel.initLoaded(self.allocator, dev.backend, &self.store, dev.policy, dev.ref, pkg, initializer_tids, hash, opts);
+        var params = try api_initializers.importParamsStreaming(self.allocator, &self.store, dev.policy, &pkg, file, bytes);
+        errdefer params.deinit(self.allocator);
+        return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = pkg }, params, hash, opts);
     }
 
     /// Load an AION package as a weights-only container.
@@ -310,9 +312,9 @@ pub const Context = struct {
         const hash = std.hash.Wyhash.hash(0, bytes);
         var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
         errdefer pkg.deinit();
-        const initializer_tids = try api_weights.importInitializersForWeights(self.allocator, &self.store, self.policy, &pkg);
-        errdefer self.allocator.free(initializer_tids);
-        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, pkg, initializer_tids, hash);
+        var params = try api_initializers.importParams(self.allocator, &self.store, self.policy, &pkg);
+        errdefer params.deinit(self.allocator);
+        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, pkg, params, hash);
     }
 
     pub fn loadModelPath(self: *Self, path: []const u8, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
@@ -577,7 +579,7 @@ pub const Context = struct {
         self: *Self,
         b: *api_builder.Builder,
         outputs: []const api_builder.TensorRef,
-        opts: ExportModelOptions,
+        opts: CompileOptions,
     ) api_errors.ApiError!Model {
         return self.compileOn(.cpu, b, outputs, opts);
     }
@@ -590,7 +592,7 @@ pub const Context = struct {
         dev_sel: device_mod.DeviceSelector,
         b: *api_builder.Builder,
         outputs: []const api_builder.TensorRef,
-        opts: ExportModelOptions,
+        opts: CompileOptions,
     ) api_errors.ApiError!Model {
         if (outputs.len == 0) return api_errors.ApiError.InvalidArgument;
 
@@ -599,120 +601,86 @@ pub const Context = struct {
         const g: *graph_mod.Graph = b.innerGraph();
         try infer_mod.infer(g);
 
-        // Names that are auto-generated (unnamed public inputs) live here until
-        // `initCompiled` copies them into the model's arena.
+        // Outputs are named by whatever the builder attached to the value (an explicit
+        // `bld.name` or the op's auto-name), falling back to a position.
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
-
-        // Public inputs = graph leaves with no producer and no external binding
-        // (params are external-bound and become baked initializers).
-        var input_ids: std.ArrayList(graph_mod.ValueId) = .empty;
-        defer input_ids.deinit(self.allocator);
-        var input_names: std.ArrayList([]const u8) = .empty;
-        defer input_names.deinit(self.allocator);
-        for (g.values.items, 0..) |v, idx| {
-            if (v.producer != null or v.external != null) continue;
-            const vid: graph_mod.ValueId = @intCast(idx);
-            const nm = b.valueName(.{ .value = vid }) orelse
-                (std.fmt.allocPrint(sa, "input{d}", .{input_ids.items.len}) catch return error.OutOfMemory);
-            try input_ids.append(self.allocator, vid);
-            try input_names.append(self.allocator, nm);
-        }
-
-        // Symbolic input dims (variable shapes): map each declaration to (input
-        // index, axis, symbol index), deduplicating symbols by name so two axes
-        // sharing a name are constrained to the same runtime size.
-        var symbol_names: std.ArrayList([]const u8) = .empty;
-        defer symbol_names.deinit(self.allocator);
-        var symbolic_axes: std.ArrayList(api_loaded_model.SymbolicAxis) = .empty;
-        defer symbolic_axes.deinit(self.allocator);
-        for (b.dimSymbols()) |spec| {
-            const in_idx = findValueIdIndex(input_ids.items, spec.tensor.value) orelse return api_errors.ApiError.InvalidArgument;
-            const v = g.values.items[@intCast(spec.tensor.value)];
-            if (spec.axis >= v.shape.len) return api_errors.ApiError.InvalidArgument;
-            var sym_idx: u32 = @intCast(symbol_names.items.len);
-            for (symbol_names.items, 0..) |nm, si| {
-                if (std.mem.eql(u8, nm, spec.name)) {
-                    sym_idx = @intCast(si);
-                    break;
-                }
-            } else {
-                try symbol_names.append(self.allocator, spec.name);
-            }
-            try symbolic_axes.append(self.allocator, .{
-                .input_index = @intCast(in_idx),
-                .axis = @intCast(spec.axis),
-                .symbol_index = sym_idx,
-            });
-        }
-
-        const out_ids = try self.allocator.alloc(graph_mod.ValueId, outputs.len);
-        defer self.allocator.free(out_ids);
-        const out_names = try self.allocator.alloc([]const u8, outputs.len);
-        defer self.allocator.free(out_names);
+        const named = sa.alloc(api_package_export.NamedTensorRef, outputs.len) catch return error.OutOfMemory;
         for (outputs, 0..) |o, i| {
-            out_ids[i] = o.value;
-            // The output's name is whatever the builder attached to the value
-            // (explicit `bld.name` or the op auto-name); fall back to positional.
-            out_names[i] = b.valueName(o) orelse
-                (std.fmt.allocPrint(sa, "output{d}", .{i}) catch return error.OutOfMemory);
+            named[i] = .{
+                .name = b.valueName(o) orelse (std.fmt.allocPrint(sa, "output{d}", .{i}) catch return error.OutOfMemory),
+                .tensor = o,
+            };
         }
 
-        // Map each alias (by tensor) to (input index, output index) pairs.
-        var aliases: std.ArrayList(package_file.IoAlias) = .empty;
-        defer aliases.deinit(self.allocator);
-        for (opts.output_aliases) |al| {
-            const in_idx = findValueIdIndex(input_ids.items, al.input.value) orelse return api_errors.ApiError.InvalidArgument;
-            const out_idx = findValueIdIndex(out_ids, al.output.value) orelse return api_errors.ApiError.InvalidArgument;
-            try aliases.append(self.allocator, .{ .input = @intCast(in_idx), .output = @intCast(out_idx) });
+        // Snapshot the authored graph in symbolic form. This is the same conversion
+        // `exportModel` runs; the difference is that nothing serializes the weights, so
+        // the parameters stay the caller's tensors in the store.
+        var parts = api_package_export.collectTemplate(self.allocator, b, named, .{}) catch |e| {
+            return switch (e) {
+                error.OutOfMemory => api_errors.ApiError.OutOfMemory,
+                else => api_errors.ApiError.InvalidArgument,
+            };
+        };
+        errdefer parts.deinit(self.allocator);
+
+        // Aliases and roles address inputs and outputs by INDEX, so they are resolved
+        // against the template's own lists.
+        parts.io_aliases = try self.allocator.alloc(package_file.IoAlias, opts.output_aliases.len);
+        for (opts.output_aliases, 0..) |al, i| {
+            const in_idx = indexOfValue(parts.input_values, al.input.value) orelse return api_errors.ApiError.InvalidArgument;
+            const out_idx = indexOfValue(parts.output_values, al.output.value) orelse return api_errors.ApiError.InvalidArgument;
+            parts.io_aliases[i] = .{ .input = @intCast(in_idx), .output = @intCast(out_idx) };
         }
 
-        // Input roles (by tensor -> input index). Compiled graphs are concrete-only,
-        // so a free capacity symbol has nothing to refer to.
-        var roles: std.ArrayList(package_file.InputRole) = .empty;
-        defer roles.deinit(self.allocator);
-        for (opts.input_roles) |decl| {
+        parts.input_roles = try self.allocator.alloc(package_file.InputRole, opts.input_roles.len);
+        for (opts.input_roles, 0..) |decl, i| {
+            // A capacity symbol names a free dim of a cache the RUNTIME sizes; an
+            // in-process compile has no such thing to point at.
             if (decl.capacity_symbol != null) return api_errors.ApiError.InvalidArgument;
-            const in_idx = findValueIdIndex(input_ids.items, decl.input.value) orelse return api_errors.ApiError.InvalidArgument;
+            const in_idx = indexOfValue(parts.input_values, decl.input.value) orelse return api_errors.ApiError.InvalidArgument;
             var flags: u8 = 0;
             if (decl.zero_init) flags |= package_file.InputRoleFlags.zero_init;
             if (decl.allow_growable) flags |= package_file.InputRoleFlags.allow_growable;
             if (decl.allow_ring) flags |= package_file.InputRoleFlags.allow_ring;
-            try roles.append(self.allocator, .{
+            parts.input_roles[i] = .{
                 .input = @intCast(in_idx),
                 .kind = decl.kind,
                 .axis = decl.axis orelse package_file.input_role_no_axis,
                 .flags = flags,
-            });
+            };
         }
 
-        // The model owns a copy; the builder keeps its graph so authoring can go on
-        // after (and across) compiles.
-        const owned_graph = try b.cloneGraph();
-        return api_loaded_model.Model.initCompiled(
+        return api_loaded_model.Model.init(
             self.allocator,
             dev.backend,
             &self.store,
-            dev.policy,
-            dev.ref,
-            owned_graph,
-            input_ids.items,
-            input_names.items,
-            out_ids,
-            out_names,
-            aliases.items,
-            roles.items,
-            symbol_names.items.len,
-            symbolic_axes.items,
+            dev.target(opts.passes),
+            .{ .parts = parts },
+            try paramsFromTemplate(self.allocator, parts),
+            0,
             .{},
         );
     }
 };
 
-fn findValueIdIndex(ids: []const graph_mod.ValueId, id: graph_mod.ValueId) ?usize {
-    for (ids, 0..) |v, i| {
-        if (v == id) return i;
+/// A parameter map keyed by graph value, from the template's snapshot of the bindings.
+fn paramsFromTemplate(
+    allocator: std.mem.Allocator,
+    parts: api_package_export.Parts,
+) api_errors.ApiError!api_loaded_model.Params {
+    var out = try api_loaded_model.Params.init(allocator, parts.params.len);
+    errdefer out.deinit(allocator);
+    for (parts.params, 0..) |tid, idx| {
+        if (tid == api_loaded_model.no_param) continue;
+        out.set(@intCast(idx), tid);
     }
+    return out;
+}
+
+fn indexOfValue(values: []const u32, value: u32) ?usize {
+    for (values, 0..) |v, i| if (v == value) return i;
     return null;
 }
+

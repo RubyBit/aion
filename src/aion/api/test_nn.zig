@@ -241,7 +241,7 @@ test "api.nn: GatedMLP silu path multiplies the two projections" {
     defer fx.deinit(allocator);
 
     // in=1, ffn=2. Concatenating gate and up into one wide weight is a fusion the
-    // compiler performs (`opt/fuse_horizontal_matmul`), so this layer only ever
+    // compiler performs (`opt/horizontal_matmul`), so this layer only ever
     // describes the two projections and has one code path.
     const gate = [_]f32{ 1.0, 2.0 }; // [1, 2]
     const up = [_]f32{ 10.0, 20.0 }; // [1, 2]
@@ -269,7 +269,7 @@ test "api.nn: a q8_0 GatedMLP runs against a rank-3 activation" {
     // The shape a real transformer has: a `[batch, seq, dim]` residual stream and
     // quantized `[1, K, N]` projections. Weights are stored rank-aligned with the
     // activation, which is also what keeps them eligible for
-    // `opt/fuse_horizontal_matmul` (it only fuses *externally bound* weights, and
+    // `opt/horizontal_matmul` (it only fuses *externally bound* weights, and
     // rank-padding a weight would replace it with an Unsqueeze result).
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
@@ -523,6 +523,89 @@ test "api.nn: a free axis survives a layer's reshape" {
         try (out).read(got[0..want]);
         for (got[0..want]) |v| try std.testing.expect(std.math.isFinite(v));
     }
+}
+
+// The same case, compiled in process instead of round-tripped through a file.
+//
+// `ctx.compile` used to carry only symbolic INPUT axes: a reshape's target sizes went in
+// as the authoring placeholders, so this model could only ever run at seq 1 — exactly the
+// bug the loaded path above exists to catch, still live on the other path. Both paths
+// snapshot the same template now, so the reshape's free axis is symbolic either way.
+test "api.nn: a free axis survives a reshape in a compiled model" {
+    const allocator = std.testing.allocator;
+    const heads: usize = 2;
+    const head_dim: usize = 4;
+    const model_dim: usize = heads * head_dim;
+    const vocab: usize = 16;
+
+    var tab_vals: [vocab * model_dim]f32 = undefined;
+    for (&tab_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    var proj_vals: [model_dim * model_dim]f32 = undefined;
+    for (&proj_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.2;
+
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    const Tokens = try fx.bld.name(try fx.bld.input(.i32, &[_]usize{ 1, 1 }), "tokens");
+    try fx.bld.symbolicDim(Tokens, 1, "seq");
+
+    const emb = try nn.Embedding.bind(&fx.bld, .{
+        .weight = try fx.ctx.fromF32(&[_]usize{ vocab, model_dim }, &tab_vals),
+    }, .{ .name = "embed" });
+    const X = try emb.forward(&fx.bld, Tokens);
+
+    const attn = try nn.Attention.bind(&fx.bld, .{
+        .q_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ model_dim, model_dim }, &proj_vals) },
+        .o_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ model_dim, model_dim }, &proj_vals) },
+    }, .{ .heads = heads, .kv_heads = 1, .head_dim = head_dim, .scale = 1.0 }, .{ .name = "self_attn" });
+
+    const projected = try attn.project(&fx.bld, X);
+    const Y = try fx.bld.name(projected.q, "q");
+
+    var model = try fx.ctx.compile(&fx.bld, &[_]TensorRef{Y}, .{});
+    defer model.deinit();
+
+    // One compile, two sequence lengths.
+    for ([_]usize{ 1, 5 }) |seq| {
+        var ids: [5]i32 = undefined;
+        for (0..seq) |i| ids[i] = @intCast(i + 1);
+        try model.bindInput("tokens", try fx.ctx.from(&[_]usize{ 1, seq }, ids[0..seq]));
+        try model.run();
+
+        const out = try model.outputTensor("q");
+        var got: [5 * heads * head_dim]f32 = undefined;
+        const want: usize = seq * heads * head_dim;
+        try std.testing.expectEqual(want, out.elemCount());
+        try out.read(got[0..want]);
+        for (got[0..want]) |v| try std.testing.expect(std.math.isFinite(v));
+    }
+}
+
+// A parameter is addressable by the name its author gave it on both paths: a package
+// persists debug names and a Builder has them in hand. This was package-only before —
+// `debugNames` returned an empty slice for a compiled model.
+test "api.nn: a compiled model's weights are addressable by debug name" {
+    const allocator = std.testing.allocator;
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    const w = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const X = try fx.bld.name(try fx.bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const lin = try nn.Linear.bind(&fx.bld, .{
+        .weight = try fx.ctx.fromF32(&[_]usize{ 2, 2 }, &w),
+    }, .{ .name = "proj" });
+    const Y = try lin.forward(&fx.bld, X);
+
+    var model = try fx.ctx.compile(&fx.bld, &[_]TensorRef{Y}, .{});
+    defer model.deinit();
+    try std.testing.expect(model.debugNames().len != 0);
+
+    // The name the layer gave it: scopes join with "/".
+    try std.testing.expectEqualStrings("proj/weight", fx.bld.valueName(lin.w).?);
+    const weight = try model.initializerTensorByDebugName("proj/weight");
+    var got: [4]f32 = undefined;
+    try weight.read(&got);
+    try std.testing.expectEqualSlices(f32, &w, &got);
 }
 
 test "api.nn: GLU gates one half of a projection with the other" {

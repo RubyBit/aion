@@ -4,9 +4,13 @@
 //!
 //! Two passes run between placement and workspace planning — `alias_views` and
 //! `fuse_steps` — and both need the same question answered for a tensor id: who writes
-//! it, who reads it, and when. Both also need the same hazard boundary, that anything a
-//! control-flow body touches is off the table, because a block replays and can capture
-//! outer values, so step indices are not comparable across domains.
+//! it, who reads it, and when. Both also need the same hazard boundary.
+//!
+//! That boundary is the step LIST. A program has several: the top-level schedule and one
+//! per control-flow body. Step indices are comparable only inside one of them, because a
+//! body replays and can capture outer values, so a rule editing one list may only reason
+//! by index about tensors confined to it — which is what `Use.list` records. A tensor
+//! more than one list touches has no list, and every rule declines it.
 //!
 //! Deciding this at the STEP level rather than the value level is deliberate. The one
 //! previous attempt at workspace aliasing in this repo was reverted because it reasoned
@@ -22,38 +26,59 @@ const PlacedStep = executable.PlacedStep;
 
 pub const Error = error{OutOfMemory};
 
+/// A step list: 0 is the top-level schedule, `i + 1` is block `i`'s body. The same
+/// numbering as `opt.rewriter`'s node lists.
+pub const List = usize;
+
+/// Lists in a program: the top-level schedule plus one per block.
+pub fn listCount(prog: *const Program) usize {
+    return 1 + prog.blocks.len;
+}
+
+/// The steps of one list.
+pub fn listSteps(prog: *const Program, list: List) []PlacedStep {
+    if (list == 0) return prog.steps;
+    return prog.blocks[list - 1].steps;
+}
+
 pub const Use = struct {
     writes: usize = 0,
     reads: usize = 0,
     first_touch: usize = std.math.maxInt(usize),
     last_touch: usize = 0,
     last_write: usize = 0,
-    /// Touched inside an If/Loop body. Those replay and can capture outer values, so
-    /// nothing about them is decided by index.
-    in_block: bool = false,
+    /// The one list that touches this tensor, or null when several do. The counts and
+    /// indices above describe that list only, and stop being maintained the moment a
+    /// second list is seen — a rule reads `list` first and declines, so they are never
+    /// consulted for a tensor that has none.
+    list: ?List = null,
 };
 
 pub const Map = std.AutoHashMap(TensorId, Use);
 
-/// Walk the whole program once. Blocks come first, so anything a region body touches is
-/// flagged before the top-level walk records comparable indices for it.
+/// Walk every list of the program once, recording each tensor's facts within its own.
 pub fn collect(allocator: std.mem.Allocator, prog: *const Program) Error!Map {
     var uses: Map = .init(allocator);
     errdefer uses.deinit();
-    for (prog.blocks) |block| try gather(&uses, block.steps, true);
-    try gather(&uses, prog.steps, false);
+    var list: List = 0;
+    while (list < listCount(prog)) : (list += 1) {
+        try gather(&uses, listSteps(prog, list), list);
+    }
     return uses;
 }
 
-fn gather(uses: *Map, steps: []PlacedStep, in_block: bool) Error!void {
+fn gather(uses: *Map, steps: []PlacedStep, list: List) Error!void {
     for (steps, 0..) |*placed, i| {
         const walk = executable.tensorUses(&placed.op);
         for (walk.slice()) |use| {
             const gop = uses.getOrPut(use.id.*) catch return error.OutOfMemory;
-            if (!gop.found_existing) gop.value_ptr.* = .{};
+            if (!gop.found_existing) gop.value_ptr.* = .{ .list = list };
             const u = gop.value_ptr;
-            u.in_block = u.in_block or in_block;
-            if (in_block) continue; // indices are not comparable across domains
+            const own = u.list orelse continue; // already crosses lists
+            if (own != list) {
+                u.list = null;
+                continue;
+            }
             u.first_touch = @min(u.first_touch, i);
             u.last_touch = @max(u.last_touch, i);
             switch (use.access) {

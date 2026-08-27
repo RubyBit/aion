@@ -9,6 +9,8 @@ const std = @import("std");
 
 const backend_mod = @import("../backend/backend.zig");
 const plan_mod = @import("../graph/plan.zig");
+const opt_mod = @import("../graph/opt.zig");
+const target_mod = @import("../graph/target.zig");
 const storage_mod = @import("../storage/storage.zig");
 const dm = @import("../runtime/device_memory.zig");
 
@@ -40,4 +42,11 @@ pub const Device = struct {
     backend: backend_mod.Backend,
     policy: plan_mod.TilePolicy,
     device_memory: ?dm.DeviceMemory,
+
+    /// The compile target this device implies. `passes` overrides the device's default
+    /// pass set — bisecting a pass on a real model is the only reason to.
+    pub fn target(self: Device, passes: ?opt_mod.Policy) target_mod.Target {
+        const t: target_mod.Target = .init(self.ref, self.policy);
+        return if (passes) |p| t.withPasses(p) else t;
+    }
 };

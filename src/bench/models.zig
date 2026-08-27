@@ -6,7 +6,7 @@
 //! step**, so a change can be judged against the thing that actually ships. The
 //! Gemma-4 E2B builder mirrors `scripts/convert_gemma4_e2b_to_aion.py`'s
 //! `_emit_forward` op for op and compiles through the real `compileGraph`, so
-//! `fuse_horizontal_matmul` and `fuse_gpu_decode` run exactly as they do on the
+//! the opt passes run exactly as they do on the
 //! loaded model.
 //!
 //! Two properties are load-bearing, and both exist because of measurement bugs
@@ -141,11 +141,10 @@ pub const DecodeOptions = struct {
     /// ~1.3 ms. Ablation asks the question directly -- build the same graph without it
     /// and diff.
     ablate: Ablate = .{},
-    /// Optimizer passes. Exposed so the bench can size what a pass costs as well
-    /// as what it saves: horizontal MatMul fusion buys one wide GEMV but pays 150
-    /// SliceND dispatches per token, and at decode a dispatch is ~8-20 us of
-    /// critical path whatever it does.
-    opt: aion.program.OptPolicy = .{},
+    /// Passes to switch OFF, on top of the target defaults. Exposed so the bench can
+    /// size what a pass costs as well as what it saves: horizontal MatMul fusion buys
+    /// one wide GEMV but pays 115 more SliceND dispatches per token.
+    disable: aion.program.OptPolicy = .empty,
 };
 
 pub const Ablate = struct {
@@ -520,7 +519,7 @@ pub fn gemma4E2BDecode(
         const x_norm = try ctx.rms(x, embed);
 
         // Q/K/V stay separate here, as the checkpoint ships them; fusing them is
-        // `fuse_horizontal_matmul`'s job and part of what this bench measures.
+        // `opt/horizontal_matmul`'s job and part of what this bench measures.
         var q = try g.addMatMul(x_norm, try ctx.weight(embed, q_width), 1.0, 0.0);
         q = try g.addViewReshape(q, &.{ bsz, seq, G4.num_heads, hd });
         q = try ctx.rms(q, hd);
@@ -560,10 +559,10 @@ pub fn gemma4E2BDecode(
         o = try g.addMatMul(o, try ctx.weight(q_width, embed), 1.0, 0.0);
         x = try g.addElemwiseBinary(.add, x, try ctx.rms(o, embed));
 
-        // Gated MLP. gate/up split so `fuse_horizontal_matmul` sees the same pattern it
+        // Gated MLP. gate/up split so `opt/horizontal_matmul` sees the same pattern it
         // sees on the model, and one `gate` node for the GEGLU because that is what
         // `nn.GatedMLP` emits — the converters author the gate rather than leaving a
-        // unary and a multiply for `program/fuse_steps.zig` to recover.
+        // unary and a multiply for `opt/fuse_steps.zig` to recover.
         const ff_in = try ctx.rms(x, embed);
         const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
         const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
@@ -602,7 +601,10 @@ pub fn gemma4E2BDecode(
     }
     try g.setOutputs(&.{out_v});
 
-    const prog = try aion.program.compileGraphOpt(alloc, &g, mgr, policy, opts.opt);
+    // The bench ablates passes by name (`--no-hfuse` and friends).
+    var bench_target: aion.program.Target = .init(target, policy);
+    bench_target.passes.setIntersection(opts.disable.complement());
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, bench_target);
     return .{ .prog = prog, .out = prog.outputs[0], .stats = stats };
 }
 
@@ -690,7 +692,7 @@ pub fn gemma4Attention(
     const visible: usize = if (kind == .global) t_len else @min(t_len, G4.local_sliding_window);
     stats.stream_bytes = @as(u64, 2 * visible * G4.num_kv_heads * head_dim) * 2 * n_rep;
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .cpu(policy));
     return .{ .prog = prog, .out = prog.outputs[0], .stats = stats };
 }
 
@@ -734,7 +736,7 @@ pub const gemma4_e2b_expected_steps = [_]struct { name: []const u8, count: usize
     .{ .name = "MatMulTiled", .count = 211 },
     .{ .name = "SliceNDScalar", .count = 150 },
     // All 242 norms, of which 106 carry a residual: the "sandwich norm" pairs
-    // (`x = x + norm(f(x))`) that `program/fuse_steps.zig` folds into the norm step.
+    // (`x = x + norm(f(x))`) that `opt/fuse_steps.zig` folds into the norm step.
     //
     // NOTE this histogram is keyed on step TAG, and the residual is a FIELD, so these
     // counts can no longer tell a fused norm from a plain one — if the fusion stopped
@@ -748,7 +750,7 @@ pub const gemma4_e2b_expected_steps = [_]struct { name: []const u8, count: usize
     // pointless copy rather than real work:
     //   * the M-hint tile fix in `program/compiler.zig` (a 4096-row tile stamped on a
     //     1-row decode activation made every neighbour disagree),
-    //   * `program/alias_views.zig` (copies between byte-identical layouts),
+    //   * `opt/alias_views.zig` (copies between byte-identical layouts),
     //   * the quantized tile cap in `plan.zig` (a 4096 N/K cap split wide weights and
     //     left the split pieces tiled unlike their neighbours).
     // Re-captured from the model after each; text output identical throughout.
@@ -863,23 +865,11 @@ pub fn countNoopViews(mgr: *StorageManager, prog: *const aion.program.Program) s
         };
         const p = pair orelse continue;
         total += 1;
-        if (layoutsIdentical(mgr, p[0], p[1])) noop += 1;
+        if (aion.opt.layoutsIdentical(mgr, p[0], p[1])) noop += 1;
     }
     return .{ .noop = noop, .total = total };
 }
 
-/// True when two tensors occupy the same bytes in the same arrangement, so a copy
-/// between them is a no-op. Per-tile lengths must match one-for-one: on the device
-/// each tile is its own buffer, so equal tiling means a tile-for-tile duplicate.
-pub fn layoutsIdentical(mgr: *StorageManager, a_id: TensorId, b_id: TensorId) bool {
-    const a = mgr.getConst(a_id) catch return false;
-    const b = mgr.getConst(b_id) catch return false;
-    if (a.dtype != b.dtype) return false;
-    if (a.tile_lens.len != b.tile_lens.len) return false;
-    for (a.tile_lens, b.tile_lens) |x, y| if (x != y) return false;
-    for (a.tile_offsets, b.tile_offsets) |x, y| if (x != y) return false;
-    return true;
-}
 
 /// Print the histogram, densest first, plus the total. Formatted to be diffed by eye
 /// against the operation table `AION_PROFILE=summary` prints for the real model.

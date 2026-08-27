@@ -81,7 +81,7 @@ pub const StepConv2DTiled = struct {
 };
 pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 /// `residual` folds a residual add into the apply pass: `out = residual + rmsnorm(x)*gamma
-/// + beta`. It is a SCHEDULE, not a meaning — `program/fuse_steps.zig` sets it from a
+/// + beta`. It is a SCHEDULE, not a meaning — `opt/fuse_steps.zig` sets it from a
 /// lowered norm-then-add pair, and no graph op or on-disk record mentions it, so one
 /// `.aion` can still compile to a different schedule per backend.
 ///

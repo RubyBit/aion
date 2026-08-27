@@ -10,7 +10,7 @@ const env = @import("../../env.zig");
 const executable = @import("../../runtime/executable.zig");
 const device_memory = @import("../../runtime/device_memory.zig");
 const manager_mod = @import("../../storage/manager.zig");
-const alias_views = @import("alias_views.zig");
+const alias_views = @import("../opt/alias_views.zig");
 
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
@@ -55,10 +55,10 @@ pub fn plan(
     mgr: *StorageManager,
     prog: *Program,
     owned: []const TensorId,
-    /// destination -> source pairs from `alias_views.elideNoopViews`. Each
+    /// destination -> source pairs from `alias_views.elide`. Each
     /// destination borrows the source's backing instead of getting a slot, because
     /// the copy that would have filled it was removed as a no-op.
-    alias: ?*const alias_views.AliasMap,
+    alias: *const alias_views.AliasMap,
 ) PlanError!void {
     if (owned.len == 0) return;
 
@@ -174,8 +174,8 @@ pub fn plan(
     // must never be handed to another tensor -- otherwise a later reuse would
     // overwrite the bytes the destination is about to read. Extend and pin it here,
     // before slots are assigned.
-    if (alias) |m| {
-        var it = m.iterator();
+    {
+        var it = alias.iterator();
         while (it.next()) |entry| {
             const dst_i = by_id.get(entry.key_ptr.*) orelse continue;
             const src_i = by_id.get(entry.value_ptr.*) orelse continue;
@@ -269,8 +269,8 @@ pub fn plan(
     // extra member. That reuses the existing member machinery — the loop below aliases
     // every non-owner member to the owner and `validateAliases` sees it — instead of
     // bolting on a second aliasing path.
-    if (alias) |m| {
-        var it = m.iterator();
+    {
+        var it = alias.iterator();
         while (it.next()) |entry| {
             const dst_id = entry.key_ptr.*;
             const src_id = entry.value_ptr.*;
@@ -444,7 +444,9 @@ test "workspace planner grows capacity for disjoint lifetimes in one domain" {
         allocator.free(prog.workspace_slots);
     }
 
-    try plan(allocator, &mgr, &prog, &owned, null);
+    var no_alias: alias_views.AliasMap = .init(allocator);
+    defer no_alias.deinit();
+    try plan(allocator, &mgr, &prog, &owned, &no_alias);
     try std.testing.expectEqual(@as(usize, 3), prog.workspace_slots.len);
     try std.testing.expect((try mgr.physicalBackingId(b)) != b);
     try std.testing.expect((try mgr.physicalBackingId(c)) != try mgr.physicalBackingId(b));
@@ -505,7 +507,9 @@ test "workspace planner isolates loop-body reuse from the enclosing schedule" {
         allocator.free(prog.workspace_slots);
     }
 
-    try plan(allocator, &mgr, &prog, &owned, null);
+    var no_alias: alias_views.AliasMap = .init(allocator);
+    defer no_alias.deinit();
+    try plan(allocator, &mgr, &prog, &owned, &no_alias);
     try std.testing.expectEqual(@as(usize, 3), prog.workspace_slots.len);
     try std.testing.expect((try mgr.physicalBackingId(outer_tmp)) != try mgr.physicalBackingId(body_a));
     const c_backing = try mgr.physicalBackingId(body_c);

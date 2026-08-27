@@ -10,14 +10,13 @@ const api_tiling = @import("../../api/tiling.zig");
 const graph_mod = @import("../graph.zig");
 const infer_mod = @import("../infer.zig");
 const plan_mod = @import("../plan.zig");
-const optimize_mod = @import("../optimize.zig");
+const opt_mod = @import("../opt.zig");
 const placement = @import("placement.zig");
 const workspace = @import("workspace.zig");
-const alias_views = @import("alias_views.zig");
-const fuse_steps = @import("fuse_steps.zig");
 const allocation = @import("allocation.zig");
 const reachability = @import("reachability.zig");
 const manager_mod = @import("../../storage/manager.zig");
+const target_mod = @import("../target.zig");
 
 const backend_utils = @import("../../backend/utils.zig");
 
@@ -1267,33 +1266,22 @@ fn fillTileShapeDefault(policy: plan_mod.TilePolicy, dtype: types.DType, shape: 
     api_tiling.fillDefaultTileShape(policy, dtype, shape, out) catch return CompileError.InvalidArgument;
 }
 
-pub const OptPolicy = optimize_mod.OptPolicy;
+pub const OptPolicy = opt_mod.Policy;
+pub const Target = target_mod.Target;
 
 pub fn compileGraph(
     allocator: std.mem.Allocator,
     graph: *graph_mod.Graph,
     mgr: *StorageManager,
-    policy: plan_mod.TilePolicy,
-) CompileError!Program {
-    return compileGraphOpt(allocator, graph, mgr, policy, .{});
-}
-
-pub fn compileGraphOpt(
-    allocator: std.mem.Allocator,
-    graph: *graph_mod.Graph,
-    mgr: *StorageManager,
-    policy: plan_mod.TilePolicy,
-    opt: OptPolicy,
+    target: Target,
 ) CompileError!Program {
     infer_mod.infer(graph) catch |e| {
         if (traceEnabled()) std.debug.print("[aion][compile] infer failed: {s}\n", .{@errorName(e)});
         return e;
     };
 
-    // Graph-rewrite optimization passes (e.g. horizontal MatMul fusion). Runs
-    // after inference (so rewrites see concrete shapes) and before the
-    // value→tensor map below is sized (so appended values compile normally).
-    try optimize_mod.run(allocator, graph, mgr, policy, opt);
+    const opt_ctx: opt_mod.Ctx = .{ .gpa = allocator, .mgr = mgr, .target = target };
+    try opt_mod.graphPasses(opt_ctx, graph);
 
     // Map graph values -> concrete tensors.
     const v_count: usize = graph.values.items.len;
@@ -1338,7 +1326,7 @@ pub fn compileGraphOpt(
         blocks.deinit(allocator);
     }
 
-    var ctx: allocation.Context = .{ .allocator = allocator, .mgr = mgr, .policy = policy, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor, .owned_tensors = &owned_tensors };
+    var ctx: allocation.Context = .{ .allocator = allocator, .mgr = mgr, .policy = target.tiles, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor, .owned_tensors = &owned_tensors };
 
     // Lower nodes in order, skipping any whose results nothing asked for.
     const live: []bool = try liveNodes(allocator, graph);
@@ -1346,7 +1334,7 @@ pub fn compileGraphOpt(
 
     for (graph.nodes.items, 0..) |node, idx| {
         if (!live[idx]) continue;
-        try lowerNode(allocator, graph, node, mgr, policy, &ctx, &steps, &blocks);
+        try lowerNode(allocator, graph, node, mgr, target.tiles, &ctx, &steps, &blocks);
     }
 
     var compiled: Program = .{
@@ -1367,23 +1355,8 @@ pub fn compileGraphOpt(
         compiled.outputs[i] = value_tensor[idx];
     }
 
-    try placement.place(allocator, mgr, &compiled, &owned_tensors, policy);
-    // Schedule-level fusion, after placement (so the target and the host-operand masks
-    // are known) and before workspace planning (so the intermediates it kills are never
-    // given a slot). Nothing here is expressible in the graph, by design: see
-    // fuse_steps.zig.
-    _ = fuse_steps.run(allocator, mgr, &compiled, owned_tensors.items, policy) catch |e| switch (e) {
-        error.OutOfMemory => return CompileError.OutOfMemory,
-        else => return CompileError.InvalidArgument,
-    };
-    // Drop view steps that only copy between byte-identical layouts, then let
-    // workspace planning hand each such destination the source's backing instead of a
-    // slot of its own. Both halves are needed: the step is what costs critical path,
-    // and the shared backing is what keeps the destination's bytes correct.
-    var view_alias = alias_views.elideNoopViews(allocator, mgr, &compiled, owned_tensors.items) catch |e| switch (e) {
-        error.OutOfMemory => return CompileError.OutOfMemory,
-        else => return CompileError.InvalidArgument,
-    };
+    try placement.place(allocator, mgr, &compiled, &owned_tensors, target.tiles);
+    var view_alias = try opt_mod.stepPasses(opt_ctx, &compiled, owned_tensors.items);
     defer view_alias.deinit();
     try workspace.plan(allocator, mgr, &compiled, owned_tensors.items, &view_alias);
     compiled.owned_tensors = try owned_tensors.toOwnedSlice(allocator);

@@ -72,7 +72,7 @@ pub fn execRMSNormTiled(
 /// decode is a q8 GEMV problem, full stop. (On GPU the same fusion is worth +1.1%,
 /// because there the cost being removed is a dispatch launch, which has no CPU analogue.)
 ///
-/// Keeping it decomposed has a second benefit: `program/fuse_steps.zig` fires only for GPU
+/// Keeping it decomposed has a second benefit: `opt/fuse_steps.zig` fires only for GPU
 /// targets, so a GPU-vs-CPU comparison pits the fused kernel against the unfused pair and
 /// the test asserts "fusing changed nothing".
 ///

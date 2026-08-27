@@ -59,7 +59,7 @@ pub fn create(allocator: std.mem.Allocator, opts: device.GpuOptions) GpuCreateEr
     errdefer bundle.gpu.deinit();
 
     bundle.backend = gpu_backend.GpuBackend.init(allocator, &bundle.gpu);
-    bundle.policy = plan_mod.tilePolicyForTarget(.{ .kind = .webgpu });
+    bundle.policy = plan_mod.tilePolicyForTarget(.webgpu);
     // Cap tile sizes to what this device can actually bind (e.g. a multi-GB
     // quantized embedding table must be split along its row axis).
     bundle.policy.max_binding_bytes = bundle.gpu.limits.max_storage_binding_bytes;

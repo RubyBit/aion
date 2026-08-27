@@ -221,6 +221,10 @@ pub const TiledTensor = struct {
     /// Bytes reserved by this canonical physical backing.
     backing_bytes: usize = 0,
     workspace_owned: bool = false,
+    /// Live compiled programs naming this tensor. Maintained by
+    /// `StorageManager.retainTensor`/`releaseTensor`; see those for why the count
+    /// lives on the tensor rather than in the model that compiled the program.
+    program_refs: u32 = 0,
 
     const Self = @This();
 

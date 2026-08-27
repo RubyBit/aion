@@ -128,7 +128,7 @@ pub const Op = union(OpTag) {
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
 
     /// `ElemwiseBinaryOp.gate` is NOT graph vocabulary — it is a step-level schedule
-    /// that `program/fuse_steps.zig` produces from a `Unary` feeding a `mul`. A gated
+    /// that `opt/fuse_steps.zig` produces from a `Unary` feeding a `mul`. A gated
     /// activation is authored as exactly that pair, so no `act`
     /// parameter is carried here or serialized.
     ElemwiseBinary: struct { op: ElemwiseBinaryOp },
@@ -173,11 +173,45 @@ pub const Op = union(OpTag) {
 
     /// Normalize over the last dimensions (rank>=1; normalized_shape is required).
     /// out = ((x - mean) / sqrt(var + eps)) * gamma + beta
-    LayerNorm: struct { eps: f32, normalized_shape: []const usize },
+    LayerNorm: struct {
+        eps: f32,
+        normalized_shape: []const usize,
+        /// Free axes: `free_dims[i]`, when non-null, is the index of the dim EXPRESSION
+        /// that gives axis `i`'s size at runtime. Empty when the attribute is fully
+        /// fixed, which is the common case.
+        ///
+        /// An expression index, not a symbol index — for a `Builder` graph the two
+        /// coincide (one expression per declared symbol, in declaration order), but a
+        /// package may point an axis at an arithmetic tree over several symbols.
+        ///
+        /// A free axis makes the size above a PLACEHOLDER: the authoring size while a
+        /// `Builder` graph is being inferred eagerly, and 0 for one parsed from a file
+        /// (which records no size for a free axis). `Template.specialize` overwrites it
+        /// before inference runs, and a 0 that escaped would fail there rather than
+        /// quietly become an empty axis.
+        free_dims: []const ?u32 = &.{},
+    },
 
     /// Normalize over the last dimensions (rank>=1; normalized_shape is required).
     /// out = (x / sqrt(mean(x^2) + eps)) * gamma + beta
-    RMSNorm: struct { eps: f32, normalized_shape: []const usize },
+    RMSNorm: struct {
+        eps: f32,
+        normalized_shape: []const usize,
+        /// Free axes: `free_dims[i]`, when non-null, is the index of the dim EXPRESSION
+        /// that gives axis `i`'s size at runtime. Empty when the attribute is fully
+        /// fixed, which is the common case.
+        ///
+        /// An expression index, not a symbol index — for a `Builder` graph the two
+        /// coincide (one expression per declared symbol, in declaration order), but a
+        /// package may point an axis at an arithmetic tree over several symbols.
+        ///
+        /// A free axis makes the size above a PLACEHOLDER: the authoring size while a
+        /// `Builder` graph is being inferred eagerly, and 0 for one parsed from a file
+        /// (which records no size for a free axis). `Template.specialize` overwrites it
+        /// before inference runs, and a 0 that escaped would fail there rather than
+        /// quietly become an empty axis.
+        free_dims: []const ?u32 = &.{},
+    },
 
     Reduce: struct { op: ReduceOp, axis: ?i32 = null },
     Concat: struct { axis: i32 },
@@ -200,11 +234,45 @@ pub const Op = union(OpTag) {
     Copy: void,
 
     /// View ops (lowered into materialization steps in v0).
-    ViewReshape: struct { new_shape: []const usize },
+    ViewReshape: struct {
+        new_shape: []const usize,
+        /// Free axes: `free_dims[i]`, when non-null, is the index of the dim EXPRESSION
+        /// that gives axis `i`'s size at runtime. Empty when the attribute is fully
+        /// fixed, which is the common case.
+        ///
+        /// An expression index, not a symbol index — for a `Builder` graph the two
+        /// coincide (one expression per declared symbol, in declaration order), but a
+        /// package may point an axis at an arithmetic tree over several symbols.
+        ///
+        /// A free axis makes the size above a PLACEHOLDER: the authoring size while a
+        /// `Builder` graph is being inferred eagerly, and 0 for one parsed from a file
+        /// (which records no size for a free axis). `Template.specialize` overwrites it
+        /// before inference runs, and a 0 that escaped would fail there rather than
+        /// quietly become an empty axis.
+        free_dims: []const ?u32 = &.{},
+    },
     ViewSqueeze: struct { axis: ?i32 = null },
     ViewUnsqueeze: struct { axis: i32 },
     ViewTranspose2D: void,
-    ViewSliceND: struct { starts: []const usize, lens: []const usize },
+    ViewSliceND: struct {
+        starts: []const usize,
+        /// Only `lens` may be free; a slice's START is a position, not an extent.
+        lens: []const usize,
+        /// Free axes: `free_dims[i]`, when non-null, is the index of the dim EXPRESSION
+        /// that gives axis `i`'s size at runtime. Empty when the attribute is fully
+        /// fixed, which is the common case.
+        ///
+        /// An expression index, not a symbol index — for a `Builder` graph the two
+        /// coincide (one expression per declared symbol, in declaration order), but a
+        /// package may point an axis at an arithmetic tree over several symbols.
+        ///
+        /// A free axis makes the size above a PLACEHOLDER: the authoring size while a
+        /// `Builder` graph is being inferred eagerly, and 0 for one parsed from a file
+        /// (which records no size for a free axis). `Template.specialize` overwrites it
+        /// before inference runs, and a 0 that escaped would fail there rather than
+        /// quietly become an empty axis.
+        free_dims: []const ?u32 = &.{},
+    },
 
     /// Rotary positional embedding over head dimension using chunked-halves pairing.
     ///
@@ -428,7 +496,7 @@ pub fn opId(op: Op) u8 {
 
 pub const Node = struct {
     op: Op,
-    inputs: []const ValueId,
+    inputs: []ValueId,
     output: ValueId,
     /// Additional outputs beyond the primary `output`. Empty for all ops except
     /// a multi-carry `Loop` (whose i-th final carried tensor is exposed here as
@@ -443,6 +511,34 @@ pub const Region = struct {
 };
 
 pub const GraphError = error{ InvalidArgument, OutOfMemory };
+
+/// An op attribute that can carry free axes: the sizes, and the symbol per axis.
+///
+/// Four ops have one, and they are the only ops that STATE a shape rather than deriving
+/// it: the two norms' `normalized_shape`, a reshape's `new_shape`, a slice's `lens`.
+/// Everywhere else a free axis flows through inference on its own — a matmul's output
+/// inherits its operand's free dim with nothing to annotate — which is why this list is
+/// four and not thirty-two.
+///
+/// Only the two view ops can be AUTHORED with free axes (`Builder.reshapeSym`/`sliceSym`);
+/// the norms carry the field because the file format stores a shape term per axis there
+/// and a package that has one must round-trip. Everything that treats the four uniformly
+/// — resolving a template, reading a package, writing one — goes through here.
+pub const SymbolicAttr = struct {
+    sizes: []usize,
+    free_dims: []const ?u32,
+};
+
+/// The op's free-axis attribute, or null when it has none.
+pub fn symbolicAttr(op: *Op) ?SymbolicAttr {
+    return switch (op.*) {
+        .LayerNorm => |*a| .{ .sizes = @constCast(a.normalized_shape), .free_dims = a.free_dims },
+        .RMSNorm => |*a| .{ .sizes = @constCast(a.normalized_shape), .free_dims = a.free_dims },
+        .ViewReshape => |*a| .{ .sizes = @constCast(a.new_shape), .free_dims = a.free_dims },
+        .ViewSliceND => |*a| .{ .sizes = @constCast(a.lens), .free_dims = a.free_dims },
+        else => null,
+    };
+}
 
 pub const Graph = struct {
     arena: std.heap.ArenaAllocator,
@@ -477,6 +573,13 @@ pub const Graph = struct {
         self.active_region_nodes.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn dupeFreeDims(self: *Self, free_dims: []const ?u32) GraphError![]const ?u32 {
+        if (free_dims.len == 0) return &.{};
+        const out: []?u32 = self.arenaAlloc().alloc(?u32, free_dims.len) catch return GraphError.OutOfMemory;
+        @memcpy(out, free_dims);
+        return out;
     }
 
     pub fn arenaAlloc(self: *Self) std.mem.Allocator {
@@ -558,11 +661,36 @@ pub const Graph = struct {
                 return d;
             }
         }.f;
+        const dupSyms = struct {
+            fn f(a: std.mem.Allocator, s: []const ?u32) GraphError![]const ?u32 {
+                if (s.len == 0) return &.{};
+                const d = a.alloc(?u32, s.len) catch return GraphError.OutOfMemory;
+                @memcpy(d, s);
+                return d;
+            }
+        }.f;
+        // The four ops with slice attributes; everything else is copied by value. Same
+        // list as `symbolicAttr`, which is why both live next to each other.
         return switch (op) {
-            .LayerNorm => |x| .{ .LayerNorm = .{ .eps = x.eps, .normalized_shape = try dup(aa, x.normalized_shape) } },
-            .RMSNorm => |x| .{ .RMSNorm = .{ .eps = x.eps, .normalized_shape = try dup(aa, x.normalized_shape) } },
-            .ViewReshape => |x| .{ .ViewReshape = .{ .new_shape = try dup(aa, x.new_shape) } },
-            .ViewSliceND => |x| .{ .ViewSliceND = .{ .starts = try dup(aa, x.starts), .lens = try dup(aa, x.lens) } },
+            .LayerNorm => |x| .{ .LayerNorm = .{
+                .eps = x.eps,
+                .normalized_shape = try dup(aa, x.normalized_shape),
+                .free_dims = try dupSyms(aa, x.free_dims),
+            } },
+            .RMSNorm => |x| .{ .RMSNorm = .{
+                .eps = x.eps,
+                .normalized_shape = try dup(aa, x.normalized_shape),
+                .free_dims = try dupSyms(aa, x.free_dims),
+            } },
+            .ViewReshape => |x| .{ .ViewReshape = .{
+                .new_shape = try dup(aa, x.new_shape),
+                .free_dims = try dupSyms(aa, x.free_dims),
+            } },
+            .ViewSliceND => |x| .{ .ViewSliceND = .{
+                .starts = try dup(aa, x.starts),
+                .lens = try dup(aa, x.lens),
+                .free_dims = try dupSyms(aa, x.free_dims),
+            } },
             else => op,
         };
     }
@@ -629,6 +757,57 @@ pub const Graph = struct {
             for (outs) |o| self.values.items[@intCast(o)].producer = node_id;
         }
         return outs;
+    }
+
+    /// Append a node whose output values already exist.
+    ///
+    /// The one op-agnostic way in: a caller that materializes a whole graph at once
+    /// already knows every value id, so it has nothing to allocate. `Template.specialize`
+    /// is that caller, and this is what keeps it from needing a case per op. The
+    /// authoring `add*` helpers allocate their outputs as they go and cannot use it.
+    pub fn appendNode(
+        self: *Self,
+        op: Op,
+        inputs: []const ValueId,
+        output: ValueId,
+        extra_outputs: []const ValueId,
+    ) GraphError!void {
+        const inputs_copy: []ValueId = self.arenaAlloc().alloc(ValueId, inputs.len) catch return GraphError.OutOfMemory;
+        @memcpy(inputs_copy, inputs);
+        const extra_copy: []ValueId = self.arenaAlloc().alloc(ValueId, extra_outputs.len) catch return GraphError.OutOfMemory;
+        @memcpy(extra_copy, extra_outputs);
+
+        const node: Node = .{ .op = op, .inputs = inputs_copy, .output = output, .extra_outputs = extra_copy };
+        if (self.active_region) {
+            self.active_region_nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            // See `addNodeInternal`: a region's nodes do not live in `self.nodes`, so the
+            // producer id is a sentinel that only says "not a public input".
+            self.values.items[@intCast(output)].producer = std.math.maxInt(NodeId);
+            for (extra_copy) |o| self.values.items[@intCast(o)].producer = std.math.maxInt(NodeId);
+        } else {
+            const node_id: NodeId = @intCast(self.nodes.items.len);
+            self.nodes.append(self.allocator, node) catch return GraphError.OutOfMemory;
+            self.values.items[@intCast(output)].producer = node_id;
+            for (extra_copy) |o| self.values.items[@intCast(o)].producer = node_id;
+        }
+    }
+
+    /// The node that produced `value`, mutable, when it is in scope.
+    ///
+    /// The authoring `Builder` needs it to finish an op whose attribute it could only
+    /// resolve after the op existed. Null for a value with no producer, and for one
+    /// produced inside a region that is no longer open.
+    pub fn mutableNodeFor(self: *Self, value: ValueId) ?*Node {
+        const idx: usize = @intCast(value);
+        if (idx >= self.values.items.len) return null;
+        const producer = self.values.items[idx].producer orelse return null;
+        if (producer == std.math.maxInt(NodeId)) {
+            if (!self.active_region or self.active_region_nodes.items.len == 0) return null;
+            const last = &self.active_region_nodes.items[self.active_region_nodes.items.len - 1];
+            return if (last.output == value) last else null;
+        }
+        if (producer >= self.nodes.items.len) return null;
+        return &self.nodes.items[@intCast(producer)];
     }
 
     /// The most recently appended node — the active region's last node while a
@@ -1015,8 +1194,22 @@ pub const Graph = struct {
     }
 
     pub fn addViewReshape(self: *Self, a: ValueId, new_shape: []const usize) GraphError!ValueId {
+        return self.addViewReshapeSym(a, new_shape, &.{});
+    }
+
+    /// Reshape with free axes: `free_dims[i]` is the dim expression giving axis `i`'s
+    /// runtime size, `new_shape[i]` being its authoring placeholder. `&.{}` for none.
+    pub fn addViewReshapeSym(
+        self: *Self,
+        a: ValueId,
+        new_shape: []const usize,
+        free_dims: []const ?u32,
+    ) GraphError!ValueId {
         const sh: []const usize = try self.dupeShape(new_shape);
-        return self.addNodeInternal(.{ .ViewReshape = .{ .new_shape = sh } }, &[_]ValueId{a});
+        return self.addNodeInternal(
+            .{ .ViewReshape = .{ .new_shape = sh, .free_dims = try self.dupeFreeDims(free_dims) } },
+            &[_]ValueId{a},
+        );
     }
 
     pub fn addViewSqueeze(self: *Self, a: ValueId, axis: ?i32) GraphError!ValueId {
@@ -1032,10 +1225,25 @@ pub const Graph = struct {
     }
 
     pub fn addViewSliceND(self: *Self, a: ValueId, starts: []const usize, lens: []const usize) GraphError!ValueId {
+        return self.addViewSliceNDSym(a, starts, lens, &.{});
+    }
+
+    /// Slice with free extents. See `addViewReshapeSym`; only `lens` may be free, since a
+    /// slice's start is a position rather than an extent.
+    pub fn addViewSliceNDSym(
+        self: *Self,
+        a: ValueId,
+        starts: []const usize,
+        lens: []const usize,
+        free_dims: []const ?u32,
+    ) GraphError!ValueId {
         if (starts.len == 0 or starts.len != lens.len or starts.len > MAX_RANK) return GraphError.InvalidArgument;
         const starts_copy: []const usize = try self.dupeShape(starts);
         const lens_copy: []const usize = try self.dupeShape(lens);
-        return self.addNodeInternal(.{ .ViewSliceND = .{ .starts = starts_copy, .lens = lens_copy } }, &[_]ValueId{a});
+        return self.addNodeInternal(
+            .{ .ViewSliceND = .{ .starts = starts_copy, .lens = lens_copy, .free_dims = try self.dupeFreeDims(free_dims) } },
+            &[_]ValueId{a},
+        );
     }
 
     pub fn addViewSlice2D(self: *Self, a: ValueId, start0: usize, len0: usize, start1: usize, len1: usize) GraphError!ValueId {

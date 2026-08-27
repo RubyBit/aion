@@ -8,14 +8,14 @@ const api_errors = @import("../errors.zig");
 
 pub fn buildSignatures(
     allocator: std.mem.Allocator,
-    package: *const types_mod.Package,
+    values: []const package_file.ValueRecord,
     named_values: []const package_file.NamedValue,
 ) api_errors.LoadError![]types_mod.SignatureInfo {
     const out = try allocator.alloc(types_mod.SignatureInfo, named_values.len);
     errdefer allocator.free(out);
     for (named_values, 0..) |sig, i| {
-        if (sig.value >= package.values.len) return error.InvalidArgument;
-        const value = package.values[sig.value];
+        if (sig.value >= values.len) return error.InvalidArgument;
+        const value = values[sig.value];
         out[i] = .{
             .name = sig.name,
             .value = sig.value,

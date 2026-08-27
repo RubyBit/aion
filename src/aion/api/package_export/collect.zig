@@ -5,19 +5,29 @@ const graph_mod = @import("../../graph/graph.zig");
 const package_file = @import("../../storage/aion_file.zig");
 
 const types_mod = @import("types.zig");
-const convert = @import("convert.zig");
 
+/// The graph's public inputs — leaves with no producer and no parameter binding — in
+/// value order, which is signature order.
 pub fn collectInputs(
     allocator: std.mem.Allocator,
     builder: *types_mod.Builder,
     graph: *graph_mod.Graph,
+    require_names: bool,
 ) ![]package_file.NamedValue {
     var out: std.ArrayList(package_file.NamedValue) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        for (out.items) |entry| allocator.free(entry.name);
+        out.deinit(allocator);
+    }
     for (graph.values.items, 0..) |value, idx| {
         if (value.producer != null or value.external != null) continue;
-        const name = builder.valueName(.{ .value = @intCast(idx) }) orelse return error.InvalidArgument;
-        try out.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = @intCast(idx) });
+        const name: []u8 = if (builder.valueName(.{ .value = @intCast(idx) })) |n|
+            try allocator.dupe(u8, n)
+        else if (require_names)
+            return error.InvalidArgument
+        else
+            try std.fmt.allocPrint(allocator, "input{d}", .{out.items.len});
+        try out.append(allocator, .{ .name = name, .value = @intCast(idx) });
     }
     return out.toOwnedSlice(allocator);
 }
@@ -98,55 +108,73 @@ pub fn collectInputRoles(
 
 const max_rank: usize = 8;
 
-/// Overwrite constant shape terms with symbolic (dim-expr) terms for view-op
-/// attr axes flagged in `view_symbol_expr` (keyed by output value * max_rank + axis).
-fn applyViewSymbols(op: *package_file.NodeOp, output: u32, view_symbol_expr: []const ?u32) void {
-    const base = @as(usize, output) * max_rank;
+fn setAttrSymbols(op: *package_file.NodeOp, symbols: []const ?u32) void {
     switch (op.*) {
-        .ViewSliceND => |*sl| {
-            const lens = @constCast(sl.lens);
-            for (0..lens.len) |axis| {
-                if (view_symbol_expr[base + axis]) |e| lens[axis] = .{ .expr = e };
-            }
-        },
-        .ViewReshape => |*vr| {
-            const new_shape = @constCast(vr.new_shape);
-            for (0..new_shape.len) |axis| {
-                if (view_symbol_expr[base + axis]) |e| new_shape[axis] = .{ .expr = e };
-            }
-        },
+        .LayerNorm => |*a| a.free_dims = symbols,
+        .RMSNorm => |*a| a.free_dims = symbols,
+        .ViewReshape => |*a| a.free_dims = symbols,
+        .ViewSliceND => |*a| a.free_dims = symbols,
         else => {},
     }
 }
 
-fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node, view_symbol_expr: []const ?u32) ![]package_file.NodeRecord {
+/// Copy a graph's nodes into owned records. The op type is the graph's own, so this is a
+/// deep copy of the slice attributes plus the view symbols the Builder recorded — not a
+/// conversion.
+fn collectNodeSlice(allocator: std.mem.Allocator, nodes: []const graph_mod.Node) ![]package_file.NodeRecord {
     const out = try allocator.alloc(package_file.NodeRecord, nodes.len);
     errdefer allocator.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |rec| {
+        allocator.free(rec.inputs);
+        if (rec.extra_outputs.len != 0) allocator.free(@constCast(rec.extra_outputs));
+        package_file.deinitNodeOp(allocator, rec.op);
+    };
     for (nodes, 0..) |node, idx| {
-        var op = try convert.convertOp(allocator, node.op);
-        applyViewSymbols(&op, node.output, view_symbol_expr);
-        // A multi-carry Loop's outputs 1..N live on `node.extra_outputs`; the op
-        // record carries them for serialization (output 0 is `node.output`).
-        switch (op) {
-            .Loop => |*lp| {
-                if (node.extra_outputs.len > 0) lp.extra_outputs = try allocator.dupe(u32, node.extra_outputs);
-            },
-            else => {},
-        }
+        const op = try cloneOpOwned(allocator, node.op);
         out[idx] = .{
-            .inputs = try allocator.dupe(u32, node.inputs),
+            .inputs = try allocator.dupe(graph_mod.ValueId, node.inputs),
             .output = node.output,
             .op = op,
+            .extra_outputs = try allocator.dupe(graph_mod.ValueId, node.extra_outputs),
         };
+        initialized += 1;
     }
     return out;
 }
 
-pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph, view_symbol_expr: []const ?u32) ![]package_file.NodeRecord {
-    return collectNodeSlice(allocator, graph.nodes.items, view_symbol_expr);
+/// The op with its slice attributes owned by `allocator` (the graph owns them in an arena
+/// that does not outlive the export).
+fn cloneOpOwned(allocator: std.mem.Allocator, op: graph_mod.Op) !package_file.NodeOp {
+    var out = op;
+    if (graph_mod.symbolicAttr(&out)) |attr| {
+        const sizes = try allocator.dupe(usize, attr.sizes);
+        const symbols: []const ?u32 = if (attr.free_dims.len == 0) &.{} else try allocator.dupe(?u32, attr.free_dims);
+        setAttrSizes(&out, sizes);
+        setAttrSymbols(&out, symbols);
+    }
+    switch (out) {
+        .ViewSliceND => |*sl| sl.starts = try allocator.dupe(usize, sl.starts),
+        else => {},
+    }
+    return out;
 }
 
-pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph, view_symbol_expr: []const ?u32) ![]package_file.RegionRecord {
+fn setAttrSizes(op: *package_file.NodeOp, sizes: []const usize) void {
+    switch (op.*) {
+        .LayerNorm => |*a| a.normalized_shape = sizes,
+        .RMSNorm => |*a| a.normalized_shape = sizes,
+        .ViewReshape => |*a| a.new_shape = sizes,
+        .ViewSliceND => |*a| a.lens = sizes,
+        else => {},
+    }
+}
+
+pub fn collectNodes(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.NodeRecord {
+    return collectNodeSlice(allocator, graph.nodes.items);
+}
+
+pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph) ![]package_file.RegionRecord {
     const out = try allocator.alloc(package_file.RegionRecord, graph.regions.items.len);
     errdefer allocator.free(out);
     var initialized: usize = 0;
@@ -158,7 +186,7 @@ pub fn collectRegions(allocator: std.mem.Allocator, graph: *graph_mod.Graph, vie
     }
     for (graph.regions.items, 0..) |region, idx| {
         out[idx] = .{
-            .nodes = try collectNodeSlice(allocator, region.nodes, view_symbol_expr),
+            .nodes = try collectNodeSlice(allocator, region.nodes),
             .outputs = try allocator.dupe(u32, region.outputs),
         };
         initialized += 1;

@@ -9,12 +9,15 @@ const package_file = @import("../storage/aion_file.zig");
 
 const api_errors = @import("errors.zig");
 
+const lease = @import("../graph/program/lease.zig");
+const template_mod = @import("../graph/template.zig");
+const api_package_export = @import("package_export.zig");
+
 const types_mod = @import("loaded_model/types.zig");
 const signatures = @import("loaded_model/signatures.zig");
 const retarget = @import("loaded_model/retarget.zig");
-const instantiate = @import("loaded_model/instantiate.zig");
 const initializers = @import("loaded_model/initializers.zig");
-const fuse = @import("../graph/opt/fuse_horizontal_matmul.zig");
+const params_mod = @import("loaded_model/params.zig");
 
 fn traceEnabled() bool {
     return env_util.flagEnabled("AION_TRACE");
@@ -27,6 +30,9 @@ pub const DeviceRef = types_mod.DeviceRef;
 pub const SequenceCachePolicy = types_mod.SequenceCachePolicy;
 pub const DType = types_mod.DType;
 pub const TilePolicy = types_mod.TilePolicy;
+pub const Target = types_mod.Target;
+pub const Params = params_mod.Params;
+pub const no_param = params_mod.invalid;
 pub const Package = types_mod.Package;
 pub const SignatureInfo = types_mod.SignatureInfo;
 pub const IoAliasInfo = types_mod.IoAliasInfo;
@@ -34,34 +40,79 @@ pub const LoadModelOptions = types_mod.LoadModelOptions;
 pub const CacheOptions = types_mod.CacheOptions;
 pub const CacheGrowth = types_mod.CacheGrowth;
 
-/// In-process Builder graph source (via `ctx.compile`). The graph is compiled
-/// directly — no serialization round trip. Owns the graph + an arena backing the
-/// per-input shape terms / value-id maps.
-pub const BuilderSource = struct {
-    graph: graph_mod.Graph,
-    arena: std.heap.ArenaAllocator,
-    input_value_ids: []const graph_mod.ValueId,
-    output_value_ids: []const graph_mod.ValueId,
-};
-
-/// Where a `Model`'s concrete graphs come from. The runtime is otherwise
-/// source-agnostic: it reads native metadata fields (signatures, shape terms, dim
-/// exprs) and only consults the source to *instantiate* a concrete graph per shape.
-pub const GraphSource = union(enum) {
-    /// Loaded from an `.aion`: instantiate by walking package node records.
+/// Backing for a `Model`'s template records: two ways to own the same thing.
+///
+/// A template BORROWS its records (see `graph/template.zig`), so something has to keep
+/// them alive — the parsed file for a loaded model, its own snapshot for a compiled one.
+/// This is the ONLY place that distinction survives: everything downstream reads the
+/// template, which is what makes specializing one code path instead of two.
+pub const TemplateOwner = union(enum) {
     package: Package,
-    /// Compiled in-process: instantiate by (re)using the retained Builder graph.
-    builder: BuilderSource,
-};
+    parts: api_package_export.Parts,
 
-/// Declares that input `input_index`'s axis `axis` is the free (variable) dim
-/// bound to dim symbol `symbol_index`. Used to give an in-process compiled model
-/// symbolic shapes so one model serves multiple input sizes (e.g. prefill then
-/// decode) without recompiling from scratch.
-pub const SymbolicAxis = struct {
-    input_index: u32,
-    axis: u32,
-    symbol_index: u32,
+    pub fn template(self: *const TemplateOwner) template_mod.Template {
+        return switch (self.*) {
+            .package => |*p| .{
+                .values = p.values,
+                .nodes = p.nodes,
+                .regions = p.regions,
+                .inputs = &.{}, // filled by `init` from the signatures
+                .outputs = &.{},
+                .dim_exprs = p.dim_exprs,
+                .dim_symbol_count = p.dim_symbols.len,
+            },
+            .parts => |*parts| parts.view(),
+        };
+    }
+
+    fn values(self: *const TemplateOwner) []const package_file.ValueRecord {
+        return switch (self.*) {
+            .package => |*p| p.values,
+            .parts => |*parts| parts.values,
+        };
+    }
+
+    fn namedInputs(self: *const TemplateOwner) []const package_file.NamedValue {
+        return switch (self.*) {
+            .package => |*p| p.inputs,
+            .parts => |*parts| parts.inputs,
+        };
+    }
+
+    fn namedOutputs(self: *const TemplateOwner) []const package_file.NamedValue {
+        return switch (self.*) {
+            .package => |*p| p.outputs,
+            .parts => |*parts| parts.outputs,
+        };
+    }
+
+    fn debugNames(self: *const TemplateOwner) []const package_file.DebugName {
+        return switch (self.*) {
+            .package => |*p| p.debug_names,
+            .parts => |*parts| parts.debug_names,
+        };
+    }
+
+    fn ioAliases(self: *const TemplateOwner) []const package_file.IoAlias {
+        return switch (self.*) {
+            .package => |*p| p.io_aliases,
+            .parts => |*parts| parts.io_aliases,
+        };
+    }
+
+    fn inputRoles(self: *const TemplateOwner) []const package_file.InputRole {
+        return switch (self.*) {
+            .package => |*p| p.input_roles,
+            .parts => |*parts| parts.input_roles,
+        };
+    }
+
+    fn deinit(self: *TemplateOwner, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .package => |*p| p.deinit(),
+            .parts => |*parts| parts.deinit(allocator),
+        }
+    }
 };
 
 pub const Model = struct {
@@ -72,26 +123,19 @@ pub const Model = struct {
     /// (device residency on GPU) for this model's lifetime, so weights stay
     /// device-resident across `run` calls. Released in `deinit`.
     session: backend_mod.Session,
-    policy: TilePolicy,
-    /// The device this model executes on (`.cpu` or a registered `.gpu`). Drives
-    /// whether recurrent-state slots are migrated to device-exclusive residency
-    /// (discrete GPU only — see `ensureAliasedStateSlot`); `.cpu`/unified leave
-    /// state host-backed.
-    device: DeviceRef,
-    /// Where concrete graphs are instantiated from (loaded package vs compiled graph).
-    source: GraphSource,
-    initializer_tids: []TensorId,
+    /// Where this model compiles and executes: device, tiling, pass set. The device
+    /// also drives whether recurrent-state slots are migrated to device-exclusive
+    /// residency (discrete GPU only — see `ensureAliasedStateSlot`); `.cpu`/unified
+    /// leave state host-backed.
+    target: Target,
+    /// The model's graph before its free dims are known, and whatever owns its records.
+    template: template_mod.Template,
+    template_owner: TemplateOwner,
+    /// This model's weights, keyed by graph value. One representation for both sources
+    /// (see `loaded_model/params.zig`).
+    params: Params,
     input_signatures: []SignatureInfo,
     output_signatures: []SignatureInfo,
-    /// Native per-public-input shape terms (source-agnostic): loaded models borrow
-    /// these from the package's value records; compiled models own constant terms in
-    /// the builder arena. Read by `resolveBindings`/`ensureAutoInputs` so the hot path
-    /// never depends on `Package`.
-    input_shape_terms: []const []const package_file.ShapeTerm,
-    /// Dimension-expression table for symbol resolution (loaded: package's; compiled: empty).
-    dim_exprs: []const package_file.DimExpr,
-    /// Number of dimension symbols (loaded: package's; compiled: 0).
-    dim_symbol_count: usize,
     output_aliases: []IoAliasInfo,
     input_alias_output_indices: []u32,
     output_alias_input_indices: []u32,
@@ -188,10 +232,9 @@ pub const Model = struct {
         for (self.cache_entries.items) |*entry| self.destroyCacheEntry(entry);
         self.cache_entries.deinit(self.allocator);
         self.session.deinit();
-        self.allocator.free(self.initializer_tids);
+        self.params.deinit(self.allocator);
         self.allocator.free(self.input_signatures);
         self.allocator.free(self.output_signatures);
-        self.allocator.free(self.input_shape_terms);
         self.allocator.free(self.output_aliases);
         self.allocator.free(self.input_alias_output_indices);
         self.allocator.free(self.output_alias_input_indices);
@@ -210,14 +253,9 @@ pub const Model = struct {
         self.allocator.free(self.run_symbol_values);
         self.allocator.free(self.run_input_shapes);
         self.allocator.free(self.run_direct_input_ids);
-        switch (self.source) {
-            .package => |*p| p.deinit(),
-            .builder => |*b| {
-                // Owns the Builder graph + an arena backing shape terms / value-id maps.
-                b.graph.deinit();
-                b.arena.deinit();
-            },
-        }
+        self.allocator.free(@constCast(self.template.inputs));
+        self.allocator.free(@constCast(self.template.outputs));
+        self.template_owner.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -235,38 +273,28 @@ pub const Model = struct {
 
     /// The backing package, if this model was loaded (not compiled in-process).
     /// Debug-name lookups and initializer/weight-swap are package-only.
-    fn packageOrNull(self: *const Self) ?*const Package {
-        return switch (self.source) {
-            .package => |*p| p,
-            .builder => null,
-        };
-    }
-
     /// Return the debug-name table persisted in the loaded package (empty for
     /// compiled models, which have no debug-name table).
+    /// Value -> author-given name, for both sources: a package persists them and a
+    /// Builder has them in hand, so a weight is addressable by name either way.
     pub fn debugNames(self: *const Self) []const package_file.DebugName {
-        const p = self.packageOrNull() orelse return &[_]package_file.DebugName{};
-        return p.debug_names;
+        return self.template_owner.debugNames();
     }
 
     /// Return the value index for a debug name, or null if not present.
     pub fn findValueByDebugName(self: *const Self, name: []const u8) ?u32 {
-        const p = self.packageOrNull() orelse return null;
-        for (p.debug_names) |entry| {
+        for (self.template_owner.debugNames()) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.value;
         }
         return null;
     }
 
-    /// Resolve an initializer value index to its store tensor id.
-    fn initializerTidByValue(self: *Self, value_index: u32) api_errors.ApiError!TensorId {
-        const p = self.packageOrNull() orelse return api_errors.ApiError.InvalidArgument;
-        if (value_index >= p.values.len) return api_errors.ApiError.InvalidArgument;
-        const value = p.values[value_index];
-        if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
-        const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
-        if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
-        return self.initializer_tids[init_idx];
+    /// The store tensor backing parameter value `value_index`.
+    ///
+    /// Works for a compiled model as well as a loaded one: `Params` is keyed by graph
+    /// value, which both sources have.
+    fn paramTid(self: *Self, value_index: u32) api_errors.ApiError!TensorId {
+        return self.params.get(value_index) orelse api_errors.ApiError.InvalidArgument;
     }
 
     /// Return an owned tensor handle for an initializer value.
@@ -276,8 +304,8 @@ pub const Model = struct {
     /// a combined tensor — that weight has no standalone in-place storage; use
     /// `overwriteInitializerByValue`, which writes through to the fused weight.
     pub fn initializerTensorByValue(self: *Self, value_index: u32) api_errors.ApiError!Tensor {
-        const tid: TensorId = try self.initializerTidByValue(value_index);
-        if (self.store.findDerivedWeightBySource(tid) != null) return api_errors.ApiError.InvalidArgument;
+        const tid: TensorId = try self.paramTid(value_index);
+        if (self.store.derivedLocate(tid) != null) return api_errors.ApiError.InvalidArgument;
         const meta = try self.store.getConst(tid);
         return .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
     }
@@ -296,13 +324,13 @@ pub const Model = struct {
     /// tilings via pack/unpack when needed.
     pub fn overwriteInitializerByValue(self: *Self, value_index: u32, src: Tensor) api_errors.ApiError!void {
         if (src.store != self.store) return api_errors.ApiError.InvalidArgument;
-        const tid: TensorId = try self.initializerTidByValue(value_index);
+        const tid: TensorId = try self.paramTid(value_index);
 
         // If this weight was fused into a combined tensor, the fused tensor is the
         // canonical store — write through to its sub-region (the original buffer may
         // have been reclaimed). Takes effect next run with no recompile.
-        if (self.store.findDerivedWeightBySource(tid)) |ref| {
-            return fuse.overwriteFusedColumns(self.allocator, self.store, ref, src.id) catch api_errors.ApiError.InvalidArgument;
+        if (self.store.derivedLocate(tid) != null) {
+            return self.store.writeDerivedSource(tid, src.id) catch api_errors.ApiError.InvalidArgument;
         }
 
         if (tid == src.id) return;
@@ -321,10 +349,10 @@ pub const Model = struct {
     /// match the logical weight's dtype/shape and is owned by the caller.
     pub fn readInitializerByValue(self: *Self, value_index: u32, dst: Tensor) api_errors.ApiError!void {
         if (dst.store != self.store) return api_errors.ApiError.InvalidArgument;
-        const tid: TensorId = try self.initializerTidByValue(value_index);
+        const tid: TensorId = try self.paramTid(value_index);
 
-        if (self.store.findDerivedWeightBySource(tid)) |ref| {
-            return fuse.readFusedColumns(self.allocator, self.store, ref, dst.id) catch api_errors.ApiError.InvalidArgument;
+        if (self.store.derivedLocate(tid) != null) {
+            return self.store.readDerivedSource(tid, dst.id) catch api_errors.ApiError.InvalidArgument;
         }
 
         if (tid == dst.id) return;
@@ -349,14 +377,7 @@ pub const Model = struct {
     /// - layout must be compatible (dtype, shape, tile layout)
     pub fn retargetInitializerByValue(self: *Self, value_index: u32, new_tensor: Tensor) api_errors.ApiError!void {
         if (new_tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
-        const p = self.packageOrNull() orelse return api_errors.ApiError.InvalidArgument;
-        if (value_index >= p.values.len) return api_errors.ApiError.InvalidArgument;
-        const value = p.values[value_index];
-        if (value.source != .initializer) return api_errors.ApiError.InvalidArgument;
-        const init_idx: u32 = value.initializer_index orelse return api_errors.ApiError.InvalidArgument;
-        if (init_idx >= self.initializer_tids.len) return api_errors.ApiError.InvalidArgument;
-
-        const old_tid: TensorId = self.initializer_tids[init_idx];
+        const old_tid: TensorId = try self.paramTid(value_index);
         const new_tid: TensorId = new_tensor.id;
         if (old_tid == new_tid) return;
         if (self.store.tensorIsWorkspace(new_tid) catch true) return api_errors.ApiError.InvalidArgument;
@@ -364,21 +385,28 @@ pub const Model = struct {
         // A fused weight isn't referenced by the program (the combined tensor is), so
         // retargeting its id would patch nothing. Write the new contents through to
         // the fused weight's sub-region instead; the alias mapping stays put.
-        if (self.store.findDerivedWeightBySource(old_tid)) |ref| {
-            return fuse.overwriteFusedColumns(self.allocator, self.store, ref, new_tid) catch api_errors.ApiError.InvalidArgument;
+        if (self.store.derivedLocate(old_tid) != null) {
+            return self.store.writeDerivedSource(old_tid, new_tid) catch api_errors.ApiError.InvalidArgument;
         }
 
         const ok = try signatures.tensorsHaveCompatibleLayout(self.store, old_tid, new_tid);
         if (!ok) return api_errors.ApiError.InvalidArgument;
 
-        self.initializer_tids[init_idx] = new_tid;
+        self.params.set(value_index, new_tid);
         for (self.cache_entries.items) |*entry| {
             retarget.retargetProgramTensorIds(&entry.program, old_tid, new_tid);
+            // The program now names `new_tid` where it named `old_tid`, and reclaim
+            // reads those counts, so they move with the ids.
+            self.store.releaseTensor(old_tid);
+            self.store.retainTensor(new_tid);
         }
         // The compiled programs now name a tensor the caller supplied, and their
         // placement table still says the weight is device-placed. Honor that
         // table rather than leaving a host tensor wired into a device program.
-        try self.placeTensorOnDevice(new_tid);
+        self.store.placeTensor(new_tid, self.target.device) catch |err| switch (err) {
+            error.OutOfMemory => return api_errors.ApiError.OutOfMemory,
+            else => return api_errors.ApiError.InvalidArgument,
+        };
     }
 
     pub fn retargetInitializerByDebugName(self: *Self, debug_name: []const u8, new_tensor: Tensor) api_errors.ApiError!void {
@@ -674,7 +702,7 @@ pub const Model = struct {
     /// ahead of the run; `appendPositionsAreExternal` refuses lazy growth at
     /// load time otherwise, so no case here has to synchronize to find a size.
     fn prepareGrowableCaches(self: *Self, entry: *const CacheEntry) api_errors.ExecuteError!void {
-        if (self.device.kind == .cpu) return;
+        if (self.target.device.kind == .cpu) return;
 
         for (entry.program.growth_requests) |request| {
             if (self.store.sequenceCachePolicyInfo(request.cache).kind != .growable) continue;
@@ -797,7 +825,7 @@ pub const Model = struct {
             const old = self.output_host_mirror_tids[output_index];
             if (old != types_mod.invalid_tensor_id) self.store.releaseTensorData(old) catch {};
             self.output_host_mirror_tids[output_index] =
-                try initializers.createTensorSingleTile(self.store, self.policy, src_meta.dtype, src_meta.shape);
+                try initializers.createTensorSingleTile(self.store, self.target.tiles, src_meta.dtype, src_meta.shape);
         }
         const mirror_tid = self.output_host_mirror_tids[output_index];
         try self.store.copyTensorData(mirror_tid, src_tid);
@@ -836,12 +864,15 @@ pub const Model = struct {
         return tmp[0];
     }
 
-    /// Shared constructor: allocates the runtime bookkeeping arrays + io-alias index
-    /// maps from already-extracted, source-agnostic metadata. Both `initLoaded` and
-    /// `initCompiled` populate the metadata from their source, then delegate here.
-    /// On success the returned `Model` owns `source`, `initializer_tids`,
-    /// `input_signatures`, `output_signatures`, and the outer `input_shape_terms`
-    /// array; on error the caller's `errdefer`s free them.
+    /// Build a `Model` from a graph template and its parameters.
+    ///
+    /// One constructor for both sources. Everything it needs — signatures, shape terms,
+    /// the dim-symbol table, io-aliases, input roles, debug names — comes off the
+    /// template and its owner, so a loaded `.aion` and an in-process `ctx.compile` differ
+    /// only in which arm of `TemplateOwner` they hand over.
+    ///
+    /// Takes ownership of `owner` and `params` on success; on error both are left to the
+    /// caller's `errdefer`s.
     /// Whether every `SequenceAppend` takes its write position from outside the
     /// graph rather than computing it in one.
     ///
@@ -852,58 +883,55 @@ pub const Model = struct {
     /// append. Such a model gets its cache pre-allocated at the declared
     /// capacity instead: the same fallback an unsupported layout takes, and the
     /// reason the growth path needs no in-graph case at all.
-    fn appendPositionsAreExternal(source: GraphSource) bool {
-        switch (source) {
-            .package => |*pkg| {
-                for (pkg.nodes) |node| {
-                    if (node.op != .SequenceAppend) continue;
-                    if (node.inputs.len < 3) continue;
-                    if (pkg.values[node.inputs[2]].source == .produced) return false;
-                }
-                for (pkg.regions) |region| {
-                    for (region.nodes) |node| {
-                        if (node.op != .SequenceAppend) continue;
-                        if (node.inputs.len < 3) continue;
-                        if (pkg.values[node.inputs[2]].source == .produced) return false;
-                    }
-                }
-            },
-            .builder => |*b| {
-                for (b.graph.nodes.items) |node| {
-                    if (node.op != .SequenceAppend) continue;
-                    if (node.inputs.len < 3) continue;
-                    if (b.graph.values.items[@intCast(node.inputs[2])].producer != null) return false;
-                }
-                for (b.graph.regions.items) |region| {
-                    for (region.nodes) |node| {
-                        if (node.op != .SequenceAppend) continue;
-                        if (node.inputs.len < 3) continue;
-                        if (b.graph.values.items[@intCast(node.inputs[2])].producer != null) return false;
-                    }
-                }
-            },
+    fn appendPositionsAreExternal(t: template_mod.Template) bool {
+        for (t.nodes) |node| {
+            if (!appendPositionIsExternal(t, node)) return false;
+        }
+        for (t.regions) |region| {
+            for (region.nodes) |node| {
+                if (!appendPositionIsExternal(t, node)) return false;
+            }
         }
         return true;
     }
 
-    fn initCommon(
+    fn appendPositionIsExternal(t: template_mod.Template, node: package_file.NodeRecord) bool {
+        if (node.op != .SequenceAppend) return true;
+        if (node.inputs.len < 3) return true;
+        return t.values[node.inputs[2]].source != .produced;
+    }
+
+    pub fn init(
         allocator: std.mem.Allocator,
         backend: backend_mod.Backend,
         store: *StorageManager,
-        policy: TilePolicy,
-        device: DeviceRef,
-        source: GraphSource,
-        initializer_tids: []TensorId,
-        input_signatures: []SignatureInfo,
-        output_signatures: []SignatureInfo,
-        input_shape_terms: []const []const package_file.ShapeTerm,
-        dim_exprs: []const package_file.DimExpr,
-        dim_symbol_count: usize,
-        io_aliases: []const package_file.IoAlias,
-        input_roles_src: []const package_file.InputRole,
+        target: Target,
+        owner: TemplateOwner,
+        params: Params,
         package_hash: u64,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
+        const input_signatures = try signatures.buildSignatures(allocator, owner.values(), owner.namedInputs());
+        errdefer allocator.free(input_signatures);
+        const output_signatures = try signatures.buildSignatures(allocator, owner.values(), owner.namedOutputs());
+        errdefer allocator.free(output_signatures);
+
+        // The template needs its public inputs and outputs as value ids; the signatures
+        // are that list, named.
+        const template_inputs = try allocator.alloc(u32, input_signatures.len);
+        errdefer allocator.free(template_inputs);
+        for (input_signatures, 0..) |sig, i| template_inputs[i] = sig.value;
+        const template_outputs = try allocator.alloc(u32, output_signatures.len);
+        errdefer allocator.free(template_outputs);
+        for (output_signatures, 0..) |sig, i| template_outputs[i] = sig.value;
+
+        var template = owner.template();
+        template.inputs = template_inputs;
+        template.outputs = template_outputs;
+
+        const io_aliases = owner.ioAliases();
+        const input_roles_src = owner.inputRoles();
+        const dim_symbol_count = template.dim_symbol_count;
         // `io_aliases` are an optimization hint (copy outputs back into input slots).
         // Filter incompatible ones so executing never fails on an alias dtype/rank mismatch.
         var valid_alias_count: usize = 0;
@@ -1025,7 +1053,7 @@ pub const Model = struct {
                     if (growable != null and
                         (role.flags & package_file.InputRoleFlags.allow_growable) != 0 and
                         input_signatures[i].rank == 4 and role.axis == 1 and
-                        appendPositionsAreExternal(source))
+                        appendPositionsAreExternal(template))
                     {
                         const g = growable.?;
                         const initial: usize = @max(1, @min(g.initial_capacity_tokens, cap));
@@ -1071,15 +1099,12 @@ pub const Model = struct {
             .backend = backend,
             .store = store,
             .session = session,
-            .policy = policy,
-            .device = device,
-            .source = source,
-            .initializer_tids = initializer_tids,
+            .target = target,
+            .template = template,
+            .template_owner = owner,
+            .params = params,
             .input_signatures = input_signatures,
             .output_signatures = output_signatures,
-            .input_shape_terms = input_shape_terms,
-            .dim_exprs = dim_exprs,
-            .dim_symbol_count = dim_symbol_count,
             .output_aliases = output_aliases,
             .input_alias_output_indices = input_alias_output_indices,
             .output_alias_input_indices = output_alias_input_indices,
@@ -1110,159 +1135,6 @@ pub const Model = struct {
         };
     }
 
-    /// Build a `Model` from a parsed `.aion` package. Metadata (signatures, shape
-    /// terms, dim exprs) is taken from the package; the package is retained as the
-    /// graph source for per-shape instantiation + weight-swap-by-debug-name.
-    pub fn initLoaded(
-        allocator: std.mem.Allocator,
-        backend: backend_mod.Backend,
-        store: *StorageManager,
-        policy: TilePolicy,
-        device: DeviceRef,
-        package: Package,
-        initializer_tids: []TensorId,
-        package_hash: u64,
-        opts: LoadModelOptions,
-    ) api_errors.LoadError!Self {
-        const input_signatures = try signatures.buildSignatures(allocator, &package, package.inputs);
-        errdefer allocator.free(input_signatures);
-        const output_signatures = try signatures.buildSignatures(allocator, &package, package.outputs);
-        errdefer allocator.free(output_signatures);
-
-        // Borrow each public input's shape terms from its value record (zero-copy;
-        // the package — retained in `source` — keeps them alive).
-        const input_shape_terms = try allocator.alloc([]const package_file.ShapeTerm, input_signatures.len);
-        errdefer allocator.free(input_shape_terms);
-        for (input_signatures, 0..) |sig, i| input_shape_terms[i] = package.values[sig.value].shape_terms;
-
-        return initCommon(
-            allocator,
-            backend,
-            store,
-            policy,
-            device,
-            .{ .package = package },
-            initializer_tids,
-            input_signatures,
-            output_signatures,
-            input_shape_terms,
-            package.dim_exprs,
-            package.dim_symbols.len,
-            package.io_aliases,
-            package.input_roles,
-            package_hash,
-            opts,
-        );
-    }
-
-    /// Build a `Model` from an in-process Builder graph (via `ctx.compile`).
-    ///
-    /// Takes ownership of `graph_in`. Metadata (signatures, constant shape terms) is
-    /// derived natively from the graph + names — no synthetic package, no
-    /// serialization round trip. The program is compiled directly from the retained
-    /// graph by the `builder` source's `instantiate`. `graph_in` must already have had
-    /// shape inference run (concrete shapes). Inputs are the graph's *public* inputs
-    /// (params are baked initializers already bound in the graph).
-    pub fn initCompiled(
-        allocator: std.mem.Allocator,
-        backend: backend_mod.Backend,
-        store: *StorageManager,
-        policy: TilePolicy,
-        device: DeviceRef,
-        graph_in: graph_mod.Graph,
-        input_value_ids: []const graph_mod.ValueId,
-        input_names: []const []const u8,
-        output_value_ids: []const graph_mod.ValueId,
-        output_names: []const []const u8,
-        io_aliases: []const package_file.IoAlias,
-        input_roles: []const package_file.InputRole,
-        dim_symbol_count: usize,
-        symbolic_axes: []const SymbolicAxis,
-        opts: LoadModelOptions,
-    ) api_errors.LoadError!Self {
-        var graph = graph_in;
-        errdefer graph.deinit();
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const aa = arena.allocator();
-
-        const n_in = input_value_ids.len;
-        const n_out = output_value_ids.len;
-
-        const input_signatures = try allocator.alloc(SignatureInfo, n_in);
-        errdefer allocator.free(input_signatures);
-        const output_signatures = try allocator.alloc(SignatureInfo, n_out);
-        errdefer allocator.free(output_signatures);
-        const input_shape_terms = try allocator.alloc([]const package_file.ShapeTerm, n_in);
-        errdefer allocator.free(input_shape_terms);
-
-        for (input_value_ids, 0..) |vid, k| {
-            const v = graph.values.items[@intCast(vid)];
-            const dtype = v.dtype orelse return error.InvalidArgument;
-            const terms = try aa.alloc(package_file.ShapeTerm, v.shape.len);
-            for (v.shape, 0..) |d, i| terms[i] = .{ .constant = @intCast(d) };
-            // Mark declared-symbolic axes as expressions so a differently-sized
-            // bound input resolves the symbol instead of being rejected.
-            for (symbolic_axes) |sa| {
-                if (sa.input_index == k) {
-                    if (sa.axis >= terms.len or sa.symbol_index >= dim_symbol_count) return error.InvalidArgument;
-                    terms[sa.axis] = .{ .expr = sa.symbol_index };
-                }
-            }
-            input_signatures[k] = .{ .name = try aa.dupe(u8, input_names[k]), .value = vid, .dtype = dtype, .rank = @intCast(v.shape.len) };
-            input_shape_terms[k] = terms;
-        }
-
-        // One dim-expr per symbol (`expr_index == symbol_index`), mirroring the
-        // package-export encoding so `bindInputDimExprs` resolves them uniformly.
-        const dim_exprs = try aa.alloc(package_file.DimExpr, dim_symbol_count);
-        for (0..dim_symbol_count) |i| dim_exprs[i] = .{ .symbol = @intCast(i) };
-        for (output_value_ids, 0..) |vid, j| {
-            const v = graph.values.items[@intCast(vid)];
-            const dtype = v.dtype orelse return error.InvalidArgument;
-            output_signatures[j] = .{ .name = try aa.dupe(u8, output_names[j]), .value = vid, .dtype = dtype, .rank = @intCast(v.shape.len) };
-        }
-
-        // IMPORTANT: complete ALL arena allocations *before* copying `arena` into
-        // `source`. `ArenaAllocator` is a value type; copying it snapshots its buffer
-        // state, so allocations made via `aa` after the copy would not be tracked by
-        // the stored arena and would leak.
-        const in_ids_dup = try aa.dupe(graph_mod.ValueId, input_value_ids);
-        const out_ids_dup = try aa.dupe(graph_mod.ValueId, output_value_ids);
-        const aliases_dup = try aa.dupe(package_file.IoAlias, io_aliases);
-        const roles_dup = try aa.dupe(package_file.InputRole, input_roles);
-
-        const empty_tids = try allocator.alloc(TensorId, 0);
-        errdefer allocator.free(empty_tids);
-
-        const source = GraphSource{ .builder = .{
-            .graph = graph,
-            .arena = arena,
-            .input_value_ids = in_ids_dup,
-            .output_value_ids = out_ids_dup,
-        } };
-
-        return initCommon(
-            allocator,
-            backend,
-            store,
-            policy,
-            device,
-            source,
-            empty_tids,
-            input_signatures,
-            output_signatures,
-            input_shape_terms,
-            dim_exprs,
-            dim_symbol_count,
-            aliases_dup,
-            roles_dup,
-            0,
-            opts,
-        );
-    }
-
     fn resolveBindings(self: *Self) error{InvalidArgument}!ResolvedInputs {
         @memset(self.run_symbol_bindings, null);
         @memset(self.run_direct_input_ids, types_mod.invalid_tensor_id);
@@ -1272,13 +1144,13 @@ pub const Model = struct {
         while (i < self.input_signatures.len) : (i += 1) {
             const tensor = self.bound_inputs[i] orelse return error.InvalidArgument;
             const sig = self.input_signatures[i];
-            const terms = self.input_shape_terms[i];
+            const terms = self.template.inputShapeTerms(i);
             if (tensor.dtype != sig.dtype or tensor.shape.len != sig.rank) return error.InvalidArgument;
 
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
                 const actual: u64 = @intCast(tensor.shape[d]);
-                try signatures.bindInputDimExprs(self.dim_exprs, terms[d], actual, self.run_symbol_bindings);
+                try signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], actual, self.run_symbol_bindings);
                 self.run_input_shapes[shape_cursor] = tensor.shape[d];
                 shape_cursor += 1;
             }
@@ -1301,11 +1173,11 @@ pub const Model = struct {
         @memset(self.run_symbol_bindings, null);
         for (self.input_signatures, 0..) |sig, i| {
             const tensor = self.bound_inputs[i] orelse continue;
-            const terms = self.input_shape_terms[i];
+            const terms = self.template.inputShapeTerms(i);
             if (tensor.dtype != sig.dtype or tensor.shape.len != sig.rank) return error.InvalidArgument;
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
-                try signatures.bindInputDimExprs(self.dim_exprs, terms[d], @intCast(tensor.shape[d]), self.run_symbol_bindings);
+                try signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], @intCast(tensor.shape[d]), self.run_symbol_bindings);
             }
         }
         for (self.run_symbol_bindings, 0..) |v, idx| self.run_symbol_values[idx] = v orelse 0;
@@ -1325,7 +1197,7 @@ pub const Model = struct {
             break :blk !signatures.sameUsize(meta.shape, shape);
         };
         if (need_new) {
-            tid = initializers.createTensorForShape(self.store, self.policy, .i32, shape) catch return error.OutOfMemory;
+            tid = initializers.createTensorForShape(self.store, self.target.tiles, .i32, shape) catch return error.OutOfMemory;
             self.role_input_tids[index] = tid;
         }
         const meta = self.store.getConst(tid) catch return error.InvalidArgument;
@@ -1420,7 +1292,10 @@ pub const Model = struct {
         }
 
         const symbol_values = try self.resolveSymbolsFromBoundInputs();
-        const optional_symbols = instantiate.optionalizeSymbols(self.allocator, symbol_values) catch return error.OutOfMemory;
+        const optional_symbols = self.allocator.alloc(?u64, symbol_values.len) catch return error.OutOfMemory;
+        // A symbol left at 0 is one no bound input determined; shape terms treat that as
+        // unresolved rather than as a zero-sized axis.
+        for (symbol_values, 0..) |v, i| optional_symbols[i] = if (v == 0) null else v;
         defer self.allocator.free(optional_symbols);
 
         // Symbols no bound input determines fall back to their load-time default
@@ -1433,7 +1308,7 @@ pub const Model = struct {
         for (self.input_signatures, 0..) |sig, i| {
             if (self.bound_inputs[i] != null) continue;
 
-            const shape = package_file.resolveShapeTermsExprs(self.allocator, self.dim_exprs, self.input_shape_terms[i], optional_symbols) catch {
+            const shape = package_file.resolveShapeTermsExprs(self.allocator, self.template.dim_exprs, self.template.inputShapeTerms(i), optional_symbols) catch {
                 if (trace) std.debug.print(
                     "[aion][run] cannot auto-size unbound input '{s}': a symbolic dimension is not determined by any bound input — bind it explicitly\n",
                     .{sig.name},
@@ -1454,9 +1329,9 @@ pub const Model = struct {
 
             if (need_new) {
                 const tid = if (is_aliased)
-                    try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, shape)
+                    try initializers.createTensorSingleTile(self.store, self.target.tiles, sig.dtype, shape)
                 else
-                    try initializers.createTensorForShape(self.store, self.policy, sig.dtype, shape);
+                    try initializers.createTensorForShape(self.store, self.target.tiles, sig.dtype, shape);
                 // Freshly created store tensors are zero-initialized.
                 self.auto_input_tids[i] = tid;
                 if (trace) std.debug.print(
@@ -1538,29 +1413,8 @@ pub const Model = struct {
 
         try self.cache_entries.append(self.allocator, entry);
         self.cache_workspace_bytes += entry.workspace_bytes;
-        self.reclaimFusedInitializers();
         self.traceDeviceBreakdown(&self.cache_entries.items[self.cache_entries.items.len - 1]);
         return self.cache_entries.items.len - 1;
-    }
-
-    /// Give `tid` its physical backing on this model's execution device,
-    /// preserving its tile geometry. No-op on a CPU model or when it is already
-    /// there. Unified-memory devices keep the host allocation and lower GPU
-    /// access to an alias inside the device-memory implementation.
-    fn placeTensorOnDevice(self: *Self, tid: TensorId) api_errors.ExecuteError!void {
-        if (self.device.kind == .cpu) return;
-        const mem = self.store.deviceMemoryFor(self.device) orelse return error.InvalidArgument;
-        const t = self.store.getConst(tid) catch return error.InvalidArgument;
-        if (t.device.eql(self.device)) return;
-
-        var tile_shape: [8]usize = undefined;
-        const rank: usize = @intCast(t.rank);
-        @memcpy(tile_shape[0..rank], t.tile_shape);
-        const alignment = self.store.policyFor(self.device).tile_alignment;
-        self.store.moveTensor(tid, self.device, mem, tile_shape[0..rank], alignment) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidArgument,
-        };
     }
 
     /// Materialize the compiler's placement table: every tensor the program
@@ -1571,24 +1425,19 @@ pub const Model = struct {
     /// over one source of truth — the same table `validatePlacements` checked.
     /// The executor never falls back to staging a CPU backing, so a declared
     /// placement that cannot be materialized is an error, not a downgrade.
+    ///
+    /// A weight an optimization pass derived needs nothing special here. It is an
+    /// operand of the step that reads it, so the program that fused is the program that
+    /// places it; a specialization that does NOT fuse names the sources instead, and
+    /// `restoreFoldedInitializers` has already given those their bytes back.
     fn placeProgram(self: *Self, program: *const program_mod.Program) api_errors.ExecuteError!void {
-        if (self.device.kind == .cpu) return;
+        if (self.target.device.kind == .cpu) return;
 
-        const mem = self.store.deviceMemoryFor(self.device) orelse return error.InvalidArgument;
-        program_mod.materializePlacements(self.store, program, self.device, mem) catch |err| switch (err) {
+        const mem = self.store.deviceMemoryFor(self.target.device) orelse return error.InvalidArgument;
+        program_mod.materializePlacements(self.store, program, self.target.device, mem) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidArgument,
         };
-
-        // A derived weight built for an earlier specialization is absent from
-        // this program's table when this program does not reference it, but it
-        // must still follow its sources onto the device.
-        for (self.initializer_tids) |tid| {
-            self.store.moveDerivedWeightsForSource(tid, self.device) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.InvalidArgument,
-            };
-        }
 
         traceStorageTotals(self, "placed");
     }
@@ -1627,7 +1476,7 @@ pub const Model = struct {
             if (tensor.device.kind == .cpu) continue;
             const b = tensor.backing_bytes;
             const id: TensorId = @intCast(idx);
-            if (idIn(self.initializer_tids, id)) {
+            if (self.params.contains(id)) {
                 init_b +|= b;
             } else if (idIn(entry.program.owned_tensors, id)) {
                 ws_b +|= b;
@@ -1642,6 +1491,7 @@ pub const Model = struct {
     }
 
     fn destroyCacheEntry(self: *Self, entry: *CacheEntry) void {
+        lease.release(self.store, &entry.program);
         for (entry.owned_input_slots) |tid| self.store.releaseTensorData(tid) catch {};
         if (entry.owned_input_slots.len != 0) self.allocator.free(entry.owned_input_slots);
         for (entry.program.owned_tensors) |tid| {
@@ -1654,134 +1504,37 @@ pub const Model = struct {
         self.allocator.free(entry.direct_input_ids);
     }
 
-    /// Reclaim weights that an optimization pass fused into a combined tensor: their
-    /// data is now redundant with the fused weight (the canonical store), so free
-    /// the backing buffer while keeping metadata. Lifecycle lives here, not in the
-    /// pass. A weight is freed only if no compiled program still references it
-    /// directly (guards a weight shared with an unfused op). Idempotent; weight-swap
-    /// stays correct via write-through to the fused weight.
-    fn reclaimFusedInitializers(self: *Self) void {
-        for (self.initializer_tids) |tid| {
-            if (self.store.findDerivedWeightBySource(tid) == null) continue;
-            var referenced = false;
-            for (self.cache_entries.items) |*entry| {
-                if (retarget.programReferencesTensorId(&entry.program, tid)) {
-                    referenced = true;
-                    break;
-                }
-            }
-            if (!referenced) self.store.releaseTensorData(tid) catch {};
-        }
-        traceStorageTotals(self, "after_reclaim");
-    }
-
     /// Produce a concrete graph for the requested shapes (source-specific), then
     /// bind public-input slots + compile via the shared `finishCacheEntry`.
+    /// Specialize the template for these shapes, then bind slots and compile.
+    ///
+    /// One path for both sources: `Template.specialize` neither knows nor cares whether
+    /// the records it reads came from a file or from an authored graph.
     fn buildCacheEntry(
         self: *Self,
         symbol_values: []const u64,
         input_shapes: []const usize,
         direct_input_ids: []const TensorId,
     ) api_errors.ExecuteError!CacheEntry {
-        switch (self.source) {
-            // Compiled model: clone the pristine authored template into a fresh
-            // concrete graph for this run's shapes, then compile it (infer +
-            // optimize + lower) — mirroring the loaded path below. The template is
-            // never mutated; the clone shares weight tensors (external ids copied
-            // by value) and is discarded once its program is built.
-            .builder => |*b| {
-                var g = b.graph.clone(self.allocator) catch return error.OutOfMemory;
-                defer g.deinit();
-                // A freshly-materialized graph: produced shapes are (re)inferred, so
-                // clear them and set each public input to this run's concrete shape.
-                for (g.values.items) |*v| {
-                    if (v.producer != null) v.shape = &[_]usize{};
-                }
-                var cursor: usize = 0;
-                for (self.input_signatures, 0..) |_, si| {
-                    const cshape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, si, &cursor);
-                    g.values.items[@intCast(b.input_value_ids[si])].shape = g.dupeShape(cshape) catch return error.OutOfMemory;
-                }
-                return self.finishCacheEntry(&g, b.input_value_ids, b.output_value_ids, symbol_values, input_shapes, direct_input_ids);
-            },
-            // Loaded model: walk the package node records to build a fresh concrete
-            // graph specialized to these shapes/symbols.
-            .package => |*pkg| {
-                var graph = graph_mod.Graph.init(self.allocator);
-                defer graph.deinit();
+        const in_ids = try self.allocator.alloc(graph_mod.ValueId, self.input_signatures.len);
+        defer self.allocator.free(in_ids);
+        const out_ids = try self.allocator.alloc(graph_mod.ValueId, self.output_signatures.len);
+        defer self.allocator.free(out_ids);
 
-                var value_map = try self.allocator.alloc(graph_mod.ValueId, pkg.values.len);
-                defer self.allocator.free(value_map);
-                @memset(value_map, std.math.maxInt(graph_mod.ValueId));
+        var graph = self.template.specialize(
+            self.allocator,
+            self.params.by_value,
+            symbol_values,
+            input_shapes,
+            in_ids,
+            out_ids,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidArgument,
+        };
+        defer graph.deinit();
 
-                const in_ids = try self.allocator.alloc(graph_mod.ValueId, self.input_signatures.len);
-                defer self.allocator.free(in_ids);
-                const out_ids = try self.allocator.alloc(graph_mod.ValueId, self.output_signatures.len);
-                defer self.allocator.free(out_ids);
-
-                // Public inputs: add (unbound — slot binding happens in finishCacheEntry).
-                var input_shape_cursor: usize = 0;
-                for (self.input_signatures, 0..) |sig, sig_idx| {
-                    const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
-                    const vid = try graph.addInput(sig.dtype, concrete_shape);
-                    value_map[sig.value] = vid;
-                    in_ids[sig_idx] = vid;
-                }
-
-                const optional_symbols = try instantiate.optionalizeSymbols(self.allocator, symbol_values);
-                defer self.allocator.free(optional_symbols);
-
-                // Initializers (weights): bound to their store tensors.
-                for (pkg.values, 0..) |value, idx| {
-                    if (value.source != .initializer) continue;
-                    const shape = try package_file.resolveShapeTerms(self.allocator, pkg, value.shape_terms, optional_symbols);
-                    defer self.allocator.free(shape);
-                    const vid = try graph.addInput(value.dtype, shape);
-                    try graph.bindExternal(vid, self.initializer_tids[value.initializer_index.?]);
-                    value_map[idx] = vid;
-                }
-
-                // Regions are built lazily, just before the main `If`/`Loop` node that
-                // references them, so a region body can reference values produced by
-                // earlier main nodes (e.g. an in-graph decode Loop reading the encoder out).
-                const region_built = try self.allocator.alloc(bool, pkg.regions.len);
-                defer self.allocator.free(region_built);
-                @memset(region_built, false);
-                const region_map = try self.allocator.alloc(graph_mod.RegionId, pkg.regions.len);
-                defer self.allocator.free(region_map);
-
-                for (pkg.nodes) |node| {
-                    switch (node.op) {
-                        .If => |iff| {
-                            try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.then_region), self.allocator);
-                            try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(iff.else_region), self.allocator);
-                        },
-                        .Loop => |lp| try ensureRegionBuilt(pkg, symbol_values, &graph, value_map, region_built, region_map, @intCast(lp.body_region), self.allocator),
-                        else => {},
-                    }
-
-                    const mapped_inputs = try self.allocator.alloc(graph_mod.ValueId, node.inputs.len);
-                    defer self.allocator.free(mapped_inputs);
-                    for (node.inputs, 0..) |input, i| {
-                        if (input >= value_map.len) return error.InvalidArgument;
-                        mapped_inputs[i] = value_map[input];
-                    }
-                    const extra_ids = package_file.nodeExtraOutputs(node);
-                    const extra_buf = try self.allocator.alloc(graph_mod.ValueId, extra_ids.len);
-                    defer self.allocator.free(extra_buf);
-                    const out_vid = try instantiate.instantiateNode(self.allocator, pkg, symbol_values, &graph, node, mapped_inputs, region_map, extra_buf);
-                    value_map[node.output] = out_vid;
-                    for (extra_ids, 0..) |eid, i| {
-                        if (eid >= value_map.len) return error.InvalidArgument;
-                        value_map[eid] = extra_buf[i];
-                    }
-                }
-
-                for (pkg.outputs, 0..) |sig, idx| out_ids[idx] = value_map[sig.value];
-
-                return self.finishCacheEntry(&graph, in_ids, out_ids, symbol_values, input_shapes, direct_input_ids);
-            },
-        }
+        return self.finishCacheEntry(&graph, in_ids, out_ids, symbol_values, input_shapes, direct_input_ids);
     }
 
     /// Shared tail of cache-entry construction: bind each public input's value to its
@@ -1815,11 +1568,11 @@ pub const Model = struct {
                 // different input shapes (prefill vs decode). Single-tile (SequenceAppend
                 // needs a contiguous last axis; the default tiler would split it).
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
-            else if (self.device.kind != .cpu) blk: {
+            else if (self.target.device.kind != .cpu) blk: {
                 // A GPU program binds a stable device slot, never the caller's
                 // host tensor. `run()` performs the explicit H2D copy into this
                 // slot, so execution has one backing and no staged-input cache.
-                const tid = try initializers.createTensorSingleTile(self.store, self.policy, self.input_signatures[sig_idx].dtype, concrete_shape);
+                const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, self.input_signatures[sig_idx].dtype, concrete_shape);
                 owned_input_slots.append(self.allocator, tid) catch {
                     self.store.releaseTensorData(tid) catch {};
                     return error.OutOfMemory;
@@ -1838,11 +1591,19 @@ pub const Model = struct {
 
         try graph.setOutputs(out_ids);
 
-        var program = try program_mod.compileGraph(self.allocator, graph, self.store, self.policy);
+        var program = try program_mod.compileGraph(self.allocator, graph, self.store, self.target);
         errdefer {
             for (program.owned_tensors) |tid| self.store.releaseTensorData(tid) catch {};
             program.deinit();
         }
+        // The program now exists, which is the only thing this layer knows about weight
+        // lifetime: the store decides what that implies (see `graph/program/lease.zig`).
+        lease.acquire(self.store, &program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidArgument,
+        };
+        errdefer lease.release(self.store, &program);
+        traceStorageTotals(self, "leased");
 
         var workspace_bytes: usize = program.workspace_bytes;
         for (owned_input_slots.items) |tid| {
@@ -1878,7 +1639,7 @@ pub const Model = struct {
             // Capacity truly changed: re-seed into the new slot on the next run.
             self.aliased_state_synced_versions[input_index] = 0;
         }
-        const tid = try initializers.createTensorSingleTile(self.store, self.policy, sig.dtype, shape);
+        const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, sig.dtype, shape);
         if (self.state_input_policies[input_index]) |pol| {
             self.store.registerSequenceCachePolicy(tid, pol) catch return error.InvalidArgument;
         }
@@ -1924,8 +1685,8 @@ pub const Model = struct {
     /// Migration failure falls back to staged: `moveTensor` leaves the source
     /// tensor untouched on error.
     fn migrateStateSlotToDevice(self: *Self, tid: TensorId, dtype: DType, shape: []const usize) void {
-        if (self.device.kind == .cpu) return;
-        const mem = self.store.deviceMemoryFor(self.device) orelse return;
+        if (self.target.device.kind == .cpu) return;
+        const mem = self.store.deviceMemoryFor(self.target.device) orelse return;
 
         const info = dtype.info();
         if (info.is_quantized) return; // createTensorSingleTile already rejects these
@@ -1934,9 +1695,9 @@ pub const Model = struct {
         const bytes: u64 = elems * @as(u64, @intCast(info.block_bytes));
         if (bytes > mem.maxBindingBytes()) return; // over the device's per-buffer ceiling
 
-        const policy = self.store.policyFor(self.device);
+        const policy = self.store.policyFor(self.target.device);
         // Single-tile target (tile_shape == shape), matching createTensorSingleTile.
-        self.store.moveTensor(tid, self.device, mem, shape, policy.tile_alignment) catch return;
+        self.store.moveTensor(tid, self.target.device, mem, shape, policy.tile_alignment) catch return;
     }
 
     /// Seed recurrent-state slot `dst` from a caller-bound source, honoring the
@@ -1968,7 +1729,7 @@ pub const Model = struct {
     }
 
     fn findStaticCacheEntry(self: *Self, desired_direct_input_ids: []const TensorId) api_errors.ExecuteError!?usize {
-        if (self.dim_symbol_count != 0) return null;
+        if (self.template.dim_symbol_count != 0) return null;
         for (self.cache_entries.items, 0..) |*entry, idx| {
             if (try self.prepareCacheEntryInputs(entry, desired_direct_input_ids)) {
                 self.cache_clock +%= 1;
@@ -2002,13 +1763,17 @@ pub const Model = struct {
             const current_tid = entry.direct_input_ids[idx];
             if (current_tid == types_mod.invalid_tensor_id) return false;
             if (current_tid == desired_tid) continue;
-            if (self.device.kind != .cpu) {
+            if (self.target.device.kind != .cpu) {
                 if (!try signatures.tensorsHaveCompatibleLayout(self.store, entry.input_slots[idx], desired_tid)) return false;
                 entry.direct_input_ids[idx] = desired_tid;
                 continue;
             }
             if (!try signatures.tensorsHaveCompatibleLayout(self.store, current_tid, desired_tid)) return false;
             retarget.retargetProgramTensorIds(&entry.program, current_tid, desired_tid);
+            // The program names the caller's tensor now, and teardown will release what
+            // it names, so the count has to follow the id.
+            self.store.releaseTensor(current_tid);
+            self.store.retainTensor(desired_tid);
             entry.direct_input_ids[idx] = desired_tid;
             entry.input_slots[idx] = desired_tid;
         }
@@ -2043,88 +1808,6 @@ const CacheEntry = struct {
     workspace_bytes: usize,
     last_used: u64 = 0,
 };
-
-/// Build one control-flow region's body into the graph, lazily. Sub-regions
-/// referenced by `If`/`Loop` nodes inside the body are built first (recursively),
-/// so no nested active region is needed. Region nodes may reference any value
-/// already in `value_map` — including outputs of earlier main nodes (e.g. the
-/// encoder output an in-graph decode Loop reads via Gather).
-fn ensureRegionBuilt(
-    package: *const Package,
-    symbol_values: []const u64,
-    graph: *graph_mod.Graph,
-    value_map: []graph_mod.ValueId,
-    region_built: []bool,
-    region_map: []graph_mod.RegionId,
-    region_idx: usize,
-    allocator: std.mem.Allocator,
-) api_errors.ExecuteError!void {
-    if (region_idx >= package.regions.len) return error.InvalidArgument;
-    if (region_built[region_idx]) return;
-    const region = package.regions[region_idx];
-
-    // Pre-build sub-regions (so they are complete before this region's beginRegion).
-    for (region.nodes) |n| {
-        switch (n.op) {
-            .If => |iff| {
-                try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(iff.then_region), allocator);
-                try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(iff.else_region), allocator);
-            },
-            .Loop => |lp| try ensureRegionBuilt(package, symbol_values, graph, value_map, region_built, region_map, @intCast(lp.body_region), allocator),
-            else => {},
-        }
-    }
-
-    try graph.beginRegion();
-    errdefer {
-        if (graph.active_region) graph.active_region = false;
-    }
-    for (region.nodes) |node| {
-        const mapped_inputs = try allocator.alloc(graph_mod.ValueId, node.inputs.len);
-        defer allocator.free(mapped_inputs);
-        for (node.inputs, 0..) |input, i| {
-            if (input >= value_map.len) return error.InvalidArgument;
-            mapped_inputs[i] = value_map[input];
-        }
-        const extra_ids = package_file.nodeExtraOutputs(node);
-        const extra_buf = try allocator.alloc(graph_mod.ValueId, extra_ids.len);
-        defer allocator.free(extra_buf);
-        const out_vid = try instantiate.instantiateNode(allocator, package, symbol_values, graph, node, mapped_inputs, region_map, extra_buf);
-        value_map[node.output] = out_vid;
-        for (extra_ids, 0..) |eid, i| {
-            if (eid >= value_map.len) return error.InvalidArgument;
-            value_map[eid] = extra_buf[i];
-        }
-    }
-    const mapped_outputs = try allocator.alloc(graph_mod.ValueId, region.outputs.len);
-    defer allocator.free(mapped_outputs);
-    for (region.outputs, 0..) |output, i| {
-        if (output >= value_map.len) return error.InvalidArgument;
-        mapped_outputs[i] = value_map[output];
-    }
-    region_map[region_idx] = try graph.endRegion(mapped_outputs);
-    region_built[region_idx] = true;
-}
-
-pub fn importInitializersForLoadedModel(
-    allocator: std.mem.Allocator,
-    store: *StorageManager,
-    policy: TilePolicy,
-    package: *const Package,
-) api_errors.LoadError![]TensorId {
-    return initializers.importInitializersForLoadedModel(allocator, store, policy, package);
-}
-
-pub fn importInitializersStreaming(
-    allocator: std.mem.Allocator,
-    store: *StorageManager,
-    policy: TilePolicy,
-    package: *Package,
-    file: std.Io.File,
-    source_bytes: []const u8,
-) api_errors.LoadError![]TensorId {
-    return initializers.importInitializersStreaming(allocator, store, policy, package, file, source_bytes);
-}
 
 fn buildConcreteShapeFromFlat(
     flat_shapes: []const usize,

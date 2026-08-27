@@ -145,6 +145,12 @@ fn inputI32(g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const
     return v;
 }
 
+/// The device a tile policy was derived for. The kernels bench sweeps CPU and GPU with
+/// the same builders, so the target has to follow the policy rather than be assumed.
+fn deviceFor(policy: plan.TilePolicy) aion.storage.DeviceRef {
+    return .{ .kind = if (policy.target_kind == .cpu) .cpu else .gpu };
+}
+
 fn inputI32Pattern(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const usize, seed: usize) !aion.graph.ValueId {
     var n: usize = 1;
     for (shape) |d| n *= d;
@@ -528,6 +534,6 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
         },
     };
     try g.setOutputs(&[_]aion.graph.ValueId{out_v});
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, policy);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(deviceFor(policy), policy));
     return .{ .prog = prog, .out = prog.outputs[0] };
 }

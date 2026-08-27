@@ -711,6 +711,89 @@ test "storage file: model package write/parse roundtrip" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w_vals[0..]), parsed.initializers[0].data);
 }
 
+// Four op attributes can carry free axes, but only a reshape's and a slice's are
+// reachable from the authoring APIs (`Builder.reshapeSym`/`sliceSym`, and the `reshape`
+// and `slice` members of `AionOpAttr` — `norm` has no `_symbols` array). The two norms
+// have the slot because the format stores a shape term per axis for all four, so a
+// hand-written package can put one there and must round-trip unchanged.
+test "storage file: a norm's normalized_shape can be free" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pkg = package_file.Package{
+        .allocator = allocator,
+        .initializers = try allocator.alloc(package_file.Initializer, 0),
+        .values = try allocator.alloc(package_file.ValueRecord, 4),
+        .nodes = try allocator.alloc(package_file.NodeRecord, 1),
+        .inputs = try allocator.alloc(package_file.NamedValue, 3),
+        .outputs = try allocator.alloc(package_file.NamedValue, 1),
+        .dim_symbols = try allocator.alloc(package_file.DimSymbol, 1),
+        .dim_exprs = try allocator.alloc(package_file.DimExpr, 1),
+        .metadata = try allocator.alloc(package_file.MetadataEntry, 0),
+        .debug_names = try allocator.alloc(package_file.DebugName, 0),
+        .io_aliases = try allocator.alloc(package_file.IoAlias, 0),
+    };
+    defer pkg.deinit();
+
+    pkg.dim_symbols[0] = .{ .name = try allocator.dupe(u8, "width") };
+    pkg.dim_exprs[0] = .{ .symbol = 0 };
+
+    // x, gamma and beta all have a free trailing axis, which is what makes a free
+    // `normalized_shape` coherent at all: inference requires the three to agree.
+    for (0..3) |i| {
+        const terms = try allocator.alloc(package_file.ShapeTerm, if (i == 0) 2 else 1);
+        if (i == 0) {
+            terms[0] = .{ .constant = 1 };
+            terms[1] = .{ .expr = 0 };
+        } else {
+            terms[0] = .{ .expr = 0 };
+        }
+        pkg.values[i] = .{
+            .dtype = .f32,
+            .rank = @intCast(terms.len),
+            .source = .public_input,
+            .shape_terms = terms,
+        };
+    }
+    pkg.values[3] = .{
+        .dtype = .f32,
+        .rank = 2,
+        .source = .produced,
+        .shape_terms = try allocator.alloc(package_file.ShapeTerm, 0),
+    };
+
+    const norm_shape = try allocator.alloc(usize, 1);
+    norm_shape[0] = 0; // a free axis records no size
+    const norm_free = try allocator.alloc(?u32, 1);
+    norm_free[0] = 0; // ...it resolves through dim expression 0
+    pkg.nodes[0] = .{
+        .inputs = try allocator.dupe(u32, &[_]u32{ 0, 1, 2 }),
+        .output = 3,
+        .op = .{ .RMSNorm = .{ .eps = 1e-6, .normalized_shape = norm_shape, .free_dims = norm_free } },
+    };
+    pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "x"), .value = 0 };
+    pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "gamma"), .value = 1 };
+    pkg.inputs[2] = .{ .name = try allocator.dupe(u8, "beta"), .value = 2 };
+    pkg.outputs[0] = .{ .name = try allocator.dupe(u8, "y"), .value = 3 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "free_norm.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+
+    const bytes = try package_file.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package_file.parse(allocator, bytes);
+    defer parsed.deinit();
+
+    // The free axis survived, and its size is still the "unresolved" 0.
+    const rn = parsed.nodes[0].op.RMSNorm;
+    try std.testing.expectEqual(@as(usize, 1), rn.normalized_shape.len);
+    try std.testing.expectEqual(@as(usize, 0), rn.normalized_shape[0]);
+    try std.testing.expectEqual(@as(usize, 1), rn.free_dims.len);
+    try std.testing.expectEqual(@as(?u32, 0), rn.free_dims[0]);
+}
+
 test "storage file: dim expressions evaluate after parse" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

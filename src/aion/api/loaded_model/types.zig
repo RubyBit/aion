@@ -4,6 +4,8 @@ const std = @import("std");
 const manager_mod = @import("../../storage/manager.zig");
 const package_file = @import("../../storage/aion_file.zig");
 const plan_mod = @import("../../graph/plan.zig");
+const opt_mod = @import("../../graph/opt.zig");
+const target_mod = @import("../../graph/target.zig");
 const api_tensor = @import("../tensor.zig");
 const device_mod = @import("../device.zig");
 
@@ -12,6 +14,8 @@ pub const StorageManager = manager_mod.StorageManager;
 pub const TensorId = manager_mod.TensorId;
 pub const DType = package_file.DType;
 pub const TilePolicy = plan_mod.TilePolicy;
+pub const OptPolicy = opt_mod.Policy;
+pub const Target = target_mod.Target;
 pub const Package = package_file.Package;
 pub const DeviceRef = device_mod.DeviceRef;
 pub const SequenceCachePolicy = manager_mod.SequenceCachePolicy;
@@ -84,6 +88,10 @@ pub const LoadModelOptions = struct {
     /// specializations. Eviction is LRU and an individual specialization may
     /// exceed the budget (in which case it is retained alone).
     plan_cache_budget_bytes: usize = 256 * 1024 * 1024,
+
+    /// Which optional rewrite passes to run. Null takes `opt.defaults` for the target,
+    /// which is what production wants; set it to bisect a pass on a real model.
+    passes: ?OptPolicy = null,
 };
 
 pub const invalid_alias_index: u32 = std.math.maxInt(u32);

@@ -83,7 +83,7 @@ test "cpu backend: if selects region output" {
     const out = try g.addIf(cond, then_region, else_region);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -120,7 +120,7 @@ test "cpu backend: loop carries state with tensor-id alias swap" {
     const out = try g.addLoop(carried, body_region, 4);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -180,7 +180,7 @@ test "cpu backend: multi-carry loop with early-exit condition" {
     );
     try g.setOutputs(&[_]graph_mod.ValueId{ outs[1], outs[0] }); // acc, i
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -285,7 +285,7 @@ test "cpu backend: rmsnorm supports row tiles >256" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -446,7 +446,7 @@ test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -535,7 +535,7 @@ test "cpu backend: batched matmul rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -624,7 +624,7 @@ test "cpu backend: batched matmul broadcast B rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -713,7 +713,7 @@ test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -803,7 +803,7 @@ test "cpu backend: batch retile guard accepts small, rejects large" {
     defer cpu.deinit();
     const backend: Backend = cpu.backend();
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy_ok);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy_ok));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -819,7 +819,7 @@ test "cpu backend: batch retile guard accepts small, rejects large" {
 
     // Reject when guard is tighter than required batch tiles.
     const policy_bad: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64, .batch_retile_max_tiles = 1 };
-    try std.testing.expectError(program.CompileError.InvalidArgument, program.compileGraph(allocator, &g, &sm, policy_bad));
+    try std.testing.expectError(program.CompileError.InvalidArgument, program.compileGraph(allocator, &g, &sm, .cpu(policy_bad)));
 }
 
 test "cpu backend: unary ops match reference (f32)" {
@@ -867,7 +867,7 @@ test "cpu backend: unary ops match reference (f32)" {
         const y = try g.addUnary(case.op, x_in);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
         defer prog.deinit();
         try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1195,7 +1195,7 @@ test "cpu backend: softmax rank-1 matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1266,7 +1266,7 @@ test "cpu backend: softmax rank-2 matches reference (f32)" {
 
     // Force softmax tiling to span multiple tiles in both dims.
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1341,7 +1341,7 @@ test "cpu backend: softmax rank-2 axis-0 matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1413,7 +1413,7 @@ test "cpu backend: softmax rank-3 axis-last matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1515,7 +1515,7 @@ test "cpu backend: layernorm and rmsnorm rank-2 match reference (f32)" {
         const y = if (case.is_rms) try g.addRMSNorm(x_in, gamma_in, beta_in, eps, norm_shape[0..]) else try g.addLayerNorm(x_in, gamma_in, beta_in, eps, norm_shape[0..]);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
         defer prog.deinit();
         try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1611,7 +1611,7 @@ test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1737,7 +1737,7 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
         try g.setOutputs(&[_]graph_mod.ValueId{out});
 
         const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, policy);
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
         defer prog.deinit();
 
         var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -1901,7 +1901,7 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -2034,7 +2034,7 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
                 try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, sc, chunk, left);
             try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-            var prog = try program.compileGraph(alloc, &g, &sm, pol);
+            var prog = try program.compileGraph(alloc, &g, &sm, .cpu(pol));
             defer prog.deinit();
             try be.executeProgram(&prog, sm.tensorStore());
             try sm.readToPackedScalar(prog.outputs[0], out);
@@ -2098,7 +2098,7 @@ test "cpu backend: argmax over last axis returns i32 indices" {
     const y = try g.addArgMax(x, 1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -2146,7 +2146,7 @@ test "cpu backend: packed-state loop (slice/cast/i32-add/scatter/concat) — in-
     const out = try g.addLoop(state, body_region, M);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2189,7 +2189,7 @@ test "cpu backend: scatter row writes value at dynamic index" {
     const out = try g.addScatterRow(buf, idx, src);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2224,7 +2224,7 @@ test "cpu backend: i32 elementwise add and eq comparison" {
     const eq = try g.addElemwiseBinary(.eq, a, b);
     try g.setOutputs(&[_]graph_mod.ValueId{ sum, eq });
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2275,7 +2275,7 @@ test "cpu backend: loop body lowers matmul + relu (region full-op lowering)" {
     const out = try g.addLoop(carried, body_region, 3);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .{});
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2354,7 +2354,7 @@ test "cpu backend: matmul f16 allows promoted f32 output" {
     }
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -2425,7 +2425,7 @@ test "cpu backend: view ops lower to materialization (transpose/slice/reshape)" 
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -2475,7 +2475,7 @@ test "cpu backend: reshape supports rank-3 materialization" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2531,7 +2531,7 @@ test "cpu backend: view slice nd materialization rank-3" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2584,7 +2584,7 @@ test "cpu backend: concat axis-1 materialization" {
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2650,7 +2650,7 @@ test "cpu backend: gather rows matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2716,7 +2716,7 @@ test "cpu backend: shape index ops and batched gather derive pooling indices" {
     try g.setOutputs(&.{ gathered, positions, seq_len });
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2791,7 +2791,7 @@ test "cpu backend: gather rows matches reference (f16)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2907,7 +2907,7 @@ test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2955,7 +2955,7 @@ test "cpu backend: cast f32 -> f16 roundtrip matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2997,7 +2997,7 @@ test "cpu backend: cast f16 -> f32 matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3112,7 +3112,7 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     try g.setOutputs(&[_]graph_mod.ValueId{c_out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3172,7 +3172,7 @@ test "cpu backend: gather rows out-of-bounds returns InvalidArgument" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3267,7 +3267,7 @@ test "cpu backend: rope1d matches chunked-halves reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3371,7 +3371,7 @@ test "cpu backend: rope1d matches chunked-halves reference (f16)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3485,7 +3485,7 @@ test "cpu backend: conv1d depthwise (NLC) matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3597,7 +3597,7 @@ test "cpu backend: conv1d depthwise reflect padding matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3700,7 +3700,7 @@ test "cpu backend: conv1d reflect padding matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3817,7 +3817,7 @@ test "cpu backend: conv2d reflect padding matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3917,7 +3917,7 @@ test "cpu backend: conv1d pointwise (NLC) matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3968,7 +3968,7 @@ test "cpu backend: reduce axis sum/mean matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{ sum_axis0, mean_axis_neg1 });
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4081,7 +4081,7 @@ test "cpu backend: conv1d general (NLC) supports large c_out" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4191,7 +4191,7 @@ test "cpu backend: conv2d pointwise (NHWC) matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4311,7 +4311,7 @@ test "cpu backend: conv2d depthwise (NHWC) matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4439,7 +4439,7 @@ test "cpu backend: conv2d depthwise reflect padding matches reference" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4562,7 +4562,7 @@ test "cpu backend: conv2d general (NHWC) supports large c_out" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4683,7 +4683,7 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     // In-place alias contract: output tensor id is cache tensor id.
@@ -4755,7 +4755,7 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4817,7 +4817,7 @@ test "cpu backend: kv cache append ring policy wraps time index" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4889,7 +4889,7 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -5133,7 +5133,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -5276,7 +5276,7 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     const out_meta: *const manager_mod.TiledTensor = try sm.getConst(prog.outputs[0]);
@@ -5357,7 +5357,7 @@ test "cpu backend: softmax rank-1 (f16) normalizes without an f16 intermediate" 
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5428,7 +5428,7 @@ test "cpu backend: softmax rank-2 (f16) matches reference per row" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5490,7 +5490,7 @@ test "cpu backend: argmax (f16) picks the same index as f32" {
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5577,7 +5577,7 @@ fn runLSTMCellAsF32(
     defer cpu.deinit();
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
     try cpu.backend().executeProgram(&prog, sm.tensorStore());
 

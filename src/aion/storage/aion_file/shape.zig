@@ -50,6 +50,21 @@ pub fn resolveShapeTermsExprs(
     return out;
 }
 
+/// One dim expression's value. `resolveShapeTermsExprs` resolves a whole shape; an op
+/// attribute resolves axis by axis, because only some of its axes are free.
+pub fn evaluateDimExpr(
+    allocator: std.mem.Allocator,
+    dim_exprs: []const DimExpr,
+    expr_idx: u32,
+    symbol_values: []const ?u64,
+) PackageError!usize {
+    const visiting = allocator.alloc(bool, dim_exprs.len) catch return PackageError.OutOfMemory;
+    defer allocator.free(visiting);
+    @memset(visiting, false);
+    const value = try evaluateExpr(dim_exprs, expr_idx, symbol_values, visiting);
+    return std.math.cast(usize, value) orelse PackageError.InvalidArgument;
+}
+
 fn evaluateShapeTermWithVisiting(
     dim_exprs: []const DimExpr,
     term: ShapeTerm,

@@ -927,7 +927,7 @@ pub const AionBinaryOp = enum(c_int) {
     AION_BINARY_GE = 9,
     // 10 was AION_BINARY_GATE, retired: a gated activation is the unary and the
     // multiply the author writes; fusing them is a compile-time schedule that never
-    // reaches a graph or an `.aion` (see `graph/program/fuse_steps.zig`).
+    // reaches a graph or an `.aion` (see `graph/opt/fuse_steps.zig`).
 };
 
 pub const AionReduceOp = enum(c_int) {
@@ -1925,8 +1925,9 @@ pub export fn aion_builder_compile(
     defer b.alloc().free(refs);
 
     // Symbolic dims are declared on the builder (`symbolicDim`) and read there.
-    const opts: api.ExportModelOptions = .{
-        .metadata = b.metadata.items,
+    // A compile, so no `metadata`: which passes ran and what the file records are
+    // different questions (see `CompileOptions`).
+    const opts: api.CompileOptions = .{
         .output_aliases = b.aliases.items,
         .input_roles = b.roles.items,
     };

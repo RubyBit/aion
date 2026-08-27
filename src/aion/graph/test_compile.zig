@@ -13,7 +13,7 @@ const infer_mod = @import("infer.zig");
 const plan_mod = @import("plan.zig");
 
 test "gpu general and matmul tile caps are independent" {
-    var policy = plan_mod.tilePolicyForTarget(.{ .kind = .webgpu });
+    var policy = plan_mod.tilePolicyForTarget(.webgpu);
     policy.base_square_2d = 32;
     policy.matmul_mn_tile_cap = 512;
     policy.matmul_k_tile_cap = 128;
@@ -75,7 +75,7 @@ test "graph: matmul rejects mismatched non-quant dtypes" {
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, policy));
+    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, .cpu(policy)));
 }
 
 test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
@@ -121,7 +121,7 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, policy));
+    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, .cpu(policy)));
 }
 
 test "graph: attention controls are independent and ambiguous causal defaults are rejected" {
@@ -223,7 +223,7 @@ test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
         .small_tensor_threshold = 1,
         .tile_alignment = 64,
     };
-    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, policy);
+    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
     defer prog.deinit();
 
     // The lowered step must see whole head-dim vectors on both x and out.
@@ -280,7 +280,7 @@ test "placement: a device-written control predicate gets a transfer" {
         const out = try g.addIf(cond, then_r, else_r);
         try g.setOutputs(&.{out});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
+        var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = if (target == .cpu) .cpu else .gpu }, .{ .target_kind = target }));
         defer prog.deinit();
 
         var transfers: usize = 0;
@@ -308,208 +308,4 @@ test "placement: a device-written control predicate gets a transfer" {
 
         try prog.validatePlacements();
     }
-}
-
-
-// `x + rmsnorm(y)` is a SCHEDULE, not a meaning. There is no graph op for it: nobody
-// authors a "residual norm", so `program/fuse_steps.zig` recovers it from the lowered
-// step list for a device target, and leaves the pair alone on CPU where the unfused form
-// is the numerical oracle the fused kernel is checked against
-// (`backend/gpu/test_gpu_backend.zig`). Asserting it here costs no device.
-test "fuse_steps: residual + rmsnorm is one step on device and a pair on cpu" {
-    const allocator = std.testing.allocator;
-
-    for ([_]types.BackendKind{ .webgpu, .cpu }) |target| {
-        var sm = manager_mod.StorageManager.init(allocator);
-        defer sm.deinit();
-
-        var g = graph_mod.Graph.init(allocator);
-        defer g.deinit();
-
-        const M = 2;
-        const N = 8;
-        const res = try g.addInput(.f32, &.{ M, N });
-        try g.bindExternal(res, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
-        const x = try g.addInput(.f32, &.{ M, N });
-        try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
-        const gamma = try g.addInput(.f32, &.{N});
-        try g.bindExternal(gamma, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
-        const beta = try g.addInput(.f32, &.{N});
-        try g.bindExternal(beta, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
-
-        const normed = try g.addRMSNorm(x, gamma, beta, 1e-6, &.{N});
-        const out = try g.addElemwiseBinary(.add, res, normed);
-        try g.setOutputs(&.{out});
-
-        var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
-        defer prog.deinit();
-
-        var norms: usize = 0;
-        var adds: usize = 0;
-        var fused: usize = 0;
-        for (prog.steps) |step| switch (step.op) {
-            // The residual is a field, not a tag, so what distinguishes a fused norm from
-            // a plain one is the operand being there — assert on that, not on a name.
-            .RMSNormTiled => |s| if (s.residual != null) {
-                fused += 1;
-            } else {
-                norms += 1;
-            },
-            .ElemwiseBinaryTiled => adds += 1,
-            else => {},
-        };
-
-        const device = target != .cpu;
-        try std.testing.expectEqual(@as(usize, if (device) 0 else 1), norms);
-        try std.testing.expectEqual(@as(usize, if (device) 0 else 1), adds);
-        try std.testing.expectEqual(@as(usize, if (device) 1 else 0), fused);
-
-        // The pass runs after placement, so the entry for the intermediate it killed has
-        // to be gone too: `materializePlacements` demands backing for everything listed,
-        // while `workspace.plan` releases anything with no remaining use.
-        try prog.validatePlacements();
-        for (prog.tensor_placements) |entry| {
-            try std.testing.expect(try sm.tensorHasBacking(entry.id));
-        }
-    }
-}
-
-
-// The tiering rule applied to a gate: an author writes `act(a) * b` — that is how every
-// SwiGLU/GEGLU in the wild is written — so folding it into one kernel is a SCHEDULE, and
-// schedules never reach the graph or the file. There is no gate op and no gate helper:
-// this peephole is the only thing in the codebase that knows about gates.
-//
-// These asserts ARE the guard against a silent regression: with the fusion at step level
-// a shape it cannot take no longer errors, it just stays a pair, and the bench histogram
-// keys on step tag names so `ElemwiseBinaryTiled` alone cannot tell fused from plain.
-test "fuse_steps: unary + mul becomes one gate step on device, stays a pair on cpu" {
-    const allocator = std.testing.allocator;
-
-    for ([_]types.BackendKind{ .webgpu, .cpu }) |target| {
-        for ([_]types.UnaryOp{ .gelu, .silu, .relu }) |act| {
-            var sm = manager_mod.StorageManager.init(allocator);
-            defer sm.deinit();
-
-            var g = graph_mod.Graph.init(allocator);
-            defer g.deinit();
-
-            const N = 8;
-            const x = try g.addInput(.f32, &.{ 2, N });
-            try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
-            const y = try g.addInput(.f32, &.{ 2, N });
-            try g.bindExternal(y, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
-
-            const out = try g.addElemwiseBinary(.mul, try g.addUnary(act, x), y);
-            try g.setOutputs(&.{out});
-
-            var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = target });
-            defer prog.deinit();
-
-            var unaries: usize = 0;
-            var muls: usize = 0;
-            var gates: usize = 0;
-            for (prog.steps) |step| switch (step.op) {
-                .UnaryTiled => unaries += 1,
-                .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
-                    gates += 1;
-                    // The activation has to survive the rewrite, or every gate would be
-                    // a GEGLU regardless of what the graph asked for.
-                    try std.testing.expectEqual(act, s.act);
-                } else {
-                    muls += 1;
-                },
-                else => {},
-            };
-
-            const device = target != .cpu;
-            try std.testing.expectEqual(@as(usize, if (device) 0 else 1), unaries);
-            try std.testing.expectEqual(@as(usize, if (device) 0 else 1), muls);
-            try std.testing.expectEqual(@as(usize, if (device) 1 else 0), gates);
-            try prog.validatePlacements();
-        }
-    }
-}
-
-// The shape a real gated FFN has: rank-3 [B, L, ffn], authored the way `nn.GatedMLP`
-// authors it. Before the gate moved to step
-// level this was one node and could not be anything else; now it has to actually fuse,
-// and nothing else in the suite would notice if it stopped.
-test "fuse_steps: a rank-3 gated FFN fuses" {
-    const allocator = std.testing.allocator;
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const shape = [_]usize{ 1, 4, 16 };
-    const gate_v = try g.addInput(.f32, &shape);
-    try g.bindExternal(gate_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
-    const up_v = try g.addInput(.f32, &shape);
-    try g.bindExternal(up_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
-
-    const out = try g.addElemwiseBinary(.mul, try g.addUnary(.silu, gate_v), up_v);
-    try g.setOutputs(&.{out});
-
-    var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = .webgpu });
-    defer prog.deinit();
-
-    var unaries: usize = 0;
-    var gates: usize = 0;
-    for (prog.steps) |step| switch (step.op) {
-        .UnaryTiled => unaries += 1,
-        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
-            gates += 1;
-            try std.testing.expectEqual(types.UnaryOp.silu, s.act);
-        },
-        else => {},
-    };
-    try std.testing.expectEqual(@as(usize, 1), gates);
-    try std.testing.expectEqual(@as(usize, 0), unaries);
-}
-
-// The point of moving the gate out of the graph: a dtype the fused kernel does not take
-// is no longer a REJECTED GRAPH, it is an unfused pair that runs. `infer` used to refuse
-// f16 here, which made `nn.GatedMLP` unusable in f16 even though `act(a) * b` is
-// perfectly well defined there and both halves have had f16 kernels all along.
-test "fuse_steps: an f16 gate compiles and runs as an unfused pair" {
-    const allocator = std.testing.allocator;
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const shape = [_]usize{ 2, 8 };
-    const a = try g.addInput(.f16, &shape);
-    try g.bindExternal(a, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
-    const b = try g.addInput(.f16, &shape);
-    try g.bindExternal(b, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
-
-    const out = try g.addElemwiseBinary(.mul, try g.addUnary(.silu, a), b);
-    try g.setOutputs(&.{out});
-
-    var prog = try program.compileGraph(allocator, &g, &sm, .{ .target_kind = .webgpu });
-    defer prog.deinit();
-
-    var unaries: usize = 0;
-    var muls: usize = 0;
-    var gates: usize = 0;
-    for (prog.steps) |step| switch (step.op) {
-        .UnaryTiled => unaries += 1,
-        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
-            gates += 1;
-        } else if (s.op == .mul) {
-            muls += 1;
-        },
-        else => {},
-    };
-    // No f16 gate kernel exists, so `fusableGate` declines and the pair survives —
-    // the graceful degradation a residual add already had against RMSNorm.
-    try std.testing.expectEqual(@as(usize, 0), gates);
-    try std.testing.expectEqual(@as(usize, 1), unaries);
-    try std.testing.expectEqual(@as(usize, 1), muls);
 }

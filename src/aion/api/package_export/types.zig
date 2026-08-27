@@ -3,6 +3,7 @@ const std = @import("std");
 
 const package_file = @import("../../storage/aion_file.zig");
 const manager_mod = @import("../../storage/manager.zig");
+const opt_mod = @import("../../graph/opt.zig");
 const api_builder = @import("../builder.zig");
 
 pub const Builder = api_builder.Builder;
@@ -47,4 +48,18 @@ pub const ExportModelOptions = struct {
     metadata: []const Metadata = &.{},
     output_aliases: []const OutputAlias = &.{},
     input_roles: []const InputRoleDecl = &.{},
+};
+
+/// What `Context.compile`/`compileOn` needs that the graph does not carry.
+///
+/// Deliberately not `ExportModelOptions`: `metadata` is a file concern and `passes` is a
+/// compile concern, and one struct serving both is how the pass set ended up configured
+/// through an export type. Which passes ran must never reach a `.aion` — one file has to
+/// be able to compile to a different schedule per backend.
+pub const CompileOptions = struct {
+    output_aliases: []const OutputAlias = &.{},
+    input_roles: []const InputRoleDecl = &.{},
+    /// Null takes the target's default pass set, which is what production wants; set it
+    /// to bisect a pass or ablate one in a bench.
+    passes: ?opt_mod.Policy = null,
 };

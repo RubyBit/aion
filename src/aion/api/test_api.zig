@@ -1764,7 +1764,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
 
     var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer load_ctx.deinit();
-    var model = try load_ctx.loadModel(file, .{});
+    var model = try load_ctx.loadModel(file, .{ .passes = .initOne(.horizontal_matmul) });
     defer model.deinit();
 
     const xv = try allocator.alloc(f32, M * K);
@@ -3119,7 +3119,7 @@ test "api: export/load keeps q8_0 weights packed (dtype + byte size) and runs" {
     // byte size: q8_0 stays packed (34 B per 32-element block), f32 stays scalar.
     var q8_count: usize = 0;
     var f32_count: usize = 0;
-    for (model.source.package.values, 0..) |value, idx| {
+    for (model.template.values, 0..) |value, idx| {
         if (value.source != .initializer) continue;
         const wt = try model.initializerTensorByValue(@intCast(idx));
         const meta = try load_ctx.store.getConst(wt.tensorId());
@@ -3643,4 +3643,182 @@ test "api: authoring survives compilation" {
         try std.testing.expectApproxEqAbs(@as(f32, 6.0), got[0], 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 8.0), got[1], 1e-6);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two models, one store: a weight one of them fused away
+// ---------------------------------------------------------------------------
+
+/// Two q8_0 projections off one input, summed. `Context.compile` bakes the params as
+/// initializers bound to the caller's tensors, so every model compiled from this builder
+/// shares those tensor ids — and the store's derived table with them.
+const SharedProj = struct {
+    const K: usize = 64;
+    const N: usize = 32;
+    const M: usize = 2;
+
+    ctx: api.Context,
+    bld: api.Builder,
+    out: api.TensorRef,
+    q: api.TensorRef,
+    k: api.TensorRef,
+    /// A second copy of q's original bytes: the swap below overwrites q's own tensor.
+    q_backup: api.Tensor,
+    x: api.Tensor,
+
+    fn init(allocator: std.mem.Allocator) !*SharedProj {
+        const self = try allocator.create(SharedProj);
+        errdefer allocator.destroy(self);
+        self.ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+
+        const qv = try allocator.alloc(f32, K * N);
+        defer allocator.free(qv);
+        for (qv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.1;
+        const kv = try allocator.alloc(f32, K * N);
+        defer allocator.free(kv);
+        for (kv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.1;
+        const q_packed = try packQ8WeightKN(allocator, qv, K, N);
+        defer allocator.free(q_packed);
+        const k_packed = try packQ8WeightKN(allocator, kv, K, N);
+        defer allocator.free(k_packed);
+
+        const wq = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, q_packed);
+        self.q_backup = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, q_packed);
+        const wk = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, k_packed);
+
+        self.bld = api.Builder.init(&self.ctx);
+        const X = try self.bld.name(try self.bld.input(.f32, &[_]usize{ M, K }), "x");
+        const Q = try self.bld.name(try self.bld.param(wq), "q");
+        const Kp = try self.bld.name(try self.bld.param(wk), "k");
+        self.out = try self.bld.add(
+            try self.bld.matmul(X, Q, 1.0, 0.0),
+            try self.bld.matmul(X, Kp, 1.0, 0.0),
+        );
+        self.q = Q;
+        self.k = Kp;
+
+        const xv = try allocator.alloc(f32, M * K);
+        defer allocator.free(xv);
+        for (xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+        self.x = try self.ctx.fromF32(&[_]usize{ M, K }, xv);
+        return self;
+    }
+
+    fn deinit(self: *SharedProj, allocator: std.mem.Allocator) void {
+        self.bld.deinit();
+        self.ctx.deinit();
+        allocator.destroy(self);
+    }
+
+    /// Compile with an explicit pass set, run once, and return the summed output.
+    fn runWith(self: *SharedProj, passes: api.OptPolicy, out: *[M * N]f32) !void {
+        var model = try self.ctx.compile(&self.bld, &[_]api.TensorRef{self.out}, .{ .passes = passes });
+        defer model.deinit();
+        try model.bindInput("x", self.x);
+        try model.run();
+        const t = try model.outputTensorAt(0);
+        try t.read(out);
+    }
+};
+
+// Folding makes the fused weight the canonical store and frees the sources, which is only
+// sound while every program reads the fused weight. A model on the same store that did
+// NOT fuse names the sources directly, so their bytes are materialized back out — the
+// alternative is a program reading released memory.
+test "api: a weight one model fused away is still readable by a model that did not" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const P = SharedProj;
+    const self = try P.init(allocator);
+    defer self.deinit(allocator);
+
+    var reference: [P.M * P.N]f32 = undefined;
+    try self.runWith(.empty, &reference);
+
+    var fused: [P.M * P.N]f32 = undefined;
+    try self.runWith(.initOne(.horizontal_matmul), &fused);
+    try std.testing.expectEqualSlices(f32, &reference, &fused);
+
+    // The fusing model is gone, so nothing reads the fused weight and nothing reads the
+    // sources either — this is exactly when reclaim frees them. A fresh unfused compile
+    // has to get them back.
+    var after: [P.M * P.N]f32 = undefined;
+    try self.runWith(.empty, &after);
+    try std.testing.expectEqualSlices(f32, &reference, &after);
+}
+
+// The reverse order is the one a per-model scan gets wrong: the unfused model is still
+// alive when the fusing one reclaims, and its program still names the sources.
+test "api: reclaim leaves a weight another live model still reads" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const P = SharedProj;
+    const self = try P.init(allocator);
+    defer self.deinit(allocator);
+
+    var plain = try self.ctx.compile(&self.bld, &[_]api.TensorRef{self.out}, .{ .passes = .empty });
+    defer plain.deinit();
+    try plain.bindInput("x", self.x);
+    try plain.run();
+    var reference: [P.M * P.N]f32 = undefined;
+    {
+        const t = try plain.outputTensorAt(0);
+        try t.read(&reference);
+    }
+
+    // Compiling and running a fusing model folds the same weights and triggers reclaim.
+    var fused: [P.M * P.N]f32 = undefined;
+    try self.runWith(.initOne(.horizontal_matmul), &fused);
+    try std.testing.expectEqualSlices(f32, &reference, &fused);
+
+    // `plain` never recompiled: it reads the same weights it was compiled against.
+    try plain.run();
+    var again: [P.M * P.N]f32 = undefined;
+    {
+        const t = try plain.outputTensorAt(0);
+        try t.read(&again);
+    }
+    try std.testing.expectEqualSlices(f32, &reference, &again);
+}
+
+// A parameter is addressed by its graph value on both paths now, so the weight-swap API
+// is no longer package-only: an in-process compiled model gets it too, and the swap
+// reaches programs that were already compiled.
+test "api: a compiled model's weights can be swapped in place" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const P = SharedProj;
+    const self = try P.init(allocator);
+    defer self.deinit(allocator);
+
+    var model = try self.ctx.compile(&self.bld, &[_]api.TensorRef{self.out}, .{});
+    defer model.deinit();
+    try model.bindInput("x", self.x);
+
+    var reference: [P.M * P.N]f32 = undefined;
+    try model.run();
+    {
+        const t = try model.outputTensorAt(0);
+        try t.read(&reference);
+    }
+
+    // Point "q" at k's weight. Same layout, so this is a byte copy into q's tensor.
+    const k_tensor = try model.initializerTensorByValue(self.k.value);
+    try model.overwriteInitializerByValue(self.q.value, k_tensor);
+
+    var swapped: [P.M * P.N]f32 = undefined;
+    try model.run();
+    {
+        const t = try model.outputTensorAt(0);
+        try t.read(&swapped);
+    }
+    // Observable: q contributed something, and it is gone.
+    try std.testing.expect(!std.mem.eql(f32, &reference, &swapped));
+
+    // Swapping back restores it, with no recompile in between.
+    try model.overwriteInitializerByValue(self.q.value, self.q_backup);
+    var restored: [P.M * P.N]f32 = undefined;
+    try model.run();
+    {
+        const t = try model.outputTensorAt(0);
+        try t.read(&restored);
+    }
+    try std.testing.expectEqualSlices(f32, &reference, &restored);
 }

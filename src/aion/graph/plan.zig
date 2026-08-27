@@ -9,17 +9,6 @@ pub const DType = types.DType;
 pub const BackendKind = types.BackendKind;
 pub const BackendCaps = types.BackendCaps;
 
-/// Describes the backend a graph is being compiled for. Today only `.cpu` is
-/// realized; this is the seam through which a GPU backend selects a different
-/// `TilePolicy` (see `TilePolicy.forTarget`) without the lowering pipeline
-/// changing. The compiled `TilePolicy` carries `target_kind`, so `lowerNode`
-/// can branch per-target later via the policy it already receives — no extra
-/// parameter threading required.
-pub const CompileTarget = struct {
-    kind: BackendKind = .cpu,
-    caps: BackendCaps = .{},
-};
-
 pub const TilePolicy = struct {
     /// Backend this policy was derived for. Defaults to `.cpu` so a bare
     /// `TilePolicy{}` is unchanged from before this field existed.
@@ -146,15 +135,17 @@ const GPU_MATMUL_QUANT_TILE_CAP: usize = 16384;
 /// defaults; GPU targets get large base tile sizes so typical tensors land in a
 /// single tile (few, large dispatches). The matmul choosers additionally branch
 /// on `target_kind` (see `chooseMatMulTiles`/`chooseMatMulTk`).
-pub fn tilePolicyForTarget(target: CompileTarget) TilePolicy {
-    return switch (target.kind) {
-        .cpu => .{ .target_kind = target.kind },
+/// The tiling a backend wants. The compiled `TilePolicy` carries `target_kind`, so
+/// `lowerNode` branches per target through the policy it already receives.
+pub fn tilePolicyForTarget(kind: BackendKind) TilePolicy {
+    return switch (kind) {
+        .cpu => .{ .target_kind = kind },
         // GPU kernels stage scratch in shared/global memory and tolerate much
         // larger tiles than the CPU's cache-blocked kernels. Large bases push most
         // tensors to a single tile; the per-row/attention caps stay at their
         // defaults for now (matmul + elementwise are the realized GPU paths).
         .cuda, .metal, .vulkan, .webgpu => .{
-            .target_kind = target.kind,
+            .target_kind = kind,
             .base_square_2d = GPU_GENERAL_TILE_CAP,
             .matmul_mn_tile_cap = GPU_MATMUL_MN_TILE_CAP,
             .matmul_k_tile_cap = GPU_MATMUL_K_TILE_CAP,

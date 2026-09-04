@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any, NewType, TypeAlias
 
 from ..enums import AionDType, AionOp
+from ..types import AttentionWindow
 from ._raw import ffi, lib
 from .handles import (
     BuilderHandle,
@@ -125,11 +126,16 @@ class SliceAttrs:
     lens: ViewDims
 
 
+def _set_window(member, w: AttentionWindow) -> None:
+    member.left = int(w.left)
+    member.right = int(w.right)
+    member.chunk = int(w.chunk)
+
+
 @dataclass(frozen=True)
 class AttentionAttrs:
     scale: float
-    causal: bool
-    sliding_window: int = 0
+    window: AttentionWindow = AttentionWindow.CAUSAL
     attn_logits_soft_cap: float = 0.0
     has_query_positions: bool = False
     has_kv_lengths: bool = False
@@ -139,12 +145,9 @@ class AttentionAttrs:
 class RelposMhaAttrs:
     #: No head count: it is q's dim 2 (q is ``[B, T, heads, head_dim]``).
     scale: float
-    #: Chunked-limited attention window (NeMo ``chunked_limited``). 0 = every key.
-    #: A query attends to its own chunk of ``chunk_size`` keys plus ``chunk_left``
-    #: keys before that chunk's start — structural, so it replaces an additive
-    #: ``[T_q, T_kv]`` mask and lets the kernels skip out-of-window keys.
-    chunk_size: int = 0
-    chunk_left: int = 0
+    window: AttentionWindow = AttentionWindow.FULL
+    relative_zero_index: int = 0
+    attn_logits_soft_cap: float = 0.0
 
 
 OpAttrs: TypeAlias = (
@@ -491,8 +494,7 @@ def emit_op(
             raise TypeError(f"AttentionAttrs are not valid for {op.name}")
         member = spec.attr.attention
         member.scale = float(attrs.scale)
-        member.causal = 1 if attrs.causal else 0
-        member.sliding_window = int(attrs.sliding_window)
+        _set_window(member.window, attrs.window)
         member.attn_logits_soft_cap = float(attrs.attn_logits_soft_cap)
         member.has_query_positions = 1 if attrs.has_query_positions else 0
         member.has_kv_lengths = 1 if attrs.has_kv_lengths else 0
@@ -501,8 +503,9 @@ def emit_op(
         spec.attr.gather.batch_dims = int(attrs.batch_dims)
     elif isinstance(attrs, RelposMhaAttrs):
         spec.attr.relpos_mha.scale = float(attrs.scale)
-        spec.attr.relpos_mha.chunk_size = int(attrs.chunk_size)
-        spec.attr.relpos_mha.chunk_left = int(attrs.chunk_left)
+        _set_window(spec.attr.relpos_mha.window, attrs.window)
+        spec.attr.relpos_mha.relative_zero_index = int(attrs.relative_zero_index)
+        spec.attr.relpos_mha.attn_logits_soft_cap = float(attrs.attn_logits_soft_cap)
 
     out = ffi.new("AionValueId*")
     status = lib.aion_builder_op(builder.raw, spec, out)
@@ -657,6 +660,7 @@ def export_builder(
 
 __all__ = [
     "AttentionAttrs",
+    "AttentionWindow",
     "AxisAttrs",
     "CastAttrs",
     "Conv1DAttrs",

@@ -10,12 +10,13 @@ pub const UnaryOp = backend_types.UnaryOp;
 pub const ReduceOp = backend_types.ReduceOp;
 pub const PadMode = backend_types.PadMode;
 pub const ValueId = graph_mod.ValueId;
+pub const AttentionWindow = graph_mod.AttentionWindow;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-/// v10: RelPosMHA attrs dropped the redundant `heads` (it is q's dim 2) and gained
-/// the chunked-limited window (`chunk_size`/`chunk_left`). Parsing requires an exact
-/// match, so every `.aion` must be re-converted.
-pub const current_version: u32 = 10;
+/// v12: Attention and RelPosMHA share one `AttentionWindow` (left/right/chunk) in
+/// place of `causal`/`sliding_window` and `window_kind`/`chunk_size`. Parsing
+/// requires an exact match, so every `.aion` must be re-converted.
+pub const current_version: u32 = 12;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -540,7 +541,6 @@ pub fn nodeExtraOutputs(node: NodeRecord) []const u32 {
     return node.extra_outputs;
 }
 
-
 fn validateNodeRefs(pkg: *const Package, node: NodeRecord, producer_counts: *[]u8, available: []const bool) PackageError!void {
     if (node.output >= pkg.values.len) return PackageError.InvalidFormat;
     if (pkg.values[node.output].source != .produced) return PackageError.InvalidFormat;
@@ -570,7 +570,7 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
         },
         .RelPosMHA => |attn| {
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
-            if (attn.chunk_size == 0 and attn.chunk_left != 0) return PackageError.InvalidFormat;
+            if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0) return PackageError.InvalidFormat;
         },
         .Attention => |attn| {
             const expected_inputs: usize = 3 +
@@ -579,7 +579,6 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
             if (node.inputs.len != expected_inputs) return PackageError.InvalidFormat;
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return PackageError.InvalidFormat;
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return PackageError.InvalidFormat;
-            if (attn.sliding_window > 0 and !attn.causal) return PackageError.InvalidFormat;
         },
         .STFT => |st| if (st.n_fft < 4 or (st.n_fft & (st.n_fft - 1)) != 0 or st.hop_length == 0) return PackageError.InvalidFormat,
         .If => |iff| {

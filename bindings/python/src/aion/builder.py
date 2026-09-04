@@ -91,7 +91,7 @@ from .enums import (
     AionUnaryOp,
 )
 from .tensor import Tensor
-from .types import ArrayLike, DTypeLike, NDArray, Shape
+from .types import ArrayLike, AttentionWindow, DTypeLike, NDArray, Shape
 
 if TYPE_CHECKING:
     from .model import LoadedModel
@@ -789,11 +789,11 @@ class Builder:
         This is how a fused projection is split back into its parts (QKV,
         gate/up), which otherwise means spelling out full starts/lens per call.
         """
-        shape = a.shape
-        if not shape:
+        dims = a.dims
+        if not dims:
             raise ValueError("slice_last_dim needs a ranked value")
-        starts = [0] * len(shape)
-        lens = list(shape)
+        starts = [0] * len(dims)
+        lens = list(dims)
         starts[-1] = int(start)
         lens[-1] = int(length)
         return self.slice(a, starts, lens)
@@ -802,7 +802,7 @@ class Builder:
     def attention(self, q: TensorRef, k: TensorRef, v: TensorRef, *,
                   query_positions: Optional[TensorRef] = None,
                   kv_lengths: Optional[TensorRef] = None, scale: float,
-                  causal: bool = True, sliding_window: int = 0,
+                  window: AttentionWindow = AttentionWindow.CAUSAL,
                   attn_logits_soft_cap: float = 0.0) -> TensorRef:
         """Grouped-query attention in canonical time-major layout.
 
@@ -820,26 +820,26 @@ class Builder:
             AionOp.AION_OP_ATTENTION,
             tuple(inputs),
             AttentionAttrs(
-                scale, causal, sliding_window, attn_logits_soft_cap,
+                scale, window, attn_logits_soft_cap,
                 query_positions is not None, kv_lengths is not None,
             ),
         )
 
     def relpos_mha(self, q: TensorRef, k: TensorRef, v: TensorRef, pos_emb: TensorRef, bu: TensorRef, bv: TensorRef,
                    mask: Optional[TensorRef] = None, *, scale: float,
-                   chunk_size: int = 0, chunk_left: int = 0) -> TensorRef:
+                   window: AttentionWindow = AttentionWindow.FULL,
+                   relative_zero_index: int = 0,
+                   attn_logits_soft_cap: float = 0.0) -> TensorRef:
         """Relative-position MHA. The head count is `q`'s dim 2 — never passed.
-        `chunk_size`/`chunk_left` express chunked-limited attention structurally:
-        prefer them over baking the same pattern into `mask`, which costs a
-        [T_q, T_kv] tensor and forces every key to be scored."""
+        `window` is structural, so the kernels skip keys outside it; keep `mask` for
+        what an interval cannot express, such as streaming padding."""
         inputs: list[TensorRef] = [q, k, v, pos_emb, bu, bv]
         if mask is not None:
             inputs.append(mask)
-
         return self._emit(
             AionOp.AION_OP_RELPOS_MHA,
             inputs,
-            RelposMhaAttrs(scale, chunk_size, chunk_left),
+            RelposMhaAttrs(scale, window, relative_zero_index, attn_logits_soft_cap),
         )
 
     # --- recurrent / indexed / misc ---------------------------------------

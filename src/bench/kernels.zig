@@ -451,7 +451,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const q = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ 1, KA.AT_T, 1, KA.AT_D }, 21);
             const k = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 22);
             const v = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 23);
-            break :blk try g.addAttention(q, k, v, null, null, 0.125, true, 0, 0.0);
+            break :blk try g.addAttention(q, k, v, null, null, 0.125, .causal, 0.0);
         },
         .mha_cached => blk: {
             // Decode: one query row (L_q = 1) against a long GQA cache. The 8
@@ -462,7 +462,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
             const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
             const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
-            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, true, 0, 0.0);
+            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, .causal, 0.0);
         },
         .mha_window => blk: {
             // Gemma-4 local layer at decode: same cache as `mha_cached`, but with
@@ -472,7 +472,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
             const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
             const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
-            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, true, KA.MC_WIN, KA.MC_SOFT_CAP);
+            break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, .sliding(KA.MC_WIN - 1, 0), KA.MC_SOFT_CAP);
         },
         .relpos => blk: {
             const t = KA.RP_T;
@@ -482,7 +482,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
             const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
             const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
-            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, 0, 0);
+            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, .full, t - 1, 0);
         },
         .relpos_chunked => blk: {
             const t = KA.RP_T;
@@ -492,7 +492,7 @@ pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: p
             const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
             const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
             const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
-            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, KA.RP_CHUNK, KA.RP_LEFT);
+            break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, .chunked(KA.RP_CHUNK, KA.RP_LEFT), t - 1, 0);
         },
         .conv1d => blk: {
             const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.C1_C }, &.{ 1, KA.C1_L, KA.C1_C }, 33);

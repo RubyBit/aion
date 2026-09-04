@@ -2,6 +2,7 @@
 const std = @import("std");
 
 const api = @import("api/api.zig");
+const graph_mod = @import("graph/graph.zig");
 const types = @import("backend/types.zig");
 const pkg_types = @import("storage/aion_file/types.zig");
 
@@ -986,6 +987,20 @@ pub const AionOp = enum(c_int) {
     AION_OP_IOTA = 30,
 };
 
+/// Keys a query may attend to; `AION_ATTENTION_UNBOUNDED` on a side means no limit.
+/// `chunk > 0` anchors the interval at the query's chunk start.
+pub const AionAttentionWindow = extern struct {
+    left: u32 = unbounded,
+    right: u32 = unbounded,
+    chunk: u32 = 0,
+
+    pub const unbounded: u32 = std.math.maxInt(u32);
+};
+
+fn cWindow(w: AionAttentionWindow) graph_mod.AttentionWindow {
+    return .{ .left = w.left, .right = w.right, .chunk = w.chunk };
+}
+
 /// Per-op attributes. Only the member matching `AionOpSpec.op` is read.
 pub const AionOpAttr = extern union {
     matmul: extern struct { alpha: f32, beta: f32 },
@@ -995,13 +1010,12 @@ pub const AionOpAttr = extern union {
     norm: extern struct { eps: f32, normalized_shape: [*c]const usize, normalized_shape_len: usize },
     attention: extern struct {
         scale: f32,
-        causal: u8,
-        sliding_window: usize,
+        window: AionAttentionWindow,
         attn_logits_soft_cap: f32,
         has_query_positions: u8,
         has_kv_lengths: u8,
     },
-    relpos_mha: extern struct { scale: f32, chunk_size: usize = 0, chunk_left: usize = 0 },
+    relpos_mha: extern struct { scale: f32, window: AionAttentionWindow = .{}, relative_zero_index: usize = 0, attn_logits_soft_cap: f32 = 0 },
     conv1d: extern struct {
         stride: usize,
         dilation: usize,
@@ -1527,8 +1541,7 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
                 query_positions,
                 kv_lengths,
                 a.scale,
-                a.causal != 0,
-                a.sliding_window,
+                cWindow(a.window),
                 a.attn_logits_soft_cap,
             );
         },
@@ -1544,10 +1557,9 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
                 in(spec, 5),
                 mask,
                 spec.attr.relpos_mha.scale,
-                .{
-                    .size = spec.attr.relpos_mha.chunk_size,
-                    .left = spec.attr.relpos_mha.chunk_left,
-                },
+                cWindow(spec.attr.relpos_mha.window),
+                spec.attr.relpos_mha.relative_zero_index,
+                spec.attr.relpos_mha.attn_logits_soft_cap,
             );
         },
         .AION_OP_CONV1D => blk: {

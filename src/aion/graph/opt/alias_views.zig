@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Elide view steps that copy between byte-identical layouts.
-//!
-//! A `Reshape`/`ReTile` exists because two graph values are two tensors. When the two
-//! tensors occupy the same bytes in the same arrangement — which a reshape between
-//! `[1,1,8,256]` and `[1,1,2048]` does, and a retile does whenever the tile extents
-//! merely clamp to the same shape — the step copies a buffer onto an identical one.
-//!
-//! Measured on a Gemma-4 E2B step: 136 of 172 view steps were such copies, and a step on
-//! the serial residual path costs ~10-20 us of critical path no matter how little it
-//! does (a 6 KB scalar multiply measured the same as a 6.4 MiB GEMV).
-//!
-//! The fix is NOT to rewrite consumers to read the source id: consumers take logical
-//! shape from tensor metadata, and the two disagree there by construction. The
-//! destination keeps its metadata and BORROWS the source's bytes, so this pass only
-//! deletes steps and records pairs; `workspace.plan` aliases once slots are known.
+//! Elide reshape/retile copies between byte-identical layouts while preserving distinct
+//! destination metadata and aliasing its backing during workspace planning.
 
 const std = @import("std");
 
@@ -32,15 +19,8 @@ pub const Error = editor_mod.Error;
 /// destination -> source. The destination borrows the source's backing.
 pub const AliasMap = std.AutoHashMap(TensorId, TensorId);
 
-/// True when two tensors occupy the same bytes in the same arrangement.
-///
-/// Per-tile lengths AND offsets must match one-for-one: on the device each tile is its
-/// own buffer, so equal tiling means a tile-for-tile duplicate, and on the host the
-/// offsets are what make the single allocation identical.
-///
-/// Equal offsets are NOT enough on their own, because tiles are stored tile-major: both
-/// tilings must also lay their bytes out in flat row-major order (see `rowMajorChunked`),
-/// or the two tensors agree on every tile boundary while ordering values differently.
+/// Whether tensors have matching tile lengths/offsets and flat row-major byte order.
+/// Offsets alone are insufficient because tile-major layouts can reorder values.
 pub fn layoutsIdentical(mgr: *const StorageManager, a_id: TensorId, b_id: TensorId) bool {
     const a = mgr.getConst(a_id) catch return false;
     const b = mgr.getConst(b_id) catch return false;
@@ -52,13 +32,8 @@ pub fn layoutsIdentical(mgr: *const StorageManager, a_id: TensorId, b_id: Tensor
     return rowMajorChunked(a) and rowMajorChunked(b);
 }
 
-/// True when a tensor's bytes run in flat row-major order.
-///
-/// Each tile is a contiguous run holding its own elements row-major, and tiles follow
-/// tile-coordinate order — so a tiling preserves the flat order only if it CHUNKS it:
-/// every axis before the last split one must contribute a single element per tile. On
-/// `[4,4]`, `{2,4}` chunks the flat order and `{4,2}` interleaves it, while both produce
-/// two 32-byte tiles at the same offsets.
+/// Whether tile-coordinate order preserves flat row-major order.
+/// Every axis before the last split axis must contribute one element per tile.
 fn rowMajorChunked(t: *const TiledTensor) bool {
     var split: usize = t.rank;
     while (split > 0) {
@@ -80,10 +55,8 @@ fn viewPair(step: *const PlacedStep) ?struct { src: TensorId, dst: TensorId } {
     };
 }
 
-/// Kill every eligible no-op view step in the edited list, recording the
-/// destination->source pairs into `map`. The caller commits the editor and owns the map,
-/// which spans every list: the pairs are about backings, not step order, so a chain may
-/// cross a control-flow boundary even though a match may not.
+/// Remove eligible view copies and record destination-to-source backing aliases.
+/// The alias map spans lists, though each match remains list-local.
 pub fn elide(ed: *Editor, map: *AliasMap) Error!void {
     for (ed.steps, 0..) |*step, i| {
         const pair = viewPair(step) orelse continue;
@@ -123,10 +96,8 @@ fn eligible(ed: *const Editor, map: *const AliasMap, src: TensorId, dst: TensorI
     // new value instead of the copied one.
     if (su.writes > 0 and su.last_write > step_index) return false;
 
-    // No later step may bind BOTH as operands: sharing a backing between two operands of
-    // one dispatch is what `workspace.validateAliases` refuses (and what wgpu reports as
-    // conflicting buffer usages), so `add(x, reshape(x))` must keep its copy. Only steps
-    // after the copy can see the destination.
+    // Keep the copy if a later dispatch binds both ids: sharing one backing across two
+    // operands conflicts with workspace and wgpu binding rules.
     var j: usize = step_index + 1;
     while (j < ed.steps.len) : (j += 1) {
         const walk = executable.tensorUses(&ed.steps[j].op);

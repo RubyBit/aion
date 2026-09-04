@@ -633,8 +633,9 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
 
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
             if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0.0) return InferError.InvalidGraph;
-            if (attn.sliding_window > 0 and !attn.causal) return InferError.InvalidGraph;
-            if (attn.causal and query_positions == null and l_q != t_k) return InferError.ShapeMismatch;
+            // A bounded window is measured in absolute positions, so row indices
+            // only stand in for them when the query and key runs line up.
+            if (!attn.window.isFull() and query_positions == null and l_q != t_k) return InferError.ShapeMismatch;
 
             const out_shape: []usize = graph.arenaAlloc().alloc(usize, 4) catch return InferError.InvalidGraph;
             out_shape[0] = bsz;
@@ -1153,8 +1154,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (pos_emb.dtype.? != .f32 or bu.dtype.? != .f32 or bv.dtype.? != .f32) return InferError.DTypeMismatch;
 
             if (!(attn.scale > 0.0) or !std.math.isFinite(attn.scale)) return InferError.InvalidGraph;
-            // `chunk_left` without `chunk_size` would be silently ignored.
-            if (attn.chunk_size == 0 and attn.chunk_left != 0) return InferError.InvalidGraph;
+            if (!std.math.isFinite(attn.attn_logits_soft_cap) or attn.attn_logits_soft_cap < 0) return InferError.InvalidGraph;
 
             // Layout [B, T*, H, D]; pos_emb [H, P, D]; biases [H, D].
             const B: usize = q.shape[0];
@@ -1170,7 +1170,7 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (pos_emb.shape[0] != H or pos_emb.shape[2] != D) return InferError.ShapeMismatch;
             if (bu.shape[0] != H or bu.shape[1] != D) return InferError.ShapeMismatch;
             if (bv.shape[0] != H or bv.shape[1] != D) return InferError.ShapeMismatch;
-            if (T_kv == 0 or P != 2 * T_kv - 1) return InferError.ShapeMismatch;
+            if (T_kv == 0 or P == 0 or attn.relative_zero_index >= P) return InferError.ShapeMismatch;
             if (T_q > T_kv) return InferError.ShapeMismatch;
 
             if (attn.has_mask) {

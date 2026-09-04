@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const types = @import("types.zig");
+const graph_mod = @import("../../graph/graph.zig");
 
 const DType = types.DType;
 const ElemwiseBinaryOp = types.ElemwiseBinaryOp;
@@ -496,7 +497,6 @@ fn parseRegionsSection(allocator: std.mem.Allocator, bytes: []const u8) PackageE
     return out;
 }
 
-
 /// One node's attribute blob. A Loop's extra outputs are stored in it, but they belong to
 /// the NODE (`graph.Node.extra_outputs`), so they come back alongside the op.
 const ParsedOp = struct { op: NodeOp, extra_outputs: []const u32 = &.{} };
@@ -563,16 +563,14 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         },
         .Attention => blk: {
             const scale = try readIntCursor(bytes, &cursor, f32);
-            const causal = (try readIntCursor(bytes, &cursor, u8)) != 0;
-            const sliding_window = try readSizeCursor(bytes, &cursor);
+            const window = try readWindow(bytes, &cursor);
             const soft_cap = try readIntCursor(bytes, &cursor, f32);
             // The file packs the two optional control operands into one byte.
             const controls = try readIntCursor(bytes, &cursor, u8);
             if ((controls & ~@as(u8, 0x3)) != 0) return PackageError.InvalidFormat;
             break :blk .{ .Attention = .{
                 .scale = scale,
-                .causal = causal,
-                .sliding_window = sliding_window,
+                .window = window,
                 .attn_logits_soft_cap = soft_cap,
                 .has_query_positions = (controls & 1) != 0,
                 .has_kv_lengths = (controls & 2) != 0,
@@ -593,8 +591,9 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         .RelPosMHA => .{ .RelPosMHA = .{
             .scale = try readIntCursor(bytes, &cursor, f32),
             .has_mask = (try readIntCursor(bytes, &cursor, u8)) != 0,
-            .chunk_size = try readSizeCursor(bytes, &cursor),
-            .chunk_left = try readSizeCursor(bytes, &cursor),
+            .window = try readWindow(bytes, &cursor),
+            .relative_zero_index = try readSizeCursor(bytes, &cursor),
+            .attn_logits_soft_cap = try readIntCursor(bytes, &cursor, f32),
         } },
         .ArgMax => .{ .ArgMax = .{ .axis = try readIntCursor(bytes, &cursor, i32) } },
         .ScatterRow => .ScatterRow,
@@ -816,7 +815,6 @@ fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
     allocator.free(symbols);
 }
 
-
 /// An op's shape attribute, read as the (sizes, symbols) pair `graph.Op` carries.
 ///
 /// The file stores each axis as a `ShapeTerm`: a constant, or an expression index for a
@@ -855,6 +853,14 @@ fn readSymbolicAttr(allocator: std.mem.Allocator, bytes: []const u8, cursor: *us
 }
 
 /// A size stored as u64 and held as `usize`, which is what the graph's ops use.
+fn readWindow(bytes: []const u8, cursor: *usize) PackageError!graph_mod.AttentionWindow {
+    return .{
+        .left = try readIntCursor(bytes, cursor, u32),
+        .right = try readIntCursor(bytes, cursor, u32),
+        .chunk = try readIntCursor(bytes, cursor, u32),
+    };
+}
+
 fn readSizeCursor(bytes: []const u8, cursor: *usize) PackageError!usize {
     return std.math.cast(usize, try readIntCursor(bytes, cursor, u64)) orelse PackageError.InvalidFormat;
 }
@@ -866,7 +872,6 @@ fn readSizeArray(allocator: std.mem.Allocator, bytes: []const u8, cursor: *usize
     for (out) |*value| value.* = try readSizeCursor(bytes, cursor);
     return out;
 }
-
 
 fn readShapeTerm(bytes: []const u8, cursor: *usize) PackageError!ShapeTerm {
     const kind = try readIntCursor(bytes, cursor, u8);

@@ -1,20 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//
-//! Per-tensor facts about a lowered step list, shared by the step-level passes.
-//!
-//! Two passes run between placement and workspace planning — `alias_views` and
-//! `fuse_steps` — and both need the same question answered for a tensor id: who writes
-//! it, who reads it, and when. Both also need the same hazard boundary.
-//!
-//! That boundary is the step LIST. A program has several: the top-level schedule and one
-//! per control-flow body. Step indices are comparable only inside one of them, because a
-//! body replays and can capture outer values, so a rule editing one list may only reason
-//! by index about tensors confined to it — which is what `Use.list` records. A tensor
-//! more than one list touches has no list, and every rule declines it.
-//!
-//! Deciding this at the STEP level rather than the value level is deliberate. The one
-//! previous attempt at workspace aliasing in this repo was reverted because it reasoned
-//! about graph values while the hazards live in the emitted schedule.
+//! Per-tensor read/write facts; indices are local to one schedule or control-flow body.
+//! Tensors touched by multiple lists are unconfined and excluded from local rewrites.
 
 const std = @import("std");
 const executable = @import("../../runtime/executable.zig");
@@ -47,10 +33,8 @@ pub const Use = struct {
     first_touch: usize = std.math.maxInt(usize),
     last_touch: usize = 0,
     last_write: usize = 0,
-    /// The one list that touches this tensor, or null when several do. The counts and
-    /// indices above describe that list only, and stop being maintained the moment a
-    /// second list is seen — a rule reads `list` first and declines, so they are never
-    /// consulted for a tensor that has none.
+    /// The sole list touching this tensor, or null for multiple lists.
+    /// Counts and indices are meaningful only when this is non-null.
     list: ?List = null,
 };
 

@@ -395,6 +395,15 @@ typedef enum AionOp {
     AION_OP_IOTA = 30,
 } AionOp;
 
+// Keys a query may attend to. AION_ATTENTION_UNBOUNDED on a side means no limit;
+// chunk > 0 anchors the interval at the query's chunk start instead of the query.
+#define AION_ATTENTION_UNBOUNDED 0xFFFFFFFFu
+typedef struct AionAttentionWindow {
+    uint32_t left;
+    uint32_t right;
+    uint32_t chunk;
+} AionAttentionWindow;
+
 // Per-op attributes. Only the member matching AionOpSpec.op is read.
 typedef union AionOpAttr {
     struct { float alpha; float beta; } matmul;
@@ -404,19 +413,13 @@ typedef union AionOpAttr {
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;
     struct {
         float scale;
-        uint8_t causal;
-        size_t sliding_window;
+        AionAttentionWindow window;
         float attn_logits_soft_cap;
         uint8_t has_query_positions;
         uint8_t has_kv_lengths;
     } attention;
     // The head count is q's dim 2 (q is [B, T, heads, D]) — never passed separately.
-    //
-    // chunk_size = 0 means attend to every key; otherwise a query attends to its
-    // own chunk of `chunk_size` keys plus `chunk_left` keys before that chunk's
-    // start (NeMo "chunked_limited"). Structural, so it replaces an additive
-    // [T_q, T_kv] mask and lets the kernels skip out-of-window keys.
-    struct { float scale; size_t chunk_size; size_t chunk_left; } relpos_mha;
+    struct { float scale; AionAttentionWindow window; size_t relative_zero_index; float attn_logits_soft_cap; } relpos_mha;
     struct { size_t stride; size_t dilation; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv1d;
     struct { size_t stride_h; size_t stride_w; size_t dilation_h; size_t dilation_w; size_t pad_top; size_t pad_bottom; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv2d;
     struct { float base_frequency; float scale_factor; float rope_proportion; } rope1d;

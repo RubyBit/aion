@@ -91,6 +91,7 @@ pub const Builder = struct {
     /// Includes `InferError` because ops infer their output shape eagerly as they
     /// are added, so a shape/dtype error surfaces at the offending op call.
     pub const Error = graph_mod.GraphError || infer_mod.InferError;
+    pub const AttentionWindow = graph_mod.AttentionWindow;
 
     /// Where a bound parameter came from.
     pub const ParamKind = enum {
@@ -257,8 +258,11 @@ pub const Builder = struct {
             };
             // Only a name some input axis already declared: a view cannot introduce a free
             // dim out of nothing, because nothing would bind it at run time.
-            dst[axis] = self.symbolIndex(sym_name) orelse return Error.InvalidArgument;
-            try self.setValueDimSymbol(out, axis, sym_name);
+            const sym_idx = self.symbolIndex(sym_name) orelse return Error.InvalidArgument;
+            dst[axis] = sym_idx;
+            // `names` may come from a language binding's temporary C buffers.
+            // Always attach the graph-owned interned spelling to the value.
+            try self.setValueDimSymbol(out, axis, self.symbol_names.items[sym_idx]);
         }
     }
 
@@ -678,8 +682,7 @@ pub const Builder = struct {
         query_positions: ?TensorRef,
         kv_lengths: ?TensorRef,
         scale: f32,
-        causal: bool,
-        sliding_window: usize,
+        window: AttentionWindow,
         attn_logits_soft_cap: f32,
     ) Error!TensorRef {
         const out: ValueId = try self.graph.addAttention(
@@ -689,8 +692,7 @@ pub const Builder = struct {
             if (query_positions) |x| x.value else null,
             if (kv_lengths) |x| x.value else null,
             scale,
-            causal,
-            sliding_window,
+            window,
             attn_logits_soft_cap,
         );
         try self.autoNameIfUnnamed(out, "attention");
@@ -1141,13 +1143,6 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
-    /// Chunked-limited attention window: a query attends to its own chunk of
-    /// `size` keys plus `left` keys before that chunk's start. `size = 0` (the
-    /// default) means every key. Prefer this over an additive mask — it is two
-    /// integers instead of a [T_q, T_kv] tensor, and it lets the kernels skip the
-    /// keys outside the window instead of scoring and then discarding them.
-    pub const ChunkWindow = struct { size: usize = 0, left: usize = 0 };
-
     /// Relative-position multi-head self-attention (Transformer-XL / Conformer).
     /// `mask` is optional and composes with `window` (use it only for what an
     /// interval cannot express, e.g. streaming padding). The head count comes from
@@ -1162,7 +1157,9 @@ pub const Builder = struct {
         pos_bias_v: TensorRef,
         mask: ?TensorRef,
         scale: f32,
-        window: ChunkWindow,
+        window: AttentionWindow,
+        relative_zero_index: usize,
+        attn_logits_soft_cap: f32,
     ) Error!TensorRef {
         const out: ValueId = try self.graph.addRelPosMHA(
             q.value,
@@ -1173,8 +1170,9 @@ pub const Builder = struct {
             pos_bias_v.value,
             if (mask) |m| m.value else null,
             scale,
-            window.size,
-            window.left,
+            window,
+            relative_zero_index,
+            attn_logits_soft_cap,
         );
         try self.autoNameIfUnnamed(out, "relpos_mha");
         return .{ .value = out };

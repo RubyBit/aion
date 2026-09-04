@@ -137,8 +137,8 @@ fn encodeInitializersSection(allocator: std.mem.Allocator, interner: *const Stri
         switch (init.encoding) {
             .plain => |dtype| {
                 try appendInt(&out, allocator, u8, 0);
-                try appendInt(&out, allocator, u8, @intFromEnum(dtype));
-                try appendInt(&out, allocator, u8, @intFromEnum(dtype));
+                try appendInt(&out, allocator, u8, @backingInt(dtype));
+                try appendInt(&out, allocator, u8, @backingInt(dtype));
                 try appendInt(&out, allocator, u8, 0);
                 try appendInt(&out, allocator, u32, invalid_index);
                 try appendInt(&out, allocator, u32, @intCast(dtype.info().block_elems));
@@ -151,7 +151,7 @@ fn encodeInitializersSection(allocator: std.mem.Allocator, interner: *const Stri
             .quantized => |q| {
                 try appendInt(&out, allocator, u8, 1);
                 try appendInt(&out, allocator, u8, 0);
-                try appendInt(&out, allocator, u8, @intFromEnum(q.logical_dtype));
+                try appendInt(&out, allocator, u8, @backingInt(q.logical_dtype));
                 try appendInt(&out, allocator, u8, 0);
                 try appendInt(&out, allocator, u32, interner.get(q.scheme).?);
                 try appendInt(&out, allocator, u32, q.block_elems);
@@ -172,9 +172,9 @@ fn encodeValuesSection(allocator: std.mem.Allocator, values: []const ValueRecord
     errdefer out.deinit(allocator);
     try appendInt(&out, allocator, u32, @intCast(values.len));
     for (values) |value| {
-        try appendInt(&out, allocator, u8, @intFromEnum(value.dtype));
+        try appendInt(&out, allocator, u8, @backingInt(value.dtype));
         try appendInt(&out, allocator, u8, value.rank);
-        try appendInt(&out, allocator, u8, @intFromEnum(value.source));
+        try appendInt(&out, allocator, u8, @backingInt(value.source));
         try appendInt(&out, allocator, u8, 0);
         try appendInt(&out, allocator, u32, value.initializer_index orelse invalid_index);
         try appendInt(&out, allocator, u32, @intCast(value.shape_terms.len));
@@ -189,7 +189,7 @@ fn appendNodeRecords(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node
         var attr: std.ArrayList(u8) = .empty;
         defer attr.deinit(allocator);
         const kind = try encodeNodeOp(&attr, allocator, node);
-        try appendInt(out, allocator, u8, @intFromEnum(kind));
+        try appendInt(out, allocator, u8, @backingInt(kind));
         try out.appendNTimes(allocator, 0, 3);
         try appendInt(out, allocator, u32, node.output);
         try appendInt(out, allocator, u32, @intCast(node.inputs.len));
@@ -229,10 +229,10 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendInt(out, allocator, f32, mm.beta);
         },
         .ElemwiseBinary => |eb| {
-            try appendInt(out, allocator, u8, @intFromEnum(eb.op));
+            try appendInt(out, allocator, u8, @backingInt(eb.op));
         },
         .Unary => |u| {
-            try appendInt(out, allocator, u8, @intFromEnum(u.op));
+            try appendInt(out, allocator, u8, @backingInt(u.op));
         },
         .Softmax => |s| {
             try appendInt(out, allocator, i32, s.axis);
@@ -242,7 +242,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendSize(out, allocator, cv.dilation);
             try appendSize(out, allocator, cv.pad_left);
             try appendSize(out, allocator, cv.pad_right);
-            try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
+            try appendInt(out, allocator, u8, @backingInt(cv.pad_mode));
             try appendSize(out, allocator, cv.groups);
         },
         .Conv2D => |cv| {
@@ -254,7 +254,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendSize(out, allocator, cv.pad_bottom);
             try appendSize(out, allocator, cv.pad_left);
             try appendSize(out, allocator, cv.pad_right);
-            try appendInt(out, allocator, u8, @intFromEnum(cv.pad_mode));
+            try appendInt(out, allocator, u8, @backingInt(cv.pad_mode));
             try appendSize(out, allocator, cv.groups);
         },
         .LayerNorm => |ln| {
@@ -267,8 +267,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
         },
         .Attention => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
-            try appendInt(out, allocator, u8, if (attn.causal) 1 else 0);
-            try appendSize(out, allocator, attn.sliding_window);
+            try appendWindow(out, allocator, attn.window);
             try appendInt(out, allocator, f32, attn.attn_logits_soft_cap);
             // Packed back into the one control byte the file stores.
             const controls: u8 = (if (attn.has_query_positions) @as(u8, 1) else 0) |
@@ -276,7 +275,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendInt(out, allocator, u8, controls);
         },
         .Reduce => |rr| {
-            try appendInt(out, allocator, u8, @intFromEnum(rr.op));
+            try appendInt(out, allocator, u8, @backingInt(rr.op));
             try appendInt(out, allocator, u8, if (rr.axis != null) 1 else 0);
             if (rr.axis) |axis| try appendInt(out, allocator, i32, axis);
         },
@@ -295,8 +294,9 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
         .RelPosMHA => |attn| {
             try appendInt(out, allocator, f32, attn.scale);
             try appendInt(out, allocator, u8, if (attn.has_mask) 1 else 0);
-            try appendSize(out, allocator, attn.chunk_size);
-            try appendSize(out, allocator, attn.chunk_left);
+            try appendWindow(out, allocator, attn.window);
+            try appendSize(out, allocator, attn.relative_zero_index);
+            try appendInt(out, allocator, f32, attn.attn_logits_soft_cap);
         },
         .ArgMax => |am| {
             try appendInt(out, allocator, i32, am.axis);
@@ -316,7 +316,7 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
         },
         .SequenceAppend => {},
         .Cast => |ct| {
-            try appendInt(out, allocator, u8, @intFromEnum(ct.to_dtype));
+            try appendInt(out, allocator, u8, @backingInt(ct.to_dtype));
         },
         .MatMulNT => |mm| {
             try appendInt(out, allocator, f32, mm.alpha);
@@ -403,7 +403,7 @@ fn encodeInputRolesSection(allocator: std.mem.Allocator, input_roles: []const ty
     try appendInt(&out, allocator, u32, @intCast(input_roles.len));
     for (input_roles) |role| {
         try appendInt(&out, allocator, u32, role.input);
-        try appendInt(&out, allocator, u8, @intFromEnum(role.kind));
+        try appendInt(&out, allocator, u8, @backingInt(role.kind));
         try appendInt(&out, allocator, u8, role.axis);
         try appendInt(&out, allocator, u8, role.flags);
         try appendInt(&out, allocator, u8, 0); // reserved
@@ -480,6 +480,12 @@ fn appendSymbolicAttr(
 }
 
 /// A `usize` field, stored as u64.
+fn appendWindow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, w: types.AttentionWindow) PackageError!void {
+    try appendInt(out, allocator, u32, w.left);
+    try appendInt(out, allocator, u32, w.right);
+    try appendInt(out, allocator, u32, w.chunk);
+}
+
 fn appendSize(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) PackageError!void {
     return appendInt(out, allocator, u64, @intCast(value));
 }
@@ -488,8 +494,6 @@ fn appendSizeArray(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values
     try appendInt(out, allocator, u32, @intCast(values.len));
     for (values) |value| try appendSize(out, allocator, value);
 }
-
-
 
 fn collectPackageStrings(interner: *StringInterner, pkg: *const Package) PackageError!void {
     for (pkg.initializers) |init| {
@@ -523,7 +527,7 @@ fn writeHeader(writer: *WriteCursor, section_count: u32, dir_offset: u64, file_s
 }
 
 fn writeSectionDesc(writer: *WriteCursor, section_type: SectionType, flags: u32, offset: u64, size: u64) PackageError!void {
-    try writeInt(writer, u32, @intFromEnum(section_type));
+    try writeInt(writer, u32, @backingInt(section_type));
     try writeInt(writer, u32, flags);
     try writeInt(writer, u64, offset);
     try writeInt(writer, u64, size);

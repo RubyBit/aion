@@ -312,6 +312,58 @@ def test_cached_attention_rejects_k_without_v():
         nn.Attention(eye, eye, k_proj=eye, heads=1, kv_heads=1, head_dim=2, scale=1.0)
 
 
+def _rope_ref(x, pos, base):
+    """Half-split RoPE on the last axis, written out rather than composed."""
+    d = x.shape[-1]
+    half = d // 2
+    freqs = base ** (-2.0 * np.arange(half) / d)
+    ang = pos[..., None] * freqs
+    lo, hi = x[..., :half], x[..., half:]
+    return np.concatenate(
+        [lo * np.cos(ang) - hi * np.sin(ang), lo * np.sin(ang) + hi * np.cos(ang)],
+        axis=-1,
+    )
+
+
+def test_axial_rope_rotates_each_half_by_its_own_axis(b):
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal((1, 4, 2, 8)).astype(np.float32)
+    px = np.array([[0, 1, 2, 3]], np.int32)
+    py = np.array([[5, 4, 3, 2]], np.int32)
+
+    xv = b.input(x.shape, dtype=aion.float32).rename("x")
+    pxv = b.input(px.shape, dtype=aion.int32).rename("px")
+    pyv = b.input(py.shape, dtype=aion.int32).rename("py")
+    out = nn.AxialRoPE(base_frequency=100.0).forward(xv, [pxv, pyv])
+    got = run(b, out, {"x": x, "px": px, "py": py})
+
+    want = np.concatenate(
+        [_rope_ref(x[..., :4], px[..., None], 100.0),
+         _rope_ref(x[..., 4:], py[..., None], 100.0)],
+        axis=-1,
+    )
+    np.testing.assert_allclose(got, want, atol=2e-5)
+
+
+def test_axial_rope_with_one_axis_is_plain_rope(b):
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((1, 3, 1, 6)).astype(np.float32)
+    pos = np.array([[0, 2, 4]], np.int32)
+
+    xv = b.input(x.shape, dtype=aion.float32).rename("x")
+    pv = b.input(pos.shape, dtype=aion.int32).rename("p")
+    out = nn.AxialRoPE(base_frequency=10000.0).forward(xv, [pv])
+    got = run(b, out, {"x": x, "p": pos})
+    np.testing.assert_allclose(got, _rope_ref(x, pos[..., None], 10000.0), atol=2e-5)
+
+
+def test_axial_rope_rejects_an_uneven_split(b):
+    xv = b.input((1, 2, 1, 6), dtype=aion.float32).rename("x")
+    pv = b.input((1, 2), dtype=aion.int32).rename("p")
+    with pytest.raises(ValueError):
+        nn.AxialRoPE().forward(xv, [pv, pv, pv, pv])
+
+
 def _relpos(heads=2, head_dim=2, time=3, seed=0):
     """A RelPosSelfAttention with random weights, plus the arrays it was built from."""
     rng = np.random.default_rng(seed)

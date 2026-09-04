@@ -124,8 +124,8 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("nemo_path")
-    ap.add_argument("aion_path")
     ap.add_argument("--frames", type=int, default=200)
+    ap.add_argument("--thread-count", type=int, default=4)
     args = ap.parse_args()
 
     sd = load_sd(args.nemo_path)
@@ -134,8 +134,14 @@ def main():
 
     ref = encoder_ref(sd, torch.from_numpy(mel_np)).detach().numpy()
 
-    m = aion.load_model(args.aion_path, thread_count=4)
-    got = m.run_numpy({"mel": mel_np[None]}, outputs=["encoder_out"])["encoder_out"][0]
+    # Full attention, to match the reference's plain softmax over every key.
+    loader = conv._Loader(args.nemo_path)
+    with aion.Context(thread_count=args.thread_count) as ctx:
+        with aion.Builder(ctx=ctx) as b:
+            mel = b.input([1, args.frames, 128], dtype=aion.float32).rename("mel")
+            enc = conv.build_encoder(loader, b, args.frames, feat=mel)
+            with b.compile({"encoder_out": enc}) as m:
+                got = m.run_numpy({"mel": mel_np[None]})["encoder_out"][0]
 
     print("ref", ref.shape, "got", got.shape)
     diff = np.abs(ref - got)

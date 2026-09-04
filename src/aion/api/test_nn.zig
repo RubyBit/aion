@@ -847,7 +847,6 @@ test "api.nn: KVCache + Attention decode two steps against real history" {
         .kv_heads = 1,
         .head_dim = 1,
         .scale = 1.0,
-        .causal = true,
     }, .{ .name = "attn" });
 
     const proj = try attn.project(&fx.bld, X);

@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Pointwise (1x1) Conv1D -> MatMul lowering.
-//!
-//! A 1x1 conv with groups==1, stride==1, dilation==1 and no padding is exactly a matmul:
-//! `out[b,l,co] = sum_ci x[b,l,ci] * w[0,ci,co]`. The conv weight (aion layout
-//! `[k=1, c_in, c_out]`) is byte-identical to a MatMul B `[1, K, N]`, so the rewrite
-//! reuses the same tensors and routes pointwise convs onto the autotuned GEMM/GEMV path.
-//!
-//! Shape only; it does NOT quantize. Quantizing a pointwise projection is a convert-time
-//! decision (store it as a `MatMul` q8 B up front), so already-quantized conv weights
-//! are skipped rather than turned into a MatMul B with an incompatible quant layout.
+//! Lower eligible unquantized 1x1 Conv1D operations to MatMul using byte-identical
+//! weights; requires groups/stride/dilation 1 and no padding.
 
 const graph_mod = @import("../graph.zig");
 const rewriter_mod = @import("rewriter.zig");

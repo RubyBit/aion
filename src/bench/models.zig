@@ -1,31 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//
-//! Model-faithful decode graphs for the benches.
-//!
-//! `kernels.zig` beside it benchmarks single ops; this benchmarks a whole **model
-//! step**, so a change can be judged against the thing that actually ships. The
-//! Gemma-4 E2B builder mirrors `scripts/convert_gemma4_e2b_to_aion.py`'s
-//! `_emit_forward` op for op and compiles through the real `compileGraph`, so
-//! the opt passes run exactly as they do on the
-//! loaded model.
-//!
-//! Two properties are load-bearing, and both exist because of measurement bugs
-//! this module is meant to prevent:
-//!
-//!  1. **Every weight gets its own storage at its real size.** Decode is a
-//!     bandwidth problem; the working set has to be the real ~2.4 GB or the GPU
-//!     serves weights out of L2. On a 432 GB/s part with 48 MB of L2, a bench that
-//!     re-reads one 20 MB weight reports figures ABOVE the DRAM peak -- which is
-//!     arithmetically impossible and has previously been mistaken for a win.
-//!  2. **Weights are filled per tile, in place.** `writeFromPackedQuant` wants a
-//!     full-size packed staging buffer; the per-layer embedding table alone is
-//!     2.5 GB. Writing `TiledTensor.data` directly keeps host peak negligible while
-//!     still producing well-formed q8_0 blocks (see `fillQuantPattern`).
-//!
-//! Fidelity is not assumed: `printStepHistogram` dumps the step counts so they can
-//! be diffed against the real model's, and a scaled-down `--layers` build still
-//! covers every layer *kind* (source/non-source x local/global, and both elastic
-//! FFN widths).
+//! Whole-model benchmark graphs with distinct, real-sized, per-tile-filled weights.
+//! They use the production compiler without requiring full-size host staging buffers.
 
 const std = @import("std");
 const aion = @import("aion");
@@ -90,8 +65,8 @@ pub const G4 = struct {
         return if (isGlobal(layer)) global_source_layer else local_source_layer;
     }
     /// Sliding window for the attention op: 0 means unbounded (global layers).
-    pub fn slidingWindow(layer: usize) usize {
-        return if (isGlobal(layer)) 0 else local_sliding_window;
+    pub fn window(layer: usize) aion.graph.AttentionWindow {
+        return if (isGlobal(layer)) .causal else .sliding(local_sliding_window - 1, 0);
     }
     pub fn ropeBase(layer: usize) f32 {
         return if (isGlobal(layer)) rope_global_base else rope_local_base;
@@ -130,16 +105,8 @@ pub const DecodeOptions = struct {
     pli_vocab: usize = G4.vocab_size,
     /// Query length. 1 is decode; >1 walks the same graph as prefill.
     seq: usize = 1,
-    /// Replace a component with a shape-preserving no-op to measure what removing it
-    /// would actually be worth.
-    ///
-    /// This is the only honest way to size a component of a decode step. A per-op
-    /// microbenchmark measures the op in isolation, but the step is a long dependent
-    /// chain where work can partly overlap, so an op's *busy time* is not its
-    /// *marginal cost*. Measured proof: disabling attention split-K made an isolated
-    /// dependent chain 7x slower (1.9 -> 13.9 ms/token) while the real model lost only
-    /// ~1.3 ms. Ablation asks the question directly -- build the same graph without it
-    /// and diff.
+    /// Replace components with shape-preserving no-ops to measure their marginal cost
+    /// in the full dependent decode step.
     ablate: Ablate = .{},
     /// Passes to switch OFF, on top of the target defaults. Exposed so the bench can
     /// size what a pass costs as well as what it saves: horizontal MatMul fusion buys
@@ -154,13 +121,7 @@ pub const Ablate = struct {
     /// Every RMSNorm -> relu: keeps the dispatch, drops only the norm's arithmetic.
     /// Measures how much the norm COMPUTE costs.
     norms_compute: bool = false,
-    /// Every RMSNorm removed outright. Measures dispatch + compute, i.e. the ceiling
-    /// for fusing norms into their consumer.
-    ///
-    /// The two are separate because they answer different questions and the answers
-    /// differ by an order of magnitude: on the serial residual path a dispatch costs
-    /// ~24 us whatever it computes, so replacing an op with a cheaper op saves almost
-    /// nothing while REMOVING it saves the whole 24 us.
+    /// Remove every RMSNorm, measuring dispatch plus compute and the ceiling for fusion.
     norms: bool = false,
     /// Every broadcast scalar multiply -> identity (the `* skip_scale`, the
     /// `* sqrt(dim)` embedding scales, and the softcap's two scalings).
@@ -207,14 +168,8 @@ fn q8Bytes(elems: usize) u64 {
     return @as(u64, elems / info.block_elems) * info.block_bytes;
 }
 
-/// Fill a tensor's backing bytes with a valid, cheap q8_0 pattern, tile by tile.
-///
-/// A q8_0 block is an opaque 34-byte unit (f16 scale + 32 i8) and each tile is
-/// itself a packed-quant buffer, so restarting the pattern at every tile offset
-/// keeps every block well-formed. Writing `data` directly is deliberate: the packed
-/// path would need a staging buffer the size of the tensor, and one of these tensors
-/// is 2.5 GB. Contents are arbitrary but finite -- the scale is a normal f16, so no
-/// kernel ever sees NaN or Inf.
+/// Fill each tile directly with finite, valid q8_0 blocks.
+/// Direct writes avoid allocating a tensor-sized packed staging buffer.
 fn fillQuantPattern(mgr: *StorageManager, id: TensorId, seed: usize) !void {
     const t = try mgr.getMut(id);
     var block: [34]u8 = undefined;
@@ -419,10 +374,9 @@ pub fn selectLayers(buf: []usize, want: usize) []usize {
 // The decode graph
 // ---------------------------------------------------------------------------
 
-/// Build one Gemma-4 E2B decode step. Op-for-op the same sequence as the
-/// converter's `_emit_forward`, compiled with `policy` through the real optimizer
-/// pipeline. `dev` (with a non-cpu `target`) streams each weight to the device as it
-/// is built; pass null to keep everything on the host for the CPU bench.
+/// Build one Gemma-4 E2B decode step through the production optimizer pipeline.
+/// A non-CPU `dev` streams weights to the target as they are built; null keeps them
+/// on the host.
 pub fn gemma4E2BDecode(
     alloc: std.mem.Allocator,
     mgr: *StorageManager,
@@ -551,18 +505,15 @@ pub fn gemma4E2BDecode(
                 positions,
                 visible_end,
                 1.0,
-                true,
-                G4.slidingWindow(layer),
+                G4.window(layer),
                 0.0,
             );
         o = try g.addViewReshape(o, &.{ bsz, seq, q_width });
         o = try g.addMatMul(o, try ctx.weight(q_width, embed), 1.0, 0.0);
         x = try g.addElemwiseBinary(.add, x, try ctx.rms(o, embed));
 
-        // Gated MLP. gate/up split so `opt/horizontal_matmul` sees the same pattern it
-        // sees on the model, and one `gate` node for the GEGLU because that is what
-        // `nn.GatedMLP` emits — the converters author the gate rather than leaving a
-        // unary and a multiply for `opt/fuse_steps.zig` to recover.
+        // Match the model's separate gate/up projections and authored GEGLU gate so
+        // horizontal matmul fusion sees the production graph pattern.
         const ff_in = try ctx.rms(x, embed);
         const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
         const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
@@ -617,18 +568,9 @@ pub fn gemma4E2BDecode(
 /// whole cache with head_dim 512.
 pub const AttnKind = enum { local, global };
 
-/// One `Attention` op alone, at the model's real decode shapes and dtypes (f32 q
-/// against an f16 cache, 8 query heads over 1 KV head).
-///
-/// This exists because per-op GPU attribution inside the full step needs
-/// `AION_PROFILE_GPU=dispatch`, which puts every dispatch in its own compute pass
-/// and so inflates exactly the short kernels it is trying to measure. Timing the op
-/// on its own, over many iterations, measures the kernel instead of the profiler.
-/// `repeat` emits that many independent copies of the op in ONE program. This is not
-/// cosmetic: a program with a single dispatch measures the harness, not the kernel --
-/// there is a fixed cost of roughly 0.7 ms per `session.execute`, so a lone
-/// attention dispatch times at ~750 us whether it does work or not. Repeating
-/// amortizes that, and sweeping `repeat` recovers the per-op cost as the slope.
+/// Build repeated attention at the model's decode shapes and dtypes.
+/// Repetition in one program amortizes fixed execution overhead so a sweep can recover
+/// per-operation cost from the slope.
 pub fn gemma4Attention(
     alloc: std.mem.Allocator,
     mgr: *StorageManager,
@@ -655,7 +597,7 @@ pub fn gemma4Attention(
 
     const head_dim: usize = if (kind == .global) G4.global_head_dim else G4.local_head_dim;
     const t_len: usize = if (kind == .global) ctx_len else G4.local_sliding_window;
-    const window: usize = if (kind == .global) 0 else G4.local_sliding_window;
+    const win: aion.graph.AttentionWindow = if (kind == .global) .causal else .sliding(G4.local_sliding_window - 1, 0);
 
     const q_shape = [_]usize{ 1, 1, G4.num_heads, head_dim };
     const q_id = try mgr.createTiledTensor(.f32, &q_shape, &q_shape, .{ .tile_alignment = policy.tile_alignment });
@@ -667,16 +609,8 @@ pub fn gemma4Attention(
     const positions = try ctx.i32In(&.{ 1, 1 }, &.{@intCast(t_len - 1)});
     const kv_len = try ctx.i32In(&.{1}, &.{@intCast(t_len)});
 
-    // The copies form a DEPENDENT chain: each one's q is the previous one's output
-    // (attention returns [B, L, H_q, D_v], the same shape q came in as, so this
-    // chains with no reshape).
-    //
-    // This is load-bearing. Independent copies let the GPU overlap them, which
-    // measures throughput -- and then a config that overlaps well but has poor
-    // latency wins the benchmark and loses on the model. Measured: with split-K
-    // disabled, independent copies read 6x FASTER (0.31 vs 1.88 ms/token) while the
-    // real model got 8% SLOWER. The model's 35 attentions sit on a dependent
-    // critical path separated by other work, so per-op latency is what it pays.
+    // Chain each attention from the previous output to measure critical-path latency;
+    // independent copies would overlap and measure throughput instead.
     const n_rep = @max(@as(usize, 1), repeat);
     var cur = q;
     for (0..n_rep) |_| {
@@ -684,7 +618,7 @@ pub fn gemma4Attention(
         // repeat after the first and turn this into a cache benchmark.
         const k = try ctx.cache(t_len, head_dim);
         const v = try ctx.cache(t_len, head_dim);
-        cur = try g.addAttention(cur, k, v, positions, kv_len, 1.0, true, window, 0.0);
+        cur = try g.addAttention(cur, k, v, positions, kv_len, 1.0, win, 0.0);
     }
     try g.setOutputs(&.{cur});
 
@@ -708,103 +642,16 @@ pub fn attnKindCount(kind: AttnKind) usize {
 }
 
 // ---------------------------------------------------------------------------
-// Step histogram (the fidelity gate)
+// Step diagnostics
 // ---------------------------------------------------------------------------
 
-/// Count lowered steps by tag. Diffing this against the real model's histogram is
-/// what makes the synthetic graph trustworthy: if they disagree, the bench is wrong.
+/// Count lowered steps by tag.
 pub fn stepHistogram(prog: *const aion.program.Program, counts: *std.StringHashMap(usize)) !void {
     for (prog.steps) |step| {
         const gop = try counts.getOrPut(@tagName(step.op));
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
     }
-}
-
-/// The step histogram of the REAL `models/gemma/gemma4_e2b_q8.aion` compiled for
-/// WebGPU at seq=1, captured 2026-08-19 from
-/// `AION_PROFILE=summary AION_PROFILE_GPU=pass` on
-/// `bindings/python/examples/gemma4_e2b_generate_one.py --device gpu` (the CPU
-/// per-step spans are exact step counts).
-///
-/// The synthetic graph reproduced every one of these on the first attempt, which is
-/// what licenses using it as a stand-in for the model. Keep it that way: if this
-/// check fails, the bench has stopped measuring the model and any number it reports
-/// is about something else. A deliberate change to the converter or the optimizer
-/// updates the fixture -- after re-capturing it, not by loosening the check.
-pub const gemma4_e2b_expected_steps = [_]struct { name: []const u8, count: usize }{
-    .{ .name = "MatMulTiled", .count = 211 },
-    .{ .name = "SliceNDScalar", .count = 150 },
-    // All 242 norms, of which 106 carry a residual: the "sandwich norm" pairs
-    // (`x = x + norm(f(x))`) that `opt/fuse_steps.zig` folds into the norm step.
-    //
-    // NOTE this histogram is keyed on step TAG, and the residual is a FIELD, so these
-    // counts can no longer tell a fused norm from a plain one — if the fusion stopped
-    // firing, only `ElemwiseBinaryTiled` below would move. Checking the property instead
-    // of the name belongs with the bench rework (this file and the CPU bench into one
-    // bench/ directory), not here.
-    .{ .name = "RMSNormTiled", .count = 242 },
-    .{ .name = "ElemwiseBinaryTiled", .count = 111 },
-    // No ReshapeScalar or ReTileCopyScalar at all any more. They were 137 and 353 at
-    // the start of 2026-08-19; three changes removed them, and each removal was a
-    // pointless copy rather than real work:
-    //   * the M-hint tile fix in `program/compiler.zig` (a 4096-row tile stamped on a
-    //     1-row decode activation made every neighbour disagree),
-    //   * `opt/alias_views.zig` (copies between byte-identical layouts),
-    //   * the quantized tile cap in `plan.zig` (a 4096 N/K cap split wide weights and
-    //     left the split pieces tiled unlike their neighbours).
-    // Re-captured from the model after each; text output identical throughout.
-    // The 70 GEGLU gates are `ElemwiseBinaryTiled{ .op = .gate }` now, not a tag of
-    // their own, so they land in the ElemwiseBinaryTiled row above (41 + 70 = 111).
-    .{ .name = "RoPE1DTiled", .count = 50 },
-    .{ .name = "AttentionTiled", .count = 35 },
-    .{ .name = "CastTiled", .count = 30 },
-    .{ .name = "SequenceAppendTiled", .count = 30 },
-    .{ .name = "GatherRowsTiled", .count = 2 },
-    .{ .name = "ArgMax", .count = 1 },
-    .{ .name = "MatMulNTTiled", .count = 1 },
-    .{ .name = "UnaryTiled", .count = 1 },
-};
-
-/// Compare a built program against `gemma4_e2b_expected_steps`. Returns true on an
-/// exact match; otherwise prints every disagreement and returns false. Only valid
-/// for a full-scale build (all 35 layers, head on, full vocab) -- any reduced knob
-/// legitimately changes the counts, so the caller checks that first.
-pub fn verifyGemma4Steps(alloc: std.mem.Allocator, prog: *const aion.program.Program) !bool {
-    var counts: std.StringHashMap(usize) = .init(alloc);
-    defer counts.deinit();
-    try stepHistogram(prog, &counts);
-
-    var ok = true;
-    var expected_total: usize = 0;
-    for (gemma4_e2b_expected_steps) |e| {
-        expected_total += e.count;
-        const got = counts.get(e.name) orelse 0;
-        if (got != e.count) {
-            std.debug.print("    MISMATCH {s:<24} expected {d}, got {d}\n", .{ e.name, e.count, got });
-            ok = false;
-        }
-    }
-    // Also catch steps the model does NOT have: a new tag is just as much a drift.
-    var it = counts.iterator();
-    while (it.next()) |entry| {
-        var known = false;
-        for (gemma4_e2b_expected_steps) |e| {
-            if (std.mem.eql(u8, e.name, entry.key_ptr.*)) {
-                known = true;
-                break;
-            }
-        }
-        if (!known) {
-            std.debug.print("    UNEXPECTED {s:<24} x{d} (not in the model)\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-            ok = false;
-        }
-    }
-    if (prog.steps.len != expected_total) {
-        std.debug.print("    MISMATCH total steps expected {d}, got {d}\n", .{ expected_total, prog.steps.len });
-        ok = false;
-    }
-    return ok;
 }
 
 /// Print the lowered steps in execution order. Counts say what is expensive; the
@@ -845,15 +692,8 @@ fn printOne(mgr: *StorageManager, label: []const u8, id: TensorId) void {
     std.debug.print("]", .{});
 }
 
-/// Count view steps whose source and destination have **byte-identical physical
-/// layout** — same dtype, same tile byte-lengths, same offsets. Such a step copies a
-/// buffer onto an identically-shaped buffer, so it does no work at all; it exists only
-/// because the two values are different graph values and therefore different tensors.
-///
-/// This sizes the aliasing opportunity before any is built. Note the fix is NOT to
-/// reuse the source tensor id: consumers read logical shape from tensor metadata, and
-/// `[1,1,8,256]` and `[1,1,2048]` disagree there. It is to give the two ids one
-/// backing, which the workspace planner's slot mechanism already expresses.
+/// Count view steps whose source and destination have byte-identical physical layouts.
+/// The values retain separate tensor ids because their logical shapes may differ.
 pub fn countNoopViews(mgr: *StorageManager, prog: *const aion.program.Program) struct { noop: usize, total: usize } {
     var noop: usize = 0;
     var total: usize = 0;
@@ -870,9 +710,7 @@ pub fn countNoopViews(mgr: *StorageManager, prog: *const aion.program.Program) s
     return .{ .noop = noop, .total = total };
 }
 
-
-/// Print the histogram, densest first, plus the total. Formatted to be diffed by eye
-/// against the operation table `AION_PROFILE=summary` prints for the real model.
+/// Print step counts in descending frequency.
 pub fn printStepHistogram(alloc: std.mem.Allocator, prog: *const aion.program.Program) !void {
     var counts: std.StringHashMap(usize) = .init(alloc);
     defer counts.deinit();

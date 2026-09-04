@@ -18,11 +18,12 @@ from .dtype import float16, float32, int8, int32, normalize_dtype, q4_0, q8_0
 from .errors import AionError
 from .model import LoadedModel, TensorSpec
 from .tensor import Tensor
-from .types import ArrayLike, DTypeLike
+from .types import ArrayLike, AttentionWindow, DTypeLike
 from ._trace import InputSpec, compile, export, spec
 from .enums import AionDeviceKind, AionDType, AionGpuBackend, AionGpuPower, AionStatus
 
 __all__ = [
+    "AttentionWindow",
     "AionDType",
     "AionDeviceKind",
     "AionError",

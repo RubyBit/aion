@@ -823,8 +823,7 @@ fn benchProgramAttentionF32(
     t_cache: usize,
     dk: usize,
     dv: usize,
-    causal: bool,
-    sliding_window: usize,
+    window: aion.graph.AttentionWindow,
     attn_logits_soft_cap: f32,
     has_controls: bool,
     label: []const u8,
@@ -926,7 +925,7 @@ fn benchProgramAttentionF32(
     }
 
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(dk)));
-    const y = try g.addAttention(q_in, k_in, v_in, p_in, e_in, scale, causal, sliding_window, attn_logits_soft_cap);
+    const y = try g.addAttention(q_in, k_in, v_in, p_in, e_in, scale, window, attn_logits_soft_cap);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
@@ -940,20 +939,8 @@ fn benchProgramAttentionF32(
     var n_eff_sum: u64 = 0;
     for (0..l_q) |l| {
         const q_pos: usize = base_pos + l;
-        var upper: usize = t_cache;
-        if (causal) {
-            const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch return error.InvalidArgument;
-            if (q_pos_next < upper) upper = q_pos_next;
-        }
-
-        var lower: usize = 0;
-        if (sliding_window > 0) {
-            const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch return error.InvalidArgument;
-            const sw_lower: usize = if (q_pos_next > sliding_window) q_pos_next - sliding_window else 0;
-            if (sw_lower > lower) lower = sw_lower;
-        }
-
-        if (upper > lower) n_eff_sum += @intCast(upper - lower);
+        const w = window.keys(q_pos, t_cache);
+        if (w.hi > w.lo) n_eff_sum += @intCast(w.hi - w.lo);
     }
 
     const flops_total_wide: u128 = @as(u128, 2) *
@@ -976,7 +963,7 @@ fn benchProgramAttentionF32(
     const idx2: usize = (((batch - 1) * l_q + (l_q - 1)) * h_q + (h_q - 1)) * dv + (dv - 1);
     const chk: f32 = out_vals[idx0] + out_vals[idx1] + out_vals[idx2];
 
-    const mode: []const u8 = if (causal) "causal" else "noncausal";
+    const mode: []const u8 = if (window.right == 0) "causal" else "noncausal";
     rep("attn_{s}_{s}", .{ mode, label }, iters, ns, 0, @as(f64, @floatFromInt(flops_total)) / @as(f64, @floatFromInt(iters)), chk);
 }
 
@@ -2096,17 +2083,8 @@ fn benchKernelCpu(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend,
     bk.report(.{ .label = info.label, .iters = opts.iters, .ns = ns, .bytes = info.bytes, .flops = info.flops, .chk = chk });
 }
 
-/// The model-shaped decode step, from the same `bench_models` graph builder gpu-bench
-/// uses. That sharing is the point: a CPU-vs-GPU token comparison is only meaningful if
-/// both sides build the SAME graph, at the real Gemma-4 E2B shapes, with the real weight
-/// footprint -- so the graph lives in `src/bench/models.zig` and neither bench owns it.
-///
-/// No fidelity gate here. The step fixture in `bench_models` records the GPU SCHEDULE
-/// (`opt/fuse_steps.zig` is device-only), so a CPU run legitimately has 242 plain
-/// norms and 217 elementwise where the GPU has 242 norms carrying 106 residuals and 111
-/// elementwise. Comparing the two against one fixture would only teach the fixture to be
-/// vague. The target-independent facts -- layer count and streamed bytes -- are printed
-/// instead, and those DO have to match the GPU run.
+/// Run the shared model-shaped decode graph at the real Gemma-4 E2B shapes and weight
+/// footprint so CPU and GPU token results remain comparable.
 fn runTokenSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) !void {
     // ~0.4 s per CPU token at full scale, so 50 iterations is 20 seconds of waiting for a
     // number that has already converged. Explicit --iters always wins.
@@ -2212,13 +2190,13 @@ fn runF32Benches(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptio
     try benchProgramLayerNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     try benchProgramRMSNormF32(allocator, rnd, opts.iters, opts.m, opts.n, be);
     // Plain sequence (prefill / encoder shape), bidirectional then causal.
-    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, false, 0, 0.0, false, "seq", be);
-    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, true, 0, 0.0, false, "seq", be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, .full, 0.0, false, "seq", be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, opts.heads, opts.m, opts.m, opts.k, opts.n, .causal, 0.0, false, "seq", be);
     const cached_h_kv: usize = if ((opts.heads % 2) == 0) @max(@as(usize, 1), opts.heads / 2) else 1;
-    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, 0, 0.0, true, "cache_global", be);
+    try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, .causal, 0.0, true, "cache_global", be);
     const cached_sw: usize = @max(@as(usize, 1), opts.n / 2);
     if (cached_sw > 0 and cached_sw < opts.n) {
-        try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, true, cached_sw, 0.0, true, "cache_window", be);
+        try benchProgramAttentionF32(allocator, rnd, opts.iters, opts.batch, opts.heads, cached_h_kv, opts.m, opts.n, opts.k, opts.n, .sliding(@intCast(cached_sw - 1), 0), 0.0, true, "cache_window", be);
     }
     if ((opts.k % 2) == 0) {
         try benchProgramRoPE1DF32(allocator, rnd, opts.iters, opts.batch, opts.m, opts.heads, opts.k, be);

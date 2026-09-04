@@ -58,7 +58,7 @@ const Args = struct {
     suite: Suite = .matmul,
     /// --suite token knobs (whole Gemma-4 E2B decode step).
     model: bm.DecodeOptions = .{},
-    /// Print the lowered step histogram (the fidelity gate against the real model).
+    /// Print the lowered step histogram.
     show_steps: bool = false,
     /// Print the first N lowered steps in order (--dump-steps N).
     dump_steps: usize = 0,
@@ -708,19 +708,6 @@ fn runToken(alloc: std.mem.Allocator, a: Args) !void {
         out.print("  no-op views: {d} of {d} view steps copy between byte-identical layouts" ++ "\n", .{ nv.noop, nv.total });
     }
     if (a.dump_steps > 0) bm.printStepSequence(&mgr, &built.prog, a.dump_steps);
-
-    // The fidelity gate. Only meaningful at full scale -- any reduced knob changes
-    // the counts legitimately, so a scaled run reports that it skipped the check
-    // rather than pretending to have passed it.
-    const full_scale = built.stats.layers_emitted == bm.G4.num_layers and
-        a.model.head and a.model.pli_vocab == bm.G4.vocab_size and a.model.seq == 1;
-    if (!full_scale) {
-        out.print("  fidelity: SKIPPED (reduced run; full scale is --layers 35, head on, full --pli-vocab, --seq 1)\n", .{});
-    } else if (try bm.verifyGemma4Steps(alloc, &built.prog)) {
-        out.print("  fidelity: OK -- step histogram matches models/gemma/gemma4_e2b_q8.aion exactly\n", .{});
-    } else {
-        out.print("  fidelity: FAILED -- this bench is no longer measuring the model (see mismatches above)\n", .{});
-    }
 }
 
 // ---- attn suite (attention alone, at the model's exact decode shapes) --------

@@ -197,7 +197,7 @@ class ConformerLayer(nn.Module):
 
     def __init__(self, loader: _Loader, li: int, *, t_kv: int,
                  mask: Optional[TensorRef] = None, conv_pad_left: int = 0,
-                 chunk_size: int = 0, chunk_left: int = 0) -> None:
+                 window: aion.AttentionWindow = aion.AttentionWindow.FULL) -> None:
         # The caller opens a `layers.{li}` scope around the body, so every parameter
         # below lands under it without this type having to know its own index.
         pf = f"encoder.layers.{li}"
@@ -224,8 +224,7 @@ class ConformerLayer(nn.Module):
             np.ascontiguousarray(pe_proj),
             get(f"{pf}.self_attn.pos_bias_u"),
             get(f"{pf}.self_attn.pos_bias_v"),
-            scale=ATT_SCALE, mask=mask,
-                chunk_size=chunk_size, chunk_left=chunk_left,
+            scale=ATT_SCALE, mask=mask, window=window,
                 dtype=aion.q8_0, name="self_attn")
 
         # Pointwise convs are k=1, i.e. matmuls, so they are stored q8_0 and take the
@@ -327,7 +326,7 @@ def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) ->
     w6 = conv2d_w(f"{pe}.conv.6.weight"); b6 = b.param(loader.get(f"{pe}.conv.6.bias"))
     out_w = loader.get(f"{pe}.out.weight").reshape(D_MODEL, SUB_CH, FREQ_OUT)             # [out,c,f]
     out_w = np.ascontiguousarray(out_w.transpose(0, 2, 1).reshape(D_MODEL, FREQ_OUT * SUB_CH))  # [out,f*c]
-    out_wq = q8b(b, out_w)
+    out_wq = b.param(mm_b(out_w), dtype=aion.q8_0)
     out_b = b.param(loader.get(f"{pe}.out.bias"))
 
     relu = lambda x: x.relu()
@@ -349,7 +348,8 @@ def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) ->
 
 
 def build_encoder(loader: _Loader, b: Builder, t_mel: int,
-                  att_left: Optional[int] = None, att_right: int = 0) -> TensorRef:
+                  att_left: Optional[int] = None, att_right: int = 0,
+                  feat: Optional[TensorRef] = None) -> TensorRef:
     t_out = calc_length(t_mel)
     p_len = 2 * t_out - 1
 
@@ -359,23 +359,25 @@ def build_encoder(loader: _Loader, b: Builder, t_mel: int,
     # frames get up to att_right lookahead). This matches NeMo
     # att_context_style="chunked_limited", att_context_size=[att_left, att_right].
     #
-    # It goes on the op as two integers, NOT as an additive [t_out, t_out] mask: the
+    # It goes on the op as a window, NOT as an additive [t_out, t_out] mask: the
     # pattern is one contiguous key interval per row, so the kernels can restrict the
     # work to the window (~att_left + chunk keys) instead of scoring all t_out keys and
     # adding -1e9 to nearly all of them. At t_out = 3750 that mask was also a 56 MB
     # parameter in the file.
-    chunk_size = (att_right + 1) if att_left is not None else 0
-    chunk_left = att_left if att_left is not None else 0
+    att_window = (aion.AttentionWindow.chunked(att_right + 1, att_left)
+                  if att_left is not None else aion.AttentionWindow.FULL)
 
     # ---- in-graph log-mel -> dw_striding subsampling -> h [1, T_out, 1024] ----
-    feat = build_logmel(loader, b, t_mel)        # [1, T_mel, 128]
+    # `feat` lets a caller supply `[1, T_mel, 128]` itself, which is how
+    # verify_nemotron_encoder.py checks the encoder against a mel-fed reference.
+    if feat is None:
+        feat = build_logmel(loader, b, t_mel)
     h = build_subsample(loader, b, feat, t_mel)  # [1, T_out, 1024]
 
     # ---- 24 conformer layers ----
     for li in range(N_LAYERS):
         with b.scope(f"layers.{li}"):
-            layer = ConformerLayer(loader, li, t_kv=t_out,
-                                   chunk_size=chunk_size, chunk_left=chunk_left,
+            layer = ConformerLayer(loader, li, t_kv=t_out, window=att_window,
                                    conv_pad_left=CONV_K - 1)
             h = layer.ff1(h)
 

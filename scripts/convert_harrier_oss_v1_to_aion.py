@@ -394,7 +394,7 @@ def _emit_forward(
                 lw.q_proj, lw.o_proj,
                 k_proj=lw.k_proj, v_proj=lw.v_proj,
                 heads=NUM_HEADS, kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
-                scale=ATTN_SCALE, causal=True, sliding_window=0,
+                scale=ATTN_SCALE, window=aion.AttentionWindow.CAUSAL,
                 attn_logits_soft_cap=0.0,
                 dtype=weight_dtype, name="self_attn",
             )

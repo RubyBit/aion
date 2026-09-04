@@ -123,6 +123,59 @@ pub const OpTag = enum(u8) {
     Iota = 32,
 };
 
+/// Which keys a query may attend to, as one interval: `[anchor - left, anchor +
+/// span + right)` clipped to the valid key range, where `anchor` is the query
+/// (its chunk start when `chunk > 0`) and `span` is `chunk` or 1.
+pub const AttentionWindow = struct {
+    pub const unbounded: u32 = std.math.maxInt(u32);
+
+    /// Keys before the anchor, `unbounded` for no limit.
+    left: u32 = unbounded,
+    /// Keys after the anchor's span, `unbounded` for no limit. 0 is causal.
+    right: u32 = unbounded,
+    /// Anchor the interval at the query's chunk start instead of the query.
+    chunk: u32 = 0,
+
+    pub const full: AttentionWindow = .{};
+    pub const causal: AttentionWindow = .{ .right = 0 };
+
+    /// `n` keys before the query and `m` after it, the query included.
+    pub fn sliding(n: u32, m: u32) AttentionWindow {
+        return .{ .left = n, .right = m };
+    }
+
+    /// Every query in a chunk of `size` sees that chunk plus `n` keys before it.
+    pub fn chunked(size: u32, n: u32) AttentionWindow {
+        return .{ .left = n, .right = 0, .chunk = size };
+    }
+
+    pub fn isFull(self: AttentionWindow) bool {
+        return self.chunk == 0 and self.left == unbounded and self.right == unbounded;
+    }
+
+    pub fn keys(self: AttentionWindow, query_pos: usize, kv_end: usize) struct { lo: usize, hi: usize } {
+        const anchor: usize = if (self.chunk > 0) (query_pos / self.chunk) * self.chunk else query_pos;
+        const span: usize = if (self.chunk > 0) self.chunk else 1;
+        return .{
+            .lo = anchor - @min(anchor, @as(usize, self.left)),
+            .hi = @min(kv_end, anchor +| span +| @as(usize, self.right)),
+        };
+    }
+
+    /// Widest key interval any one query can see; sizes per-row score scratch.
+    pub fn maxKeys(self: AttentionWindow, kv_end: usize) usize {
+        const span: usize = if (self.chunk > 0) self.chunk else 1;
+        return @min(kv_end, @as(usize, self.left) +| span +| @as(usize, self.right));
+    }
+
+    /// How many consecutive queries share one key interval.
+    pub fn sharedRows(self: AttentionWindow, t_q: usize) usize {
+        if (self.chunk > 0) return @min(t_q, @as(usize, self.chunk));
+        if (self.left == unbounded and self.right == unbounded) return t_q;
+        return 1;
+    }
+};
+
 pub const Op = union(OpTag) {
     /// out = alpha * (a @ b) + beta * out
     MatMul: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
@@ -323,15 +376,13 @@ pub const Op = union(OpTag) {
     ///
     /// Semantics:
     /// - valid keys are in logical range [0, kv_lengths[b]), or [0, T) when absent
-    /// - causal mask uses absolute query positions from `query_positions`, or the query's
-    ///   row index when absent
-    /// - sliding_window == 0 means global attention
+    /// - `window` is measured in absolute query positions, from `query_positions`
+    ///   when present and the query's row index otherwise
     /// - attn_logits_soft_cap == 0 means disabled
     /// - requires H_q % H_kv == 0
     Attention: struct {
         scale: f32,
-        causal: bool,
-        sliding_window: usize,
+        window: AttentionWindow,
         attn_logits_soft_cap: f32,
         has_query_positions: bool,
         has_kv_lengths: bool,
@@ -399,18 +450,15 @@ pub const Op = union(OpTag) {
     /// Output:
     /// - out: [B, H, T_q, D]
     ///
-    /// scores[i,j] = ((q[i]+u)·k[j] + (q[i]+v)·pos_emb[(T_q-1)-i+j]) * scale + mask[i,j]
-    /// Relative-positional MHA. `chunk_size > 0` selects chunked-limited attention
-    /// (NeMo `att_context_style="chunked_limited"`): the keys are cut into
-    /// non-overlapping chunks of `chunk_size`, and a query attends to its own chunk
-    /// plus `chunk_left` frames before that chunk's start — a contiguous interval,
-    /// so it costs two integers instead of an additive [T_q, T_kv] mask tensor.
-    /// `chunk_size == 0` means attend to every key (subject to `mask`).
+    /// scores[i,j] = ((q[i]+u)·k[j] + (q[i]+v)·pos_emb[zero + j - i]) * scale + mask[i,j],
+    /// where the position row is skipped when `zero + j - i` falls outside `[0, P)`.
+    /// `window` is structural, so `mask` only carries what an interval cannot.
     RelPosMHA: struct {
         scale: f32,
         has_mask: bool,
-        chunk_size: usize = 0,
-        chunk_left: usize = 0,
+        window: AttentionWindow = .full,
+        relative_zero_index: usize,
+        attn_logits_soft_cap: f32 = 0,
     },
 
     /// Index of max value along `axis` (v1: must be the last axis). Output i32,
@@ -491,7 +539,7 @@ pub fn opTag(op: Op) OpTag {
 }
 
 pub fn opId(op: Op) u8 {
-    return @intFromEnum(opTag(op));
+    return @backingInt(opTag(op));
 }
 
 pub const Node = struct {
@@ -1006,15 +1054,8 @@ pub const Graph = struct {
     }
 
     /// Relative-positional multi-head self-attention (Conformer / Transformer-XL).
-    /// `pos_emb` is [H, P, D] (P = 2*T_kv-1, already projected); biases are [H, D];
-    /// `mask` (optional) is an additive [T_q, T_kv] tensor.
-    ///
-    /// `chunk_size`/`chunk_left` express chunked-limited attention structurally (see
-    /// `Op.RelPosMHA`); pass 0 for full attention. They compose with `mask`, which
-    /// then only has to carry what an interval cannot — e.g. streaming padding.
-    /// There is no `heads` parameter or attribute: the head count is `q`'s dim 2, and
-    /// every consumer reads it from the shape. (Carrying it separately is the exact
-    /// redundancy that got `MultiHeadAttention.heads` retired.)
+    /// `pos_emb` is [H, P, D] (already projected); biases are [H, D]; `mask`
+    /// (optional) is an additive [T_q, T_kv] tensor. The head count is `q`'s dim 2.
     pub fn addRelPosMHA(
         self: *Self,
         q: ValueId,
@@ -1025,14 +1066,16 @@ pub const Graph = struct {
         pos_bias_v: ValueId,
         mask: ?ValueId,
         scale: f32,
-        chunk_size: usize,
-        chunk_left: usize,
+        window: AttentionWindow,
+        relative_zero_index: usize,
+        attn_logits_soft_cap: f32,
     ) GraphError!ValueId {
         const op: Op = .{ .RelPosMHA = .{
             .scale = scale,
             .has_mask = (mask != null),
-            .chunk_size = chunk_size,
-            .chunk_left = chunk_left,
+            .window = window,
+            .relative_zero_index = relative_zero_index,
+            .attn_logits_soft_cap = attn_logits_soft_cap,
         } };
         if (mask) |m| {
             return self.addNodeInternal(op, &[_]ValueId{ q, k, v, pos_emb, pos_bias_u, pos_bias_v, m });
@@ -1060,14 +1103,12 @@ pub const Graph = struct {
         query_positions: ?ValueId,
         kv_lengths: ?ValueId,
         scale: f32,
-        causal: bool,
-        sliding_window: usize,
+        window: AttentionWindow,
         attn_logits_soft_cap: f32,
     ) GraphError!ValueId {
         const op: Op = .{ .Attention = .{
             .scale = scale,
-            .causal = causal,
-            .sliding_window = sliding_window,
+            .window = window,
             .attn_logits_soft_cap = attn_logits_soft_cap,
             .has_query_positions = (query_positions != null),
             .has_kv_lengths = (kv_lengths != null),

@@ -377,25 +377,26 @@ pub const Context = struct {
     }
 
     /// Convenience: allocate and initialize from packed quant bytes, blocking
-    /// along `quant_axis`. Picks a tile shape that respects quant block alignment
-    /// on that axis (the canonical 2-D matmul-B `[K, N]` case, `quant_axis = 0`,
-    /// uses the tuned matmul-B tiling; other cases use a single full-tensor tile,
-    /// which the graph compiler retiles as ops require).
+    /// along `quant_axis`.
+    ///
+    /// Tiling comes from the shared chooser, so an authored weight lands on the same
+    /// tiling the loader gives the identical weight. It cannot be left to the
+    /// compiler: quantized tensors are the one thing `ensureTilingMaybeRetile`
+    /// refuses to re-tile, so a wrong tiling here is a compile error at first use.
     pub fn fromPackedQuant(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
         if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
         if (quant_axis >= shape.len) return api_errors.ApiError.InvalidArgument;
+        if (shape.len > api_tiling.MAX_RANK) return api_errors.ApiError.InvalidArgument;
 
-        if (shape.len == 2 and quant_axis == 0) {
-            const tn: [2]usize = api_tiling.chooseQuantMatMulBTiles(self.policy, shape[0], shape[1], dtype);
-            var t: api_tensor.Tensor = try self.tensorTiled(dtype, shape, tn[0..2]);
-            try t.writePackedQuant(packed_bytes);
-            return t;
-        }
+        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
+        const tile_shape = tile_mem[0..shape.len];
+        api_tiling.chooseTileShapeForTensor(self.policy, dtype, shape, @intCast(quant_axis), tile_shape) catch
+            return api_errors.ApiError.InvalidArgument;
 
-        // General case: a single full-tensor tile is trivially block-aligned on
-        // `quant_axis` (tile == shape); the compiler retiles on first use.
         const tid: manager_mod.TensorId = try self.store.createTiledTensor(
-            dtype, shape, shape,
+            dtype,
+            shape,
+            tile_shape,
             .{ .tile_alignment = self.policy.tile_alignment, .quant_axis = @intCast(quant_axis) },
         );
         const ct = try self.store.getConst(tid);
@@ -683,4 +684,3 @@ fn indexOfValue(values: []const u32, value: u32) ?usize {
     for (values, 0..) |v, i| if (v == value) return i;
     return null;
 }
-

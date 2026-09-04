@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! `StorageManager` behind the runtime's `TensorStore` interface.
-//!
-//! This is the seam that keeps `backend/` from depending on `storage/`: an executor is
-//! handed a `TensorStore` and reaches tiles through it, so nothing under `backend/`
-//! imports this layer (the two that do are test-only). The cost is one indirect call per
-//! tile acquire and this file; the benefit is that a backend cannot reach into tensor
-//! lifetime, residency, or the derived-weight table by accident.
-//!
-//! Nothing here decides anything. Every function is a translation between the manager's
-//! vocabulary and the runtime's, which is why it is 300 lines with no branches worth
-//! reading — and why it does not belong in the manager itself.
+//! Adapts `StorageManager` to the runtime's `TensorStore` interface.
+//! This keeps backends independent of tensor lifetime, residency, and derived weights.
 
 const std = @import("std");
 

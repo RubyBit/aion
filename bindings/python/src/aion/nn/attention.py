@@ -2,10 +2,11 @@
 """Attention layers, mirroring `src/aion/api/nn/attention.zig`."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Optional
 
 from ..dtype import float16, float32
-from ..types import DTypeLike
+from ..types import AttentionWindow, DTypeLike
 from ..builder import Builder, TensorRef, WeightData
 from ..enums import AionInputRoleKind
 from .layers import Linear, _shape_of
@@ -36,6 +37,37 @@ class RoPE(Module):
             base_frequency=self.base_frequency,
             scale_factor=self.scale_factor,
             rope_proportion=self.rope_proportion,
+        )
+
+
+class AxialRoPE(Module):
+    """Independent 1-D RoPE per spatial axis, over consecutive head-dim slices.
+
+    A 2-D image patch rotates its first half by the patch's x position and its
+    second half by its y. `head_dim` splits evenly across `positions`, and each
+    slice is one ordinary `rope1d` — the axes never mix.
+    """
+
+    def __init__(self, *, base_frequency: float = 10000.0) -> None:
+        self.base_frequency = float(base_frequency)
+
+    def forward(self, x: TensorRef, positions: Sequence[TensorRef]) -> TensorRef:
+        if not positions:
+            raise ValueError("AxialRoPE needs at least one position tensor")
+        b = builder_of(x)
+        head_dim = int(x.shape[-1])
+        if head_dim % len(positions) != 0:
+            raise ValueError(
+                f"head_dim {head_dim} does not split evenly across {len(positions)} axes"
+            )
+        width = head_dim // len(positions)
+        return b.concat(
+            [
+                b.rope1d(b.slice_last_dim(x, i * width, width), pos,
+                         base_frequency=self.base_frequency)
+                for i, pos in enumerate(positions)
+            ],
+            axis=-1,
         )
 
 
@@ -148,8 +180,7 @@ class Attention(Module):
         kv_heads: int,
         head_dim: int,
         scale: float,
-        causal: bool = True,
-        sliding_window: int = 0,
+        window: AttentionWindow = AttentionWindow.CAUSAL,
         attn_logits_soft_cap: float = 0.0,
         name: Optional[str] = None,
         dtype: DTypeLike = float32,
@@ -158,14 +189,11 @@ class Attention(Module):
             raise ValueError("heads, kv_heads and head_dim must be > 0")
         if heads % kv_heads != 0:
             raise ValueError(f"heads ({heads}) must be a multiple of kv_heads ({kv_heads})")
-        if sliding_window > 0 and not causal:
-            raise ValueError("sliding_window requires causal attention")
 
         self._layer_name = name
         self.heads, self.kv_heads, self.head_dim = heads, kv_heads, head_dim
         self.scale = float(scale)
-        self.causal = bool(causal)
-        self.sliding_window = int(sliding_window)
+        self.window = window
         self.attn_logits_soft_cap = float(attn_logits_soft_cap)
 
         # K and V go together: a layer with one but not the other cannot fill a
@@ -229,8 +257,7 @@ class Attention(Module):
         with self._scoped(b):
             opts = {
                 "scale": self.scale,
-                "causal": self.causal,
-                "sliding_window": self.sliding_window,
+                "window": self.window,
                 "attn_logits_soft_cap": self.attn_logits_soft_cap,
             }
             attn = b.attention(
@@ -250,7 +277,7 @@ class Attention(Module):
 class RelPosSelfAttention(Module):
     """Relative-position multi-head self-attention (Transformer-XL / Conformer).
 
-    `pos_emb` is the already-projected `[heads, 2*T-1, head_dim]` table — projecting
+    `pos_emb` is the already-projected `[heads, P, head_dim]` table — projecting
     the sinusoidal table through `linear_pos` is a fold the converter does once, on
     the host — and `pos_bias_u`/`pos_bias_v` are the two `[heads, head_dim]` learned
     biases. `head_dim` comes off `pos_emb`, so it cannot disagree with it.
@@ -271,8 +298,9 @@ class RelPosSelfAttention(Module):
         *,
         scale: float,
         mask: Optional[TensorRef] = None,
-        chunk_size: int = 0,
-        chunk_left: int = 0,
+        window: AttentionWindow = AttentionWindow.FULL,
+        relative_zero_index: Optional[int] = None,
+        attn_logits_soft_cap: float = 0.0,
         name: Optional[str] = None,
         dtype: DTypeLike = float32,
     ) -> None:
@@ -282,18 +310,15 @@ class RelPosSelfAttention(Module):
         # separately, so neither can disagree with the weights.
         pe = _shape_of(pos_emb)
         if len(pe) != 3:
-            raise ValueError(f"pos_emb must be [heads, 2*T-1, head_dim], got {pe}")
+            raise ValueError(f"pos_emb must be [heads, P, head_dim], got {pe}")
 
         self.heads = int(pe[0])
         self.head_dim = int(pe[2])
         self.scale = float(scale)
         self.mask = mask
-        # Chunked-limited window; structural, so prefer it over encoding the same
-        # pattern in `mask` (see Builder.relpos_mha).
-        if chunk_size == 0 and chunk_left != 0:
-            raise ValueError("chunk_left requires chunk_size")
-        self.chunk_size = int(chunk_size)
-        self.chunk_left = int(chunk_left)
+        self.window = window
+        self.relative_zero_index = int(pe[1] // 2 if relative_zero_index is None else relative_zero_index)
+        self.attn_logits_soft_cap = float(attn_logits_soft_cap)
 
         self.q_proj = Linear(q, dtype=dtype)
         self.k_proj = Linear(k, dtype=dtype)
@@ -332,8 +357,9 @@ class RelPosSelfAttention(Module):
                 self.pos_bias_v.value(b, "pos_bias_v"),
                 self.mask,
                 scale=self.scale,
-                chunk_size=self.chunk_size,
-                chunk_left=self.chunk_left,
+                window=self.window,
+                relative_zero_index=self.relative_zero_index,
+                attn_logits_soft_cap=self.attn_logits_soft_cap,
             )
             return self.o_proj(
                 b.reshape(att, (*att.dims[:2], self.heads * self.head_dim))

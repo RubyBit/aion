@@ -4,7 +4,7 @@
 //   scores[i,j] = ((q[i]+u) . k[j] + (q[i]+v) . pos_emb[base_i + j]) * scale
 //                 + mask[i,j]                       (base_i = (T_q-1) - i)
 //   out[i] = softmax_j(scores[i,:]) @ v
-// over the row's key window (chunked-limited attention; see p.chunk_size).
+// over the row's key window (see window_keys).
 //
 // Layouts (per the compile contract): q/k/v/out slices are contiguous [T, D]
 // panels (the [B, T, H, D] tensors are tiled [1, T, 1, D]); pos_emb / biases are
@@ -48,18 +48,18 @@ struct Params {
     t_q: u32,
     t_kv: u32,
     d: u32,
+    p_len: u32,
     pe_base: u32, // element offset of this head's [P, D] panel
     u_base: u32, // element offset of this head's [D] bias row
     v_base: u32,
     has_mask: u32,
-    // Chunked-limited window: 0 = attend to every key. Otherwise a query attends to
-    // its own chunk of `chunk_size` keys plus `chunk_left` before that chunk's start
-    // — one contiguous interval, so the key loop runs over the window instead of
-    // scoring all t_kv keys and masking almost all of them away.
-    chunk_size: u32,
-    chunk_left: u32,
+    win_left: u32,
+    win_right: u32,
+    win_chunk: u32,
+    relative_zero_index: u32,
     rl: u32, // query rows per block
     scale: f32,
+    attn_logits_soft_cap: f32,
 };
 
 const WG: u32 = 256u;
@@ -126,18 +126,11 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
         hi_r[r] = 0u;
         let row = row0 + r;
         if (row >= p.t_q) { continue; }
-        var lo = 0u;
-        var hi = p.t_kv;
-        if (p.chunk_size > 0u) {
-            let a = row + (p.t_kv - p.t_q);
-            let cs = (a / p.chunk_size) * p.chunk_size;
-            lo = cs - min(cs, p.chunk_left);
-            hi = min(cs + p.chunk_size, p.t_kv);
-        }
-        lo_r[r] = lo;
-        hi_r[r] = hi;
-        span_lo = min(span_lo, lo);
-        span_hi = max(span_hi, hi);
+        let w = window_keys(p.win_left, p.win_right, p.win_chunk, row + (p.t_kv - p.t_q), p.t_kv);
+        lo_r[r] = w.x;
+        hi_r[r] = w.y;
+        span_lo = min(span_lo, w.x);
+        span_hi = max(span_hi, w.y);
     }
     if (span_hi <= span_lo) { return; }
 
@@ -176,9 +169,11 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
         // --- scores: K row read ONCE for the block; pos_emb once per (row, key) ---
         var sv: array<f32, 4>;
         var vr: array<bool, 4>;
+        var hp: array<bool, 4>;
         for (var r = 0u; r < rows; r += 1u) {
             sv[r] = FMIN;
             vr[r] = false;
+            hp[r] = false;
         }
         if (j < span_hi) {
             let kb = j * p.d;
@@ -190,18 +185,30 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
                 bd[r] = 0.0;
                 // base_{row0+r} + j, i.e. the band shifts down by one per row. Loop
                 // invariant, so it is computed once per row rather than per element.
-                peb[r] = p.pe_base + (((p.t_q - 1u) - (row0 + r)) + j) * p.d;
+                vr[r] = j >= lo_r[r] && j < hi_r[r];
+                peb[r] = p.pe_base;
+                if (vr[r]) {
+                    let abs_query = (p.t_kv - p.t_q) + row0 + r;
+                    let rel = i32(p.relative_zero_index) + i32(j) - i32(abs_query);
+                    if (rel >= 0 && rel < i32(p.p_len)) {
+                        peb[r] = p.pe_base + u32(rel) * p.d;
+                        hp[r] = true;
+                    }
+                }
             }
             for (var i = 0u; i < p.d; i += 1u) {
                 let kv = k[kb + i];
                 for (var r = 0u; r < rows; r += 1u) {
                     ac[r] += qu_s[r * p.d + i] * kv;
-                    bd[r] += qv_s[r * p.d + i] * pe[peb[r] + i];
+                    if (hp[r]) { bd[r] += qv_s[r * p.d + i] * pe[peb[r] + i]; }
                 }
             }
             for (var r = 0u; r < rows; r += 1u) {
                 if (j >= lo_r[r] && j < hi_r[r]) {
                     var sc = (ac[r] + bd[r]) * p.scale;
+                    if (p.attn_logits_soft_cap > 0.0) {
+                        sc = p.attn_logits_soft_cap * tanh(sc / p.attn_logits_soft_cap);
+                    }
                     if (p.has_mask != 0u) { sc += mask[(row0 + r) * p.t_kv + j]; }
                     sv[r] = sc;
                     vr[r] = true;

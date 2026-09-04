@@ -562,7 +562,7 @@ inline fn scaleRowF32(row: []align(1) f32, n: usize, scale: f32) void {
 //   * runs each block as GEMM -> online softmax -> GEMM through the same
 //     SIMD-tuned panel kernels RelPosMHA already uses, with a narrow-row variant
 //     for when a group has fewer rows than the microkernel's `mr`;
-//   * skips key blocks entirely outside a block's causal/sliding-window range;
+//   * skips key blocks entirely outside a block's window range;
 //   * can split ONE group's key range across workers (flash-decoding). That is the
 //     only available parallelism when decode has a single query row, where work
 //     partitioned by output tile leaves every thread but one idle.
@@ -805,12 +805,9 @@ const BlockedCtx = struct {
                 break :blk @intCast(p);
             } else l;
 
-            var upper: usize = valid_end;
-            if (self.s.causal) upper = @min(upper, q_pos + 1);
-            var lower: usize = 0;
-            if (self.s.sliding_window > 0 and q_pos + 1 > self.s.sliding_window) {
-                lower = q_pos + 1 - self.s.sliding_window;
-            }
+            const win = self.s.window.keys(q_pos, valid_end);
+            const lower: usize = win.lo;
+            const upper: usize = win.hi;
             if (upper > lower) {
                 uni_lo = @min(uni_lo, lower);
                 uni_hi = @max(uni_hi, upper);
@@ -1038,12 +1035,9 @@ const BlockedCtx = struct {
                     if (p < 0) return BackendError.InvalidArgument;
                     break :blk @intCast(p);
                 } else l;
-                var upper: usize = valid_end;
-                if (self.s.causal) upper = @min(upper, q_pos + 1);
-                var lower: usize = 0;
-                if (self.s.sliding_window > 0 and q_pos + 1 > self.s.sliding_window) {
-                    lower = q_pos + 1 - self.s.sliding_window;
-                }
+                const win = self.s.window.keys(q_pos, valid_end);
+                const lower: usize = win.lo;
+                const upper: usize = win.hi;
                 var hi: usize = 0;
                 while (hi < u.hq_n) : (hi += 1) {
                     row_l[r] = l;
@@ -1224,24 +1218,9 @@ const ExecCtx = struct {
                         break :blk @intCast(q_pos_i32);
                     } else l;
 
-                    var upper: usize = valid_end;
-                    if (self.s.causal) {
-                        const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch {
-                            self.fail(BackendError.InvalidArgument);
-                            return;
-                        };
-                        if (q_pos_next < upper) upper = q_pos_next;
-                    }
-
-                    var lower: usize = available_start;
-                    if (self.s.sliding_window > 0) {
-                        const q_pos_next: usize = std.math.add(usize, q_pos, 1) catch {
-                            self.fail(BackendError.InvalidArgument);
-                            return;
-                        };
-                        const sw_lower: usize = if (q_pos_next > self.s.sliding_window) q_pos_next - self.s.sliding_window else 0;
-                        if (sw_lower > lower) lower = sw_lower;
-                    }
+                    const win = self.s.window.keys(q_pos, valid_end);
+                    const upper: usize = win.hi;
+                    const lower: usize = @max(win.lo, available_start);
 
                     var hq: usize = hq_start;
                     while (hq < hq_end) : (hq += 1) {
@@ -1518,7 +1497,7 @@ fn execBlocked(
     // — decode's single query row is the case that needs it.
     var segs: usize = 1;
     if (thread_count > 1 and base_units < thread_count) {
-        const span_hint: usize = if (s.sliding_window > 0) @min(sh.k_cap, s.sliding_window) else sh.k_cap;
+        const span_hint: usize = s.window.maxKeys(sh.k_cap);
         const by_keys: usize = @max(@as(usize, 1), span_hint / kernels.tuning.min_segment_keys);
         segs = @min(ceilDiv(thread_count, base_units), by_keys);
         if (segs == 0) segs = 1;

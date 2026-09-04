@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Step-list editing: the facts a peephole needs, plus one compaction.
-//!
-//! A rule marks producers dead with `kill` and rewrites consumers in place through
-//! `steps`. Collecting uses, the owned set and the compaction are here, so a rule is
-//! only its match condition.
-//!
-//! One editor edits one step list — the top-level schedule or one control-flow body —
-//! so a rule matching on adjacency never sees across the boundary, and `confined` is how
-//! it refuses a tensor another list can also observe. `opt.stepPasses` walks the lists.
+//! Edit one lowered step list using shared use facts; rules rewrite consumers, kill
+//! producers, and decline tensors visible from another schedule or control-flow body.
 
 const std = @import("std");
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Growing a sequence cache's capacity axis at run time.
-//!
-//! `cache.zig` holds the policy — how much to grow by, and up to what ceiling. This is
-//! the execution: reallocating the axis, preserving what was already written, and zeroing
-//! the rest. It needs the tensor table, the device memory and the policy at once, so it
-//! sits beside the manager rather than inside it (the same split as `fold.zig`).
-//!
-//! Capacity is the one piece of model state the compiler cannot own, which is why the
-//! runtime drives this from a `GrowthRequest` list rather than from the schedule — see
-//! `api.Model.prepareGrowableCaches`, and note the host must know the write position
-//! before the frame is recorded or there is no size to grow to.
+//! Runtime growth of sequence-cache capacity while preserving existing data.
+//! Growth is driven by requests with host-known write positions; `cache.zig` owns policy.
 
 const std = @import("std");
 
@@ -41,13 +32,8 @@ pub fn zeroDeviceRange(mgr: *StorageManager, dev: dm.DeviceMemory, handle: dm.De
     }
 }
 
-/// Grow a device-resident tensor without leaving the device: allocate the
-/// new backing, zero it, and move the old contents across with `copyD2D`.
-///
-/// Applies to the single, unpadded tile that role-declared sequence caches
-/// use — there the two backings differ only in the stride of `axis`, so the
-/// move is `outer` contiguous runs. Returns false for any other layout,
-/// leaving the caller its host round-trip.
+/// Grow a single-tile, unpadded device tensor by zeroing new backing and copying
+/// preserved runs with `copyD2D`. Returns false for layouts requiring a host fallback.
 fn growAxisOnDevice(mgr: *StorageManager, id: TensorId, axis: usize, new_size: usize, dev: dm.DeviceMemory) StorageError!bool {
     const t: *TiledTensor = try mgr.getMut(id);
     if (t.dtype.info().is_quantized) return false;
@@ -116,11 +102,8 @@ pub fn ensureTensorAxisCapacity(mgr: *StorageManager, id: TensorId, axis: usize,
         if (try growAxisOnDevice(mgr, id, axis, min_size, d)) return;
     }
 
-    // Layouts device growth does not cover round-trip through the host (D2H
-    // gather -> host grow -> H2D re-migrate), reusing `moveTensor`. Growth is
-    // geometric, so this amortizes to O(final size) and never touches the
-    // fixed/ring fast path. `moveTensor` frees the old device buffer only
-    // after the re-upload, and the tensor id is preserved.
+    // Unsupported device layouts round-trip through host growth and remigration.
+    // Geometric growth amortizes this to O(final size) while preserving the tensor id.
     const dev: dm.DeviceMemory = t0.dev orelse return StorageError.InvalidArgument;
     const tile_align: usize = t0.tile_alignment;
     const rank: usize = @as(usize, t0.rank);

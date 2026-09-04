@@ -32,9 +32,12 @@ const Frame = @import("../frame.zig").Frame;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const KernelDesc = pipelines.KernelDesc;
 
-const attn_kernel: KernelDesc = .{ .name = "attention", .wgsl = @embedFile("../kernels/attention.wgsl") };
+/// Both attention kernels share the window helper; appended, since WGSL wants its
+/// `enable` directives first and does not need forward declarations.
+const window_wgsl = @embedFile("../kernels/window.wgsl");
+const attn_kernel: KernelDesc = .{ .name = "attention", .wgsl = @embedFile("../kernels/attention.wgsl") ++ window_wgsl };
 const merge_kernel: KernelDesc = .{ .name = "attention_merge", .wgsl = @embedFile("../kernels/attention_merge.wgsl") };
-const relpos_kernel: KernelDesc = .{ .name = "relpos_mha", .wgsl = @embedFile("../kernels/relpos_mha.wgsl") };
+const relpos_kernel: KernelDesc = .{ .name = "relpos_mha", .wgsl = @embedFile("../kernels/relpos_mha.wgsl") ++ window_wgsl };
 
 /// Kernel limits — must match MAX_DK / ACC * WG in the WGSL.
 const MAX_DK: u32 = 512;
@@ -158,8 +161,9 @@ const CachedParams = extern struct {
     t_cap: u32,
     h_kv: u32,
     gqa: u32,
-    causal: u32,
-    sliding: u32,
+    win_left: u32,
+    win_right: u32,
+    win_chunk: u32,
     ring: u32,
     ring_window: u32,
     kv_f16: u32,
@@ -187,14 +191,18 @@ const RelPosParams = extern struct {
     t_q: u32,
     t_kv: u32,
     d: u32,
+    p_len: u32,
     pe_base: u32,
     u_base: u32,
     v_base: u32,
     has_mask: u32,
-    chunk_size: u32,
-    chunk_left: u32,
+    win_left: u32,
+    win_right: u32,
+    win_chunk: u32,
+    relative_zero_index: u32,
     rl: u32,
     scale: f32,
+    attn_logits_soft_cap: f32,
 };
 
 const packedElemsSized = context.packedElemsSized;
@@ -220,7 +228,7 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
     const d = q_meta.shape[3];
     const t_kv = k_meta.shape[1];
     const p_len = pe_meta.shape[1];
-    if (p_len != 2 * t_kv - 1 or t_q > t_kv or t_q == 0) return error.Unsupported;
+    if (p_len == 0 or s.relative_zero_index >= p_len or t_q > t_kv or t_q == 0) return error.Unsupported;
     // RelPosMHA has ONE head dim for q/k/v, so the attention kernel's separate
     // dk/dv ceilings don't apply: the binding limits are the q staging arrays
     // (`rl * d <= RELPOS_Q_STAGE`, checked once `rl` is chosen) and the per-thread
@@ -293,14 +301,18 @@ pub fn execRelPosMHA(ctx: Ctx, frame: *Frame, s: executable.StepRelPosMHATiled) 
                 .t_q = @intCast(t_q),
                 .t_kv = @intCast(t_kv),
                 .d = @intCast(d),
+                .p_len = @intCast(p_len),
                 .pe_base = @intCast((h % pe_ts0) * p_len * d),
                 .u_base = @intCast((h % bu_ts0) * d),
                 .v_base = @intCast((h % bv_ts0) * d),
                 .has_mask = @intFromBool(mask_tile != null),
-                .chunk_size = std.math.cast(u32, s.chunk_size) orelse return error.Unsupported,
-                .chunk_left = std.math.cast(u32, s.chunk_left) orelse return error.Unsupported,
+                .win_left = s.window.left,
+                .win_right = s.window.right,
+                .win_chunk = s.window.chunk,
+                .relative_zero_index = std.math.cast(u32, s.relative_zero_index) orelse return error.Unsupported,
                 .rl = @intCast(rl),
                 .scale = s.scale,
+                .attn_logits_soft_cap = s.attn_logits_soft_cap,
             };
             const mask_buf = if (mask_tile) |mt| ctx.devmem.bufferFor(mt.handle).? else ctx.devmem.bufferFor(dq.handle).?;
             const mask_len = if (mask_tile) |mt| mt.len else dq.len;
@@ -468,7 +480,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
         // The split is sized off the range a row ACTUALLY scans — with a sliding
         // window that is the window, not the cache capacity.
         const gqa: usize = h_q / h_kv;
-        const span_hint: usize = if (s.sliding_window > 0) @min(t_cap, s.sliding_window) else t_cap;
+        const span_hint: usize = s.window.maxKeys(t_cap);
         const rb: RowBlock = chooseRowBlock(gqa, th, tl, tb, span_hint, d_k);
         const rh: usize = rb.rh;
         const rl: usize = rb.rl;
@@ -503,8 +515,9 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             .t_cap = std.math.cast(u32, t_cap) orelse return error.Unsupported,
             .h_kv = @intCast(h_kv),
             .gqa = @intCast(h_q / h_kv),
-            .causal = @intFromBool(s.causal),
-            .sliding = std.math.cast(u32, s.sliding_window) orelse return error.Unsupported,
+            .win_left = s.window.left,
+            .win_right = s.window.right,
+            .win_chunk = s.window.chunk,
             .ring = @intFromBool(is_ring),
             .ring_window = std.math.cast(u32, ring_window) orelse return error.Unsupported,
             .kv_f16 = @intFromBool(kv_f16),

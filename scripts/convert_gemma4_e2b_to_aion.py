@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Convert Gemma 4 E2B (text-only) safetensors -> a self-contained q8_0 `.aion`.
+"""Convert Gemma 4 E2B safetensors -> one multimodal q8_0 `.aion`.
 
 Emits ONE full-forward model: token embedding + per-layer-input encoder + 35
 transformer blocks (KV-cache attention with local/global rope, elastic FFN, PLI)
@@ -66,6 +66,11 @@ ROPE_LOCAL_BASE: float = 10_000.0
 ROPE_GLOBAL_BASE: float = 1_000_000.0
 ROPE_LOCAL_PROPORTION: float = 1.0
 ROPE_GLOBAL_PROPORTION: float = 0.25
+# The reference masks `0 <= q - k < attention_context_left - 1`: 12 keys, not 13.
+# The 13-entry relative table therefore has one row the mask never admits.
+AUDIO_WINDOW = aion.AttentionWindow.sliding(11)
+# Each head's first half rotates by the patch's x position, the second by its y.
+VISION_ROPE = nn.AxialRoPE(base_frequency=100.0)
 
 
 def is_global_layer(layer: int) -> bool:
@@ -85,7 +90,11 @@ def kv_source_of(layer: int) -> int:
 
 # Authoring placeholder sizes for the symbolic axes (eager inference only; the
 # exported model serves any runtime size on them).
-_PLACEHOLDER = {"batch": 1, "seq": 1, "G": LOCAL_SLIDING_WINDOW}
+_PLACEHOLDER = {
+    "batch": 1, "seq": 1, "G": LOCAL_SLIDING_WINDOW,
+    "vision_seq": 9, "vision_out": 1,
+    "audio_frames": 4, "audio_sub1": 2, "audio_tokens": 1,
+}
 
 Shape = Tuple[Union[int, str], ...]
 
@@ -94,28 +103,10 @@ Shape = Tuple[Union[int, str], ...]
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Convert Gemma 4 E2B text-only to a q8_0 .aion")
+    ap = argparse.ArgumentParser(description="Convert Gemma 4 E2B text/image/audio to one q8_0 .aion")
     ap.add_argument("in_safetensors", type=str)
     ap.add_argument("out_aion", type=str)
-    ap.add_argument(
-        "--allow-multimodal",
-        action="store_true",
-        help="Ignore audio/vision tensors in a multimodal checkpoint (they are not included).",
-    )
     return ap.parse_args(argv)
-
-
-def _reject_if_unexpected_multimodal(keys: List[str], allow: bool) -> None:
-    if allow:
-        return
-    bad = [k for k in keys if k.startswith("model.audio_tower.") or k.startswith("model.vision_tower.")]
-    if not bad:
-        return
-    sample = "\n  ".join(bad[:5])
-    raise SystemExit(
-        f"checkpoint contains {len(bad)} multimodal tensor(s); pass --allow-multimodal "
-        f"to ignore them\ne.g.:\n  {sample}"
-    )
 
 
 class _WeightLoader:
@@ -179,6 +170,18 @@ def _scaled(b: Builder, x: TensorRef, factor: float) -> TensorRef:
     return b.mul(x, b.constant(factor))
 
 
+# Stage dumps for scripts/verify_gemma4_e2b.py: off unless the env var is set, so
+# a normal conversion writes exactly the public outputs.
+_DEBUG_STAGES: bool = os.environ.get("AION_GEMMA_DEBUG_STAGES") == "1"
+
+
+def _dbg(b: Builder, value: TensorRef, name: str) -> TensorRef:
+    """Mark `value` as a `dbg.<name>` output when stage dumping is enabled."""
+    if _DEBUG_STAGES:
+        b.mark_output(value, f"dbg.{name}")
+    return value
+
+
 def _rms(gamma: Optional[np.ndarray], name: str, width: Optional[int] = None) -> nn.RMSNorm:
     """A norm with Gemma's epsilon.
 
@@ -236,6 +239,17 @@ class _SharedWeights:
     final_norm: np.ndarray
 
 
+@dataclass
+class _TowerWeights:
+    values: Dict[str, np.ndarray]
+
+    def get(self, name: str) -> np.ndarray:
+        try:
+            return self.values[name]
+        except KeyError as exc:
+            raise KeyError(f"multimodal checkpoint tensor is missing: {name}") from exc
+
+
 def _load_weights(loader: _WeightLoader) -> Tuple[_SharedWeights, List[_LayerWeights]]:
     ln = "model.language_model"
 
@@ -277,10 +291,205 @@ def _load_weights(loader: _WeightLoader) -> Tuple[_SharedWeights, List[_LayerWei
     return shared, layers
 
 
+def _load_tower_weights(loader: _WeightLoader) -> _TowerWeights:
+    prefixes = ("model.vision_tower.", "model.audio_tower.", "model.embed_vision.", "model.embed_audio.")
+    keys = [key for key in loader.keys() if key.startswith(prefixes) and key.endswith((".weight", ".bias", "position_embedding_table", "per_dim_scale"))]
+    if not any(key.startswith("model.vision_tower.") for key in keys):
+        raise SystemExit("checkpoint has no Gemma 4 vision tower")
+    if not any(key.startswith("model.audio_tower.") for key in keys):
+        raise SystemExit("checkpoint has no Gemma 4 audio tower")
+    return _TowerWeights({key: _f32(loader.get_f32(key)) for key in keys})
+
+
+def _linear_weight(towers: _TowerWeights, prefix: str) -> np.ndarray:
+    """Read either a plain Linear or Gemma4ClippableLinear checkpoint weight."""
+    direct = f"{prefix}.weight"
+    wrapped = f"{prefix}.linear.weight"
+    if direct in towers.values:
+        return _mm_b(towers.get(direct))
+    return _mm_b(towers.get(wrapped))
+
+
+def _emit_vision_tower(
+    b: Builder, towers: _TowerWeights, pixel_values: TensorRef,
+    pixel_pos: Tuple[TensorRef, TensorRef], vision_lengths: TensorRef,
+    pool_map: TensorRef, embed_map: TensorRef,
+) -> TensorRef:
+    pixel_x, pixel_y = pixel_pos
+    vp = "model.vision_tower"
+    x = _scaled(b, pixel_values, 2.0) - b.constant(1.0)
+    x = nn.Linear(_linear_weight(towers, f"{vp}.patch_embedder.input_proj"),
+                  dtype=aion.q8_0, name="patch_embedder.input_proj")(x)
+    pos = towers.get(f"{vp}.patch_embedder.position_embedding_table")
+    x_pos = nn.Embedding(pos[0], dtype=aion.q8_0, name="patch_embedder.x_pos")(pixel_x)
+    y_pos = nn.Embedding(pos[1], dtype=aion.q8_0, name="patch_embedder.y_pos")(pixel_y)
+    x = x + x_pos + y_pos
+    _dbg(b, x, "vis.patch")
+
+    for layer in range(16):
+        p = f"{vp}.encoder.layers.{layer}"
+        with b.scope(f"vision.layers.{layer}"):
+            residual = x
+            h = _rms(towers.get(f"{p}.input_layernorm.weight"), "input_layernorm")(x)
+            attn = nn.Attention(
+                _linear_weight(towers, f"{p}.self_attn.q_proj"),
+                _linear_weight(towers, f"{p}.self_attn.o_proj"),
+                k_proj=_linear_weight(towers, f"{p}.self_attn.k_proj"),
+                v_proj=_linear_weight(towers, f"{p}.self_attn.v_proj"),
+                heads=12, kv_heads=12, head_dim=64, scale=1.0,
+                window=aion.AttentionWindow.FULL,
+                dtype=aion.q8_0, name="self_attn",
+            )
+            q, k, v = attn.project(h)
+            assert k is not None and v is not None
+            q = VISION_ROPE.forward(_rms(towers.get(f"{p}.self_attn.q_norm.weight"), "q_norm")(q), pixel_pos)
+            k = VISION_ROPE.forward(_rms(towers.get(f"{p}.self_attn.k_norm.weight"), "k_norm")(k), pixel_pos)
+            v = _rms(None, "v_norm", 64)(v)
+            h = attn.attend(q, k, v, kv_lengths=vision_lengths)
+            x = residual + _rms(towers.get(f"{p}.post_attention_layernorm.weight"), "post_attention_layernorm")(h)
+
+            residual = x
+            h = _rms(towers.get(f"{p}.pre_feedforward_layernorm.weight"), "pre_feedforward_layernorm")(x)
+            h = nn.GatedMLP(
+                _linear_weight(towers, f"{p}.mlp.gate_proj"),
+                _linear_weight(towers, f"{p}.mlp.up_proj"),
+                _linear_weight(towers, f"{p}.mlp.down_proj"),
+                act="gelu", dtype=aion.q8_0, name="mlp",
+            )(h)
+            x = residual + _rms(towers.get(f"{p}.post_feedforward_layernorm.weight"), "post_feedforward_layernorm")(h)
+            if layer == 0:
+                _dbg(b, x, "vis.layer0")
+    _dbg(b, x, "vis.last")
+
+    # Host-provided geometry matrix is the exact sparse k×k spatial average.
+    x = _scaled(b, b.matmul(pool_map, x), math.sqrt(768.0))
+    _dbg(b, x, "vis.pooled")
+    x = _rms(None, "embed_vision.pre_projection_norm", 768)(x)
+    x = nn.Linear(_linear_weight(towers, "model.embed_vision.embedding_projection"),
+                  dtype=aion.q8_0, name="embed_vision.projection")(x)
+    _dbg(b, x, "vis.features")
+    return b.matmul(embed_map, x)
+
+
+AUDIO_K_SCALE: float = math.log1p(math.e) / math.log(2.0)
+
+
+def _audio_q_weight(towers: _TowerWeights, prefix: str) -> np.ndarray:
+    """q_proj with Gemma's per-dim query scale folded in, so attention takes one scalar."""
+    per_dim = towers.get(f"{prefix}.self_attn.per_dim_scale")
+    scale = (128.0 ** -0.5) / math.log(2.0) * np.logaddexp(0.0, per_dim)
+    return _linear_weight(towers, f"{prefix}.self_attn.q_proj") * np.tile(scale, 8)[None, :]
+
+
+def _audio_position_table(towers: _TowerWeights, layer: int) -> np.ndarray:
+    inv = np.exp(np.arange(512, dtype=np.float32) * (-math.log(10000.0) / 511.0))
+    positions = np.arange(12, -1, -1, dtype=np.float32)[:, None]
+    base = np.concatenate((np.sin(positions * inv), np.cos(positions * inv)), axis=-1)
+    w = towers.get(f"model.audio_tower.layers.{layer}.self_attn.relative_k_proj.weight")
+    return _f32((base @ w.T).reshape(13, 8, 128).transpose(1, 0, 2))
+
+
+def _audio_ffn(b: Builder, towers: _TowerWeights, x: TensorRef, prefix: str) -> TensorRef:
+    residual = x
+    x = _rms(towers.get(f"{prefix}.pre_layer_norm.weight"), "pre_layer_norm")(x)
+    x = nn.Linear(_linear_weight(towers, f"{prefix}.ffw_layer_1"), dtype=aion.q8_0, name="linear_1")(x).silu()
+    x = nn.Linear(_linear_weight(towers, f"{prefix}.ffw_layer_2"), dtype=aion.q8_0, name="linear_2")(x)
+    x = _scaled(b, _rms(towers.get(f"{prefix}.post_layer_norm.weight"), "post_layer_norm")(x), 0.5)
+    return residual + x
+
+
+def _emit_audio_tower(
+    b: Builder, towers: _TowerWeights, features: TensorRef, feature_mask: TensorRef,
+    subsample1_mask: TensorRef, attention_mask: TensorRef, embed_map: TensorRef,
+) -> TensorRef:
+    ap = "model.audio_tower"
+    x = (features * feature_mask).reshape((1, "audio_frames", 128, 1))
+    for idx, cin, cout in ((0, 1, 128), (1, 128, 32)):
+        p = f"{ap}.subsample_conv_projection.layer{idx}"
+        if idx == 1:
+            x = x * subsample1_mask
+        w = towers.get(f"{p}.conv.weight").transpose(2, 3, 1, 0)
+        x = nn.Conv2D(_f32(w), stride_h=2, stride_w=2,
+                      pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+                      name=f"audio.subsample.{idx}.conv")(x)
+        x = nn.LayerNorm(towers.get(f"{p}.norm.weight"), eps=RMS_EPS,
+                         name=f"audio.subsample.{idx}.norm")(x).relu()
+    x = x.reshape((1, "audio_tokens", 1024))
+    x = nn.Linear(_linear_weight(towers, f"{ap}.subsample_conv_projection.input_proj_linear"),
+                  dtype=aion.q8_0, name="audio.input_projection")(x)
+    _dbg(b, x, "aud.subsample")
+
+    zero_bias = np.zeros((8, 128), dtype=np.float32)
+    for layer in range(12):
+        p = f"{ap}.layers.{layer}"
+        with b.scope(f"audio.layers.{layer}"):
+            x = _audio_ffn(b, towers, x, f"{p}.feed_forward1")
+            if layer == 0:
+                _dbg(b, x, "aud.l0.ffn1")
+            residual = x
+            h = nn.RelPosSelfAttention(
+                _audio_q_weight(towers, p),
+                _linear_weight(towers, f"{p}.self_attn.k_proj") * AUDIO_K_SCALE,
+                _linear_weight(towers, f"{p}.self_attn.v_proj"),
+                _linear_weight(towers, f"{p}.self_attn.post"),
+                _audio_position_table(towers, layer), zero_bias, zero_bias,
+                scale=1.0, mask=attention_mask, window=AUDIO_WINDOW,
+                relative_zero_index=12, attn_logits_soft_cap=50.0,
+                dtype=aion.q8_0, name="self_attn",
+            )(_rms(towers.get(f"{p}.norm_pre_attn.weight"), "norm_pre_attn")(x))
+            if layer == 0:
+                _dbg(b, h, "aud.l0.attn")
+            x = residual + _rms(towers.get(f"{p}.norm_post_attn.weight"), "norm_post_attn")(h)
+            if layer == 0:
+                _dbg(b, x, "aud.l0.post_attn")
+
+            residual = x
+            h = _rms(towers.get(f"{p}.lconv1d.pre_layer_norm.weight"), "lconv1d.pre_norm")(x)
+            h = nn.Linear(_linear_weight(towers, f"{p}.lconv1d.linear_start"), dtype=aion.q8_0, name="lconv1d.linear_start")(h)
+            # `F.glu(x)` is `first * sigmoid(second)` -- the value is the FIRST half
+            # and the gate the second, which is the opposite of the reading that
+            # comes naturally from "gated".
+            h = b.slice_last_dim(h, 0, 1024) * b.slice_last_dim(h, 1024, 1024).sigmoid()
+            cw = towers.get(f"{p}.lconv1d.depthwise_conv1d.weight").transpose(2, 1, 0)
+            h = nn.Conv1D(_f32(cw), pad_left=4, groups=1024, name="lconv1d.depthwise")(h)
+            h = _rms(towers.get(f"{p}.lconv1d.conv_norm.weight"), "lconv1d.conv_norm")(h).silu()
+            h = nn.Linear(_linear_weight(towers, f"{p}.lconv1d.linear_end"), dtype=aion.q8_0, name="lconv1d.linear_end")(h)
+            x = residual + h
+            if layer == 0:
+                _dbg(b, x, "aud.l0.lconv")
+            x = _audio_ffn(b, towers, x, f"{p}.feed_forward2")
+            if layer == 0:
+                _dbg(b, x, "aud.l0.ffn2")
+            x = _rms(towers.get(f"{p}.norm_out.weight"), "norm_out")(x)
+            if layer == 0:
+                _dbg(b, x, "aud.layer0")
+
+    x = nn.Linear(_linear_weight(towers, f"{ap}.output_proj"), towers.get(f"{ap}.output_proj.bias"),
+                  dtype=aion.q8_0, name="audio.output_proj")(x)
+    _dbg(b, x, "aud.tower")
+    x = _rms(None, "embed_audio.pre_projection_norm", 1536)(x)
+    x = nn.Linear(_linear_weight(towers, "model.embed_audio.embedding_projection"),
+                  dtype=aion.q8_0, name="embed_audio.projection")(x)
+    _dbg(b, x, "aud.features")
+    return b.matmul(embed_map, x)
+
+
 # --------------------------------- forward -----------------------------------
 
 
-def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights]):
+def _last_index(b: Builder, tokens: TensorRef, x: TensorRef) -> TensorRef:
+    """`[batch, 1]` i32 holding `seq - 1`, the row generation samples from.
+
+    `b.dim` reifies the runtime sequence length as a one-element tensor. The `1`
+    to subtract comes from `col <= col`, which is a batch-shaped i32 one -- so the
+    index broadcasts to every batch entry (no `batch == 1` assumption) and the
+    model carries no baked integer weight for it.
+    """
+    col = b.slice(tokens, (0, 0), ("batch", 1))
+    return b.sub(b.dim(x, 1), b.compare("le", col, col))
+
+
+def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights], towers: _TowerWeights):
     """Emit the full forward graph. Returns (logits, {src: (k_in, k_out, v_in, v_out)})."""
     # Public runtime inputs.
     tokens = _input(b, "tokens", aion.int32, ("batch", "seq"))
@@ -291,6 +500,24 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     cache_visible_end = _input(
         b, "cache_visible_end", aion.int32, ("batch",)
     )
+
+    # Processor outputs and sparse placement matrices. Towers live behind regions,
+    # so text-only decode never evaluates them; dummy tensors only satisfy binding.
+    has_image = _input(b, "has_image", aion.int32, (1,))
+    text_embedding_mask = _input(b, "text_embedding_mask", aion.float32, ("batch", "seq", 1))
+    pixel_values = _input(b, "pixel_values", aion.float32, (1, "vision_seq", 768))
+    pixel_x = _input(b, "image_position_x", aion.int32, (1, "vision_seq"))
+    pixel_y = _input(b, "image_position_y", aion.int32, (1, "vision_seq"))
+    vision_lengths = _input(b, "vision_lengths", aion.int32, (1,))
+    image_pool_map = _input(b, "image_pool_map", aion.float32, (1, "vision_out", "vision_seq"))
+    image_embed_map = _input(b, "image_embed_map", aion.float32, ("batch", "seq", "vision_out"))
+
+    has_audio = _input(b, "has_audio", aion.int32, (1,))
+    audio_features = _input(b, "input_features", aion.float32, (1, "audio_frames", 128))
+    audio_feature_mask = _input(b, "input_features_mask", aion.float32, (1, "audio_frames", 1))
+    audio_subsample1_mask = _input(b, "audio_subsample1_mask", aion.float32, (1, "audio_sub1", 1, 1))
+    audio_attention_mask = _input(b, "audio_attention_mask", aion.float32, ("audio_tokens", "audio_tokens"))
+    audio_embed_map = _input(b, "audio_embed_map", aion.float32, ("batch", "seq", "audio_tokens"))
 
     # KV cache public inputs — f16, one pair per source layer.
     k_cache_in: Dict[int, TensorRef] = {}
@@ -318,9 +545,56 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     embed = nn.Embedding(shared.embed_tokens, dtype=aion.q8_0, name="embed_tokens")
     emb_scaled = _scaled(b, embed(tokens), math.sqrt(EMBED_DIM))         # [B,S,1536]
 
+    _dbg(b, emb_scaled, "emb_scaled")
+
+    if _DEBUG_STAGES:
+        # Stage dumping needs the tower stages to be ordinary graph values, which a
+        # region output is not. The towers then always execute; only the validation
+        # build takes this path.
+        vision_sparse = _emit_vision_tower(
+            b, towers, pixel_values, (pixel_x, pixel_y), vision_lengths,
+            image_pool_map, image_embed_map,
+        )
+        audio_sparse = _emit_audio_tower(
+            b, towers, audio_features, audio_feature_mask, audio_subsample1_mask,
+            audio_attention_mask, audio_embed_map,
+        )
+    else:
+        b.begin_region()
+        vision_sparse = _emit_vision_tower(
+            b, towers, pixel_values, (pixel_x, pixel_y), vision_lengths,
+            image_pool_map, image_embed_map,
+        )
+        vision_region = b.end_region((vision_sparse,))
+        b.begin_region()
+        no_vision_region = b.end_region((_scaled(b, emb_scaled, 0.0),))
+
+        b.begin_region()
+        audio_sparse = _emit_audio_tower(
+            b, towers, audio_features, audio_feature_mask, audio_subsample1_mask,
+            audio_attention_mask, audio_embed_map,
+        )
+        audio_region = b.end_region((audio_sparse,))
+        b.begin_region()
+        no_audio_region = b.end_region((_scaled(b, emb_scaled, 0.0),))
+
+        vision_sparse = b.if_(has_image, vision_region, no_vision_region)
+        audio_sparse = b.if_(has_audio, audio_region, no_audio_region)
+    # Placeholder ids are replaced with PAD for safe gathers and PLI construction;
+    # this mask removes PAD's main embedding where a soft token is inserted.
+    x = emb_scaled * text_embedding_mask + vision_sparse + audio_sparse
+    _dbg(b, x, "merged")
+
+    # ---- PLI ----
+    # Two halves, and they read different things. The token-identity half comes
+    # from the ids (placeholders already replaced with PAD upstream); the
+    # context half projects the embedding the decoder actually consumes -- the
+    # MERGED one, soft tokens included, which is what the reference feeds its
+    # text model. Building it before the merge would leave every image/audio slot
+    # projecting PAD.
     pli_proj = nn.Linear(shared.per_layer_model_projection, dtype=aion.q8_0,
                          name="per_layer_model_projection")
-    pli_proj_scaled = _scaled(b, pli_proj(emb_scaled), 1.0 / math.sqrt(EMBED_DIM))
+    pli_proj_scaled = _scaled(b, pli_proj(x), 1.0 / math.sqrt(EMBED_DIM))
     pli_proj_norm = _rms(shared.per_layer_projection_norm, "per_layer_projection_norm")(
         pli_proj_scaled.reshape(("batch", "seq", NUM_LAYERS, PLI_DIM)))
 
@@ -330,8 +604,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
         ("batch", "seq", NUM_LAYERS, PLI_DIM))
 
     pli = _scaled(b, pli_proj_norm + pli_emb_r, 1.0 / math.sqrt(2.0))     # [B,S,35,256]
-
-    x = emb_scaled
+    _dbg(b, pli, "pli")
     k_cache_cur: Dict[int, TensorRef] = dict(k_cache_in)
     v_cache_cur: Dict[int, TensorRef] = dict(v_cache_in)
 
@@ -339,7 +612,8 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     for layer_idx, lw in enumerate(layers):
         is_glob = is_global_layer(layer_idx)
         head_dim = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
-        sliding = 0 if is_glob else LOCAL_SLIDING_WINDOW
+        window = (aion.AttentionWindow.CAUSAL if is_glob
+                  else aion.AttentionWindow.sliding(LOCAL_SLIDING_WINDOW - 1))
         rope_base = ROPE_GLOBAL_BASE if is_glob else ROPE_LOCAL_BASE
         rope_prop = ROPE_GLOBAL_PROPORTION if is_glob else ROPE_LOCAL_PROPORTION
         src = kv_source_of(layer_idx)
@@ -354,26 +628,44 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
                 lw.q_proj, lw.o_proj,
                 k_proj=lw.k_proj, v_proj=lw.v_proj,
                 heads=NUM_HEADS, kv_heads=NUM_KV_HEADS, head_dim=head_dim,
-                scale=1.0, sliding_window=sliding, attn_logits_soft_cap=0.0,
+                scale=1.0, window=window, attn_logits_soft_cap=0.0,
                 dtype=aion.q8_0, name="self_attn",
             )
 
             x_norm = _rms(lw.input_ln, "input_layernorm")(x)
+            if layer_idx == 0:
+                _dbg(b, x_norm, "l0.input_ln")
             q, k4, v4 = attn.project(x_norm)
+            if layer_idx == 0:
+                _dbg(b, q, "l0.q_proj")
+                if k4 is not None:
+                    _dbg(b, k4, "l0.k_proj")
+                if v4 is not None:
+                    _dbg(b, v4, "l0.v_proj")
 
             # Q/K norms and RoPE sit between projection and attention — which is
             # exactly why `project` and `attend` are separate calls, and why all
             # three come back in this layout.
             q = _rms(lw.q_norm, "q_norm")(q)
+            if layer_idx == 0:
+                _dbg(b, q, "l0.q_norm")
             q = b.rope1d(q, positions, base_frequency=rope_base, rope_proportion=rope_prop)
+            if layer_idx == 0:
+                _dbg(b, q, "l0.q_rope")
 
             if is_source:
                 assert k4 is not None and v4 is not None and lw.k_norm is not None
                 k4 = _rms(lw.k_norm, "k_norm")(k4)
+                if layer_idx == 0:
+                    _dbg(b, k4, "l0.k_norm")
                 k4 = b.rope1d(k4, positions, base_frequency=rope_base, rope_proportion=rope_prop)
+                if layer_idx == 0:
+                    _dbg(b, k4, "l0.k_rope")
                 # A parameterless V-norm: with no gamma, `nn` supplies the shared
                 # all-ones identity rather than making the caller bake one.
                 v4 = _rms(None, "v_norm", head_dim)(v4)
+                if layer_idx == 0:
+                    _dbg(b, v4, "l0.v_norm")
 
                 for kv, cur in ((k4, k_cache_cur), (v4, v_cache_cur)):
                     cur[layer_idx] = b.sequence_append(
@@ -385,14 +677,32 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
                 q, k_cache_cur[src], v_cache_cur[src],
                 query_positions=positions, kv_lengths=cache_visible_end,
             )
-            x = x + _rms(lw.post_attn_ln, "post_attention_layernorm")(o_out)
+            if layer_idx == 0:
+                _dbg(b, o_out, "l0.o_proj")
+            post_attn = _rms(lw.post_attn_ln, "post_attention_layernorm")(o_out)
+            if layer_idx == 0:
+                _dbg(b, post_attn, "l0.post_attn_ln")
+            if layer_idx == 0:
+                _dbg(b, x, "l0.residual_in")
+            x = x + post_attn
+            if layer_idx == 0:
+                _dbg(b, x, "l0.x_after_attn")
 
             ff_in = _rms(lw.pre_ffn_ln, "pre_feedforward_layernorm")(x)
+            if layer_idx == 0:
+                _dbg(b, ff_in, "l0.pre_ffn_ln")
             # Split gate/up: the compiler fuses the matmul pair, and the GEGLU is one
             # `gate` op, so there is nothing to pre-concatenate or slice here.
             ff = nn.GatedMLP(lw.gate_proj, lw.up_proj, lw.down_proj,
                 act="gelu", dtype=aion.q8_0, name="mlp")(ff_in)
-            x = x + _rms(lw.post_ffn_ln, "post_feedforward_layernorm")(ff)
+            if layer_idx == 0:
+                _dbg(b, ff, "l0.mlp")
+            post_ffn = _rms(lw.post_ffn_ln, "post_feedforward_layernorm")(ff)
+            if layer_idx == 0:
+                _dbg(b, post_ffn, "l0.post_ffn_ln")
+            x = x + post_ffn
+            if layer_idx == 0:
+                _dbg(b, x, "l0.x_after_ffn")
 
             pli_gate = nn.Linear(
                 lw.pli_gate, dtype=aion.q8_0, name="per_layer_input_gate"
@@ -401,13 +711,29 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
                 lw.pli_proj, dtype=aion.q8_0, name="per_layer_projection"
             )
             pli_slice = b.slice(pli, (0, 0, layer_idx, 0), ("batch", "seq", 1, PLI_DIM))
+            pli_gated = pli_gate(x)
             pli_out = pli_out_proj(
-                pli_gate(x).gelu() * pli_slice.reshape(("batch", "seq", PLI_DIM)))
-            x = x + _rms(lw.post_pli_ln, "post_per_layer_input_norm")(pli_out)
+                pli_gated.gelu() * pli_slice.reshape(("batch", "seq", PLI_DIM)))
+            post_pli = _rms(lw.post_pli_ln, "post_per_layer_input_norm")(pli_out)
+            if layer_idx == 0:
+                _dbg(b, pli_slice.reshape(("batch", "seq", PLI_DIM)), "l0.per_layer_input")
+                _dbg(b, pli_gated, "l0.pli_gate")
+                _dbg(b, pli_out, "l0.pli_proj")
+                _dbg(b, post_pli, "l0.post_pli_ln")
+            x = x + post_pli
 
             x = _scaled(b, x, lw.skip_scale)
+            _dbg(b, x, f"layer{layer_idx}")
 
     # ---- Tail ----
+    # Generation only ever needs the *last* position's distribution, and the tied
+    # head is the single widest matmul in the model (vocab 262144). Keeping every
+    # prefill row would make a 272-token prompt materialize a 285 MB f32 logits
+    # tensor -- which argmax then has to see as whole rows, forcing a retile the
+    # compiler rightly refuses. Select the final row first: decode (seq == 1)
+    # gathers row 0 and is unchanged, prefill drops S-1 rows of head work.
+    x = b.gather(x, _last_index(b, tokens, x), axis=1, batch_dims=1)
+
     x = _rms(shared.final_norm, "norm")(x)
     # Tied head: contract against the embedding table's *rows*, reusing the very
     # parameter `embed` bound rather than a second copy of the table.
@@ -427,8 +753,8 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
 
     # Greedy next token, picked on the execution device. Outputs are mirrored to
     # the host lazily (only when read), so a caller that wants greedy decoding
-    # reads 4 bytes here instead of copying the whole [B, T, vocab] logits back
-    # every step; a caller that samples still has `logits`.
+    # reads 4 bytes here instead of copying the [B, 1, vocab] logits back every
+    # step; a caller that samples still has `logits`.
     b.mark_output(b.argmax(logits, axis=-1), "next_token")
 
     # next_*_cache outputs io-aliased back to the cache inputs.
@@ -455,7 +781,7 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
                 b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1, zero_init=True)
 
     for key, value in [
-        ("arch", "gemma4-e2b-text"),
+        ("arch", "gemma4-e2b-multimodal"),
         ("quant", "q8_0-weights-f16-cache"),
         ("num_layers", str(NUM_LAYERS)),
         ("embed_dim", str(EMBED_DIM)),
@@ -465,7 +791,7 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
         ("final_logit_softcap", str(FINAL_LOGIT_SOFTCAP)),
         ("kv_sharing.local_source_layer", str(LOCAL_SOURCE_LAYER)),
         ("kv_sharing.global_source_layer", str(GLOBAL_SOURCE_LAYER)),
-        ("graph_phase", "2-full-forward"),
+        ("graph_phase", "3-multimodal-forward"),
     ]:
         b.add_metadata(key, value)
 
@@ -476,14 +802,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     with aion.Context(thread_count=1) as ctx:
         with Builder(ctx) as b:
             with _WeightLoader(args.in_safetensors) as loader:
-                _reject_if_unexpected_multimodal(loader.keys(), args.allow_multimodal)
                 shared, layers = _load_weights(loader)
-            out = _emit_forward(b, shared, layers)
+                towers = _load_tower_weights(loader)
+            out = _emit_forward(b, shared, layers, towers)
             _finalize(b, *out)
             # Binding/quantization copies weights into Aion-owned storage. Drop
             # the checkpoint-side f32 arrays before export, which itself packs
             # initializer sections and temporarily needs another large buffer.
-            del shared, layers
+            del shared, layers, towers
             gc.collect()
             b.export(os.path.abspath(args.out_aion), None)
 

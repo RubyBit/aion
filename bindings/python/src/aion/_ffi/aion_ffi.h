@@ -231,6 +231,12 @@ typedef enum AionOp {
     AION_OP_IOTA = 30,
 } AionOp;
 
+typedef struct AionAttentionWindow {
+    uint32_t left;
+    uint32_t right;
+    uint32_t chunk;
+} AionAttentionWindow;
+
 typedef union AionOpAttr {
     struct { float alpha; float beta; } matmul;
     struct { AionBinaryOp op; } elemwise;
@@ -239,13 +245,12 @@ typedef union AionOpAttr {
     struct { float eps; const size_t* normalized_shape; size_t normalized_shape_len; } norm;
     struct {
         float scale;
-        uint8_t causal;
-        size_t sliding_window;
+        AionAttentionWindow window;
         float attn_logits_soft_cap;
         uint8_t has_query_positions;
         uint8_t has_kv_lengths;
     } attention;
-    struct { float scale; size_t chunk_size; size_t chunk_left; } relpos_mha;
+    struct { float scale; AionAttentionWindow window; size_t relative_zero_index; float attn_logits_soft_cap; } relpos_mha;
     struct { size_t stride; size_t dilation; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv1d;
     struct { size_t stride_h; size_t stride_w; size_t dilation_h; size_t dilation_w; size_t pad_top; size_t pad_bottom; size_t pad_left; size_t pad_right; size_t groups; AionPadMode pad_mode; } conv2d;
     struct { float base_frequency; float scale_factor; float rope_proportion; } rope1d;

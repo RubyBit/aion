@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import time
-import urllib.request
 from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -17,15 +17,15 @@ import aion
 from _common import add_device_args, load_model_with_device
 
 
-def _read_next_token(model, position: int) -> int:
+def _read_next_token(model) -> int:
     """Greedy token id from the model's device-side `next_token` output.
 
-    Shaped [B, T] like the logits it reduces, so `position` selects the same
-    row `np.argmax(logits[0, position])` would have.
+    The graph selects the final sequence row before the tied head, so this is
+    `[B, 1]` for both prefill and decode: the only row is the one to sample.
     """
     t = model.output_tensor("next_token")
     try:
-        return int(t.numpy()[0, position])
+        return int(t.numpy()[0, -1])
     finally:
         t.close()
 
@@ -41,17 +41,6 @@ def default_tokenizer_path() -> Path:
     return repo_root / "models" / "gemma" / "tokenizer.json"
 
 
-def default_sp_model_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[3]
-    return repo_root / "models" / "gemma" / "tokenizer.model"
-
-
-def _download(url: str, dst: Path) -> None: # TODO: Test download path
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "aion-gemma-example"})
-    with urllib.request.urlopen(req, timeout=60.0) as resp:
-        dst.write_bytes(resp.read())
-
 class _Tokenizer:
     """Tiny wrapper to normalize multiple tokenizer backends."""
 
@@ -63,6 +52,12 @@ class _Tokenizer:
     MASK: int = 4
     START_OF_TURN: int = 105
     END_OF_TURN: int = 106
+    BEGIN_OF_IMAGE: int = 255999
+    BEGIN_OF_AUDIO: int = 256000
+    IMAGE: int = 258880
+    AUDIO: int = 258881
+    END_OF_IMAGE: int = 258882
+    END_OF_AUDIO: int = 258883
 
     def __init__(self, kind: str, backend: object):
         self.kind = kind
@@ -94,8 +89,8 @@ class _Tokenizer:
         raise RuntimeError(f"unknown tokenizer kind: {self.kind}")
 
 
-def _load_tokenizer(path_or_url: str, *, cache_path: Path) -> _Tokenizer:
-    """Load a tokenizer from a file path, directory, or URL.
+def _load_tokenizer(path: str) -> _Tokenizer:
+    """Load a tokenizer from a local file or directory.
 
     Supported inputs:
       - tokenizer.json (Hugging Face `tokenizers`)
@@ -124,18 +119,7 @@ def _load_tokenizer(path_or_url: str, *, cache_path: Path) -> _Tokenizer:
             raise SystemExit(f"failed to load sentencepiece model: {p}")
         return _Tokenizer("sentencepiece", proc)
 
-    # URL: download to cache_path and then load based on extension.
-    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
-        # Preserve extension when the cache_path is a directory.
-        if cache_path.suffix == "":
-            cache_path = cache_path / Path(path_or_url).name
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        if not cache_path.is_file():
-            print(f"downloading tokenizer -> {cache_path}")
-            _download(path_or_url, cache_path)
-        p = cache_path
-    else:
-        p = Path(path_or_url).expanduser().resolve()
+    p = Path(path).expanduser().resolve()
 
     if p.is_dir():
         json_p = p / "tokenizer.json"
@@ -179,6 +163,234 @@ def _ns_to_ms(ns: int) -> float:
     return float(ns) / 1.0e6
 
 
+def _gemma_chat_ids(tokenizer: _Tokenizer, content_ids: Sequence[int], prompt: str) -> List[int]:
+    """The canonical single-user Gemma turn used by this standalone example."""
+    ids = [tokenizer.BOS, tokenizer.START_OF_TURN]
+    ids += tokenizer.encode("user\n")
+    ids += [int(x) for x in content_ids]
+    ids += tokenizer.encode(prompt)
+    ids += [tokenizer.END_OF_TURN]
+    ids += tokenizer.encode("\n")
+    ids += [tokenizer.START_OF_TURN]
+    ids += tokenizer.encode("model\n")
+    return ids
+
+
+def _mel_filter_bank() -> np.ndarray:
+    """Gemma's 257-bin -> 128-bin HTK mel filter bank."""
+    fft_freqs = np.linspace(0.0, 8000.0, 257)
+    min_mel = 2595.0 * np.log10(1.0)
+    max_mel = 2595.0 * np.log10(1.0 + 8000.0 / 700.0)
+    mel_freqs = np.linspace(min_mel, max_mel, 130)
+    filter_freqs = 700.0 * (np.power(10.0, mel_freqs / 2595.0) - 1.0)
+    diffs = np.diff(filter_freqs)
+    slopes = filter_freqs[None, :] - fft_freqs[:, None]
+    down = -slopes[:, :-2] / diffs[:-1]
+    up = slopes[:, 2:] / diffs[1:]
+    return np.maximum(0.0, np.minimum(down, up))
+
+
+def _prepare_audio(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read 16 kHz audio and reproduce Gemma's local log-mel frontend."""
+    try:
+        import soundfile as sf
+    except Exception as exc:  # pragma: no cover
+        raise SystemExit("--audio requires soundfile; install via: uv pip install soundfile") from exc
+
+    samples, rate = sf.read(path, dtype="float32", always_2d=False)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1, dtype=np.float32)
+    if samples.ndim != 1:
+        raise SystemExit(f"unsupported audio shape: {samples.shape}")
+    if int(rate) != 16_000:
+        raise SystemExit(f"Gemma audio must be 16 kHz; got {rate} Hz")
+
+    # The reference accepts at most 30 seconds and pads the waveform length to a
+    # multiple of 128 before applying semicausal (160-sample left) padding.
+    samples = np.asarray(samples[:480_000], dtype=np.float32)
+    original_length = samples.shape[0]
+    padded_length = ((max(original_length, 1) + 127) // 128) * 128
+    waveform = np.pad(samples, (160, padded_length - original_length))
+    sample_mask = np.pad(
+        np.ones(original_length, dtype=np.bool_),
+        (160, padded_length - original_length),
+    )
+
+    # Frames contain 321 samples because the last is reserved for the optional
+    # pre-emphasis operation. Gemma has pre-emphasis disabled, so use the first 320.
+    frame_count = (waveform.shape[0] - 321) // 160 + 1
+    if frame_count <= 0:
+        raise SystemExit("audio is too short to produce a feature frame")
+    frames = np.lib.stride_tricks.as_strided(
+        waveform,
+        shape=(frame_count, 321),
+        strides=(waveform.strides[0] * 160, waveform.strides[0]),
+    )[:, :320]
+    n = np.arange(320, dtype=np.float32)
+    window = (0.5 - 0.5 * np.cos(2.0 * np.pi * n / 320.0)).astype(np.float32)
+    magnitude = np.abs(np.fft.rfft(frames * window, n=512, axis=-1))
+    features = np.log(magnitude @ _mel_filter_bank() + np.float64(1.0e-3))
+
+    frame_ends = np.arange(frame_count) * 160 + 320
+    mask = sample_mask[frame_ends]
+    features = (features * mask[:, None]).astype(np.float32)
+    return features[None, ...], mask[None, ...].astype(np.float32)
+
+
+def _image_target_size(height: int, width: int) -> tuple[int, int]:
+    max_patches = 280 * 9
+    patch_size = 16
+    side_multiple = 3 * patch_size
+    factor = math.sqrt(max_patches * patch_size**2 / (height * width))
+    target_h = int(math.floor(factor * height / side_multiple)) * side_multiple
+    target_w = int(math.floor(factor * width / side_multiple)) * side_multiple
+    max_side = (max_patches // 9) * side_multiple
+    if target_h == 0 and target_w == 0:
+        raise SystemExit("image aspect ratio is too extreme for Gemma's patch budget")
+    if target_h == 0:
+        target_h = side_multiple
+        target_w = min(int(math.floor(width / height)) * side_multiple, max_side)
+    elif target_w == 0:
+        target_w = side_multiple
+        target_h = min(int(math.floor(height / width)) * side_multiple, max_side)
+    return target_h, target_w
+
+
+def _prepare_image(path: Path) -> tuple[np.ndarray, np.ndarray, int]:
+    """Resize, patchify, and position one image in Gemma's expected layout."""
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover
+        raise SystemExit("--image requires pillow; install via: uv pip install pillow") from exc
+
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+        target_h, target_w = _image_target_size(image.height, image.width)
+        image = image.resize((target_w, target_h), resample=Image.Resampling.BICUBIC)
+        pixels = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+
+    patch_h, patch_w = target_h // 16, target_w // 16
+    patches = pixels.reshape(3, patch_h, 16, patch_w, 16)
+    patches = patches.transpose(1, 3, 2, 4, 0).reshape(patch_h * patch_w, 768)
+    yy, xx = np.meshgrid(np.arange(patch_h), np.arange(patch_w), indexing="ij")
+    positions = np.stack((xx, yy), axis=-1).reshape(-1, 2).astype(np.int32)
+    real_patches = patches.shape[0]
+    patches = np.pad(patches, ((0, 2520 - real_patches), (0, 0)))
+    positions = np.pad(positions, ((0, 2520 - real_patches), (0, 0)), constant_values=-1)
+    return patches[None, ...].astype(np.float32), positions[None, ...], real_patches // 9
+
+
+def _pool_matrix(position_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Exact Gemma 4 position-driven 3x3 average-pooling geometry."""
+    if position_ids.shape[0] != 1:
+        raise SystemExit("this example currently accepts one image per prompt")
+    positions = position_ids[0]
+    p = positions.shape[0]
+    out_len = p // 9
+    valid_patch = np.all(positions != -1, axis=-1)
+    clamped = np.maximum(positions, 0)
+    max_x = int(clamped[valid_patch][:, 0].max()) + 1
+    groups = clamped[:, 0] // 3 + (max_x // 3) * (clamped[:, 1] // 3)
+    pool = np.zeros((1, out_len, p), dtype=np.float32)
+    pool[0, groups, np.arange(p)] = 1.0 / 9.0
+    # A padding patch has position (-1, -1), which clamps into group 0 -- so every
+    # one of them would otherwise be averaged into the image's first soft token
+    # (216 extra patches at 1/9 each, i.e. 25x too large). The reference zeroes the
+    # padded rows before pooling; dropping their weights here is the same thing,
+    # and keeps the divisor at the fixed k^2 the reference uses.
+    pool[0][:, ~valid_patch] = 0.0
+    valid_groups = np.any(pool[0] != 0, axis=1)
+    return pool, valid_groups
+
+
+def _prepare_multimodal(args) -> tuple[List[int], _Tokenizer, dict[str, np.ndarray]]:
+    tokenizer = _load_tokenizer(args.tokenizer)
+    content_ids: List[int] = []
+    pixels = pos = features = mask0 = None
+    if args.image is not None:
+        pixels, pos, image_tokens = _prepare_image(args.image)
+        content_ids += [tokenizer.BEGIN_OF_IMAGE]
+        content_ids += [tokenizer.IMAGE] * image_tokens
+        content_ids += [tokenizer.END_OF_IMAGE]
+    if args.audio is not None:
+        features, mask0 = _prepare_audio(args.audio)
+        mask1 = mask0[:, ::2]
+        mask2 = mask1[:, ::2]
+        audio_tokens = int((mask2[0] != 0).sum())
+        content_ids += [tokenizer.BEGIN_OF_AUDIO]
+        content_ids += [tokenizer.AUDIO] * audio_tokens
+        content_ids += [tokenizer.END_OF_AUDIO]
+
+    original_ids = np.asarray(
+        [_gemma_chat_ids(tokenizer, content_ids, args.prompt)], dtype=np.int32
+    )
+    seq = original_ids.shape[1]
+    image_slots = np.flatnonzero(original_ids[0] == tokenizer.IMAGE)
+    audio_slots = np.flatnonzero(original_ids[0] == tokenizer.AUDIO)
+    multimodal = (original_ids == tokenizer.IMAGE) | (original_ids == tokenizer.AUDIO)
+    llm_ids = original_ids.copy()
+    llm_ids[multimodal] = 0
+
+    bindings: dict[str, np.ndarray] = {
+        "has_image": np.array([int(args.image is not None)], np.int32),
+        "has_audio": np.array([int(args.audio is not None)], np.int32),
+        "text_embedding_mask": (~multimodal)[..., None].astype(np.float32),
+    }
+
+    if args.image is not None:
+        assert pixels is not None and pos is not None
+        pool, valid_groups = _pool_matrix(pos)
+        valid_count = int(valid_groups.sum())
+        if valid_count != len(image_slots):
+            raise SystemExit(f"image soft-token mismatch: prompt={len(image_slots)}, tower={valid_count}")
+        place = np.zeros((1, seq, pool.shape[1]), np.float32)
+        place[0, image_slots, np.flatnonzero(valid_groups)] = 1.0
+        bindings.update({
+            "pixel_values": pixels,
+            "image_position_x": np.maximum(pos[..., 0], 0),
+            "image_position_y": np.maximum(pos[..., 1], 0),
+            "vision_lengths": np.array([np.all(pos != -1, axis=-1).sum()], np.int32),
+            "image_pool_map": pool,
+            "image_embed_map": place,
+        })
+    else:
+        bindings.update({
+            "pixel_values": np.zeros((1, 9, 768), np.float32),
+            "image_position_x": np.zeros((1, 9), np.int32),
+            "image_position_y": np.zeros((1, 9), np.int32),
+            "vision_lengths": np.array([1], np.int32),
+            "image_pool_map": np.zeros((1, 1, 9), np.float32),
+            "image_embed_map": np.zeros((1, seq, 1), np.float32),
+        })
+
+    if args.audio is not None:
+        assert features is not None and mask0 is not None
+        mask1 = mask0[:, ::2]
+        mask2 = mask1[:, ::2]
+        valid = mask2[0] != 0
+        if int(valid.sum()) != len(audio_slots):
+            raise SystemExit(f"audio soft-token mismatch: prompt={len(audio_slots)}, tower={int(valid.sum())}")
+        place = np.zeros((1, seq, mask2.shape[1]), np.float32)
+        place[0, audio_slots, np.flatnonzero(valid)] = 1.0
+        additive = np.where(valid[None, :], 0.0, -1.0e9).astype(np.float32)
+        bindings.update({
+            "input_features": features,
+            "input_features_mask": mask0[..., None],
+            "audio_subsample1_mask": mask1[..., None, None],
+            "audio_attention_mask": np.broadcast_to(additive, (mask2.shape[1], mask2.shape[1])).copy(),
+            "audio_embed_map": place,
+        })
+    else:
+        bindings.update({
+            "input_features": np.zeros((1, 4, 128), np.float32),
+            "input_features_mask": np.ones((1, 4, 1), np.float32),
+            "audio_subsample1_mask": np.ones((1, 2, 1, 1), np.float32),
+            "audio_attention_mask": np.zeros((1, 1), np.float32),
+            "audio_embed_map": np.zeros((1, seq, 1), np.float32),
+        })
+    return llm_ids[0].tolist(), tokenizer, bindings
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Gemma 4 E2B: prefill + generate 1+ token(s) using aion")
     p.add_argument("--model", type=Path, default=default_model_path(), help="Path to gemma4_e2b_q8.aion")
@@ -187,7 +399,7 @@ def main() -> None:
         type=str,
         default=str(default_tokenizer_path()),
         help=(
-            "Path/URL to tokenizer.json or tokenizer.model, or a directory containing them. "
+            "Local tokenizer.json/tokenizer.model path, or a directory containing one. "
             "If omitted, uses a dummy token id (useful for kernel debugging but not real text)."
         ),
     )
@@ -199,6 +411,8 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     p.add_argument("--prompt", type=str, default="Hello")
+    p.add_argument("--image", type=Path, default=None, help="Optional image for a multimodal prompt")
+    p.add_argument("--audio", type=Path, default=None, help="Optional audio file for a multimodal prompt")
     p.add_argument("--add-bos", action="store_true", help="Prepend BOS token (requires tokenizer)")
     p.add_argument("--add-eos", action="store_true", help="Append EOS token (requires tokenizer)")
     p.add_argument(
@@ -276,15 +490,16 @@ def main() -> None:
     tok_src: Optional[str] = args.tokenizer
     if tok_src is None and args.tokenizer_json is not None:
         tok_src = args.tokenizer_json
-    if tok_src is not None:
-        # If the user provided a URL, cache into models/gemma/{tokenizer.json|tokenizer.model}.
-        cache_path = default_tokenizer_path() if tok_src.endswith(".json") else default_sp_model_path()
-        tokenizer = _load_tokenizer(tok_src, cache_path=cache_path)
+    if tok_src is not None and args.image is None and args.audio is None:
+        tokenizer = _load_tokenizer(tok_src)
 
     t0_all_ns = time.perf_counter_ns()
 
     t0_tok_ns = time.perf_counter_ns()
-    if args.chat:
+    mm_bindings: dict[str, np.ndarray] = {}
+    if args.image is not None or args.audio is not None:
+        prompt_ids, tokenizer, mm_bindings = _prepare_multimodal(args)
+    elif args.chat:
         if tokenizer is None:
             raise SystemExit("--chat requires a tokenizer")
         # Follow upstream Gemma4 chat formatting (see gemma4_pt_claude README).
@@ -298,6 +513,24 @@ def main() -> None:
         if (args.add_bos or args.add_eos) and tokenizer is None:
             raise SystemExit("--add-bos/--add-eos require a tokenizer")
         prompt_ids = _encode_prompt(tokenizer, args.prompt, add_bos=bool(args.add_bos), add_eos=bool(args.add_eos))
+    if args.image is None and args.audio is None:
+        seq = len(prompt_ids)
+        mm_bindings = {
+            "has_image": np.array([0], np.int32),
+            "has_audio": np.array([0], np.int32),
+            "text_embedding_mask": np.ones((1, seq, 1), np.float32),
+            "pixel_values": np.zeros((1, 9, 768), np.float32),
+            "image_position_x": np.zeros((1, 9), np.int32),
+            "image_position_y": np.zeros((1, 9), np.int32),
+            "vision_lengths": np.array([1], np.int32),
+            "image_pool_map": np.zeros((1, 1, 9), np.float32),
+            "image_embed_map": np.zeros((1, seq, 1), np.float32),
+            "input_features": np.zeros((1, 4, 128), np.float32),
+            "input_features_mask": np.ones((1, 4, 1), np.float32),
+            "audio_subsample1_mask": np.ones((1, 2, 1, 1), np.float32),
+            "audio_attention_mask": np.zeros((1, 1), np.float32),
+            "audio_embed_map": np.zeros((1, seq, 1), np.float32),
+        }
     tok_ns = time.perf_counter_ns() - t0_tok_ns
     s0 = len(prompt_ids)
 
@@ -347,10 +580,16 @@ def main() -> None:
         # Prefill tokens [1, S]; decode-step tensor [1, 1] rewritten in place.
         tokens_prefill = aion.Tensor([prompt_ids], ctx=ctx, dtype=aion.int32)
         tokens_step = aion.Tensor([[0]], ctx=ctx, dtype=aion.int32)
+        modality_tensors = {
+            name: aion.Tensor(value, ctx=ctx, dtype=aion.int32 if value.dtype == np.int32 else aion.float32)
+            for name, value in mm_bindings.items()
+        }
 
         try:
             # ---- Prefill ----
             model.bind_input("tokens", tokens_prefill)
+            for name, tensor in modality_tensors.items():
+                model.bind_input(name, tensor)
 
             print(f"prefill: tokens={s0}")
             t0_prefill_run_ns = time.perf_counter_ns()
@@ -364,7 +603,7 @@ def main() -> None:
             # device. Outputs are mirrored to the host lazily, so leaving the
             # [1, S, vocab] logits unread is what skips copying them back.
             t0_argmax_ns = time.perf_counter_ns()
-            next_id = _read_next_token(model, -1)
+            next_id = _read_next_token(model)
             argmax_ns = time.perf_counter_ns() - t0_argmax_ns
 
             # Generated token ids (excluding stop tokens for readability).
@@ -394,6 +633,19 @@ def main() -> None:
             # Switch bindings once: decode steps use a [1,1] tokens tensor. The
             # runtime keeps feeding indices/positions from its tracked position.
             model.bind_input("tokens", tokens_step)
+            modality_tensors["has_image"].copy_from(np.array([0], np.int32))
+            modality_tensors["has_audio"].copy_from(np.array([0], np.int32))
+            decode_bindings = {
+                "text_embedding_mask": np.ones((1, 1, 1), np.float32),
+                "image_embed_map": np.zeros((1, 1, mm_bindings["image_embed_map"].shape[2]), np.float32),
+                "audio_embed_map": np.zeros((1, 1, mm_bindings["audio_embed_map"].shape[2]), np.float32),
+            }
+            for name, value in decode_bindings.items():
+                previous = modality_tensors[name]
+                replacement = aion.Tensor(value, ctx=ctx, dtype=aion.float32)
+                modality_tensors[name] = replacement
+                model.bind_input(name, replacement)
+                previous.close()
 
             decode_total_run_ns: int = 0
             decode_total_argmax_ns: int = 0
@@ -410,7 +662,7 @@ def main() -> None:
                 decode_total_run_ns += time.perf_counter_ns() - t0_step_run_ns
 
                 t0_step_argmax_ns = time.perf_counter_ns()
-                next_id = _read_next_token(model, 0)
+                next_id = _read_next_token(model)
                 decode_total_argmax_ns += time.perf_counter_ns() - t0_step_argmax_ns
 
                 if tokenizer is not None and (next_id in stop_tokens):
@@ -485,7 +737,7 @@ def main() -> None:
                     print(f"[aion-perf-json] {json.dumps(timing_record, separators=(',', ':'))}")
         finally:
             # Close tensors (best-effort).
-            for t in [tokens_prefill, tokens_step]:
+            for t in [tokens_prefill, tokens_step, *modality_tensors.values()]:
                 try:
                     t.close()
                 except Exception:

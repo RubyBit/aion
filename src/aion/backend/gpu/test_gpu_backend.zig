@@ -1194,7 +1194,7 @@ fn buildAttentionSeq(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg 
     const q = try makeInput(&g, mgr, &.{ 2, 300, 4, 32 }, &.{ 2, 300, 4, 32 }, 50);
     const k = try makeInput(&g, mgr, &.{ 2, 300, 2, 32 }, &.{ 2, 300, 2, 32 }, 51);
     const v = try makeInput(&g, mgr, &.{ 2, 300, 2, 24 }, &.{ 2, 300, 2, 24 }, 52);
-    const out = try g.addAttention(q, k, v, null, null, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, null, null, 0.1767767, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1209,7 +1209,7 @@ fn buildAttentionSeqNonCausal(alloc: std.mem.Allocator, mgr: *StorageManager) !B
     const q = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 53);
     const k = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 54);
     const v = try makeInput(&g, mgr, &.{ 1, 24, 3, 32 }, &.{ 1, 24, 3, 32 }, 55);
-    const out = try g.addAttention(q, k, v, null, null, 0.25, false, 0, 0.0);
+    const out = try g.addAttention(q, k, v, null, null, 0.25, .full, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1227,7 +1227,7 @@ fn buildMHACached(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const v = try makeInput(&g, mgr, &.{ 2, 600, 2, 32 }, &.{ 2, 600, 2, 32 }, 62);
     const pos = try makeInputI32(&g, mgr, &.{ 2, 3 }, &.{ 1, 3 }, &.{ 517, 518, 519, 97, 98, 99 });
     const end = try makeInputI32(&g, mgr, &.{2}, &.{2}, &.{ 520, 100 });
-    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1248,7 +1248,7 @@ fn buildMHACachedTiledKV(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltP
     const v = try makeInput(&g, mgr, &.{ 2, 600, 2, 32 }, &.{ 2, 256, 2, 32 }, 62);
     const pos = try makeInputI32(&g, mgr, &.{ 2, 3 }, &.{ 1, 3 }, &.{ 517, 518, 519, 97, 98, 99 });
     const end = try makeInputI32(&g, mgr, &.{2}, &.{2}, &.{ 520, 100 });
-    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1298,7 +1298,7 @@ fn buildMHACachedF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg 
     const v = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 16 }, &.{ 1, 64, 1, 16 }, 65);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 48, 49 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{50});
-    const out = try g.addAttention(q, k, v, pos, end, 0.25, true, 20, 30.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.25, .sliding(19, 0), 30.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1312,7 +1312,7 @@ fn buildMHACachedSplitK(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPr
     const v = try makeInput(&g, mgr, &.{ 1, 2048, 2, 32 }, &.{ 1, 2048, 2, 32 }, 68);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 1990, 1991 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{1992});
-    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1618,7 +1618,7 @@ fn buildRelPosMHA(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const u = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 107);
     const vb = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 108);
     const mask = try makeInput(&g, mgr, &.{ 10, 10 }, &.{ 10, 10 }, 109);
-    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, mask, 0.25, 0, 0);
+    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, mask, 0.25, .full, 9, 0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -1637,12 +1637,69 @@ fn buildRelPosMHAChunked(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltP
     const pe = try makeInput(&g, mgr, &.{ 2, 19, 16 }, &.{ 1, 19, 16 }, 106);
     const u = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 107);
     const vb = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 108);
-    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.25, 4, 3);
+    const out = try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.25, .chunked(4, 3), 9, 0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
 test "gpu backend: rel-pos mha (chunked-limited window) matches CPU" {
     try expectGpuMatchesCpu(buildRelPosMHAChunked, 2 * 10 * 2 * 16, 2e-3);
+}
+
+/// One window vocabulary, two kernels: sweep every shape through both so the GPU's
+/// interval arithmetic and block skipping cannot drift from the CPU's.
+const window_cases = .{
+    aion.graph.AttentionWindow.causal,
+    aion.graph.AttentionWindow.full,
+    aion.graph.AttentionWindow.sliding(7, 0),
+    aion.graph.AttentionWindow.sliding(3, 3),
+    aion.graph.AttentionWindow.sliding(0, 0),
+    aion.graph.AttentionWindow.sliding(5, aion.graph.AttentionWindow.unbounded),
+    aion.graph.AttentionWindow.chunked(8, 4),
+    aion.graph.AttentionWindow.chunked(8, 0),
+    aion.graph.AttentionWindow.chunked(3, 7),
+};
+
+fn windowedAttention(comptime w: aion.graph.AttentionWindow) fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg {
+    return struct {
+        fn build(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+            var g = Graph.init(alloc);
+            defer g.deinit();
+            const q = try makeInput(&g, mgr, &.{ 1, 40, 4, 32 }, &.{ 1, 40, 4, 32 }, 70);
+            const k = try makeInput(&g, mgr, &.{ 1, 40, 2, 32 }, &.{ 1, 40, 2, 32 }, 71);
+            const v = try makeInput(&g, mgr, &.{ 1, 40, 2, 24 }, &.{ 1, 40, 2, 24 }, 72);
+            const out = try g.addAttention(q, k, v, null, null, 0.1767767, w, 0.0);
+            return finishProgGpuTiled(alloc, &g, mgr, out);
+        }
+    }.build;
+}
+
+test "gpu backend: every attention window shape matches CPU" {
+    inline for (window_cases) |w| {
+        try expectGpuMatchesCpu(windowedAttention(w), 1 * 40 * 4 * 24, 2e-5);
+    }
+}
+
+fn windowedRelPos(comptime w: aion.graph.AttentionWindow) fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg {
+    return struct {
+        fn build(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+            var g = Graph.init(alloc);
+            defer g.deinit();
+            const q = try makeInput(&g, mgr, &.{ 2, 20, 2, 16 }, &.{ 1, 20, 1, 16 }, 113);
+            const k = try makeInput(&g, mgr, &.{ 2, 20, 2, 16 }, &.{ 1, 20, 1, 16 }, 114);
+            const v = try makeInput(&g, mgr, &.{ 2, 20, 2, 16 }, &.{ 1, 20, 1, 16 }, 115);
+            const pe = try makeInput(&g, mgr, &.{ 2, 13, 16 }, &.{ 1, 13, 16 }, 116);
+            const u = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 117);
+            const vb = try makeInput(&g, mgr, &.{ 2, 16 }, &.{ 2, 16 }, 118);
+            const out = try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.25, w, 12, 50.0);
+            return finishProgGpuTiled(alloc, &g, mgr, out);
+        }
+    }.build;
+}
+
+test "gpu backend: every rel-pos window shape matches CPU" {
+    inline for (window_cases) |w| {
+        try expectGpuMatchesCpu(windowedRelPos(w), 2 * 20 * 2 * 16, 2e-3);
+    }
 }
 
 // ---- concat / views -------------------------------------------------------------
@@ -2703,7 +2760,7 @@ fn buildMHAQueryF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     const v = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 16 }, &.{ 1, 64, 1, 16 }, 255);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 48, 49 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{50});
-    const out = try g.addAttention(q, k, v, pos, end, 0.25, true, 20, 30.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.25, .sliding(19, 0), 30.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -2720,7 +2777,7 @@ fn buildMHAQueryF16CacheF32(alloc: std.mem.Allocator, mgr: *StorageManager) !Bui
     const v = try makeInput(&g, mgr, &.{ 1, 64, 1, 16 }, &.{ 1, 64, 1, 16 }, 258);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 48, 49 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{50});
-    const out = try g.addAttention(q, k, v, pos, end, 0.25, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.25, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 
@@ -2737,7 +2794,7 @@ fn buildMHAQueryF16SplitK(alloc: std.mem.Allocator, mgr: *StorageManager) !Built
     const v = try makeInput(&g, mgr, &.{ 1, 2048, 2, 32 }, &.{ 1, 2048, 2, 32 }, 261);
     const pos = try makeInputI32(&g, mgr, &.{ 1, 2 }, &.{ 1, 2 }, &.{ 1990, 1991 });
     const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{1992});
-    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, true, 0, 0.0);
+    const out = try g.addAttention(q, k, v, pos, end, 0.1767767, .causal, 0.0);
     return finishProgGpuTiled(alloc, &g, mgr, out);
 }
 

@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Step-level peephole fusion: merge adjacent-in-dataflow steps into one dispatch.
-//!
-//! Neither fusion here is expressible in the graph, by design. `x = x + norm(f(x))` is
-//! nobody's named primitive — the converter writes an add. A gate IS one, so the
-//! authoring API emits `act(a) * b` and this recovers the schedule; no meaning is added
-//! because the two forms are defined to be the same value.
-//!
-//! Working at step level also makes a match cheaper to prove correct than the graph
-//! equivalent: tiling is resolved, so invariants are checked against real tensors
-//! instead of predicted from shapes.
-//!
-//! Why fuse when a dispatch costs ~1.5 us: these sit on the serial residual chain, where
-//! a step costs 4-9 us of critical path however little it computes. Removing 106 measured
-//! 0.13 ms/token on Gemma-4 E2B.
+//! Fuse lowered add-norm and activation-multiply patterns using resolved layouts to
+//! remove dispatches from serial residual paths.
 
 const std = @import("std");
 
@@ -26,14 +14,8 @@ const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
 const TiledTensor = manager_mod.TiledTensor;
 
-/// `RMSNormTiled` whose only reader is an identical-shape `add` => the norm gains
-/// `.residual` and moves to where the add was; the add is dropped.
-///
-/// The residual is a CONFIGURATION of the norm, so this sets one field on a step the
-/// compiler already validated — which is why `fusableAddNorm` is four lines.
-///
-/// f32 addition commutes exactly, so folding the add into the norm's apply loop is
-/// bit-identical whichever operand was the residual.
+/// Fold a single-use `RMSNormTiled` into its identical-shape add by configuring the
+/// norm's residual and moving it to the add's position.
 pub fn addNorm(ed: *Editor) void {
     for (ed.steps, 0..) |*step, i| {
         const norm = switch (step.op) {
@@ -71,12 +53,8 @@ pub fn addNorm(ed: *Editor) void {
     }
 }
 
-/// `UnaryTiled(act)` whose only reader is an identical-shape `mul` => the mul becomes
-/// `ElemwiseBinaryTiled{ .op = .gate, .act }` and the unary is dropped.
-///
-/// This is the ONLY place a gate exists. It generalizes over the activation because the
-/// step does: GEGLU, SwiGLU, GLU and ReGLU are one step with one parameter. Where
-/// `fusableGate` declines — an f16 or a broadcasting gate — the pair survives and runs.
+/// Fold a single-use activation into an identical-shape multiply as a gate step.
+/// Unsupported dtypes or broadcasting retain the original pair.
 pub fn gate(ed: *Editor) void {
     for (ed.steps, 0..) |*step, i| {
         const un = switch (step.op) {

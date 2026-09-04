@@ -51,6 +51,40 @@ pub const RoPE = struct {
     }
 };
 
+/// Independent 1-D RoPE per spatial axis, over consecutive head-dim slices.
+///
+/// A 2-D image patch rotates its first half by the patch's x position and its
+/// second half by its y. `head_dim` splits evenly across `positions`, and each
+/// slice is one ordinary `rope1d` — the axes never mix.
+pub const AxialRoPE = struct {
+    opts: Options = .{},
+
+    const Self = @This();
+
+    pub const Options = struct {
+        base_frequency: f32 = 10000.0,
+    };
+
+    pub fn init(opts: Options) Self {
+        return .{ .opts = opts };
+    }
+
+    pub fn forward(self: Self, bld: *Builder, x: TensorRef, positions: []const TensorRef) Builder.Error!TensorRef {
+        if (positions.len == 0 or positions.len > 4) return Builder.Error.InvalidArgument;
+        const shape = bld.knownShape(x) orelse return Builder.Error.InvalidArgument;
+        const head_dim: usize = shape[shape.len - 1];
+        if (head_dim % positions.len != 0) return Builder.Error.InvalidArgument;
+        const width: usize = head_dim / positions.len;
+
+        var parts: [4]TensorRef = undefined;
+        for (positions, 0..) |pos, i| {
+            const part = try bld.sliceLastDim(x, i * width, width);
+            parts[i] = try bld.rope1d(part, pos, self.opts.base_frequency, 1.0, 1.0);
+        }
+        return bld.concat(parts[0..positions.len], -1);
+    }
+};
+
 /// A `[batch, capacity, kv_heads, head_dim]` key/value cache that the runtime
 /// allocates, zero-fills, and carries across runs.
 ///
@@ -217,9 +251,7 @@ pub const Attention = struct {
         /// Logit scale. Pass `1 / sqrt(head_dim)` for textbook attention; some
         /// models fold the scale into a Q-norm instead and pass 1.0.
         scale: f32,
-        causal: bool = true,
-        /// Attend only to the last `sliding_window` positions (0 = global).
-        sliding_window: usize = 0,
+        window: Builder.AttentionWindow = .causal,
         /// `cap * tanh(logits / cap)` on the attention logits (0 = disabled).
         attn_logits_soft_cap: f32 = 0.0,
     };
@@ -257,7 +289,6 @@ pub const Attention = struct {
         if (cfg.heads == 0 or cfg.kv_heads == 0 or cfg.head_dim == 0) return Builder.Error.InvalidArgument;
         if (cfg.heads % cfg.kv_heads != 0) return Builder.Error.InvalidArgument;
         if (!std.math.isFinite(cfg.scale)) return Builder.Error.InvalidArgument;
-        if (cfg.sliding_window > 0 and !cfg.causal) return Builder.Error.InvalidArgument;
     }
 
     /// Q/K/V for this step, all reshaped to `[batch, seq, heads, head_dim]` (K/V
@@ -330,8 +361,7 @@ pub const Attention = struct {
             query_positions,
             kv_lengths,
             self.cfg.scale,
-            self.cfg.causal,
-            self.cfg.sliding_window,
+            self.cfg.window,
             self.cfg.attn_logits_soft_cap,
         );
 
@@ -366,7 +396,9 @@ pub const RelPosSelfAttention = struct {
     heads: usize,
     head_dim: usize,
     scale: f32,
-    window: Builder.ChunkWindow = .{},
+    window: Builder.AttentionWindow = .full,
+    relative_zero_index: usize,
+    attn_logits_soft_cap: f32 = 0,
     id: LayerName = .{},
 
     const Self = @This();
@@ -390,10 +422,10 @@ pub const RelPosSelfAttention = struct {
     pub const Config = struct {
         /// Logit scale, usually `1 / sqrt(head_dim)`.
         scale: f32,
-        /// Chunked-limited attention window. Structural, so it costs two integers
-        /// and lets the kernels skip out-of-window keys; prefer it over encoding
-        /// the same pattern in `Weights.mask`.
-        window: Builder.ChunkWindow = .{},
+        window: Builder.AttentionWindow = .full,
+        /// Null selects the middle row, suitable for symmetric full tables.
+        relative_zero_index: ?usize = null,
+        attn_logits_soft_cap: f32 = 0,
     };
 
     pub const Options = struct {
@@ -401,7 +433,7 @@ pub const RelPosSelfAttention = struct {
     };
 
     pub fn bind(bld: *Builder, params: anytype, cfg: Config, opts: Options) BindError!Self {
-        if (!std.math.isFinite(cfg.scale)) return error.InvalidArgument;
+        if (!std.math.isFinite(cfg.scale) or !std.math.isFinite(cfg.attn_logits_soft_cap) or cfg.attn_logits_soft_cap < 0) return error.InvalidArgument;
 
         var src = state_mod.binding(Weights, params);
         const p: Params = src.params();
@@ -436,6 +468,8 @@ pub const RelPosSelfAttention = struct {
             .head_dim = pe[2],
             .scale = cfg.scale,
             .window = cfg.window,
+            .relative_zero_index = cfg.relative_zero_index orelse pe[1] / 2,
+            .attn_logits_soft_cap = cfg.attn_logits_soft_cap,
             .id = id,
         };
     }
@@ -475,7 +509,19 @@ pub const RelPosSelfAttention = struct {
         const scope = try self.id.enter(bld);
         defer bld.endScope(scope);
 
-        const attn: TensorRef = try bld.relPosMHA(q, k, v, self.pos_emb, self.pos_bias_u, self.pos_bias_v, self.mask, self.scale, self.window);
+        const attn: TensorRef = try bld.relPosMHA(
+            q,
+            k,
+            v,
+            self.pos_emb,
+            self.pos_bias_u,
+            self.pos_bias_v,
+            self.mask,
+            self.scale,
+            self.window,
+            self.relative_zero_index,
+            self.attn_logits_soft_cap,
+        );
         const flat: TensorRef = try bld.reshapeDims(attn, &[_]Builder.Dim{
             try bld.dimAt(attn, 0),
             try bld.dimAt(attn, 1),

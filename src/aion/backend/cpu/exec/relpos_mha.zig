@@ -30,11 +30,10 @@
 // per-layer left-context cache onto K/V in-graph and slices the tail back out as the
 // next cache.
 //
-// Chunked-limited attention is STRUCTURAL (`chunk_size`/`chunk_left`): every query
-// row sees one contiguous key window, so the work is O(T_q * window) instead of
-// scoring all T_kv keys and masking almost all of them away. The additive `mask`
-// operand still applies inside the window, for what an interval cannot express
-// (streaming padding, or any bespoke pattern).
+// The window is STRUCTURAL (`graph.AttentionWindow`): every query row sees one
+// contiguous key interval, so the work is O(T_q * window) instead of scoring all
+// T_kv keys and masking almost all of them away. The additive `mask` operand still
+// applies inside the window, for what an interval cannot express.
 //
 // Hot path: rows are processed in panels that share a key window. The `ac`/`bd` GEMMs
 // and the V accumulation use the shared, SIMD-tuned attention kernels selected per
@@ -118,19 +117,10 @@ const Scratch = struct {
     }
 };
 
-/// Keys visible to query row `i` under chunked-limited attention. The row's absolute
-/// index in the K/V window is `i + (t_kv - t_q)` (a left-context cache occupies the
-/// front), it attends to its own chunk plus `chunk_left` frames before that chunk's
-/// start, and the result is one contiguous interval — which is the whole reason this
-/// can replace an additive [T_q, T_kv] mask.
-fn keyWindow(dims: Dims, chunk_size: usize, chunk_left: usize, i: usize) struct { lo: usize, hi: usize } {
-    if (chunk_size == 0) return .{ .lo = 0, .hi = dims.t_kv };
-    const a: usize = i + (dims.t_kv - dims.t_q);
-    const cs: usize = (a / chunk_size) * chunk_size;
-    return .{
-        .lo = cs - @min(cs, chunk_left),
-        .hi = @min(cs + chunk_size, dims.t_kv),
-    };
+/// Keys visible to query row `i`. Its absolute key position is `i + (t_kv - t_q)`,
+/// since a left-context cache occupies the front of the K/V run.
+fn keyWindow(dims: Dims, s: executable.StepRelPosMHATiled, i: usize) @TypeOf(s.window.keys(0, 0)) {
+    return s.window.keys(i + (dims.t_kv - dims.t_q), dims.t_kv);
 }
 
 inline fn alignUp(x: usize, a: usize) usize {
@@ -220,7 +210,7 @@ pub fn execRelPosMHATiled(
     if (pe_meta.shape[0] != H or pe_meta.shape[2] != D) return BackendError.InvalidArgument;
     if (bu_meta.shape[0] != H or bu_meta.shape[1] != D) return BackendError.InvalidArgument;
     if (bv_meta.shape[0] != H or bv_meta.shape[1] != D) return BackendError.InvalidArgument;
-    if (P != 2 * T_kv - 1) return BackendError.InvalidArgument;
+    if (P == 0 or s.relative_zero_index >= P) return BackendError.InvalidArgument;
     if (T_q > T_kv) return BackendError.InvalidArgument;
 
     // Tiling contract: dims [T, D] (1 and 3) form a single tile per (batch, head);
@@ -239,15 +229,13 @@ pub fn execRelPosMHATiled(
         if (m_meta.tile_counts[0] != 1 or m_meta.tile_counts[1] != 1) return BackendError.InvalidArgument;
     }
 
-    if (s.chunk_size == 0 and s.chunk_left != 0) return BackendError.InvalidArgument;
+    if (!std.math.isFinite(s.attn_logits_soft_cap) or s.attn_logits_soft_cap < 0) return BackendError.InvalidArgument;
     // Widest window any row can see, and the most rows that can share one window.
-    const w_max: usize = if (s.chunk_size == 0)
-        T_kv
-    else
-        @min(T_kv, s.chunk_size + s.chunk_left);
+    const w_max: usize = s.window.maxKeys(T_kv);
     // Rows per panel: the tuned cap (see `attention_registry.Tuning.relpos_panel`),
     // then whatever can actually share one key window.
-    const panel: usize = @min(kernels.tuning.relpos_panel, @min(T_q, if (s.chunk_size == 0) T_q else s.chunk_size));
+    const share_rows: usize = s.window.sharedRows(T_q);
+    const panel: usize = @min(kernels.tuning.relpos_panel, @min(T_q, share_rows));
 
     const dims: Dims = .{
         .b = B,
@@ -426,13 +414,13 @@ fn computeSlice(
     // --- row panels: rows sharing a key window, at most `panel` at a time ---
     var r0: usize = 0;
     while (r0 < T_q) {
-        const win = keyWindow(dims, s.chunk_size, s.chunk_left, r0);
+        const win = keyWindow(dims, s, r0);
         // Extend the panel while the window and the cap allow it. With chunked
         // attention that stops at the chunk boundary; unchunked, every row shares
         // [0, T_kv) so it runs to the cap.
         var r1: usize = r0 + 1;
         while (r1 < T_q and (r1 - r0) < dims.panel) {
-            const w = keyWindow(dims, s.chunk_size, s.chunk_left, r1);
+            const w = keyWindow(dims, s, r1);
             if (w.lo != win.lo or w.hi != win.hi) break;
             r1 += 1;
         }
@@ -446,30 +434,45 @@ fn computeSlice(
         const k_panel = kbuf[win.lo * D ..];
         addScores(kernels, rows, n_k, D, scratch.qu[r0 * D ..], D, k_panel, D, scratch.ktp, scratch.qtp, ac, n_k);
 
-        // --- bd = (q+v) @ pos_emb[band]^T -> [rows, n_k + rows - 1] ---
-        // Row r reads pos_emb[base_r + win.lo ..][0..n_k] with base_r = (T_q-1) - r,
-        // so the panel's rows span one contiguous band starting at the LAST row's base.
-        const band: usize = n_k + rows - 1;
-        const pe_lo: usize = ((T_q - 1) - (r1 - 1)) + win.lo;
-        if (pe_lo + band > P) return BackendError.InvalidArgument;
-        const bd = scratch.bd[0 .. rows * band];
+        // Compact relative tables are allowed: an offset outside [0,P) contributes
+        // zero to the positional score. Gemma audio relies on this when a 13-row
+        // table is shifted across a 24-key chunk context.
+        const bd = scratch.bd[0 .. rows * n_k];
         @memset(bd, 0.0);
-        const pe_panel = pebuf[pe_lo * D ..];
-        addScores(kernels, rows, band, D, scratch.qv[r0 * D ..], D, pe_panel, D, scratch.ktp, scratch.qtp, bd, band);
+        var pri: usize = 0;
+        while (pri < rows) : (pri += 1) {
+            const abs_query: isize = @intCast((T_kv - T_q) + r0 + pri);
+            var pj: usize = 0;
+            while (pj < n_k) : (pj += 1) {
+                const rel: isize = @as(isize, @intCast(s.relative_zero_index)) + @as(isize, @intCast(win.lo + pj)) - abs_query;
+                if (rel < 0 or rel >= @as(isize, @intCast(P))) continue;
+                var pk: usize = 0;
+                while (pk < D) : (pk += 1) {
+                    bd[pri * n_k + pj] += scratch.qv[(r0 + pri) * D + pk] * pebuf[@as(usize, @intCast(rel)) * D + pk];
+                }
+            }
+        }
 
         // --- combine: scores[i,j] = (ac + bd[i, shift_i + j]) * scale + mask ---
         var ri: usize = 0;
         while (ri < rows) : (ri += 1) {
-            const shift: usize = (r1 - 1) - (r0 + ri); // base_{r0+ri} - base_{r1-1}
             const ac_row = ac[ri * n_k ..][0..n_k];
-            const bd_row = bd[ri * band + shift ..][0..n_k];
+            const bd_row = bd[ri * n_k ..][0..n_k];
             if (mask_buf) |mb| {
                 const mrow = mb[(r0 + ri) * T_kv + win.lo ..][0..n_k];
                 var j: usize = 0;
-                while (j < n_k) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale + mrow[j];
+                while (j < n_k) : (j += 1) {
+                    var score = (ac_row[j] + bd_row[j]) * scale;
+                    if (s.attn_logits_soft_cap > 0) score = s.attn_logits_soft_cap * std.math.tanh(score / s.attn_logits_soft_cap);
+                    ac_row[j] = score + mrow[j];
+                }
             } else {
                 var j: usize = 0;
-                while (j < n_k) : (j += 1) ac_row[j] = (ac_row[j] + bd_row[j]) * scale;
+                while (j < n_k) : (j += 1) {
+                    var score = (ac_row[j] + bd_row[j]) * scale;
+                    if (s.attn_logits_soft_cap > 0) score = s.attn_logits_soft_cap * std.math.tanh(score / s.attn_logits_soft_cap);
+                    ac_row[j] = score;
+                }
             }
         }
 

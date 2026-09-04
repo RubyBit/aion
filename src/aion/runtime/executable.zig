@@ -109,15 +109,14 @@ pub const StepAttentionTiled = struct {
     query_positions: ?TensorId,
     kv_lengths: ?TensorId,
     scale: f32,
-    causal: bool,
-    sliding_window: usize,
+    window: @import("../graph/graph.zig").AttentionWindow,
     attn_logits_soft_cap: f32,
 };
 /// Relative-positional multi-head self-attention (Transformer-XL / Conformer).
 ///
 /// Shapes:
 /// - q, k, v, out: [B, H, T*, D] (q rows T_q; k/v rows T_kv)
-/// - pos_emb:      [H, P, D] (P = 2*T_kv - 1)
+/// - pos_emb:      [H, P, D]
 /// - pos_bias_u/_v:[H, D]
 /// - mask (opt):   [T_q, T_kv] additive
 pub const StepRelPosMHATiled = struct {
@@ -130,9 +129,9 @@ pub const StepRelPosMHATiled = struct {
     pos_bias_v: TensorId,
     mask: ?TensorId,
     scale: f32,
-    /// Chunked-limited attention window (see `graph.Op.RelPosMHA`). 0 = full.
-    chunk_size: usize = 0,
-    chunk_left: usize = 0,
+    window: @import("../graph/graph.zig").AttentionWindow = .full,
+    relative_zero_index: usize,
+    attn_logits_soft_cap: f32 = 0,
 };
 pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorId };
 pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: TensorId, axis: usize };

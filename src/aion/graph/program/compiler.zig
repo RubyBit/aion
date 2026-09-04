@@ -690,9 +690,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             const bv: *const TiledTensor = mgr.getConst(s.pos_bias_v) catch return CompileError.InvalidArgument;
 
             try compileRequire(s.scale > 0.0 and std.math.isFinite(s.scale));
-            // A left context without a chunk size has no meaning: the window would be
-            // "all keys", silently ignoring the operand the author supplied.
-            try compileRequire(s.chunk_size > 0 or s.chunk_left == 0);
+            try compileRequire(std.math.isFinite(s.attn_logits_soft_cap) and s.attn_logits_soft_cap >= 0);
 
             // q,k,v,out:[B,H,T*,D]; pos_emb:[H,P,D]; pos_bias_u/_v:[H,D]
             try compileRequire(out.rank == 4 and q.rank == 4 and k.rank == 4 and v.rank == 4);
@@ -715,7 +713,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(pe.shape[0] == H and pe.shape[2] == d);
             try compileRequire(bu.shape[0] == H and bu.shape[1] == d);
             try compileRequire(bv.shape[0] == H and bv.shape[1] == d);
-            try compileRequire(t_kv > 0 and p_len == 2 * t_kv - 1);
+            try compileRequire(t_kv > 0 and p_len > 0 and s.relative_zero_index < p_len);
             try compileRequire(t_q <= t_kv);
 
             // [T, D] dims (1 and 3) must be a single tile; [B, H] (0 and 2) size-1 tiles.
@@ -806,8 +804,7 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(s.scale > 0.0 and std.math.isFinite(s.scale));
             try compileRequire(std.math.isFinite(s.attn_logits_soft_cap));
             try compileRequire(s.attn_logits_soft_cap >= 0.0);
-            _ = s.causal;
-            _ = s.sliding_window;
+            _ = s.window;
         },
 
         .CopyTiled => |s| {
@@ -1334,7 +1331,7 @@ pub fn compileGraph(
 
     for (graph.nodes.items, 0..) |node, idx| {
         if (!live[idx]) continue;
-        try lowerNode(allocator, graph, node, mgr, target.tiles, &ctx, &steps, &blocks);
+        try lowerTraced(allocator, graph, node, mgr, target.tiles, &ctx, &steps, &blocks);
     }
 
     var compiled: Program = .{
@@ -1402,8 +1399,30 @@ fn lowerRegionBlock(
 ) CompileError!executable.BlockId {
     var region_steps: std.ArrayList(PlacedStep) = .empty;
     errdefer region_steps.deinit(allocator);
+
+    // A body may retile a value defined OUTSIDE the region: a captured activation,
+    // or a Builder-shared constant such as a norm's zero beta, which every norm in
+    // the model points at. `ensureTilingScalarMaybeRetile` rebinds the value to the
+    // retiled tensor, but the copy that fills it is appended HERE — into a block
+    // that only runs when this branch is taken. Letting that rebinding escape makes
+    // lowering after the region resolve the outer value to a tensor a skipped
+    // branch was supposed to fill, and every later consumer then reads
+    // uninitialized memory (silently: no step is missing, the data is just absent).
+    //
+    // So bindings that existed at region entry are restored on the way out, while
+    // values the body itself defines keep theirs — `If`/`Loop` read their region
+    // outputs through exactly those.
+    const entry_tensor: []TensorId = allocator.alloc(TensorId, ctx.value_tensor.len) catch
+        return CompileError.OutOfMemory;
+    defer allocator.free(entry_tensor);
+    @memcpy(entry_tensor, ctx.value_tensor);
+    const entry_bound: []bool = allocator.alloc(bool, ctx.value_has_tensor.len) catch
+        return CompileError.OutOfMemory;
+    defer allocator.free(entry_bound);
+    @memcpy(entry_bound, ctx.value_has_tensor);
+
     for (region.nodes) |rnode| {
-        try lowerNode(allocator, graph, rnode, mgr, policy, ctx, &region_steps, blocks);
+        try lowerTraced(allocator, graph, rnode, mgr, policy, ctx, &region_steps, blocks);
     }
     // A loop's executor writes each carried output back into the carry buffer, so
     // the two must be tiled identically. Body ops may choose a different tiling
@@ -1421,11 +1440,48 @@ fn lowerRegionBlock(
             _ = try ensureTilingScalarMaybeRetile(allocator, &region_steps, mgr, policy, ctx, idx, v.dtype.?, v.shape, want_tile);
         }
     }
+    // Undo any rebinding of a value the region did not define (see above). Done
+    // after the carry reconciliation, so that retile is emitted against the body's
+    // own view of the values.
+    for (entry_bound, 0..) |was_bound, i| {
+        if (was_bound) ctx.value_tensor[i] = entry_tensor[i];
+    }
+
     const block_steps: []PlacedStep = try region_steps.toOwnedSlice(allocator);
     errdefer allocator.free(block_steps);
     const id: executable.BlockId = @intCast(blocks.items.len);
     blocks.append(allocator, .{ .steps = block_steps }) catch return CompileError.OutOfMemory;
     return id;
+}
+
+/// `lowerNode`, reporting which op refused. A rejected `compileRequire` is
+/// otherwise an `InvalidArgument` with no hint which of ~30 ops raised it; nested
+/// regions print innermost-first.
+fn lowerTraced(
+    allocator: std.mem.Allocator,
+    graph: *graph_mod.Graph,
+    node: graph_mod.Node,
+    mgr: *StorageManager,
+    policy: plan_mod.TilePolicy,
+    ctx: anytype,
+    steps: *std.ArrayList(PlacedStep),
+    blocks: *std.ArrayList(executable.Block),
+) CompileError!void {
+    return lowerNode(allocator, graph, node, mgr, policy, ctx, steps, blocks) catch |e| {
+        if (traceEnabled()) {
+            std.debug.print(
+                "[aion][compile] lowerNode failed: op={s} err={s}\n",
+                .{ @tagName(node.op), @errorName(e) },
+            );
+            for (node.inputs, 0..) |in_id, i| {
+                const v = graph.values.items[@intCast(in_id)];
+                std.debug.print("  in[{d}]: dtype={?s} shape={any}\n", .{ i, if (v.dtype) |d| @tagName(d) else null, v.shape });
+            }
+            const ov = graph.values.items[@intCast(node.output)];
+            std.debug.print("  out:   dtype={?s} shape={any}\n", .{ if (ov.dtype) |d| @tagName(d) else null, ov.shape });
+        }
+        return e;
+    };
 }
 
 /// Lower a single graph node into tiled executable steps. Shared by the
@@ -1441,6 +1497,8 @@ fn lowerNode(
     steps: *std.ArrayList(PlacedStep),
     blocks: *std.ArrayList(executable.Block),
 ) CompileError!void {
+    // A rejected `compileRequire` is otherwise an `InvalidArgument` with no hint
+    // which of ~30 ops refused it.
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return CompileError.InvalidArgument;
     const out_idx: usize = @intCast(node.output);
     const out_v = graph.values.items[out_idx];
@@ -1941,8 +1999,9 @@ fn lowerNode(
                 .pos_bias_v = bv_tid,
                 .mask = mask_tid,
                 .scale = attn.scale,
-                .chunk_size = attn.chunk_size,
-                .chunk_left = attn.chunk_left,
+                .window = attn.window,
+                .relative_zero_index = attn.relative_zero_index,
+                .attn_logits_soft_cap = attn.attn_logits_soft_cap,
             } });
         },
 
@@ -2041,8 +2100,7 @@ fn lowerNode(
                 .query_positions = pos_tid,
                 .kv_lengths = lengths_tid,
                 .scale = attn.scale,
-                .causal = attn.causal,
-                .sliding_window = attn.sliding_window,
+                .window = attn.window,
                 .attn_logits_soft_cap = attn.attn_logits_soft_cap,
             } });
         },
@@ -2508,10 +2566,21 @@ fn lowerNode(
             const then_region: graph_mod.Region = graph.regions.items[@intCast(iff.then_region)];
             const else_region: graph_mod.Region = graph.regions.items[@intCast(iff.else_region)];
             const then_block: executable.BlockId = try lowerRegionBlock(allocator, graph, then_region, mgr, policy, ctx, blocks, null);
-            const else_block: executable.BlockId = try lowerRegionBlock(allocator, graph, else_region, mgr, policy, ctx, blocks, null);
-
             const cond_tid: TensorId = try ensureAnyTensor(ctx, cond_id);
             const then_tid: TensorId = try ensureAnyTensor(ctx, then_value_id);
+            // Branches are shape-compatible at graph level but their final ops may
+            // naturally choose different tiles. Reconcile the else output inside
+            // its block to the then output, exactly as loop carries are reconciled.
+            const else_block: executable.BlockId = try lowerRegionBlock(
+                allocator,
+                graph,
+                else_region,
+                mgr,
+                policy,
+                ctx,
+                blocks,
+                &.{then_tid},
+            );
             const else_tid: TensorId = try ensureAnyTensor(ctx, else_value_id);
             const then_t: *const TiledTensor = try mgr.getConst(then_tid);
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, then_t.tile_shape);
@@ -2758,10 +2827,13 @@ fn ensureTilingMaybeRetile(
     if (dtype.info().is_quantized) {
         const tid: TensorId = try ensureAnyTensor(ctx, value_index);
         const t: *const TiledTensor = try mgr.getConst(tid);
-        if (t.tile_shape.len != want_tile.len) return CompileError.InvalidArgument;
-        var i: usize = 0;
-        while (i < want_tile.len) : (i += 1) {
-            if (t.tile_shape[i] != want_tile[i]) return CompileError.InvalidArgument;
+        const ok = t.tile_shape.len == want_tile.len and std.mem.eql(usize, t.tile_shape, want_tile);
+        if (!ok) {
+            if (traceEnabled()) std.debug.print(
+                "[aion][compile] quant operand tiling mismatch: dtype={s} shape={any} have={any} want={any}\n",
+                .{ @tagName(dtype), shape, t.tile_shape, want_tile },
+            );
+            return CompileError.InvalidArgument;
         }
         return tid;
     }

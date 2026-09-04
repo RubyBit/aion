@@ -1,21 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Graph editing for the graph-level passes.
-//!
-//! A pass streams the nodes it keeps through `add`, allocates any new values, and
-//! records `old -> new` for outputs it replaced. The driver then rebuilds each node list
-//! once, applies the remap everywhere a value can be READ, and re-infers.
-//!
-//! Everywhere matters: regions read outer values directly, so a pass that rewrites only
-//! `graph.nodes` can drop a producer a loop body is the sole consumer of. That is why
-//! remapping is not a pass's job.
-//!
-//! A graph has more than one node list — the top-level schedule and one body per region
-//! — and `rewrite` runs the rule over each in turn. They are separate lists rather than
-//! one because a rule matching on adjacency must not see across the boundary: a body
-//! replays, so a node may not move into or out of one. Values, by contrast, are
-//! graph-wide, which is why the remap and the re-inference are a single step at the end.
-//!
-//! For each list a rule either emits every node it keeps, or calls `keepAll`.
+//! Graph editing for list-local rewrite passes; the driver applies value remaps
+//! graph-wide and re-infers metadata after rebuilding each schedule/body.
 
 const std = @import("std");
 
@@ -30,10 +15,8 @@ const ExternalId = graph_mod.ExternalId;
 
 pub const Error = graph_mod.GraphError;
 
-/// Run `rule` over every node list in the graph, then remap and re-infer once.
-///
-/// `rule` is any value with `fn run(self, *Rewriter) Error!void`, so a pass carries its
-/// own parameters without this having to know them.
+/// Run a `fn run(*Rewriter) Error!void` rule over every node list, then remap and
+/// re-infer once.
 pub fn rewrite(
     gpa: std.mem.Allocator,
     g: *Graph,

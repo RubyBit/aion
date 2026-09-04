@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Tests for every optional rewrite pass, at both IR levels.
-//!
-//! Each pass is exercised through `compileGraphOpt` with an explicit `Policy`, so a test
-//! asserts what the pass does rather than what the target defaults happen to be. The
-//! exception is the `fuse_steps` pair, which is asserted through `compileGraph` precisely
-//! to pin `opt.defaults`: fused on a device target, an unfused pair on CPU where the
-//! decomposed form is the numerical oracle the fused kernels are checked against.
+//! Tests optional graph and step rewrite passes with explicit policies.
+//! Step fusion also tests `compileGraph` to pin target defaults.
 
 const std = @import("std");
 
@@ -784,11 +779,8 @@ test "alias_views: a view producing a program output keeps its copy" {
     try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .ReshapeScalar));
 }
 
-// `layoutsIdentical` compares per-tile lengths and offsets, and tiles are stored
-// tile-major (each tile a contiguous run, row-major WITHIN the tile). So two tilings can
-// agree on every offset and length while ordering the bytes differently: {2,4} on [4,4]
-// chunks the flat row-major order, {4,2} interleaves it. Eliding a copy between those two
-// would alias tensors that do not hold the same value at the same byte.
+// Equal tile offsets and lengths can still order values differently: `{2,4}` chunks a
+// `[4,4]` row-major tensor, while `{4,2}` interleaves it.
 test "alias_views: equal tile offsets do not imply equal byte order" {
     const allocator = std.testing.allocator;
 
@@ -820,10 +812,8 @@ test "alias_views: equal tile offsets do not imply equal byte order" {
 // Control-flow bodies are node lists like any other
 // ---------------------------------------------------------------------------
 
-// A model whose hot path is an in-graph `Loop` used to get no graph-level fusion at all:
-// the pass walked `graph.nodes` and a body's nodes are not in it. The rule now runs per
-// node list, so the body is optimized while still being a closed list — nothing may move
-// across the boundary, because a body replays.
+// Rewrites visit loop bodies as closed node lists; replayed nodes cannot cross the body
+// boundary.
 test "horizontal_matmul: fuses inside a control-flow body" {
     const allocator = std.testing.allocator;
     const k: usize = 64;
@@ -952,11 +942,8 @@ fn q8WeightBatched(allocator: std.mem.Allocator, sm: *StorageManager, batch: usi
     return tid;
 }
 
-// Whether weights can be concatenated is a fact about their STORED layout, so grouping
-// reads that rather than the graph. Two weights whose batch dims merely BROADCAST to the
-// same output — `[2,k,n]` and `[1,k,n]` against a `[2,1,k]` activation — used to look
-// fusable and then fail the concat, which killed the whole group: its members are marked
-// taken, so the two weights that DID match lost their fusion too.
+// Fusion compares stored batch layouts, not broadcast-compatible graph outputs, so one
+// incompatible weight cannot invalidate an otherwise valid concat group.
 test "horizontal_matmul: an unconcatenatable weight does not poison its group" {
     const allocator = std.testing.allocator;
     const k: usize = 64;

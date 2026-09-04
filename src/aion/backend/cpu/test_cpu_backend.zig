@@ -1686,10 +1686,15 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
     for (implied_end) |*x| x.* = @intCast(t);
 
     inline for (.{
-        .{ .causal = true, .sliding = @as(usize, 0) },
-        .{ .causal = false, .sliding = @as(usize, 0) },
-        .{ .causal = true, .sliding = @as(usize, 2) },
-    }) |case| {
+        graph_mod.AttentionWindow.causal,
+        graph_mod.AttentionWindow.full,
+        graph_mod.AttentionWindow.sliding(1, 0),
+        graph_mod.AttentionWindow.sliding(0, 0),
+        graph_mod.AttentionWindow.sliding(1, 1),
+        graph_mod.AttentionWindow.sliding(2, graph_mod.AttentionWindow.unbounded),
+        graph_mod.AttentionWindow.chunked(2, 0),
+        graph_mod.AttentionWindow.chunked(2, 2),
+    }) |window| {
         const ref_vals: []f32 = try allocator.alloc(f32, bsz * l_q * h_q * d_v);
         defer allocator.free(ref_vals);
         cachedGqaRefF32(
@@ -1707,8 +1712,7 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
             d_k,
             d_v,
             scale,
-            case.causal,
-            case.sliding,
+            window,
             0.0,
         );
 
@@ -1733,7 +1737,7 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
         try g.bindExternal(v_in, @intCast(v_tid));
 
         // No positions, no end_index.
-        const out = try g.addAttention(q_in, k_in, v_in, null, null, scale, case.causal, case.sliding, 0.0);
+        const out = try g.addAttention(q_in, k_in, v_in, null, null, scale, window, 0.0);
         try g.setOutputs(&[_]graph_mod.ValueId{out});
 
         const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
@@ -1898,7 +1902,7 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     try g.bindExternal(u_in, @intCast(u_tid));
     try g.bindExternal(vb_in, @intCast(vb_tid));
 
-    const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, 0, 0);
+    const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, .full, t - 1, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
     var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
@@ -2029,9 +2033,9 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
             try g.bindExternal(m_in, @intCast(m_tid));
 
             const y = if (use_mask)
-                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, m_in, sc, 0, 0)
+                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, m_in, sc, .full, t - 1, 0)
             else
-                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, sc, chunk, left);
+                try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, sc, .chunked(chunk, left), t - 1, 0);
             try g.setOutputs(&[_]graph_mod.ValueId{y});
 
             var prog = try program.compileGraph(alloc, &g, &sm, .cpu(pol));
@@ -4914,6 +4918,16 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     try std.testing.expectEqual(@as(f32, 0.0), out_vals[7]);
 }
 
+/// Is key `k_pos` visible to a query at `q_pos`? Written per pair, independent of
+/// the interval arithmetic the kernels use, so the two can disagree.
+fn windowAllows(w: graph_mod.AttentionWindow, q_pos: usize, k_pos: usize) bool {
+    const anchor: usize = if (w.chunk > 0) (q_pos / w.chunk) * w.chunk else q_pos;
+    const span: usize = if (w.chunk > 0) w.chunk else 1;
+    const first: usize = anchor - @min(anchor, @as(usize, w.left));
+    const last: usize = anchor +| span +| @as(usize, w.right);
+    return k_pos >= first and k_pos < last;
+}
+
 fn cachedGqaRefF32(
     out: []f32,
     q: []align(1) const f32,
@@ -4929,8 +4943,7 @@ fn cachedGqaRefF32(
     d_k: usize,
     d_v: usize,
     scale: f32,
-    causal: bool,
-    sliding_window: usize,
+    window: graph_mod.AttentionWindow,
     attn_logits_soft_cap: f32,
 ) void {
     std.debug.assert(out.len == bsz * l_q * h_q * d_v);
@@ -4951,17 +4964,8 @@ fn cachedGqaRefF32(
         while (l < l_q) : (l += 1) {
             const q_pos: usize = @intCast(@max(positions[b * l_q + l], 0));
 
-            var upper: usize = valid_end;
-            if (causal) {
-                const q_next: usize = q_pos + 1;
-                if (q_next < upper) upper = q_next;
-            }
-
-            var lower: usize = 0;
-            if (sliding_window > 0) {
-                const q_next: usize = q_pos + 1;
-                lower = if (q_next > sliding_window) q_next - sliding_window else 0;
-            }
+            const lower: usize = 0;
+            const upper: usize = valid_end;
 
             var hq_idx: usize = 0;
             while (hq_idx < h_q) : (hq_idx += 1) {
@@ -4980,6 +4984,7 @@ fn cachedGqaRefF32(
 
                 var t: usize = lower;
                 while (t < upper) : (t += 1) {
+                    if (!windowAllows(window, q_pos, t)) continue;
                     const k_base: usize = (((b * t_cap + t) * h_kv + hkv_idx) * d_k);
                     const v_base: usize = (((b * t_cap + t) * h_kv + hkv_idx) * d_v);
 
@@ -5035,8 +5040,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     const d_v: usize = 2;
 
     const scale: f32 = 0.5;
-    const causal: bool = true;
-    const sliding_window: usize = 3;
+    const window: graph_mod.AttentionWindow = .sliding(2, 0);
     const softcap: f32 = 1.75;
 
     const q_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_k * @sizeOf(f32));
@@ -5084,8 +5088,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
         d_k,
         d_v,
         scale,
-        causal,
-        sliding_window,
+        window,
         softcap,
     );
 
@@ -5126,8 +5129,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
         pos_in,
         end_in,
         scale,
-        causal,
-        sliding_window,
+        window,
         softcap,
     );
     try g.setOutputs(&[_]graph_mod.ValueId{out});
@@ -5165,8 +5167,7 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     const d_v: usize = 3;
 
     const scale: f32 = 0.5;
-    const causal: bool = true;
-    const sliding_window: usize = 4;
+    const window: graph_mod.AttentionWindow = .sliding(3, 0);
     const softcap: f32 = 0.0;
 
     const q_buf: []u8 = try allocator.alloc(u8, bsz * l_q * h_q * d_k * @sizeOf(f32));
@@ -5227,8 +5228,7 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
         d_k,
         d_v,
         scale,
-        causal,
-        sliding_window,
+        window,
         softcap,
     );
 
@@ -5269,8 +5269,7 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
         pos_in,
         end_in,
         scale,
-        causal,
-        sliding_window,
+        window,
         softcap,
     );
     try g.setOutputs(&[_]graph_mod.ValueId{out});

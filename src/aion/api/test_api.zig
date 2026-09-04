@@ -2630,6 +2630,56 @@ test "api: a quantized 2-D weight serves a 3-D activation without reshaping" {
     }
 }
 
+test "api: an authored q8_0 weight is tiled for the matmul at any rank" {
+    // Quantized tensors are the one thing `ensureTilingMaybeRetile` will not
+    // re-tile, so authoring must land on the tiling the matmul wants — the same one
+    // the loader picks. K/N are large enough that the matmul wants sub-tiles; a
+    // small weight's whole-tensor tile matches by luck and proves nothing.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const K: usize = 4352;
+    const N: usize = 1024;
+    const S: usize = 4;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const w_vals: []f32 = try allocator.alloc(f32, K * N);
+    defer allocator.free(w_vals);
+    for (w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.05;
+    var x_vals: [S * K]f32 = undefined;
+    for (&x_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+
+    // Rank 2 `[K, N]` and rank 3 `[1, K, N]` are both legal matmul-B shapes.
+    for ([_]usize{ 2, 3 }) |rank| {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+
+        const w_shape: []const usize = if (rank == 2)
+            &[_]usize{ K, N }
+        else
+            &[_]usize{ 1, K, N };
+        const X: api.TensorRef = try bld.param(try ctx.fromF32(&[_]usize{ 1, S, K }, &x_vals));
+        const W: api.TensorRef = try bld.param(try ctx.fromF32Quantized(.q8_0, w_shape, rank - 2, w_vals));
+        const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+
+        var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
+        defer model.deinit();
+
+        const out_t: api.Tensor = try model.runOutputTensor(0);
+        const out: []f32 = try allocator.alloc(f32, S * N);
+        defer allocator.free(out);
+        try out_t.read(out);
+
+        for (0..S) |row| {
+            for ([_]usize{ 0, N / 2, N - 1 }) |col| {
+                var acc: f32 = 0.0;
+                for (0..K) |d| acc += x_vals[row * K + d] * w_vals[d * N + col];
+                try std.testing.expectApproxEqAbs(acc, out[row * N + col], 0.5);
+            }
+        }
+    }
+}
+
 test "api: matmul still rejects a genuine inner-dim mismatch" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -2991,8 +3041,7 @@ test "api: attention matches deterministic windowed-causal averages" {
         Pos,
         End,
         1.0,
-        true,
-        3,
+        .sliding(2, 0),
         0.0,
     );
 
@@ -3051,7 +3100,7 @@ test "api: attention validates H_q % H_kv == 0" {
     const End: api.TensorRef = try bld.param(end_t);
 
     // H_q (3) % H_kv (2) != 0: eager per-op inference rejects this at the op call.
-    try std.testing.expectError(error.ShapeMismatch, bld.attention(Q, K, V, Pos, End, 1.0, true, 0, 0.0));
+    try std.testing.expectError(error.ShapeMismatch, bld.attention(Q, K, V, Pos, End, 1.0, .causal, 0.0));
 }
 
 /// Dequantize a `[K, N]` q8_0 weight packed by `packQ8WeightKN` back to f32.
@@ -3409,6 +3458,76 @@ test "api: builder control-flow wrappers compile and run (If + Loop, in-process)
         var v: [1]f32 = undefined;
         try (try model.outputTensor("out")).read(&v);
         try std.testing.expectApproxEqAbs(@as(f32, 9.0), v[0], 1e-6);
+    }
+}
+
+test "api: a retile inside an untaken If branch does not corrupt an outer shared constant" {
+    // Regression: a region body that retiles a value defined OUTSIDE it must not
+    // rebind that value for the code after the region. The copy that fills the
+    // retiled tensor lives in the branch's block, so it only runs when the branch
+    // is taken -- a rebinding that escapes makes every later consumer read a
+    // tensor nothing wrote.
+    //
+    // The classic victim is a Builder-shared constant: `zeros(W)` is the identity
+    // beta of EVERY norm of that width in the model. One norm inside a tower that
+    // an `If` skips was enough to feed uninitialized memory to all 175 norms of a
+    // Gemma-4 decoder, which reads as a plausible-looking but wrong model.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const W: usize = 512;
+    const M: usize = 4;
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+
+    var gamma_v: [W]f32 = @splat(1.0);
+    const gamma: api.TensorRef = try bld.param(try ctx.fromF32(&[_]usize{W}, &gamma_v));
+    const beta: api.TensorRef = try bld.zeros(W);
+
+    // The branch norm reads a matmul result, whose tiling the GEMM policy picks;
+    // the outer norm reads an input, which is one whole tile. Different last-dim
+    // tiles are what make the branch retile the shared `beta` at all.
+    const cond = try bld.name(try bld.input(.i32, &[_]usize{1}), "cond");
+    const x = try bld.name(try bld.input(.f32, &[_]usize{ 1, M, W }), "x");
+    var w_v: [W * W]f32 = @splat(0.01);
+    const w = try bld.param(try ctx.fromF32(&[_]usize{ W, W }, &w_v));
+
+    try bld.beginRegion();
+    const branch = try bld.rmsnorm(try bld.matmul(x, w, 1.0, 0.0), gamma, beta, 1e-6, &[_]usize{W});
+    const then_region = try bld.endRegion(&[_]api.TensorRef{branch});
+    try bld.beginRegion();
+    const else_region = try bld.endRegion(&[_]api.TensorRef{try bld.mul(x, try bld.constant(0.0))});
+    const picked = try bld.ifThenElse(cond, then_region, else_region);
+
+    const normed = try bld.name(try bld.rmsnorm(x, gamma, beta, 1e-6, &[_]usize{W}), "normed");
+    const out = try bld.name(try bld.add(normed, try bld.mul(picked, try bld.constant(0.0))), "out");
+
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{out}, .{});
+    defer model.deinit();
+
+    var xv: [M * W]f32 = undefined;
+    for (&xv, 0..) |*v, i| v.* = @floatFromInt((i % 7) + 1);
+    try model.bindInput("x", try ctx.fromF32(&[_]usize{ 1, M, W }, &xv));
+    // cond = 0: the branch that retiles `beta` never runs.
+    try model.bindInput("cond", try ctx.vector([_]i32{0}));
+    try model.run();
+
+    var got: [M * W]f32 = undefined;
+    try (try model.outputTensor("out")).read(&got);
+
+    for (0..M) |r| {
+        var sumsq: f64 = 0.0;
+        for (0..W) |c| {
+            const v: f64 = xv[r * W + c];
+            sumsq += v * v;
+        }
+        const inv: f64 = 1.0 / @sqrt(sumsq / @as(f64, @floatFromInt(W)) + 1e-6);
+        for (0..W) |c| {
+            const want: f32 = @floatCast(@as(f64, xv[r * W + c]) * inv);
+            try std.testing.expectApproxEqAbs(want, got[r * W + c], 1e-4);
+        }
     }
 }
 

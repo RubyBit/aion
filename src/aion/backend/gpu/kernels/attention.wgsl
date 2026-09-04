@@ -3,8 +3,8 @@
 // Grouped-query attention:
 //   out[b, l, hq, :] = softmax(scale * q[b, l, hq, :] @ K[b, t, hkv, :]^T) @ V[b, t, hkv, :]
 // over the valid key range t in [lower, upper):
-//   upper = kv_lengths[b], clamped to query_positions[b, l] + 1 when causal;
-//   lower = max(ring window start, sliding-window start).
+//   the key range is `window_keys(...)` on the query's position, intersected with
+//   kv_lengths[b] and the ring-cache start.
 // Optional logit soft cap: s = cap * tanh(s / cap).
 //
 // Layouts (all packed, single device buffer each):
@@ -69,8 +69,9 @@ struct Params {
     t_cap: u32, // physical T of the caches
     h_kv: u32,
     gqa: u32, // query heads per kv head
-    causal: u32,
-    sliding: u32, // 0 = global attention
+    win_left: u32,
+    win_right: u32,
+    win_chunk: u32,
     ring: u32, // 0 = identity time map, 1 = ring
     ring_window: u32,
     kv_f16: u32,
@@ -217,11 +218,10 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         var q_pos = p.base_l + l_local;
         if (p.has_pos != 0u) { q_pos = u32(pos[b_local * p.tl + l_local]); }
 
-        var upper = valid_end;
-        if (p.causal != 0u) { upper = min(upper, q_pos + 1u); }
-        var lower = 0u;
-        if (p.ring != 0u && valid_end > p.ring_window) { lower = valid_end - p.ring_window; }
-        if (p.sliding > 0u && q_pos + 1u > p.sliding) { lower = max(lower, q_pos + 1u - p.sliding); }
+        let w = window_keys(p.win_left, p.win_right, p.win_chunk, q_pos, valid_end);
+        let upper = w.y;
+        var lower = w.x;
+        if (p.ring != 0u && valid_end > p.ring_window) { lower = max(lower, valid_end - p.ring_window); }
         if (upper <= lower) { continue; }
 
         lo_r[r] = lower;

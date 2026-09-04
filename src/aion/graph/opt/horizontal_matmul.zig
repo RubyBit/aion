@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Horizontal MatMul fusion.
-//!
-//! Parallel projections off a shared input — attention Q/K/V, MoE gate/up — are emitted
-//! as separate `MatMul`s by converters, each paying its own dispatch and weight-pack
-//! overhead. Any group of `MatMul`s sharing operand `A`, whose `B`s are bound quantized
-//! weights agreeing in K, becomes one wide `MatMul` over the column-concatenated weight
-//! plus one `ViewSliceND` per original output. Numerically identical, and keyed off graph
-//! structure rather than model identity.
-//!
-//! Measured on Gemma-4 E2B: worth ~2%/token at GPU decode (65 fewer matmul dispatches
-//! against 115 more slices), a ~3% LOSS at seq 256 where the slice copies scale with the
-//! row count, and a loss on CPU where there is no dispatch cost to save. `opt.defaults`
-//! is where that lands; making the slices views instead of copies is what would remove
-//! the prefill cost.
+//! Fuse parallel MatMuls sharing A using a column-concatenated quantized weight and
+//! sliced outputs; target defaults decide whether reduced dispatch cost justifies it.
 
 const std = @import("std");
 
@@ -37,11 +25,8 @@ pub const Error = graph_mod.GraphError || manager_mod.StorageError;
 
 const MAX_RANK: usize = 8;
 
-/// A fusable matmul: `out = A @ B` where B is a bound quantized weight.
-///
-/// The weight fields describe B as STORED, not as the graph declares it: what a column
-/// concat needs to know — the quant axis, the block size, the batch extents — exists only
-/// in the store. `compileGraphOpt` validates that the two agree for every external value.
+/// A fusable `out = A @ B` with B's quantization and batch layout resolved from storage.
+/// `compileGraphOpt` validates stored and declared layouts agree.
 const Cand = struct {
     node: usize,
     a: ValueId,
@@ -138,12 +123,8 @@ fn fuseList(rw: *Rewriter, mgr: *StorageManager, target: Target) Error!void {
     }
 }
 
-/// A matmul this pass could fuse: B is a bound weight stored the way a column concat
-/// needs it — quantized and blocked along K, so the concat is a per-block-row append.
-///
-/// The per-weight half of `concatColumns`'s contract lives here; `fusable` has the
-/// pairwise half. Together they are exactly what it validates, so a group this pass
-/// forms is one it can always build.
+/// Return a candidate whose B is quantized, K-blocked, and safe for per-block-row concat.
+/// Pairwise compatibility is checked by `fusable`.
 fn candidate(g: *const Graph, mgr: *const StorageManager, node: Node, idx: usize) ?Cand {
     const mm = switch (node.op) {
         .MatMul => |m| m,
@@ -178,14 +159,8 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, node: Node, idx: usize
     };
 }
 
-/// Two candidates fuse if they share A and their weights are columns of one matrix.
-///
-/// Equal batch extents is the clause that makes this exact. Two weights whose batch dims
-/// merely BROADCAST to the same output — `[2,K,N]` and `[1,K,N]` against a `[2,S,K]`
-/// activation — are not columns of one matrix: the concat has a single layout, so fusing
-/// them would mean either duplicating the narrower weight's bytes per batch or dropping
-/// the wider one's. Comparing the weights instead of the outputs also subsumes the output
-/// check, since both members share A.
+/// Two candidates fuse when they share A and have identical stored batch extents.
+/// Broadcast-compatible but unequal batches cannot share one concatenated layout.
 fn fusable(a: Cand, b: Cand) bool {
     if (a.a != b.a) return false;
     if (a.alpha != b.alpha or a.beta != b.beta) return false;
@@ -259,22 +234,9 @@ fn emit(rw: *Rewriter, grp: Group) Error!void {
     }
 }
 
-/// Concatenate quantized matmul-B weights `[.., K, Ni]` along N into `[.., K, sum N]`.
-///
-/// The packed layout is block-space row-major (`[.., K/blk, N]`, each block a
-/// self-contained unit), so this is a per-block-row append: no requantization, scales
-/// preserved, dtype-agnostic across q8_0 / q4_0. Memoized on the store, keyed by the
-/// sources, the tiling AND the device, since the tiling is chosen per target and a
-/// quantized weight cannot be retiled downstream.
-///
-/// `device` is part of the key rather than a placement instruction: a tensor is resident
-/// on exactly one device, so handing one target's result to a compile for another would
-/// migrate it away from the first. Placement itself stays with the program that
-/// references the result, like every other weight.
-///
-/// The validation below is the definition `candidate`/`fusable` are written against, so
-/// the pass never reaches it with a group it cannot build. It stays because this is also
-/// the public entry point, and a caller that hands it mismatched weights should hear so.
+/// Concatenate quantized `[.., K, Ni]` weights along N without requantization.
+/// Results are memoized by sources, tiling, and device because quantized weights cannot
+/// be retiled and each tensor has one residency; public callers are fully validated.
 pub fn concatColumns(
     gpa: std.mem.Allocator,
     mgr: *StorageManager,

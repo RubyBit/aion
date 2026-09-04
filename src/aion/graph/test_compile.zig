@@ -117,14 +117,14 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     try g.bindExternal(pos_in, @intCast(pos_tid));
     try g.bindExternal(end_in, @intCast(end_tid));
 
-    const out: graph_mod.ValueId = try g.addAttention(q_in, k_in, v_in, pos_in, end_in, 1.0, true, 0, 0.0);
+    const out: graph_mod.ValueId = try g.addAttention(q_in, k_in, v_in, pos_in, end_in, 1.0, .causal, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
     try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, .cpu(policy)));
 }
 
-test "graph: attention controls are independent and ambiguous causal defaults are rejected" {
+test "graph: attention controls are independent and a bounded window needs aligned runs" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     {
@@ -134,7 +134,7 @@ test "graph: attention controls are independent and ambiguous causal defaults ar
         const k = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 8 });
         const v = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 6 });
         const positions = try g.addInput(.i32, &[_]usize{ 2, 1 });
-        const out = try g.addAttention(q, k, v, positions, null, 0.25, true, 0, 0.0);
+        const out = try g.addAttention(q, k, v, positions, null, 0.25, .causal, 0.0);
         try infer_mod.infer(&g);
         try std.testing.expectEqualSlices(usize, &[_]usize{ 2, 1, 4, 6 }, g.values.items[out].shape);
     }
@@ -146,7 +146,7 @@ test "graph: attention controls are independent and ambiguous causal defaults ar
         const k = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 8 });
         const v = try g.addInput(.f32, &[_]usize{ 2, 7, 2, 6 });
         const lengths = try g.addInput(.i32, &[_]usize{2});
-        _ = try g.addAttention(q, k, v, null, lengths, 0.25, false, 0, 0.0);
+        _ = try g.addAttention(q, k, v, null, lengths, 0.25, .full, 0.0);
         try infer_mod.infer(&g);
     }
 
@@ -156,7 +156,7 @@ test "graph: attention controls are independent and ambiguous causal defaults ar
         const q = try g.addInput(.f32, &[_]usize{ 1, 1, 4, 8 });
         const k = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 8 });
         const v = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 6 });
-        _ = try g.addAttention(q, k, v, null, null, 0.25, true, 0, 0.0);
+        _ = try g.addAttention(q, k, v, null, null, 0.25, .causal, 0.0);
         try std.testing.expectError(infer_mod.InferError.ShapeMismatch, infer_mod.infer(&g));
     }
 
@@ -166,8 +166,8 @@ test "graph: attention controls are independent and ambiguous causal defaults ar
         const q = try g.addInput(.f32, &[_]usize{ 1, 7, 4, 8 });
         const k = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 8 });
         const v = try g.addInput(.f32, &[_]usize{ 1, 7, 2, 6 });
-        _ = try g.addAttention(q, k, v, null, null, 0.25, false, 4, 0.0);
-        try std.testing.expectError(infer_mod.InferError.InvalidGraph, infer_mod.infer(&g));
+        _ = try g.addAttention(q, k, v, null, null, 0.25, .sliding(3, graph_mod.AttentionWindow.unbounded), 0.0);
+        try infer_mod.infer(&g);
     }
 }
 

@@ -177,7 +177,7 @@ fn buildAttention(b: *B) anyerror!ValueId {
     const q = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
     const k = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
     const v = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
-    return b.g.addAttention(q, k, v, null, null, 0.25, false, 0, 0.0);
+    return b.g.addAttention(q, k, v, null, null, 0.25, .full, 0.0);
 }
 
 fn buildDecodeChain(b: *B) anyerror!ValueId {

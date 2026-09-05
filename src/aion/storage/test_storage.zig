@@ -920,8 +920,9 @@ fn buildRolesTestPackage(allocator: std.mem.Allocator) !package_file.Package {
         .input = 0,
         .kind = .sequence_cache,
         .axis = 1,
-        .flags = package_file.InputRoleFlags.zero_init | package_file.InputRoleFlags.allow_growable,
+        .flags = package_file.InputRoleFlags.zero_init,
         .capacity_symbol = 0,
+        .retained_history_tokens = 511,
     };
     pkg.input_roles[1] = .{ .input = 1, .kind = .cache_write_index };
     pkg.input_roles[2] = .{ .input = 2, .kind = .tokens, .axis = 1 };
@@ -1034,12 +1035,12 @@ test "storage cache: lease tokens and policy info" {
         &[_]usize{4},
         .{ .tile_alignment = 64 },
     );
-    try sm.registerSequenceCachePolicy(tid, .{ .ring = .{ .window_tokens = 4 } });
+    try sm.registerSequenceCachePolicy(tid, .{ .rolling = .{ .history_tokens = 4 } });
 
     const store: tensor_store.TensorStore = sm.tensorStore();
     const info: tensor_store.SequenceCachePolicyInfo = store.sequenceCachePolicyInfo(tid);
-    try std.testing.expectEqual(tensor_store.SequenceCachePolicyKind.ring, info.kind);
-    try std.testing.expectEqual(@as(usize, 4), info.ring_window_tokens);
+    try std.testing.expectEqual(tensor_store.SequenceCachePolicyKind.rolling, info.kind);
+    try std.testing.expectEqual(@as(usize, 4), info.rolling_history_tokens);
 
     var t0: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
     defer store.releaseConst(t0.token);
@@ -1083,4 +1084,24 @@ test "storage cache: lease tokens and policy info" {
         .{ .tile_alignment = 64 },
     );
     try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.mapSequenceStep(plain_tid, 9, 8));
+}
+
+test "storage cache: rolling growth rehashes retained logical rows" {
+    const allocator = std.testing.allocator;
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const tid = try sm.createTiledTensor(
+        .f32,
+        &.{ 1, 4, 1, 1 },
+        &.{ 1, 4, 1, 1 },
+        .{ .tile_alignment = 64 },
+    );
+    // At logical end 6, retained rows 3,4,5 occupy physical 3,0,1.
+    try sm.writeFromPackedScalar(tid, std.mem.sliceAsBytes(&[_]f32{ 4, 5, 0, 3 }));
+    try sm.ensureRollingCacheCapacity(tid, 7, 3, &.{6});
+
+    var got: [7]f32 = undefined;
+    try sm.readToPackedScalar(tid, std.mem.sliceAsBytes(&got));
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 3, 4, 5, 0 }, &got);
 }

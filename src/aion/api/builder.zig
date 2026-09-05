@@ -1136,6 +1136,18 @@ pub const Builder = struct {
         return .{ .value = out };
     }
 
+    /// The `k` best values along `axis` and the index each came from, sorted
+    /// best-first (ties to the lowest index). `largest = false` gives the k
+    /// smallest. Lowering implements the last axis; transpose to reach another.
+    pub const TopK = struct { values: TensorRef, indices: TensorRef };
+
+    pub fn topk(self: *Self, a: TensorRef, k: usize, axis: i32, largest: bool) Error!TopK {
+        const outs: []const ValueId = try self.graph.addTopK(a.value, k, axis, largest);
+        try self.autoNameIfUnnamed(outs[0], "topk_values");
+        try self.autoNameIfUnnamed(outs[1], "topk_indices");
+        return .{ .values = .{ .value = outs[0] }, .indices = .{ .value = outs[1] } };
+    }
+
     /// In-place row scatter: `buf[idx] = src`. Output aliases `buf`.
     pub fn scatterRow(self: *Self, buf: TensorRef, idx: TensorRef, src: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addScatterRow(buf.value, idx.value, src.value);

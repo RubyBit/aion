@@ -121,6 +121,10 @@ pub const OpTag = enum(u8) {
     Dim = 31,
     /// Coordinate tensor with the input's shape, increasing along one axis.
     Iota = 32,
+
+    /// The `k` largest (or smallest) values along an axis, and where they came
+    /// from. Two outputs: values, then i32 indices.
+    TopK = 33,
 };
 
 /// Which keys a query may attend to, as one interval: `[anchor - left, anchor +
@@ -471,6 +475,17 @@ pub const Op = union(OpTag) {
     Gather: struct { axis: i32, batch_dims: usize },
     Dim: struct { axis: i32 },
     Iota: struct { axis: i32 },
+
+    /// The `k` largest (`largest`) or smallest values along `axis`, with the index
+    /// each came from. Two outputs — values (input dtype) then indices (i32) —
+    /// both the input's shape with `axis` resized to `k`.
+    ///
+    /// Always sorted best-first, and ties resolve to the lowest index, so a result
+    /// is a function of the input alone: no ordering flag can be set wrong, and CPU
+    /// and GPU cannot disagree on a tie. `axis` accepts any value the rank allows,
+    /// but lowering implements the LAST axis (transpose to reach another) — the
+    /// same restriction `ArgMax` carries.
+    TopK: struct { k: usize, axis: i32, largest: bool = true },
 };
 
 pub const InputArity = union(enum) {
@@ -526,6 +541,7 @@ pub fn opInputArity(op: Op) InputArity {
         .Gather => .{ .exact = 2 },
         .Dim => .{ .exact = 1 },
         .Iota => .{ .exact = 1 },
+        .TopK => .{ .exact = 1 },
     };
 }
 
@@ -1086,6 +1102,12 @@ pub const Graph = struct {
     /// Index of the max value along `axis` (v1: last axis). Output dtype i32.
     pub fn addArgMax(self: *Self, x: ValueId, axis: i32) GraphError!ValueId {
         return self.addNodeInternal(.{ .ArgMax = .{ .axis = axis } }, &[_]ValueId{x});
+    }
+
+    /// `k` best values along `axis` and their indices: `.{ values, indices }`.
+    pub fn addTopK(self: *Self, x: ValueId, k: usize, axis: i32, largest: bool) GraphError![]const ValueId {
+        if (k == 0) return GraphError.InvalidArgument;
+        return self.addNodeMulti(.{ .TopK = .{ .k = k, .axis = axis, .largest = largest } }, &[_]ValueId{x}, 2);
     }
 
     /// In-place row scatter: buf[idx] = src. Output aliases buf.

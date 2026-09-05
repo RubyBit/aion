@@ -13,10 +13,10 @@ pub const ValueId = graph_mod.ValueId;
 pub const AttentionWindow = graph_mod.AttentionWindow;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-/// v12: Attention and RelPosMHA share one `AttentionWindow` (left/right/chunk) in
-/// place of `causal`/`sliding_window` and `window_kind`/`chunk_size`. Parsing
-/// requires an exact match, so every `.aion` must be re-converted.
-pub const current_version: u32 = 12;
+/// v13: sequence-cache roles store a semantic retained-history bound. Physical
+/// rolling-cache capacity is a runtime concern and may grow for append headroom.
+/// Parsing requires an exact match, so every `.aion` must be re-converted.
+pub const current_version: u32 = 13;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -150,8 +150,7 @@ pub const InputRoleKind = enum(u8) {
 pub const InputRoleFlags = struct {
     pub const zero_init: u8 = 1 << 0;
     pub const allow_growable: u8 = 1 << 1;
-    pub const allow_ring: u8 = 1 << 2;
-    pub const all: u8 = zero_init | allow_growable | allow_ring;
+    pub const all: u8 = zero_init | allow_growable;
 };
 
 pub const input_role_no_axis: u8 = 0xFF;
@@ -164,6 +163,9 @@ pub const InputRole = struct {
     flags: u8 = InputRoleFlags.zero_init,
     /// dim_symbols index of the free capacity symbol, or `invalid_index` (fixed shape).
     capacity_symbol: u32 = invalid_index,
+    /// Number of prior logical positions that must remain available. Zero means
+    /// full-history retention. Valid only for sequence caches.
+    retained_history_tokens: u32 = 0,
 };
 
 /// The graph's own op, which is what a package stores.
@@ -481,6 +483,14 @@ fn validateInputRoles(pkg: *const Package) PackageError!void {
                         if (role.capacity_symbol >= pkg.dim_symbols.len) return PackageError.InvalidFormat;
                         if (value.shape_terms[role.axis] != .expr) return PackageError.InvalidFormat;
                     }
+                    if (role.retained_history_tokens != 0 and role.capacity_symbol == invalid_index) {
+                        return PackageError.InvalidFormat;
+                    }
+                    if (role.retained_history_tokens != 0 and
+                        (role.flags & InputRoleFlags.allow_growable) != 0)
+                    {
+                        return PackageError.InvalidFormat;
+                    }
                 }
             },
             .cache_write_index, .cache_visible_end, .positions, .tokens => {
@@ -498,6 +508,7 @@ fn validateInputRoles(pkg: *const Package) PackageError!void {
                     if (role.axis == input_role_no_axis or role.axis >= value.rank) return PackageError.InvalidFormat;
                 }
                 if (role.capacity_symbol != invalid_index) return PackageError.InvalidFormat;
+                if (role.retained_history_tokens != 0) return PackageError.InvalidFormat;
             },
         }
     }

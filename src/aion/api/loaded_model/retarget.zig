@@ -28,11 +28,6 @@ pub fn retargetProgramTensorIds(program: *program_mod.Program, old_tid: types_mo
         for (block.steps) |*step| retargetStepTensorIds(&step.op, old_tid, new_tid);
     }
     for (program.outputs) |*tid| retargetTensorId(tid, old_tid, new_tid);
-    for (program.growth_requests) |*request| {
-        retargetTensorId(&request.cache, old_tid, new_tid);
-        retargetTensorId(&request.new_kv, old_tid, new_tid);
-        retargetTensorId(&request.end_index, old_tid, new_tid);
-    }
     for (program.tensor_placements) |*placement| {
         retargetTensorId(&placement.id, old_tid, new_tid);
     }

@@ -91,7 +91,6 @@ pub fn collectInputRoles(
         var flags: u8 = 0;
         if (decl.zero_init) flags |= package_file.InputRoleFlags.zero_init;
         if (decl.allow_growable) flags |= package_file.InputRoleFlags.allow_growable;
-        if (decl.allow_ring) flags |= package_file.InputRoleFlags.allow_ring;
         out[idx] = .{
             .input = try findNamedValueByValueId(inputs, decl.input.value),
             .kind = decl.kind,
@@ -101,6 +100,7 @@ pub fn collectInputRoles(
                 symbol_map.get(name) orelse return error.InvalidArgument
             else
                 package_file.invalid_index,
+            .retained_history_tokens = decl.retained_history_tokens,
         };
     }
     return out;
@@ -242,6 +242,9 @@ pub fn freeRegions(allocator: std.mem.Allocator, regions: []package_file.RegionR
 pub fn freeNodes(allocator: std.mem.Allocator, nodes: []package_file.NodeRecord) void {
     for (nodes) |node| {
         allocator.free(node.inputs);
+        // `collectNodeSlice` dupes these, so a multi-output op (TopK, Loop) owns
+        // them exactly like its inputs.
+        if (node.extra_outputs.len != 0) allocator.free(@constCast(node.extra_outputs));
         package_file.deinitNodeOp(allocator, node.op);
     }
     allocator.free(nodes);

@@ -137,6 +137,9 @@ pub const StepReduceAll = struct { op: types.ReduceOp, out: TensorId, a: TensorI
 pub const StepReduceAxis = struct { op: types.ReduceOp, out: TensorId, a: TensorId, axis: usize };
 /// ArgMax over the last axis (v1): out (i32) = index of max of a along axis.
 pub const StepArgMax = struct { out: TensorId, a: TensorId, axis: usize };
+/// The `k` best values along the last axis and the index each came from, both
+/// sorted best-first with ties going to the lowest index.
+pub const StepTopK = struct { values: TensorId, indices: TensorId, a: TensorId, k: usize, axis: usize, largest: bool };
 /// In-place row scatter: buf[idx] = src. Output aliases buf (set in lowering).
 pub const StepScatterRow = struct { buf: TensorId, idx: TensorId, src: TensorId };
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
@@ -185,8 +188,8 @@ pub const StepSequenceAppendTiled = struct {
     cache: TensorId,
     new_kv: TensorId,
     /// The append position, consumed as a device buffer by any backend that
-    /// implements this op. Growable-cache capacity is settled before the frame
-    /// (see `Model.prepareGrowableCaches`), so nothing reads it on the host.
+    /// implements this op. Cache capacity is settled before specialization
+    /// (see `Model.settleSequenceCaches`), so nothing reads it on the host.
     end_index: TensorId,
 };
 
@@ -299,6 +302,7 @@ pub const Step = union(enum) {
     AttentionTiled: StepAttentionTiled,
     RelPosMHATiled: StepRelPosMHATiled,
     ArgMax: StepArgMax,
+    TopK: StepTopK,
     ScatterRow: StepScatterRow,
     ReduceAll: StepReduceAll,
     ReduceAxis: StepReduceAxis,
@@ -451,6 +455,11 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.out, .write);
             out.add(&s.a, .read);
         },
+        .TopK => |*s| {
+            out.add(&s.values, .write);
+            out.add(&s.indices, .write);
+            out.add(&s.a, .read);
+        },
         .ScatterRow => |*s| {
             out.add(&s.buf, .read_write);
             out.add(&s.idx, .read);
@@ -583,21 +592,6 @@ pub fn controlHostOperands(step: *Step) u64 {
 pub const TensorPlacement = struct { id: TensorId, placement: Placement };
 pub const PlacementError = error{ InvalidProgram, MissingPlacement, PlacementMismatch, MissingTransfer };
 
-/// A sequence-append site whose cache may need growing before the frame that
-/// writes it is recorded. Emitted by placement so the runtime consults a
-/// declared summary rather than re-deriving one by walking the schedule every
-/// step: capacity is the one model-state concern the compiler cannot own, and
-/// this is the whole of what it hands over.
-///
-/// `end_index` is the operand as the graph produced it — before placement may
-/// have rewritten the step's copy to a CPU mirror — so the runtime can still
-/// match it against the input slot that feeds it.
-pub const GrowthRequest = struct {
-    cache: TensorId,
-    new_kv: TensorId,
-    end_index: TensorId,
-};
-
 /// Validated executable schedule.
 ///
 /// Contract:
@@ -632,8 +626,6 @@ pub const ExecutableProgram = struct {
     /// schedule to re-derive what placement already decided.
     target: Placement = .{},
     tensor_placements: []TensorPlacement = &[_]TensorPlacement{},
-    /// Sequence-append sites the runtime may need to grow. See `GrowthRequest`.
-    growth_requests: []GrowthRequest = &[_]GrowthRequest{},
     /// Storage allocated specifically for this compiled specialization. External
     /// inputs, parameters, and model state are excluded. The owning model uses
     /// this list to reclaim an evicted specialization's workspace.
@@ -702,7 +694,6 @@ pub const ExecutableProgram = struct {
         if (self.blocks.len != 0) self.allocator.free(self.blocks);
         self.allocator.free(self.outputs);
         if (self.tensor_placements.len != 0) self.allocator.free(self.tensor_placements);
-        if (self.growth_requests.len != 0) self.allocator.free(self.growth_requests);
         if (self.owned_tensors.len != 0) self.allocator.free(self.owned_tensors);
         for (self.workspace_slots) |slot| {
             self.allocator.free(slot.members);

@@ -334,6 +334,15 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendInt(out, allocator, u32, @intCast(node.extra_outputs.len));
             for (node.extra_outputs) |e| try appendInt(out, allocator, u32, e);
         },
+        .TopK => |tk| {
+            try appendSize(out, allocator, tk.k);
+            try appendInt(out, allocator, i32, tk.axis);
+            try appendInt(out, allocator, u8, @intFromBool(tk.largest));
+            // The indices output is the node's, not the attribute's, but the format
+            // carries extra outputs inside the op blob (see `Loop`).
+            try appendInt(out, allocator, u32, @intCast(node.extra_outputs.len));
+            for (node.extra_outputs) |e| try appendInt(out, allocator, u32, e);
+        },
         .ViewReshape => |vr| {
             try appendSymbolicAttr(out, allocator, vr.new_shape, vr.free_dims);
         },
@@ -408,6 +417,7 @@ fn encodeInputRolesSection(allocator: std.mem.Allocator, input_roles: []const ty
         try appendInt(&out, allocator, u8, role.flags);
         try appendInt(&out, allocator, u8, 0); // reserved
         try appendInt(&out, allocator, u32, role.capacity_symbol);
+        try appendInt(&out, allocator, u32, role.retained_history_tokens);
     }
     return out.toOwnedSlice(allocator);
 }

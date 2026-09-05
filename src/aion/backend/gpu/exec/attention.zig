@@ -6,7 +6,7 @@
 //!   - `AttentionTiled` -> `execAttention` (kernels/attention.wgsl):
 //!     GQA over single-buffer k/v (f32 or f16 — bound as u32 words, no
 //!     shader-f16 extension needed). Optional query positions and K/V lengths
-//!     are read ON DEVICE, with identity/ring time mapping done in-kernel;
+//!     are read ON DEVICE, with identity/rolling time mapping done in-kernel;
 //!     only cache GROWTH needs the host, where K/V lengths are read at record time
 //!     to pre-touch `mapSequenceStep` (same protocol as the CPU executor and the
 //!     GPU KV-append) before metadata is re-fetched. Defaults are position == row
@@ -165,7 +165,7 @@ const CachedParams = extern struct {
     win_right: u32,
     win_chunk: u32,
     ring: u32,
-    ring_window: u32,
+    ring_modulus: u32,
     kv_f16: u32,
     scale: f32,
     soft_cap: f32,
@@ -400,15 +400,14 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
     const t_cap = k_meta.shape[1];
     if (v_meta.shape[1] != t_cap or t_cap == 0) return error.Unsupported;
 
-    // Time mapping: identity for none/growable, modulo for ring — resolved
+    // Time mapping: identity for none/growable, modulo for rolling — resolved
     // in-kernel (no per-token host round-trips).
     const policy_info = hs.sequenceCachePolicyInfo(s.k);
-    const is_ring = policy_info.kind == .ring;
-    const ring_window: usize = if (is_ring) blk: {
-        const configured: usize = policy_info.ring_window_tokens;
-        break :blk if (configured == 0) t_cap else @min(configured, t_cap);
-    } else 0;
-    if (is_ring and ring_window == 0) return error.Unsupported;
+    const is_ring = policy_info.kind == .rolling;
+    // Ring is the physical layout; the modulus is the whole allocation, not the
+    // semantic retained-history bound the model declared.
+    const ring_modulus: usize = if (is_ring) t_cap else 0;
+    if (is_ring and ring_modulus == 0) return error.Unsupported;
 
     const built = try ctx.pipes.get(attn_kernel, if (q_f16) "attn_row_qf16" else "attn_row");
 
@@ -519,7 +518,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             .win_right = s.window.right,
             .win_chunk = s.window.chunk,
             .ring = @intFromBool(is_ring),
-            .ring_window = std.math.cast(u32, ring_window) orelse return error.Unsupported,
+            .ring_modulus = std.math.cast(u32, ring_modulus) orelse return error.Unsupported,
             .kv_f16 = @intFromBool(kv_f16),
             .scale = s.scale,
             .soft_cap = s.attn_logits_soft_cap,

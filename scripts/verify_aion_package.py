@@ -40,12 +40,14 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-# Self-contained `.aion` v12 container constants (source of truth: the Zig
+# Self-contained `.aion` v13 container constants (source of truth: the Zig
 # implementation in src/aion/storage/aion_file/{types,write}.zig). Inlined so this
-# read-only verifier has no dependency on any pure-Python writer.
+# read-only verifier has no dependency on any pure-Python writer. Only the
+# CONTAINER is read here (header, section directory, strings, tensors), so a bump
+# that only changes a section's record layout needs just the version raised.
 class aw:  # noqa: N801 - kept lowercase as a drop-in constants namespace
     MAGIC = b"AION"
-    VERSION = 12
+    VERSION = 13
     HEADER_SIZE = 72
     SECTION_DESC_SIZE = 24
     INVALID_INDEX_U32 = 0xFFFFFFFF

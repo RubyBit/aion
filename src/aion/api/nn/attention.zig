@@ -106,6 +106,7 @@ pub const KVCache = struct {
     axis: u8,
     capacity_symbol: ?[]const u8,
     growable: bool,
+    retained_history_tokens: u32,
 
     const Self = @This();
 
@@ -120,6 +121,8 @@ pub const KVCache = struct {
         capacity_symbol: ?[]const u8 = null,
         /// Let the runtime grow the cache on demand up to its bound.
         growable: bool = false,
+        /// Bound semantic cache history without constraining append width.
+        retained_history_tokens: u32 = 0,
     };
 
     /// Declare the cache input. `shape` is `[batch, capacity, kv_heads, head_dim]`;
@@ -154,6 +157,7 @@ pub const KVCache = struct {
             .axis = 1,
             .capacity_symbol = opts.capacity_symbol,
             .growable = opts.growable,
+            .retained_history_tokens = opts.retained_history_tokens,
         };
     }
 
@@ -188,6 +192,7 @@ pub const KVCache = struct {
             .capacity_symbol = self.capacity_symbol,
             .zero_init = true,
             .allow_growable = self.growable,
+            .retained_history_tokens = self.retained_history_tokens,
         };
     }
 

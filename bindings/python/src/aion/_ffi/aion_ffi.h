@@ -144,7 +144,7 @@ AionStatus aion_loaded_model_output_rank(const AionLoadedModel* m, size_t index,
 AionStatus aion_loaded_model_bind_input(AionLoadedModel* m, const char* name, const AionTensor* tensor);
 AionStatus aion_loaded_model_run(AionLoadedModel* m);
 AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
-AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
+AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t retained_history_tokens);
 AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
 AionStatus aion_loaded_model_position(const AionLoadedModel* m, uint64_t* out_tokens);
 AionStatus aion_loaded_model_set_position(AionLoadedModel* m, uint64_t tokens);
@@ -302,12 +302,13 @@ typedef uint32_t AionRegionId;
 AionStatus aion_builder_begin_region(AionBuilder* b);
 AionStatus aion_builder_end_region(AionBuilder* b, const AionValueId* outputs, size_t outputs_len, AionRegionId* out_region);
 AionStatus aion_builder_if(AionBuilder* b, AionValueId cond, AionRegionId then_region, AionRegionId else_region, AionValueId* out_value);
+AionStatus aion_builder_topk(AionBuilder* b, AionValueId x, size_t k, int32_t axis, uint8_t largest, AionValueId* out_values, AionValueId* out_indices);
 AionStatus aion_builder_loop(AionBuilder* b, const AionValueId* carried, size_t carried_len, AionRegionId body_region, size_t trip, size_t cond_carry, uint8_t has_cond_carry, uint8_t check_before, AionValueId* out_values);
 
 AionStatus aion_builder_mark_output(AionBuilder* b, AionValueId value, const char* name);
 AionStatus aion_builder_clear_outputs(AionBuilder* b);
 AionStatus aion_builder_add_output_alias(AionBuilder* b, AionValueId input_value, AionValueId output_value);
-AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint8_t allow_ring);
+AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint32_t retained_history_tokens);
 AionStatus aion_builder_add_dim_symbol(AionBuilder* b, AionValueId value, size_t axis, const char* name);
 AionStatus aion_builder_add_metadata(AionBuilder* b, const char* key, const char* value);
 

@@ -44,7 +44,7 @@ pub const CacheConfig = @import("context.zig").CacheConfig;
 pub const CachePolicy = @import("context.zig").CachePolicy;
 pub const SequenceCachePolicy = @import("context.zig").SequenceCachePolicy;
 pub const GrowablePolicy = @import("context.zig").GrowablePolicy;
-pub const RingPolicy = @import("context.zig").RingPolicy;
+pub const RollingPolicy = @import("context.zig").RollingPolicy;
 
 pub const DeviceSelector = @import("device.zig").DeviceSelector;
 pub const GpuOptions = @import("device.zig").GpuOptions;

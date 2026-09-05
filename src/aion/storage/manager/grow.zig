@@ -118,3 +118,50 @@ pub fn ensureTensorAxisCapacity(mgr: *StorageManager, id: TensorId, axis: usize,
     @memcpy(grown_shape[0..rank], grown.shape);
     try mgr.moveTensor(id, target, dev, grown_shape[0..rank], tile_align);
 }
+
+/// Grow rolling storage without changing the logical sequence it represents.
+/// Ordinary axis growth preserves physical indices, but modulo indices change
+/// when capacity changes, so retained rows must be explicitly rehashed.
+pub fn ensureRollingCacheCapacity(
+    mgr: *StorageManager,
+    id: TensorId,
+    min_size: usize,
+    retained_history: usize,
+    logical_ends: []const usize,
+) StorageError!void {
+    const before = try mgr.getConst(id);
+    if (before.rank != 4 or before.dtype.info().is_quantized) return StorageError.InvalidArgument;
+    if (before.shape[0] != logical_ends.len or before.shape[1] == 0) return StorageError.InvalidArgument;
+    const old_capacity = before.shape[1];
+    if (old_capacity >= min_size) return;
+
+    const old_bytes_len = try before.packedByteLen();
+    const old_bytes = mgr.allocator.alloc(u8, old_bytes_len) catch return StorageError.OutOfMemory;
+    defer mgr.allocator.free(old_bytes);
+    try mgr.readPackedAtPlacement(id, old_bytes);
+
+    try ensureTensorAxisCapacity(mgr, id, 1, min_size);
+    const after = try mgr.getConst(id);
+    const new_capacity = after.shape[1];
+    const new_bytes_len = try after.packedByteLen();
+    const new_bytes = mgr.allocator.alloc(u8, new_bytes_len) catch return StorageError.OutOfMemory;
+    defer mgr.allocator.free(new_bytes);
+    @memset(new_bytes, 0);
+
+    var row_bytes: usize = after.dtype.info().block_bytes;
+    row_bytes = std.math.mul(usize, row_bytes, after.shape[2]) catch return StorageError.InvalidArgument;
+    row_bytes = std.math.mul(usize, row_bytes, after.shape[3]) catch return StorageError.InvalidArgument;
+    for (logical_ends, 0..) |end, batch| {
+        const kept = @min(@min(end, retained_history), old_capacity);
+        const begin = end - kept;
+        var logical = begin;
+        while (logical < end) : (logical += 1) {
+            const old_row = batch * old_capacity + logical % old_capacity;
+            const new_row = batch * new_capacity + logical % new_capacity;
+            const old_off = std.math.mul(usize, old_row, row_bytes) catch return StorageError.InvalidArgument;
+            const new_off = std.math.mul(usize, new_row, row_bytes) catch return StorageError.InvalidArgument;
+            @memcpy(new_bytes[new_off .. new_off + row_bytes], old_bytes[old_off .. old_off + row_bytes]);
+        }
+    }
+    try mgr.writePackedAtPlacement(id, new_bytes);
+}

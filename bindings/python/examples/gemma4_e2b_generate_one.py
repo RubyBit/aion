@@ -30,6 +30,76 @@ def _read_next_token(model) -> int:
         t.close()
 
 
+class Sampler:
+    """Temperature / top-k / top-p sampling over the model's device-side top-k.
+
+    The graph hands back the 64 best logits and their ids, so a step reads ~512
+    bytes instead of the 1 MiB the full vocabulary row would cost. Policy stays
+    here: the model contains no RNG, and the same seed reproduces a run exactly.
+
+    `temperature == 0` means greedy, which is just the first entry — the top-k
+    output is already sorted best-first.
+    """
+
+    # Markers that only ever appear in a PROMPT: the modality blocks the processor
+    # splices in, and pad. The model will happily emit `<|image>` as its first reply
+    # token and then loop on it, so a serving layer has to take them off the table.
+    SUPPRESSED = frozenset({
+        0,       # <pad>
+        255999,  # <|image>
+        256000,  # <|audio>
+        258880,  # <|image|>
+        258881,  # <|audio|>
+        258882,  # <image|>
+        258883,  # <audio|>
+    })
+
+    def __init__(self, *, temperature: float, top_k: int, top_p: float, seed: int):
+        if temperature < 0.0:
+            raise ValueError("temperature must be >= 0")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError("top-p must be in (0, 1]")
+        self.temperature = float(temperature)
+        self.top_k = int(top_k)
+        self.top_p = float(top_p)
+        self.rng = np.random.default_rng(seed)
+
+    def __call__(self, model) -> int:
+        vt = model.output_tensor("topk_values")
+        it = model.output_tensor("topk_indices")
+        try:
+            values = np.asarray(vt.numpy(), dtype=np.float64).reshape(-1)
+            ids = np.asarray(it.numpy()).reshape(-1)
+        finally:
+            vt.close()
+            it.close()
+
+        keep = np.array([int(i) not in self.SUPPRESSED for i in ids], dtype=bool)
+        if keep.any():
+            values, ids = values[keep], ids[keep]
+
+        if self.temperature == 0.0:
+            return int(ids[0])
+
+        if 0 < self.top_k < values.size:
+            values = values[: self.top_k]
+            ids = ids[: self.top_k]
+
+        # Subtracting the max before exp is what keeps a large logit finite.
+        probs = np.exp((values - values[0]) / self.temperature)
+        probs /= probs.sum()
+
+        if self.top_p < 1.0:
+            # Values arrive sorted, so the nucleus is a prefix: keep entries up to
+            # and including the one that crosses `top_p`.
+            cutoff = int(np.searchsorted(np.cumsum(probs), self.top_p)) + 1
+            probs = probs[:cutoff]
+            ids = ids[:cutoff]
+            probs /= probs.sum()
+
+        return int(self.rng.choice(ids, p=probs))
+
+
 def default_model_path() -> Path:
     # bindings/python/examples -> repo root
     repo_root = Path(__file__).resolve().parents[3]
@@ -50,6 +120,7 @@ class _Tokenizer:
     BOS: int = 2
     UNK: int = 3
     MASK: int = 4
+    THINK: int = 98
     START_OF_TURN: int = 105
     END_OF_TURN: int = 106
     BEGIN_OF_IMAGE: int = 255999
@@ -163,9 +234,37 @@ def _ns_to_ms(ns: int) -> float:
     return float(ns) / 1.0e6
 
 
-def _gemma_chat_ids(tokenizer: _Tokenizer, content_ids: Sequence[int], prompt: str) -> List[int]:
-    """The canonical single-user Gemma turn used by this standalone example."""
-    ids = [tokenizer.BOS, tokenizer.START_OF_TURN]
+def _gemma_chat_ids(
+    tokenizer: _Tokenizer,
+    content_ids: Sequence[int],
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    think: bool = False,
+) -> List[int]:
+    """One user turn in Gemma 4's canonical chat format.
+
+    Mirrors `chat_template.jinja` from the checkpoint for the single-message case:
+
+        <bos>[<|turn>system\n[<|think|>\n][system]<turn|>\n]<|turn>user\n
+        {content}<turn|>\n<|turn>model\n
+
+    The system turn appears only when there is a system message or thinking is on,
+    exactly as the template gates it. It is worth passing one: without it this
+    checkpoint tends to continue the conversation itself instead of answering.
+    """
+    ids = [tokenizer.BOS]
+    if think or system:
+        ids += [tokenizer.START_OF_TURN]
+        ids += tokenizer.encode("system\n")
+        if think:
+            ids += [tokenizer.THINK]
+            ids += tokenizer.encode("\n")
+        if system:
+            ids += tokenizer.encode(system.strip())
+        ids += [tokenizer.END_OF_TURN]
+        ids += tokenizer.encode("\n")
+    ids += [tokenizer.START_OF_TURN]
     ids += tokenizer.encode("user\n")
     ids += [int(x) for x in content_ids]
     ids += tokenizer.encode(prompt)
@@ -322,7 +421,7 @@ def _prepare_multimodal(args) -> tuple[List[int], _Tokenizer, dict[str, np.ndarr
         content_ids += [tokenizer.END_OF_AUDIO]
 
     original_ids = np.asarray(
-        [_gemma_chat_ids(tokenizer, content_ids, args.prompt)], dtype=np.int32
+        [_gemma_chat_ids(tokenizer, content_ids, args.prompt, system=args.system, think=args.think)], dtype=np.int32
     )
     seq = original_ids.shape[1]
     image_slots = np.flatnonzero(original_ids[0] == tokenizer.IMAGE)
@@ -412,7 +511,15 @@ def main() -> None:
     )
     p.add_argument("--prompt", type=str, default="Hello")
     p.add_argument("--image", type=Path, default=None, help="Optional image for a multimodal prompt")
-    p.add_argument("--audio", type=Path, default=None, help="Optional audio file for a multimodal prompt")
+    p.add_argument(
+        "--audio",
+        type=Path,
+        default=None,
+        help="Optional audio file for a multimodal prompt (16 kHz wav). Note: this "
+        "checkpoint does not usefully transcribe -- the same input through the "
+        "reference Gemma4Processor + f32 model returns whitespace too. The path is "
+        "numerically faithful; the model is the limit.",
+    )
     p.add_argument("--add-bos", action="store_true", help="Prepend BOS token (requires tokenizer)")
     p.add_argument("--add-eos", action="store_true", help="Append EOS token (requires tokenizer)")
     p.add_argument(
@@ -436,6 +543,39 @@ def main() -> None:
         help="Stop early when END_OF_TURN is generated (default: on for --chat)",
     )
     p.add_argument("--max-new-tokens", type=int, default=1)
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature; 0 (default) is greedy. Greedy repeats itself on "
+        "this checkpoint, so a chat-style run wants ~1.0.",
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=32,
+        help="Keep only the k best candidates, capped at the number the model "
+        "returns (TOPK_OUT in the converter, currently 32).",
+    )
+    p.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus cutoff over the kept candidates [default: 0.95]",
+    )
+    p.add_argument("--seed", type=int, default=0, help="Sampling seed (reproducible).")
+    p.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help="System message for --chat. The template emits a system turn only when "
+        "one is given; without it this checkpoint tends to answer its own question.",
+    )
+    p.add_argument(
+        "--think",
+        action="store_true",
+        help="Open the template's thinking channel (<|think|>) in the system turn.",
+    )
     p.add_argument("--thread-count", type=int, default=1, help="Context thread count (default: 1)")
     add_device_args(p)
     p.add_argument("--timing", action="store_true", help="Print per-stage timing and throughput")
@@ -502,13 +642,10 @@ def main() -> None:
     elif args.chat:
         if tokenizer is None:
             raise SystemExit("--chat requires a tokenizer")
-        # Follow upstream Gemma4 chat formatting (see gemma4_pt_claude README).
-        prompt_ids = [tokenizer.BOS, tokenizer.START_OF_TURN]
-        prompt_ids += tokenizer.encode(f"user\n{args.prompt}")
-        prompt_ids += [tokenizer.END_OF_TURN]
-        prompt_ids += tokenizer.encode("\n")
-        prompt_ids += [tokenizer.START_OF_TURN]
-        prompt_ids += tokenizer.encode("model\n")
+        # One builder for the chat format, shared with the multimodal path.
+        prompt_ids = _gemma_chat_ids(
+            tokenizer, [], args.prompt, system=args.system, think=args.think
+        )
     else:
         if (args.add_bos or args.add_eos) and tokenizer is None:
             raise SystemExit("--add-bos/--add-eos require a tokenizer")
@@ -534,10 +671,20 @@ def main() -> None:
     tok_ns = time.perf_counter_ns() - t0_tok_ns
     s0 = len(prompt_ids)
 
-    # Stop tokens (useful for chat templates).
-    stop_on_eos: bool = bool(args.stop_on_eos) if args.stop_on_eos is not None else bool(args.chat and tokenizer is not None)
+    sampler = Sampler(
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        seed=args.seed,
+    )
+
+    # Stop tokens. The multimodal paths always build a chat turn (the model has to
+    # be told where the image/audio block sits), so they need the turn's stops too —
+    # gating these on `--chat` alone let `<eos>` through mid-reply.
+    templated: bool = bool(args.chat or args.image is not None or args.audio is not None)
+    stop_on_eos: bool = bool(args.stop_on_eos) if args.stop_on_eos is not None else bool(templated and tokenizer is not None)
     stop_on_eot: bool = (
-        bool(args.stop_on_end_of_turn) if args.stop_on_end_of_turn is not None else bool(args.chat and tokenizer is not None)
+        bool(args.stop_on_end_of_turn) if args.stop_on_end_of_turn is not None else bool(templated and tokenizer is not None)
     )
     stop_tokens: set[int] = set()
     if tokenizer is not None:
@@ -546,11 +693,6 @@ def main() -> None:
         if stop_on_eot:
             stop_tokens.add(int(tokenizer.END_OF_TURN))
 
-    if s0 > 512:
-        raise SystemExit(
-            f"prompt is too long for the local sliding window (512): tokens={s0}. "
-            "Try a shorter prompt."
-        )
     if (s0 + args.max_new_tokens) > args.global_cache_capacity:
         raise SystemExit(
             "global cache capacity is too small: "
@@ -603,7 +745,7 @@ def main() -> None:
             # device. Outputs are mirrored to the host lazily, so leaving the
             # [1, S, vocab] logits unread is what skips copying them back.
             t0_argmax_ns = time.perf_counter_ns()
-            next_id = _read_next_token(model)
+            next_id = sampler(model)
             argmax_ns = time.perf_counter_ns() - t0_argmax_ns
 
             # Generated token ids (excluding stop tokens for readability).
@@ -662,7 +804,7 @@ def main() -> None:
                 decode_total_run_ns += time.perf_counter_ns() - t0_step_run_ns
 
                 t0_step_argmax_ns = time.perf_counter_ns()
-                next_id = _read_next_token(model)
+                next_id = sampler(model)
                 decode_total_argmax_ns += time.perf_counter_ns() - t0_step_argmax_ns
 
                 if tokenizer is not None and (next_id in stop_tokens):

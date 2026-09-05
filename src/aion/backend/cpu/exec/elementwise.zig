@@ -220,8 +220,11 @@ pub fn execCopyTiled(
     const min_total_bytes: usize = 256 * 1024;
 
     const bytesForTileView = struct {
+        // Every dim, not just the leading two: a tile is contiguous, so its byte
+        // length is the product of its whole extent.
         fn calc(dtype: types.DType, view: anytype) usize {
-            const elems: usize = if (view.layout.rank == 1) view.layout.shape[0] else (view.layout.shape[0] * view.layout.shape[1]);
+            var elems: usize = 1;
+            for (view.layout.shape[0..view.layout.rank]) |dim| elems *= dim;
             return switch (dtype) {
                 .f32 => elems * 4,
                 .f16 => elems * 2,

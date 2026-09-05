@@ -89,6 +89,12 @@ fn mapDropAxis(buf: []?usize, in_rank: usize, axis: usize) []const ?usize {
     return buf[0..dst];
 }
 
+/// `map` for an op that keeps every axis but resizes one (top-k's `k`).
+fn mapResizeAxis(buf: []?usize, in_rank: usize, axis: usize) []const ?usize {
+    for (0..in_rank) |i| buf[i] = if (i == axis) null else i;
+    return buf[0..in_rank];
+}
+
 /// Resolve `syms` against the output shape. Allocates only when a symbol actually
 /// carries, so a graph with no symbolic dims — the common case, and inference runs
 /// per op as the graph is built — pays nothing.
@@ -996,6 +1002,27 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             try require(input.dtype != null and input.shape.len != 0);
             _ = try normalizeAxis(dd.axis, input.shape.len);
             try setInferred(graph, node.output, .i32, &[_]usize{1}, .none);
+        },
+
+        .TopK => |tk| {
+            const x = try getValue(graph, node.inputs[0]);
+            try require(x.dtype != null and x.shape.len >= 1);
+            // Float only, matching ArgMax: an integer top-k is meaningful but no
+            // backend implements one, and admitting it defers the failure to exec.
+            if (!isScalarFloat(x.dtype.?)) return InferError.Unsupported;
+            const rank: usize = x.shape.len;
+            const axis: usize = try normalizeAxis(tk.axis, rank);
+            if (tk.k == 0 or tk.k > x.shape[axis]) return InferError.InvalidGraph;
+            if (node.extra_outputs.len != 1) return InferError.InvalidGraph;
+
+            const out_shape: []usize = graph.arenaAlloc().alloc(usize, rank) catch return InferError.InvalidGraph;
+            @memcpy(out_shape, x.shape);
+            out_shape[axis] = tk.k;
+
+            var sym_buf: [8]?usize = undefined;
+            const syms: Symbols = .{ .mapped = .{ .of = node.inputs[0], .map = mapResizeAxis(&sym_buf, rank, axis) } };
+            try setInferred(graph, node.output, x.dtype.?, out_shape, syms);
+            try setInferred(graph, node.extra_outputs[0], .i32, out_shape, syms);
         },
 
         .Iota => |io| {

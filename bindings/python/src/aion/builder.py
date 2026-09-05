@@ -19,13 +19,14 @@ from __future__ import annotations
 import contextlib
 from types import TracebackType
 from collections.abc import Generator
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Union, overload
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Tuple, Union, overload
 
 from .context import Context
 from .device import DeviceLike, _normalize_device
 from .dtype import dtype_name, float32, normalize_dtype as _as_dtype
 from .errors import AionError
 from ._ffi.authoring import (
+    builder_topk,
     AttentionAttrs,
     AxisAttrs,
     CastAttrs,
@@ -691,6 +692,26 @@ class Builder:
     def argmax(self, a: TensorRef, axis: int = -1) -> TensorRef:
         return self._emit(AionOp.AION_OP_ARGMAX, (a,), AxisAttrs(axis))
 
+    def topk(
+        self,
+        a: TensorRef,
+        k: int,
+        axis: int = -1,
+        *,
+        largest: bool = True,
+    ) -> Tuple[TensorRef, TensorRef]:
+        """`(values, indices)`: the `k` best entries along `axis` and where they came from.
+
+        Sorted best-first, ties going to the lowest index, so the result is a
+        function of the input alone. `largest=False` gives the k smallest. Both
+        outputs have the input's shape with `axis` resized to `k`; the indices are
+        int32. Lowering implements the last axis -- transpose to reach another.
+        """
+        values, indices = builder_topk(
+            self._ctx_owner.ptr, self.ptr, a.id, int(k), int(axis), bool(largest)
+        )
+        return TensorRef(self, values), TensorRef(self, indices)
+
     def reduce(self, op: str, a: TensorRef, axis: Optional[int] = None) -> TensorRef:
         r = AionReduceOp.AION_REDUCE_SUM if op == "sum" else AionReduceOp.AION_REDUCE_MEAN
 
@@ -876,7 +897,8 @@ class Builder:
 
     def add_input_role(self, value: TensorRef, kind: AionInputRoleKind, *,
                        axis: Optional[int] = None, capacity_symbol: Optional[str] = None,
-                       zero_init: bool = True, growable: bool = False, ring: bool = False) -> None:
+                       zero_init: bool = True, growable: bool = False,
+                       retained_history_tokens: int = 0) -> None:
         """Tag an input with a runtime role (KV cache, positions, tokens, state, …).
 
         `capacity_symbol` names a dim symbol declared on `value` (via
@@ -890,7 +912,7 @@ class Builder:
             capacity_symbol=capacity_symbol,
             zero_init=zero_init,
             growable=growable,
-            ring=ring,
+            retained_history_tokens=retained_history_tokens,
         )
 
     # --- control flow (regions) -------------------------------------------

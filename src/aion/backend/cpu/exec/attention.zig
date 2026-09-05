@@ -24,11 +24,11 @@ const Vec = @Vector(simd_lanes, f32);
 /// growth before dispatch, so metadata is stable), `ring` is a modulo.
 ///
 /// There used to be a third mode that called `store.mapSequenceStep` per key; it was
-/// unreachable — `execAttentionTiled` only ever derives identity or ring — and it sat
+/// unreachable — `execAttentionTiled` only ever derives identity or rolling — and it sat
 /// in the innermost key loop of both score paths.
 const TimeMapMode = enum {
     identity,
-    ring,
+    rolling,
 };
 
 const ConstTileCache = struct {
@@ -568,7 +568,7 @@ inline fn scaleRowF32(row: []align(1) f32, n: usize, scale: f32) void {
 //     partitioned by output tile leaves every thread but one idle.
 //
 // Restricted to f32 q/k/v/out and identity time mapping; f16 caches and
-// ring mapping fall through to the generic path, which stays authoritative.
+// rolling mapping fall through to the generic path, which stays authoritative.
 
 /// Comptime bound for the per-row stack descriptors below. The block size actually
 /// walked is the selected variant's `tuning.row_block` (carried as `BlockedCtx.row_block`),
@@ -1086,7 +1086,7 @@ const BlockedCtx = struct {
     }
 };
 
-/// Blocked path preconditions. f16 caches and ring time mapping keep the
+/// Blocked path preconditions. f16 caches and rolling time mapping keep the
 /// generic executor (this path's panels assume physically contiguous key rows).
 fn blockedEligible(
     q_dtype: DType,
@@ -1128,7 +1128,7 @@ const ExecCtx = struct {
     groups_per_kv: usize,
 
     map_mode: TimeMapMode,
-    ring_window: usize,
+    ring_modulus: usize,
     k_cap: usize,
     v_cap: usize,
 
@@ -1198,8 +1198,8 @@ const ExecCtx = struct {
                 }
 
                 var available_start: usize = 0;
-                if (self.map_mode == .ring and valid_end > self.ring_window) {
-                    available_start = valid_end - self.ring_window;
+                if (self.map_mode == .rolling and valid_end > self.ring_modulus) {
+                    available_start = valid_end - self.ring_modulus;
                 }
 
                 var l: usize = l_start;
@@ -1275,9 +1275,9 @@ const ExecCtx = struct {
                                         k_t = logical_t;
                                         v_t = logical_t;
                                     },
-                                    .ring => {
-                                        k_t = logical_t % self.ring_window;
-                                        v_t = logical_t % self.ring_window;
+                                    .rolling => {
+                                        k_t = logical_t % self.ring_modulus;
+                                        v_t = logical_t % self.ring_modulus;
                                     },
                                 }
 
@@ -1369,9 +1369,9 @@ const ExecCtx = struct {
                                         k_t = logical_t;
                                         v_t = logical_t;
                                     },
-                                    .ring => {
-                                        k_t = logical_t % self.ring_window;
-                                        v_t = logical_t % self.ring_window;
+                                    .rolling => {
+                                        k_t = logical_t % self.ring_modulus;
+                                        v_t = logical_t % self.ring_modulus;
                                     },
                                 }
 
@@ -1668,13 +1668,12 @@ pub fn execAttentionTiled(
     const map_mode: TimeMapMode = switch (policy_info.kind) {
         .none => .identity,
         .growable => .identity,
-        .ring => .ring,
+        .rolling => .rolling,
     };
-    const ring_window: usize = if (map_mode == .ring) blk: {
-        const configured: usize = policy_info.ring_window_tokens;
-        break :blk if (configured == 0) k_cap else @min(configured, k_cap);
-    } else 0;
-    if (map_mode == .ring and ring_window == 0) return BackendError.InvalidArgument;
+    // Retention is semantic; modulo addressing uses the complete physical
+    // allocation, which may include headroom for a multi-token append.
+    const ring_modulus: usize = if (map_mode == .rolling) k_cap else 0;
+    if (map_mode == .rolling and ring_modulus == 0) return BackendError.InvalidArgument;
 
     const b_tiles: usize = out_meta.tile_counts[0];
     const l_tiles: usize = out_meta.tile_counts[1];
@@ -1724,7 +1723,7 @@ pub fn execAttentionTiled(
         .d_v = d_v,
         .groups_per_kv = groups_per_kv,
         .map_mode = map_mode,
-        .ring_window = ring_window,
+        .ring_modulus = ring_modulus,
         .k_cap = k_cap,
         .v_cap = v_cap,
         .hq_tiles = hq_tiles,

@@ -826,9 +826,9 @@ pub export fn aion_loaded_model_reset_state(m_opt: ?*AionLoadedModel) callconv(.
 }
 
 /// Declare a sequence-cache policy for an io-aliased recurrent-state input by
-/// name. `kind`: 0 = none (fixed), 1 = growable, 2 = ring. Growable uses
+/// name. `kind`: 0 = none (fixed), 1 = growable, 2 = rolling. Growable uses
 /// `initial_capacity_tokens` / `growth_numerator` / `growth_denominator` /
-/// `max_capacity_tokens`; ring uses `ring_window_tokens`. Lets a caller allocate
+/// `max_capacity_tokens`; rolling uses `retained_history_tokens`.
 /// a small initial cache and have the runtime grow its slot on demand up to the
 /// bound (device-resident growth included). Unused fields are ignored per kind.
 pub export fn aion_loaded_model_set_state_input_policy(
@@ -839,7 +839,7 @@ pub export fn aion_loaded_model_set_state_input_policy(
     growth_numerator: u64,
     growth_denominator: u64,
     max_capacity_tokens: u64,
-    ring_window_tokens: u64,
+    retained_history_tokens: u64,
 ) callconv(.c) AionStatus {
     const m: *AionLoadedModel = m_opt orelse return .AION_INVALID_ARGUMENT;
     const ctx: *AionContext = m.owner;
@@ -854,7 +854,7 @@ pub export fn aion_loaded_model_set_state_input_policy(
             .growth_denominator = @intCast(growth_denominator),
             .max_capacity_tokens = @intCast(max_capacity_tokens),
         } },
-        2 => .{ .ring = .{ .window_tokens = @intCast(ring_window_tokens) } },
+        2 => .{ .rolling = .{ .history_tokens = @intCast(retained_history_tokens) } },
         else => .{ .none = {} },
     };
     m.model.setStateInputPolicy(n, policy) catch |e| {
@@ -1777,6 +1777,31 @@ pub export fn aion_builder_if(
 /// Loop. `out_values` must hold `carried_len` ids (the final carried values);
 /// single-carry loops pass `carried_len == 1`. `has_cond_carry == 0` means no
 /// continue-predicate carry.
+/// Top-k along `axis`. Writes the values id and the i32 indices id; both are the
+/// input's shape with `axis` resized to `k`, sorted best-first with ties going to
+/// the lowest index. `largest == 0` selects the k smallest. Multi-output, so it is
+/// its own entry rather than an `aion_builder_op` spec.
+pub export fn aion_builder_topk(
+    b_opt: ?*AionBuilder,
+    x: AionValueId,
+    k: usize,
+    axis: i32,
+    largest: u8,
+    out_values: [*c]AionValueId,
+    out_indices: [*c]AionValueId,
+) callconv(.c) AionStatus {
+    const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
+    b.owner.clearLastError();
+    if (out_values == null or out_indices == null) return .AION_INVALID_ARGUMENT;
+    const top = b.builder.topk(vref(x), k, axis, largest != 0) catch |e| {
+        b.owner.setLastError("builder_topk", e);
+        return mapError(e);
+    };
+    out_values[0] = top.values.value;
+    out_indices[0] = top.indices.value;
+    return .AION_OK;
+}
+
 pub export fn aion_builder_loop(
     b_opt: ?*AionBuilder,
     carried_ptr: [*c]const AionValueId,
@@ -1862,7 +1887,7 @@ pub export fn aion_builder_add_input_role(
     capacity_symbol: ?[*:0]const u8,
     zero_init: u8,
     allow_growable: u8,
-    allow_ring: u8,
+    retained_history_tokens: u32,
 ) callconv(.c) AionStatus {
     const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
     b.owner.clearLastError();
@@ -1877,7 +1902,7 @@ pub export fn aion_builder_add_input_role(
         .capacity_symbol = sym,
         .zero_init = zero_init != 0,
         .allow_growable = allow_growable != 0,
-        .allow_ring = allow_ring != 0,
+        .retained_history_tokens = retained_history_tokens,
     }) catch {
         b.owner.setLastError("add_input_role", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;

@@ -28,7 +28,6 @@ pub const Derived = derived_mod;
 /// Stable across internal resizes because it is an index into a pointer table.
 pub const TensorId = u32;
 
-
 /// RAM-only storage manager.
 ///
 /// This owns all `TiledTensor` allocations for a context.
@@ -139,13 +138,6 @@ pub const StorageManager = struct {
         return fold.collectDerived(self);
     }
 
-
-
-
-
-
-
-
     /// Give `id` its physical backing on `target`, preserving its tile geometry.
     ///
     /// The one way anything says "this tensor belongs on that device": placement,
@@ -202,13 +194,22 @@ pub const StorageManager = struct {
         cache_ptr.registerTensorPolicy(id, policy) catch |e| return mapCacheError(e);
     }
 
-
-
-
     /// Grow `id`'s axis `axis` to at least `min_size`, following its cache policy.
     /// Executed in `manager/grow.zig`.
     pub fn ensureTensorAxisCapacity(self: *Self, id: TensorId, axis: usize, min_size: usize) StorageError!void {
         return grow.ensureTensorAxisCapacity(self, id, axis, min_size);
+    }
+
+    /// Grow a rank-4 rolling cache and remap its retained logical rows from the
+    /// old modulo to the new one. `logical_ends[b]` is the next write position.
+    pub fn ensureRollingCacheCapacity(
+        self: *Self,
+        id: TensorId,
+        min_size: usize,
+        retained_history: usize,
+        logical_ends: []const usize,
+    ) StorageError!void {
+        return grow.ensureRollingCacheCapacity(self, id, min_size, retained_history, logical_ends);
     }
 
     pub fn sequenceCachePolicy(self: *const Self, id: TensorId) SequenceCachePolicy {
@@ -669,5 +670,4 @@ pub const StorageManager = struct {
     pub fn tensorStore(self: *Self) tensor_store.TensorStore {
         return store_view.of(self);
     }
-
 };

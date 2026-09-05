@@ -14,6 +14,152 @@ fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.Dir.Creat
     return try dir.createFile(std.testing.io, sub_path, flags);
 }
 
+test "api: topk returns the k best values and their indices, sorted" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    // Row 0 has a repeated max so the tie-break is exercised: equal values must
+    // come back lowest-index first.
+    const vals = [_]f32{
+        3.0,  9.0,  1.0, 9.0,  5.0,
+        -1.0, -7.0, 0.5, -3.0, 2.0,
+    };
+    const src = try ctx.fromF32(&[_]usize{ 2, 5 }, &vals);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const top = try bld.topk(try bld.param(src), 3, -1, true);
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ top.values, top.indices }, .{});
+    defer model.deinit();
+    try model.run();
+
+    var got_v: [6]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&got_v);
+    var got_i: [6]i32 = undefined;
+    try (try model.outputTensorAt(1)).read(&got_i);
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 9, 9, 5, 2, 0.5, -1 }, &got_v);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 3, 4, 4, 2, 0 }, &got_i);
+}
+
+test "api: topk with largest=false returns the k smallest" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const src = try ctx.fromF32(&[_]usize{ 1, 5 }, &[_]f32{ 3.0, 9.0, 1.0, 9.0, 5.0 });
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const bot = try bld.topk(try bld.param(src), 2, -1, false);
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ bot.values, bot.indices }, .{});
+    defer model.deinit();
+    try model.run();
+
+    var got_v: [2]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&got_v);
+    var got_i: [2]i32 = undefined;
+    try (try model.outputTensorAt(1)).read(&got_i);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 3 }, &got_v);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 0 }, &got_i);
+}
+
+test "api: topk k == n is a full sort, and k == 1 agrees with argmax" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const raw = [_]f32{ 0.25, -4.0, 7.5, 7.5, 2.0, -0.5, 3.0, 1.0 };
+    const src = try ctx.fromF32(&[_]usize{ 1, 8 }, &raw);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const p = try bld.param(src);
+    const all = try bld.topk(p, raw.len, -1, true);
+    const one = try bld.topk(p, 1, -1, true);
+    const am = try bld.argmax(p, -1);
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{ all.values, all.indices, one.indices, am }, .{});
+    defer model.deinit();
+    try model.run();
+
+    var sorted: [8]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&sorted);
+    var order: [8]i32 = undefined;
+    try (try model.outputTensorAt(1)).read(&order);
+    // Descending, and a permutation of the input: every index appears once.
+    var seen: [8]bool = @splat(false);
+    for (sorted[1..], 0..) |v, i| try std.testing.expect(v <= sorted[i]);
+    for (order, sorted) |idx, v| {
+        try std.testing.expect(!seen[@intCast(idx)]);
+        seen[@intCast(idx)] = true;
+        try std.testing.expectEqual(raw[@intCast(idx)], v);
+    }
+
+    var top1: [1]i32 = undefined;
+    try (try model.outputTensorAt(2)).read(&top1);
+    var argm: [1]i32 = undefined;
+    try (try model.outputTensorAt(3)).read(&argm);
+    try std.testing.expectEqual(argm[0], top1[0]);
+}
+
+test "api: topk survives an export/load round-trip" {
+    // The op carries its indices output inside its attribute blob (the format has
+    // no generic per-node extra-output list), so serialization is worth pinning.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "topk.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const X = try bld.name(try bld.input(.f32, &.{ 1, 6 }), "x");
+        const top = try bld.topk(X, 3, -1, true);
+        try ctx.exportModel(file, &bld, &.{
+            .{ .name = "values", .tensor = top.values },
+            .{ .name = "indices", .tensor = top.indices },
+        }, .{});
+    }
+
+    var model = try ctx.loadModel(file, .{});
+    defer model.deinit();
+    try model.bindInput("x", try ctx.fromF32(&[_]usize{ 1, 6 }, &[_]f32{ 2, -1, 8, 8, 0, 4 }));
+    try model.run();
+
+    var got_v: [3]f32 = undefined;
+    try (try model.outputTensor("values")).read(&got_v);
+    var got_i: [3]i32 = undefined;
+    try (try model.outputTensor("indices")).read(&got_i);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 8, 8, 4 }, &got_v);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 3, 5 }, &got_i);
+}
+
+test "api: copy moves every element of a rank-4 tensor" {
+    // A tile byte length taken from the leading two dims only silently truncated
+    // rank-3+ copies, which a KV append then carried into the cache as stale bytes.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var vals: [2 * 3 * 4]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)))) * 0.25 - 1.0;
+    const src = try ctx.fromF32(&[_]usize{ 1, 2, 3, 4 }, &vals);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const Out = try bld.copy(try bld.param(src));
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{Out}, .{});
+    defer model.deinit();
+
+    const out = try model.runOutputTensor(0);
+    var got: [2 * 3 * 4]f32 = undefined;
+    try out.read(&got);
+    try std.testing.expectEqualSlices(f32, &vals, &got);
+}
+
 test "api: build+compile+run (matmul/broadcast/relu/copy/reduce)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -1529,6 +1675,51 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
     }
 }
 
+test "api: rolling cache grows for a prefill wider than retained history" {
+    const allocator = std.testing.allocator;
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "rolling_prefill.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    {
+        var bld = api.Builder.init(&export_ctx);
+        defer bld.deinit();
+        const Driver = try bld.name(try bld.input(.i32, &.{ 1, 5 }), "tokens");
+        const Values = try bld.name(try bld.input(.f32, &.{ 1, 5, 1, 1 }), "values");
+        const WriteIdx = try bld.name(try bld.input(.i32, &.{1}), "cache_write_index");
+        const Cache = try bld.name(try bld.input(.f32, &.{ 1, 4, 1, 1 }), "cache");
+        try bld.symbolicDim(Cache, 1, "L");
+        const CacheOut = try bld.name(try bld.sequenceAppend(Cache, Values, WriteIdx), "next_cache");
+        try export_ctx.exportModel(file, &bld, &.{.{ .name = "next_cache", .tensor = CacheOut }}, .{
+            .output_aliases = &.{.{ .input = Cache, .output = CacheOut }},
+            .input_roles = &.{
+                .{ .input = Driver, .kind = .tokens, .axis = 1 },
+                .{ .input = WriteIdx, .kind = .cache_write_index },
+                .{ .input = Cache, .kind = .sequence_cache, .axis = 1, .capacity_symbol = "L", .retained_history_tokens = 3 },
+            },
+        });
+    }
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var model = try ctx.loadModel(file, .{});
+    defer model.deinit();
+    const tokens = try ctx.fromArray([1][5]i32{.{ 0, 0, 0, 0, 0 }});
+    const values = try ctx.fromArray([1][5][1][1]f32{.{ .{.{1}}, .{.{2}}, .{.{3}}, .{.{4}}, .{.{5}} }});
+    try model.bindInput("tokens", tokens);
+    try model.bindInput("values", values);
+    try model.run();
+
+    const out = try model.outputTensor("next_cache");
+    try std.testing.expectEqualSlices(usize, &.{ 1, 8, 1, 1 }, out.getShape());
+    var got: [8]f32 = undefined;
+    try out.read(&got);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 0, 0, 0 }, &got);
+}
+
 test "api: compile io-alias gives auto-init + carry + reset (no export/load)" {
     // The unified Model from ctx.compile must support the same recurrent-state
     // ergonomics as a loaded model: unbound aliased state auto-zeros, carries across
@@ -2915,7 +3106,7 @@ test "api: sequenceAppend mutates cache in-place" {
     }, out_vals[0..]);
 }
 
-test "api: sequenceAppend ring policy wraps" {
+test "api: sequenceAppend rolling policy wraps" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{
@@ -2927,7 +3118,7 @@ test "api: sequenceAppend ring policy wraps" {
     const cache_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 4, 1, 1 }, &[_]f32{ 0, 1, 2, 3 });
     const new_t: api.Tensor = try ctx.fromF32(&[_]usize{ 1, 2, 1, 1 }, &[_]f32{ 90, 91 });
     const end_t: api.Tensor = try ctx.fromArray([1]i32{3});
-    try ctx.setTensorSequenceCachePolicy(cache_t, .{ .ring = .{ .window_tokens = 4 } });
+    try ctx.setTensorSequenceCachePolicy(cache_t, .{ .rolling = .{ .history_tokens = 4 } });
 
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();

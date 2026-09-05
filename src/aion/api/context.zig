@@ -47,7 +47,7 @@ pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
 pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
 pub const GrowablePolicy = cache_mod.GrowablePolicy;
-pub const RingPolicy = cache_mod.RingPolicy;
+pub const RollingPolicy = cache_mod.RollingPolicy;
 pub const DeviceSelector = device_mod.DeviceSelector;
 pub const GpuOptions = device_mod.GpuOptions;
 
@@ -644,12 +644,12 @@ pub const Context = struct {
             var flags: u8 = 0;
             if (decl.zero_init) flags |= package_file.InputRoleFlags.zero_init;
             if (decl.allow_growable) flags |= package_file.InputRoleFlags.allow_growable;
-            if (decl.allow_ring) flags |= package_file.InputRoleFlags.allow_ring;
             parts.input_roles[i] = .{
                 .input = @intCast(in_idx),
                 .kind = decl.kind,
                 .axis = decl.axis orelse package_file.input_role_no_axis,
                 .flags = flags,
+                .retained_history_tokens = decl.retained_history_tokens,
             };
         }
 

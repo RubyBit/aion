@@ -73,7 +73,6 @@ fn groups1D(n: u32) u32 {
 /// (one per table tile). The table may be split across bindings — each tile
 /// covers a row range and the kernel skips indices outside it — but every tile
 /// must hold whole rows, since a row is the unit a work item addresses.
-
 pub fn gatherRowsOnDevice(out_meta: TensorMeta, table_meta: TensorMeta, idx_meta: TensorMeta) bool {
     if (out_meta.rank != 3 or table_meta.rank != 2 or idx_meta.rank != 2) return false;
     if (idx_meta.dtype != .i32 or context.totalTiles(idx_meta) != 1) return false;
@@ -521,7 +520,7 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
         if (!context.storageBindingFits(ctx, dnew.len) or !context.storageBindingFits(ctx, dend.len)) return error.Unsupported;
 
         const built = try ctx.pipes.get(gather_kernel, if (f16_elems) "sequence_append_f16" else "sequence_append_u32");
-        const ring_window: usize = if (policy.kind == .ring) @min(policy.ring_window_tokens, cache_meta.shape[1]) else 0;
+        const ring_modulus: usize = if (policy.kind == .rolling) cache_meta.shape[1] else 0;
 
         // One dispatch per cache tile: an appended row lands in exactly one, and
         // the rest no-op on it.
@@ -540,7 +539,7 @@ pub fn execSequenceAppend(ctx: Ctx, frame: *Frame, s: executable.StepSequenceApp
                 .v = @intCast(new_len),
                 .wpr = @intCast(heads),
                 .total = @intCast(row_units),
-                ._p0 = @intCast(ring_window),
+                ._p0 = @intCast(ring_modulus),
                 ._p1 = @intCast(total_words),
                 ._p2 = @intCast(t_begin),
             };

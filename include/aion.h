@@ -284,11 +284,12 @@ AION_API AionStatus aion_loaded_model_run(AionLoadedModel* m);
    Use between independent sequences. No-op before the first run. */
 AION_API AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
 /* Declare a sequence-cache policy for an io-aliased recurrent-state input by
-   name, so the runtime can grow (or ring-wrap) its state slot on demand instead
-   of the caller pre-allocating the maximum. kind: 0=none (fixed), 1=growable,
-   2=ring. Growable uses initial/growth_numerator/growth_denominator/max_capacity;
-   ring uses ring_window_tokens. Unused fields are ignored per kind. */
-AION_API AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t ring_window_tokens);
+   name, so the runtime can size its state slot on demand instead of the caller
+   pre-allocating the maximum. kind: 0=none (fixed), 1=growable, 2=rolling.
+   Growable uses initial/growth_numerator/growth_denominator/max_capacity; rolling
+   uses retained_history_tokens, the prior positions the model needs kept (physical
+   capacity is the runtime's business). Unused fields are ignored per kind. */
+AION_API AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t retained_history_tokens);
 AION_API AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
 
 /* Tokens consumed so far by position auto-management (0 when disabled). */
@@ -503,6 +504,12 @@ AION_API AionStatus aion_builder_symbol_size(const AionBuilder* b, const char* n
 // arity (concat, optional bias/mask) is carried by `spec->inputs`.
 AION_API AionStatus aion_builder_op(AionBuilder* b, const AionOpSpec* spec, AionValueId* out_value);
 
+// Top-k along `axis` (lowering implements the last axis; transpose to reach
+// another). Writes the values id and the i32 indices id — both the input's shape
+// with `axis` resized to `k`, sorted best-first with ties going to the lowest
+// index. `largest == 0` selects the k smallest.
+AION_API AionStatus aion_builder_topk(AionBuilder* b, AionValueId x, size_t k, int32_t axis, uint8_t largest, AionValueId* out_values, AionValueId* out_indices);
+
 // Control flow. Build a region (a branch body or loop body) between
 // begin/end_region, then reference it from `if`/`loop`. `end_region` returns a
 // region id. `loop` writes `carried_len` final carried values into `out_values`
@@ -520,7 +527,7 @@ AION_API AionStatus aion_builder_mark_output(AionBuilder* b, AionValueId value, 
 // means "compile exactly these outputs" clears first.
 AION_API AionStatus aion_builder_clear_outputs(AionBuilder* b);
 AION_API AionStatus aion_builder_add_output_alias(AionBuilder* b, AionValueId input_value, AionValueId output_value);
-AION_API AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint8_t allow_ring);
+AION_API AionStatus aion_builder_add_input_role(AionBuilder* b, AionValueId value, AionInputRoleKind kind, int32_t axis, uint8_t has_axis, const char* capacity_symbol, uint8_t zero_init, uint8_t allow_growable, uint32_t retained_history_tokens);
 AION_API AionStatus aion_builder_add_dim_symbol(AionBuilder* b, AionValueId value, size_t axis, const char* name);
 AION_API AionStatus aion_builder_add_metadata(AionBuilder* b, const char* key, const char* value);
 

@@ -57,6 +57,10 @@ NUM_KV_HEADS: int = 1
 LOCAL_HEAD_DIM: int = 256
 GLOBAL_HEAD_DIM: int = 512
 LOCAL_SLIDING_WINDOW: int = 512
+# Candidates the model hands back per step for host-side sampling. The top-k kernel
+# costs one selection round per k, so this is a real per-token price: 32 measured
+# ~1.5 tok/s faster than 64 on a 4080 and still covers any practical top-p nucleus.
+TOPK_OUT: int = 32
 FINAL_LOGIT_SOFTCAP: float = 30.0
 PLI_DIM: int = 256
 PLI_TOTAL: int = NUM_LAYERS * PLI_DIM  # 8960
@@ -91,7 +95,8 @@ def kv_source_of(layer: int) -> int:
 # Authoring placeholder sizes for the symbolic axes (eager inference only; the
 # exported model serves any runtime size on them).
 _PLACEHOLDER = {
-    "batch": 1, "seq": 1, "G": LOCAL_SLIDING_WINDOW,
+    "batch": 1, "seq": 1,
+    "G": LOCAL_SLIDING_WINDOW, "L": LOCAL_SLIDING_WINDOW,
     "vision_seq": 9, "vision_out": 1,
     "audio_frames": 4, "audio_sub1": 2, "audio_tokens": 1,
 }
@@ -525,7 +530,10 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     for src in SOURCE_LAYERS:
         is_glob = is_global_layer(src)
         head_dim = GLOBAL_HEAD_DIM if is_glob else LOCAL_HEAD_DIM
-        t_dim: Union[int, str] = "G" if is_glob else LOCAL_SLIDING_WINDOW
+        # Both cache kinds have a runtime-sized physical capacity, on separate
+        # symbols: `G` follows the whole context, `L` only ever holds the retained
+        # 511 tokens plus room for the widest append seen.
+        t_dim: Union[int, str] = "G" if is_glob else "L"
         k_cache_in[src] = _input(
             b,
             f"k_cache.layer{src}",
@@ -751,11 +759,22 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
               k_cache_in: Dict[int, TensorRef], v_cache_in: Dict[int, TensorRef], caches) -> None:
     b.mark_output(logits, "logits")
 
-    # Greedy next token, picked on the execution device. Outputs are mirrored to
-    # the host lazily (only when read), so a caller that wants greedy decoding
-    # reads 4 bytes here instead of copying the [B, 1, vocab] logits back every
-    # step; a caller that samples still has `logits`.
-    b.mark_output(b.argmax(logits, axis=-1), "next_token")
+    # Sampling needs a distribution, not one id -- but reading the [B, 1, 262144]
+    # logits back per step is 1 MiB of transfer for the ~64 entries any sane
+    # temperature/top-p leaves alive. Top-k on the device turns that into 512 bytes
+    # and keeps the sampling POLICY (temperature, top-p, seed) on the host where it
+    # belongs, rather than baking an RNG into the graph. Outputs are mirrored to the
+    # host lazily, so leaving `logits` unread is what skips copying them.
+    top_v, top_i = b.topk(logits, TOPK_OUT, axis=-1)
+    b.mark_output(top_v, "topk_values")
+    b.mark_output(top_i, "topk_indices")
+
+    # Greedy next token. Top-k is sorted best-first, so this is its first column --
+    # a view, not a second full pass over the vocabulary. An `argmax` here would
+    # scan all 262144 logits again for a value top-k already computed.
+    # `logits` is [batch, 1, vocab] -- the tail already gathered the sampled row --
+    # so this is [batch, 1, 1] reshaped to the [batch, 1] the old argmax produced.
+    b.mark_output(b.slice_last_dim(top_i, 0, 1).reshape(("batch", 1)), "next_token")
 
     # next_*_cache outputs io-aliased back to the cache inputs.
     for src, (k_in, k_out, v_in, v_out) in caches.items():
@@ -777,8 +796,10 @@ def _finalize(b: Builder, logits: TensorRef, tokens: TensorRef, positions: Tenso
                 b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1,
                                  capacity_symbol="G", zero_init=True, growable=True)
             else:
-                # Local caches: fixed sliding-window size.
-                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1, zero_init=True)
+                # Local caches: bounded semantic history, runtime-sized storage.
+                b.add_input_role(v, RK.AION_ROLE_SEQUENCE_CACHE, axis=1,
+                                 capacity_symbol="L", zero_init=True,
+                                 retained_history_tokens=LOCAL_SLIDING_WINDOW - 1)
 
     for key, value in [
         ("arch", "gemma4-e2b-multimodal"),

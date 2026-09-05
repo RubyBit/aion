@@ -41,7 +41,9 @@ pub const InputRoleDecl = struct {
     capacity_symbol: ?[]const u8 = null,
     zero_init: bool = true,
     allow_growable: bool = false,
-    allow_ring: bool = false,
+    /// Number of prior logical positions the cache must retain. Zero retains
+    /// the complete history.
+    retained_history_tokens: u32 = 0,
 };
 
 pub const ExportModelOptions = struct {

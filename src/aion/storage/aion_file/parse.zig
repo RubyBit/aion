@@ -531,6 +531,18 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
                 .check_before = check_before,
             } };
         },
+        .TopK => blk: {
+            const k = try readSizeCursor(bytes, &cursor);
+            const axis = try readIntCursor(bytes, &cursor, i32);
+            const largest = (try readIntCursor(bytes, &cursor, u8)) != 0;
+            const n_extra = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
+            if (n_extra != 1) return PackageError.InvalidFormat;
+            const extra = allocator.alloc(u32, n_extra) catch return PackageError.OutOfMemory;
+            errdefer allocator.free(extra);
+            for (extra) |*e| e.* = try readIntCursor(bytes, &cursor, u32);
+            extra_outputs = extra;
+            break :blk .{ .TopK = .{ .k = k, .axis = axis, .largest = largest } };
+        },
         .Conv1D => .{ .Conv1D = .{
             .stride = try readSizeCursor(bytes, &cursor),
             .dilation = try readSizeCursor(bytes, &cursor),
@@ -724,6 +736,7 @@ fn parseInputRolesSection(allocator: std.mem.Allocator, bytes: []const u8) Packa
         const flags = try readIntCursor(bytes, &cursor, u8);
         const reserved = try readIntCursor(bytes, &cursor, u8);
         const capacity_symbol = try readIntCursor(bytes, &cursor, u32);
+        const retained_history_tokens = try readIntCursor(bytes, &cursor, u32);
         if (reserved != 0) return PackageError.InvalidFormat;
         const kind = std.enums.fromInt(types.InputRoleKind, kind_raw) orelse return PackageError.InvalidFormat;
         slot.* = .{
@@ -732,6 +745,7 @@ fn parseInputRolesSection(allocator: std.mem.Allocator, bytes: []const u8) Packa
             .axis = axis,
             .flags = flags,
             .capacity_symbol = capacity_symbol,
+            .retained_history_tokens = retained_history_tokens,
         };
     }
     if (cursor != bytes.len) return PackageError.InvalidFormat;

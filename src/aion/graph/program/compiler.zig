@@ -744,6 +744,23 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             while (d < @as(usize, out.rank)) : (d += 1) try compileRequire(out.tile_counts[d] == 1);
         },
 
+        .TopK => |s| {
+            const a: *const TiledTensor = mgr.getConst(s.a) catch return CompileError.InvalidArgument;
+            const values: *const TiledTensor = mgr.getConst(s.values) catch return CompileError.InvalidArgument;
+            const indices: *const TiledTensor = mgr.getConst(s.indices) catch return CompileError.InvalidArgument;
+            try compileRequire(a.dtype == .f32 or a.dtype == .f16);
+            try compileRequire(values.dtype == a.dtype and indices.dtype == .i32);
+            try compileRequire(@as(usize, a.rank) >= 1 and s.axis == @as(usize, a.rank) - 1);
+            try compileRequire(values.rank == a.rank and indices.rank == a.rank);
+            try compileRequire(s.k != 0 and s.k <= a.shape[s.axis]);
+            var d: usize = 0;
+            while (d < @as(usize, a.rank)) : (d += 1) {
+                const want: usize = if (d == s.axis) s.k else a.shape[d];
+                try compileRequire(values.shape[d] == want and indices.shape[d] == want);
+                try compileRequire(a.tile_counts[d] == 1 and values.tile_counts[d] == 1 and indices.tile_counts[d] == 1);
+            }
+        },
+
         .ScatterRow => |s| {
             const buf: *const TiledTensor = mgr.getConst(s.buf) catch return CompileError.InvalidArgument;
             const idx: *const TiledTensor = mgr.getConst(s.idx) catch return CompileError.InvalidArgument;
@@ -2126,6 +2143,38 @@ fn lowerNode(
             while (d < out_shape.len) : (d += 1) out_tile[d] = out_shape[d];
             const out_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
             try appendStepChecked(allocator, mgr, steps, .{ .ArgMax = .{ .out = out_tid, .a = a_tid, .axis = axis } });
+        },
+
+        .TopK => |tk| {
+            const a_id: usize = @intCast(node.inputs[0]);
+            const a_v = graph.values.items[a_id];
+            const rank: usize = a_v.shape.len;
+            const axis: usize = try normalizeAxis(tk.axis, rank);
+            // Transpose to top-k a different axis; the kernels walk contiguous rows.
+            if (axis != rank - 1) return CompileError.InvalidArgument;
+            if (node.extra_outputs.len != 1) return CompileError.InvalidArgument;
+
+            // Single tile throughout: a row is the unit both kernels sort.
+            var in_tile_buf: [MAX_RANK]usize = undefined;
+            const in_tile: []usize = in_tile_buf[0..rank];
+            @memcpy(in_tile, a_v.shape);
+            const a_tid: TensorId = try ensureTilingScalarMaybeRetile(allocator, steps, mgr, policy, ctx, a_id, a_v.dtype.?, a_v.shape, in_tile);
+
+            var out_tile_buf: [MAX_RANK]usize = undefined;
+            const out_tile: []usize = out_tile_buf[0..out_shape.len];
+            @memcpy(out_tile, out_shape);
+            const values_tid: TensorId = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, out_tile);
+            const idx_value: usize = @intCast(node.extra_outputs[0]);
+            const indices_tid: TensorId = try ctx.ensureValueTensor(idx_value, .i32, out_shape, out_tile);
+
+            try appendStepChecked(allocator, mgr, steps, .{ .TopK = .{
+                .values = values_tid,
+                .indices = indices_tid,
+                .a = a_tid,
+                .k = tk.k,
+                .axis = axis,
+                .largest = tk.largest,
+            } });
         },
 
         .ScatterRow => {

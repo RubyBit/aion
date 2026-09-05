@@ -250,16 +250,16 @@ class LoadedModel:
             growth_denominator=growth_denominator,
         )
 
-    def set_state_input_ring(self, name: str, *, window: int) -> None:
-        """Make an io-aliased recurrent-state input a fixed ring buffer of `window` tokens."""
+    def set_state_input_rolling(self, name: str, *, retained_history: int) -> None:
+        """Retain bounded history while allowing physical append headroom."""
         if not isinstance(name, str):
             raise TypeError("name must be a str")
         set_state_input_policy(
             self._ctx_owner.ptr,
             self._require_handle(),
             name,
-            kind="ring",
-            window=window,
+            kind="rolling",
+            retained_history=retained_history,
         )
 
     def output_is_state(self, index: int) -> bool:

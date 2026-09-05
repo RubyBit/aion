@@ -97,6 +97,7 @@ class KVCache:
         capacity: int = 0,
         capacity_symbol: Optional[str] = None,
         growable: bool = False,
+        retained_history_tokens: int = 0,
     ) -> None:
         if min(batch, kv_heads, head_dim) <= 0:
             raise ValueError("batch, kv_heads and head_dim must be > 0")
@@ -110,6 +111,7 @@ class KVCache:
         self.dtype: DTypeLike = dtype
         self.capacity_symbol = capacity_symbol
         self.growable = bool(growable)
+        self.retained_history_tokens = int(retained_history_tokens)
 
         dyn = {1: capacity_symbol} if capacity_symbol else None
         self.input = b.input((batch, cap, kv_heads, head_dim), dtype=dtype, dynamic=dyn)
@@ -139,6 +141,7 @@ class KVCache:
             "capacity_symbol": self.capacity_symbol,
             "zero_init": True,
             "growable": self.growable,
+            "retained_history_tokens": self.retained_history_tokens,
         }
 
     def declare(self) -> None:

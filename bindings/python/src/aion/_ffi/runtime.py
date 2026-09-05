@@ -136,12 +136,12 @@ def set_state_input_policy(
     model: ModelHandle,
     name: str,
     *,
-    kind: Literal["growable", "ring"],
+    kind: Literal["growable", "rolling"],
     initial_capacity: int = 0,
     max_capacity: int = 0,
     growth_numerator: int = 0,
     growth_denominator: int = 0,
-    window: int = 0,
+    retained_history: int = 0,
 ) -> None:
     policy = 1 if kind == "growable" else 2
     status = lib.aion_loaded_model_set_state_input_policy(
@@ -152,7 +152,7 @@ def set_state_input_policy(
         int(growth_numerator),
         int(growth_denominator),
         int(max_capacity),
-        int(window),
+        int(retained_history),
     )
     raise_for_status(status, ctx, what="aion_loaded_model_set_state_input_policy")
 

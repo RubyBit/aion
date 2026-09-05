@@ -18,6 +18,7 @@ const signatures = @import("loaded_model/signatures.zig");
 const retarget = @import("loaded_model/retarget.zig");
 const initializers = @import("loaded_model/initializers.zig");
 const params_mod = @import("loaded_model/params.zig");
+const sequence_cache = @import("loaded_model/sequence_cache.zig");
 
 fn traceEnabled() bool {
     return env_util.flagEnabled("AION_TRACE");
@@ -146,7 +147,7 @@ pub const Model = struct {
     /// Shared backing per io-aliased state input, allowing recurrent state to carry
     /// across cache entries with different shapes. Invalid for non-aliased/unbuilt inputs.
     aliased_state_tids: []TensorId,
-    /// Optional per-input sequence-cache policy (grow-on-demand / ring), set via
+    /// Optional per-input sequence-cache policy (grow-on-demand / rolling), set via
     /// `setStateInputPolicy` and applied to the recurrent-state slot when it is
     /// created. `null` = fixed capacity (the slot never grows). One slot per input.
     state_input_policies: []?SequenceCachePolicy,
@@ -155,6 +156,9 @@ pub const Model = struct {
     aliased_state_synced_versions: []u64,
     /// Per-input package-declared role (null = none). Records copied at init.
     input_roles: []?package_file.InputRole,
+    /// Every `SequenceAppend` site whose cache is a public input, in public-input
+    /// terms so `settleSequenceCaches` can size caches before specialization.
+    cache_sites: []sequence_cache.Site,
     /// Cached input indices of the singleton control roles (null when absent).
     role_tokens_index: ?usize,
     role_positions_index: ?usize,
@@ -201,14 +205,17 @@ pub const Model = struct {
                 std.debug.print("  - {s}: <unbound>\n", .{sig.name});
                 continue;
             }
-            const t: Tensor = t_opt.?;
-            const meta = self.store.getConst(t.id) catch {
-                std.debug.print("  - {s}: <invalid tensor id {d}>\n", .{ sig.name, t.id });
+            // The persistent state slot when there is one: that is what the graph
+            // binds, and its capacity can differ from what the caller supplied.
+            const slot = self.aliased_state_tids[idx];
+            const id: TensorId = if (slot != types_mod.invalid_tensor_id) slot else t_opt.?.id;
+            const meta = self.store.getConst(id) catch {
+                std.debug.print("  - {s}: <invalid tensor id {d}>\n", .{ sig.name, id });
                 continue;
             };
             std.debug.print(
                 "  - {s}: id={d} dtype={s} rank={d} shape={any} tile_shape={any} tile_counts={any} quant_axis={d} aliased_input={any}\n",
-                .{ sig.name, t.id, @tagName(meta.dtype), meta.rank, meta.shape, meta.tile_shape, meta.tile_counts, meta.quant_axis, (self.inputAliasOutputIndex(idx) != null) },
+                .{ sig.name, id, @tagName(meta.dtype), meta.rank, meta.shape, meta.tile_shape, meta.tile_counts, meta.quant_axis, (self.inputAliasOutputIndex(idx) != null) },
             );
         }
     }
@@ -232,6 +239,7 @@ pub const Model = struct {
         self.allocator.free(self.aliased_state_synced_versions);
         self.allocator.free(self.state_input_policies);
         self.allocator.free(self.input_roles);
+        self.allocator.free(self.cache_sites);
         self.allocator.free(self.role_input_tids);
         self.allocator.free(self.role_auto_bound);
         self.allocator.free(self.symbol_defaults);
@@ -427,15 +435,20 @@ pub const Model = struct {
     }
 
     /// Zero all shared io-aliased recurrent-state slots; a no-op before first run.
-    /// Declare grow-on-demand or ring policy for a named io-aliased state input.
+    /// Declare a grow-on-demand or rolling policy for a named io-aliased state input.
     /// Prefer calling before first run so the policy shapes the initial slot.
     pub fn setStateInputPolicy(self: *Self, name: []const u8, policy: SequenceCachePolicy) api_errors.ApiError!void {
         const index = self.findInputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
-        // Growth/ring bookkeeping lives in the store's cache; ensure one exists.
+        // Growth and retention bookkeeping live in the store's cache; ensure one exists.
         // The RAM budget is a reserved (not-yet-enforced) soft bound, so a sentinel
         // max is fine — only tensors that carry a policy ever lease against it.
         if (!self.store.hasCache()) {
             self.store.configureCache(.{ .ram_budget_bytes = std.math.maxInt(usize) }) catch return api_errors.ApiError.OutOfMemory;
+        }
+        if (std.meta.activeTag(policy) != .none and
+            sequence_cache.settleableSite(self.cache_sites, index, self.role_tokens_index != null) == null)
+        {
+            return api_errors.ApiError.InvalidArgument;
         }
         self.state_input_policies[index] = policy;
         // If the slot already exists (policy set between runs), register it now too.
@@ -482,6 +495,10 @@ pub const Model = struct {
         // slot (recurrent/aliased ones carry their contents across runs). After this,
         // every input is bound and the rest of `run()` proceeds unchanged.
         try self.ensureAutoInputs(trace);
+
+        // Managed sequence caches get their append headroom here: capacity feeds
+        // the symbols resolved next, so it must be settled before specialization.
+        try self.settleSequenceCaches();
 
         if (trace) self.debugDumpBoundInputs(true);
 
@@ -568,11 +585,6 @@ pub const Model = struct {
             };
         }
 
-        // After input seeding (which settles the append index) and before the
-        // frame is recorded — the only window in which capacity can change
-        // without synchronizing against device work. See `prepareGrowableCaches`.
-        try self.prepareGrowableCaches(entry);
-
         if (trace) {
             std.debug.print("[aion][run] executing\n", .{});
         }
@@ -641,53 +653,171 @@ pub const Model = struct {
         self.last_run_cache_index = cache_index;
     }
 
-    /// Grow device sequence caches from placement requests using host-known write
-    /// positions. In-graph positions are excluded at load time to avoid synchronization.
-    fn prepareGrowableCaches(self: *Self, entry: *const CacheEntry) api_errors.ExecuteError!void {
-        if (self.target.device.kind == .cpu) return;
+    /// Give every managed sequence cache the physical rows this invocation needs,
+    /// before symbols are resolved. Capacity is part of the specialization key, so
+    /// a slot grown after compilation would leave the program describing a shape
+    /// the store no longer has — see `loaded_model/sequence_cache.zig`.
+    fn settleSequenceCaches(self: *Self) api_errors.ExecuteError!void {
+        if (self.cache_sites.len == 0) return;
+        const token_width = self.tokenRoleWidth();
 
-        for (entry.program.growth_requests) |request| {
-            if (self.store.sequenceCachePolicyInfo(request.cache).kind != .growable) continue;
+        // Every managed cache in a model shares one write-index input in practice,
+        // and reading it is a tensor read. Read it once per distinct input rather
+        // than once per site: a 30-cache model runs this on every decode step.
+        var starts_input: u32 = sequence_cache.no_input;
+        var starts_len: usize = 0;
+        var stack_starts: [64]usize = undefined;
+        var heap_starts: ?[]usize = null;
+        defer if (heap_starts) |buf| self.allocator.free(buf);
+        var starts: []usize = stack_starts[0..0];
 
-            const cache_meta = self.store.getConst(request.cache) catch return error.InvalidArgument;
-            const new_meta = self.store.getConst(request.new_kv) catch return error.InvalidArgument;
-            if (cache_meta.rank != 4 or new_meta.rank != 4 or cache_meta.shape[0] == 0) return error.InvalidArgument;
-            const new_len = new_meta.shape[1];
-            if (new_len == 0) continue;
+        for (self.cache_sites) |site| {
+            const index: usize = site.cache_input;
+            const policy = self.state_input_policies[index] orelse continue;
+            if (std.meta.activeTag(policy) == .none) continue;
+            // A policy only survives load when its site is sizable; a second,
+            // unsizable append into the same cache would break that promise.
+            if (site.start_input == sequence_cache.no_input) return error.InvalidArgument;
 
-            var input_index: ?usize = null;
-            for (entry.input_slots, 0..) |tid, i| {
-                if (tid == request.end_index) {
-                    input_index = i;
-                    break;
-                }
-            }
-            // A growable cache's position is an external input by construction
-            // (see `appendPositionsAreExternal`), so a miss here is a bug.
-            const idx = input_index orelse return error.InvalidArgument;
-            const required: usize = if (self.role_write_index_index == idx and self.role_auto_bound[idx])
-                std.math.add(usize, @intCast(self.position_tokens), new_len) catch return error.InvalidArgument
+            const append_len: usize = if (site.width_input == sequence_cache.no_input)
+                token_width orelse return error.InvalidArgument
             else
-                try self.appendEndFromBoundIndex(idx, cache_meta.shape[0], new_len);
+                self.appendWidthOf(site.width_input) orelse return error.InvalidArgument;
+            if (append_len == 0) continue;
 
-            if (required <= cache_meta.shape[1]) continue;
-            _ = self.store.tensorStore().mapSequenceStep(request.cache, required - 1, cache_meta.shape[1]) catch return error.InvalidArgument;
+            const bound = self.bound_inputs[index] orelse return error.InvalidArgument;
+            if (bound.shape.len != 4 or bound.shape[0] == 0) return error.InvalidArgument;
+            const batch: usize = bound.shape[0];
+
+            if (site.start_input != starts_input or starts_len != batch) {
+                if (batch > stack_starts.len) {
+                    if (heap_starts) |buf| self.allocator.free(buf);
+                    heap_starts = self.allocator.alloc(usize, batch) catch return error.OutOfMemory;
+                    starts = heap_starts.?;
+                } else {
+                    starts = stack_starts[0..batch];
+                }
+                try self.appendStartsFromBoundIndex(site.start_input, starts);
+                starts_input = site.start_input;
+                starts_len = batch;
+            }
+
+            const retention: sequence_cache.Retention = switch (policy) {
+                .rolling => |r| .{ .bounded = r.history_tokens },
+                else => .all,
+            };
+            var required: usize = 0;
+            for (starts) |start| {
+                required = @max(required, try sequence_cache.requiredCapacity(retention, start, append_len));
+            }
+
+            // Steady state: the slot exists, owes the caller nothing, and already
+            // holds the rows this invocation needs. That is every decode step after
+            // the first, so it must not touch the store.
+            const existing = self.aliased_state_tids[index];
+            if (existing != types_mod.invalid_tensor_id and !self.stateReseedPending(index)) {
+                const meta = self.store.getConst(existing) catch return error.InvalidArgument;
+                if (required <= meta.shape[sequence_cache.time_axis]) continue;
+            }
+
+            const slot = try self.settledStateSlot(index);
+            const meta = self.store.getConst(slot) catch return error.InvalidArgument;
+            if (meta.rank != 4 or meta.shape[0] != batch or meta.shape[1] == 0) return error.InvalidArgument;
+            if (required > meta.shape[sequence_cache.time_axis]) {
+                try self.growSequenceCache(slot, policy, required, starts);
+            }
         }
     }
 
-    /// Furthest append end implied by the caller-bound start-index input, read
-    /// off the host. Stack-buffered for realistic batch counts so a growable
-    /// cache costs no allocation per token.
-    fn appendEndFromBoundIndex(
+    /// Whether the caller's tensor still owes this state slot its contents.
+    fn stateReseedPending(self: *const Self, index: usize) bool {
+        const version = self.aliased_input_bind_versions[index];
+        return version != 0 and self.aliased_state_synced_versions[index] != version;
+    }
+
+    /// The persistent slot a managed cache grows in place. A caller-bound cache is
+    /// seeded into it first: growth preserves rows, a copy across capacities cannot.
+    fn settledStateSlot(self: *Self, index: usize) api_errors.ExecuteError!TensorId {
+        const bound = self.bound_inputs[index] orelse return error.InvalidArgument;
+        var slot = self.aliased_state_tids[index];
+        if (slot == types_mod.invalid_tensor_id) slot = try self.ensureAliasedStateSlot(index, bound.shape);
+        if (slot == bound.id) return slot;
+
+        const version = self.aliased_input_bind_versions[index];
+        if (version == 0 or self.aliased_state_synced_versions[index] == version) return slot;
+        const meta = self.store.getConst(slot) catch return error.InvalidArgument;
+        if (!signatures.sameUsize(meta.shape, bound.shape)) {
+            // The caller supplied state of a different capacity; theirs wins.
+            self.aliased_state_tids[index] = types_mod.invalid_tensor_id;
+            slot = try self.ensureAliasedStateSlot(index, bound.shape);
+        }
+        try self.copyTensorInto(slot, bound);
+        self.aliased_state_synced_versions[index] = version;
+        return slot;
+    }
+
+    /// Grow geometrically past `required` so a token-at-a-time session pays for
+    /// growth O(log capacity) times, then rehash rolling rows onto the new modulus.
+    fn growSequenceCache(
+        self: *Self,
+        slot: TensorId,
+        policy: SequenceCachePolicy,
+        required: usize,
+        starts: []const usize,
+    ) api_errors.ExecuteError!void {
+        const meta = self.store.getConst(slot) catch return error.InvalidArgument;
+        const growth: [2]usize = switch (policy) {
+            .rolling => .{ 2, 1 },
+            .growable => |g| .{ g.growth_numerator, g.growth_denominator },
+            .none => unreachable,
+        };
+        var target = meta.shape[sequence_cache.time_axis];
+        while (target < required) {
+            target = StorageManager.growTarget(target, growth[0], growth[1]) catch return error.InvalidArgument;
+        }
+        // Capacity is part of the specialization key, so a growth factor like 3/2
+        // would compile a fresh program at 48, 72, 108, 162 ... Rounding to a power
+        // of two keeps a whole session down to a handful of specializations without
+        // changing what the cache holds.
+        target = std.math.ceilPowerOfTwo(usize, target) catch return error.InvalidArgument;
+        switch (policy) {
+            .rolling => |r| self.store.ensureRollingCacheCapacity(slot, target, r.history_tokens, starts) catch return error.InvalidArgument,
+            .growable => |g| {
+                if (g.max_capacity_tokens != 0) {
+                    if (required > g.max_capacity_tokens) return error.InvalidArgument;
+                    target = @min(target, g.max_capacity_tokens);
+                }
+                self.store.ensureTensorAxisCapacity(slot, sequence_cache.time_axis, target) catch return error.InvalidArgument;
+            },
+            .none => unreachable,
+        }
+    }
+
+    /// Rows appended per invocation when the appended value is produced: one per
+    /// token, which is what the `tokens` / `cache_write_index` role pair means.
+    fn tokenRoleWidth(self: *const Self) ?usize {
+        const index = self.role_tokens_index orelse return null;
+        const tokens = self.bound_inputs[index] orelse return null;
+        const role = self.input_roles[index] orelse return null;
+        if (role.axis == package_file.input_role_no_axis or role.axis >= tokens.shape.len) return null;
+        return tokens.shape[role.axis];
+    }
+
+    fn appendWidthOf(self: *const Self, input_index: u32) ?usize {
+        const t = self.bound_inputs[input_index] orelse return null;
+        if (t.shape.len != 4) return null;
+        return t.shape[sequence_cache.time_axis];
+    }
+
+    fn appendStartsFromBoundIndex(
         self: *Self,
         input_index: usize,
-        batch: usize,
-        new_len: usize,
-    ) api_errors.ExecuteError!usize {
+        out: []usize,
+    ) api_errors.ExecuteError!void {
         const src = self.bound_inputs[input_index] orelse return error.InvalidArgument;
         if (src.dtype != .i32) return error.InvalidArgument;
         const total = src.elemCount() catch return error.InvalidArgument;
-        if (total < batch) return error.InvalidArgument;
+        if (total < out.len) return error.InvalidArgument;
 
         var stack_starts: [64]i32 = undefined;
         var heap_starts: ?[]i32 = null;
@@ -703,13 +833,10 @@ pub const Model = struct {
             break :blk buf;
         };
 
-        var end_max: usize = 0;
-        for (starts[0..batch]) |raw| {
+        for (starts[0..out.len], out) |raw, *dst| {
             if (raw < 0) return error.InvalidArgument;
-            const end = std.math.add(usize, @intCast(raw), new_len) catch return error.InvalidArgument;
-            end_max = @max(end_max, end);
+            dst.* = @intCast(raw);
         }
-        return end_max;
     }
 
     pub fn outputTensor(self: *Self, name: []const u8) api_errors.ApiError!Tensor {
@@ -965,6 +1092,16 @@ pub const Model = struct {
                 .sequence_cache => {
                     if (role.capacity_symbol == package_file.invalid_index) continue;
                     if (role.capacity_symbol >= dim_symbol_count) return error.InvalidArgument;
+                    if (role.retained_history_tokens != 0) {
+                        if (input_signatures[i].rank != 4 or role.axis != 1) return error.InvalidArgument;
+                        if (!store.hasCache()) {
+                            store.configureCache(.{ .ram_budget_bytes = std.math.maxInt(usize) }) catch return error.OutOfMemory;
+                        }
+                        const history: usize = role.retained_history_tokens;
+                        state_input_policies[i] = .{ .rolling = .{ .history_tokens = history } };
+                        symbol_defaults[role.capacity_symbol] = std.math.add(usize, history, 1) catch return error.InvalidArgument;
+                        continue;
+                    }
                     if (opts.cache.capacity_tokens == 0) continue;
                     const cap: usize = opts.cache.capacity_tokens;
                     // Lazy growth requires a supported rank-4 layout, package opt-in,
@@ -994,6 +1131,19 @@ pub const Model = struct {
                 .state => {},
             }
         }
+        // A role-declared growth policy is only honored if the runtime can actually
+        // size that cache before specialization; a silently unsized one would
+        // under-grow on a backend that never touches the host index.
+        const cache_sites = try sequence_cache.collect(allocator, template);
+        errdefer allocator.free(cache_sites);
+        for (state_input_policies, 0..) |policy_opt, i| {
+            const policy = policy_opt orelse continue;
+            if (std.meta.activeTag(policy) == .none) continue;
+            if (sequence_cache.settleableSite(cache_sites, i, role_tokens_index != null) == null) {
+                return error.InvalidArgument;
+            }
+        }
+
         const auto_positions_enabled = opts.auto_positions and role_tokens_index != null and
             (role_write_index_index != null or role_visible_end_index != null or role_positions_index != null);
 
@@ -1037,6 +1187,7 @@ pub const Model = struct {
             .aliased_state_synced_versions = aliased_state_synced_versions,
             .state_input_policies = state_input_policies,
             .input_roles = input_roles,
+            .cache_sites = cache_sites,
             .role_tokens_index = role_tokens_index,
             .role_positions_index = role_positions_index,
             .role_write_index_index = role_write_index_index,
@@ -1055,6 +1206,24 @@ pub const Model = struct {
         };
     }
 
+    /// Size of axis `d` of public input `index` as the graph should see it.
+    ///
+    /// A managed sequence cache is bound to a persistent slot whose capacity
+    /// `settleSequenceCaches` may have grown past the tensor the caller supplied.
+    /// A FREE capacity axis follows that physical size, which is what keeps the
+    /// specialization and the store describing the same tensor; a constant axis is
+    /// what the author declared, and the extra rows stay invisible to the graph.
+    fn specializationDim(self: *const Self, index: usize, d: usize) error{InvalidArgument}!usize {
+        const tensor = self.bound_inputs[index] orelse return error.InvalidArgument;
+        if (d != sequence_cache.time_axis or !self.stateInputResizable(index)) return tensor.shape[d];
+        if (self.template.inputShapeTerms(index)[d] == .constant) return tensor.shape[d];
+        const slot = self.aliased_state_tids[index];
+        if (slot == types_mod.invalid_tensor_id) return tensor.shape[d];
+        const meta = self.store.getConst(slot) catch return error.InvalidArgument;
+        if (meta.rank != tensor.shape.len) return error.InvalidArgument;
+        return meta.shape[d];
+    }
+
     fn resolveBindings(self: *Self) error{InvalidArgument}!ResolvedInputs {
         @memset(self.run_symbol_bindings, null);
         @memset(self.run_direct_input_ids, types_mod.invalid_tensor_id);
@@ -1069,9 +1238,9 @@ pub const Model = struct {
 
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
-                const actual: u64 = @intCast(tensor.shape[d]);
-                try signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], actual, self.run_symbol_bindings);
-                self.run_input_shapes[shape_cursor] = tensor.shape[d];
+                const dim = try self.specializationDim(i, d);
+                try signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], @intCast(dim), self.run_symbol_bindings);
+                self.run_input_shapes[shape_cursor] = dim;
                 shape_cursor += 1;
             }
             if (self.inputAliasOutputIndex(i) == null) self.run_direct_input_ids[i] = tensor.id;
@@ -1522,13 +1691,13 @@ pub const Model = struct {
     /// Replacing it after a capacity change resets the seeded bind version.
     fn ensureAliasedStateSlot(self: *Self, input_index: usize, shape: []const usize) api_errors.ExecuteError!TensorId {
         const sig = self.input_signatures[input_index];
-        const growable = self.stateInputGrowable(input_index);
+        const resizable = self.stateInputResizable(input_index);
         const cur = self.aliased_state_tids[input_index];
         if (cur != types_mod.invalid_tensor_id) {
             const meta = self.store.getConst(cur) catch return error.InvalidArgument;
             // Reuse grown slots for smaller declared capacities so later cache entries
             // do not discard existing state.
-            if (stateSlotCompatible(meta.shape, shape, growable)) return cur;
+            if (stateSlotCompatible(meta.shape, shape, resizable)) return cur;
             // Capacity truly changed: re-seed into the new slot on the next run.
             self.aliased_state_synced_versions[input_index] = 0;
         }
@@ -1541,18 +1710,18 @@ pub const Model = struct {
         return tid;
     }
 
-    fn stateInputGrowable(self: *const Self, input_index: usize) bool {
-        if (self.state_input_policies[input_index]) |pol| return std.meta.activeTag(pol) == .growable;
+    fn stateInputResizable(self: *const Self, input_index: usize) bool {
+        if (self.state_input_policies[input_index]) |pol| return std.meta.activeTag(pol) != .none;
         return false;
     }
 
-    /// Whether `have` can back `want`: exact shape, or a growable rank-4 cache whose
+    /// Whether `have` can back `want`: exact shape, or a resizable rank-4 cache whose
     /// sequence axis has expanded while all other axes match.
-    fn stateSlotCompatible(have: []const usize, want: []const usize, growable: bool) bool {
+    fn stateSlotCompatible(have: []const usize, want: []const usize, resizable: bool) bool {
         if (have.len != want.len) return false;
-        if (growable and have.len == 4) {
+        if (resizable and have.len == 4) {
             for (have, want, 0..) |h, w, d| {
-                if (d == 2) {
+                if (d == 1) {
                     if (h < w) return false;
                 } else if (h != w) return false;
             }
@@ -1626,8 +1795,9 @@ pub const Model = struct {
             const tensor = self.bound_inputs[idx] orelse return false;
             if (tensor.dtype != sig.dtype) return false;
             if (tensor.shape.len != sig.rank) return false;
-            for (tensor.shape) |dim| {
+            for (0..tensor.shape.len) |d| {
                 if (shape_cursor >= entry.input_shapes.len) return false;
+                const dim = self.specializationDim(idx, d) catch return false;
                 if (entry.input_shapes[shape_cursor] != dim) return false;
                 shape_cursor += 1;
             }

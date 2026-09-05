@@ -362,6 +362,22 @@ pub const GpuBackend = struct {
                                 .{ s.out, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts, s.axis, @tagName(s.op) },
                             );
                         },
+                        .LayerNormTiled => |s| {
+                            const x = r.op_ctx.store.meta(s.x) catch null;
+                            const gamma = r.op_ctx.store.meta(s.gamma) catch null;
+                            const beta = r.op_ctx.store.meta(s.beta) catch null;
+                            const output = r.op_ctx.store.meta(s.out) catch null;
+                            if (x) |m| std.debug.print(
+                                "[gpu]   x id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
+                                .{ s.x, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                            );
+                            if (gamma) |m| std.debug.print("[gpu]   gamma id={} dtype={s} shape={any}\n", .{ s.gamma, @tagName(m.dtype), m.shape });
+                            if (beta) |m| std.debug.print("[gpu]   beta id={} dtype={s} shape={any}\n", .{ s.beta, @tagName(m.dtype), m.shape });
+                            if (output) |m| std.debug.print(
+                                "[gpu]   output id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
+                                .{ s.out, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                            );
+                        },
                         else => {},
                     }
                 }
@@ -436,6 +452,7 @@ pub const GpuBackend = struct {
                 .RFFT => |s| try fft_ops.execRFFT(op_ctx, frame, s),
                 .STFT => |s| try fft_ops.execSTFT(op_ctx, frame, s),
                 .ArgMax => |s| try rowwise.execArgMax(op_ctx, frame, s),
+                .TopK => |s| try rowwise.execTopK(op_ctx, frame, s),
                 .ScatterRow => |s| try decode_ops.execScatterRow(op_ctx, frame, s),
                 .ConcatScalar => |s| try view_ops.execConcat(op_ctx, frame, s),
                 .ReshapeScalar => |s| try view_ops.execPackedCopy(op_ctx, frame, s.dst, s.src),

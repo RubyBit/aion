@@ -11,7 +11,7 @@ pub const CacheError = error{
 pub const CachePolicy = enum(u8) {
     none = 0,
     growable = 1,
-    ring = 2,
+    rolling = 2,
 };
 
 pub const GrowablePolicy = struct {
@@ -32,17 +32,15 @@ pub const GrowablePolicy = struct {
     max_capacity_tokens: usize = 0,
 };
 
-pub const RingPolicy = struct {
-    /// Logical window size in tokens.
-    ///
-    /// `0` means "use full physical T capacity".
-    window_tokens: usize = 0,
+pub const RollingPolicy = struct {
+    /// Maximum number of positions preceding the current append that must survive.
+    history_tokens: usize,
 };
 
 pub const SequenceCachePolicy = union(CachePolicy) {
     none: void,
     growable: GrowablePolicy,
-    ring: RingPolicy,
+    rolling: RollingPolicy,
 };
 
 pub const CacheConfig = struct {
@@ -63,12 +61,12 @@ pub const CacheConfig = struct {
 pub const SequenceCachePolicyKind = enum(u8) {
     none = 0,
     growable = 1,
-    ring = 2,
+    rolling = 2,
 };
 
 pub const SequenceCachePolicyInfo = struct {
     kind: SequenceCachePolicyKind = .none,
-    ring_window_tokens: usize = 0,
+    rolling_history_tokens: usize = 0,
 };
 
 pub const Cache = struct {
@@ -86,15 +84,10 @@ pub const Cache = struct {
         max_seen_end_tokens: usize = 0,
     };
 
-    const RingState = struct {
-        window_tokens: usize = 0,
-        write_head_tokens: usize = 0,
-    };
-
     const PolicyState = union(CachePolicy) {
         none: void,
         growable: GrowableState,
-        ring: RingState,
+        rolling: void,
     };
 
     const TensorPolicyRecord = struct {
@@ -120,9 +113,9 @@ pub const Cache = struct {
                     .state = .{ .growable = .{ .logical_capacity_tokens = g.initial_capacity_tokens } },
                 };
             },
-            .ring => |r| .{
-                .policy = .{ .ring = r },
-                .state = .{ .ring = .{ .window_tokens = r.window_tokens, .write_head_tokens = 0 } },
+            .rolling => |r| .{
+                .policy = .{ .rolling = r },
+                .state = .{ .rolling = {} },
             },
         };
     }
@@ -176,9 +169,9 @@ pub const Cache = struct {
 
     pub fn tensorPolicyInfo(self: *const Self, tensor_id: u32) SequenceCachePolicyInfo {
         return switch (self.tensorPolicy(tensor_id)) {
-            .none => .{ .kind = .none, .ring_window_tokens = 0 },
-            .growable => .{ .kind = .growable, .ring_window_tokens = 0 },
-            .ring => |r| .{ .kind = .ring, .ring_window_tokens = r.window_tokens },
+            .none => .{ .kind = .none },
+            .growable => .{ .kind = .growable },
+            .rolling => |r| .{ .kind = .rolling, .rolling_history_tokens = r.history_tokens },
         };
     }
 
@@ -186,7 +179,8 @@ pub const Cache = struct {
     ///
     /// This is deterministic and policy-specific:
     /// - `.none` / `.growable`: identity mapping with strict bounds checks.
-    /// - `.ring`: modulo mapping using window or full physical capacity.
+    /// - `.rolling`: modulo mapping using the physical capacity. Retention and
+    ///   append-width headroom are enforced by the model runtime before execution.
     pub fn mapLogicalTime(self: *Self, tensor_id: u32, logical_t: usize, physical_capacity_tokens: usize) CacheError!usize {
         if (physical_capacity_tokens == 0) return CacheError.InvalidArgument;
 
@@ -220,13 +214,9 @@ pub const Cache = struct {
                 if (need > st.max_seen_end_tokens) st.max_seen_end_tokens = need;
                 return logical_t;
             },
-            .ring => {
-                if (rec.state != .ring) return CacheError.InvalidArgument;
-                var st: *RingState = &rec.state.ring;
-                const configured_window: usize = if (st.window_tokens == 0) physical_capacity_tokens else @min(st.window_tokens, physical_capacity_tokens);
-                if (configured_window == 0) return CacheError.InvalidArgument;
-                st.write_head_tokens = logical_t;
-                return logical_t % configured_window;
+            .rolling => {
+                if (rec.state != .rolling) return CacheError.InvalidArgument;
+                return logical_t % physical_capacity_tokens;
             },
         }
     }

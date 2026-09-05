@@ -52,7 +52,7 @@ pub const CacheOptions = struct {
     capacity_tokens: usize = 0,
     /// Non-null: allocate the caches small and grow on demand up to
     /// `capacity_tokens`. Honored only for roles flagged `allow_growable` with the
-    /// runtime-supported rank-4/axis-2 layout; otherwise the cache is pre-allocated
+    /// runtime-supported rank-4/axis-1 layout; otherwise the cache is pre-allocated
     /// at full capacity (never a load error).
     growable: ?CacheGrowth = null,
 };

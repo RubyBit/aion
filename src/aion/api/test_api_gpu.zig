@@ -360,3 +360,183 @@ test "api: tensor.to round-trips cpu -> gpu -> cpu (move semantics)" {
     defer alloc.free(got);
     try std.testing.expectEqualSlices(f32, &vals, got);
 }
+
+/// A rolling KV cache driven through a wide prefill and a few decode steps on
+/// `dev`, returning every attention output. Retained history is 7 and the cache
+/// starts at 8 rows, so the 20-token prefill forces growth-with-rehash and the
+/// decode steps then wrap repeatedly.
+fn runRollingCacheSchedule(
+    alloc: std.mem.Allocator,
+    ctx: *api.Context,
+    file: std.Io.File,
+    dev: api.DeviceSelector,
+    out: *std.ArrayList(f32),
+) !void {
+    const head_dim: usize = 4;
+    var model = try ctx.loadModel(file, .{ .device = dev });
+    defer model.deinit();
+
+    const chunks = [_]usize{ 20, 1, 1, 1, 1, 1, 5, 1, 1 };
+    var pos: usize = 0;
+    for (chunks) |width| {
+        const tokens = try alloc.alloc(i32, width);
+        defer alloc.free(tokens);
+        const qkv = try alloc.alloc(f32, width * head_dim);
+        defer alloc.free(qkv);
+        for (0..width) |s| {
+            tokens[s] = @intCast((pos + s) % 97);
+            for (0..head_dim) |d| {
+                qkv[s * head_dim + d] = @as(f32, @floatFromInt(((pos + s) * 7 + d * 3) % 23)) * 0.05 - 0.5;
+            }
+        }
+        try model.bindInput("tokens", try ctx.from(&.{ 1, width }, tokens));
+        try model.bindInput("q", try ctx.fromF32(&.{ 1, width, 1, head_dim }, qkv));
+        try model.bindInput("kv", try ctx.fromF32(&.{ 1, width, 1, head_dim }, qkv));
+        try model.run();
+
+        const got = try model.outputTensor("out");
+        const values = try alloc.alloc(f32, width * head_dim);
+        defer alloc.free(values);
+        try got.read(values);
+        try out.appendSlice(alloc, values);
+        pos += width;
+    }
+}
+
+test "api: a rolling kv cache decodes identically on gpu and cpu" {
+    const alloc = std.testing.allocator;
+    const head_dim: usize = 4;
+
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "rolling.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const Tokens = try bld.name(try bld.input(.i32, &.{ 1, 1 }), "tokens");
+        try bld.symbolicDim(Tokens, 1, "S");
+        const Q = try bld.name(try bld.input(.f32, &.{ 1, 1, 1, head_dim }), "q");
+        try bld.symbolicDim(Q, 1, "S");
+        const Kv = try bld.name(try bld.input(.f32, &.{ 1, 1, 1, head_dim }), "kv");
+        try bld.symbolicDim(Kv, 1, "S");
+        const Positions = try bld.name(try bld.input(.i32, &.{ 1, 1 }), "positions");
+        try bld.symbolicDim(Positions, 1, "S");
+        const WriteIndex = try bld.name(try bld.input(.i32, &.{1}), "cache_write_index");
+        const VisibleEnd = try bld.name(try bld.input(.i32, &.{1}), "cache_visible_end");
+        const KCache = try bld.name(try bld.input(.f32, &.{ 1, 2, 1, head_dim }), "k_cache");
+        try bld.symbolicDim(KCache, 1, "L");
+        const VCache = try bld.name(try bld.input(.f32, &.{ 1, 2, 1, head_dim }), "v_cache");
+        try bld.symbolicDim(VCache, 1, "L");
+
+        const KNext = try bld.name(try bld.sequenceAppend(KCache, try bld.copy(Kv), WriteIndex), "k_next");
+        const VNext = try bld.name(try bld.sequenceAppend(VCache, try bld.relu(Kv), WriteIndex), "v_next");
+        const Out = try bld.name(
+            try bld.attention(Q, KNext, VNext, Positions, VisibleEnd, 0.5, .sliding(7, 0), 0.0),
+            "out",
+        );
+
+        const cache_role: api.InputRoleDecl = .{
+            .input = KCache,
+            .kind = .sequence_cache,
+            .axis = 1,
+            .capacity_symbol = "L",
+            .retained_history_tokens = 7,
+        };
+        var v_role = cache_role;
+        v_role.input = VCache;
+        try ctx.exportModel(file, &bld, &.{
+            .{ .name = "out", .tensor = Out },
+            .{ .name = "k_next", .tensor = KNext },
+            .{ .name = "v_next", .tensor = VNext },
+        }, .{
+            .output_aliases = &.{
+                .{ .input = KCache, .output = KNext },
+                .{ .input = VCache, .output = VNext },
+            },
+            .input_roles = &.{
+                .{ .input = Tokens, .kind = .tokens, .axis = 1 },
+                .{ .input = Positions, .kind = .positions, .axis = 1 },
+                .{ .input = WriteIndex, .kind = .cache_write_index },
+                .{ .input = VisibleEnd, .kind = .cache_visible_end },
+                cache_role,
+                v_role,
+            },
+        });
+    }
+
+    var cpu: std.ArrayList(f32) = .empty;
+    defer cpu.deinit(alloc);
+    var gpu: std.ArrayList(f32) = .empty;
+    defer gpu.deinit(alloc);
+    try runRollingCacheSchedule(alloc, &ctx, file, .cpu, &cpu);
+    try runRollingCacheSchedule(alloc, &ctx, file, .{ .gpu = 0 }, &gpu);
+
+    try std.testing.expectEqual(cpu.items.len, gpu.items.len);
+    for (cpu.items, gpu.items) |c, g| try std.testing.expectApproxEqAbs(c, g, 1e-5);
+}
+
+/// Top-k of one wide row on `dev` — the decode shape, where the row is a whole
+/// vocabulary and only a handful of entries are wanted.
+const TopKOut = struct { v: [8]f32, i: [8]i32 };
+
+/// Builds its own param: a tensor is moved to the device it is compiled for, so a
+/// single one cannot be shared between the cpu and gpu runs being compared.
+fn runTopK(ctx: *api.Context, dev: api.DeviceSelector, vals: []const f32, k: usize, largest: bool) !TopKOut {
+    var bld = api.Builder.init(ctx);
+    defer bld.deinit();
+    const src = try ctx.fromF32(&[_]usize{ 1, vals.len }, vals);
+    const top = try bld.topk(try bld.param(src), k, -1, largest);
+    var model = try ctx.compileOn(dev, &bld, &[_]api.TensorRef{ top.values, top.indices }, .{});
+    defer model.deinit();
+    try model.run();
+
+    var out: TopKOut = .{ .v = @splat(0), .i = @splat(0) };
+    try (try model.outputTensorAt(0)).read(out.v[0..k]);
+    try (try model.outputTensorAt(1)).read(out.i[0..k]);
+    return out;
+}
+
+test "api: topk matches between gpu and cpu, values and indices" {
+    const alloc = std.testing.allocator;
+
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    // Wider than the split path's 4096-column segment, so this exercises
+    // topk_partial + topk_finish rather than the single-workgroup kernel, with
+    // deliberate duplicate maxima so the lowest-index tie-break has to agree
+    // across devices rather than just the values.
+    const n: usize = 40000;
+    const vals = try alloc.alloc(f32, n);
+    defer alloc.free(vals);
+    for (vals, 0..) |*v, i| {
+        const x: f32 = @floatFromInt((i * 7919) % 1000);
+        v.* = x * 0.001;
+    }
+    vals[100] = 2.0;
+    vals[9000] = 2.0; // ties with vals[100], and in a different 4096-column segment
+    vals[42] = 3.0;
+
+    for ([_]bool{ true, false }) |largest| {
+        const cpu = try runTopK(&ctx, .cpu, vals, 6, largest);
+        const gpu = try runTopK(&ctx, .{ .gpu = 0 }, vals, 6, largest);
+        try std.testing.expectEqualSlices(f32, cpu.v[0..6], gpu.v[0..6]);
+        try std.testing.expectEqualSlices(i32, cpu.i[0..6], gpu.i[0..6]);
+    }
+
+    // The known extremes, so this pins actual values rather than only agreement.
+    const top = try runTopK(&ctx, .{ .gpu = 0 }, vals, 3, true);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 3.0, 2.0, 2.0 }, top.v[0..3]);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 42, 100, 9000 }, top.i[0..3]);
+}

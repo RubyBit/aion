@@ -27,6 +27,7 @@ const exec_attention = @import("exec/attention.zig");
 const exec_relpos_mha = @import("exec/relpos_mha.zig");
 const exec_argmax = @import("exec/argmax.zig");
 const exec_scatter = @import("exec/scatter.zig");
+const exec_topk = @import("exec/topk.zig");
 const exec_lstm = @import("exec/lstm.zig");
 const exec_rfft = @import("exec/rfft.zig");
 const exec_stft = @import("exec/stft.zig");
@@ -468,6 +469,11 @@ pub const CpuBackend = struct {
 
             .ArgMax => |s| {
                 try exec_argmax.execArgMax(s, store);
+            },
+
+            .TopK => |s| {
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                try exec_topk.execTopK(self.allocator, pool_ptr, self.thread_count, s, store);
             },
 
             .ScatterRow => |s| {

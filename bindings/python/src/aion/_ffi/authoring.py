@@ -535,7 +535,7 @@ def builder_add_input_role(
     capacity_symbol: str | None,
     zero_init: bool,
     growable: bool,
-    ring: bool,
+    retained_history_tokens: int,
 ) -> None:
     capacity = ffi.NULL if capacity_symbol is None else _string(capacity_symbol)
     status = lib.aion_builder_add_input_role(
@@ -547,7 +547,7 @@ def builder_add_input_role(
         capacity,
         1 if zero_init else 0,
         1 if growable else 0,
-        1 if ring else 0,
+        int(retained_history_tokens),
     )
     raise_for_status(status, ctx, what="aion_builder_add_input_role")
 
@@ -584,6 +584,29 @@ def builder_if(
     )
     raise_for_status(status, ctx, what="aion_builder_if")
     return ValueId(int(out[0]))
+
+
+def builder_topk(
+    ctx: ContextHandle,
+    builder: BuilderHandle,
+    x: ValueId,
+    k: int,
+    axis: int,
+    largest: bool,
+) -> tuple[ValueId, ValueId]:
+    values = ffi.new("AionValueId*")
+    indices = ffi.new("AionValueId*")
+    status = lib.aion_builder_topk(
+        builder.raw,
+        int(x),
+        int(k),
+        int(axis),
+        1 if largest else 0,
+        values,
+        indices,
+    )
+    raise_for_status(status, ctx, what="aion_builder_topk")
+    return int(values[0]), int(indices[0])
 
 
 def builder_loop(

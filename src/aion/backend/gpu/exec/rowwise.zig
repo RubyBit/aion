@@ -33,6 +33,8 @@ const reduce_kernel: KernelDesc = .{ .name = "reduce", .wgsl = @embedFile("../ke
 const reduce_i32_kernel: KernelDesc = .{ .name = "reduce_i32", .wgsl = @embedFile("../kernels/reduce_i32.wgsl") };
 const argmax_kernel: KernelDesc = .{ .name = "argmax", .wgsl = @embedFile("../kernels/argmax.wgsl") };
 const argmax_cross_kernel: KernelDesc = .{ .name = "argmax_cross", .wgsl = @embedFile("../kernels/argmax_cross.wgsl") };
+const topk_kernel: KernelDesc = .{ .name = "topk", .wgsl = @embedFile("../kernels/topk.wgsl") };
+const topk_split_kernel: KernelDesc = .{ .name = "topk_split", .wgsl = @embedFile("../kernels/topk_split.wgsl") };
 const rowwise_partial_kernel: KernelDesc = .{ .name = "rowwise_partial", .wgsl = @embedFile("../kernels/rowwise_partial.wgsl") };
 const rowwise_finish_kernel: KernelDesc = .{ .name = "rowwise_finish", .wgsl = @embedFile("../kernels/rowwise_finish.wgsl") };
 const softmax_cross_apply_kernel: KernelDesc = .{ .name = "softmax_cross_apply", .wgsl = @embedFile("../kernels/softmax_cross_apply.wgsl") };
@@ -41,6 +43,8 @@ const norm_cross_apply_kernel: KernelDesc = .{ .name = "norm_cross_apply", .wgsl
 /// Uniform params shared by softmax (`rows/cols/x_row/o_row`) and, prefix-wise,
 /// reduce (`rows/cols/x_row`). Field order matches the WGSL structs.
 const RowParams = extern struct { rows: u32, cols: u32, x_row: u32, o_row: u32 = 0 };
+/// Field order matches `Params` in topk.wgsl.
+const TopKParams = extern struct { rows: u32, cols: u32, k: u32, largest: u32, x_row: u32, o_row: u32, groups_x: u32 = 0, seg: u32 = 0 };
 const NormParams = extern struct { rows: u32, cols: u32, x_row: u32, o_row: u32, eps: f32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 /// Field order matches `Params` in add_norm.wgsl. Pads are scalar `u32` on purpose: a
 /// `vec3<u32>` pad forces 16-byte alignment in WGSL and the struct sizes then disagree,
@@ -72,6 +76,14 @@ const ArgmaxCrossParams = extern struct {
 };
 
 pub const NormMode = enum { rmsnorm, layernorm };
+
+fn rowGrid(rows: u32) ExecuteProgramError![3]u32 {
+    if (rows == 0) return error.Unsupported;
+    const x = @min(rows, context.MAX_GROUPS_PER_DIM);
+    const y = std.math.divCeil(u32, rows, x) catch return error.Unsupported;
+    if (y > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
+    return .{ x, y, 1 };
+}
 
 fn requireF32(dtype: types.DType) ExecuteProgramError!void {
     if (dtype != .f32) return error.Unsupported;
@@ -199,7 +211,6 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
         const xv = try deviceRowViewDt(dx, meta.dtype);
         const ov = try deviceRowViewDt(dout, meta.dtype);
         if (xv.rows != ov.rows or xv.cols != ov.cols) return error.Unsupported;
-        if (xv.rows > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
         if (dg.shape_mem[0] < xv.cols or db.shape_mem[0] < xv.cols) return error.Unsupported;
 
         const bufs = [_]c.WGPUBuffer{
@@ -209,8 +220,16 @@ pub fn execNorm(ctx: Ctx, frame: *Frame, mode: NormMode, s: anytype) ExecuteProg
             ctx.devmem.bufferFor(dout.handle).?,
         };
         const sizes = [_]u64{ dx.len, dg.len, db.len, dout.len };
-        const params: NormParams = .{ .rows = xv.rows, .cols = xv.cols, .x_row = xv.row_stride, .o_row = ov.row_stride, .eps = s.eps };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ xv.rows, 1, 1 });
+        const grid = try rowGrid(xv.rows);
+        const params: NormParams = .{
+            .rows = xv.rows,
+            .cols = xv.cols,
+            .x_row = xv.row_stride,
+            .o_row = ov.row_stride,
+            .eps = s.eps,
+            ._p0 = grid[0],
+        };
+        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), grid);
     }
 }
 
@@ -674,6 +693,108 @@ pub fn execArgMax(ctx: Ctx, frame: *Frame, s: executable.StepArgMax) ExecuteProg
     const sizes = [_]u64{ dx.len, dout.len };
     const params: RowParams = .{ .rows = xv.rows, .cols = xv.cols, .x_row = xv.row_stride };
     try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ xv.rows, 1, 1 });
+}
+
+/// Top-k over the last axis: `k` values and their i32 indices per row, sorted
+/// best-first with ties to the lowest index — identical to the CPU kernel's order.
+pub fn execTopK(ctx: Ctx, frame: *Frame, s: executable.StepTopK) ExecuteProgramError!void {
+    const hs = ctx.store;
+    const meta = hs.meta(s.a) catch return error.ExecutionFailed;
+    try requireScalarFloat(meta.dtype);
+    const val_meta = hs.meta(s.values) catch return error.ExecutionFailed;
+    const idx_meta = hs.meta(s.indices) catch return error.ExecutionFailed;
+    if (val_meta.dtype != meta.dtype or idx_meta.dtype != .i32) return error.Unsupported;
+
+    const rank: usize = @as(usize, meta.rank);
+    if (rank == 0 or s.axis != rank - 1) return error.Unsupported; // last axis only
+    if (s.k == 0 or s.k > meta.shape[rank - 1]) return error.Unsupported;
+    if (context.totalTiles(meta) != 1 or context.totalTiles(val_meta) != 1 or context.totalTiles(idx_meta) != 1) {
+        return error.Unsupported;
+    }
+
+    const built = try ctx.pipes.get(topk_kernel, if (meta.dtype == .f16) "topk_row_f16" else "topk_row");
+
+    const dx = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
+    const dval = ctx.store.acquireTileDeviceMutLinear(s.values, 0) catch return error.ExecutionFailed;
+    const didx = ctx.store.acquireTileDeviceMutLinear(s.indices, 0) catch return error.ExecutionFailed;
+    defer {
+        hs.releaseConst(dx.token);
+        hs.releaseMut(dval.token);
+        hs.releaseMut(didx.token);
+    }
+    if (!context.storageBindingFits(ctx, dx.len)) return error.Unsupported;
+
+    const xv = try deviceRowViewDt(dx, meta.dtype);
+    const vv = try deviceRowViewDt(dval, val_meta.dtype);
+    const iv = try deviceRowViewDt(didx, .f32); // i32 and f32 are both 4-byte scalars
+    if (vv.rows != xv.rows or iv.rows != xv.rows) return error.Unsupported;
+    if (vv.cols != s.k or iv.cols != s.k) return error.Unsupported;
+    // One output row per input row, so both output views must share a stride.
+    if (vv.row_stride != iv.row_stride) return error.Unsupported;
+
+    const x_buf = ctx.devmem.bufferFor(dx.handle).?;
+    const val_buf = ctx.devmem.bufferFor(dval.handle).?;
+    const idx_buf = ctx.devmem.bufferFor(didx.handle).?;
+    const k: u32 = @intCast(s.k);
+
+    // Decode shape: ONE row of a whole vocab. `k` rounds on a single workgroup use
+    // one SM and leave the rest of the GPU idle, so take each segment's top-k in
+    // parallel and fold the candidates. Segments must hold at least `k` columns for
+    // a segment's top-k to be meaningful.
+    const SEG_COLS: u32 = 4096;
+    const segs: u32 = context.ceilDiv(xv.cols, SEG_COLS);
+    if (segs > 1 and segs <= context.MAX_GROUPS_PER_DIM and SEG_COLS >= k) {
+        const entries: u64 = @as(u64, xv.rows) * segs * k;
+        const scratch_bytes: u64 = entries * 2 * @sizeOf(f32);
+        const scratch = try ctx.scratch.ensure(ctx.gpu, scratch_bytes);
+        {
+            const b1 = try ctx.pipes.get(topk_split_kernel, if (meta.dtype == .f16) "topk_partial_f16" else "topk_partial");
+            const bufs = [_]c.WGPUBuffer{ x_buf, scratch };
+            const sizes = [_]u64{ dx.len, scratch_bytes };
+            const params: TopKParams = .{
+                .rows = xv.rows,
+                .cols = xv.cols,
+                .k = k,
+                .largest = @intFromBool(s.largest),
+                .x_row = xv.row_stride,
+                .o_row = 0,
+                .seg = SEG_COLS,
+            };
+            try frame.recordCompute(b1, &bufs, &sizes, std.mem.asBytes(&params), .{ segs, xv.rows, 1 });
+        }
+        {
+            const b2 = try ctx.pipes.get(topk_kernel, if (meta.dtype == .f16) "topk_finish_f16" else "topk_finish");
+            const grid = try rowGrid(xv.rows);
+            const bufs = [_]c.WGPUBuffer{ scratch, val_buf, idx_buf };
+            const sizes = [_]u64{ scratch_bytes, dval.len, didx.len };
+            const params: TopKParams = .{
+                .rows = xv.rows,
+                // The fold's "columns" are the candidates stage 1 produced per row.
+                .cols = segs * k,
+                .k = k,
+                .largest = @intFromBool(s.largest),
+                .x_row = 0,
+                .o_row = vv.row_stride,
+                .groups_x = grid[0],
+            };
+            try frame.recordCompute(b2, &bufs, &sizes, std.mem.asBytes(&params), grid);
+        }
+        return;
+    }
+
+    const grid = try rowGrid(xv.rows);
+    const params: TopKParams = .{
+        .rows = xv.rows,
+        .cols = xv.cols,
+        .k = k,
+        .largest = @intFromBool(s.largest),
+        .x_row = xv.row_stride,
+        .o_row = vv.row_stride,
+        .groups_x = grid[0],
+    };
+    const bufs = [_]c.WGPUBuffer{ x_buf, val_buf, idx_buf };
+    const sizes = [_]u64{ dx.len, dval.len, didx.len };
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), grid);
 }
 
 fn execArgMaxCrossTile(ctx: Ctx, frame: *Frame, s: executable.StepArgMax, meta: anytype, out_meta: anytype, rank: usize, input_tiles: usize, output_tiles: usize) ExecuteProgramError!void {

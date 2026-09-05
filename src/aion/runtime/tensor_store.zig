@@ -9,12 +9,12 @@ pub const StoreError = error{ InvalidArgument, OutOfMemory };
 pub const SequenceCachePolicyKind = enum(u8) {
     none = 0,
     growable = 1,
-    ring = 2,
+    rolling = 2,
 };
 
 pub const SequenceCachePolicyInfo = struct {
     kind: SequenceCachePolicyKind = .none,
-    ring_window_tokens: usize = 0,
+    rolling_history_tokens: usize = 0,
 };
 
 pub const TensorMeta = struct {

@@ -33,6 +33,7 @@ comptime {
     _ = @import("aion/graph/opt/test_opt.zig");
     _ = @import("aion/api/test_api.zig");
     _ = @import("aion/api/test_nn.zig");
+    _ = @import("aion/api/test_sequence_cache.zig");
 }
 
 test {

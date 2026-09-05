@@ -4767,7 +4767,7 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     try std.testing.expectError(types.BackendError.InvalidArgument, cpu.backend().executeProgram(&prog, sm.tensorStore()));
 }
 
-test "cpu backend: kv cache append ring policy wraps time index" {
+test "cpu backend: kv cache append rolling policy wraps time index" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const bsz: usize = 1;
@@ -4805,7 +4805,7 @@ test "cpu backend: kv cache append ring policy wraps time index" {
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
-    try sm.registerSequenceCachePolicy(cache_tid, .{ .ring = .{ .window_tokens = t_cap } });
+    try sm.registerSequenceCachePolicy(cache_tid, .{ .rolling = .{ .history_tokens = t_cap } });
 
     var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
     defer g.deinit();

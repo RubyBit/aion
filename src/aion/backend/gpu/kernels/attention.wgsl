@@ -73,7 +73,7 @@ struct Params {
     win_right: u32,
     win_chunk: u32,
     ring: u32, // 0 = identity time map, 1 = ring
-    ring_window: u32,
+    ring_modulus: u32,
     kv_f16: u32,
     scale: f32,
     soft_cap: f32, // 0 = disabled
@@ -221,7 +221,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         let w = window_keys(p.win_left, p.win_right, p.win_chunk, q_pos, valid_end);
         let upper = w.y;
         var lower = w.x;
-        if (p.ring != 0u && valid_end > p.ring_window) { lower = max(lower, valid_end - p.ring_window); }
+        if (p.ring != 0u && valid_end > p.ring_modulus) { lower = max(lower, valid_end - p.ring_modulus); }
         if (upper <= lower) { continue; }
 
         lo_r[r] = lower;
@@ -277,7 +277,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         var okk = tj < t_end;
         if (okk) {
             t_phys = tj;
-            if (p.ring != 0u) { t_phys = tj % p.ring_window; }
+            if (p.ring != 0u) { t_phys = tj % p.ring_modulus; }
             // Bound by the cache AND by the tile actually bound here.
             okk = t_phys < p.t_cap && t_phys >= p.kv_t0 && t_phys - p.kv_t0 < p.kv_tile_t;
         }

@@ -34,10 +34,6 @@ pub fn place(
         for (block.steps) |*placed| placed.placement = target;
     }
 
-    // Collect before rewriting so growth requests name graph-produced operands
-    // and can still be matched to runtime input slots.
-    prog.growth_requests = try collectGrowthRequests(allocator, prog);
-
     var mirrors: std.AutoHashMap(TensorId, TensorId) = .init(allocator);
     defer mirrors.deinit();
     var refreshes: std.ArrayList(LoopCondRefresh) = .empty;
@@ -136,33 +132,6 @@ const HoistCtx = struct {
         return dst;
     }
 };
-
-fn collectGrowthRequests(allocator: std.mem.Allocator, prog: *const Program) Error![]executable.GrowthRequest {
-    var out: std.ArrayList(executable.GrowthRequest) = .empty;
-    errdefer out.deinit(allocator);
-
-    for (prog.steps) |placed| try noteGrowthRequest(allocator, &out, placed);
-    for (prog.blocks) |block| {
-        for (block.steps) |placed| try noteGrowthRequest(allocator, &out, placed);
-    }
-    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
-}
-
-fn noteGrowthRequest(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(executable.GrowthRequest),
-    placed: PlacedStep,
-) Error!void {
-    const append = switch (placed.op) {
-        .SequenceAppendTiled => |s| s,
-        else => return,
-    };
-    out.append(allocator, .{
-        .cache = append.cache,
-        .new_kv = append.new_kv,
-        .end_index = append.end_index,
-    }) catch return error.OutOfMemory;
-}
 
 fn collectPlacements(
     allocator: std.mem.Allocator,

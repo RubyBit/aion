@@ -24,7 +24,14 @@ enable f16;
 
 @group(0) @binding(4) var<uniform>             p: Params;
 
-struct Params { rows: u32, cols: u32, x_row: u32, o_row: u32, eps: f32 };
+struct Params {
+    rows: u32, cols: u32, x_row: u32, o_row: u32,
+    eps: f32, groups_x: u32, _pad0: u32, _pad1: u32,
+};
+
+fn row_index(wid: vec3<u32>) -> u32 {
+    return wid.x + wid.y * p.groups_x;
+}
 
 const WG: u32 = 256u;
 var<workgroup> scratch: array<f32, 256>;
@@ -45,8 +52,10 @@ fn wg_reduce_sum(lidx: u32, v: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn rmsnorm_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+    let row = row_index(wid);
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var ss = 0.0;
     for (var c = lidx; c < p.cols; c += WG) { let v = x[xb + c]; ss += v * v; }
@@ -60,8 +69,10 @@ fn rmsnorm_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
 
 @compute @workgroup_size(256)
 fn layernorm_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+    let row = row_index(wid);
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var s = 0.0;
     var ss = 0.0;
@@ -81,8 +92,10 @@ fn layernorm_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 
 @compute @workgroup_size(256)
 fn rmsnorm_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+    let row = row_index(wid);
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var ss = 0.0;
     for (var c = lidx; c < p.cols; c += WG) { let v = f32(xh[xb + c]); ss += v * v; }
@@ -96,8 +109,10 @@ fn rmsnorm_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocat
 
 @compute @workgroup_size(256)
 fn layernorm_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+    let row = row_index(wid);
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var s = 0.0;
     var ss = 0.0;

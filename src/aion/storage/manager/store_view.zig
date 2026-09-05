@@ -33,9 +33,9 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
             const kind: tensor_store.SequenceCachePolicyKind = switch (info.kind) {
                 .none => .none,
                 .growable => .growable,
-                .ring => .ring,
+                .rolling => .rolling,
             };
-            return .{ .kind = kind, .ring_window_tokens = info.ring_window_tokens };
+            return .{ .kind = kind, .rolling_history_tokens = info.rolling_history_tokens };
         }
 
         fn meta(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.StoreError!tensor_store.TensorMeta {

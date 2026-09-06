@@ -63,23 +63,29 @@ class Sampler:
         self.top_k = int(top_k)
         self.top_p = float(top_p)
         self.rng = np.random.default_rng(seed)
+        self._suppressed = np.fromiter(self.SUPPRESSED, dtype=np.int64)
+
+    @staticmethod
+    def _read(model, name: str) -> np.ndarray:
+        t = model.output_tensor(name)
+        try:
+            return np.asarray(t.numpy()).reshape(-1)
+        finally:
+            t.close()
 
     def __call__(self, model) -> int:
-        vt = model.output_tensor("topk_values")
-        it = model.output_tensor("topk_indices")
-        try:
-            values = np.asarray(vt.numpy(), dtype=np.float64).reshape(-1)
-            ids = np.asarray(it.numpy()).reshape(-1)
-        finally:
-            vt.close()
-            it.close()
+        ids = self._read(model, "topk_indices")
+        keep = ~np.isin(ids, self._suppressed)
+        if not keep.any():
+            keep = np.ones_like(keep)  # every candidate suppressed: emit anyway
+        ids = ids[keep]
 
-        keep = np.array([int(i) not in self.SUPPRESSED for i in ids], dtype=bool)
-        if keep.any():
-            values, ids = values[keep], ids[keep]
-
+        # Top-k arrives sorted best-first, so greedy is the first surviving id and
+        # never needs the values tensor read back at all.
         if self.temperature == 0.0:
             return int(ids[0])
+
+        values = self._read(model, "topk_values").astype(np.float64)[keep]
 
         if 0 < self.top_k < values.size:
             values = values[: self.top_k]

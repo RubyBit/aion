@@ -1645,12 +1645,17 @@ test "api: role-declared symbolic cache auto-sizes from LoadModelOptions.cache" 
 
         try drive.steps(&model, &ctx, &[_]i32{ 1, 2, 3, 1 });
 
-        // Appends at positions 0..3 grow the slot 2 -> 4 (doubling), under the ceiling 6.
+        // Appends at positions 0..3 grow the slot past 4 and no further than the
+        // ceiling 6. The exact step is a perf heuristic (see `growSequenceCache`);
+        // what this pins is that growth happened, stayed bounded, and kept the rows.
         const out = try model.outputTensor("next_cache");
-        try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 4, 1, 1 }, out.getShape());
-        var vals: [4]f32 = undefined;
-        try out.read(&vals);
-        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 20 }, &vals);
+        const shape = out.getShape();
+        try std.testing.expectEqual(@as(usize, 4), shape.len);
+        try std.testing.expect(shape[1] >= 4 and shape[1] <= 6);
+        const vals = try allocator.alloc(f32, shape[1]);
+        defer allocator.free(vals);
+        try out.read(vals);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 20, 30, 40, 20 }, vals[0..4]);
     }
 
     // (c) No cache options: the free symbol stays undetermined, matching the old
@@ -1713,11 +1718,17 @@ test "api: rolling cache grows for a prefill wider than retained history" {
     try model.bindInput("values", values);
     try model.run();
 
+    // Capacity has to cover the 5-row append; the exact step it lands on is a perf
+    // heuristic, so this pins the rows rather than the ladder.
     const out = try model.outputTensor("next_cache");
-    try std.testing.expectEqualSlices(usize, &.{ 1, 8, 1, 1 }, out.getShape());
-    var got: [8]f32 = undefined;
-    try out.read(&got);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 0, 0, 0 }, &got);
+    const shape = out.getShape();
+    try std.testing.expectEqual(@as(usize, 4), shape.len);
+    try std.testing.expect(shape[1] >= 5);
+    const got = try allocator.alloc(f32, shape[1]);
+    defer allocator.free(got);
+    try out.read(got);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5 }, got[0..5]);
+    for (got[5..]) |v| try std.testing.expectEqual(@as(f32, 0), v);
 }
 
 test "api: compile io-alias gives auto-init + carry + reset (no export/load)" {

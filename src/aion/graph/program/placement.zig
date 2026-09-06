@@ -11,6 +11,7 @@ const plan_mod = @import("../plan.zig");
 
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
+const DeviceRef = manager_mod.DeviceRef;
 const Program = executable.ExecutableProgram;
 const PlacedStep = executable.PlacedStep;
 
@@ -39,6 +40,15 @@ pub fn place(
     var refreshes: std.ArrayList(LoopCondRefresh) = .empty;
     defer refreshes.deinit(allocator);
 
+    // Collected before hoisting so it covers the program as the compiler produced it.
+    var written: std.AutoHashMap(TensorId, void) = .init(allocator);
+    defer written.deinit();
+    try collectWritten(&written, prog);
+    // Host operands read in place: the placement table has to say so, or the
+    // verifier sees a host read of a device tensor.
+    var host_inputs: std.AutoHashMap(TensorId, void) = .init(allocator);
+    defer host_inputs.deinit();
+
     var ctx: HoistCtx = .{
         .allocator = allocator,
         .mgr = mgr,
@@ -46,6 +56,8 @@ pub fn place(
         .mirrors = &mirrors,
         .refreshes = &refreshes,
         .target = target,
+        .written = &written,
+        .host_inputs = &host_inputs,
     };
     for (prog.blocks) |*block| block.steps = try ctx.hoist(block.steps);
     prog.steps = try ctx.hoist(prog.steps);
@@ -58,7 +70,23 @@ pub fn place(
         prog.blocks[idx].steps = list.toOwnedSlice(allocator) catch return error.OutOfMemory;
     }
 
-    try collectPlacements(allocator, prog, &mirrors, target);
+    try collectPlacements(allocator, prog, &mirrors, &host_inputs, target);
+}
+
+/// Every tensor some step writes, across the top level and every block.
+fn collectWritten(out: *std.AutoHashMap(TensorId, void), prog: *Program) Error!void {
+    for (prog.steps) |*placed| try noteWritten(out, placed);
+    for (prog.blocks) |block| {
+        for (block.steps) |*placed| try noteWritten(out, placed);
+    }
+}
+
+fn noteWritten(out: *std.AutoHashMap(TensorId, void), placed: *PlacedStep) Error!void {
+    const uses = executable.tensorUses(&placed.op);
+    for (uses.slice()) |use| {
+        if (use.access == .read) continue;
+        out.put(use.id.*, {}) catch return error.OutOfMemory;
+    }
 }
 
 const LoopCondRefresh = struct {
@@ -73,6 +101,12 @@ const HoistCtx = struct {
     mirrors: *std.AutoHashMap(TensorId, TensorId),
     refreshes: *std.ArrayList(LoopCondRefresh),
     target: executable.Placement,
+    /// Tensors some step writes. A host operand whose source is NOT in here is a
+    /// pure input, so where it already lives is where it will stay.
+    written: *const std.AutoHashMap(TensorId, void),
+    /// Sources whose host-operand transfer was elided because they already live
+    /// on the host; `collectPlacements` records them as host-placed.
+    host_inputs: *std.AutoHashMap(TensorId, void),
 
     fn hoist(self: *HoistCtx, old_steps: []PlacedStep) Error![]PlacedStep {
         var out: std.ArrayList(PlacedStep) = .empty;
@@ -91,6 +125,19 @@ const HoistCtx = struct {
                     if (mask & (@as(u64, 1) << @intCast(i)) == 0) continue;
                     const source = use.id.*;
                     if (self.target.kind == .cpu) continue;
+                    // A pure input that already lives on the host needs no copy: the
+                    // operand reads it in place. That is what keeps a caller-supplied
+                    // `If` predicate from costing an upload plus the pipeline flush and
+                    // readback a mirror would need. Anything a step WRITES is excluded:
+                    // workspace tensors are not materialized on the device yet at this
+                    // point, so residency alone would wrongly match every one of them.
+                    if (!self.written.contains(source)) {
+                        const src_dev = self.mgr.tensorDevice(source) catch DeviceRef{};
+                        if (src_dev.kind == .cpu) {
+                            self.host_inputs.put(source, {}) catch return error.OutOfMemory;
+                            continue;
+                        }
+                    }
                     const mirror = try self.transferToHost(&out, source);
                     use.id.* = mirror;
                     if (loop_cond) |field| if (use.id == field) {
@@ -137,12 +184,15 @@ fn collectPlacements(
     allocator: std.mem.Allocator,
     prog: *Program,
     mirrors: *const std.AutoHashMap(TensorId, TensorId),
+    host_inputs: *const std.AutoHashMap(TensorId, void),
     target: executable.Placement,
 ) Error!void {
     var host_side: std.AutoHashMap(TensorId, void) = .init(allocator);
     defer host_side.deinit();
     var it_mirror = mirrors.valueIterator();
     while (it_mirror.next()) |mirror| host_side.put(mirror.*, {}) catch return error.OutOfMemory;
+    var it_host = host_inputs.keyIterator();
+    while (it_host.next()) |id| host_side.put(id.*, {}) catch return error.OutOfMemory;
     var seen: std.AutoHashMap(TensorId, void) = .init(allocator);
     defer seen.deinit();
 

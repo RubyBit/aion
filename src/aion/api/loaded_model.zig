@@ -775,11 +775,16 @@ pub const Model = struct {
         while (target < required) {
             target = StorageManager.growTarget(target, growth[0], growth[1]) catch return error.InvalidArgument;
         }
-        // Capacity is part of the specialization key, so a growth factor like 3/2
-        // would compile a fresh program at 48, 72, 108, 162 ... Rounding to a power
-        // of two keeps a whole session down to a handful of specializations without
-        // changing what the cache holds.
-        target = std.math.ceilPowerOfTwo(usize, target) catch return error.InvalidArgument;
+        // Capacity is part of the specialization key, so EVERY distinct capacity a
+        // session sees costs a full graph compile. A 3/2 factor would compile at 48,
+        // 72, 108, 162 ...; even doubling from a small initial capacity compiled five
+        // times in a 300-token run. Quantize to a power of two AND never grow by less
+        // than 4x, which bounds a 32 -> 2048 session to three shapes. The extra rows
+        // are far cheaper than the compiles they avoid.
+        target = @max(
+            std.math.ceilPowerOfTwo(usize, target) catch return error.InvalidArgument,
+            std.math.mul(usize, meta.shape[sequence_cache.time_axis], 4) catch return error.InvalidArgument,
+        );
         switch (policy) {
             .rolling => |r| self.store.ensureRollingCacheCapacity(slot, target, r.history_tokens, starts) catch return error.InvalidArgument,
             .growable => |g| {
@@ -1634,7 +1639,7 @@ pub const Model = struct {
                 // Share recurrent state across cache entries and keep it single-tile
                 // because SequenceAppend requires a contiguous last axis.
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
-            else if (self.target.device.kind != .cpu) blk: {
+            else if (self.target.device.kind != .cpu and !inputIsHostOnly(graph, in_ids[sig_idx])) blk: {
                 // A GPU program binds a stable device slot, never the caller's
                 // host tensor. `run()` performs the explicit H2D copy into this
                 // slot, so execution has one backing and no staged-input cache.
@@ -1685,6 +1690,31 @@ pub const Model = struct {
             .program = program,
             .workspace_bytes = workspace_bytes,
         };
+    }
+
+    /// Whether every use of `value` is a position the executor resolves on the HOST.
+    ///
+    /// Today that is only an `If` predicate (`inputs[0]`). Such an input's slot stays
+    /// on the host for a GPU model: uploading it would only force placement to insert
+    /// a readback to get it again, and that readback is a full pipeline flush plus a
+    /// map/poll — far more than the model's whole per-step dispatch cost.
+    fn inputIsHostOnly(graph: *const graph_mod.Graph, value: graph_mod.ValueId) bool {
+        var seen_use = false;
+        for (graph.nodes.items) |node| {
+            for (node.inputs, 0..) |input, pos| {
+                if (input != value) continue;
+                seen_use = true;
+                const host_pos = node.op == .If and pos == 0;
+                if (!host_pos) return false;
+            }
+        }
+        for (graph.regions.items) |region| {
+            for (region.nodes) |node| {
+                for (node.inputs) |input| if (input == value) return false;
+            }
+        }
+        for (graph.outputs.items) |out| if (out == value) return false;
+        return seen_use;
     }
 
     /// Return or lazily allocate the shared single-tile slot for an io-aliased input.

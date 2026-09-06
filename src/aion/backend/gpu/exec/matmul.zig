@@ -38,6 +38,10 @@ const dequant_kernel: pipelines.KernelDesc = .{ .name = "dequant", .wgsl = @embe
 const gemv_kernel: pipelines.KernelDesc = .{ .name = "matmul_gemv", .wgsl = @embedFile("../kernels/matmul_gemv.wgsl") };
 /// Column-pairs per GEMV workgroup (matches `COLS` in matmul_gemv.wgsl).
 const GEMV_COLS: u32 = 32;
+/// Same for the narrow variant (`COLS_N`), and the group count below which it wins.
+/// Tuned on a 58-SM 4080 Laptop: fewer groups than this and whole SMs sit idle.
+const GEMV_COLS_NARROW: u32 = 8;
+const GEMV_MIN_GROUPS: u32 = 64;
 const Q8_BLOCK_ELEMS: u32 = 32;
 const Q8_BLOCK_BYTES: u32 = 34;
 const DEQUANT_WG: u32 = 64;
@@ -383,9 +387,20 @@ pub const Matmul = struct {
             };
             const sizes = [_]u64{ da.len, db.len, dc.len };
             if (n_dim % 2 == 0) {
-                const gemv_built = try ctx.pipes.get(gemv_kernel, "gemv_q8_kmajor");
-                const groups = @max(1, context.ceilDiv(n_dim / 2, GEMV_COLS));
-                try frame.recordCompute(gemv_built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
+                // The group count is pairs/COLS, so a small N leaves most of the GPU
+                // idle at the wide kernel's COLS=32. Below the occupancy threshold the
+                // narrow kernel quarters COLS for 4x the groups at the same total
+                // threads and the same B traffic.
+                const pairs = n_dim / 2;
+                const wide_groups = @max(1, context.ceilDiv(pairs, GEMV_COLS));
+                if (wide_groups < GEMV_MIN_GROUPS) {
+                    const gemv_built = try ctx.pipes.get(gemv_kernel, "gemv_q8_kmajor_narrow");
+                    const groups = @max(1, context.ceilDiv(pairs, GEMV_COLS_NARROW));
+                    try frame.recordCompute(gemv_built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
+                } else {
+                    const gemv_built = try ctx.pipes.get(gemv_kernel, "gemv_q8_kmajor");
+                    try frame.recordCompute(gemv_built, &bufs, &sizes, std.mem.asBytes(&params), .{ wide_groups, 1, 1 });
+                }
             } else {
                 const gemv_built = try ctx.pipes.get(gemv_kernel, "gemv_q8_kmajor_odd");
                 const groups = @max(1, context.ceilDiv(n_dim, 256));

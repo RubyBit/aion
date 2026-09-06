@@ -80,7 +80,10 @@ fn candidateForId(id: VariantId) Candidate {
 }
 
 pub fn selectForTarget(target: cpu_target.Target) Candidate {
-    if (comptime builtin.cpu.arch.isX86()) {
+    // The self-hosted x86 assembler cannot emit VPDPBUSD or its {vex}
+    // prefix. Eliminate these variants at comptime: runtime dispatch alone
+    // still instantiates their assembly, even on CPUs without VNNI.
+    if (comptime builtin.cpu.arch.isX86() and builtin.zig_backend != .stage2_x86_64) {
         return switch (target.quant_dot) {
             .vex => candidateForIdDot(target.simd_width, .vex),
             .evex => candidateForIdDot(target.simd_width, .evex),

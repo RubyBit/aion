@@ -351,6 +351,11 @@ pub fn build(b: *std.Build) void {
     // `--listen=-` test runner mode can stall on Windows. The direct `zig test`
     // path is the closest stable fallback and still honors the selected
     // target/optimize settings.
+    // These raw commands capture graph.zig_exe, and setEnvironmentVariable
+    // copies the current process environment. Neither is relocatable across
+    // CI runners when setup-zig restores the configuration cache. Regenerate
+    // the configuration each invocation; compiled artifacts remain cached.
+    b.graph.poisonCache();
     const skip_thread_pool_tests: bool = b.option(
         bool,
         "skip-thread-pool-tests",

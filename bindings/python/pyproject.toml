@@ -143,6 +143,9 @@ reportUnnecessaryTypeIgnoreComment = "warning"
 # Every published target has a wgpu-native prebuilt pinned in build.zig.zon; on a
 # target that doesn't, build.zig degrades to a CPU-only build automatically.
 [tool.cibuildwheel]
+# Build only the native 64-bit target; the Zig and wgpu builds are native too.
+# The default "auto" also selects win32/i686 on x86-64 hosts.
+archs = ["native"]
 build = "cp312-* cp313-*"
 skip = "*-musllinux_*" # musl would need a separate in-container Zig; manylinux only.
 build-frontend = "build"
@@ -158,7 +161,10 @@ AION_PY_CPU = "baseline"   # conservative ISA floor for the main module
 # Linux wheels build in a manylinux container. Zig is installed on the host
 # (mlugg/setup-zig) and the host filesystem is visible at /host, so point the
 # build at the host zig rather than installing it inside the container.
+# Keep builds and import tests on the same glibc 2.17 floor as the Zig targets.
 [tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
 environment-pass = ["HOST_ZIG"]
 
 [tool.cibuildwheel.linux.environment]
@@ -166,3 +172,17 @@ AION_PY_GPU = "1"
 AION_PY_MULTIVERSION = "1"
 AION_PY_CPU = "baseline"
 AION_ZIG_EXE = "/host$HOST_ZIG"
+
+# Avoid Zig's native libc detection: the host-mounted compiler must use its
+# bundled headers and a glibc floor matching the wheel policy. Native detection
+# hits old mathinline.h syntax on x86-64 and can emit unavailable libc calls
+# (e.g. copy_file_range) on ARM. Preserve the common GPU/CPU/Zig environment.
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux_x86_64"
+inherit.environment = "append"
+environment.AION_PY_TARGET = "x86_64-linux-gnu.2.17"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux_aarch64"
+inherit.environment = "append"
+environment.AION_PY_TARGET = "aarch64-linux-gnu.2.17"

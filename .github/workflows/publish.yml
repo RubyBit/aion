@@ -11,7 +11,8 @@
 #   - aion-wgpu   : the wgpu-native runtime, one py3-none-<platform> wheel per
 #                   host. `aion-engine[gpu]` pulls it in.
 # Both must have a Trusted Publisher registered on PyPI for this repo, this
-# workflow file, and the selected environment (`pypi` / `testpypi`).
+# workflow file, and its package environment: pypi-core / pypi-wgpu
+# (testpypi-core / testpypi-wgpu for TestPyPI).
 name: publish
 
 on:
@@ -92,12 +93,22 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish to ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    name: Publish ${{ matrix.package }} to ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: aion-engine
+            wheel-prefix: aion_engine
+            environment-suffix: core
+          - package: aion-wgpu
+            wheel-prefix: aion_wgpu
+            environment-suffix: wgpu
     needs: [build-aion]
     runs-on: ubuntu-24.04
     # A tag push always targets PyPI; manual runs choose. The environment name
     # must match the Trusted Publisher registered on PyPI for each project.
-    environment: ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    environment: ${{ format('{0}-{1}', github.event_name == 'push' && 'pypi' || inputs.repository, matrix.environment-suffix) }}
     permissions:
       id-token: write # OIDC token for Trusted Publishing
     steps:
@@ -107,14 +118,21 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List collected distributions
-        run: ls -l dist
+      # Each OIDC identity is authorized for only its own package. Never send
+      # the other distribution to that publisher (including on first upload).
+      - name: Select package distributions
+        env:
+          WHEEL_PREFIX: ${{ matrix.wheel-prefix }}
+        run: |
+          mkdir publish-dist
+          mv dist/"${WHEEL_PREFIX}"-*.whl publish-dist/
+          ls -l publish-dist
 
       - name: Publish to TestPyPI
         if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: publish-dist
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
 
@@ -122,7 +140,7 @@ jobs:
         if: github.event_name == 'push' || inputs.repository == 'pypi'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: publish-dist
           # `aion-wgpu` rarely changes version; skip re-uploading it on
           # aion-engine-only releases rather than failing on a duplicate.
           skip-existing: true

@@ -21,7 +21,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py as _build_py
 
 try:
@@ -82,6 +82,14 @@ class build_py(_build_py):
         super().run()
 
 
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        # install chooses purelib/platlib from the distribution, independently
+        # of bdist_wheel.root_is_pure. The bundled library must go to platlib
+        # even though we do not compile a Python extension.
+        return True
+
+
 cmdclass: dict = {"build_py": build_py}
 
 if _bdist_wheel is not None:
@@ -101,4 +109,4 @@ if _bdist_wheel is not None:
     cmdclass["bdist_wheel"] = bdist_wheel
 
 
-setup(cmdclass=cmdclass)
+setup(cmdclass=cmdclass, distclass=BinaryDistribution)

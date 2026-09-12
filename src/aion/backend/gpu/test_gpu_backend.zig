@@ -220,6 +220,83 @@ test "gpu backend: tiled matmul matches CPU reference" {
     }
 }
 
+// Small GEMMs expose adjacent invocations overwriting components of a shared
+// A vec4 on Metal. Check each staging path explicitly, rather than letting the
+// autotuner choose which shader receives regression coverage.
+fn checkMatmulSharedRows(entry: []const u8, m: usize, k: usize, n: usize) !void {
+    const alloc = std.testing.allocator;
+    var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+    for (gb.matmul.generated, 0..) |generated, i| {
+        if (std.mem.eql(u8, generated.entry, entry)) {
+            // The arena still owns all generated shaders. Restrict only this
+            // test backend's menu, without changing process environment state.
+            gb.matmul.generated = gb.matmul.generated[i .. i + 1];
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), gb.matmul.generated.len);
+
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+    const a_shape = [_]usize{ m, k };
+    const b_shape = [_]usize{ k, n };
+    const a_id = try mgr.createTiledTensor(.f32, &a_shape, &a_shape, .{});
+    const b_id = try mgr.createTiledTensor(.f32, &b_shape, &b_shape, .{});
+    const a_data = try alloc.alloc(f32, m * k);
+    defer alloc.free(a_data);
+    const b_data = try alloc.alloc(f32, k * n);
+    defer alloc.free(b_data);
+    const actual = try alloc.alloc(f32, m * n);
+    defer alloc.free(actual);
+    for (a_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 3) % 29)) - 14)) * 0.125;
+    for (b_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 5) % 31)) - 15)) * 0.125;
+    try mgr.writeFromPackedScalar(a_id, std.mem.sliceAsBytes(a_data));
+    try mgr.writeFromPackedScalar(b_id, std.mem.sliceAsBytes(b_data));
+
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const av = try g.addInput(.f32, &a_shape);
+    try g.bindExternal(av, a_id);
+    const bv = try g.addInput(.f32, &b_shape);
+    try g.bindExternal(bv, b_id);
+    const y = try g.addMatMul(av, bv, 1.0, 0.0);
+    try g.setOutputs(&.{y});
+    var prog = try aion.program.compileGraph(alloc, &g, &mgr, .init(.{ .kind = .gpu }, gpu_policy));
+    defer prog.deinit();
+    try placeProgramOnGpu(&mgr, &prog, &gb);
+    for (0..3) |_| {
+        try gb.backend().executeProgram(&prog, mgr.tensorStore());
+        try std.testing.expectEqualStrings(entry, gb.matmul.lastChoiceEntry().?);
+        try readPlacedOutput(&mgr, prog.outputs[0], std.mem.sliceAsBytes(actual));
+        for (0..m) |row| {
+            for (0..n) |col| {
+                var expected: f32 = 0;
+                for (0..k) |inner| expected += a_data[row * k + inner] * b_data[inner * n + col];
+                try std.testing.expectApproxEqAbs(expected, actual[row * n + col], 1e-5);
+            }
+        }
+    }
+}
+
+test "gpu backend: matmul shared rows scalar staging" {
+    try checkMatmulSharedRows("mm_128x128x8_8x8_s", 8, 4, 16);
+    try checkMatmulSharedRows("mm_128x128x8_8x8_s", 9, 20, 12);
+    try checkMatmulSharedRows("mm_128x128x8_8x8_s", 5, 7, 3);
+}
+
+test "gpu backend: matmul shared rows vec4 staging" {
+    try checkMatmulSharedRows("mm_128x128x8_8x8_v", 8, 4, 16);
+    try checkMatmulSharedRows("mm_128x128x8_8x8_v", 9, 20, 12);
+}
+
+test "gpu backend: matmul shared rows double-buffered staging" {
+    try checkMatmulSharedRows("mm_128x128x16_8x8_v_db", 8, 4, 16);
+    try checkMatmulSharedRows("mm_128x128x16_8x8_v_db", 9, 20, 12);
+}
+
 // ---- shared CPU-vs-GPU runner for the simple/row-wise op tests --------------
 
 const BuiltProg = struct { prog: aion.program.Program, out: TensorId };

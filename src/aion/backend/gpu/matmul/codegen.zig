@@ -133,14 +133,16 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
     w.line("@group(0) @binding(1) var<storage, read> b: {s};", .{ab_ty});
     w.lit("@group(0) @binding(2) var<storage, read_write> cmat: array<f32>;");
     w.lit("@group(0) @binding(3) var<uniform> p: Params;");
-    w.line("var<workgroup> As: array<vec4<f32>, {d}>;", .{cfg.aVecs()});
+    // Different invocations stage adjacent rows. Scalar storage gives each
+    // writer a separate memory location; vector-component stores can lower to
+    // a read/modify/write of the whole vector (notably on Metal).
+    w.line("var<workgroup> As: array<f32, {d}>;", .{cfg.bm * cfg.bk});
     w.line("var<workgroup> Bs: array<vec4<f32>, {d}>;", .{cfg.bVecs()});
     w.blank();
 }
 
-/// Thread/tile index setup + zeroed accumulator registers. As is transposed +
-/// vec4-packed, so `rm/4u` addresses this thread's 4-row group; Bs is vec4-typed,
-/// so `cn4` is this thread's column group.
+/// Thread/tile index setup + zeroed accumulator registers. As is transposed
+/// scalar storage; Bs is vec4-typed, so `cn4` addresses the column group.
 fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
     const cols = cfg.bn / cfg.tn;
     w.lit("let M = p.dims.x; let N = p.dims.y; let K = p.dims.z;");
@@ -168,7 +170,10 @@ fn computeBlock(w: *Wgsl, cfg: MatmulConfig) void {
     w.close();
     // One vec4 load per owned output-col group, and tm/4 contiguous A-row vec4s.
     for (0..cfg.vpr()) |v| w.line("let bvec{d} = Bs[dd * {d}u + cn4 + {d}u];", .{ v, cfg.bn / 4, v });
-    for (0..cfg.tm / 4) |g| w.line("let av{d} = As[dd * {d}u + rm / 4u + {d}u];", .{ g, cfg.bm / 4, g });
+    for (0..cfg.tm / 4) |g| {
+        w.line("let ai{d} = dd * {d}u + rm + {d}u;", .{ g, cfg.bm, g * 4 });
+        w.line("let av{d} = vec4<f32>(As[ai{d}], As[ai{d} + 1u], As[ai{d} + 2u], As[ai{d} + 3u]);", .{ g, g, g, g, g });
+    }
     for (0..cfg.tm) |i| {
         for (0..cfg.vpr()) |v| w.line("acc_{d}_{d} += vec4<f32>(av{d}.{s}) * bvec{d};", .{ i, v, i / 4, swiz[i % 4], v });
     }
@@ -180,12 +185,11 @@ fn computeBlock(w: *Wgsl, cfg: MatmulConfig) void {
 // ---- cooperative global->shared load (single-buffer, inline) ---------------
 
 /// Stage this thread's vec4 of A (`vi`, slab base `k0`) into shared As, transposed
-/// + vec4-packed: element (row, k4+lane) lands at As[(k4+lane)*(bm/4) + row/4][row%4].
+/// scalar storage: element (row, k4+lane) lands at As[(k4+lane)*bm + row].
 fn coopLoadA(w: *Wgsl, cfg: MatmulConfig) void {
     const kpv = cfg.bk / 4;
     w.line("let row = vi / {d}u; let k4 = (vi % {d}u) * 4u;", .{ kpv, kpv });
     w.lit("let gr = block_row + row; let gk = k0 + k4;");
-    w.lit("let rg = row / 4u; let cmp = row % 4u;");
     if (cfg.bounds_check) {
         w.open("if (gr < M && gk + 3u < K)", .{});
         storeARows(w, cfg);
@@ -199,15 +203,15 @@ fn coopLoadA(w: *Wgsl, cfg: MatmulConfig) void {
 /// Fast path: whole vec4 in-bounds, one global read then 4 transposed stores.
 fn storeARows(w: *Wgsl, cfg: MatmulConfig) void {
     w.line("let av = {s};", .{aVec4(cfg)});
-    for (0..4) |l| w.line("As[(k4 + {d}u) * {d}u + rg][cmp] = av.{s};", .{ l, cfg.bm / 4, swiz[l] });
+    for (0..4) |l| w.line("As[(k4 + {d}u) * {d}u + row] = av.{s};", .{ l, cfg.bm, swiz[l] });
 }
 /// Edge path: per-lane bounds-checked scalar (zero-fill out of bounds).
 fn storeARowsEdge(w: *Wgsl, cfg: MatmulConfig) void {
     for (0..4) |l| {
         w.open("if (gr < M && gk + {d}u < K)", .{l});
-        w.line("As[(k4 + {d}u) * {d}u + rg][cmp] = {s};", .{ l, cfg.bm / 4, aScalar(w, cfg, @intCast(l)) });
+        w.line("As[(k4 + {d}u) * {d}u + row] = {s};", .{ l, cfg.bm, aScalar(w, cfg, @intCast(l)) });
         w.otherwise();
-        w.line("As[(k4 + {d}u) * {d}u + rg][cmp] = 0.0;", .{ l, cfg.bm / 4 });
+        w.line("As[(k4 + {d}u) * {d}u + row] = 0.0;", .{ l, cfg.bm });
         w.close();
     }
 }
@@ -358,7 +362,7 @@ fn prefetchOne(w: *Wgsl, cfg: MatmulConfig, reg: []const u8, vec4_expr: []const 
     w.close();
 }
 
-/// Store prefetched registers into shared (A transposed + vec4-packed, B vec4-typed).
+/// Store prefetched registers into shared (A transposed scalar, B vec4-typed).
 fn storeShared(w: *Wgsl, cfg: MatmulConfig) void {
     const nt = cfg.threads();
     const kpv = cfg.bk / 4;
@@ -367,8 +371,7 @@ fn storeShared(w: *Wgsl, cfg: MatmulConfig) void {
         w.line("let vj = lidx + {d}u;", .{j * nt});
         w.open("if (vj < {d}u)", .{cfg.aVecs()});
         w.line("let row = vj / {d}u; let k4 = (vj % {d}u) * 4u;", .{ kpv, kpv });
-        w.lit("let rg = row / 4u; let cmp = row % 4u;");
-        for (0..4) |l| w.line("As[(k4 + {d}u) * {d}u + rg][cmp] = apre{d}.{s};", .{ l, cfg.bm / 4, j, swiz[l] });
+        for (0..4) |l| w.line("As[(k4 + {d}u) * {d}u + row] = apre{d}.{s};", .{ l, cfg.bm, j, swiz[l] });
         w.close();
         w.close();
     }

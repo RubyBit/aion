@@ -38,6 +38,7 @@ const exec_cast = @import("exec/cast.zig");
 const exec_matmul_nt = @import("exec/matmul_nt.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 const executable = @import("../../runtime/executable.zig");
+const diagnostic = @import("../../diagnostic.zig");
 const cpuid = @import("tuning/cpuid.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 const profile = @import("../../profile.zig");
@@ -384,7 +385,10 @@ pub const CpuBackend = struct {
         const idx: usize = @intCast(block_id);
         if (idx >= prog.blocks.len) return error.InvalidArgument;
         for (prog.blocks[idx].steps) |block_step| {
-            try self.execStep(prog, block_step.op, store);
+            self.execStep(prog, block_step.op, store) catch |err| {
+                diagnostic.current().recordStep("cpu", block_step, err);
+                return err;
+            };
         }
     }
 
@@ -433,6 +437,7 @@ pub const CpuBackend = struct {
                 try exec_conv.execConv1DTiled(&conv_ctx, s, store);
             },
 
+            .MaxPool2D => |s| try @import("exec/pool.zig").exec(self.allocator, s, store),
             .Conv2DTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 var conv_ctx: exec_conv.ConvExecCtx = .{
@@ -578,6 +583,7 @@ pub const CpuBackend = struct {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_gather.execGatherRowsTiled(pool_ptr, self.thread_count, s, store);
             },
+            .GatherND => |s| try @import("exec/gather.zig").execGatherND(s, store),
             .GatherTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 try exec_gather.execGatherTiled(pool_ptr, self.thread_count, s, store);
@@ -625,6 +631,7 @@ pub const CpuBackend = struct {
                 std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step.op) });
             }
             self.execStep(prog, step.op, store) catch |e| {
+                diagnostic.current().recordStep("cpu", step, e);
                 if (trace_exec) {
                     std.debug.print("[aion][exec] step {d} failed: {s} err={s}\n", .{ step_i, @tagName(step.op), @errorName(e) });
                 }

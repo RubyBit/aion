@@ -106,7 +106,12 @@ pub const Context = struct {
             .allocator = allocator,
             .cpu = cpu,
             .store = sm,
-            .policy = opts.tile_policy_override orelse plan_mod.tilePolicyForTarget(.cpu),
+            // A quantized weight is tiled once, where it is created, and can never be
+            // re-tiled — so on a context that registers a GPU, author for the GPU:
+            // that is what the weight is there to run on. Scalar tensors are
+            // re-tileable either way, so a CPU model here costs a copy, not a failure.
+            .policy = opts.tile_policy_override orelse
+                plan_mod.tilePolicyForTarget(if (opts.gpus.len != 0) .webgpu else .cpu),
             .gpu_devices = if (build_options.enable_gpu) &.{} else {},
             .device_entries = &.{},
         };

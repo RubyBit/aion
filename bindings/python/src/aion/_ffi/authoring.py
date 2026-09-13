@@ -95,6 +95,21 @@ class Conv1DAttrs:
 
 
 @dataclass(frozen=True)
+class MaxPool2DAttrs:
+    kernel_h: int
+    kernel_w: int
+    stride_h: int
+    stride_w: int
+    dilation_h: int
+    dilation_w: int
+    pad_top: int
+    pad_bottom: int
+    pad_left: int
+    pad_right: int
+    ceil_mode: bool
+
+
+@dataclass(frozen=True)
 class Conv2DAttrs:
     stride_h: int
     stride_w: int
@@ -163,6 +178,7 @@ OpAttrs: TypeAlias = (
     | ReduceAttrs
     | Conv1DAttrs
     | Conv2DAttrs
+    | MaxPool2DAttrs
     | StftAttrs
     | OptionalAxisAttrs
     | SliceAttrs
@@ -463,6 +479,18 @@ def emit_op(
         spec.attr.conv1d.pad_right = int(attrs.pad_right)
         spec.attr.conv1d.groups = int(attrs.groups)
         spec.attr.conv1d.pad_mode = int(attrs.pad_mode)
+    elif isinstance(attrs, MaxPool2DAttrs):
+        spec.attr.maxpool2d.kernel_h = int(attrs.kernel_h)
+        spec.attr.maxpool2d.kernel_w = int(attrs.kernel_w)
+        spec.attr.maxpool2d.stride_h = int(attrs.stride_h)
+        spec.attr.maxpool2d.stride_w = int(attrs.stride_w)
+        spec.attr.maxpool2d.dilation_h = int(attrs.dilation_h)
+        spec.attr.maxpool2d.dilation_w = int(attrs.dilation_w)
+        spec.attr.maxpool2d.pad_top = int(attrs.pad_top)
+        spec.attr.maxpool2d.pad_bottom = int(attrs.pad_bottom)
+        spec.attr.maxpool2d.pad_left = int(attrs.pad_left)
+        spec.attr.maxpool2d.pad_right = int(attrs.pad_right)
+        spec.attr.maxpool2d.ceil_mode = int(attrs.ceil_mode)
     elif isinstance(attrs, Conv2DAttrs):
         spec.attr.conv2d.stride_h = int(attrs.stride_h)
         spec.attr.conv2d.stride_w = int(attrs.stride_w)
@@ -688,6 +716,7 @@ __all__ = [
     "CastAttrs",
     "Conv1DAttrs",
     "Conv2DAttrs",
+    "MaxPool2DAttrs",
     "ElemwiseAttrs",
     "GatherAttrs",
     "MatmulAttrs",

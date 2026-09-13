@@ -13,10 +13,9 @@ pub const ValueId = graph_mod.ValueId;
 pub const AttentionWindow = graph_mod.AttentionWindow;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
-/// v13: sequence-cache roles store a semantic retained-history bound. Physical
-/// rolling-cache capacity is a runtime concern and may grow for append headroom.
-/// Parsing requires an exact match, so every `.aion` must be re-converted.
-pub const current_version: u32 = 13;
+/// v14: node operation tags occupy u16, followed by a zero u16 reserved field.
+/// Only this version is accepted.
+pub const current_version: u32 = 14;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);
@@ -184,7 +183,7 @@ pub fn nodeOpKind(op: NodeOp) NodeOpKind {
     return std.meta.activeTag(op);
 }
 
-pub fn parseNodeOpKind(raw: u8) ?NodeOpKind {
+pub fn parseNodeOpKind(raw: u16) ?NodeOpKind {
     return std.enums.fromInt(NodeOpKind, raw);
 }
 

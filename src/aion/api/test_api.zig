@@ -4143,3 +4143,41 @@ test "api: a compiled model's weights can be swapped in place" {
     }
     try std.testing.expectEqualSlices(f32, &reference, &restored);
 }
+
+test "api: two threads on one context see only their own diagnostic" {
+    // The diagnostic is per-thread precisely so a shared context cannot mix
+    // failures. Both workers must RECORD before either READS, otherwise a single
+    // shared slot would still look right and this would prove nothing.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const diagnostic = @import("../diagnostic.zig");
+    const Shared = struct {
+        recorded: std.atomic.Value(u32) = .init(0),
+        a_code: []const u8 = "",
+        b_code: []const u8 = "",
+    };
+    var shared: Shared = .{};
+
+    const Worker = struct {
+        fn run(c: *api.Context, sh: *Shared, kernel: usize, out: *[]const u8) void {
+            var bld = api.Builder.init(c);
+            defer bld.deinit();
+            const x = bld.input(.f32, &[_]usize{ 1, 4, 4, 2 }) catch return;
+            // kernel 0 is an invalid window; kernel 9 leaves no output rows.
+            _ = bld.maxPool2D(x, .{ .kernel_h = kernel, .kernel_w = kernel }) catch {};
+            _ = sh.recorded.fetchAdd(1, .release);
+            while (sh.recorded.load(.acquire) < 2) std.Thread.yield() catch {};
+            out.* = diagnostic.current().code;
+        }
+    };
+
+    const t_a = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, &shared, 0, &shared.a_code });
+    const t_b = try std.Thread.spawn(.{}, Worker.run, .{ &ctx, &shared, 9, &shared.b_code });
+    t_a.join();
+    t_b.join();
+
+    try std.testing.expectEqualStrings("InvalidKernel", shared.a_code);
+    try std.testing.expectEqualStrings("EmptyOutput", shared.b_code);
+}

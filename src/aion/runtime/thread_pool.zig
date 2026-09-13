@@ -110,6 +110,14 @@ pub const ThreadPool = struct {
         for (shared.worker_slots) |*slot| slot.* = .{};
 
         var i: usize = 0;
+        errdefer {
+            shared.stop.store(true, .release);
+            for (shared.worker_slots[0..i]) |*slot| {
+                _ = slot.job_seq.fetchAdd(1, .release);
+                futexIo().futexWake(u32, &slot.job_seq.raw, 1);
+            }
+            for (pool.worker_threads[0..i]) |thread| thread.join();
+        }
         while (i < worker_count) : (i += 1) {
             const args: WorkerArgs = .{ .shared = shared, .tid = i + 1 };
             pool.worker_threads[i] = try std.Thread.spawn(.{}, workerMain, .{args});
@@ -175,6 +183,34 @@ pub const ThreadPool = struct {
     /// sequential chunks (still deterministic, no stealing). Overlapping host
     /// submissions to the same pool are serialized, and nested same-pool calls run
     /// inline on the calling tid to avoid deadlock on the shared job slot.
+    /// Fallible jobs use the same scheduler and join semantics. Each invocation
+    /// owns its failure slot, including nested and concurrent submissions.
+    pub fn parallelForFallible(
+        self: *ThreadPool,
+        comptime E: type,
+        ctx: *anyopaque,
+        n: usize,
+        grain: usize,
+        func: *const fn (*anyopaque, usize, usize, usize) E!void,
+    ) E!void {
+        const Job = struct {
+            ctx: *anyopaque,
+            func: *const fn (*anyopaque, usize, usize, usize) E!void,
+            failure: std.atomic.Value(u32) = .init(0),
+
+            fn run(raw: *anyopaque, start: usize, end: usize, tid: usize) void {
+                const job: *@This() = @ptrCast(@alignCast(raw));
+                job.func(job.ctx, start, end, tid) catch |err| {
+                    _ = job.failure.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
+                };
+            }
+        };
+        var job: Job = .{ .ctx = ctx, .func = func };
+        self.parallelForAny(&job, n, grain, Job.run);
+        const failure = job.failure.load(.acquire);
+        if (failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(failure))));
+    }
+
     pub fn parallelForAny(
         self: *ThreadPool,
         ctx: *anyopaque,
@@ -258,13 +294,16 @@ pub const ThreadPool = struct {
         const shared = args.shared;
         const tid = args.tid;
 
+        const idx: usize = tid - 1;
+        const seq_ptr = workerJobSeq(shared, idx);
+        // The initial sequence is established before spawning workers. Reading
+        // a live sequence after publishing readiness can miss the first job.
+        // Using that initial value also handles shutdown during partial startup.
+        var last_seq: u32 = 0;
+
         // Signal that this worker is ready.
         _ = shared.ready_workers.fetchAdd(1, .release);
         futexIo().futexWake(u32, &shared.ready_workers.raw, 1);
-
-        const idx: usize = tid - 1;
-        const seq_ptr = workerJobSeq(shared, idx);
-        var last_seq = seq_ptr.load(.acquire);
 
         while (true) {
             // Wait for new job (per-worker futex word).
@@ -762,4 +801,23 @@ test "thread pool: deinit waits for an active submission" {
     submitter.join();
     deinit_thread.join();
     try std.testing.expect(deinit_done.load(.acquire));
+}
+
+test "fallible parallel jobs join and return worker failures" {
+    var pool = try ThreadPool.init(std.testing.allocator, .{ .thread_count = 3 });
+    defer pool.deinit();
+    const E = error{InjectedFailure};
+    const Task = struct {
+        completed: std.atomic.Value(usize) = .init(0),
+        fn run(raw: *anyopaque, start: usize, end: usize, _: usize) E!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.completed.fetchAdd(end - start, .monotonic);
+            if (start <= 5 and end > 5) return error.InjectedFailure;
+        }
+    };
+    var task: Task = .{};
+    try std.testing.expectError(error.InjectedFailure, pool.parallelForFallible(E, &task, 12, 1, Task.run));
+    try std.testing.expectEqual(@as(usize, 12), task.completed.load(.acquire));
+    // The previous failure must not leak into the next invocation.
+    try pool.parallelForFallible(E, &task, 2, 1, Task.run);
 }

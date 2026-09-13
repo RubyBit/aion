@@ -271,6 +271,31 @@ class DepthwiseConv1D(Conv1D):
         )
 
 
+class MaxPool2D(Module):
+    """NHWC max pooling; stride defaults to kernel size."""
+
+    def __init__(self, kernel_size: int | tuple[int, int], *,
+                 stride: int | tuple[int, int] | None = None,
+                 dilation: int | tuple[int, int] = 1,
+                 padding: tuple[int, int, int, int] = (0, 0, 0, 0),
+                 ceil_mode: bool = False):
+        def pair(value):
+            return (value, value) if isinstance(value, int) else value
+        self.kernel = pair(kernel_size)
+        self.stride = self.kernel if stride is None else pair(stride)
+        self.dilation = pair(dilation)
+        self.padding = padding
+        self.ceil_mode = ceil_mode
+
+    def forward(self, x: TensorRef) -> TensorRef:
+        return builder_of(x).max_pool2d(
+            x, *self.kernel, stride_h=self.stride[0], stride_w=self.stride[1],
+            dilation_h=self.dilation[0], dilation_w=self.dilation[1],
+            pad_top=self.padding[0], pad_bottom=self.padding[1],
+            pad_left=self.padding[2], pad_right=self.padding[3],
+            ceil_mode=self.ceil_mode)
+
+
 class Conv2D(Module):
     """NHWC conv2d, weight `[k_h, k_w, c_in/groups, c_out]`."""
 

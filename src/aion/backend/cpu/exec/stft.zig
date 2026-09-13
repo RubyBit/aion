@@ -150,7 +150,7 @@ const FastTask = struct {
     num_groups: usize,
     center: bool,
 
-    fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+    fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
         const t: *FastTask = @ptrCast(@alignCast(ctx_any));
         const n_fft = t.n_fft;
         const lanes = t.lanes;
@@ -196,7 +196,7 @@ const FastTask = struct {
 
             const out_off: usize = (b * t.num_frames + gstart) * two_bins;
             const out_group: []f32 = t.out[out_off ..][0 .. count * two_bins];
-            t.kernels.process_group(t.plan, in_buf, out_group, count, scratch) catch {};
+            t.kernels.process_group(t.plan, in_buf, out_group, count, scratch) catch |err| return switch (err) { error.OutOfMemory => error.OutOfMemory, else => error.InvalidArgument };
         }
     }
 };
@@ -260,10 +260,10 @@ fn execFast(
     };
 
     if (want_parallel and n_threads > 1) {
-        pool.?.parallelForAny(@ptrCast(&task), total_items, 1, FastTask.runItems);
+        try pool.?.parallelForFallible(ExecuteProgramError, @ptrCast(&task), total_items, 1, FastTask.runItems);
         return;
     }
-    FastTask.runItems(@ptrCast(&task), 0, total_items, 0);
+    try FastTask.runItems(@ptrCast(&task), 0, total_items, 0);
 }
 
 fn execScalar(

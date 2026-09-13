@@ -118,3 +118,4 @@ class AionOp(IntEnum):
     AION_OP_GATHER = 28
     AION_OP_DIM = 29
     AION_OP_IOTA = 30
+    AION_OP_MAXPOOL2D = 31

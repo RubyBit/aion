@@ -345,7 +345,7 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
         return .{ .tm = tm, .tn = tn, .tk = tk };
     }
 
-    if (m <= 4 and n >= 64) {
+    if (m <= 4) {
         const tm: usize = @max(@as(usize, 1), m);
 
         // Keep N tiles reasonably large to amortize per-tile overhead, but not so large
@@ -360,7 +360,7 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
         const tk: usize = chooseMatMulTk(policy, k, b_dtype);
         return .{ .tm = tm, .tn = tn, .tk = tk };
     }
-    if (n <= 4 and m >= 64) {
+    if (n <= 4) {
         const tn: usize = @max(@as(usize, 1), n);
         var tm_target: usize = @min(@as(usize, 256), m);
         if (tm_target >= 16) {

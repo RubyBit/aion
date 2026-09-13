@@ -19,6 +19,7 @@ const manager_mod = @import("../../storage/manager.zig");
 const target_mod = @import("../target.zig");
 
 const backend_utils = @import("../../backend/utils.zig");
+const diagnostic = @import("../../diagnostic.zig");
 
 pub const StorageError = storage.StorageError;
 pub const TiledTensor = storage.TiledTensor;
@@ -529,6 +530,12 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             }
         },
 
+        .MaxPool2D => |s| {
+            const x = try mgr.getConst(s.x);
+            const out = try mgr.getConst(s.out);
+            const shape = try s.opts.output(x.shape);
+            if (!std.mem.eql(usize, &shape, out.shape) or x.dtype != out.dtype or (x.dtype != .f32 and x.dtype != .f16)) return CompileError.InvalidArgument;
+        },
         .Conv2DTiled => |s| {
             const out: *const TiledTensor = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const x: *const TiledTensor = mgr.getConst(s.x) catch return CompileError.InvalidArgument;
@@ -882,6 +889,13 @@ fn validateStep(mgr: *StorageManager, step: Step) CompileError!void {
             try compileRequire(out.tile_counts[2] == 1);
         },
 
+        .GatherND => |s| {
+            const out = try mgr.getConst(s.out);
+            const data = try mgr.getConst(s.data);
+            const idx = try mgr.getConst(s.indices);
+            if (idx.dtype != .i32 or out.dtype != data.dtype) return CompileError.InvalidArgument;
+            if (s.axis >= data.rank or s.batch_dims > s.axis or s.batch_dims > idx.rank) return CompileError.InvalidArgument;
+        },
         .GatherTiled => |s| {
             const out = mgr.getConst(s.out) catch return CompileError.InvalidArgument;
             const data = mgr.getConst(s.data) catch return CompileError.InvalidArgument;
@@ -1228,6 +1242,11 @@ fn debugDumpStep(mgr: *StorageManager, step: Step) void {
             debugDumpTensorMeta(mgr, s.indices, "indices");
             debugDumpTensorMeta(mgr, s.out, "out");
         },
+        .GatherND => |s| {
+            debugDumpTensorMeta(mgr, s.data, "data");
+            debugDumpTensorMeta(mgr, s.indices, "indices");
+            debugDumpTensorMeta(mgr, s.out, "out");
+        },
         .GatherTiled => |s| {
             debugDumpTensorMeta(mgr, s.data, "data");
             debugDumpTensorMeta(mgr, s.indices, "indices");
@@ -1289,6 +1308,7 @@ pub fn compileGraph(
     mgr: *StorageManager,
     target: Target,
 ) CompileError!Program {
+    diagnostic.current().clear();
     infer_mod.infer(graph) catch |e| {
         if (traceEnabled()) std.debug.print("[aion][compile] infer failed: {s}\n", .{@errorName(e)});
         return e;
@@ -1484,7 +1504,9 @@ fn lowerTraced(
     steps: *std.ArrayList(PlacedStep),
     blocks: *std.ArrayList(executable.Block),
 ) CompileError!void {
-    return lowerNode(allocator, graph, node, mgr, policy, ctx, steps, blocks) catch |e| {
+    const first_step = steps.items.len;
+    lowerNode(allocator, graph, node, mgr, policy, ctx, steps, blocks) catch |e| {
+        diagnostic.current().recordGraph(.lowering, graph, node, e);
         if (traceEnabled()) {
             std.debug.print(
                 "[aion][compile] lowerNode failed: op={s} err={s}\n",
@@ -1499,6 +1521,9 @@ fn lowerTraced(
         }
         return e;
     };
+    for (steps.items[first_step..]) |*step| {
+        if (step.origin == null) step.origin = .{ .output = node.output, .operation = @tagName(node.op) };
+    }
 }
 
 /// Lower a single graph node into tiled executable steps. Shared by the
@@ -1544,7 +1569,20 @@ fn lowerNode(
             // longer prefill runs without demanding different weight tile shapes.
             const tiles = if (b_dtype.info().is_quantized) blk: {
                 const m_hint = plan_mod.matMulMHint(policy);
-                break :blk plan_mod.chooseMatMulTiles(policy, m_hint, n, k, b_dtype);
+                var chosen = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, b_dtype);
+                // A quantized B cannot be re-tiled, so an existing one's tiling is a
+                // fact rather than a preference: adopt it instead of demanding one it
+                // cannot satisfy. That is what lets a weight authored against one
+                // device's policy compile for another; the chooser still decides when
+                // B has yet to be created.
+                if (ctx.value_has_tensor[b_id]) {
+                    const bt: *const TiledTensor = try mgr.getConst(ctx.value_tensor[b_id]);
+                    if (bt.tile_shape.len == b_rank and b_rank >= 2) {
+                        chosen.tk = bt.tile_shape[b_rank - 2];
+                        chosen.tn = bt.tile_shape[b_rank - 1];
+                    }
+                }
+                break :blk chosen;
             } else plan_mod.chooseMatMulTiles(policy, m, n, k, b_dtype);
 
             var c_tile_buf: [MAX_RANK]usize = undefined;
@@ -1799,6 +1837,13 @@ fn lowerNode(
             } });
         },
 
+        .MaxPool2D => |opts| {
+            const x_tid = try ensureAnyTensor(ctx, @intCast(node.inputs[0]));
+            var tile: [4]usize = undefined;
+            try fillTileShapeDefault(policy, out_dt, out_shape, &tile);
+            const out_tid = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, &tile);
+            try appendStepChecked(allocator, mgr, steps, .{ .MaxPool2D = .{ .x = x_tid, .out = out_tid, .opts = opts } });
+        },
         .Conv2D => |cv| {
             const x_id: usize = @intCast(node.inputs[0]);
             const w_id: usize = @intCast(node.inputs[1]);
@@ -2390,10 +2435,16 @@ fn lowerNode(
             const data_v = graph.values.items[data_id];
             const indices_v = graph.values.items[indices_id];
 
-            if (axis == 0 and gg.batch_dims == 0) {
+            // A specialized step's preconditions SELECT it; they must not reject,
+            // or a shape inference accepted would have nowhere to run.
+            const quantized = data_v.dtype.?.info().is_quantized;
+            const embedding_shaped = axis == 0 and gg.batch_dims == 0 and
+                data_v.shape.len == 2 and indices_v.shape.len == 2 and out_shape.len == 3;
+            const batched_shaped = axis == 1 and gg.batch_dims == 1 and
+                data_v.shape.len == 3 and indices_v.shape.len == 2 and out_shape.len == 3;
+            if (embedding_shaped) {
                 // Canonical embedding lookup lowers to the specialized row-gather
                 // execution step.
-                if (data_v.shape.len != 2 or indices_v.shape.len != 2 or out_shape.len != 3) return CompileError.InvalidArgument;
                 if (indices_v.dtype.? != .i32) return CompileError.InvalidArgument;
                 const data_dtype = data_v.dtype.?;
                 switch (data_dtype) {
@@ -2443,8 +2494,7 @@ fn lowerNode(
                     .table = data_tid,
                     .indices = indices_tid,
                 } });
-            } else if (axis == 1 and gg.batch_dims == 1) {
-                if (data_v.shape.len != 3 or indices_v.shape.len != 2 or out_shape.len != 3) return CompileError.InvalidArgument;
+            } else if (batched_shaped and !quantized) {
 
                 const b = indices_v.shape[0];
                 const l = indices_v.shape[1];
@@ -2485,7 +2535,48 @@ fn lowerNode(
                     .batch_dims = 1,
                 } });
             } else {
-                return CompileError.InvalidArgument;
+                // Everything the two specialized steps decline. They exist for the
+                // large tiled tables; this path takes any remaining axis /
+                // batch_dims / rank with the operands in one tile each, so whatever
+                // inference accepted has somewhere to run. Only the embedding step
+                // reads a quantized table, which is why inference confines q8_0 to it.
+                if (quantized) return CompileError.InvalidArgument;
+                var gnd_out_tile: [MAX_RANK]usize = undefined;
+                var gnd_data_tile: [MAX_RANK]usize = undefined;
+                var gnd_idx_tile: [MAX_RANK]usize = undefined;
+                @memcpy(gnd_out_tile[0..out_shape.len], out_shape);
+                @memcpy(gnd_data_tile[0..data_v.shape.len], data_v.shape);
+                @memcpy(gnd_idx_tile[0..indices_v.shape.len], indices_v.shape);
+                const out_tid = try ctx.ensureValueTensor(out_idx, out_dt, out_shape, gnd_out_tile[0..out_shape.len]);
+                const data_tid = try ensureTilingScalarMaybeRetile(
+                    allocator,
+                    steps,
+                    mgr,
+                    policy,
+                    ctx,
+                    data_id,
+                    data_v.dtype.?,
+                    data_v.shape,
+                    gnd_data_tile[0..data_v.shape.len],
+                );
+                const indices_tid = try ensureTilingScalarMaybeRetile(
+                    allocator,
+                    steps,
+                    mgr,
+                    policy,
+                    ctx,
+                    indices_id,
+                    .i32,
+                    indices_v.shape,
+                    gnd_idx_tile[0..indices_v.shape.len],
+                );
+                try appendStepChecked(allocator, mgr, steps, .{ .GatherND = .{
+                    .out = out_tid,
+                    .data = data_tid,
+                    .indices = indices_tid,
+                    .axis = @intCast(axis),
+                    .batch_dims = @intCast(gg.batch_dims),
+                } });
             }
         },
 

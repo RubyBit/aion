@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..enums import AionStatus
-from ..errors import AionError
+from ..errors import AionError, Diagnostic
 from ._raw import ffi, lib
 from .handles import ContextHandle
 
@@ -42,9 +42,22 @@ def raise_for_status(
     if typed_status == AionStatus.AION_OK:
         return
     message = _last_error_message(ctx) or _status_string(int(status))
-    if what:
+    diagnostic = None
+    if ctx is not None:
+        detail = ffi.new("AionDiagnostic*")
+        lib.aion_context_last_diagnostic(ctx.raw, detail)
+        if detail.phase:
+            diagnostic = Diagnostic(
+                phase={1: "validation", 2: "lowering", 3: "execution"}.get(int(detail.phase), "unknown"),
+                output_value=int(detail.output_value),
+                code=bytes(ffi.buffer(detail.code, detail.code_len)).decode("utf-8"),
+                operation=bytes(ffi.buffer(detail.operation, detail.operation_len)).decode("utf-8"),
+            )
+    # The core already names the failing entry point when it has a diagnostic;
+    # only label the call ourselves when it does not.
+    if what and diagnostic is None:
         message = f"{what}: {message}"
-    raise AionError(typed_status, message)
+    raise AionError(typed_status, message, diagnostic)
 
 
 __all__ = ["raise_for_status"]

@@ -193,3 +193,40 @@ def test_conv1d(ctx):
         # cross-correlation with [1,0,-1]: out[l] = x[l] - x[l+2]
         ref = np.array([[[0.0 - 2.0], [1.0 - 3.0], [2.0 - 4.0]]], np.float32)
         assert got.shape == (1, 3, 1) and np.allclose(got, ref)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_max_pool2d_ceil_negative_values(ctx, dtype):
+    with Builder(ctx) as b:
+        x = b.input((1, 3, 3, 1), dtype=aion.float32 if dtype == np.float32 else aion.float16).rename("x")
+        y = b.max_pool2d(x, 2, 2, stride_h=2, stride_w=2, ceil_mode=True)
+        with b.compile({"y": y}) as model:
+            values = -np.arange(1, 10, dtype=dtype).reshape(1, 3, 3, 1)
+            np.testing.assert_array_equal(model.run_numpy({"x": values})["y"], values[:, ::2, ::2, :])
+
+
+def test_validation_diagnostic_survives_builder_destruction(ctx):
+    from aion.errors import AionError
+
+    with pytest.raises(AionError) as raised:
+        with Builder(ctx) as b:
+            x = b.input((3, 3)).rename("x")
+            b.max_pool2d(x, 2, 2)
+    error = raised.value
+    assert error.diagnostic.phase == "validation"
+    assert error.diagnostic.operation == "MaxPool2D"
+    assert error.diagnostic.code == "RankMismatch"
+    assert "input[0]" in error.message
+    assert "NHWC" in error.message
+
+
+def test_diagnostic_message_names_the_failing_entry_point(ctx):
+    from aion.errors import AionError
+
+    with pytest.raises(AionError) as raised:
+        with Builder(ctx) as b:
+            b.max_pool2d(b.input((3, 3)).rename("x"), 2, 2)
+    message = raised.value.message
+    assert message.startswith("builder_op: ")
+    # The core labels the call site; the binding must not label it again.
+    assert message.count("builder_op") == 1

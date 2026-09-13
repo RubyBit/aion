@@ -449,11 +449,14 @@ pub const StorageManager = struct {
         try tmp.init(self.allocator, t.dtype, t.shape, t.tile_shape, .{ .tile_alignment = t.tile_alignment, .quant_axis = t.quant_axis });
         defer tmp.deinit();
         // `tmp` has geometry identical to `t` (same params) → matching tile offsets/lens.
-        for (t.tile_handles, 0..) |h, i| {
+        // Issued as one batch: a per-tile loop would wait on the device once per tile.
+        const regions = self.allocator.alloc(dm.D2HRegion, t.tile_handles.len) catch return StorageError.OutOfMemory;
+        defer self.allocator.free(regions);
+        for (t.tile_handles, regions, 0..) |h, *region, i| {
             const off = tmp.tile_offsets[i];
-            const len = tmp.tile_lens[i];
-            d.copyD2H(tmp.data[off .. off + len], h, 0) catch return StorageError.InvalidArgument;
+            region.* = .{ .dst = tmp.data[off .. off + tmp.tile_lens[i]], .handle = h };
         }
+        d.copyD2HMany(regions) catch return StorageError.InvalidArgument;
         return if (t.dtype.info().is_quantized) tmp.readToPackedQuant(out) else tmp.readToPackedScalar(out);
     }
 

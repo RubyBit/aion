@@ -309,3 +309,113 @@ test "placement: a device-written control predicate gets a transfer" {
         try prog.validatePlacements();
     }
 }
+
+test "plan: a skinny matmul keeps whole tiles and needs no retile" {
+    // A tiny m used to collapse the square-tile side to 1, splitting a constant
+    // B into n one-column tiles and forcing a ReTileCopyScalar on every run.
+    const policy: plan_mod.TilePolicy = .{};
+    for ([_][2]usize{ .{ 1, 10 }, .{ 1, 4 }, .{ 4, 32 }, .{ 2, 63 }, .{ 32, 2 }, .{ 63, 3 } }) |mn| {
+        const t = plan_mod.chooseMatMulTiles(policy, mn[0], mn[1], 256, .f32);
+        try std.testing.expect(t.tm > 1 or mn[0] == 1);
+        try std.testing.expect(t.tn > 1 or mn[1] == 1);
+    }
+
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const k: usize = 256;
+    const n: usize = 10;
+
+    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
+    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ k, n }, .{ .tile_alignment = 64 });
+    const x_init: [k]f32 = @splat(0.0);
+    const w_init: [k * n]f32 = @splat(0.0);
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(@constCast(x_init[0..])));
+    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(@constCast(w_init[0..])));
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f32, &[_]usize{ 1, k });
+    const w_in = try g.addInput(.f32, &[_]usize{ k, n });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(w_tid));
+    const y = try g.addMatMul(x_in, w_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .cpu(.{}));
+    defer prog.deinit();
+
+    var saw_matmul: bool = false;
+    for (prog.steps) |step| {
+        try std.testing.expect(step.op != .ReTileCopyScalar);
+        switch (step.op) {
+            .MatMulTiled => |s| {
+                saw_matmul = true;
+                const bt = try sm.getConst(s.b);
+                try std.testing.expectEqual(@as(usize, 1), bt.tile_counts[1]);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_matmul);
+}
+
+test "plan: a quantized weight's own tiling is adopted rather than demanded" {
+    // A quantized B cannot be re-tiled, so a weight authored against one policy
+    // (say a CPU context) must still compile for another (a GPU target). The
+    // lowering adopts its tiling instead of insisting on the chooser's.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const k: usize = 256;
+    const n: usize = 256;
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+
+    const cpu_policy: plan_mod.TilePolicy = plan_mod.tilePolicyForTarget(.cpu);
+    const authored = plan_mod.chooseMatMulTiles(cpu_policy, plan_mod.matMulMHint(cpu_policy), n, k, .q8_0);
+    const gpu_policy: plan_mod.TilePolicy = plan_mod.tilePolicyForTarget(.webgpu);
+    const wanted = plan_mod.chooseMatMulTiles(gpu_policy, plan_mod.matMulMHint(gpu_policy), n, k, .q8_0);
+    // The premise: the two policies really do disagree for this shape.
+    try std.testing.expect(authored.tk != wanted.tk or authored.tn != wanted.tn);
+
+    const b_tid = try sm.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ authored.tk, authored.tn }, .{
+        .tile_alignment = 64,
+        .quant_axis = 0,
+    });
+    const packed_len = try @import("../backend/utils.zig").requiredBytesForElems(.q8_0, k * n);
+    const buf = try allocator.alloc(u8, packed_len);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+    try sm.writeFromPackedQuant(b_tid, buf);
+
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
+    const x_init: [k]f32 = @splat(0.0);
+    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(@constCast(x_init[0..])));
+
+    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f32, &[_]usize{ 1, k });
+    const w_in = try g.addInput(.q8_0, &[_]usize{ k, n });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(b_tid));
+    const y = try g.addMatMul(x_in, w_in, 1.0, 0.0);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    // Compiling for the GPU policy must succeed and keep the authored tiling.
+    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, gpu_policy));
+    defer prog.deinit();
+
+    var saw: bool = false;
+    for (prog.steps) |step| {
+        switch (step.op) {
+            .MatMulTiled => |s| {
+                saw = true;
+                const bt = try sm.getConst(s.b);
+                try std.testing.expectEqual(authored.tk, bt.tile_shape[0]);
+                try std.testing.expectEqual(authored.tn, bt.tile_shape[1]);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw);
+}

@@ -38,6 +38,10 @@ const H2D_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 /// its own buffer, so the padding belongs to no one else.
 const COPY_ALIGN: usize = 4;
 
+/// Staging budget for one batched readback. Bounds peak staging while keeping
+/// the number of device waits at ceil(total / this) rather than one per region.
+const D2H_STAGE_MAX: usize = 32 << 20;
+
 fn alignUp(n: usize) usize {
     return (n + COPY_ALIGN - 1) / COPY_ALIGN * COPY_ALIGN;
 }
@@ -186,28 +190,67 @@ pub const WgpuDeviceMemory = struct {
     }
 
     fn copyD2H(ctx: *anyopaque, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void {
+        const one = [_]dm.D2HRegion{.{ .dst = dst, .handle = handle, .src_offset = src_offset }};
+        return copyD2HMany(ctx, &one);
+    }
+
+    /// Read any set of device regions in as few waits as the staging budget
+    /// allows. Mapping a buffer costs a full device round trip regardless of
+    /// size, so the batch — not the region — is what we sync on. Regions need
+    /// not be related, ordered, or contiguous; an over-budget batch is chunked,
+    /// and a single region larger than the budget simply gets its own chunk.
+    fn copyD2HMany(ctx: *anyopaque, regions: []const dm.D2HRegion) DeviceError!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (dst.len == 0) return;
-        const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
-        if (src_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
-        // Stage whole words (`alloc` rounded the source up); hand back `dst.len`.
-        const staged = alignUp(dst.len);
-        const staging = try self.ensureStaging(staged);
+        var i: usize = 0;
+        while (i < regions.len) {
+            var staged: usize = 0;
+            var end: usize = i;
+            while (end < regions.len) : (end += 1) {
+                const r = regions[end];
+                if (r.dst.len == 0) continue;
+                if (r.src_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
+                // Stage whole words (`alloc` rounded each source up).
+                const need = alignUp(r.dst.len);
+                if (staged != 0 and staged + need > D2H_STAGE_MAX) break;
+                staged += need;
+            }
+            if (staged == 0) {
+                i = end;
+                continue;
+            }
+            const staging = try self.ensureStaging(staged);
 
-        // Copy device->staging on the queue. `mapBlocking`'s wait covers both the
-        // prior submits (the compute that produced `buf`) and this copy, so the
-        // readback costs ONE device round trip, not a drain plus a map.
-        const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
-        fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(src_offset), staging, 0, staged);
-        const cmd = fns.wgpuCommandEncoderFinish(enc, null);
-        fns.wgpuCommandEncoderRelease(enc);
-        fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
-        fns.wgpuCommandBufferRelease(cmd);
+            const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
+            var off: usize = 0;
+            for (regions[i..end]) |r| {
+                if (r.dst.len == 0) continue;
+                const buf = self.bufFor(r.handle) orelse {
+                    fns.wgpuCommandEncoderRelease(enc);
+                    return DeviceError.InvalidArgument;
+                };
+                const need = alignUp(r.dst.len);
+                fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(r.src_offset), staging, @intCast(off), need);
+                off += need;
+            }
+            const cmd = fns.wgpuCommandEncoderFinish(enc, null);
+            fns.wgpuCommandEncoderRelease(enc);
+            fns.wgpuQueueSubmit(self.gpu.queue, 1, &cmd);
+            fns.wgpuCommandBufferRelease(cmd);
 
-        self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, staged) catch return DeviceError.InvalidArgument;
-        const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, staged) orelse return DeviceError.InvalidArgument;
-        self.copyHostBytes(dst, @as([*]const u8, @ptrCast(mapped))[0..dst.len]);
-        fns.wgpuBufferUnmap(staging);
+            // One wait covers the compute that produced these buffers AND every
+            // copy in this chunk, so the batch costs a single round trip.
+            self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, staged) catch return DeviceError.InvalidArgument;
+            const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, staged) orelse return DeviceError.InvalidArgument;
+            const base: [*]const u8 = @ptrCast(mapped);
+            var read: usize = 0;
+            for (regions[i..end]) |r| {
+                if (r.dst.len == 0) continue;
+                self.copyHostBytes(r.dst, base[read .. read + r.dst.len]);
+                read += alignUp(r.dst.len);
+            }
+            fns.wgpuBufferUnmap(staging);
+            i = end;
+        }
     }
 
     fn copyD2D(ctx: *anyopaque, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void {
@@ -239,6 +282,7 @@ pub const WgpuDeviceMemory = struct {
         .free = free,
         .copyH2D = copyH2D,
         .copyD2H = copyD2H,
+        .copyD2HMany = copyD2HMany,
         .copyD2D = copyD2D,
         // importHost stays null: discrete memory has no host aliasing.
         .maxBindingBytes = maxBindingBytes,

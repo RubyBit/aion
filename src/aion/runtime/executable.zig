@@ -63,6 +63,8 @@ pub const StepConv1DTiled = struct {
     pad_mode: types.PadMode,
     groups: usize,
 };
+pub const StepMaxPool2D = struct { out: TensorId, x: TensorId, opts: @import("../graph/window.zig").Pool2D };
+
 pub const StepConv2DTiled = struct {
     out: TensorId,
     x: TensorId,
@@ -170,6 +172,17 @@ pub const StepRoPE1DTiled = struct {
 
 /// General row gather. The first implementation supports the canonical
 /// `axis == batch_dims` forms used by embeddings and batched sequence pooling.
+/// General gather: `out = data[:axis] ++ indices[batch_dims:] ++ data[axis+1:]`.
+/// The row/embedding steps above cover the large tiled tables; this one covers
+/// every remaining axis/batch_dims/rank combination, for single-tile operands.
+pub const StepGatherND = struct {
+    out: TensorId,
+    data: TensorId,
+    indices: TensorId,
+    axis: u8,
+    batch_dims: u8,
+};
+
 pub const StepGatherTiled = struct {
     out: TensorId,
     data: TensorId,
@@ -297,6 +310,7 @@ pub const Step = union(enum) {
     SoftmaxTiled: StepSoftmaxTiled,
     Conv1DTiled: StepConv1DTiled,
     Conv2DTiled: StepConv2DTiled,
+    MaxPool2D: StepMaxPool2D,
     LayerNormTiled: StepLayerNormTiled,
     RMSNormTiled: StepRMSNormTiled,
     AttentionTiled: StepAttentionTiled,
@@ -311,6 +325,7 @@ pub const Step = union(enum) {
 
     GatherRowsTiled: StepGatherRowsTiled,
     GatherTiled: StepGatherTiled,
+    GatherND: StepGatherND,
 
     RoPE1DTiled: StepRoPE1DTiled,
 
@@ -347,6 +362,7 @@ pub const Step = union(enum) {
 /// no say: an operand a backend cannot consume on the device makes the op
 /// unsupported there, rather than quietly moving work to the CPU.
 pub const PlacedStep = struct {
+    origin: ?@import("../diagnostic.zig").Origin = null,
     placement: Placement = .{},
     host_operands: u64 = 0,
     op: Step,
@@ -411,6 +427,10 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.x, .read);
             out.add(&s.w, .read);
             out.addOptional(&s.bias, .read);
+        },
+        .MaxPool2D => |*s| {
+            out.add(&s.out, .write);
+            out.add(&s.x, .read);
         },
         .Conv2DTiled => |*s| {
             out.add(&s.out, .write);
@@ -484,6 +504,11 @@ pub fn tensorUses(step: *Step) TensorUses {
         .GatherRowsTiled => |*s| {
             out.add(&s.out, .write);
             out.add(&s.table, .read);
+            out.add(&s.indices, .read);
+        },
+        .GatherND => |*s| {
+            out.add(&s.out, .write);
+            out.add(&s.data, .read);
             out.add(&s.indices, .read);
         },
         .GatherTiled => |*s| {

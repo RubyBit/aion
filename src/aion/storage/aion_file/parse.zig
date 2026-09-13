@@ -433,9 +433,11 @@ fn parseNodeRecords(allocator: std.mem.Allocator, bytes: []const u8, cursor: *us
     const count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
     const out = allocator.alloc(NodeRecord, count) catch return PackageError.OutOfMemory;
     errdefer allocator.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |node| freeNode(allocator, node);
     for (out) |*slot| {
-        const op_kind_raw = try readIntCursor(bytes, cursor, u8);
-        _ = try readBytes(bytes, cursor, 3);
+        const op_kind_raw = try readIntCursor(bytes, cursor, u16);
+        if (try readIntCursor(bytes, cursor, u16) != 0) return PackageError.InvalidFormat;
         const output = try readIntCursor(bytes, cursor, u32);
         const input_count = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
         const attr_len = std.math.cast(usize, try readIntCursor(bytes, cursor, u32)) orelse return PackageError.InvalidFormat;
@@ -453,6 +455,7 @@ fn parseNodeRecords(allocator: std.mem.Allocator, bytes: []const u8, cursor: *us
             .op = parsed.op,
             .extra_outputs = parsed.extra_outputs,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -551,6 +554,24 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
             .pad_mode = try readEnumCursor(bytes, &cursor, PadMode),
             .groups = try readSizeCursor(bytes, &cursor),
         } },
+        .MaxPool2D => blk: {
+            var opts: @import("../../graph/window.zig").Pool2D = .{
+                .kernel_h = try readSizeCursor(bytes, &cursor),
+                .kernel_w = try readSizeCursor(bytes, &cursor),
+                .stride_h = try readSizeCursor(bytes, &cursor),
+                .stride_w = try readSizeCursor(bytes, &cursor),
+                .dilation_h = try readSizeCursor(bytes, &cursor),
+                .dilation_w = try readSizeCursor(bytes, &cursor),
+                .pad_top = try readSizeCursor(bytes, &cursor),
+                .pad_bottom = try readSizeCursor(bytes, &cursor),
+                .pad_left = try readSizeCursor(bytes, &cursor),
+                .pad_right = try readSizeCursor(bytes, &cursor),
+            };
+            const ceil_raw = try readIntCursor(bytes, &cursor, u8);
+            if (ceil_raw > 1) return PackageError.InvalidFormat;
+            opts.ceil_mode = ceil_raw != 0;
+            break :blk .{ .MaxPool2D = opts };
+        },
         .Conv2D => .{ .Conv2D = .{
             .stride_h = try readSizeCursor(bytes, &cursor),
             .stride_w = try readSizeCursor(bytes, &cursor),
@@ -799,11 +820,14 @@ fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
 }
 
 fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
-    for (nodes) |node| {
-        allocator.free(node.inputs);
-        types.deinitNodeOp(allocator, node.op);
-    }
+    for (nodes) |node| freeNode(allocator, node);
     allocator.free(nodes);
+}
+
+fn freeNode(allocator: std.mem.Allocator, node: NodeRecord) void {
+    allocator.free(node.inputs);
+    if (node.extra_outputs.len != 0) allocator.free(node.extra_outputs);
+    types.deinitNodeOp(allocator, node.op);
 }
 
 fn freeNamedValues(allocator: std.mem.Allocator, values: []NamedValue) void {

@@ -38,6 +38,7 @@ pub const wgpu = @import("wgpu.zig"); // re-exported so apps reach Gpu/Options/c
 const wgpu_dm = @import("device_memory.zig");
 const pipelines_mod = @import("pipelines.zig");
 const context = @import("context.zig");
+const diagnostic = @import("../../diagnostic.zig");
 const simple_ops = @import("exec/simple_ops.zig");
 const rowwise = @import("exec/rowwise.zig");
 const decode_ops = @import("exec/decode_ops.zig");
@@ -337,16 +338,18 @@ pub const GpuBackend = struct {
             if (idx >= r.prog.blocks.len) return error.ExecutionFailed;
             r.depth += 1;
             defer r.depth -= 1;
-            for (r.prog.blocks[idx].steps) |step| try r.runStep(step.op);
+            for (r.prog.blocks[idx].steps) |step| try r.runStep(step);
         }
 
-        fn runStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
+        fn runStep(r: *Runner, placed: executable.PlacedStep) ExecuteProgramError!void {
+            const step = placed.op;
             const previous_op = r.frame.profile_op;
             r.frame.profile_op = @tagName(std.meta.activeTag(step));
             defer r.frame.profile_op = previous_op;
             const generic_profile = r.profiler != null and r.depth == 0;
             const t0: u64 = if (generic_profile) profile_mod.nowNs() else 0;
             r.dispatchStep(step) catch |e| {
+                diagnostic.current().recordStep("gpu", placed, e);
                 if (env_util.flagEnabled("AION_GPU_TRACE")) {
                     std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
                     switch (step) {
@@ -441,6 +444,7 @@ pub const GpuBackend = struct {
                 .ReduceAll => |s| try rowwise.execReduceAll(op_ctx, frame, s),
                 .ReduceAxis => |s| try rowwise.execReduceAxis(op_ctx, frame, s),
                 .GatherRowsTiled => |s| try decode_ops.execGatherRows(op_ctx, frame, s),
+                .GatherND => |s| try decode_ops.execGatherND(op_ctx, frame, s),
                 .GatherTiled => |s| try decode_ops.execGather(op_ctx, frame, s),
                 .RoPE1DTiled => |s| try decode_ops.execRoPE(op_ctx, frame, s),
                 .SequenceAppendTiled => |s| try decode_ops.execSequenceAppend(op_ctx, frame, s),
@@ -448,6 +452,7 @@ pub const GpuBackend = struct {
                 .RelPosMHATiled => |s| try attention_exec.execRelPosMHA(op_ctx, frame, s),
                 .Conv1DTiled => |s| try conv_exec.execConv1D(op_ctx, frame, s),
                 .Conv2DTiled => |s| try conv_exec.execConv2D(op_ctx, frame, s),
+                .MaxPool2D => |s| try @import("exec/pool.zig").exec(op_ctx, frame, s),
                 .LSTMCellFused => |s| try lstm_exec.execLSTMCell(op_ctx, frame, s),
                 .RFFT => |s| try fft_ops.execRFFT(op_ctx, frame, s),
                 .STFT => |s| try fft_ops.execSTFT(op_ctx, frame, s),
@@ -589,7 +594,7 @@ pub const GpuBackend = struct {
         const SUBMIT_CHUNK: usize = 32;
         var since_submit: usize = 0;
         for (prog.steps) |step| {
-            try runner.runStep(step.op);
+            try runner.runStep(step);
             since_submit += 1;
             if (since_submit >= SUBMIT_CHUNK) {
                 const t_chunk_submit: u64 = if (generic_profile) profile_mod.nowNs() else 0;

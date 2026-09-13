@@ -660,3 +660,66 @@ fn tileRowOffset(tile: device_store.TileRef, meta: tensor_store_mod.TensorMeta, 
     }
     return off;
 }
+
+/// General gather for single-tile operands — the axis/batch_dims/rank combinations
+/// the specialized row and batched-row paths decline.
+///
+/// Out-of-range indices clamp here; the CPU raises. A shader cannot raise without
+/// a device fault channel, so the two agree on every valid index (including ONNX
+/// negative indexing) and differ only for a program that is already invalid.
+pub fn execGatherND(ctx: Ctx, frame: *Frame, s: executable.StepGatherND) ExecuteProgramError!void {
+    const hs = ctx.store;
+    const out_meta = hs.meta(s.out) catch return error.ExecutionFailed;
+    const data_meta = hs.meta(s.data) catch return error.ExecutionFailed;
+    const idx_meta = hs.meta(s.indices) catch return error.ExecutionFailed;
+    if (idx_meta.dtype != .i32 or out_meta.dtype != data_meta.dtype) return error.Unsupported;
+    if (context.totalTiles(out_meta) != 1 or context.totalTiles(data_meta) != 1 or context.totalTiles(idx_meta) != 1) return error.Unsupported;
+
+    const axis: usize = s.axis;
+    const bd: usize = s.batch_dims;
+    const dr: usize = data_meta.rank;
+    const ir: usize = idx_meta.rank;
+    if (axis >= dr or bd > axis or bd > ir) return error.Unsupported;
+
+    var batch: usize = 1;
+    for (data_meta.shape[0..bd]) |d| batch *= d;
+    var lead: usize = 1;
+    for (data_meta.shape[0..axis]) |d| lead *= d;
+    var inner: usize = 1;
+    for (data_meta.shape[axis + 1 .. dr]) |d| inner *= d;
+    var picked: usize = 1;
+    for (idx_meta.shape[bd..ir]) |d| picked *= d;
+    const axis_len: usize = data_meta.shape[axis];
+    if (batch == 0 or lead == 0 or axis_len == 0) return error.Unsupported;
+
+    const f16_mode = out_meta.dtype == .f16;
+    if (!f16_mode and out_meta.dtype != .f32) return error.Unsupported;
+
+    const total: usize = lead * picked * inner;
+    var p: extern struct { lead: u32, picked: u32, inner: u32, axis_len: u32, mid: u32, total: u32, pad0: u32 = 0, pad1: u32 = 0 } = .{
+        .lead = std.math.cast(u32, lead) orelse return error.Unsupported,
+        .picked = std.math.cast(u32, picked) orelse return error.Unsupported,
+        .inner = std.math.cast(u32, inner) orelse return error.Unsupported,
+        .axis_len = std.math.cast(u32, axis_len) orelse return error.Unsupported,
+        .mid = std.math.cast(u32, lead / batch) orelse return error.Unsupported,
+        .total = std.math.cast(u32, total) orelse return error.Unsupported,
+    };
+
+    const ds = ctx.store.acquireTileDeviceConstLinear(s.data, 0) catch return error.ExecutionFailed;
+    defer hs.releaseConst(ds.token);
+    const di = ctx.store.acquireTileDeviceConstLinear(s.indices, 0) catch return error.ExecutionFailed;
+    defer hs.releaseConst(di.token);
+    const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+    defer hs.releaseMut(dout.token);
+
+    const built = try ctx.pipes.get(gather_kernel, if (f16_mode) "gather_nd_f16" else "gather_nd_words");
+    const bufs = [_]c.WGPUBuffer{
+        ctx.devmem.bufferFor(ds.handle).?,
+        ctx.devmem.bufferFor(di.handle).?,
+        ctx.devmem.bufferFor(dout.handle).?,
+    };
+    const sizes = [_]u64{ ds.len, di.len, dout.len };
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&p), .{
+        @max(1, @min(context.ceilDiv(p.total, 64), context.MAX_GROUPS_1D)), 1, 1,
+    });
+}

@@ -133,3 +133,11 @@ pub const sinusoidalRelPos = initializers_mod.sinusoidalRelPos;
 pub const causalMask = initializers_mod.causalMask;
 pub const slidingWindowMask = initializers_mod.slidingWindowMask;
 pub const chunkedLimitedMask = initializers_mod.chunkedLimitedMask;
+
+/// Parameter-free NHWC pooling layer. Geometry is shared with graph inference.
+pub const MaxPool2D = struct {
+    opts: @import("../graph/window.zig").Pool2D,
+    pub fn forward(self: @This(), b: *Builder, x: TensorRef) !TensorRef {
+        return b.maxPool2D(x, self.opts);
+    }
+};

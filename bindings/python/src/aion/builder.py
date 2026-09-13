@@ -32,6 +32,7 @@ from ._ffi.authoring import (
     CastAttrs,
     Conv1DAttrs,
     Conv2DAttrs,
+    MaxPool2DAttrs,
     ElemwiseAttrs,
     GatherAttrs,
     MatmulAttrs,
@@ -748,6 +749,17 @@ class Builder:
             int(_PAD_MODES[pad_mode]),
         )
         return self._emit(AionOp.AION_OP_CONV1D, inputs, attrs)
+
+    def max_pool2d(self, x: TensorRef, kernel_h: int, kernel_w: int, *,
+                   stride_h: int = 1, stride_w: int = 1,
+                   dilation_h: int = 1, dilation_w: int = 1,
+                   pad_top: int = 0, pad_bottom: int = 0,
+                   pad_left: int = 0, pad_right: int = 0,
+                   ceil_mode: bool = False) -> TensorRef:
+        """NHWC max pooling. Padding is negative infinity; NaNs propagate."""
+        return self._emit(AionOp.AION_OP_MAXPOOL2D, (x,), MaxPool2DAttrs(
+            kernel_h, kernel_w, stride_h, stride_w, dilation_h, dilation_w,
+            pad_top, pad_bottom, pad_left, pad_right, ceil_mode))
 
     def conv2d(self, x: TensorRef, weight: TensorRef, bias: Optional[TensorRef] = None, *,
                stride_h: int = 1, stride_w: int = 1, dilation_h: int = 1, dilation_w: int = 1,

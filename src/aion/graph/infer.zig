@@ -4,6 +4,7 @@ const std = @import("std");
 const graph_mod = @import("graph.zig");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
+const diagnostic = @import("../diagnostic.zig");
 
 pub const Graph = graph_mod.Graph;
 pub const Node = graph_mod.Node;
@@ -19,7 +20,7 @@ pub const InferError = error{
     RankMismatch,
     ShapeMismatch,
     DTypeMismatch,
-};
+} || @import("window.zig").Error;
 
 fn isPowerOfTwoUsize(n: usize) bool {
     return n != 0 and (n & (n - 1)) == 0;
@@ -69,6 +70,10 @@ pub const Symbols = union(enum) {
     /// Standard right-aligned elementwise broadcasting. An output axis may be
     /// inherited from either operand.
     broadcast: struct { a: ValueId, b: ValueId },
+    /// Output axes spliced from two inputs, each with its own `mapped`-style map.
+    /// An axis takes its symbol from whichever map names it; `a` wins a tie.
+    /// Gather needs this: its output is `data[:axis] ++ indices[bd:] ++ data[axis+1:]`.
+    spliced: struct { a: ValueId, a_map: []const ?usize, b: ValueId, b_map: []const ?usize },
 };
 
 /// `map` for an op that keeps the first `keep` axes of its input and computes the
@@ -105,6 +110,17 @@ fn resolveSymbols(graph: *Graph, out_shape: []const usize, syms: Symbols) InferE
         .like => |id| .{ id, null },
         .mapped => |m| .{ m.of, m.map },
         .broadcast => |ids| return resolveBroadcastSymbols(graph, out_shape, ids.a, ids.b),
+        .spliced => |sp| {
+            const from_a = try resolveSymbols(graph, out_shape, .{ .mapped = .{ .of = sp.a, .map = sp.a_map } });
+            const from_b = try resolveSymbols(graph, out_shape, .{ .mapped = .{ .of = sp.b, .map = sp.b_map } });
+            const a_syms = from_a orelse &.{};
+            const b_syms = from_b orelse &.{};
+            if (a_syms.len == 0) return from_b;
+            if (b_syms.len == 0) return from_a;
+            const merged = graph.arenaAlloc().alloc(?[]const u8, out_shape.len) catch return InferError.InvalidGraph;
+            for (merged, 0..) |*slot, i| slot.* = a_syms[i] orelse b_syms[i];
+            return merged;
+        },
     };
 
     const src = try getValue(graph, src_id);
@@ -293,6 +309,13 @@ fn inferRegion(graph: *Graph, region_id: graph_mod.RegionId) InferError!graph_mo
 /// share this exact rule set. Safe to call repeatedly (`setInferred` validates a
 /// pre-set shape rather than overwriting it).
 pub fn inferNode(graph: *Graph, node: Node) InferError!void {
+    return inferNodeImpl(graph, node) catch |err| {
+        diagnostic.current().recordGraph(.validation, graph, node, err);
+        return err;
+    };
+}
+
+fn inferNodeImpl(graph: *Graph, node: Node) InferError!void {
     if (!graph_mod.opInputCountValid(node.op, node.inputs.len)) return InferError.InvalidGraph;
 
     switch (node.op) {
@@ -471,6 +494,12 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             });
         },
 
+        .MaxPool2D => |opts| {
+            const x = try getValue(graph, node.inputs[0]);
+            if (x.dtype == null or !isScalarFloat(x.dtype.?)) return InferError.DTypeMismatch;
+            const shape = try opts.output(x.shape);
+            try setInferred(graph, node.output, x.dtype.?, &shape, .{ .mapped = .{ .of = node.inputs[0], .map = &.{ 0, null, null, 3 } } });
+        },
         .Conv2D => |cv| {
             const x = try getValue(graph, node.inputs[0]);
             const w = try getValue(graph, node.inputs[1]);
@@ -964,11 +993,9 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             if (indices.dtype.? != .i32) return InferError.DTypeMismatch;
 
             const axis = try normalizeAxis(gg.axis, data.shape.len);
-            // The initial general gather lowering supports the two canonical
-            // regimes with axis == batch_dims:
-            //   embedding: [V,D], [B,S], axis=0, batch_dims=0
-            //   batched rows: [B,S,D], [B,L], axis=1, batch_dims=1
-            if (axis != gg.batch_dims or gg.batch_dims > indices.shape.len) return InferError.Unsupported;
+            // Batch dims are a shared prefix of both operands, and they bound
+            // `axis` from below: gathering along a batched axis has no meaning.
+            if (gg.batch_dims > axis or gg.batch_dims > indices.shape.len) return InferError.Unsupported;
             for (0..gg.batch_dims) |d| {
                 if (data.shape[d] != indices.shape[d]) return InferError.ShapeMismatch;
             }
@@ -976,25 +1003,36 @@ pub fn inferNode(graph: *Graph, node: Node) InferError!void {
             const out_dtype: DType = switch (data.dtype.?) {
                 .f16, .f32 => data.dtype.?,
                 .q8_0 => blk: {
-                    if (axis != 0 or data.shape.len != 2 or (data.shape[1] % 32) != 0) return InferError.Unsupported;
+                    // Only the specialized embedding step reads a quantized table.
+                    if (axis != 0 or data.shape.len != 2 or indices.shape.len != 2 or (data.shape[1] % 32) != 0) return InferError.Unsupported;
                     break :blk .f32;
                 },
                 else => return InferError.Unsupported,
             };
 
+            // out = data[:axis] ++ indices[batch_dims:] ++ data[axis + 1 ..]
+            const picked = indices.shape.len - gg.batch_dims;
             const trailing = data.shape.len - axis - 1;
-            const out_rank = indices.shape.len + trailing;
+            const out_rank = axis + picked + trailing;
             if (out_rank == 0 or out_rank > graph_mod.Graph.MAX_RANK) return InferError.Unsupported;
             const out_shape = graph.arenaAlloc().alloc(usize, out_rank) catch return InferError.InvalidGraph;
-            @memcpy(out_shape[0..indices.shape.len], indices.shape);
-            if (trailing > 0) {
-                @memcpy(out_shape[indices.shape.len..], data.shape[axis + 1 ..]);
-            }
-            var sym_buf: [graph_mod.Graph.MAX_RANK]?usize = @splat(null);
-            for (0..indices.shape.len) |d| sym_buf[d] = d;
-            try setInferred(graph, node.output, out_dtype, out_shape, .{
-                .mapped = .{ .of = node.inputs[1], .map = sym_buf[0..out_rank] },
-            });
+            @memcpy(out_shape[0..axis], data.shape[0..axis]);
+            @memcpy(out_shape[axis..][0..picked], indices.shape[gg.batch_dims..]);
+            @memcpy(out_shape[axis + picked ..], data.shape[axis + 1 ..]);
+
+            // Symbols follow the same splice: the leading and trailing runs keep
+            // `data`'s axes, the picked run keeps `indices`'.
+            var data_map: [graph_mod.Graph.MAX_RANK]?usize = @splat(null);
+            var idx_map: [graph_mod.Graph.MAX_RANK]?usize = @splat(null);
+            for (0..axis) |d| data_map[d] = d;
+            for (0..trailing) |d| data_map[axis + picked + d] = axis + 1 + d;
+            for (0..picked) |d| idx_map[axis + d] = gg.batch_dims + d;
+            try setInferred(graph, node.output, out_dtype, out_shape, .{ .spliced = .{
+                .a = node.inputs[0],
+                .a_map = data_map[0..out_rank],
+                .b = node.inputs[1],
+                .b_map = idx_map[0..out_rank],
+            } });
         },
 
         .Dim => |dd| {

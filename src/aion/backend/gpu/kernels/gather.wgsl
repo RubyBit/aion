@@ -25,6 +25,14 @@
 
 enable f16;
 
+// ONNX index rules: a negative index counts from the end. Applied before the
+// clamp so the CPU and GPU agree on every index in [-len, len-1]; a genuinely
+// out-of-range index still clamps here because a shader cannot raise.
+fn gather_wrap(i: i32, len: u32) -> i32 {
+    if (i < 0) { return i + i32(len); }
+    return i;
+}
+
 @group(0) @binding(0) var<storage, read>       table: array<u32>;
 @group(0) @binding(1) var<storage, read>       idx: array<i32>;
 @group(0) @binding(2) var<storage, read_write> o: array<f32>;
@@ -74,7 +82,7 @@ fn gather_rows_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / p.d;
         let col = i % p.d;
-        let src_row = u32(clamp(idx[p.p2 + r], 0, i32(p.v) - 1));
+        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
         if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
         o[i] = bitcast<f32>(table[(src_row - p.p0) * p.d + col]);
     }
@@ -102,7 +110,7 @@ fn gather_q8_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / pairs_per_row;
         let pi = i % pairs_per_row;
-        let src_row = u32(clamp(idx[p.p2 + r], 0, i32(p.v) - 1));
+        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
         if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
         let base = (src_row - p.p0) * p.wpr + pi * 17u;
         let e0 = r * p.d + pi * 64u;
@@ -143,7 +151,7 @@ fn gather_q8_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
 @compute @workgroup_size(64)
 fn scatter_row_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
-    let row = u32(clamp(idx[0], 0, i32(p.v) - 1));
+    let row = u32(clamp(gather_wrap(idx[0], p.v), 0, i32(p.v) - 1));
     if (row < p.p0 || row >= p.p1) { return; } // row lives in another buf tile
     let dst0 = (row - p.p0) * p.d;
     for (var i = gid.x; i < p.total; i += stride) {
@@ -204,7 +212,7 @@ fn gather_batched_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(
         let gb = p.p2 + b;  // batch index in the full tensor
         let gg = p.p3 + g;  // gathered row in the full tensor
         if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
-        let src = u32(clamp(idx[gb * p.wpr + gg], 0, i32(p.v) - 1));
+        let src = u32(clamp(gather_wrap(idx[gb * p.wpr + gg], p.v), 0, i32(p.v) - 1));
         o[i] = bitcast<f32>(table[((gb - p.p0) * p.v + src) * p.d + w]);
     }
 }
@@ -220,7 +228,7 @@ fn gather_rows_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / p.d;
         let col = i % p.d;
-        let src_row = u32(clamp(idx[p.p2 + r], 0, i32(p.v) - 1));
+        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
         if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
         oh[i] = table_h[(src_row - p.p0) * p.d + col];
     }
@@ -229,7 +237,7 @@ fn gather_rows_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
 @compute @workgroup_size(64)
 fn scatter_row_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
-    let row = u32(clamp(idx[0], 0, i32(p.v) - 1));
+    let row = u32(clamp(gather_wrap(idx[0], p.v), 0, i32(p.v) - 1));
     if (row < p.p0 || row >= p.p1) { return; } // row lives in another buf tile
     let dst0 = (row - p.p0) * p.d;
     for (var i = gid.x; i < p.total; i += stride) {
@@ -277,7 +285,62 @@ fn gather_batched_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
         let gb = p.p2 + b;  // batch index in the full tensor
         let gg = p.p3 + g;  // gathered row in the full tensor
         if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
-        let src = u32(clamp(idx[gb * p.wpr + gg], 0, i32(p.v) - 1));
+        let src = u32(clamp(gather_wrap(idx[gb * p.wpr + gg], p.v), 0, i32(p.v) - 1));
         oh[i] = table_h[((gb - p.p0) * p.v + src) * p.d + w];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// General gather: out = data[:axis] ++ indices[batch_dims:] ++ data[axis+1:].
+//
+// Flattening `data` around `axis` turns the whole family into one index walk, so
+// this needs no per-shape specialization: `lead` walks data[:axis], `pick` walks
+// the index tail, `in` walks data[axis+1:]. Indices repeat across the axes
+// between batch_dims and axis, which `lead / mid` recovers.
+//
+// Index rules follow ONNX: a negative index counts from the end. An index still
+// outside [-len, len-1] cannot raise from a shader, so it clamps here while the
+// CPU errors -- the one place the two backends still differ (see execGatherND).
+// ---------------------------------------------------------------------------
+struct GndParams {
+    lead: u32,
+    picked: u32,
+    inner: u32,
+    axis_len: u32,
+    mid: u32,
+    total: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gnd_src: array<u32>;
+@group(0) @binding(1) var<storage, read>       gnd_idx: array<i32>;
+@group(0) @binding(2) var<storage, read_write> gnd_dst: array<u32>;
+@group(0) @binding(0) var<storage, read>       gnd_src_h: array<f16>;
+@group(0) @binding(2) var<storage, read_write> gnd_dst_h: array<f16>;
+@group(0) @binding(3) var<uniform>             gp: GndParams;
+
+fn gnd_source(i: u32) -> u32 {
+    let in_off = i % gp.inner;
+    let rest = i / gp.inner;
+    let pick = rest % gp.picked;
+    let lead = rest / gp.picked;
+    let b = lead / gp.mid;
+    var row = gnd_idx[b * gp.picked + pick];
+    if (row < 0) { row = row + i32(gp.axis_len); }
+    let safe = u32(clamp(row, 0, i32(gp.axis_len) - 1));
+    return (lead * gp.axis_len + safe) * gp.inner + in_off;
+}
+
+@compute @workgroup_size(64)
+fn gather_nd_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    for (var i = gid.x; i < gp.total; i += ng.x * 64u) {
+        gnd_dst[i] = gnd_src[gnd_source(i)];
+    }
+}
+
+@compute @workgroup_size(64)
+fn gather_nd_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    for (var i = gid.x; i < gp.total; i += ng.x * 64u) {
+        gnd_dst_h[i] = gnd_src_h[gnd_source(i)];
     }
 }

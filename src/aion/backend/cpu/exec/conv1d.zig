@@ -895,11 +895,11 @@ fn tryExecConv1DImplicitGemmTileNative(
             }
         }
 
-        fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+        fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
             const t: *@This() = @ptrCast(@alignCast(ctx_any));
-            if (tid >= t.ctx.matmul_scratch.len) return;
+            if (tid >= t.ctx.matmul_scratch.len) return error.InvalidArgument;
             const scratch_bytes: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            t.runItemRange(scratch_bytes, start, end) catch return;
+            try t.runItemRange(scratch_bytes, start, end);
         }
     };
 
@@ -932,7 +932,7 @@ fn tryExecConv1DImplicitGemmTileNative(
 
     if (ctx.pool) |p| {
         if (ctx.thread_count > 1 and work_items >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
-            p.parallelForAny(@ptrCast(&task), work_items, 1, Task.runItems);
+            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), work_items, 1, Task.runItems);
             return true;
         }
     }
@@ -1765,10 +1765,10 @@ fn execConv1DImplicitGemm(
             }
         }
 
-        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
             const t: *@This() = @ptrCast(@alignCast(ctx_any));
             const scratch: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            t.runRowsRange(scratch, start, end) catch return;
+            try t.runRowsRange(scratch, start, end);
         }
     };
 
@@ -1801,7 +1801,7 @@ fn execConv1DImplicitGemm(
     if (ctx.pool) |p| {
         if (ctx.thread_count > 1 and rows_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
             const grain: usize = @max(m_cap, @max(@as(usize, 1), rows_total / (ctx.thread_count * 4)));
-            p.parallelForAny(@ptrCast(&task), rows_total, grain, Task.runRows);
+            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), rows_total, grain, Task.runRows);
             try writeTensorPackedF32(store, out_meta, s.out, out_packed);
             return true;
         }

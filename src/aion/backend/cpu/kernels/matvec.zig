@@ -91,12 +91,12 @@ pub fn Kernel(comptime t: Tuning) type {
                             const b0: VecF = @as(*align(1) const VecF, @ptrCast(b_ptr)).*;
                             acc0 = @mulAdd(VecF, a_v, b0, acc0);
                         } else {
-                            var tmp: [LANES]f32 = @splat(0.0);
-                            var i: usize = 0;
-                            while (i < nr) : (i += 1) {
-                                tmp[i] = b_ptr[i];
+                            // Insert into the vector directly: a stack array here
+                            // costs a memory round-trip on every reduction step.
+                            var b0: VecF = @splat(0.0);
+                            inline for (0..LANES) |i| {
+                                if (i < nr) b0[i] = b_ptr[i];
                             }
-                            const b0: VecF = tmp;
                             acc0 = @mulAdd(VecF, a_v, b0, acc0);
                         }
 
@@ -106,12 +106,10 @@ pub fn Kernel(comptime t: Tuning) type {
                                 const b1: VecF = @as(*align(1) const VecF, @ptrCast(b_ptr + LANES)).*;
                                 acc1 = @mulAdd(VecF, a_v, b1, acc1);
                             } else {
-                                var tmp1: [LANES]f32 = @splat(0.0);
-                                var ii: usize = 0;
-                                while (ii < rem) : (ii += 1) {
-                                    tmp1[ii] = b_ptr[LANES + ii];
+                                var b1: VecF = @splat(0.0);
+                                inline for (0..LANES) |ii| {
+                                    if (ii < rem) b1[ii] = b_ptr[LANES + ii];
                                 }
-                                const b1: VecF = tmp1;
                                 acc1 = @mulAdd(VecF, a_v, b1, acc1);
                             }
                         }
@@ -214,12 +212,10 @@ pub fn Kernel(comptime t: Tuning) type {
                             const b0: VecF = @floatCast(b0h);
                             acc0 = @mulAdd(VecF, a_v, b0, acc0);
                         } else {
-                            var tmp: [LANES]f32 = @splat(0.0);
-                            var i: usize = 0;
-                            while (i < nr) : (i += 1) {
-                                tmp[i] = @as(f32, @floatCast(b_ptr[i]));
+                            var b0: VecF = @splat(0.0);
+                            inline for (0..LANES) |i| {
+                                if (i < nr) b0[i] = @floatCast(b_ptr[i]);
                             }
-                            const b0: VecF = tmp;
                             acc0 = @mulAdd(VecF, a_v, b0, acc0);
                         }
 
@@ -230,12 +226,10 @@ pub fn Kernel(comptime t: Tuning) type {
                                 const b1: VecF = @floatCast(b1h);
                                 acc1 = @mulAdd(VecF, a_v, b1, acc1);
                             } else {
-                                var tmp1: [LANES]f32 = @splat(0.0);
-                                var ii: usize = 0;
-                                while (ii < rem) : (ii += 1) {
-                                    tmp1[ii] = @as(f32, @floatCast(b_ptr[LANES + ii]));
+                                var b1: VecF = @splat(0.0);
+                                inline for (0..LANES) |ii| {
+                                    if (ii < rem) b1[ii] = @floatCast(b_ptr[LANES + ii]);
                                 }
-                                const b1: VecF = tmp1;
                                 acc1 = @mulAdd(VecF, a_v, b1, acc1);
                             }
                         }

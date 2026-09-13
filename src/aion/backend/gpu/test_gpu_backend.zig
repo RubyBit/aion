@@ -2976,3 +2976,108 @@ fn buildCopyF16OddLen(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg
 test "gpu backend: copy (f16, odd element count) matches CPU" {
     try expectGpuMatchesCpu(buildCopyF16OddLen, 33, 0.0);
 }
+
+test "gpu backend: max pool crosses tiles, preserves NaNs, f32 and f16" {
+    const alloc = std.testing.allocator;
+    var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
+    defer device.deinit();
+    inline for (.{ f32, f16 }) |T| {
+        const dtype: aion.types.DType = if (T == f32) .f32 else .f16;
+        const shape = [_]usize{ 2, 5, 7, 3 };
+        const tile = [_]usize{ 1, 2, 3, 2 };
+        var values: [2 * 5 * 7 * 3]T = undefined;
+        for (&values, 0..) |*v, i| v.* = @floatFromInt(@as(i32, @intCast(i % 19)) - 9);
+        values[17] = std.math.nan(T);
+        for ([_]bool{ false, true }) |ceil| {
+            var g = Graph.init(alloc);
+            defer g.deinit();
+            var gb = gpu.GpuBackend.init(alloc, &device);
+            defer gb.deinit();
+            var mgr = StorageManager.init(alloc);
+            defer mgr.deinit();
+            const id = try mgr.createTiledTensor(dtype, &shape, &tile, .{});
+            try mgr.writeFromPackedScalar(id, std.mem.sliceAsBytes(&values));
+            const x = try g.addInput(dtype, &shape);
+            try g.bindExternal(x, id);
+            const opts: @FieldType(aion.graph.Op, "MaxPool2D") = .{ .kernel_h = @as(usize, 2), .kernel_w = @as(usize, 3), .stride_h = @as(usize, 2), .stride_w = @as(usize, 2), .dilation_h = @as(usize, 2), .pad_top = @as(usize, 1), .pad_bottom = @as(usize, 1), .pad_left = @as(usize, 1), .pad_right = @as(usize, 1), .ceil_mode = ceil };
+            const y = try g.addMaxPool2D(x, opts);
+            try g.setOutputs(&.{y});
+            var prog = try aion.program.compileGraph(alloc, &g, &mgr, .init(.{ .kind = .gpu }, gpu_policy));
+            defer prog.deinit();
+            const oh: usize = 3;
+            const ow: usize = 4;
+            var actual: [2 * oh * ow * 3]T = undefined;
+            var expected: @TypeOf(actual) = undefined;
+            for (0..2) |b| for (0..oh) |h| for (0..ow) |w| for (0..3) |c| {
+                var best: T = -std.math.inf(T);
+                for (0..2) |kh| for (0..3) |kw| {
+                    const ih = @as(isize, @intCast(h * 2 + kh * 2)) - 1;
+                    const iw = @as(isize, @intCast(w * 2 + kw)) - 1;
+                    if (ih < 0 or ih >= 5 or iw < 0 or iw >= 7) continue;
+                    const v = values[((b * 5 + @as(usize, @intCast(ih))) * 7 + @as(usize, @intCast(iw))) * 3 + c];
+                    if (std.math.isNan(v) or v > best) best = v;
+                };
+                expected[((b * oh + h) * ow + w) * 3 + c] = best;
+            };
+            var cpu = aion.cpu.CpuBackend.init(alloc);
+            defer cpu.deinit();
+            try cpu.backend().executeProgram(&prog, mgr.tensorStore());
+            try mgr.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(&actual));
+            for (expected, actual) |e, v| {
+                if (std.math.isNan(e)) try std.testing.expect(std.math.isNan(v)) else try std.testing.expectEqual(e, v);
+            }
+            try placeProgramOnGpu(&mgr, &prog, &gb);
+            try gb.backend().executeProgram(&prog, mgr.tensorStore());
+            try readPlacedOutput(&mgr, prog.outputs[0], std.mem.sliceAsBytes(&actual));
+            for (expected, actual) |e, v| {
+                if (std.math.isNan(e)) try std.testing.expect(std.math.isNan(v)) else try std.testing.expectEqual(e, v);
+            }
+        }
+    }
+}
+
+// The general gather path: shapes the specialized row / batched-row steps decline.
+// Each of these used to be a compile error, so the GPU kernel has no prior
+// coverage; matching CPU is what says the flattened index walk agrees on both.
+const GND_IDX: [6]i32 = .{ 1, 0, 2, 2, 1, 0 };
+
+fn buildGatherNDInteriorAxis(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const data = try makeInput(&g, mgr, &.{ 4, 5, 6 }, &.{ 4, 5, 6 }, 31);
+    const idx = try makeInputI32(&g, mgr, &.{3}, &.{3}, GND_IDX[0..3]);
+    const out = try g.addGather(data, idx, 1, 0);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: general gather (interior axis, rank-1 indices) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherNDInteriorAxis, 4 * 3 * 6, 0.0);
+}
+
+fn buildGatherNDAxisPastBatch(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const data = try makeInput(&g, mgr, &.{ 2, 5, 4 }, &.{ 2, 5, 4 }, 32);
+    const idx = try makeInputI32(&g, mgr, &.{ 2, 3 }, &.{ 2, 3 }, GND_IDX[0..6]);
+    const out = try g.addGather(data, idx, 2, 1);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: general gather (axis beyond batch_dims) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherNDAxisPastBatch, 2 * 5 * 3, 0.0);
+}
+
+fn buildGatherNDNegativeIndices(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const data = try makeInput(&g, mgr, &.{ 6, 3 }, &.{ 6, 3 }, 33);
+    // ONNX rules: negatives count from the end, on both backends.
+    const neg = [_]i32{ 0, -1, -6, 2 };
+    const idx = try makeInputI32(&g, mgr, &.{4}, &.{4}, neg[0..]);
+    const out = try g.addGather(data, idx, 0, 0);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: general gather (ONNX negative indices) matches CPU" {
+    try expectGpuMatchesCpu(buildGatherNDNegativeIndices, 4 * 3, 0.0);
+}

@@ -109,7 +109,22 @@ AION_API uint32_t aion_version_patch(void);
 
 AION_API const char* aion_status_string(AionStatus status);
 
-// Copy the last error message associated with this context into `buf`.
+// Structured detail for the CALLING THREAD's last failure, like errno: a context
+// may be driven from several threads and each sees only its own errors.
+// `code`/`operation` are static strings, valid for the process lifetime.
+// phase: 0=none, 1=validation, 2=lowering, 3=execution.
+typedef struct AionDiagnostic {
+    uint32_t phase;
+    uint32_t output_value;
+    const char* code;
+    size_t code_len;
+    const char* operation;
+    size_t operation_len;
+} AionDiagnostic;
+AION_API AionStatus aion_context_last_diagnostic(const AionContext* ctx, AionDiagnostic* out);
+
+// Copy the CALLING THREAD's last error message into `buf`. Pairs with
+// aion_context_last_diagnostic and is prefixed with the entry point that failed.
 // - Always writes `out_len` if non-null.
 // - Writes a NUL terminator when `cap > 0`.
 // - If truncated, the message is still NUL-terminated.
@@ -394,6 +409,7 @@ typedef enum AionOp {
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
+    AION_OP_MAXPOOL2D = 31,
 } AionOp;
 
 // Keys a query may attend to. AION_ATTENTION_UNBOUNDED on a side means no limit;
@@ -407,6 +423,7 @@ typedef struct AionAttentionWindow {
 
 // Per-op attributes. Only the member matching AionOpSpec.op is read.
 typedef union AionOpAttr {
+    struct { size_t kernel_h, kernel_w, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right; uint32_t ceil_mode; } maxpool2d;
     struct { float alpha; float beta; } matmul;
     struct { AionBinaryOp op; } elemwise;
     struct { AionUnaryOp op; } unary;

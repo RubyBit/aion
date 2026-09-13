@@ -31,6 +31,7 @@ from .layers import (
     Activation,
     Conv1D,
     Conv2D,
+    MaxPool2D,
     DepthwiseConv1D,
     Embedding,
     LayerNorm,
@@ -58,6 +59,7 @@ __all__ = [
     # convolution
     "Conv1D",
     "Conv2D",
+    "MaxPool2D",
     "DepthwiseConv1D",
     # recurrent
     "LSTMCell",

@@ -48,7 +48,7 @@ pub const Value = struct {
 };
 
 /// Stable op ids shared by graph ops and serialized package node ops.
-pub const OpTag = enum(u8) {
+pub const OpTag = enum(u16) {
     MatMul = 0,
     ElemwiseBinary = 1,
     Unary = 2,
@@ -125,6 +125,7 @@ pub const OpTag = enum(u8) {
     /// The `k` largest (or smallest) values along an axis, and where they came
     /// from. Two outputs: values, then i32 indices.
     TopK = 33,
+    MaxPool2D = 34,
 };
 
 /// Which keys a query may attend to, as one interval: `[anchor - left, anchor +
@@ -486,6 +487,7 @@ pub const Op = union(OpTag) {
     /// but lowering implements the LAST axis (transpose to reach another) — the
     /// same restriction `ArgMax` carries.
     TopK: struct { k: usize, axis: i32, largest: bool = true },
+    MaxPool2D: @import("window.zig").Pool2D,
 };
 
 pub const InputArity = union(enum) {
@@ -539,6 +541,7 @@ pub fn opInputArity(op: Op) InputArity {
         .ArgMax => .{ .exact = 1 },
         .ScatterRow => .{ .exact = 3 },
         .Gather => .{ .exact = 2 },
+        .MaxPool2D => .{ .exact = 1 },
         .Dim => .{ .exact = 1 },
         .Iota => .{ .exact = 1 },
         .TopK => .{ .exact = 1 },
@@ -554,7 +557,7 @@ pub fn opTag(op: Op) OpTag {
     return std.meta.activeTag(op);
 }
 
-pub fn opId(op: Op) u8 {
+pub fn opId(op: Op) u16 {
     return @backingInt(opTag(op));
 }
 
@@ -1162,6 +1165,10 @@ pub const Graph = struct {
 
     pub fn addCopy(self: *Self, a: ValueId) GraphError!ValueId {
         return self.addNodeInternal(.Copy, &[_]ValueId{a});
+    }
+
+    pub fn addMaxPool2D(self: *Self, x: ValueId, opts: @import("window.zig").Pool2D) GraphError!ValueId {
+        return self.addNodeInternal(.{ .MaxPool2D = opts }, &.{x});
     }
 
     pub fn addGather(self: *Self, data: ValueId, indices: ValueId, axis: i32, batch_dims: usize) GraphError!ValueId {

@@ -25,6 +25,14 @@ pub const DeviceError = error{ OutOfDeviceMemory, InvalidArgument, Unsupported }
 ///   directly via `importHost`; no copies, no dirty tracking.
 pub const MemoryModel = enum { discrete, unified };
 
+/// One device -> host transfer. A batch of these is the unit the backend gets to
+/// schedule: it decides how many device waits that costs, not the caller.
+pub const D2HRegion = struct {
+    dst: []u8,
+    handle: DeviceHandle,
+    src_offset: usize = 0,
+};
+
 pub const DeviceMemory = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -40,6 +48,10 @@ pub const DeviceMemory = struct {
         copyH2D: *const fn (ctx: *anyopaque, handle: DeviceHandle, dst_offset: usize, src: []const u8) DeviceError!void,
         /// Device -> host copy from `handle` at `src_offset` into `dst`.
         copyD2H: *const fn (ctx: *anyopaque, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void,
+        /// Device -> host copy of many regions. A backend that implements this
+        /// may coalesce the batch into fewer device waits than one call each;
+        /// null falls back to looping `copyD2H`, which is always correct.
+        copyD2HMany: ?*const fn (ctx: *anyopaque, regions: []const D2HRegion) DeviceError!void = null,
         /// Device -> device copy of `bytes` between two buffers of this device.
         /// Every target API has this (WebGPU `copyBufferToBuffer`, CUDA
         /// `cudaMemcpyDeviceToDevice`, Metal blit, `vkCmdCopyBuffer`), so
@@ -74,6 +86,13 @@ pub const DeviceMemory = struct {
     }
     pub fn copyD2H(self: DeviceMemory, dst: []u8, handle: DeviceHandle, src_offset: usize) DeviceError!void {
         return self.vtable.copyD2H(self.ctx, dst, handle, src_offset);
+    }
+    /// Read many regions at once. Prefer this over a `copyD2H` loop whenever the
+    /// destinations are known up front: waiting on the device is the expensive
+    /// part, and only the backend knows how few waits the batch really needs.
+    pub fn copyD2HMany(self: DeviceMemory, regions: []const D2HRegion) DeviceError!void {
+        if (self.vtable.copyD2HMany) |f| return f(self.ctx, regions);
+        for (regions) |r| try self.vtable.copyD2H(self.ctx, r.dst, r.handle, r.src_offset);
     }
     pub fn copyD2D(self: DeviceMemory, dst: DeviceHandle, dst_offset: usize, src: DeviceHandle, src_offset: usize, bytes: usize) DeviceError!void {
         return self.vtable.copyD2D(self.ctx, dst, dst_offset, src, src_offset, bytes);

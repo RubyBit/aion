@@ -60,6 +60,18 @@ uint32_t aion_version_patch(void);
 
 const char* aion_status_string(AionStatus status);
 
+// Borrowed diagnostic text is valid until the next operation on this context.
+// phase: 0=none, 1=validation, 2=lowering, 3=execution.
+typedef struct AionDiagnostic {
+    uint32_t phase;
+    uint32_t output_value;
+    const char* code;
+    size_t code_len;
+    const char* operation;
+    size_t operation_len;
+} AionDiagnostic;
+AionStatus aion_context_last_diagnostic(const AionContext* ctx, AionDiagnostic* out);
+
 AionStatus aion_context_last_error_message(
     const AionContext* ctx,
     char* buf,
@@ -229,6 +241,7 @@ typedef enum AionOp {
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
+    AION_OP_MAXPOOL2D = 31,
 } AionOp;
 
 typedef struct AionAttentionWindow {
@@ -238,6 +251,7 @@ typedef struct AionAttentionWindow {
 } AionAttentionWindow;
 
 typedef union AionOpAttr {
+    struct { size_t kernel_h, kernel_w, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right; uint32_t ceil_mode; } maxpool2d;
     struct { float alpha; float beta; } matmul;
     struct { AionBinaryOp op; } elemwise;
     struct { AionUnaryOp op; } unary;

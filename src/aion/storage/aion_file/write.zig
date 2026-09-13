@@ -189,8 +189,8 @@ fn appendNodeRecords(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node
         var attr: std.ArrayList(u8) = .empty;
         defer attr.deinit(allocator);
         const kind = try encodeNodeOp(&attr, allocator, node);
-        try appendInt(out, allocator, u8, @backingInt(kind));
-        try out.appendNTimes(allocator, 0, 3);
+        try appendInt(out, allocator, u16, @backingInt(kind));
+        try appendInt(out, allocator, u16, 0);
         try appendInt(out, allocator, u32, node.output);
         try appendInt(out, allocator, u32, @intCast(node.inputs.len));
         try appendInt(out, allocator, u32, @intCast(attr.items.len));
@@ -244,6 +244,19 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
             try appendSize(out, allocator, cv.pad_right);
             try appendInt(out, allocator, u8, @backingInt(cv.pad_mode));
             try appendSize(out, allocator, cv.groups);
+        },
+        .MaxPool2D => |opts| {
+            try appendInt(out, allocator, u64, @intCast(opts.kernel_h));
+            try appendInt(out, allocator, u64, @intCast(opts.kernel_w));
+            try appendInt(out, allocator, u64, @intCast(opts.stride_h));
+            try appendInt(out, allocator, u64, @intCast(opts.stride_w));
+            try appendInt(out, allocator, u64, @intCast(opts.dilation_h));
+            try appendInt(out, allocator, u64, @intCast(opts.dilation_w));
+            try appendInt(out, allocator, u64, @intCast(opts.pad_top));
+            try appendInt(out, allocator, u64, @intCast(opts.pad_bottom));
+            try appendInt(out, allocator, u64, @intCast(opts.pad_left));
+            try appendInt(out, allocator, u64, @intCast(opts.pad_right));
+            try appendInt(out, allocator, u8, @intFromBool(opts.ceil_mode));
         },
         .Conv2D => |cv| {
             try appendSize(out, allocator, cv.stride_h);

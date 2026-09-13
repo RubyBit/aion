@@ -154,7 +154,7 @@ def _flatten_for_dtype(
 
 
 def _infer_construct_dtype(data) -> AionDType:
-    """Default construction dtype: I32 for integer data, otherwise F32."""
+    """Preserve supported NumPy dtypes; default other numbers to I32/F32."""
     np = _try_numpy()
     if np is not None:
         try:
@@ -162,6 +162,10 @@ def _infer_construct_dtype(data) -> AionDType:
         except (TypeError, ValueError):
             pass
         else:
+            if isinstance(data, (np.ndarray, np.generic)) and array_dtype in (
+                np.dtype("float16"), np.dtype("float32"), np.dtype("int8"), np.dtype("int32")
+            ):
+                return normalize_dtype(array_dtype)
             if np.issubdtype(array_dtype, np.integer):
                 return AionDType.AION_DTYPE_I32
     if isinstance(data, int) and not isinstance(data, bool):

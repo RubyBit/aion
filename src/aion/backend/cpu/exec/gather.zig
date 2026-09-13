@@ -15,6 +15,16 @@ const DType = types.DType;
 const Q8_0_BLOCK_ELEMS: usize = 32;
 const Q8_0_BLOCK_BYTES: usize = 34;
 
+/// ONNX index rules: `[-len, len-1]` is valid and a negative index counts from
+/// the end; anything else is an error rather than a clamp.
+pub fn resolveIndex(raw: i32, len: usize) ?usize {
+    const l: i64 = @intCast(len);
+    var v: i64 = raw;
+    if (v < 0) v += l;
+    if (v < 0 or v >= l) return null;
+    return @intCast(v);
+}
+
 fn copyRowVectorized(dst: []u8, src: []const u8) void {
     std.debug.assert(dst.len == src.len);
 
@@ -212,10 +222,8 @@ pub fn execGatherRowsTiled(
                         const l: usize = base_l + ll;
                         if (l >= self.l_total) return BackendError.InvalidArgument;
 
-                        const idx_i32: i32 = self.idx_vals[b * self.l_total + l];
-                        if (idx_i32 < 0) return BackendError.InvalidArgument;
-                        const row: usize = @intCast(idx_i32);
-                        if (row >= self.v_total) return BackendError.InvalidArgument;
+                        const row = resolveIndex(self.idx_vals[b * self.l_total + l], self.v_total) orelse
+                            return BackendError.InvalidArgument;
 
                         // Prefetch the next row's tile while copying the current row.
                         // This helps hide cache / storage latency for random-token gathers.
@@ -423,10 +431,7 @@ pub fn execGatherTiled(
             for (0..tl) |ll| {
                 const l = base_l + ll;
                 if (b >= batch or l >= picks) return BackendError.InvalidArgument;
-                const raw = idx_vals[b * picks + l];
-                if (raw < 0) return BackendError.InvalidArgument;
-                const row: usize = @intCast(raw);
-                if (row >= seq) return BackendError.InvalidArgument;
+                const row = resolveIndex(idx_vals[b * picks + l], seq) orelse return BackendError.InvalidArgument;
 
                 const data_linear =
                     (b / data_meta.tile_shape[0]) * data_meta.tile_counts[1] +
@@ -447,6 +452,82 @@ pub fn execGatherTiled(
                     data_view.bytes[src_off .. src_off + row_bytes],
                 );
             }
+        }
+    }
+}
+
+fn tileCount(meta: tensor_store.TensorMeta) usize {
+    var n: usize = 1;
+    for (meta.tile_counts[0..meta.rank]) |c| n *= c;
+    return n;
+}
+
+/// General gather for single-tile operands: every axis/batch_dims/rank the
+/// specialized row and batched-row steps do not take.
+///
+/// Flattening `data` around `axis` makes the whole family one loop: `lead` walks
+/// `data[:axis]`, `pick` walks the index tail, and each pair copies `inner`
+/// contiguous elements. Indices repeat across the axes between `batch_dims` and
+/// `axis`, which is what `lead / mid` recovers.
+pub fn execGatherND(
+    s: executable.StepGatherND,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    const out_meta = try store.meta(s.out);
+    const data_meta = try store.meta(s.data);
+    const idx_meta = try store.meta(s.indices);
+    if (idx_meta.dtype != .i32 or out_meta.dtype != data_meta.dtype) return BackendError.InvalidArgument;
+    const elem: usize = switch (out_meta.dtype) {
+        .f16 => 2,
+        .f32 => 4,
+        else => return BackendError.InvalidArgument,
+    };
+
+    const axis: usize = s.axis;
+    const bd: usize = s.batch_dims;
+    const dr: usize = data_meta.rank;
+    const ir: usize = idx_meta.rank;
+    if (axis >= dr or bd > axis or bd > ir) return BackendError.InvalidArgument;
+    if (tileCount(out_meta) != 1 or tileCount(data_meta) != 1 or tileCount(idx_meta) != 1) return BackendError.Unsupported;
+
+    var batch: usize = 1;
+    for (data_meta.shape[0..bd]) |d| batch *= d;
+    var lead_total: usize = 1;
+    for (data_meta.shape[0..axis]) |d| lead_total *= d;
+    var inner: usize = 1;
+    for (data_meta.shape[axis + 1 .. dr]) |d| inner *= d;
+    var picked: usize = 1;
+    for (idx_meta.shape[bd..ir]) |d| picked *= d;
+    const axis_len: usize = data_meta.shape[axis];
+    if (batch == 0 or lead_total == 0 or axis_len == 0) return BackendError.InvalidArgument;
+    const mid: usize = lead_total / batch;
+
+    const idx_tile = try store.acquireTileConstLinear(s.indices, 0);
+    defer store.releaseConst(idx_tile.token);
+    const idx_bytes = idx_tile.bufferView().bytes;
+    const idx_ptr: [*]align(1) const i32 = @ptrCast(idx_bytes.ptr);
+    const idx_vals = idx_ptr[0 .. idx_bytes.len / @sizeOf(i32)];
+    if (idx_vals.len < batch * picked) return BackendError.InvalidArgument;
+
+    const data_tile = try store.acquireTileConstLinear(s.data, 0);
+    defer store.releaseConst(data_tile.token);
+    const src_bytes = data_tile.bufferView().bytes;
+    const out_tile = try store.acquireTileMutLinear(s.out, 0);
+    defer store.releaseMut(out_tile.token);
+    const dst_bytes = out_tile.bufferView().bytes;
+
+    const run: usize = inner * elem;
+    if (src_bytes.len < lead_total * axis_len * run or dst_bytes.len < lead_total * picked * run) {
+        return BackendError.InvalidArgument;
+    }
+
+    for (0..lead_total) |lead| {
+        const b = lead / mid;
+        for (0..picked) |pick| {
+            const row = resolveIndex(idx_vals[b * picked + pick], axis_len) orelse return BackendError.InvalidArgument;
+            const src = ((lead * axis_len) + row) * run;
+            const dst = ((lead * picked) + pick) * run;
+            @memcpy(dst_bytes[dst..][0..run], src_bytes[src..][0..run]);
         }
     }
 }

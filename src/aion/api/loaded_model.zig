@@ -484,6 +484,7 @@ pub const Model = struct {
     }
 
     pub fn run(self: *Self) api_errors.ExecuteError!void {
+        @import("../diagnostic.zig").current().clear();
         const trace: bool = self.trace_runs;
         if (trace) std.debug.print("[aion][run] begin\n", .{});
 

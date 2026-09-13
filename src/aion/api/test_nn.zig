@@ -1282,3 +1282,59 @@ test "api.nn: sinusoidal relative-position table is centered and normalized" {
     // An odd feature width has no sin/cos pairing.
     try std.testing.expectError(error.InvalidArgument, nn.sinusoidalRelPos(&fx.ctx, allocator, 2, 3));
 }
+
+test "api.nn: MaxPool2D includes the partial final window in ceil mode" {
+    const allocator = std.testing.allocator;
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+    const values = [_]f32{ -1, -2, -3, -4, -5, -6, -7, -8, -9 };
+    const x = try fx.bld.param(try fx.ctx.fromF32(&.{ 1, 3, 3, 1 }, &values));
+    const pool = nn.MaxPool2D{ .opts = .{ .kernel_h = 2, .kernel_w = 2, .stride_h = 2, .stride_w = 2, .ceil_mode = true } };
+    const y = try pool.forward(&fx.bld, x);
+    var got: [4]f32 = undefined;
+    try runOnce(fx, y, &got);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -3, -7, -9 }, &got);
+}
+
+test "api.nn: pooling format roundtrip and strict u16 node headers" {
+    const package = @import("../storage/aion_file.zig");
+    const allocator = std.testing.allocator;
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+    const x = try fx.bld.name(try fx.bld.input(.f32, &.{ 1, 5, 7, 2 }), "x");
+    const pool = nn.MaxPool2D{ .opts = .{ .kernel_h = 2, .kernel_w = 3, .stride_h = 2, .stride_w = 2, .dilation_h = 2, .pad_top = 1, .pad_bottom = 1, .pad_left = 1, .pad_right = 1, .ceil_mode = true } };
+    const y = try pool.forward(&fx.bld, x);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "pool.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try fx.ctx.exportModel(file, &fx.bld, &.{.{ .name = "y", .tensor = y }}, .{});
+    const bytes = try package.readAlloc(allocator, file);
+    defer allocator.free(bytes);
+    var parsed = try package.parse(allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(pool.opts, parsed.nodes[0].op.MaxPool2D);
+    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, bytes[4..8], .little));
+    for ([_]u32{ 13, 15 }) |version| {
+        std.mem.writeInt(u32, bytes[4..8], version, .little);
+        try std.testing.expectError(error.UnsupportedVersion, package.parse(allocator, bytes));
+    }
+    std.mem.writeInt(u32, bytes[4..8], 14, .little);
+    const sections = std.mem.readInt(u32, bytes[8..12], .little);
+    const directory: usize = @intCast(std.mem.readInt(u64, bytes[16..24], .little));
+    var node_offset: ?usize = null;
+    for (0..sections) |i| {
+        const d = directory + i * 24;
+        if (std.mem.readInt(u32, bytes[d..][0..4], .little) == 4) {
+            node_offset = @intCast(std.mem.readInt(u64, bytes[d + 8 ..][0..8], .little));
+        }
+    }
+    const header = (node_offset orelse return error.TestUnexpectedResult) + 4;
+    const tag = std.mem.readInt(u16, bytes[header..][0..2], .little);
+    // Preserve the low byte: a reader accidentally using u8 would accept this.
+    std.mem.writeInt(u16, bytes[header..][0..2], tag | 0x100, .little);
+    try std.testing.expectError(error.InvalidFormat, package.parse(allocator, bytes));
+    std.mem.writeInt(u16, bytes[header..][0..2], tag, .little);
+    bytes[header + 2] = 1;
+    try std.testing.expectError(error.InvalidFormat, package.parse(allocator, bytes));
+}

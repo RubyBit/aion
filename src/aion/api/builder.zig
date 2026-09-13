@@ -118,10 +118,11 @@ pub const Builder = struct {
     /// passed to `compile`/`export`.
     pub fn init(ctx: *Context) Self {
         const allocator: std.mem.Allocator = ctx.allocator;
+        const graph = graph_mod.Graph.init(allocator);
         return .{
             .allocator = allocator,
             .ctx = ctx,
-            .graph = graph_mod.Graph.init(allocator),
+            .graph = graph,
             .value_names = .empty,
             .scope_path = .empty,
             .scope_counters = .empty,
@@ -809,6 +810,12 @@ pub const Builder = struct {
     /// `data` and `indices`. This subsumes embedding lookup
     /// (`axis=0,batch_dims=0`) and per-batch row selection
     /// (`axis=1,batch_dims=1`).
+    pub fn maxPool2D(self: *Self, x: TensorRef, opts: @import("../graph/window.zig").Pool2D) Error!TensorRef {
+        const out = try self.graph.addMaxPool2D(x.value, opts);
+        try self.autoNameIfUnnamed(out, "max_pool2d");
+        return .{ .value = out };
+    }
+
     pub fn gather(self: *Self, data: TensorRef, indices: TensorRef, axis: i32, batch_dims: usize) Error!TensorRef {
         const out: ValueId = try self.graph.addGather(data.value, indices.value, axis, batch_dims);
         try self.autoNameIfUnnamed(out, "gather");
@@ -1260,6 +1267,7 @@ pub const Builder = struct {
     }
 
     fn autoNameIfUnnamed(self: *Self, vid: ValueId, tag: []const u8) Error!void {
+        @import("../diagnostic.zig").current().clear();
         // Eager per-op inference: infer the node just added (it produced `vid`).
         // Every op funnels through here exactly once after appending its node, so
         // this keeps the whole graph inferred as it is built — `knownShape` is

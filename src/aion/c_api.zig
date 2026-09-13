@@ -6,6 +6,12 @@ const graph_mod = @import("graph/graph.zig");
 const types = @import("backend/types.zig");
 const pkg_types = @import("storage/aion_file/types.zig");
 
+/// Every allocation behind the C ABI. `page_allocator` syscalls on each alloc
+/// and free, which dominated per-inference time; `smp_allocator` is the
+/// process-wide, thread-safe allocator built for this.
+const library_allocator: std.mem.Allocator = std.heap.smp_allocator;
+const diagnostic = @import("diagnostic.zig");
+
 pub const AionStatus = enum(c_int) {
     AION_OK = 0,
     AION_INVALID_ARGUMENT = 1,
@@ -51,11 +57,8 @@ pub const AionGpuOptions = extern struct {
 };
 
 pub const AionContext = struct {
-    allocator: std.mem.Allocator = std.heap.page_allocator,
+    allocator: std.mem.Allocator = library_allocator,
     ctx: api.Context = undefined,
-
-    last_err_buf: [512]u8 = @splat(0),
-    last_err_len: usize = 0,
 
     fn init(thread_count: usize, gpus: []const api.GpuOptions) !AionContext {
         var out: AionContext = .{};
@@ -69,26 +72,29 @@ pub const AionContext = struct {
         self.* = undefined;
     }
 
-    fn clearLastError(self: *AionContext) void {
-        self.last_err_len = 0;
-        self.last_err_buf[0] = 0;
+    fn clearLastError(_: *AionContext) void {
+        diagnostic.current().clear();
+        last_err_len = 0;
+        last_err_buf[0] = 0;
     }
 
-    fn setLastError(self: *AionContext, comptime prefix: []const u8, err: anyerror) void {
-        // Best-effort: format "<prefix>: <error>" into a fixed buffer.
-        const msg = std.fmt.bufPrint(self.last_err_buf[0..], "{s}: {s}", .{ prefix, @errorName(err) }) catch blk: {
-            // Fallback: just prefix.
-            const m2 = std.fmt.bufPrint(self.last_err_buf[0..], "{s}", .{prefix}) catch {
-                self.last_err_buf[0] = 0;
-                self.last_err_len = 0;
-                return;
-            };
-            break :blk m2;
-        };
-        self.last_err_len = msg.len;
-        if (self.last_err_len < self.last_err_buf.len) self.last_err_buf[self.last_err_len] = 0;
+    /// Always names the entry point that failed: a diagnostic says what went
+    /// wrong, `prefix` says which call asked. Truncation is not an error here.
+    fn setLastError(_: *AionContext, comptime prefix: []const u8, err: anyerror) void {
+        const d = diagnostic.current();
+        const msg = if (d.phase != .none)
+            std.fmt.bufPrint(&last_err_buf, "{s}: {s}", .{ prefix, d.message() }) catch &last_err_buf
+        else
+            std.fmt.bufPrint(&last_err_buf, "{s}: {s}", .{ prefix, @errorName(err) }) catch &last_err_buf;
+        last_err_len = msg.len;
+        if (last_err_len < last_err_buf.len) last_err_buf[last_err_len] = 0;
     }
 };
+
+/// Paired with the per-thread diagnostic: the message describes the failure the
+/// calling thread just saw, so it must not be shared across contexts or threads.
+threadlocal var last_err_buf: [1024]u8 = @splat(0);
+threadlocal var last_err_len: usize = 0;
 
 pub const AionTensor = struct {
     owner: *AionContext,
@@ -102,7 +108,7 @@ pub const AionLoadedModel = struct {
 
 fn mapError(err: anyerror) AionStatus {
     return switch (err) {
-        error.InvalidArgument => .AION_INVALID_ARGUMENT,
+        error.InvalidArgument, error.InvalidGraph, error.RankMismatch, error.ShapeMismatch, error.DTypeMismatch, error.EmptyDimension, error.InvalidKernel, error.InvalidStride, error.InvalidDilation, error.InvalidPadding, error.ShapeOverflow, error.EmptyOutput => .AION_INVALID_ARGUMENT,
         error.OutOfMemory => .AION_OUT_OF_MEMORY,
         error.Unsupported => .AION_UNSUPPORTED,
         error.UnsupportedVersion => .AION_UNSUPPORTED,
@@ -208,14 +214,31 @@ pub export fn aion_status_string(status: AionStatus) callconv(.c) [*c]const u8 {
     };
 }
 
+pub const AionDiagnostic = extern struct {
+    phase: u32,
+    output_value: u32,
+    code: [*c]const u8,
+    code_len: usize,
+    operation: [*c]const u8,
+    operation_len: usize,
+};
+
+pub export fn aion_context_last_diagnostic(ctx_opt: ?*const AionContext, out_opt: ?*AionDiagnostic) callconv(.c) AionStatus {
+    _ = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    const out = out_opt orelse return .AION_INVALID_ARGUMENT;
+    const d = diagnostic.current();
+    out.* = .{ .phase = @backingInt(d.phase), .output_value = d.output, .code = d.code.ptr, .code_len = d.code.len, .operation = d.operation.ptr, .operation_len = d.operation.len };
+    return .AION_OK;
+}
+
 pub export fn aion_context_last_error_message(
     ctx_opt: ?*const AionContext,
     buf: [*c]u8,
     cap: usize,
     out_len: ?*usize,
 ) callconv(.c) AionStatus {
-    const ctx: *const AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
-    copyStringToBuf(ctx.last_err_buf[0..ctx.last_err_len], buf, cap, out_len);
+    _ = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    copyStringToBuf(last_err_buf[0..last_err_len], buf, cap, out_len);
     return .AION_OK;
 }
 
@@ -224,8 +247,8 @@ pub export fn aion_context_create_cpu(thread_count: usize, out_ctx: ?*?*AionCont
     out_ctx.?.* = null;
     if (thread_count == 0) return .AION_INVALID_ARGUMENT;
 
-    const ctx_ptr: *AionContext = std.heap.page_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
-    errdefer std.heap.page_allocator.destroy(ctx_ptr);
+    const ctx_ptr: *AionContext = library_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
+    errdefer library_allocator.destroy(ctx_ptr);
 
     ctx_ptr.* = AionContext.init(thread_count, &.{}) catch |e| {
         const st = mapError(e);
@@ -259,8 +282,8 @@ pub export fn aion_context_create(
     }
     const gpus: []const api.GpuOptions = gpu_buf[0..gpu_count];
 
-    const ctx_ptr: *AionContext = std.heap.page_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
-    errdefer std.heap.page_allocator.destroy(ctx_ptr);
+    const ctx_ptr: *AionContext = library_allocator.create(AionContext) catch return .AION_OUT_OF_MEMORY;
+    errdefer library_allocator.destroy(ctx_ptr);
 
     ctx_ptr.* = AionContext.init(thread_count, gpus) catch |e| {
         // No context to store the error yet.
@@ -274,7 +297,7 @@ pub export fn aion_context_create(
 pub export fn aion_context_destroy(ctx_opt: ?*AionContext) callconv(.c) void {
     const ctx: *AionContext = ctx_opt orelse return;
     ctx.deinit();
-    std.heap.page_allocator.destroy(ctx);
+    library_allocator.destroy(ctx);
 }
 
 pub export fn aion_tensor_create_empty(
@@ -298,7 +321,7 @@ pub export fn aion_tensor_create_empty(
         return mapError(e);
     };
 
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -330,7 +353,7 @@ pub export fn aion_tensor_create_empty_tiled(
         return mapError(e);
     };
 
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -388,7 +411,7 @@ pub export fn aion_tensor_create(
         };
     };
 
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -400,7 +423,7 @@ pub export fn aion_tensor_create(
 pub export fn aion_tensor_destroy(t_opt: ?*AionTensor) callconv(.c) void {
     const t: *AionTensor = t_opt orelse return;
     // Underlying tensor storage is owned by the context; this only frees the handle.
-    std.heap.page_allocator.destroy(t);
+    library_allocator.destroy(t);
 }
 
 /// Migrate a tensor to `(kind, index)`.
@@ -597,7 +620,7 @@ fn loadModelImpl(
         return mapError(e);
     };
 
-    const handle: *AionLoadedModel = std.heap.page_allocator.create(AionLoadedModel) catch {
+    const handle: *AionLoadedModel = library_allocator.create(AionLoadedModel) catch {
         ctx.setLastError("loaded_model_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -674,7 +697,7 @@ pub export fn aion_loaded_model_load_path_absolute(
 pub export fn aion_loaded_model_destroy(m_opt: ?*AionLoadedModel) callconv(.c) void {
     const m: *AionLoadedModel = m_opt orelse return;
     m.model.deinit();
-    std.heap.page_allocator.destroy(m);
+    library_allocator.destroy(m);
 }
 
 pub export fn aion_loaded_model_input_count(m_opt: ?*const AionLoadedModel) callconv(.c) usize {
@@ -883,7 +906,7 @@ pub export fn aion_loaded_model_output_tensor(
         return mapError(e);
     };
 
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -985,6 +1008,7 @@ pub const AionOp = enum(c_int) {
     AION_OP_GATHER = 28,
     AION_OP_DIM = 29,
     AION_OP_IOTA = 30,
+    AION_OP_MAXPOOL2D = 31,
 };
 
 /// Keys a query may attend to; `AION_ATTENTION_UNBOUNDED` on a side means no limit.
@@ -1024,6 +1048,7 @@ pub const AionOpAttr = extern union {
         groups: usize,
         pad_mode: AionPadMode,
     },
+    maxpool2d: extern struct { kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, dilation_h: usize, dilation_w: usize, pad_top: usize, pad_bottom: usize, pad_left: usize, pad_right: usize, ceil_mode: u32 },
     conv2d: extern struct {
         stride_h: usize,
         stride_w: usize,
@@ -1150,7 +1175,7 @@ pub export fn aion_builder_create(ctx_opt: ?*AionContext, out_builder: ?*?*AionB
     if (out_builder == null) return .AION_INVALID_ARGUMENT;
     out_builder.?.* = null;
 
-    const b: *AionBuilder = std.heap.page_allocator.create(AionBuilder) catch {
+    const b: *AionBuilder = library_allocator.create(AionBuilder) catch {
         ctx.setLastError("builder_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -1172,7 +1197,7 @@ pub export fn aion_builder_destroy(b_opt: ?*AionBuilder) callconv(.c) void {
     b.metadata.deinit(a);
     b.str_arena.deinit();
     b.builder.deinit();
-    std.heap.page_allocator.destroy(b);
+    library_allocator.destroy(b);
 }
 
 pub export fn aion_builder_input(
@@ -1577,6 +1602,12 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
                 spec.attr.conv1d.groups,
             );
         },
+        .AION_OP_MAXPOOL2D => blk: {
+            try need(n, 1, spec.inputs);
+            const p = spec.attr.maxpool2d;
+            if (p.ceil_mode > 1) return error.InvalidArgument;
+            break :blk try bld.maxPool2D(in(spec, 0), .{ .kernel_h = p.kernel_h, .kernel_w = p.kernel_w, .stride_h = p.stride_h, .stride_w = p.stride_w, .dilation_h = p.dilation_h, .dilation_w = p.dilation_w, .pad_top = p.pad_top, .pad_bottom = p.pad_bottom, .pad_left = p.pad_left, .pad_right = p.pad_right, .ceil_mode = p.ceil_mode != 0 });
+        },
         .AION_OP_CONV2D => blk: {
             try need(n, 2, spec.inputs);
             const bias: ?api.TensorRef = if (n >= 3) in(spec, 2) else null;
@@ -1973,7 +2004,7 @@ pub export fn aion_builder_compile(
         return mapError(e);
     };
 
-    const handle: *AionLoadedModel = std.heap.page_allocator.create(AionLoadedModel) catch {
+    const handle: *AionLoadedModel = library_allocator.create(AionLoadedModel) catch {
         ctx.setLastError("loaded_model_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -2039,7 +2070,7 @@ pub export fn aion_tensor_quantize(
         ctx.setLastError("tensor_quantize", e);
         return mapError(e);
     };
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
@@ -2074,7 +2105,7 @@ pub export fn aion_tensor_create_quant(
         ctx.setLastError("tensor_create_quant", e);
         return mapError(e);
     };
-    const handle: *AionTensor = std.heap.page_allocator.create(AionTensor) catch {
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };

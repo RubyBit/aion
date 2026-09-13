@@ -37,6 +37,18 @@ fn bytesAsF32Mut(bytes: []u8) []align(1) f32 {
     return ptr[0 .. bytes.len / @sizeOf(f32)];
 }
 
+/// One im2col run is `c_in` wide — often a single channel, where the call into
+/// `memcpy` costs more than the move itself. Inline the short runs.
+inline fn packRun(dst: []f32, src: anytype) void {
+    if (dst.len > 16) return @memcpy(dst, src[0..dst.len]);
+    for (dst, src[0..dst.len]) |*d, s| d.* = s;
+}
+
+inline fn packZero(dst: []f32) void {
+    if (dst.len > 16) return @memset(dst, 0.0);
+    for (dst) |*d| d.* = 0.0;
+}
+
 inline fn reflectIndex1D(idx_nom: isize, len: usize) usize {
     const l: isize = @intCast(len);
     var x: isize = idx_nom;
@@ -670,6 +682,125 @@ fn tryExecConv2DImplicitGemmTileNative(
                 const xt0: XTile = if (single_x_tile) t.x_tiles[(t.b * t.x_htc) * t.x_wtc] else undefined;
                 const single_full_x_tile: bool = single_x_tile and (xt0.h_mem == t.h_in) and (xt0.w_mem == t.w_in) and (xt0.c_mem == t.c_in);
 
+                // Packs one GEMM row of the im2col operand, shared by the full-KC
+                // blocks and the K tail. Reduction indices run (kh, kw, ic).
+                const pack = struct {
+                    t: @TypeOf(t),
+                    xt0: XTile,
+                    single_full: bool,
+                    use_reflect: bool,
+                    h_in_i: isize,
+                    w_in_i: isize,
+                    wide: bool,
+
+                    fn row(p: @This(), row_pa: []f32, kk0: usize, k_sub: usize, oh0: isize, ow0: isize, all_valid: bool) void {
+                        const task = p.t;
+                        var rem_k: usize = k_sub;
+                        var a_off: usize = 0;
+                        const pos: usize = kk0 / task.c_in;
+                        var ic: usize = kk0 - pos * task.c_in;
+                        var kh: usize = pos / task.k_w;
+                        var kw: usize = pos - kh * task.k_w;
+                        if (p.wide) return p.rowWide(row_pa, k_sub, oh0, ow0, kh, kw, ic);
+                        while (rem_k != 0) {
+                            const span: usize = task.c_in - ic;
+                            const take: usize = @min(rem_k, span);
+                            const ih: isize = oh0 + @as(isize, @intCast(kh * task.s.dilation_h));
+                            const iw: isize = ow0 + @as(isize, @intCast(kw * task.s.dilation_w));
+                            const dst: []f32 = row_pa[a_off .. a_off + take];
+
+                            if (all_valid and p.single_full) {
+                                const src0: usize = (@as(usize, @intCast(ih)) * p.xt0.row_stride) + (@as(usize, @intCast(iw)) * p.xt0.c_mem) + ic;
+                                packRun(dst, p.xt0.vals[src0 .. src0 + take]);
+                            } else if (all_valid or p.use_reflect) {
+                                const ih_u: usize = if (all_valid) @intCast(ih) else @intCast(reflectIndex(ih, p.h_in_i));
+                                const iw_u: usize = if (all_valid) @intCast(iw) else @intCast(reflectIndex(iw, p.w_in_i));
+                                p.copyTiled(dst, ih_u, iw_u, ic, take);
+                            } else if (ih >= 0 and iw >= 0 and ih < p.h_in_i and iw < p.w_in_i) {
+                                p.copyTiled(dst, @intCast(ih), @intCast(iw), ic, take);
+                            } else {
+                                packZero(dst);
+                            }
+
+                            a_off += take;
+                            rem_k -= take;
+                            ic += take;
+                            while (ic >= task.c_in) {
+                                ic -= task.c_in;
+                                kw += 1;
+                                if (kw == task.k_w) {
+                                    kw = 0;
+                                    kh += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    /// Zero padding splits a kernel row into at most three runs: leading
+                    /// pad, one contiguous copy, trailing pad. Interior rows are one run.
+                    fn rowWide(p: @This(), row_pa: []f32, k_sub: usize, oh0: isize, ow0: isize, kh_in: usize, kw_in: usize, ic_in: usize) void {
+                        const task = p.t;
+                        const taps: usize = task.k_w;
+                        const chans: usize = task.c_in;
+                        const lo: usize = if (ow0 < 0) @min(taps, @as(usize, @intCast(-ow0))) else 0;
+                        const hi: usize = if (ow0 >= p.w_in_i) 0 else @min(taps, @as(usize, @intCast(p.w_in_i - ow0)));
+                        var kh: usize = kh_in;
+                        var kw: usize = kw_in;
+                        var ic: usize = ic_in;
+                        var rem_k: usize = k_sub;
+                        var a_off: usize = 0;
+                        while (rem_k != 0) {
+                            const ih: isize = oh0 + @as(isize, @intCast(kh * task.s.dilation_h));
+                            const in_row: bool = ih >= 0 and ih < p.h_in_i;
+                            const copy: bool = in_row and kw >= lo and kw < hi;
+                            const bound: usize = if (!in_row) taps else if (kw < lo) lo else if (kw < hi) hi else taps;
+                            const take: usize = @min(rem_k, (bound - kw) * chans - ic);
+                            const dst: []f32 = row_pa[a_off .. a_off + take];
+                            if (copy) {
+                                const iw: usize = @intCast(ow0 + @as(isize, @intCast(kw)));
+                                const src0: usize = (@as(usize, @intCast(ih)) * p.xt0.row_stride) + (iw * p.xt0.c_mem) + ic;
+                                packRun(dst, p.xt0.vals[src0 .. src0 + take]);
+                            } else {
+                                packZero(dst);
+                            }
+                            a_off += take;
+                            rem_k -= take;
+                            ic += take;
+                            while (ic >= chans) {
+                                ic -= chans;
+                                kw += 1;
+                                if (kw == taps) {
+                                    kw = 0;
+                                    kh += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    /// Copy `take` channels at an in-range input coordinate, zeroing
+                    /// if the owning tile does not physically hold them.
+                    fn copyTiled(p: @This(), dst: []f32, ih_u: usize, iw_u: usize, ic: usize, take: usize) void {
+                        const task = p.t;
+                        const xhti: usize = ih_u / task.x_th;
+                        const xwti: usize = iw_u / task.x_tw;
+                        if (xhti >= task.x_htc or xwti >= task.x_wtc) return packZero(dst);
+                        const xt: XTile = task.x_tiles[(task.b * task.x_htc + xhti) * task.x_wtc + xwti];
+                        const ih_l: usize = ih_u - xhti * task.x_th;
+                        const iw_l: usize = iw_u - xwti * task.x_tw;
+                        if (ih_l >= xt.h_mem or iw_l >= xt.w_mem or (ic + take) > xt.c_mem) return packZero(dst);
+                        const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
+                        packRun(dst, xt.vals[src0 .. src0 + take]);
+                    }
+                }{
+                    .t = t,
+                    .xt0 = xt0,
+                    .single_full = single_full_x_tile,
+                    .use_reflect = use_reflect,
+                    .h_in_i = h_in_i,
+                    .w_in_i = w_in_i,
+                    .wide = single_full_x_tile and t.s.dilation_w == 1 and t.s.pad_mode != .reflect,
+                };
+
                 const out: []align(1) f32 = t.out_tile;
                 var row0: usize = start;
                 while (row0 < end) {
@@ -728,91 +859,9 @@ fn tryExecConv2DImplicitGemmTileNative(
 
                                     const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
-                                    var rem_k: usize = k_sub;
-                                    var a_off: usize = 0;
-                                    // Avoid div/mod in the hot packing loop by iterating (kh,kw,ic)
-                                    // with carries. This is a big win when KC is small-ish relative to C.
-                                    const pos: usize = kk0 / t.c_in;
-                                    var ic: usize = kk0 - pos * t.c_in;
-                                    var kh: usize = pos / t.k_w;
-                                    var kw: usize = pos - kh * t.k_w;
-                                    while (rem_k != 0) {
-                                        const take: usize = @min(rem_k, t.c_in - ic);
-                                        const ih: isize = oh0 + @as(isize, @intCast(kh * t.s.dilation_h));
-                                        const iw: isize = ow0 + @as(isize, @intCast(kw * t.s.dilation_w));
-                                        const dst: []f32 = row_pa[a_off .. a_off + take];
-
-                                        if (all_valid) {
-                                            // Interior: in-range by construction. Keep this path as branch-light
-                                            // as possible.
-                                            if (single_full_x_tile) {
-                                                const ih_u: usize = @intCast(ih);
-                                                const iw_u: usize = @intCast(iw);
-                                                const src0: usize = (ih_u * xt0.row_stride) + (iw_u * xt0.c_mem) + ic;
-                                                @memcpy(dst, xt0.vals[src0 .. src0 + take]);
-                                            } else {
-                                                const ih_u: usize = @intCast(ih);
-                                                const iw_u: usize = @intCast(iw);
-                                                const xhti: usize = ih_u / t.x_th;
-                                                const xwti: usize = iw_u / t.x_tw;
-                                                const ih_l: usize = ih_u - xhti * t.x_th;
-                                                const iw_l: usize = iw_u - xwti * t.x_tw;
-                                                const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                                const xt: XTile = t.x_tiles[xti];
-                                                const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                                @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                            }
-                                        } else {
-                                            // Edge / padding.
-                                            if (use_reflect) {
-                                                const ih_r: usize = @intCast(reflectIndex(ih, h_in_i));
-                                                const iw_r: usize = @intCast(reflectIndex(iw, w_in_i));
-                                                const xhti: usize = ih_r / t.x_th;
-                                                const xwti: usize = iw_r / t.x_tw;
-                                                const ih_l: usize = ih_r - xhti * t.x_th;
-                                                const iw_l: usize = iw_r - xwti * t.x_tw;
-                                                const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                                const xt: XTile = t.x_tiles[xti];
-                                                const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                                @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                            } else {
-                                                if (ih >= 0 and iw >= 0 and ih < h_in_i and iw < w_in_i) {
-                                                    const ih_u: usize = @intCast(ih);
-                                                    const iw_u: usize = @intCast(iw);
-                                                    const xhti: usize = ih_u / t.x_th;
-                                                    const xwti: usize = iw_u / t.x_tw;
-                                                    if (xhti < t.x_htc and xwti < t.x_wtc) {
-                                                        const ih_l: usize = ih_u - xhti * t.x_th;
-                                                        const iw_l: usize = iw_u - xwti * t.x_tw;
-                                                        const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                                        const xt: XTile = t.x_tiles[xti];
-                                                        if (ih_l < xt.h_mem and iw_l < xt.w_mem and (ic + take) <= xt.c_mem) {
-                                                            const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                                        } else {
-                                                            @memset(dst, 0.0);
-                                                        }
-                                                    } else {
-                                                        @memset(dst, 0.0);
-                                                    }
-                                                } else {
-                                                    @memset(dst, 0.0);
-                                                }
-                                            }
-                                        }
-
-                                        a_off += take;
-                                        rem_k -= take;
-                                        ic += take;
-                                        if (ic == t.c_in) {
-                                            ic = 0;
-                                            kw += 1;
-                                            if (kw == t.k_w) {
-                                                kw = 0;
-                                                kh += 1;
-                                            }
-                                        }
-                                    }
+                                    // One kernel row is one copy when w is unstrided and channels are
+                                    // contiguous; carries then replace div/mod in the reduction walk.
+                                    pack.row(row_pa, kk0, k_sub, oh0, ow0, all_valid);
                                 }
                             }
 
@@ -845,86 +894,9 @@ fn tryExecConv2DImplicitGemmTileNative(
 
                                 const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
-                                var rem_k: usize = k_sub;
-                                var a_off: usize = 0;
-                                const pos: usize = kk0 / t.c_in;
-                                var ic: usize = kk0 - pos * t.c_in;
-                                var kh: usize = pos / t.k_w;
-                                var kw: usize = pos - kh * t.k_w;
-                                while (rem_k != 0) {
-                                    const take: usize = @min(rem_k, t.c_in - ic);
-                                    const ih: isize = oh0 + @as(isize, @intCast(kh * t.s.dilation_h));
-                                    const iw: isize = ow0 + @as(isize, @intCast(kw * t.s.dilation_w));
-                                    const dst: []f32 = row_pa[a_off .. a_off + take];
-
-                                    if (all_valid) {
-                                        if (single_full_x_tile) {
-                                            const ih_u: usize = @intCast(ih);
-                                            const iw_u: usize = @intCast(iw);
-                                            const src0: usize = (ih_u * xt0.row_stride) + (iw_u * xt0.c_mem) + ic;
-                                            @memcpy(dst, xt0.vals[src0 .. src0 + take]);
-                                        } else {
-                                            const ih_u: usize = @intCast(ih);
-                                            const iw_u: usize = @intCast(iw);
-                                            const xhti: usize = ih_u / t.x_th;
-                                            const xwti: usize = iw_u / t.x_tw;
-                                            const ih_l: usize = ih_u - xhti * t.x_th;
-                                            const iw_l: usize = iw_u - xwti * t.x_tw;
-                                            const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                            const xt: XTile = t.x_tiles[xti];
-                                            const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                        }
-                                    } else {
-                                        if (use_reflect) {
-                                            const ih_r: usize = @intCast(reflectIndex(ih, h_in_i));
-                                            const iw_r: usize = @intCast(reflectIndex(iw, w_in_i));
-                                            const xhti: usize = ih_r / t.x_th;
-                                            const xwti: usize = iw_r / t.x_tw;
-                                            const ih_l: usize = ih_r - xhti * t.x_th;
-                                            const iw_l: usize = iw_r - xwti * t.x_tw;
-                                            const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                            const xt: XTile = t.x_tiles[xti];
-                                            const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                        } else {
-                                            if (ih >= 0 and iw >= 0 and ih < h_in_i and iw < w_in_i) {
-                                                const ih_u: usize = @intCast(ih);
-                                                const iw_u: usize = @intCast(iw);
-                                                const xhti: usize = ih_u / t.x_th;
-                                                const xwti: usize = iw_u / t.x_tw;
-                                                if (xhti < t.x_htc and xwti < t.x_wtc) {
-                                                    const ih_l: usize = ih_u - xhti * t.x_th;
-                                                    const iw_l: usize = iw_u - xwti * t.x_tw;
-                                                    const xti: usize = (t.b * t.x_htc + xhti) * t.x_wtc + xwti;
-                                                    const xt: XTile = t.x_tiles[xti];
-                                                    if (ih_l < xt.h_mem and iw_l < xt.w_mem and (ic + take) <= xt.c_mem) {
-                                                        const src0: usize = (ih_l * xt.row_stride) + (iw_l * xt.c_mem) + ic;
-                                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                                    } else {
-                                                        @memset(dst, 0.0);
-                                                    }
-                                                } else {
-                                                    @memset(dst, 0.0);
-                                                }
-                                            } else {
-                                                @memset(dst, 0.0);
-                                            }
-                                        }
-                                    }
-
-                                    a_off += take;
-                                    rem_k -= take;
-                                    ic += take;
-                                    if (ic == t.c_in) {
-                                        ic = 0;
-                                        kw += 1;
-                                        if (kw == t.k_w) {
-                                            kw = 0;
-                                            kh += 1;
-                                        }
-                                    }
-                                }
+                                // One kernel row is one copy when w is unstrided and channels are
+                                // contiguous; carries then replace div/mod in the reduction walk.
+                                pack.row(row_pa, kk0, k_sub, oh0, ow0, all_valid);
                             }
                         }
 
@@ -943,11 +915,11 @@ fn tryExecConv2DImplicitGemmTileNative(
                 }
             }
 
-            fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+            fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
                 const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                if (tid >= t.ctx.matmul_scratch.len) return;
+                if (tid >= t.ctx.matmul_scratch.len) return error.InvalidArgument;
                 const scratch_bytes: []align(32) u8 = t.ctx.matmul_scratch[tid];
-                t.runRowsRange(scratch_bytes, start, end) catch return;
+                try t.runRowsRange(scratch_bytes, start, end);
             }
         };
 
@@ -1005,7 +977,7 @@ fn tryExecConv2DImplicitGemmTileNative(
                     if (ctx.pool) |p| {
                         if (ctx.thread_count > 1 and tile_rows >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
                             const grain: usize = @max(m_cap_eff, @max(@as(usize, 1), tile_rows / (ctx.thread_count * 4)));
-                            p.parallelForAny(@ptrCast(&task), tile_rows, grain, Task.runRows);
+                            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), tile_rows, grain, Task.runRows);
                         } else {
                             const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
                             defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
@@ -1205,6 +1177,106 @@ fn execConv2DImplicitGemm(
             const max_w: isize = @as(isize, @intCast((t.params.k_w - 1) * t.s.dilation_w));
             const use_reflect: bool = (t.s.pad_mode == .reflect);
 
+            // Packs one GEMM row of the im2col operand, shared by the full-KC
+            // blocks and the K tail. Reduction indices run (kh, kw, ic).
+            const pack = struct {
+                t: @TypeOf(t),
+                use_reflect: bool,
+                h_in_i: isize,
+                w_in_i: isize,
+                wide: bool,
+
+                /// Zero padding splits a kernel row into at most three runs: leading
+                /// pad, one contiguous copy, trailing pad. Interior rows are one run.
+                fn rowWide(p: @This(), row_pa: []f32, base_batch: usize, k_sub: usize, oh0: isize, ow0: isize, kh_in: usize, kw_in: usize, ic_in: usize) void {
+                    const task = p.t;
+                    const taps: usize = task.params.k_w;
+                    const chans: usize = task.params.c_in_g;
+                    const lo: usize = if (ow0 < 0) @min(taps, @as(usize, @intCast(-ow0))) else 0;
+                    const hi: usize = if (ow0 >= p.w_in_i) 0 else @min(taps, @as(usize, @intCast(p.w_in_i - ow0)));
+                    var kh: usize = kh_in;
+                    var kw: usize = kw_in;
+                    var ic0: usize = ic_in;
+                    var rem_k: usize = k_sub;
+                    var a_off: usize = 0;
+                    while (rem_k != 0) {
+                        const ih: isize = oh0 + @as(isize, @intCast(kh * task.s.dilation_h));
+                        const in_row: bool = ih >= 0 and ih < p.h_in_i;
+                        const copy: bool = in_row and kw >= lo and kw < hi;
+                        const bound: usize = if (!in_row) taps else if (kw < lo) lo else if (kw < hi) hi else taps;
+                        const take: usize = @min(rem_k, (bound - kw) * chans - ic0);
+                        const dst: []f32 = row_pa[a_off .. a_off + take];
+                        if (copy) {
+                            const iw: usize = @intCast(ow0 + @as(isize, @intCast(kw)));
+                            const x_idx: usize = base_batch + ((@as(usize, @intCast(ih)) * task.params.w_in + iw) * task.params.c_in) + ic0;
+                            packRun(dst, task.x[x_idx .. x_idx + take]);
+                        } else {
+                            packZero(dst);
+                        }
+                        a_off += take;
+                        rem_k -= take;
+                        ic0 += take;
+                        while (ic0 >= chans) {
+                            ic0 -= chans;
+                            kw += 1;
+                            if (kw == taps) {
+                                kw = 0;
+                                kh += 1;
+                            }
+                        }
+                    }
+                }
+
+                fn row(p: @This(), row_pa: []f32, base_batch: usize, kk0: usize, k_sub: usize, oh0: isize, ow0: isize, all_valid: bool) void {
+                    const task = p.t;
+                    const c_g: usize = task.params.c_in_g;
+                    var rem_k: usize = k_sub;
+                    var a_off: usize = 0;
+                    const pos: usize = kk0 / c_g;
+                    var ic0: usize = kk0 - pos * c_g;
+                    var kh: usize = pos / task.params.k_w;
+                    var kw: usize = pos - kh * task.params.k_w;
+                    if (p.wide) return p.rowWide(row_pa, base_batch, k_sub, oh0, ow0, kh, kw, ic0);
+                    while (rem_k != 0) {
+                        const span: usize = c_g - ic0;
+                        const take: usize = @min(rem_k, span);
+                        const ih: isize = oh0 + @as(isize, @intCast(kh * task.s.dilation_h));
+                        const iw: isize = ow0 + @as(isize, @intCast(kw * task.s.dilation_w));
+                        const dst: []f32 = row_pa[a_off .. a_off + take];
+
+                        if (all_valid or p.use_reflect) {
+                            const ih_u: usize = if (all_valid) @intCast(ih) else reflectIndex1D(ih, task.params.h_in);
+                            const iw_u: usize = if (all_valid) @intCast(iw) else reflectIndex1D(iw, task.params.w_in);
+                            const x_idx: usize = base_batch + ((ih_u * task.params.w_in + iw_u) * task.params.c_in) + ic0;
+                            packRun(dst, task.x[x_idx .. x_idx + take]);
+                        } else if (ih >= 0 and iw >= 0 and ih < p.h_in_i and iw < p.w_in_i) {
+                            const x_idx: usize = base_batch + ((@as(usize, @intCast(ih)) * task.params.w_in + @as(usize, @intCast(iw))) * task.params.c_in) + ic0;
+                            packRun(dst, task.x[x_idx .. x_idx + take]);
+                        } else {
+                            packZero(dst);
+                        }
+
+                        a_off += take;
+                        rem_k -= take;
+                        ic0 += take;
+                        while (ic0 >= c_g) {
+                            ic0 -= c_g;
+                            kw += 1;
+                            if (kw == task.params.k_w) {
+                                kw = 0;
+                                kh += 1;
+                            }
+                        }
+                    }
+                }
+            }{
+                .t = t,
+                .use_reflect = use_reflect,
+                .h_in_i = h_in_i,
+                .w_in_i = w_in_i,
+                .wide = t.s.dilation_w == 1 and t.params.c_in_g == t.params.c_in and t.s.pad_mode != .reflect,
+            };
+
             const b_idx: []usize = try t.alloc.alloc(usize, m_cap_local);
             defer t.alloc.free(b_idx);
             const oh_idx: []usize = try t.alloc.alloc(usize, m_cap_local);
@@ -1267,45 +1339,7 @@ fn execConv2DImplicitGemm(
 
                                     const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
-                                    var rem_k: usize = k_sub;
-                                    var gk: usize = kk0;
-                                    var a_off: usize = 0;
-                                    while (rem_k != 0) {
-                                        const pos: usize = gk / t.params.c_in_g;
-                                        const ic0: usize = gk - pos * t.params.c_in_g;
-                                        const take: usize = @min(rem_k, t.params.c_in_g - ic0);
-                                        const kh: usize = pos / t.params.k_w;
-                                        const kw: usize = pos - kh * t.params.k_w;
-
-                                        const ih: isize = oh0 + @as(isize, @intCast(kh * t.s.dilation_h));
-                                        const iw: isize = ow0 + @as(isize, @intCast(kw * t.s.dilation_w));
-
-                                        const dst: []f32 = row_pa[a_off .. a_off + take];
-                                        if (all_valid) {
-                                            const ih_u: usize = @intCast(ih);
-                                            const iw_u: usize = @intCast(iw);
-                                            const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                            @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                        } else {
-                                            if (use_reflect) {
-                                                const ih_u: usize = reflectIndex1D(ih, t.params.h_in);
-                                                const iw_u: usize = reflectIndex1D(iw, t.params.w_in);
-                                                const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                                @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                            } else if (ih >= 0 and iw >= 0 and ih < h_in_i and iw < w_in_i) {
-                                                const ih_u: usize = @intCast(ih);
-                                                const iw_u: usize = @intCast(iw);
-                                                const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                                @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                            } else {
-                                                @memset(dst, 0.0);
-                                            }
-                                        }
-
-                                        gk += take;
-                                        a_off += take;
-                                        rem_k -= take;
-                                    }
+                                    pack.row(row_pa, base_batch, kk0, k_sub, oh0, ow0, all_valid);
                                 }
                             }
 
@@ -1369,45 +1403,7 @@ fn execConv2DImplicitGemm(
 
                                 const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
-                                var rem_k: usize = k_sub;
-                                var gk: usize = kk0;
-                                var a_off: usize = 0;
-                                while (rem_k != 0) {
-                                    const pos: usize = gk / t.params.c_in_g;
-                                    const ic0: usize = gk - pos * t.params.c_in_g;
-                                    const take: usize = @min(rem_k, t.params.c_in_g - ic0);
-                                    const kh: usize = pos / t.params.k_w;
-                                    const kw: usize = pos - kh * t.params.k_w;
-
-                                    const ih: isize = oh0 + @as(isize, @intCast(kh * t.s.dilation_h));
-                                    const iw: isize = ow0 + @as(isize, @intCast(kw * t.s.dilation_w));
-
-                                    const dst: []f32 = row_pa[a_off .. a_off + take];
-                                    if (all_valid) {
-                                        const ih_u: usize = @intCast(ih);
-                                        const iw_u: usize = @intCast(iw);
-                                        const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                        @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                    } else {
-                                        if (use_reflect) {
-                                            const ih_u: usize = reflectIndex1D(ih, t.params.h_in);
-                                            const iw_u: usize = reflectIndex1D(iw, t.params.w_in);
-                                            const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                            @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                        } else if (ih >= 0 and iw >= 0 and ih < h_in_i and iw < w_in_i) {
-                                            const ih_u: usize = @intCast(ih);
-                                            const iw_u: usize = @intCast(iw);
-                                            const x_idx: usize = base_batch + ((ih_u * t.params.w_in + iw_u) * t.params.c_in) + ic0;
-                                            @memcpy(dst, t.x[x_idx .. x_idx + take]);
-                                        } else {
-                                            @memset(dst, 0.0);
-                                        }
-                                    }
-
-                                    gk += take;
-                                    a_off += take;
-                                    rem_k -= take;
-                                }
+                                pack.row(row_pa, base_batch, kk0, k_sub, oh0, ow0, all_valid);
                             }
                         }
 
@@ -1459,10 +1455,10 @@ fn execConv2DImplicitGemm(
             }
         }
 
-        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
             const t: *@This() = @ptrCast(@alignCast(ctx_any));
             const scratch_bytes: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            t.runRowsRange(scratch_bytes, start, end) catch return;
+            try t.runRowsRange(scratch_bytes, start, end);
         }
     };
 
@@ -1498,7 +1494,7 @@ fn execConv2DImplicitGemm(
     if (ctx.pool) |p| {
         if (ctx.thread_count > 1 and rows_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
             const grain: usize = @max(m_cap, @max(@as(usize, 1), rows_total / (ctx.thread_count * 4)));
-            p.parallelForAny(@ptrCast(&task), rows_total, grain, Task.runRows);
+            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), rows_total, grain, Task.runRows);
             try writeTensorPackedF32(store, out_meta, s.out, out_packed);
             return true;
         }

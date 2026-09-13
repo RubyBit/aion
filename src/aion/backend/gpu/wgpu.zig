@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env_util = @import("../../env.zig");
+const profile = @import("../../profile.zig");
 
 /// The translate-c'd wgpu.h: **types, enums and constants only** (`c.WGPU…`).
 /// These are header-level declarations, so referencing them creates no link
@@ -390,6 +391,8 @@ pub const Gpu = struct {
     limits: Limits = .{},
     /// True when the device was opened with the standard timestamp-query feature.
     timestamp_query: bool = false,
+    /// Adaptive spin budget for `mapBlocking`.
+    map_spin_ns: u64 = MAP_SPIN_MAX_NS,
 
     pub fn init(opts: Options) Error!Gpu {
         try ensureLoaded();
@@ -523,14 +526,23 @@ pub const Gpu = struct {
         return describeAdapter(self.adapter);
     }
 
-    /// Synchronously map `buffer` (blocks via the event loop).
+    /// Bounds on the adaptive map-wait spin. The floor is small enough to be free
+    /// even when it never pays off, and keeps the budget able to grow back.
+    const MAP_SPIN_MIN_NS: u64 = 32 * 1000;
+    const MAP_SPIN_MAX_NS: u64 = 2 * 1000 * 1000;
+
     /// Map `buffer` and block until the callback fires.
     ///
-    /// The wait is a blocking device poll, not an event-pump spin: a map callback
-    /// cannot fire until the queue work the buffer depends on completes, so polling
-    /// with wait=true is both the cheapest way to get there (no busy loop) and
-    /// robust to an arbitrarily long queue ahead of it. That is why callers need no
-    /// separate drain before mapping — this single wait covers both.
+    /// `devicePoll(wait)` parks the thread but only returns ~1.2 ms after the work
+    /// it waits on actually completed, which dwarfs a small readback. So poll
+    /// without waiting first — yielding so the driver's threads still make
+    /// progress — and fall back to the blocking poll once the budget is spent.
+    ///
+    /// The budget adapts: spinning past the point where work could plausibly be
+    /// done just burns a core and contends with the driver, so a wait that had to
+    /// park halves it and one that finished spinning doubles it. Short waits keep
+    /// the fast path; a model whose steps always outlast it stops paying for it.
+    /// Either way this covers the submits the copy depends on: no separate drain.
     pub fn mapBlocking(self: *Gpu, buffer: c.WGPUBuffer, mode: c.WGPUMapMode, offset: usize, size: usize) Error!void {
         var mreq: MapReq = .{};
         _ = fns.wgpuBufferMapAsync(buffer, mode, offset, size, .{
@@ -540,9 +552,26 @@ pub const Gpu = struct {
             .userdata1 = &mreq,
             .userdata2 = null,
         });
-        var i: usize = 0;
-        while (!mreq.done) : (i += 1) {
-            if (i > 1024) return Error.MapTimeout;
+
+        const deadline: u64 = profile.nowNs() + self.map_spin_ns;
+        var spins: usize = 0;
+        while (!mreq.done) : (spins += 1) {
+            // Reading the clock costs about as much as the poll; check it sparsely.
+            if (spins % 64 == 0 and profile.nowNs() >= deadline) break;
+            _ = fns.wgpuDevicePoll(self.device, 0, null); // wait = false
+            fns.wgpuInstanceProcessEvents(self.instance);
+            if (spins > 256) std.Thread.yield() catch {};
+        }
+
+        if (mreq.done) {
+            self.map_spin_ns = @min(MAP_SPIN_MAX_NS, self.map_spin_ns * 2);
+        } else {
+            self.map_spin_ns = @max(MAP_SPIN_MIN_NS, self.map_spin_ns / 2);
+        }
+
+        var waits: usize = 0;
+        while (!mreq.done) : (waits += 1) {
+            if (waits > 1024) return Error.MapTimeout;
             _ = fns.wgpuDevicePoll(self.device, 1, null); // wait = true
             fns.wgpuInstanceProcessEvents(self.instance);
         }

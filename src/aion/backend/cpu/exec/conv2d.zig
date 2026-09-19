@@ -1,6 +1,71 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const conv_utils = @import("conv_utils.zig");
+
+
+
+/// Panels held in one group on the indirect path. A group shares a sweep of the
+/// packed weights; rows-per-panel falls to the output width when that is under
+/// the micro-kernel's 32, so a narrow layer needs more panels to fill a group.
+const max_group_panels: usize = 128;
+
+/// Rows of output one group accumulates before moving on.
+///
+/// The group's slice of C is read and written once per K block, so it has to
+/// survive in L2. Within that, more rows is strictly better: the packed weights
+/// are swept once per group, and on the early wide layers that sweep is the
+/// GEMM's largest memory cost — going from 288 rows to a cache-sized group was
+/// worth 1532 -> 1660 GFLOP/s on VGG-19.
+fn indirectGroupRows(c_out: usize, mr: usize, l2_bytes: usize) usize {
+    const default_l2: usize = 4 << 20;
+    // A quarter of L2, so the weight panels streaming past keep their room.
+    const budget: usize = (if (l2_bytes != 0) l2_bytes else default_l2) / 4;
+    const rows: usize = budget / (c_out * @sizeOf(f32));
+    return std.math.clamp(rows, mr, max_group_panels * mr);
+}
+
+/// Whether conv can read activations straight out of the channel-major image
+/// instead of gathering them.
+///
+/// Unit stride is what keeps 32 consecutive output positions consecutive in the
+/// image, zero padding is what lets the pad offsets cancel out of the index, and
+/// the panels stop at row ends — so a width that rounds far past a whole
+/// micro-kernel block would pay for more rows than it uses.
+fn indirectApplies(matmul: matmul_registry.F32Kernels, s: StepConv2DTiled, w_out: usize) bool {
+    if (matmul.matmul_indirect == null) return false;
+    if (s.stride_h != 1 or s.stride_w != 1 or s.pad_mode != .zero) return false;
+    const panel_rows: usize = conv_utils.roundUpToMultiple(w_out, matmul.tuning.mr);
+    return panel_rows * 4 <= w_out * 5;
+}
+
+/// Rewrites one batch item's rows channel-major; split across workers because it
+/// is otherwise the serial head of every conv on the indirect path.
+const ImageBuild = struct {
+    dst: []f32,
+    x: []const f32,
+    geo: conv_utils.ImageGeometry,
+    plane: usize,
+
+    fn run(ctx_any: *anyopaque, first: usize, last: usize, tid: usize) ExecuteProgramError!void {
+        _ = tid;
+        const t: *@This() = @ptrCast(@alignCast(ctx_any));
+        const rows: usize = t.geo.h_in;
+        var i: usize = first;
+        while (i < last) {
+            const bi: usize = i / rows;
+            const lo: usize = i - bi * rows;
+            const hi: usize = @min(rows, lo + (last - i));
+            conv_utils.buildChannelMajorRows(
+                t.dst[bi * t.geo.c_in * t.plane ..],
+                t.x[bi * rows * t.geo.w_in * t.geo.c_in ..],
+                t.geo,
+                lo,
+                hi,
+            );
+            i += hi - lo;
+        }
+    }
+};
 const conv2d_kernels = @import("../kernels/conv2d.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
@@ -503,6 +568,13 @@ fn tryExecConv2DImplicitGemmTileNative(
     const out_wtc: usize = out_meta.tile_counts[2];
     if (x_htc == 0 or x_wtc == 0 or out_htc == 0 or out_wtc == 0) return BackendError.InvalidArgument;
 
+    // This path's GEMM rows are one output tile's pixels, so a tile smaller than
+    // the micro-kernel's row block leaves most of every block idle. It buys its
+    // keep by not materializing x; below that width the flat path wins even
+    // paying for the copy. Measured on VGG-19's 224x224 layers, whose output
+    // tiles are 1x3: 57 ms against 32-row SME blocks, for two convolutions.
+    if (out_meta.tile_shape[1] * out_meta.tile_shape[2] < ctx.matmul_f32.tuning.mr) return false;
+
     const alloc: std.mem.Allocator = ctx.allocator;
 
     // Cache all X tiles (const) for all batches.
@@ -578,7 +650,11 @@ fn tryExecConv2DImplicitGemmTileNative(
         // Safe because scratch is sized for matmul.tuning.mc; using less is always valid.
         // For N==128, halving MC improves cache locality without making per-task work too small.
         // Keep it a multiple of MR (6).
-        const m_cap_eff: usize = if (matmul.tuning.mc > 144 and oc_count <= 128) 144 else matmul.tuning.mc;
+        // Rounded to whole micro-kernel row blocks: the GEMM computes ceil(m/mr)
+        // blocks whatever we ask for, so a cap between multiples pays for rows it
+        // then throws away — 144 against a 32-row block computed 160 every time.
+        const m_cap_raw: usize = if (matmul.tuning.mc > 144 and oc_count <= 128) 144 else matmul.tuning.mc;
+        const m_cap_eff: usize = @min(matmul.tuning.mc, conv_utils.roundUpToMultiple(m_cap_raw, matmul.tuning.mr));
         if (m_cap_eff == 0) return BackendError.InvalidArgument;
 
         const oc_start: usize = oc_ti * out_meta.tile_shape[3];
@@ -591,7 +667,7 @@ fn tryExecConv2DImplicitGemmTileNative(
             .kc = kc,
             .nc = matmul.tuning.nc,
         };
-        const packed_w: PackedWeightEntry = try getOrCreatePackedWeights(ctx.packed_w, matmul, key, w_vals);
+        const packed_w: PackedWeightEntry = try getOrCreatePackedWeights(ctx.cache, matmul, key, w_vals);
 
         // Acquire bias tile (optional).
         var bias_vals: []align(1) const f32 = &[_]f32{};
@@ -660,7 +736,7 @@ fn tryExecConv2DImplicitGemmTileNative(
                 @setRuntimeSafety(false);
 
                 const pb_elems: usize = t.kc * t.matmul.tuning.nc;
-                const pa_elems: usize = t.m_cap * t.kc;
+                const pa_elems: usize = conv_utils.packedAElems(t.matmul.tuning.mr, t.m_cap, t.kc);
                 const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch));
                 std.debug.assert(scratch_f32.len >= pb_elems + pa_elems);
                 const packed_a_buf: []align(32) f32 = @alignCast(scratch_f32[pb_elems .. pb_elems + pa_elems]);
@@ -857,11 +933,19 @@ fn tryExecConv2DImplicitGemmTileNative(
                                     const ow0: isize = ow0_buf[mr];
                                     const all_valid: bool = all_valid_buf[mr];
 
-                                    const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                                    const kmaj = t.matmul.tuning.a_layout == .k_major;
+                                    const row_pa: []f32 = if (kmaj)
+                                        conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                                    else
+                                        packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                                     // One kernel row is one copy when w is unstrided and channels are
                                     // contiguous; carries then replace div/mod in the reduction walk.
                                     pack.row(row_pa, kk0, k_sub, oh0, ow0, all_valid);
+                                    if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                        const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                        conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                                    }
                                 }
                             }
 
@@ -892,11 +976,19 @@ fn tryExecConv2DImplicitGemmTileNative(
                                 const ow0: isize = ow0_buf[mr];
                                 const all_valid: bool = all_valid_buf[mr];
 
-                                const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                                const kmaj = t.matmul.tuning.a_layout == .k_major;
+                                const row_pa: []f32 = if (kmaj)
+                                    conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                                else
+                                    packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                                 // One kernel row is one copy when w is unstrided and channels are
                                 // contiguous; carries then replace div/mod in the reduction walk.
                                 pack.row(row_pa, kk0, k_sub, oh0, ow0, all_valid);
+                                if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                    const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                    conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                                }
                             }
                         }
 
@@ -1043,9 +1135,13 @@ fn execConv2DImplicitGemm(
         return true;
     }
 
-    // Prefer a tile-native path when possible (avoids large scalar pack/unpack copies).
-    if (try tryExecConv2DImplicitGemmTileNative(ctx, s, out_meta, x_meta, w_meta, store)) {
-        return true;
+    // Reading activations through the channel-major image beats gathering them
+    // wherever it applies, so it wins over the tile-native path; tile-native
+    // remains the route for everything else, where it avoids large pack copies.
+    if (!indirectApplies(ctx.matmul_f32, s, out_meta.shape[@as(usize, out_meta.rank) - 2])) {
+        if (try tryExecConv2DImplicitGemmTileNative(ctx, s, out_meta, x_meta, w_meta, store)) {
+            return true;
+        }
     }
 
     const rank: usize = @as(usize, out_meta.rank);
@@ -1080,19 +1176,16 @@ fn execConv2DImplicitGemm(
 
     const alloc: std.mem.Allocator = std.heap.page_allocator;
 
-    const x_packed: []f32 = try alloc.alloc(f32, x_count);
-    defer alloc.free(x_packed);
-    const out_packed: []f32 = try alloc.alloc(f32, out_count);
-    defer alloc.free(out_packed);
+    const x_packed: []f32 = try ctx.cache.scratch(.x, x_count);
+    const out_packed: []f32 = try ctx.cache.scratch(.out, out_count);
 
     try readTensorPackedF32(store, x_meta, s.x, x_packed);
 
     var bias_packed: []f32 = &[_]f32{};
-    defer if (bias_packed.len != 0) alloc.free(bias_packed);
     if (s.bias) |b_id| {
         const b_meta: tensor_store.TensorMeta = try store.meta(b_id);
         std.debug.assert(b_meta.dtype == .f32 and b_meta.rank == 1 and b_meta.shape[0] == c_out);
-        bias_packed = try alloc.alloc(f32, c_out);
+        bias_packed = try ctx.cache.scratch(.bias, c_out);
         try readTensorPackedF32(store, b_meta, b_id, bias_packed);
     }
 
@@ -1102,7 +1195,7 @@ fn execConv2DImplicitGemm(
     const use_local_scratch: bool = false;
 
     const kc: usize = matmul.tuning.kc;
-    const m_cap: usize = matmul.tuning.mc;
+    const m_cap: usize = conv_utils.roundUpToMultiple(matmul.tuning.mc, matmul.tuning.mr);
     const oc_tile_max: usize = @min(c_out_g, matmul.tuning.nc);
 
     const w_count: usize = try elemCountFromShape(w_meta.shape);
@@ -1149,13 +1242,13 @@ fn execConv2DImplicitGemm(
 
             // A weight never changes, so gathering its block is worth doing only
             // when the pack cache has nothing for it.
-            const packed_w_g: PackedWeightEntry = findPackedWeights(ctx.packed_w, key_g) orelse blk: {
+            const packed_w_g: PackedWeightEntry = findPackedWeights(ctx.cache, key_g) orelse blk: {
                 if (!w_loaded) {
                     try readTensorPackedF32(store, w_meta, s.w, w_packed);
                     w_loaded = true;
                 }
                 try fillWeightBlock(w_block[0 .. k_dim_g * oc_count], w_packed, k_dim_g, c_out, oc_start, oc_count);
-                break :blk try getOrCreatePackedWeights(ctx.packed_w, matmul, key_g, w_block[0 .. k_dim_g * oc_count]);
+                break :blk try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block[0 .. k_dim_g * oc_count]);
             };
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
@@ -1191,26 +1284,147 @@ fn execConv2DImplicitGemm(
         tiles_per_group: usize,
         alloc: std.mem.Allocator,
 
+        /// Set when the activations were rewritten channel-major up front, which
+        /// lets the GEMM read them through a pointer table instead of a gather.
+        image: ?conv_utils.ChannelMajorImage,
+
+        /// Row panels straight out of the channel-major image, in groups.
+        ///
+        /// Panels stop at output-row ends: only within a row are 32 consecutive
+        /// output positions 32 consecutive floats for every reduction index. A
+        /// group of them shares one sweep of the packed weights — a panel at a
+        /// time re-reads the whole weight block every 32 rows, which on the deep
+        /// layers costs more than the gather this path removes.
+        fn runPanelsIndirect(t: *const @This(), img: conv_utils.ChannelMajorImage, table_pool: [][*]const f32, start: usize, end: usize) ExecuteProgramError!void {
+            @setRuntimeSafety(false);
+            const indirect = t.matmul.matmul_indirect.?;
+            const MR: usize = t.matmul.tuning.mr;
+            const full_blocks: usize = t.params.k_dim_g / t.kc;
+            const k_tail: usize = t.params.k_dim_g - full_blocks * t.kc;
+            const k_blocks: usize = full_blocks + @intFromBool(k_tail != 0);
+            const hw_out: usize = t.params.h_out * t.params.w_out;
+            const bias_present: bool = (t.bias.len != 0);
+            const max_panels: usize = @min(max_group_panels, table_pool.len / t.kc);
+            const group_rows: usize = indirectGroupRows(t.params.c_out, MR, t.ctx.l2_bytes);
+
+            var panel_row: [max_group_panels]usize = undefined;
+            var panel_len: [max_group_panels]usize = undefined;
+
+            var row: usize = start;
+            while (row < end) {
+                var panels: usize = 0;
+                var rows_acc: usize = 0;
+                var r: usize = row;
+                while (r < end and panels < max_panels and rows_acc < group_rows) {
+                    const ow_r: usize = (r % hw_out) % t.params.w_out;
+                    const mr: usize = @min(@min(MR, t.params.w_out - ow_r), end - r);
+                    panel_row[panels] = r;
+                    panel_len[panels] = mr;
+                    panels += 1;
+                    rows_acc += mr;
+                    r += mr;
+                }
+
+                var gg: usize = 0;
+                while (gg < t.groups) : (gg += 1) {
+                    const ic_base: usize = gg * t.params.c_in_g;
+                    const tile_base: usize = gg * t.tiles_per_group;
+
+                    var bi: usize = 0;
+                    while (bi < k_blocks) : (bi += 1) {
+                        const k_sub: usize = if (bi < full_blocks) t.kc else k_tail;
+                        for (0..panels) |pi| {
+                            const rr: usize = panel_row[pi];
+                            const b: usize = rr / hw_out;
+                            const rem: usize = rr - b * hw_out;
+                            const oh: usize = rem / t.params.w_out;
+                            conv_utils.buildIndirectTable(
+                                table_pool[pi * k_sub ..][0..k_sub],
+                                img,
+                                b * t.params.c_in + ic_base,
+                                t.params.c_in_g,
+                                t.params.k_w,
+                                t.s.dilation_h,
+                                t.s.dilation_w,
+                                bi * t.kc,
+                                oh,
+                                rem - oh * t.params.w_out,
+                            );
+                        }
+                        const beta: f32 = if (bi == 0) 0.0 else 1.0;
+
+                        var ti1: usize = 0;
+                        while (ti1 < t.tiles_per_group) : (ti1 += 1) {
+                            const tile: TileInfo = t.tile_infos[tile_base + ti1];
+                            const block_elems: usize = tile.packed_w.block_elems;
+                            const pb0: usize = bi * block_elems;
+                            const packed_b_view: []align(32) const f32 = @alignCast(tile.packed_w.blocks[pb0 .. pb0 + block_elems]);
+
+                            for (0..panels) |pi| {
+                                const rr: usize = panel_row[pi];
+                                const mr: usize = panel_len[pi];
+                                const dst_base: usize = rr * t.params.c_out + tile.oc_start;
+                                const c_len: usize = (mr - 1) * t.params.c_out + tile.oc_count;
+                                try indirect(
+                                    table_pool[pi * k_sub ..][0..k_sub],
+                                    packed_b_view,
+                                    .{ .m = mr, .n = tile.oc_count, .k = k_sub, .ldc = t.params.c_out, .alpha = 1.0, .beta = beta },
+                                    std.mem.sliceAsBytes(t.out[dst_base .. dst_base + c_len]),
+                                );
+                            }
+                        }
+                    }
+
+                    if (bias_present) {
+                        var ti1: usize = 0;
+                        while (ti1 < t.tiles_per_group) : (ti1 += 1) {
+                            const tile: TileInfo = t.tile_infos[tile_base + ti1];
+                            const bias_slice: []const f32 = t.bias[tile.oc_start .. tile.oc_start + tile.oc_count];
+                            for (0..panels) |pi| {
+                                const rr: usize = panel_row[pi];
+                                const mr: usize = panel_len[pi];
+                                const dst_base: usize = rr * t.params.c_out + tile.oc_start;
+                                const c_len: usize = (mr - 1) * t.params.c_out + tile.oc_count;
+                                addBiasRowsF32(t.out[dst_base .. dst_base + c_len], 0, mr, t.params.c_out, tile.oc_count, bias_slice, t.matmul.tuning.lanes);
+                            }
+                        }
+                    }
+                }
+
+                row = r;
+            }
+        }
+
         fn runRowsRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
             @setRuntimeSafety(false);
             const m_cap_local: usize = t.m_cap;
             const full_blocks: usize = t.params.k_dim_g / t.kc;
             const k_tail: usize = t.params.k_dim_g - full_blocks * t.kc;
 
+            // The free has to outlive the block that allocates, or every use
+            // below reads freed memory.
             var local_scratch: []align(32) u8 = &[_]u8{};
+            defer if (local_scratch.len != 0) t.alloc.free(local_scratch);
             if (t.use_local_scratch) {
                 local_scratch = try t.alloc.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), t.matmul.scratch_bytes);
-                defer t.alloc.free(local_scratch);
             }
             const scratch_use: []align(32) u8 = if (t.use_local_scratch) local_scratch else scratch;
 
             // Reuse the matmul scratch's packed-A region ("pa") to avoid allocating a packed-A buffer.
             // Layout matches matmul.Kernel.splitScratch(): pb = KC*NC, pa = MC*KC.
             const pb_elems: usize = t.kc * t.matmul.tuning.nc;
-            const pa_elems: usize = t.m_cap * t.kc;
+            const pa_elems: usize = conv_utils.packedAElems(t.matmul.tuning.mr, t.m_cap, t.kc);
             const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_use));
             std.debug.assert(scratch_f32.len >= pb_elems + pa_elems);
             const packed_a_buf: []align(32) f32 = @alignCast(scratch_f32[pb_elems .. pb_elems + pa_elems]);
+
+            // The packed-A region is dead when activations are read through the
+            // image, so the pointer tables live there rather than in a buffer of
+            // their own.
+            if (t.image) |img| {
+                const pool: [][*]const f32 = @alignCast(std.mem.bytesAsSlice([*]const f32, std.mem.sliceAsBytes(packed_a_buf)));
+                if (pool.len >= t.kc) return t.runPanelsIndirect(img, pool, start, end);
+            }
 
             const h_in_i: isize = @as(isize, @intCast(t.params.h_in));
             const w_in_i: isize = @as(isize, @intCast(t.params.w_in));
@@ -1378,9 +1592,17 @@ fn execConv2DImplicitGemm(
 
                                     const all_valid: bool = (oh0 >= 0 and ow0 >= 0 and (oh0 + max_h) < h_in_i and (ow0 + max_w) < w_in_i);
 
-                                    const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                                    const kmaj = t.matmul.tuning.a_layout == .k_major;
+                                    const row_pa: []f32 = if (kmaj)
+                                        conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                                    else
+                                        packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                                     pack.row(row_pa, base_batch, kk0, k_sub, oh0, ow0, all_valid);
+                                    if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                        const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                        conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                                    }
                                 }
                             }
 
@@ -1442,9 +1664,17 @@ fn execConv2DImplicitGemm(
 
                                 const all_valid: bool = (oh0 >= 0 and ow0 >= 0 and (oh0 + max_h) < h_in_i and (ow0 + max_w) < w_in_i);
 
-                                const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                                const kmaj = t.matmul.tuning.a_layout == .k_major;
+                                const row_pa: []f32 = if (kmaj)
+                                    conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                                else
+                                    packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                                 pack.row(row_pa, base_batch, kk0, k_sub, oh0, ow0, all_valid);
+                                if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                    const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                    conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                                }
                             }
                         }
 
@@ -1503,6 +1733,47 @@ fn execConv2DImplicitGemm(
         }
     };
 
+    // Rewriting the activations channel-major up front costs one pass over x and
+    // removes the im2col gather outright: the GEMM then reads 32 output positions
+    // straight out of the image. Only unit stride keeps those 32 consecutive, and
+    // only zero padding lets the pad offsets cancel out of the index.
+    //
+    // Panels also stop at row ends, so each output row is rounded up to a whole
+    // micro-kernel block: a width just past a multiple pays for rows it discards.
+    // Once that passes a quarter of the work the gather is the cheaper of the two.
+    var image: ?conv_utils.ChannelMajorImage = null;
+    if (indirectApplies(matmul, s, w_out)) {
+        const hp: usize = h_out + (k_h - 1) * s.dilation_h;
+        const wp: usize = w_out + (k_w - 1) * s.dilation_w;
+        if (s.pad_top + h_in <= hp and s.pad_left + w_in <= wp) {
+            const plane: usize = hp * wp;
+            const buf = try ctx.cache.scratch(.image, conv_utils.ChannelMajorImage.elems(batch * c_in, hp, wp));
+            @memset(buf[batch * c_in * plane ..], 0);
+            const geo: conv_utils.ImageGeometry = .{
+                .h_in = h_in,
+                .w_in = w_in,
+                .c_in = c_in,
+                .pad_top = s.pad_top,
+                .pad_left = s.pad_left,
+                .hp = hp,
+                .wp = wp,
+            };
+            @memset(buf, 0);
+            var build: ImageBuild = .{ .dst = buf, .x = x_packed, .geo = geo, .plane = plane };
+            const img_rows: usize = batch * h_in;
+            var built_parallel = false;
+            if (ctx.pool) |pl| {
+                if (ctx.thread_count > 1 and img_rows >= 2) {
+                    const grain: usize = @max(@as(usize, 1), img_rows / (ctx.thread_count * 4));
+                    try pl.parallelForFallible(ExecuteProgramError, @ptrCast(&build), img_rows, grain, ImageBuild.run);
+                    built_parallel = true;
+                }
+            }
+            if (!built_parallel) try ImageBuild.run(@ptrCast(&build), 0, img_rows, 0);
+            image = .{ .data = buf, .wp = wp, .plane_elems = plane };
+        }
+    }
+
     var task: Task = .{
         .ctx = ctx,
         .s = s,
@@ -1530,6 +1801,7 @@ fn execConv2DImplicitGemm(
         .groups = groups,
         .tiles_per_group = tiles_per_group,
         .alloc = alloc,
+        .image = image,
     };
 
     if (ctx.pool) |p| {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 
 const std = @import("std");
+const tier_kinds = @import("src/aion/backend/cpu/multiversion/tier_kinds.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -212,7 +213,7 @@ pub fn build(b: *std.Build) void {
     // objects share no global symbols except their uniquely-named accessor, so the
     // per-tier kernel copies don't collide. Built once and attached to the public
     // module plus the shipped C/FFI library.
-    var tier_objs: [3]*std.Build.Step.Compile = undefined;
+    var tier_objs: [4]*std.Build.Step.Compile = undefined;
     var n_tiers: usize = 0;
 
     // Builds one tier object from `tier_kernels_root.zig` at `tier_target`, with
@@ -220,19 +221,21 @@ pub fn build(b: *std.Build) void {
     const TierBuild = struct {
         fn add(
             bld: *std.Build,
-            objs: *[3]*std.Build.Step.Compile,
+            objs: *[4]*std.Build.Step.Compile,
             count: *usize,
             opt: std.builtin.OptimizeMode,
             want_pic: bool,
             name: []const u8,
             lanes: u32,
-            quant_enc: u8,
+            quant: tier_kinds.QuantGemm,
+            f32_gemm: tier_kinds.F32Gemm,
             tier_target: std.Build.ResolvedTarget,
         ) void {
             const tier_opts = bld.addOptions();
             tier_opts.addOption(u32, "lanes", lanes);
             tier_opts.addOption([]const u8, "tier_name", name);
-            tier_opts.addOption(u8, "quant_enc", quant_enc);
+            tier_opts.addOption(u8, "quant_enc", @intFromEnum(quant));
+            tier_opts.addOption(u8, "f32_gemm", @intFromEnum(f32_gemm));
 
             const tier_mod = bld.createModule(.{
                 .root_source_file = bld.path("src/tier_kernels_root.zig"),
@@ -259,11 +262,11 @@ pub fn build(b: *std.Build) void {
 
     if (want_x86_multiversion) {
         // quant_enc: 0 = f32-accumulate, 1 = AVX-VNNI (VEX vpdpbusd), 2 = AVX-512-VNNI (EVEX).
-        const X86Tier = struct { name: []const u8, lanes: u32, model: *const std.Target.Cpu.Model, add: []const std.Target.x86.Feature, quant_enc: u8 };
+        const X86Tier = struct { name: []const u8, lanes: u32, model: *const std.Target.Cpu.Model, add: []const std.Target.x86.Feature, quant: tier_kinds.QuantGemm };
         const tiers = [_]X86Tier{
-            .{ .name = "v3", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{}, .quant_enc = 0 },
-            .{ .name = "v3_vnni", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{.avxvnni}, .quant_enc = 1 },
-            .{ .name = "v4", .lanes = 16, .model = &std.Target.x86.cpu.x86_64_v4, .add = &.{.avx512vnni}, .quant_enc = 2 },
+            .{ .name = "v3", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{}, .quant = .f32_accumulate },
+            .{ .name = "v3_vnni", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{.avxvnni}, .quant = .avx_vnni },
+            .{ .name = "v4", .lanes = 16, .model = &std.Target.x86.cpu.x86_64_v4, .add = &.{.avx512vnni}, .quant = .avx512_vnni },
         };
         for (tiers) |tier| {
             var q = target.query;
@@ -271,7 +274,7 @@ pub fn build(b: *std.Build) void {
             q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
             for (tier.add) |f| q.cpu_features_add.addFeature(@intFromEnum(f));
-            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant_enc, b.resolveTargetQuery(q));
+            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant, .simd, b.resolveTargetQuery(q));
         }
     } else if (want_arm_multiversion) {
         // NEON f32 is a fixed 128-bit 4-lane FMA everywhere, so unlike x86 there is
@@ -282,15 +285,23 @@ pub fn build(b: *std.Build) void {
         // The floor is not just the main module's: the tiers carry the hot f32
         // matmul/conv kernels, and compiling those at plain ARMv8.0 instead cost
         // ~9% single-thread and ~16% at 10 threads on VGG-19.
-        const ArmTier = struct { name: []const u8, add: []const std.Target.aarch64.Feature, quant_enc: u8 };
+        const ArmTier = struct {
+            name: []const u8,
+            add: []const std.Target.aarch64.Feature,
+            quant: tier_kinds.QuantGemm,
+            f32_gemm: tier_kinds.F32Gemm = .simd,
+        };
         const tiers = [_]ArmTier{
-            .{ .name = "arm_baseline", .add = &.{}, .quant_enc = 0 },
-            .{ .name = "arm_dotprod", .add = &.{.dotprod}, .quant_enc = 3 },
-            .{ .name = "arm_i8mm", .add = &.{ .dotprod, .i8mm }, .quant_enc = 4 },
+            .{ .name = "arm_baseline", .add = &.{}, .quant = .f32_accumulate },
+            .{ .name = "arm_dotprod", .add = &.{.dotprod}, .quant = .dotprod },
+            .{ .name = "arm_i8mm", .add = &.{ .dotprod, .i8mm }, .quant = .i8mm },
+            // SME implies v8.2 and the whole int8 set, so this tier keeps `smmla`
+            // and swaps only the f32 GEMM for the outer-product kernel.
+            .{ .name = "arm_sme", .add = &.{ .dotprod, .i8mm, .sme, .sme2 }, .quant = .i8mm, .f32_gemm = .sme },
         };
         for (tiers) |tier| {
             const q = armFloorQuery(target.query, tier.add, arm_floor);
-            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, 4, tier.quant_enc, b.resolveTargetQuery(q));
+            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, 4, tier.quant, tier.f32_gemm, b.resolveTargetQuery(q));
         }
     }
 

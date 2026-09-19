@@ -483,7 +483,7 @@ fn tryExecConv1DImplicitGemmTileNative(
             .kc = kc,
             .nc = matmul_oc.tuning.nc,
         };
-        packed_ws[oc_ti] = try getOrCreatePackedWeights(ctx.packed_w, matmul_oc, key, w_vals);
+        packed_ws[oc_ti] = try getOrCreatePackedWeights(ctx.cache, matmul_oc, key, w_vals);
 
         if (bias_present) {
             const b_id: tensor_store.TensorId = s.bias.?;
@@ -556,6 +556,7 @@ fn tryExecConv1DImplicitGemmTileNative(
         // Matmul kernel selection per OC tile. All entries share KC/MR/NR.
         oc_matmuls: []const matmul_registry.F32Kernels,
         mr: usize,
+        a_layout: matmul_registry.PackedALayout,
         max_nc: usize,
 
         // Shapes.
@@ -601,7 +602,7 @@ fn tryExecConv1DImplicitGemmTileNative(
             @setRuntimeSafety(false);
 
             const pb_elems: usize = t.kc * t.max_nc;
-            const pa_elems: usize = t.m_cap * t.kc;
+            const pa_elems: usize = conv_utils.packedAElems(t.mr, t.m_cap, t.kc);
             const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch));
             std.debug.assert(scratch_f32.len >= pb_elems + pa_elems);
             const packed_a_buf: []align(32) f32 = @alignCast(scratch_f32[pb_elems .. pb_elems + pa_elems]);
@@ -658,7 +659,11 @@ fn tryExecConv1DImplicitGemmTileNative(
                                 const lo0: isize = @as(isize, @intCast(lo_abs)) * @as(isize, @intCast(t.s.stride)) - @as(isize, @intCast(t.s.pad_left));
                                 const all_valid: bool = (lo0 >= 0 and (lo0 + max_l) < l_in_i);
 
-                                const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                                const kmaj = t.a_layout == .k_major;
+                                const row_pa: []f32 = if (kmaj)
+                                    conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                                else
+                                    packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                                 // Fast-path when the entire convolution window stays within a single X length-tile.
                                 var one_tile: bool = false;
@@ -740,6 +745,10 @@ fn tryExecConv1DImplicitGemmTileNative(
                                     a_off += take;
                                     rem_k -= take;
                                 }
+                                if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                    const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                    conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                                }
                             }
                         }
 
@@ -781,7 +790,11 @@ fn tryExecConv1DImplicitGemmTileNative(
                             const lo0: isize = @as(isize, @intCast(lo_abs)) * @as(isize, @intCast(t.s.stride)) - @as(isize, @intCast(t.s.pad_left));
                             const all_valid: bool = (lo0 >= 0 and (lo0 + max_l) < l_in_i);
 
-                            const row_pa: []f32 = packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
+                            const kmaj = t.a_layout == .k_major;
+                            const row_pa: []f32 = if (kmaj)
+                                conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
+                            else
+                                packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
 
                             var one_tile: bool = false;
                             var li_l0: usize = 0;
@@ -860,6 +873,10 @@ fn tryExecConv1DImplicitGemmTileNative(
                                 a_off += take;
                                 rem_k -= take;
                             }
+                            if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
+                                const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
+                                conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
+                            }
                         }
                     }
 
@@ -908,6 +925,7 @@ fn tryExecConv1DImplicitGemmTileNative(
         .s = s,
         .oc_matmuls = oc_matmuls,
         .mr = matmul_default.tuning.mr,
+        .a_layout = matmul_default.tuning.a_layout,
         .max_nc = max_nc,
         .l_in = l_in,
         .c_in = c_in,
@@ -1489,7 +1507,7 @@ fn execConv1DImplicitGemm(
                 .nc = ctx.matmul_f32.tuning.nc,
             };
 
-            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(ctx.packed_w, matmul, key_g, w_block_vals);
+            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block_vals);
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
         }

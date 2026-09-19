@@ -27,6 +27,8 @@ comptime {
     _ = @import("aion/backend/cpu/kernels/fft.zig");
     _ = @import("aion/backend/cpu/kernels/matmul.zig");
     _ = @import("aion/backend/cpu/kernels/matmul_q_i8.zig");
+    _ = @import("aion/backend/cpu/kernels/matmul_sme.zig");
+    _ = @import("aion/backend/cpu/kernels/matvec.zig");
 
     _ = @import("aion/graph/test_compile.zig");
     _ = @import("aion/graph/test_program_golden.zig");

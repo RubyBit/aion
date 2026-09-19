@@ -28,6 +28,7 @@ extern fn aion_cpu_kernels_v4() callconv(.c) *const dt.DispatchTable;
 extern fn aion_cpu_kernels_arm_baseline() callconv(.c) *const dt.DispatchTable;
 extern fn aion_cpu_kernels_arm_dotprod() callconv(.c) *const dt.DispatchTable;
 extern fn aion_cpu_kernels_arm_i8mm() callconv(.c) *const dt.DispatchTable;
+extern fn aion_cpu_kernels_arm_sme() callconv(.c) *const dt.DispatchTable;
 
 /// Pick the kernel tier whose ISA the detected CPU supports. Each arch's accessors
 /// are only referenced inside its own comptime branch, so the other arch's `extern`
@@ -39,8 +40,11 @@ pub fn selectTable(info: cpuid.CpuInfo) *const dt.DispatchTable {
         if (info.features.avx2 and info.features.avx_vnni) return aion_cpu_kernels_v3_vnni();
         return aion_cpu_kernels_v3();
     } else if (comptime builtin.cpu.arch.isAARCH64()) {
-        // NEON f32 width is fixed; the int8 quant path is what varies. FEAT_I8MM
-        // (`smmla`) beats FEAT_DotProd (`sdot`) beats the f32-accumulate baseline.
+        // FEAT_SME first: it is the only tier whose f32 GEMM is not NEON, and one
+        // `fmopa` does a whole 16x16 outer product. Below it, NEON f32 width is
+        // fixed and the int8 quant path is what varies — FEAT_I8MM (`smmla`) beats
+        // FEAT_DotProd (`sdot`) beats the f32-accumulate baseline.
+        if (info.features.sme) return aion_cpu_kernels_arm_sme();
         if (info.features.i8mm) return aion_cpu_kernels_arm_i8mm();
         if (info.features.dotprod) return aion_cpu_kernels_arm_dotprod();
         return aion_cpu_kernels_arm_baseline();

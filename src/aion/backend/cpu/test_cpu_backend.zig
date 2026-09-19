@@ -6082,3 +6082,86 @@ test "cpu backend: packed conv weights are not shared between stores" {
     try std.testing.expect(try convOnFreshStore(allocator, &cpu, 0.03) <= 1e-5);
     try std.testing.expect(try convOnFreshStore(allocator, &cpu, -0.07) <= 1e-5);
 }
+
+/// Conv2D at `shape`, 3x3 stride 1 pad 1, against a direct reference. Uses the
+/// real CPU tile policy so the output splits into channel tiles the way a model's
+/// would. Returns max |out - reference|.
+fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, c_out: usize) !f32 {
+    const x_len = h * w * c_in;
+    const w_len = 3 * 3 * c_in * c_out;
+    const y_len = h * w * c_out;
+
+    const x_buf = try allocator.alloc(u8, x_len * 4);
+    defer allocator.free(x_buf);
+    const w_buf = try allocator.alloc(u8, w_len * 4);
+    defer allocator.free(w_buf);
+    const x_vals = asF32Slice(x_buf);
+    const w_vals = asF32Slice(w_buf);
+    for (0..x_len) |i| x_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.05;
+    for (0..w_len) |i| w_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.03;
+
+    const ref_buf = try allocator.alloc(u8, y_len * 4);
+    defer allocator.free(ref_buf);
+    const ref = asF32Slice(ref_buf);
+    for (0..h) |oh| for (0..w) |ow| for (0..c_out) |oc| {
+        var acc: f32 = 0;
+        for (0..3) |kh| for (0..3) |kw| {
+            if (oh + kh < 1 or ow + kw < 1) continue;
+            const ih = oh + kh - 1;
+            const iw = ow + kw - 1;
+            if (ih >= h or iw >= w) continue;
+            for (0..c_in) |ic| acc += x_vals[((ih * w + iw) * c_in) + ic] * w_vals[(((kh * 3 + kw) * c_in + ic) * c_out) + oc];
+        };
+        ref[((oh * w + ow) * c_out) + oc] = acc;
+    };
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h, w, c_in }, &[_]usize{ 1, h, w, c_in }, .{ .tile_alignment = 64 });
+    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, &[_]usize{ 3, 3, c_in, c_out }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(w_tid, w_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f32, &[_]usize{ 1, h, w, c_in });
+    const w_in = try g.addInput(.f32, &[_]usize{ 3, 3, c_in, c_out });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(w_tid));
+    const y = try g.addConv2D(x_in, w_in, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(plan_mod.tilePolicyForTarget(.cpu)));
+    defer prog.deinit();
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf = try allocator.alloc(u8, y_len * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    var max_abs: f32 = 0;
+    for (asF32Slice(out_buf), ref) |got, want| max_abs = @max(max_abs, @abs(got - want));
+    return max_abs;
+}
+
+test "cpu backend: conv2d matches reference across channel-tiled output shapes" {
+    // The tile policy caps an output channel tile at 64, so c_out > 64 splits the
+    // output into several channel tiles — a case the fixed-shape conv tests above
+    // never reach, and one the packed-GEMM path has to get the weight offset right for.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const cases = [_][4]usize{
+        .{ 9, 7, 64, 64 },
+        .{ 9, 7, 64, 128 },
+        .{ 9, 7, 128, 64 },
+        .{ 9, 7, 32, 128 },
+        .{ 16, 16, 64, 192 },
+    };
+    for (cases) |c| {
+        const err = try conv3x3MaxErr(allocator, c[0], c[1], c[2], c[3]);
+        std.testing.expect(err <= 1e-3) catch |e| {
+            std.debug.print("conv3x3 h={d} w={d} c_in={d} c_out={d}: max_err={d}\n", .{ c[0], c[1], c[2], c[3], err });
+            return e;
+        };
+    }
+}

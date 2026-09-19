@@ -27,13 +27,13 @@ const conv1d_registry = @import("../registry/conv1d_registry.zig");
 const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
 const matmul_q_i8 = @import("../kernels/matmul_q_i8.zig");
+const tier_kinds = @import("tier_kinds.zig");
 
 const lanes: usize = opts.lanes;
 
-/// int8 GEMM encoding for this tier:
-///   0 = none (f32-accumulate quant kernels), 1 = AVX-VNNI (VEX), 2 = AVX-512-VNNI
-///   (EVEX), 3 = aarch64 FEAT_DotProd (sdot), 4 = aarch64 FEAT_I8MM (smmla).
-const quant_enc_raw: u8 = opts.quant_enc;
+/// Which kernels this tier carries, as `build.zig` declared them.
+const quant_gemm: tier_kinds.QuantGemm = @enumFromInt(opts.quant_enc);
+const f32_gemm: tier_kinds.F32Gemm = @enumFromInt(opts.f32_gemm);
 
 /// Build a `QuantKernels` backed by the int8 VNNI/sdot GEMM (`Kernel`) for this enc.
 fn vnniQuant(comptime kc: usize, comptime nc: usize, comptime enc: matmul_q_i8.DotEnc) matmul_q_registry.QuantKernels {
@@ -66,19 +66,19 @@ fn mmQuant(comptime kc: usize, comptime nc: usize, comptime enc: matmul_q_i8.MmE
 /// The tier's three packed-GEMM quant variants (small/medium/large). VNNI/sdot tiers
 /// use the int8 dot kernel; the i8mm tier uses the `smmla` matrix kernel; others keep
 /// the f32-accumulate kernels at their lane width.
-const quant_table: [3]matmul_q_registry.QuantKernels = if (quant_enc_raw == 0) .{
+const quant_table: [3]matmul_q_registry.QuantKernels = if (quant_gemm == .f32_accumulate) .{
     matmul_shapes.candidateFor(matmul_q_registry.candidates, .small, lanes).kernels,
     matmul_shapes.candidateFor(matmul_q_registry.candidates, .medium, lanes).kernels,
     matmul_shapes.candidateFor(matmul_q_registry.candidates, .large, lanes).kernels,
-} else if (quant_enc_raw == 4) .{
+} else if (quant_gemm == .i8mm) .{
     mmQuant(128, 128, .smmla),
     mmQuant(256, 256, .smmla),
     mmQuant(512, 512, .smmla),
 } else blk: {
-    const enc: matmul_q_i8.DotEnc = switch (quant_enc_raw) {
-        2 => .evex, // x86 AVX-512-VNNI
-        3 => .sdot, // aarch64 FEAT_DotProd
-        else => .vex, // x86 AVX-VNNI
+    const enc: matmul_q_i8.DotEnc = switch (quant_gemm) {
+        .avx512_vnni => .evex,
+        .dotprod => .sdot,
+        else => .vex,
     };
     break :blk .{
         vnniQuant(128, 128, enc),
@@ -87,17 +87,28 @@ const quant_table: [3]matmul_q_registry.QuantKernels = if (quant_enc_raw == 0) .
     };
 };
 
+/// The tier's three packed f32 GEMM variants (small/medium/large).
+const matmul_table: [3]matmul_registry.F32Kernels = if (f32_gemm == .sme) .{
+    matmul_registry.smeKernels(128, 160, 128, lanes),
+    matmul_registry.smeKernels(256, 160, 256, lanes),
+    matmul_registry.smeKernels(512, 288, 512, lanes),
+} else .{
+    matmul_shapes.candidateFor(matmul_registry.candidates, .small, lanes).kernels,
+    matmul_shapes.candidateFor(matmul_registry.candidates, .medium, lanes).kernels,
+    matmul_shapes.candidateFor(matmul_registry.candidates, .large, lanes).kernels,
+};
+
 /// Synthetic target used to drive the comptime registry selectors. The lane width
 /// is fixed by the tier; caches are irrelevant here because the packed-GEMM tile
 /// (L2-budget) decision is deferred to the main module at runtime.
 const tier_target = cpu_target.Target{
     .simd_width = cpu_target.simdWidthFromF32Lanes(lanes),
     .preferred_f32_lanes = lanes,
-    .quant_dot = switch (quant_enc_raw) {
-        1 => .vex,
-        2 => .evex,
-        3, 4 => .sdot,
-        else => .f32,
+    .quant_dot = switch (quant_gemm) {
+        .avx_vnni => .vex,
+        .avx512_vnni => .evex,
+        .dotprod, .i8mm => .sdot,
+        .f32_accumulate => .f32,
     },
     .caches = .{},
 };
@@ -106,11 +117,7 @@ const table: dt.DispatchTable = .{
     .abi_version = dt.ABI_VERSION,
     .lanes = @intCast(lanes),
 
-    .matmul = .{
-        matmul_shapes.candidateFor(matmul_registry.candidates, .small, lanes).kernels,
-        matmul_shapes.candidateFor(matmul_registry.candidates, .medium, lanes).kernels,
-        matmul_shapes.candidateFor(matmul_registry.candidates, .large, lanes).kernels,
-    },
+    .matmul = matmul_table,
     .matmul_q = quant_table,
 
     .matmul_nt = matmul_nt_registry.selectForTarget(tier_target).kernels,

@@ -18,6 +18,19 @@ pub const Tuning = struct {
 
     /// How far ahead to prefetch B along K (in rows).
     prefetch_k_dist: usize = 4,
+
+    /// Vector width the f32/f16 matvec accumulates with, when that should differ
+    /// from the ISA width. The loop is memory-bound, so what governs it is how
+    /// many independent loads it keeps in flight, not the native vector size:
+    /// on NEON, accumulating two registers' worth per step instead of one
+    /// measured 46 -> 65 GB/s on VGG-19's classifier. 0 means "same as `lanes`".
+    ///
+    /// The kernel keeps `nr == 2 * lanes`, so its row tile widens to match.
+    acc_lanes: usize = 0,
+
+    pub fn accLanes(t: Tuning) usize {
+        return if (t.acc_lanes != 0) t.acc_lanes else t.lanes;
+    }
 };
 
 pub const MatvecFn = *const fn (params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) types.BackendError!void;
@@ -53,7 +66,9 @@ pub const Candidate = struct {
 };
 
 fn kernelsFor(comptime t: Tuning, comptime dot_enc: matvec_q.DotEnc) Kernels {
-    const K = matvec_tuned.Kernel(t);
+    // The quantized kernel below stays at the ISA width; only the f32/f16 loop
+    // trades register pressure for loads in flight.
+    const K = matvec_tuned.Kernel(.{ .nr = 2 * t.accLanes(), .lanes = t.accLanes(), .nc = t.nc, .prefetch_k_dist = t.prefetch_k_dist });
     const Q8_0 = matvec_q.MatvecKernel(.{ .lanes = t.lanes, .dot_enc = dot_enc });
     return .{
         .tuning = t,
@@ -67,9 +82,12 @@ fn kernelsFor(comptime t: Tuning, comptime dot_enc: matvec_q.DotEnc) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .simd128, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = 128, .prefetch_k_dist = 4 }, .f32) },
-    .{ .id = .simd256, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = 256, .prefetch_k_dist = 4 }, .f32) },
-    .{ .id = .simd512, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = 256, .prefetch_k_dist = 4 }, .f32) },
+    // `nc` is how much of a B row one pass consumes, so it wants to cover a whole
+    // row of whatever tile B arrives in — short of that, every k still jumps.
+    // 256 matched the program tiler's usual width; past it nothing more is won.
+    .{ .id = .simd128, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4, .acc_lanes = 8 }, .f32) },
+    .{ .id = .simd256, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, .f32) },
+    .{ .id = .simd512, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, .f32) },
 };
 
 fn candidateForId(id: VariantId) Candidate {
@@ -98,9 +116,9 @@ pub fn selectForTarget(target: cpu_target.Target) Candidate {
 
 fn candidateForIdDot(id: VariantId, comptime enc: matvec_q.DotEnc) Candidate {
     return switch (id) {
-        .simd128 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = 128, .prefetch_k_dist = 4 }, enc) },
-        .simd256 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = 256, .prefetch_k_dist = 4 }, enc) },
-        .simd512 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = 256, .prefetch_k_dist = 4 }, enc) },
+        .simd128 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4, .acc_lanes = 8 }, enc) },
+        .simd256 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, enc) },
+        .simd512 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, enc) },
     };
 }
 

@@ -60,7 +60,12 @@ pub fn fillDefaultTileShape(policy: plan_mod.TilePolicy, dtype: types.DType, sha
 
     const m: usize = shape[shape.len - 2];
     const n: usize = shape[shape.len - 1];
-    const t2: [2]usize = plan_mod.chooseTileShape2DSquare(policy, m, n);
+    // Squareness is a rank-2 transpose concern; higher-rank trailing axes are
+    // independent and tile independently.
+    const t2: [2]usize = if (shape.len == 2)
+        plan_mod.chooseTileShape2DSquare(policy, m, n)
+    else
+        plan_mod.chooseTileShapeTrailing(policy, m, n);
     out[shape.len - 2] = t2[0];
     out[shape.len - 1] = t2[1];
     capTileToBinding(policy, dtype, out);

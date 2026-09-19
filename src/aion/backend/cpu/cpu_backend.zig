@@ -68,6 +68,9 @@ const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch
 pub const CpuBackend = struct {
     allocator: std.mem.Allocator,
 
+    /// Shared L2 per core cluster as detected at init, 0 when unknown.
+    l2_bytes: usize = 0,
+
     pool: ?thread_pool.ThreadPool = null,
     thread_count: usize = 1,
 
@@ -164,6 +167,7 @@ pub const CpuBackend = struct {
                 @panic("aion: kernel dispatch ABI version mismatch (rebuild tier objects)");
             }
             const l2_bytes: usize = topo_info.caches.l2_bytes;
+            self.l2_bytes = l2_bytes;
             self.matmul_f32 = kernel_dispatch.pickMatmul(table, l2_bytes);
             self.matmul_qx0 = kernel_dispatch.pickQuant(table, l2_bytes);
             self.matmul_nt = table.matmul_nt;
@@ -175,6 +179,7 @@ pub const CpuBackend = struct {
             self.fft = table.fft;
         } else {
             const target = cpu_target.fromCpuInfo(topo_info);
+            self.l2_bytes = target.caches.l2_bytes;
             self.matmul_f32 = matmul_registry.selectForTarget(target).kernels;
             self.matmul_qx0 = matmul_q_registry.selectForTarget(target).kernels;
             self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
@@ -291,16 +296,17 @@ pub const CpuBackend = struct {
         store: tensor_store.TensorStore,
         /// Per-store state, as the session contract says: conv weights packed
         /// for this store's tensor ids, reused across this model's runs.
-        packed_w: exec_conv.PackedWeightCache,
+        conv_cache: exec_conv.ConvCache,
 
         fn execute(ctx: *anyopaque, prog: *const executable.ExecutableProgram) ExecuteProgramError!void {
             const s: *CpuSession = @ptrCast(@alignCast(ctx));
-            return s.cpu.runProgram(prog, s.store, &s.packed_w);
+            const r = s.cpu.runProgram(prog, s.store, &s.conv_cache);
+            return r;
         }
 
         fn deinitSession(ctx: *anyopaque) void {
             const s: *CpuSession = @ptrCast(@alignCast(ctx));
-            s.packed_w.deinit();
+            s.conv_cache.deinit();
             s.cpu.allocator.destroy(s);
         }
 
@@ -316,7 +322,7 @@ pub const CpuBackend = struct {
     fn createSessionImpl(ctx: *anyopaque, store: tensor_store.TensorStore) tensor_store.StoreError!Session {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const s = self.allocator.create(CpuSession) catch return error.OutOfMemory;
-        s.* = .{ .cpu = self, .store = store, .packed_w = exec_conv.PackedWeightCache.init(self.allocator) };
+        s.* = .{ .cpu = self, .store = store, .conv_cache = exec_conv.ConvCache.init(self.allocator) };
         return .{ .ctx = @ptrCast(s), .vtable = &CpuSession.session_vtable };
     }
 
@@ -385,18 +391,18 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn execBlock(self: *Self, prog: *const executable.ExecutableProgram, block_id: executable.BlockId, store: tensor_store.TensorStore, packed_w: *exec_conv.PackedWeightCache) ExecuteProgramError!void {
+    fn execBlock(self: *Self, prog: *const executable.ExecutableProgram, block_id: executable.BlockId, store: tensor_store.TensorStore, cache: *exec_conv.ConvCache) ExecuteProgramError!void {
         const idx: usize = @intCast(block_id);
         if (idx >= prog.blocks.len) return error.InvalidArgument;
         for (prog.blocks[idx].steps) |block_step| {
-            self.execStep(prog, block_step.op, store, packed_w) catch |err| {
+            self.execStep(prog, block_step.op, store, cache) catch |err| {
                 diagnostic.current().recordStep("cpu", block_step, err);
                 return err;
             };
         }
     }
 
-    fn execStep(self: *Self, prog: *const executable.ExecutableProgram, step: executable.Step, store: tensor_store.TensorStore, packed_w: *exec_conv.PackedWeightCache) ExecuteProgramError!void {
+    fn execStep(self: *Self, prog: *const executable.ExecutableProgram, step: executable.Step, store: tensor_store.TensorStore, cache: *exec_conv.ConvCache) ExecuteProgramError!void {
         switch (step) {
             .MatMulTiled => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
@@ -437,7 +443,8 @@ pub const CpuBackend = struct {
                     .depthwise_conv1d = self.depthwise_conv1d,
                     .depthwise_conv2d = self.depthwise_conv2d,
                     .matmul_scratch = self.matmul_scratch_f32,
-                    .packed_w = packed_w,
+                    .cache = cache,
+                    .l2_bytes = self.l2_bytes,
                 };
                 try exec_conv.execConv1DTiled(&conv_ctx, s, store);
             },
@@ -459,7 +466,8 @@ pub const CpuBackend = struct {
                     .depthwise_conv1d = self.depthwise_conv1d,
                     .depthwise_conv2d = self.depthwise_conv2d,
                     .matmul_scratch = self.matmul_scratch_f32,
-                    .packed_w = packed_w,
+                    .cache = cache,
+                    .l2_bytes = self.l2_bytes,
                 };
                 try exec_conv.execConv2DTiled(&conv_ctx, s, store);
             },
@@ -524,10 +532,10 @@ pub const CpuBackend = struct {
                 const count: usize = @intCast(s.output_count);
                 if (count > executable.MAX_CONTROL_OUTPUTS) return error.InvalidArgument;
                 if (take_then) {
-                    try self.execBlock(prog, s.then_block, store, packed_w);
+                    try self.execBlock(prog, s.then_block, store, cache);
                     try copyTensorLists(store, s.outputs[0..count], s.then_outputs[0..count]);
                 } else {
-                    try self.execBlock(prog, s.else_block, store, packed_w);
+                    try self.execBlock(prog, s.else_block, store, cache);
                     try copyTensorLists(store, s.outputs[0..count], s.else_outputs[0..count]);
                 }
             },
@@ -546,7 +554,7 @@ pub const CpuBackend = struct {
                         }
                     }
 
-                    try self.execBlock(prog, s.body_block, store, packed_w);
+                    try self.execBlock(prog, s.body_block, store, cache);
                     try swapTensorLists(store, s.carried[0..carried_count], s.body_carried_outputs[0..carried_count]);
 
                     if (!s.check_before) {
@@ -626,7 +634,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn runProgram(self: *Self, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore, packed_w: *exec_conv.PackedWeightCache) ExecuteProgramError!void {
+    fn runProgram(self: *Self, prog: *const executable.ExecutableProgram, store: tensor_store.TensorStore, cache: *exec_conv.ConvCache) ExecuteProgramError!void {
         const invocation = self.profile_invocations;
         self.profile_invocations +|= 1;
         const config = self.profile_config;
@@ -642,7 +650,7 @@ pub const CpuBackend = struct {
             if (trace_exec) {
                 std.debug.print("[aion][exec] step {d}/{d}: {s}\n", .{ step_i, prog.steps.len, @tagName(step.op) });
             }
-            self.execStep(prog, step.op, store, packed_w) catch |e| {
+            self.execStep(prog, step.op, store, cache) catch |e| {
                 diagnostic.current().recordStep("cpu", step, e);
                 if (trace_exec) {
                     std.debug.print("[aion][exec] step {d} failed: {s} err={s}\n", .{ step_i, @tagName(step.op), @errorName(e) });

@@ -165,6 +165,21 @@ pub fn chooseTileShape1D(policy: TilePolicy, n: usize) [1]usize {
     return .{@max(@as(usize, 1), t)};
 }
 
+/// Tile for the two trailing axes of a rank-3+ tensor.
+///
+/// These axes are unrelated: for an NHWC activation they are a spatial extent
+/// and a channel count. Squaring them ties the spatial tile to the channel
+/// count, so a 3-channel image input gets 3-wide tiles — and since tiling
+/// propagates, so does every tensor downstream of it. Cap each axis on its own
+/// instead, which is what the GPU branch below already does.
+pub fn chooseTileShapeTrailing(policy: TilePolicy, m: usize, n: usize) [2]usize {
+    // Vector-like shapes keep the rank-2 treatment; `base_1d` exists for them.
+    if (m <= 1 or n <= 1) return chooseTileShape2DSquare(policy, m, n);
+    const tm: usize = @max(@as(usize, 1), @min(m, policy.base_square_2d));
+    const tn: usize = @max(@as(usize, 1), @min(n, policy.base_square_2d));
+    return .{ tm, tn };
+}
+
 pub fn chooseTileShape2DSquare(policy: TilePolicy, m: usize, n: usize) [2]usize {
     // Default to square tiles for ease of transpose materialization, but avoid
     // pathological tiling for skinny matrices (e.g. [1, 256]) where a square

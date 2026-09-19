@@ -159,6 +159,8 @@ pub const Matmul = struct {
     /// init. Owned here; freed in `deinit`.
     arena: std.heap.ArenaAllocator,
     generated: []const Generated,
+    /// The implicit-GEMM conv kernels, rendered into the same arena.
+    generated_conv: []const Generated,
 
     /// Pooled f32 scratch holding one dequantized B tile [k, n] for the q8_0-B
     /// GEMM path. Grows monotonically; freed in `deinit`.
@@ -168,7 +170,8 @@ pub const Matmul = struct {
     pub fn init(allocator: std.mem.Allocator) Matmul {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const generated = configs.generate(arena.allocator());
-        return .{ .tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated };
+        const generated_conv = configs.generateConv(arena.allocator());
+        return .{ .tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated, .generated_conv = generated_conv };
     }
     pub fn deinit(self: *Matmul) void {
         self.tune.deinit();

@@ -38,7 +38,15 @@ pub fn sharedBytes(cfg: MatmulConfig) u32 {
     return (cfg.bm * cfg.bk + cfg.bk * cfg.bn) * 4;
 }
 
+/// Where the kernel's A operand comes from.
+///
+/// `conv` is this same register-blocked GEMM over an A it never materializes:
+/// A[m, k] is the im2col of the activation, gathered in the cooperative load.
+/// A conv weight is already `[kh*kw*c_in, c_out]` row-major, so B is untouched.
+pub const Kind = enum { gemm, conv };
+
 pub const MatmulConfig = struct {
+    kind: Kind = .gemm,
     bm: u32, // C block rows (one workgroup computes bm×bn of C)
     bn: u32, // C block cols
     bk: u32, // K-slab depth staged through shared memory
@@ -87,7 +95,8 @@ fn validate(comptime cfg: MatmulConfig) void {
 }
 
 pub fn entryName(comptime cfg: MatmulConfig) [:0]const u8 {
-    return std.fmt.comptimePrint("mm_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}", .{
+    return std.fmt.comptimePrint("{s}_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}", .{
+        if (cfg.kind == .conv) "cv" else "mm",
         cfg.bm,                          cfg.bn,                               cfg.bk,                              cfg.tm, cfg.tn,
         if (cfg.vec4_load) "v" else "s", if (cfg.double_buffer) "_db" else "", if (cfg.bounds_check) "" else "_nb",
     });
@@ -99,6 +108,7 @@ const swiz = [4][]const u8{ "x", "y", "z", "w" };
 
 /// WGSL for A's contiguous vec4 at (gr, gk). Fast path: 4 in-bounds elements.
 fn aVec4(cfg: MatmulConfig) []const u8 {
+    if (cfg.kind == .conv) return "im2col_vec4(gr, gk)";
     return if (cfg.vec4_load)
         "a[(gr * a_row + gk) / 4u]"
     else
@@ -112,6 +122,7 @@ fn bVec4(cfg: MatmulConfig) []const u8 {
 }
 /// WGSL for a single A scalar at column offset `off` (per-lane edge fallback).
 fn aScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
+    if (cfg.kind == .conv) return w.fmt("im2col_at(gr, gk + {d}u)", .{off});
     return if (cfg.vec4_load)
         w.fmt("a[(gr * a_row + gk + {d}u) / 4u][(gr * a_row + gk + {d}u) % 4u]", .{ off, off })
     else
@@ -127,18 +138,69 @@ fn bScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
 // ---- module scaffolding ----------------------------------------------------
 
 fn header(w: *Wgsl, cfg: MatmulConfig) void {
-    w.lit("struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32> };");
     const ab_ty = if (cfg.vec4_load) "array<vec4<f32>>" else "array<f32>";
-    w.line("@group(0) @binding(0) var<storage, read> a: {s};", .{ab_ty});
-    w.line("@group(0) @binding(1) var<storage, read> b: {s};", .{ab_ty});
-    w.lit("@group(0) @binding(2) var<storage, read_write> cmat: array<f32>;");
-    w.lit("@group(0) @binding(3) var<uniform> p: Params;");
+    if (cfg.kind == .conv) {
+        // Conv geometry rides in the same uniform, and bias takes a storage slot,
+        // so the bindings match the direct kernel's (x, w, bias, out, params).
+        w.lit("struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32>,");
+        w.lit("                ow_out: u32, h_in: u32, w_in: u32, c_in: u32,");
+        w.lit("                kh: u32, kw: u32, x_base: u32, pad_top: u32,");
+        w.lit("                pad_left: u32, stride_h: u32, stride_w: u32, dil_h: u32,");
+        w.lit("                dil_w: u32, has_bias: u32, base_h: u32, base_w: u32 };");
+        // A is gathered one activation at a time, so it is always scalar-addressed;
+        // B is the weight matrix and still takes the 128-bit path when aligned.
+        w.lit("@group(0) @binding(0) var<storage, read> a: array<f32>;");
+        w.line("@group(0) @binding(1) var<storage, read> b: {s};", .{ab_ty});
+        w.lit("@group(0) @binding(2) var<storage, read> bias: array<f32>;");
+        w.lit("@group(0) @binding(3) var<storage, read_write> cmat: array<f32>;");
+        w.lit("@group(0) @binding(4) var<uniform> p: Params;");
+    } else {
+        w.lit("struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32> };");
+        w.line("@group(0) @binding(0) var<storage, read> a: {s};", .{ab_ty});
+        w.line("@group(0) @binding(1) var<storage, read> b: {s};", .{ab_ty});
+        w.lit("@group(0) @binding(2) var<storage, read_write> cmat: array<f32>;");
+        w.lit("@group(0) @binding(3) var<uniform> p: Params;");
+    }
     // Different invocations stage adjacent rows. Scalar storage gives each
     // writer a separate memory location; vector-component stores can lower to
     // a read/modify/write of the whole vector (notably on Metal).
     w.line("var<workgroup> As: array<f32, {d}>;", .{cfg.bm * cfg.bk});
     w.line("var<workgroup> Bs: array<vec4<f32>, {d}>;", .{cfg.bVecs()});
+    if (cfg.kind == .conv) im2colFns(w);
     w.blank();
+}
+
+/// The two im2col readers — the whole difference between this and the GEMM.
+/// A[m, k] is the activation at `(m -> oh, ow)` offset by `(k -> kh, kw, c_in)`,
+/// or zero where the window falls outside the image.
+fn im2colFns(w: *Wgsl) void {
+    w.blank();
+    w.open("fn im2col_at(m: u32, k: u32) -> f32", .{});
+    w.lit("let kwc = p.kw * p.c_in;");
+    w.lit("let ih = i32((p.base_h + m / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
+    w.lit("let iw = i32((p.base_w + m % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
+    w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
+    w.lit("return 0.0;");
+    w.close();
+    w.lit("return a[p.x_base + (u32(ih) * p.w_in + u32(iw)) * p.c_in + (k % p.c_in)];");
+    w.close();
+    w.blank();
+    // Four consecutive k stay within one (kh, kw) tap unless the channel run
+    // wraps, and channels are contiguous, so the common case is one 128-bit read.
+    w.open("fn im2col_vec4(m: u32, k: u32) -> vec4<f32>", .{});
+    w.lit("let ci = k % p.c_in;");
+    w.open("if (ci + 3u < p.c_in)", .{});
+    w.lit("let kwc = p.kw * p.c_in;");
+    w.lit("let ih = i32((p.base_h + m / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
+    w.lit("let iw = i32((p.base_w + m % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
+    w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
+    w.lit("return vec4<f32>(0.0);");
+    w.close();
+    w.lit("let base = p.x_base + (u32(ih) * p.w_in + u32(iw)) * p.c_in + ci;");
+    w.lit("return vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);");
+    w.close();
+    w.lit("return vec4<f32>(im2col_at(m, k), im2col_at(m, k + 1u), im2col_at(m, k + 2u), im2col_at(m, k + 3u));");
+    w.close();
 }
 
 /// Thread/tile index setup + zeroed accumulator registers. As is transposed
@@ -146,7 +208,7 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
 fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
     const cols = cfg.bn / cfg.tn;
     w.lit("let M = p.dims.x; let N = p.dims.y; let K = p.dims.z;");
-    w.lit("let a_row = p.strides.x; let b_row = p.strides.y;");
+    if (cfg.kind == .conv) w.lit("let b_row = p.strides.y;") else w.lit("let a_row = p.strides.x; let b_row = p.strides.y;");
     w.line("let block_row = wid.y * {d}u;", .{cfg.bm});
     w.line("let block_col = wid.x * {d}u;", .{cfg.bn});
     w.line("let thread_col = lidx % {d}u;", .{cols});
@@ -404,11 +466,17 @@ fn writeOneFn(w: *Wgsl, cfg: MatmulConfig) void {
         w.lit("return;");
         w.close();
     }
+    w.lit("var v = value;");
+    if (cfg.kind == .conv) {
+        w.open("if (p.has_bias != 0u)", .{});
+        w.lit("v = v + bias[c];");
+        w.close();
+    }
     w.lit("let idx = r * p.strides.z + c;");
     w.open("if (p.ab.y == 0.0)", .{});
-    w.lit("cmat[idx] = p.ab.x * value;");
+    w.lit("cmat[idx] = p.ab.x * v;");
     w.otherwise();
-    w.lit("cmat[idx] = p.ab.x * value + p.ab.y * cmat[idx];");
+    w.lit("cmat[idx] = p.ab.x * v + p.ab.y * cmat[idx];");
     w.close();
     w.close();
 }
@@ -444,3 +512,4 @@ pub fn gen(arena: std.mem.Allocator, comptime cfg: MatmulConfig) Generated {
 
 // The config MENU lives in configs.zig — tuning policy, kept separate from this
 // codegen mechanism. The backend renders each config's WGSL once at init.
+

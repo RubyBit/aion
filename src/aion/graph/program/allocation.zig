@@ -20,8 +20,13 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     mgr: *manager_mod.StorageManager,
     policy: plan.TilePolicy,
+    /// The device this program targets, part of a derived weight's identity.
+    device: manager_mod.DeviceRef,
     value_tensor: []TensorId,
     value_has_tensor: []bool,
+    /// Per value: bound to a weight whose bytes are fixed for the program's
+    /// lifetime. The compiler repacks those once instead of on every run.
+    value_is_param: []const bool,
     owned_tensors: *std.ArrayList(TensorId),
 
     pub fn allocTensor(self: *Context, dtype: types.DType, shape: []const usize, tile_shape: []const usize) Error!TensorId {

@@ -483,7 +483,7 @@ fn tryExecConv1DImplicitGemmTileNative(
             .kc = kc,
             .nc = matmul_oc.tuning.nc,
         };
-        packed_ws[oc_ti] = try getOrCreatePackedWeights(matmul_oc, key, w_vals);
+        packed_ws[oc_ti] = try getOrCreatePackedWeights(ctx.packed_w, matmul_oc, key, w_vals);
 
         if (bias_present) {
             const b_id: tensor_store.TensorId = s.bias.?;
@@ -1480,7 +1480,7 @@ fn execConv1DImplicitGemm(
             const w_block_vals: []align(1) const f32 = w_block[0 .. k_dim_g * oc_count];
 
             const key_g: PackedWeightKey = .{
-                .w_id = s.w,
+                    .w_id = s.w,
                 .oc_start = oc_start,
                 .k_dim = k_dim_g,
                 .c_out = oc_count,
@@ -1489,7 +1489,7 @@ fn execConv1DImplicitGemm(
                 .nc = ctx.matmul_f32.tuning.nc,
             };
 
-            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(matmul, key_g, w_block_vals);
+            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(ctx.packed_w, matmul, key_g, w_block_vals);
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
         }

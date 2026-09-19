@@ -24,7 +24,7 @@ const StorageError = storage.StorageError;
 const DeviceRef = storage.DeviceRef;
 const TensorId = u32;
 
-pub const Kind = enum { column_concat };
+pub const Kind = enum { column_concat, retile };
 
 /// One source's bytes inside a derived tensor, in packed block space: each row of the
 /// derived tensor holds `row_stride` blocks, of which this source owns

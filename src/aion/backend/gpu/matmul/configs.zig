@@ -40,11 +40,30 @@ pub const configs = [_]MatmulConfig{
     .{ .bm = 256, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true },
 };
 
+/// Implicit-GEMM conv menu. The same register-blocked kernel, with A gathered
+/// from the activation instead of read as a matrix, so the blocks that work for
+/// a GEMM work here; `bn` is picked against the output-channel count, which for
+/// a conv is usually 64-512. A scalar config keeps a fallback when the weight
+/// row is not 16-byte aligned.
+pub const conv_configs = [_]MatmulConfig{
+    .{ .kind = .conv, .bm = 128, .bn = 128, .bk = 16, .tm = 8, .tn = 8, .vec4_load = true, .double_buffer = true },
+    .{ .kind = .conv, .bm = 128, .bn = 64, .bk = 16, .tm = 8, .tn = 4, .vec4_load = true, .double_buffer = true },
+    .{ .kind = .conv, .bm = 64, .bn = 64, .bk = 16, .tm = 4, .tn = 4, .vec4_load = true },
+    .{ .kind = .conv, .bm = 64, .bn = 64, .bk = 16, .tm = 4, .tn = 4, .vec4_load = false },
+};
+
 /// Render every menu config's WGSL into `arena` (called once at backend init). The
 /// config set is comptime, so `codegen.gen` still specializes/validates per config;
 /// only the WGSL string is built at runtime. Returns an arena-owned slice.
 pub fn generate(arena: std.mem.Allocator) []const codegen.Generated {
     var arr = arena.alloc(codegen.Generated, configs.len) catch @panic("codegen: OOM");
     inline for (configs, 0..) |cfg, i| arr[i] = codegen.gen(arena, cfg);
+    return arr;
+}
+
+/// The conv menu's WGSL, rendered alongside the GEMM menu at backend init.
+pub fn generateConv(arena: std.mem.Allocator) []const codegen.Generated {
+    var arr = arena.alloc(codegen.Generated, conv_configs.len) catch @panic("codegen: OOM");
+    inline for (conv_configs, 0..) |cfg, i| arr[i] = codegen.gen(arena, cfg);
     return arr;
 }

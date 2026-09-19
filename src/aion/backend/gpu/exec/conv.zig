@@ -11,10 +11,10 @@
 //!   - w and bias are single packed tiles;
 //!   - pad_mode zero or reflect (reflect needs input extent >= 2).
 //!
-//! Performance note: this is the correctness base case. The CPU backend's
-//! implicit-GEMM path has no GPU counterpart yet — when conv shows up hot on a
-//! GPU profile, stage patches into shared memory or lower onto the existing
-//! GEMM pipelines.
+//! A rank-4, single-group, zero-padded conv instead lowers onto the generated
+//! implicit-GEMM kernels (`matmul/codegen.zig`, `kind = .conv`): same register
+//! blocking as the GEMM, with A gathered from the activation. The direct kernel
+//! stays as the general case — grouped, dilated-into-reflect, conv1d, depthwise.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -31,6 +31,58 @@ const Ctx = context.Ctx;
 const Frame = @import("../frame.zig").Frame;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const KernelDesc = pipelines.KernelDesc;
+const codegen = @import("../matmul/codegen.zig");
+const Generated = codegen.Generated;
+const matmul_exec = @import("matmul.zig");
+
+/// Uniform for the implicit-GEMM conv: the GEMM's own `Params` with the conv
+/// geometry appended, matching the struct `codegen.header` emits.
+const ConvGemmParams = extern struct {
+    m: u32,
+    n: u32,
+    k: u32,
+    dims3: u32 = 0,
+    a_row: u32 = 0,
+    b_row: u32,
+    c_row: u32,
+    strides3: u32 = 0,
+    alpha: f32 = 1.0,
+    beta: f32 = 0.0,
+    ab2: f32 = 0.0,
+    ab3: f32 = 0.0,
+    ow_out: u32,
+    h_in: u32,
+    w_in: u32,
+    c_in: u32,
+    kh: u32,
+    kw: u32,
+    x_base: u32,
+    pad_top: u32,
+    pad_left: u32,
+    stride_h: u32,
+    stride_w: u32,
+    dil_h: u32,
+    dil_w: u32,
+    has_bias: u32,
+    base_h: u32,
+    base_w: u32,
+};
+
+/// Widest block whose `bn` still fits the output-channel count, so a 64-channel
+/// layer does not pay for a 128-wide block it can only half fill.
+fn chooseConvConfig(generated: []const Generated, ctx: Ctx, c_out: usize, b_row_bytes: isize) ?usize {
+    var best: ?usize = null;
+    for (generated, 0..) |g, i| {
+        if (!matmul_exec.eligibleConfig(g.cfg, ctx.gpu.limits, 16, b_row_bytes)) continue;
+        if (g.cfg.bn > c_out) continue;
+        if (best) |bi| {
+            if (g.cfg.bn < generated[bi].cfg.bn) continue;
+            if (g.cfg.bn == generated[bi].cfg.bn and g.cfg.bm <= generated[bi].cfg.bm) continue;
+        }
+        best = i;
+    }
+    return best;
+}
 
 const conv_kernel: KernelDesc = .{ .name = "conv", .wgsl = @embedFile("../kernels/conv.wgsl") };
 
@@ -191,10 +243,10 @@ pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) Execut
         .pad_left = 0,
         .pad_mode = s.pad_mode,
     };
-    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3);
+    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, &.{});
 }
 
-pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2DTiled) ExecuteProgramError!void {
+pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2DTiled, generated: []const Generated) ExecuteProgramError!void {
     const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 4) return error.Unsupported;
@@ -213,7 +265,7 @@ pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2DTiled) Execut
         .pad_left = s.pad_left,
         .pad_mode = s.pad_mode,
     };
-    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 4);
+    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 4, generated);
 }
 
 fn execConv(
@@ -225,6 +277,7 @@ fn execConv(
     bias_id: ?executable.TensorId,
     geo_in: Geometry,
     rank: usize,
+    generated: []const Generated,
 ) ExecuteProgramError!void {
     const hs = ctx.store;
     const out_meta = hs.meta(out_id) catch return error.ExecutionFailed;
@@ -276,6 +329,17 @@ fn execConv(
     defer hs.releaseConst(dw.token);
     if (!context.storageBindingFits(ctx, dw.len)) return error.Unsupported;
     if (context.packedElems(dw.rank, dw.shape_mem[0..rank], dw.strides_mem[0..rank]) == null) return error.Unsupported;
+
+    // Implicit GEMM needs a plain 2-D convolution: a group splits A by output
+    // column, and reflect padding is not a zero-fill, so neither fits the kernel.
+    const gemm_idx: ?usize = if (rank == 4 and geo.groups == 1 and geo.pad_mode == .zero and generated.len != 0)
+        chooseConvConfig(generated, ctx, c_out, @intCast(c_out * @sizeOf(f32)))
+    else
+        null;
+    const gemm_built: ?pipelines.Built = if (gemm_idx) |gi|
+        (ctx.pipes.get(generated[gi].desc, generated[gi].entry) catch null)
+    else
+        null;
 
     const use_dw = depthwiseOk(geo, c_in_g, c_out, rank) and
         ctx.gpu.limits.max_shared_bytes >= DW_SHARED_BYTES;
@@ -336,6 +400,57 @@ fn execConv(
         const c_cnt = dout.shape_mem[rank - 1];
         const out_total = oh_cnt * ow_cnt * c_cnt;
         if (out_total == 0) continue;
+
+        // Implicit GEMM writes C[pixel, channel] straight into the tile, so it
+        // needs the tile to hold every output channel; a channel-split tile has
+        // no column origin to offset the weight by.
+        if (gemm_built) |gb| {
+            const base_c = coords[rank - 1] * out_meta.tile_shape[rank - 1];
+            if (base_c == 0 and c_cnt == c_out) {
+                const m_dim = std.math.cast(u32, oh_cnt * ow_cnt) orelse return error.Unsupported;
+                const n_dim = std.math.cast(u32, c_out) orelse return error.Unsupported;
+                const k_dim = std.math.cast(u32, geo.kh * geo.kw * geo.c_in) orelse return error.Unsupported;
+                const gp: ConvGemmParams = .{
+                    .m = m_dim,
+                    .n = n_dim,
+                    .k = k_dim,
+                    .b_row = n_dim,
+                    .c_row = @intCast(c_cnt),
+                    .ow_out = @intCast(ow_cnt),
+                    .h_in = @intCast(geo.h_in),
+                    .w_in = @intCast(geo.w_in),
+                    .c_in = @intCast(geo.c_in),
+                    .kh = @intCast(geo.kh),
+                    .kw = @intCast(geo.kw),
+                    .x_base = std.math.cast(u32, x_base) orelse return error.Unsupported,
+                    .pad_top = @intCast(geo.pad_top),
+                    .pad_left = @intCast(geo.pad_left),
+                    .stride_h = @intCast(geo.stride_h),
+                    .stride_w = @intCast(geo.stride_w),
+                    .dil_h = @intCast(geo.dil_h),
+                    .dil_w = @intCast(geo.dil_w),
+                    .has_bias = @intFromBool(bias_tile != null),
+                    .base_h = @intCast(coords[1] * out_meta.tile_shape[1]),
+                    .base_w = @intCast(coords[2] * out_meta.tile_shape[2]),
+                };
+                const cfg = generated[gemm_idx.?].cfg;
+                const gx = context.ceilDiv(n_dim, cfg.bn);
+                const gy = context.ceilDiv(m_dim, cfg.bm);
+                if (gx <= context.MAX_GROUPS_PER_DIM and gy <= context.MAX_GROUPS_PER_DIM) {
+                    const gbias = if (bias_tile) |bt| ctx.devmem.bufferFor(bt.handle).? else ctx.devmem.bufferFor(dw.handle).?;
+                    const gbias_len = if (bias_tile) |bt| bt.len else dw.len;
+                    const gbufs = [_]c.WGPUBuffer{
+                        x_buf,
+                        ctx.devmem.bufferFor(dw.handle).?,
+                        gbias,
+                        ctx.devmem.bufferFor(dout.handle).?,
+                    };
+                    const gsizes = [_]u64{ x_len, dw.len, gbias_len, dout.len };
+                    try frame.recordCompute(gb, &gbufs, &gsizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
+                    continue;
+                }
+            }
+        }
 
         const params: ConvParams = .{
             .x_base = std.math.cast(u32, x_base) orelse return error.Unsupported,

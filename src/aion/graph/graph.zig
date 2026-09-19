@@ -51,6 +51,11 @@ pub const Value = struct {
 
     /// Optional binding to an externally managed tensor.
     external: ?ExternalId = null,
+
+    /// True when `external` is a weight rather than a buffer the caller rewrites
+    /// between runs, so a pass may derive a repacked copy of it. False by default:
+    /// a binder that omits it pays for a copy, it does not read stale bytes.
+    external_is_param: bool = false,
 };
 
 /// Stable op ids shared by graph ops and serialized package node ops.
@@ -688,6 +693,7 @@ pub const Graph = struct {
                 .name = if (v.name) |n| (aa.dupe(u8, n) catch return GraphError.OutOfMemory) else null,
                 .producer = v.producer,
                 .external = v.external,
+                .external_is_param = v.external_is_param,
             }) catch return GraphError.OutOfMemory;
         }
         for (self.nodes.items) |n| {
@@ -786,6 +792,14 @@ pub const Graph = struct {
         const idx: usize = @intCast(value);
         if (idx >= self.values.items.len) return GraphError.InvalidArgument;
         self.values.items[idx].external = external;
+    }
+
+    /// Bind `value` to a weight: `bindExternal` plus the promise that the bytes
+    /// stay fixed for the program's lifetime, which is what lets the compiler
+    /// repack it once instead of on every run.
+    pub fn bindExternalParam(self: *Self, value: ValueId, external: ExternalId) GraphError!void {
+        try self.bindExternal(value, external);
+        self.values.items[@intCast(value)].external_is_param = true;
     }
 
     fn addNodeInternal(self: *Self, op: Op, inputs: []const ValueId) GraphError!ValueId {

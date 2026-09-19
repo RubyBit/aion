@@ -443,7 +443,7 @@ pub const Builder = struct {
 
     fn paramInner(self: *Self, t: api_tensor.Tensor, param_name: ?[]const u8, kind: ParamKind) Error!TensorRef {
         const v: ValueId = try self.graph.addInput(t.dtype, t.shape);
-        try self.graph.bindExternal(v, @intCast(t.id));
+        try self.graph.bindExternalParam(v, @intCast(t.id));
         self.params.put(self.allocator, v, kind) catch return Error.OutOfMemory;
 
         // Give parameters (external-bound inputs) a stable debug name so loaded

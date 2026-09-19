@@ -3,6 +3,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const types = @import("../../backend/types.zig");
+const derived = @import("../../storage/derived.zig");
 const storage = @import("../../storage/storage.zig");
 const executable = @import("../../runtime/executable.zig");
 const api_tiling = @import("../../api/tiling.zig");
@@ -1327,6 +1328,10 @@ pub fn compileGraph(
     defer allocator.free(value_has_tensor);
     @memset(value_has_tensor, false);
 
+    const value_is_param: []bool = try allocator.alloc(bool, v_count);
+    defer allocator.free(value_is_param);
+    @memset(value_is_param, false);
+
     var owned_tensors: std.ArrayList(TensorId) = .empty;
     errdefer {
         for (owned_tensors.items) |tid| mgr.releaseTensorData(tid) catch {};
@@ -1347,6 +1352,7 @@ pub fn compileGraph(
 
             value_tensor[i] = tid;
             value_has_tensor[i] = true;
+            value_is_param[i] = v.external_is_param;
         }
     }
 
@@ -1360,7 +1366,7 @@ pub fn compileGraph(
         blocks.deinit(allocator);
     }
 
-    var ctx: allocation.Context = .{ .allocator = allocator, .mgr = mgr, .policy = target.tiles, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor, .owned_tensors = &owned_tensors };
+    var ctx: allocation.Context = .{ .allocator = allocator, .mgr = mgr, .policy = target.tiles, .device = target.device, .value_tensor = value_tensor, .value_has_tensor = value_has_tensor, .value_is_param = value_is_param, .owned_tensors = &owned_tensors };
 
     // Lower nodes in order, skipping any whose results nothing asked for.
     const live: []bool = try liveNodes(allocator, graph);
@@ -3059,10 +3065,47 @@ fn ensureTilingScalarMaybeRetile(
         }
     }
 
+    // A weight's bytes never change, so its retile is loop-invariant: build it
+    // once now and leave `value_tensor` pointing at the original, so a consumer
+    // wanting the original tiling still gets it without a copy.
+    if (value_index < ctx.value_is_param.len and ctx.value_is_param[value_index]) {
+        return deriveRetiledParam(ctx, mgr, cur, dtype, shape, want_tile);
+    }
+
     // Allocate new tensor with desired tiling and insert a scalar retile copy.
     const new_tid: TensorId = try ctx.allocTensor(dtype, shape, want_tile);
     try appendStepChecked(allocator, mgr, steps, .{ .ReTileCopyScalar = .{ .dst = new_tid, .src = cur } });
     ctx.value_tensor[value_index] = new_tid;
     ctx.value_has_tensor[value_index] = true;
     return new_tid;
+}
+
+/// Repack a weight into `want_tile` once, recorded as a derived weight.
+///
+/// Going through packed bytes reuses the storage layer's own definition of a
+/// tiling rather than restating it, and recording the provenance is what keeps a
+/// later weight swap and a read-back of the original working.
+fn deriveRetiledParam(
+    ctx: anytype,
+    mgr: *StorageManager,
+    src: TensorId,
+    dtype: types.DType,
+    shape: []const usize,
+    want_tile: []const usize,
+) CompileError!TensorId {
+    if (mgr.derivedFind(.retile, want_tile, ctx.device, &.{src})) |existing| return existing;
+
+    const bytes: usize = try (try mgr.getConst(src)).packedByteLen();
+    const buf: []u8 = ctx.allocator.alloc(u8, bytes) catch return CompileError.OutOfMemory;
+    defer ctx.allocator.free(buf);
+    try mgr.readPackedAtPlacement(src, buf);
+
+    const out: TensorId = try mgr.createTiledTensor(dtype, shape, want_tile, .{ .tile_alignment = ctx.policy.tile_alignment });
+    errdefer mgr.releaseTensorData(out) catch {};
+    try mgr.writePackedAtPlacement(out, buf);
+
+    // The repack is byte-identical, so the source occupies the result whole.
+    const view: derived.View = .{ .rows = 1, .row_stride = bytes, .offset = 0, .len = bytes, .block_bytes = 1 };
+    try mgr.derivedRecord(.retile, want_tile, ctx.device, out, &.{.{ .tid = src, .view = view }});
+    return out;
 }

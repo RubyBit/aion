@@ -73,6 +73,32 @@ pub fn build(b: *std.Build) void {
     const want_arm_multiversion: bool = multiversion and target.result.cpu.arch == .aarch64;
     const want_multiversion: bool = want_x86_multiversion or want_arm_multiversion;
 
+    // The aarch64 analogue of x86_64_v3: a defined ARCHITECTURE level rather than
+    // the build machine's core. ARMv8.2-A is the modern floor — every Neoverse
+    // (so every Graviton2+), every Apple Silicon part, and mainstream ARM phone
+    // cores since ~2018. It is also the level FEAT_DotProd is defined at, which is
+    // what lets the tiers below assume it.
+    //
+    // Built on `generic` and not on a vendor core: adding an architecture level on
+    // top of a specific model makes LLVM's tuning worse (measured ~10% slower conv
+    // than either alternative), while `generic` + a level is exactly the portable
+    // "run anywhere at or above this line" contract x86_64_v3 gives.
+    //
+    // ARMv8.0-only parts (Cortex-A53/A57/A72, Raspberry Pi 4) fall below this floor
+    // and need `-Dmultiversion=false`, the same deal x86 pre-Haswell gets.
+    const arm_floor: std.Target.aarch64.Feature = .v8_2a;
+    const armFloorQuery = struct {
+        fn make(base: std.Target.Query, extra: []const std.Target.aarch64.Feature, floor: std.Target.aarch64.Feature) std.Target.Query {
+            var q = base;
+            q.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic };
+            q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
+            q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
+            q.cpu_features_add.addFeature(@intFromEnum(floor));
+            for (extra) |f| q.cpu_features_add.addFeature(@intFromEnum(f));
+            return q;
+        }
+    }.make;
+
     // Portable-distribution floor for the main module. Only the registry kernels
     // (matmul/conv/quant) are dispatched to the tier objects; every non-registry
     // kernel (elementwise, activations, softmax, norms, RoPE, LSTM, the
@@ -87,6 +113,10 @@ pub fn build(b: *std.Build) void {
     // genuine v2-only CPU is pre-2013 and out of support. The registry kernels
     // still dispatch up to v3_vnni / v4 (AVX-512/VNNI) via the tiers.
     //
+    // aarch64 floors the same way, to `arm_floor` above; before that it floored
+    // only on x86 and an aarch64 multiversion build compiled the main module for
+    // the build machine's own core, which made the dispatch the only portable part.
+    //
     // For a plain native build (no floor, no dispatch — fastest local iteration),
     // pass `-Dmultiversion=false`.
     const main_target: std.Build.ResolvedTarget = if (want_x86_multiversion) blk: {
@@ -95,7 +125,10 @@ pub fn build(b: *std.Build) void {
         q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
         q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
         break :blk b.resolveTargetQuery(q);
-    } else target;
+    } else if (want_arm_multiversion)
+        b.resolveTargetQuery(armFloorQuery(target.query, &.{}, arm_floor))
+    else
+        target;
 
     const linkage = b.option(
         std.builtin.LinkMode,
@@ -241,9 +274,14 @@ pub fn build(b: *std.Build) void {
             TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant_enc, b.resolveTargetQuery(q));
         }
     } else if (want_arm_multiversion) {
-        // NEON is always 4-wide for f32; the only ISA differentiator is the int8
-        // path. quant_enc: 0 = f32-accumulate, 3 = FEAT_DotProd (sdot, grouped-by-4
-        // dot), 4 = FEAT_I8MM (smmla, int8 2×2 matrix-multiply — ~2x sdot on prefill).
+        // NEON f32 is a fixed 128-bit 4-lane FMA everywhere, so unlike x86 there is
+        // no lane-width axis: a tier buys the int8 encoding, on top of the shared
+        // ARMv8.2-A floor. quant_enc: 0 = f32-accumulate, 3 = FEAT_DotProd (sdot,
+        // grouped-by-4 dot), 4 = FEAT_I8MM (smmla, int8 2×2 matrix-multiply).
+        //
+        // The floor is not just the main module's: the tiers carry the hot f32
+        // matmul/conv kernels, and compiling those at plain ARMv8.0 instead cost
+        // ~9% single-thread and ~16% at 10 threads on VGG-19.
         const ArmTier = struct { name: []const u8, add: []const std.Target.aarch64.Feature, quant_enc: u8 };
         const tiers = [_]ArmTier{
             .{ .name = "arm_baseline", .add = &.{}, .quant_enc = 0 },
@@ -251,11 +289,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "arm_i8mm", .add = &.{ .dotprod, .i8mm }, .quant_enc = 4 },
         };
         for (tiers) |tier| {
-            var q = target.query;
-            q.cpu_model = .baseline;
-            q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
-            q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
-            for (tier.add) |f| q.cpu_features_add.addFeature(@intFromEnum(f));
+            const q = armFloorQuery(target.query, tier.add, arm_floor);
             TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, 4, tier.quant_enc, b.resolveTargetQuery(q));
         }
     }

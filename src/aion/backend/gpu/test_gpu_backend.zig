@@ -1482,6 +1482,79 @@ test "gpu backend: conv2d matches CPU" {
     try expectGpuMatchesCpu(buildConv2D, 1 * 5 * 10 * 5, 1e-4);
 }
 
+// The implicit-GEMM path is only chosen when the output is at least one block
+// wide (bn >= 64), so the small conv above never reaches it. These do.
+
+// VGG's interior shape: 3x3 stride 1 pad 1, both channel counts vec4-aligned.
+fn buildConv2DGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 9, 7, 64 }, &.{ 1, 9, 7, 64 }, 91);
+    const w = try makeInput(&g, mgr, &.{ 3, 3, 64, 64 }, &.{ 3, 3, 64, 64 }, 92);
+    const b = try makeInput(&g, mgr, &.{64}, &.{64}, 93);
+    const out = try g.addConv2D(x, w, b, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: conv2d implicit GEMM matches CPU" {
+    try expectGpuMatchesCpu(buildConv2DGemm, 1 * 9 * 7 * 64, 1e-4);
+}
+
+// VGG's first layer: c_in = 3, so every vec4 of K straddles a kernel tap and
+// the gather takes its per-element path.
+fn buildConv2DGemmRgb(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 8, 8, 3 }, &.{ 1, 8, 8, 3 }, 94);
+    const w = try makeInput(&g, mgr, &.{ 3, 3, 3, 64 }, &.{ 3, 3, 3, 64 }, 95);
+    const out = try g.addConv2D(x, w, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: conv2d implicit GEMM with unaligned channels matches CPU" {
+    try expectGpuMatchesCpu(buildConv2DGemmRgb, 1 * 8 * 8 * 64, 1e-4);
+}
+
+// Asymmetric stride/dilation/pad, and an M that is not a multiple of any block,
+// so the edge guards in both the gather and the store are exercised.
+fn buildConv2DGemmStrided(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 11, 13, 8 }, &.{ 1, 11, 13, 8 }, 96);
+    const w = try makeInput(&g, mgr, &.{ 3, 2, 8, 96 }, &.{ 3, 2, 8, 96 }, 97);
+    const b = try makeInput(&g, mgr, &.{96}, &.{96}, 98);
+    const out = try g.addConv2D(x, w, b, 2, 1, 1, 2, 1, 1, 2, 0, 1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: conv2d implicit GEMM strided and dilated matches CPU" {
+    try expectGpuMatchesCpu(buildConv2DGemmStrided, 1 * 6 * 13 * 96, 1e-4);
+}
+
+// A conv output tiles at `min(h, w)` per side, so an oblong feature map splits
+// along its long axis and the gather has to offset by the tile's origin. The
+// square cases above leave that origin at zero, which hides a wrong one.
+fn buildConv2DGemmTall(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 100, 32, 64 }, &.{ 1, 100, 32, 64 }, 101);
+    const w = try makeInput(&g, mgr, &.{ 3, 3, 64, 64 }, &.{ 3, 3, 64, 64 }, 102);
+    const out = try g.addConv2D(x, w, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: conv2d implicit GEMM over row-tiled output matches CPU" {
+    try expectGpuMatchesCpu(buildConv2DGemmTall, 1 * 100 * 32 * 64, 1e-4);
+}
+
+fn buildConv2DGemmWide(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 32, 100, 64 }, &.{ 1, 32, 100, 64 }, 103);
+    const w = try makeInput(&g, mgr, &.{ 3, 3, 64, 64 }, &.{ 3, 3, 64, 64 }, 104);
+    const out = try g.addConv2D(x, w, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+test "gpu backend: conv2d implicit GEMM over column-tiled output matches CPU" {
+    try expectGpuMatchesCpu(buildConv2DGemmWide, 1 * 32 * 100 * 64, 1e-4);
+}
+
 fn buildArgMax(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();

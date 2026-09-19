@@ -101,7 +101,7 @@ pub const Template = struct {
                     const shape = try file.resolveShapeTermsExprs(arena, self.dim_exprs, rec.shape_terms, optional);
                     g.values.items[idx] = .{ .dtype = rec.dtype, .shape = shape };
                     if (idx >= params.len or params[idx] == no_param) return Error.InvalidArgument;
-                    try g.bindExternal(id, @intCast(params[idx]));
+                    try g.bindExternalParam(id, @intCast(params[idx]));
                 },
                 // Produced: dtype and shape come from inference, which runs at compile.
                 .produced => {},

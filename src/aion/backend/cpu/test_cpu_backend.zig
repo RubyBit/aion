@@ -6005,3 +6005,80 @@ test "cpu backend: general gather matches a coordinate-wise reference" {
         }
     }
 }
+
+/// One conv over its own store, with `scale` distinguishing the weights.
+/// Returns max |out - reference|.
+fn convOnFreshStore(allocator: std.mem.Allocator, cpu: *cpu_backend_mod.CpuBackend, scale: f32) !f32 {
+    const h: usize = 4;
+    const w: usize = 4;
+    const c_in: usize = 4;
+    const c_out: usize = 8;
+    const x_len = h * w * c_in;
+    const w_len = 3 * 3 * c_in * c_out;
+    const y_len = h * w * c_out;
+
+    const x_buf = try allocator.alloc(u8, x_len * 4);
+    defer allocator.free(x_buf);
+    const w_buf = try allocator.alloc(u8, w_len * 4);
+    defer allocator.free(w_buf);
+    const x_vals = asF32Slice(x_buf);
+    const w_vals = asF32Slice(w_buf);
+    for (0..x_len) |i| x_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.1;
+    for (0..w_len) |i| w_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * scale;
+
+    const ref_buf = try allocator.alloc(u8, y_len * 4);
+    defer allocator.free(ref_buf);
+    const ref_vals = asF32Slice(ref_buf);
+    for (0..h) |oh| for (0..w) |ow| for (0..c_out) |oc| {
+        var acc: f32 = 0;
+        for (0..3) |kh| for (0..3) |kw| {
+            if (oh + kh < 1 or ow + kw < 1) continue;
+            const ih = oh + kh - 1;
+            const iw = ow + kw - 1;
+            if (ih >= h or iw >= w) continue;
+            for (0..c_in) |ic| {
+                acc += x_vals[((ih * w + iw) * c_in) + ic] * w_vals[(((kh * 3 + kw) * c_in + ic) * c_out) + oc];
+            }
+        };
+        ref_vals[((oh * w + ow) * c_out) + oc] = acc;
+    };
+
+    var sm = manager_mod.StorageManager.init(allocator);
+    defer sm.deinit();
+    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h, w, c_in }, &[_]usize{ 1, h, w, c_in }, .{ .tile_alignment = 64 });
+    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, &[_]usize{ 3, 3, c_in, c_out }, .{ .tile_alignment = 64 });
+    try sm.writeFromPackedScalar(x_tid, x_buf);
+    try sm.writeFromPackedScalar(w_tid, w_buf);
+
+    var g = graph_mod.Graph.init(allocator);
+    defer g.deinit();
+    const x_in = try g.addInput(.f32, &[_]usize{ 1, h, w, c_in });
+    const w_in = try g.addInput(.f32, &[_]usize{ 3, 3, c_in, c_out });
+    try g.bindExternal(x_in, @intCast(x_tid));
+    try g.bindExternal(w_in, @intCast(w_tid));
+    const y = try g.addConv2D(x_in, w_in, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    try g.setOutputs(&[_]graph_mod.ValueId{y});
+
+    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    defer prog.deinit();
+    try cpu.backend().executeProgram(&prog, sm.tensorStore());
+
+    const out_buf = try allocator.alloc(u8, y_len * 4);
+    defer allocator.free(out_buf);
+    try sm.readToPackedScalar(prog.outputs[0], out_buf);
+    var max_abs: f32 = 0;
+    for (asF32Slice(out_buf), ref_vals) |got, want| max_abs = @max(max_abs, @abs(got - want));
+    return max_abs;
+}
+
+test "cpu backend: packed conv weights are not shared between stores" {
+    // A tensor id only identifies a tensor inside its own store, so two models
+    // built the same way get the same ids. A weight cache that ignores which
+    // store an id came from hands the second model the first one's weights.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    try std.testing.expect(try convOnFreshStore(allocator, &cpu, 0.03) <= 1e-5);
+    try std.testing.expect(try convOnFreshStore(allocator, &cpu, -0.07) <= 1e-5);
+}

@@ -31,6 +31,9 @@ pub const ConvExecCtx = struct {
 
     // Per-thread scratch for matmul packing. May be empty in single-thread mode.
     matmul_scratch: [][]align(32) u8,
+
+    /// Packed weights for this backend, reused across runs of the same model.
+    packed_w: *PackedWeightCache,
 };
 
 pub const PackedWeightKey = struct {
@@ -99,26 +102,47 @@ pub fn addBiasRowsF32(
     }
 }
 
-var g_packed_w_mutex: std.Io.Mutex = .init;
-var g_packed_w_init: bool = false;
-var g_packed_w_cache: std.AutoHashMap(PackedWeightKey, PackedWeightEntry) = undefined;
+/// Packed conv weights, reused across runs of the same model.
+///
+/// Owned by the execution session, because `w_id` identifies a tensor only
+/// inside one store and a session is bound to one store. A cache any wider than
+/// that hands the second model built in a process the first one's weights.
+pub const PackedWeightCache = struct {
+    mutex: std.Io.Mutex = .init,
+    map: std.AutoHashMapUnmanaged(PackedWeightKey, PackedWeightEntry) = .empty,
+    allocator: std.mem.Allocator,
 
-fn ensurePackedWeightCacheInit() void {
-    if (g_packed_w_init) return;
-    g_packed_w_cache = std.AutoHashMap(PackedWeightKey, PackedWeightEntry).init(std.heap.page_allocator);
-    g_packed_w_init = true;
+    pub fn init(allocator: std.mem.Allocator) PackedWeightCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *PackedWeightCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |entry| self.allocator.free(entry.blocks);
+        self.map.deinit(self.allocator);
+    }
+};
+
+/// A previously packed weight, without materializing anything to pack.
+///
+/// Gathering the weight block costs as much as the pack itself, so a caller that
+/// asks this first pays neither once the cache is warm.
+pub fn findPackedWeights(cache: *PackedWeightCache, key: PackedWeightKey) ?PackedWeightEntry {
+    std.Io.Threaded.mutexLock(&cache.mutex);
+    defer std.Io.Threaded.mutexUnlock(&cache.mutex);
+    return cache.map.get(key);
 }
 
 pub fn getOrCreatePackedWeights(
+    cache: *PackedWeightCache,
     matmul_f32: matmul_registry.F32Kernels,
     key: PackedWeightKey,
     w_matrix: ?[]align(1) const f32,
 ) ExecuteProgramError!PackedWeightEntry {
-    std.Io.Threaded.mutexLock(&g_packed_w_mutex);
-    defer std.Io.Threaded.mutexUnlock(&g_packed_w_mutex);
+    std.Io.Threaded.mutexLock(&cache.mutex);
+    defer std.Io.Threaded.mutexUnlock(&cache.mutex);
 
-    ensurePackedWeightCacheInit();
-    if (g_packed_w_cache.get(key)) |entry| return entry;
+    if (cache.map.get(key)) |entry| return entry;
 
     const wv: []align(1) const f32 = w_matrix orelse return BackendError.InvalidArgument;
     if (wv.len < key.k_dim * key.c_out) return BackendError.InvalidArgument;
@@ -135,7 +159,7 @@ pub fn getOrCreatePackedWeights(
     const block_elems: usize = n_panels * key.kc * nr;
     const total_elems: usize = k_blocks * block_elems;
 
-    const alloc: std.mem.Allocator = std.heap.page_allocator;
+    const alloc: std.mem.Allocator = cache.allocator;
     const blocks: []align(32) f32 = try alloc.alignedAlloc(f32, std.mem.Alignment.fromByteUnits(32), total_elems);
     errdefer alloc.free(blocks);
 
@@ -164,7 +188,7 @@ pub fn getOrCreatePackedWeights(
         .block_count = k_blocks,
         .block_elems = block_elems,
     };
-    try g_packed_w_cache.put(key, entry);
+    cache.map.put(cache.allocator, key, entry) catch return error.OutOfMemory;
     return entry;
 }
 

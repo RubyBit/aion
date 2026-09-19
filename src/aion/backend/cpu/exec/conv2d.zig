@@ -22,6 +22,7 @@ const getOrCreatePackedWeights = conv_utils.getOrCreatePackedWeights;
 const scratchForTid = conv_utils.scratchForTid;
 const fillWeightBlock = conv_utils.fillWeightBlock;
 const addBiasRowsF32 = conv_utils.addBiasRowsF32;
+const findPackedWeights = conv_utils.findPackedWeights;
 const readTensorPackedF32 = conv_utils.readTensorPackedF32;
 const writeTensorPackedF32 = conv_utils.writeTensorPackedF32;
 
@@ -551,7 +552,6 @@ fn tryExecConv2DImplicitGemmTileNative(
     }
 
     var w_coords_buf: [4]usize = undefined;
-    var out_coords_buf: [4]usize = undefined;
 
     var oc_ti: usize = 0;
     while (oc_ti < out_meta.tile_counts[3]) : (oc_ti += 1) {
@@ -591,7 +591,7 @@ fn tryExecConv2DImplicitGemmTileNative(
             .kc = kc,
             .nc = matmul.tuning.nc,
         };
-        const packed_w: PackedWeightEntry = try getOrCreatePackedWeights(matmul, key, w_vals);
+        const packed_w: PackedWeightEntry = try getOrCreatePackedWeights(ctx.packed_w, matmul, key, w_vals);
 
         // Acquire bias tile (optional).
         var bias_vals: []align(1) const f32 = &[_]f32{};
@@ -923,73 +923,107 @@ fn tryExecConv2DImplicitGemmTileNative(
             }
         };
 
-        var b: usize = 0;
-        while (b < batch) : (b += 1) {
-            var ohti: usize = 0;
-            while (ohti < out_htc) : (ohti += 1) {
-                var owti: usize = 0;
-                while (owti < out_wtc) : (owti += 1) {
-                    out_coords_buf = .{ b, ohti, owti, oc_ti };
-                    const out_tile_index: usize = try tensor_store.encodeTileIndex(out_meta, out_coords_buf[0..4]);
-                    const out_tile = try store.acquireTileMutLinear(s.out, out_tile_index);
-                    defer store.releaseMut(out_tile.token);
+        // One output tile is a handful of rows, so dispatching per tile spent more
+        // on synchronization than on the convolution. The tile grid is the work.
+        const Grid = struct {
+            proto: Task,
+            store: tensor_store.TensorStore,
+            out_id: tensor_store.TensorId,
+            out_meta: tensor_store.TensorMeta,
+            out_htc: usize,
+            out_wtc: usize,
+            oc_ti: usize,
+            oc_count: usize,
 
-                    const out_h_mem: usize = @as(usize, out_tile.shape_mem[1]);
-                    const out_w_mem: usize = @as(usize, out_tile.shape_mem[2]);
-                    const out_c_mem: usize = @as(usize, out_tile.shape_mem[3]);
-                    if (out_c_mem != oc_count) return BackendError.InvalidArgument;
+            fn runRange(g: *@This(), scratch: []align(32) u8, first: usize, last: usize) ExecuteProgramError!void {
+                var flat: usize = first;
+                while (flat < last) : (flat += 1) {
+                    const owti: usize = flat % g.out_wtc;
+                    const rest: usize = flat / g.out_wtc;
+                    const ohti: usize = rest % g.out_htc;
+                    const bi: usize = rest / g.out_htc;
 
-                    const tile_rows: usize = out_h_mem * out_w_mem;
-                    const ov_all: []align(1) f32 = bytesAsF32Mut(out_tile.bytes);
-                    if (ov_all.len < tile_rows * oc_count) return BackendError.InvalidArgument;
-                    const out_vals: []align(1) f32 = ov_all[0 .. tile_rows * oc_count];
+                    var coords: [4]usize = .{ bi, ohti, owti, g.oc_ti };
+                    const index: usize = try tensor_store.encodeTileIndex(g.out_meta, coords[0..4]);
+                    const tile = try g.store.acquireTileMutLinear(g.out_id, index);
+                    defer g.store.releaseMut(tile.token);
 
-                    var task: Task = .{
-                        .ctx = ctx,
-                        .s = s,
-                        .matmul = matmul,
-                        .packed_w = packed_w,
-                        .h_in = h_in,
-                        .w_in = w_in,
-                        .c_in = c_in,
-                        .h_out = h_out,
-                        .w_out = w_out,
-                        .oc_count = oc_count,
-                        .k_h = k_h,
-                        .k_w = k_w,
-                        .b = b,
-                        .oh_base = ohti * out_meta.tile_shape[1],
-                        .ow_base = owti * out_meta.tile_shape[2],
-                        .out_tile_w = out_w_mem,
-                        .x_tiles = x_tiles,
-                        .x_htc = x_htc,
-                        .x_wtc = x_wtc,
-                        .x_th = x_meta.tile_shape[1],
-                        .x_tw = x_meta.tile_shape[2],
-                        .out_tile = out_vals,
-                        .bias = if (bias_present) bias_vals else &[_]f32{},
-                        .kc = kc,
-                        .m_cap = m_cap_eff,
-                        .full_blocks = full_blocks,
-                        .k_tail = k_tail,
-                    };
+                    const h_mem: usize = @as(usize, tile.shape_mem[1]);
+                    const w_mem: usize = @as(usize, tile.shape_mem[2]);
+                    if (@as(usize, tile.shape_mem[3]) != g.oc_count) return BackendError.InvalidArgument;
+                    const rows: usize = h_mem * w_mem;
+                    const all: []align(1) f32 = bytesAsF32Mut(tile.bytes);
+                    if (all.len < rows * g.oc_count) return BackendError.InvalidArgument;
 
-                    if (ctx.pool) |p| {
-                        if (ctx.thread_count > 1 and tile_rows >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
-                            const grain: usize = @max(m_cap_eff, @max(@as(usize, 1), tile_rows / (ctx.thread_count * 4)));
-                            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), tile_rows, grain, Task.runRows);
-                        } else {
-                            const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
-                            defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
-                            try task.runRowsRange(scratch0, 0, tile_rows);
-                        }
-                    } else {
-                        const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
-                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
-                        try task.runRowsRange(scratch0, 0, tile_rows);
-                    }
+                    var t: Task = g.proto;
+                    t.b = bi;
+                    t.oh_base = ohti * g.out_meta.tile_shape[1];
+                    t.ow_base = owti * g.out_meta.tile_shape[2];
+                    t.out_tile_w = w_mem;
+                    t.out_tile = all[0 .. rows * g.oc_count];
+                    try t.runRowsRange(scratch, 0, rows);
                 }
             }
+
+            fn runTiles(ctx_any: *anyopaque, first: usize, last: usize, tid: usize) ExecuteProgramError!void {
+                const g: *@This() = @ptrCast(@alignCast(ctx_any));
+                if (tid >= g.proto.ctx.matmul_scratch.len) return error.InvalidArgument;
+                return g.runRange(g.proto.ctx.matmul_scratch[tid], first, last);
+            }
+        };
+
+        var grid: Grid = .{
+            .proto = .{
+                .ctx = ctx,
+                .s = s,
+                .matmul = matmul,
+                .packed_w = packed_w,
+                .h_in = h_in,
+                .w_in = w_in,
+                .c_in = c_in,
+                .h_out = h_out,
+                .w_out = w_out,
+                .oc_count = oc_count,
+                .k_h = k_h,
+                .k_w = k_w,
+                .b = 0,
+                .oh_base = 0,
+                .ow_base = 0,
+                .out_tile_w = 0,
+                .x_tiles = x_tiles,
+                .x_htc = x_htc,
+                .x_wtc = x_wtc,
+                .x_th = x_meta.tile_shape[1],
+                .x_tw = x_meta.tile_shape[2],
+                .out_tile = &[_]f32{},
+                .bias = if (bias_present) bias_vals else &[_]f32{},
+                .kc = kc,
+                .m_cap = m_cap_eff,
+                .full_blocks = full_blocks,
+                .k_tail = k_tail,
+            },
+            .store = store,
+            .out_id = s.out,
+            .out_meta = out_meta,
+            .out_htc = out_htc,
+            .out_wtc = out_wtc,
+            .oc_ti = oc_ti,
+            .oc_count = oc_count,
+        };
+
+        const grid_total: usize = batch * out_htc * out_wtc;
+        var ran_parallel = false;
+        if (ctx.pool) |p| {
+            if (ctx.thread_count > 1 and grid_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
+                const grain: usize = @max(@as(usize, 1), grid_total / (ctx.thread_count * 8));
+                try p.parallelForFallible(ExecuteProgramError, @ptrCast(&grid), grid_total, grain, Grid.runTiles);
+                ran_parallel = true;
+            }
+        }
+        if (!ran_parallel) {
+            const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
+            defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
+            try grid.runRange(scratch0, 0, grid_total);
         }
     }
 
@@ -1074,7 +1108,8 @@ fn execConv2DImplicitGemm(
     const w_count: usize = try elemCountFromShape(w_meta.shape);
     const w_packed: []f32 = try alloc.alloc(f32, w_count);
     defer alloc.free(w_packed);
-    try readTensorPackedF32(store, w_meta, s.w, w_packed);
+    // Filled on the first cache miss below; a warm cache never reads it.
+    var w_loaded: bool = false;
 
     const TileInfo = struct {
         oc_start: usize,
@@ -1102,11 +1137,8 @@ fn execConv2DImplicitGemm(
             const oc_count: usize = @min(oc_tile_max, c_out_g - oc0);
             const oc_start: usize = oc_base + oc0;
 
-            try fillWeightBlock(w_block[0 .. k_dim_g * oc_count], w_packed, k_dim_g, c_out, oc_start, oc_count);
-            const w_block_vals: []align(1) const f32 = w_block[0 .. k_dim_g * oc_count];
-
             const key_g: PackedWeightKey = .{
-                .w_id = s.w,
+                    .w_id = s.w,
                 .oc_start = oc_start,
                 .k_dim = k_dim_g,
                 .c_out = oc_count,
@@ -1115,7 +1147,16 @@ fn execConv2DImplicitGemm(
                 .nc = ctx.matmul_f32.tuning.nc,
             };
 
-            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(matmul, key_g, w_block_vals);
+            // A weight never changes, so gathering its block is worth doing only
+            // when the pack cache has nothing for it.
+            const packed_w_g: PackedWeightEntry = findPackedWeights(ctx.packed_w, key_g) orelse blk: {
+                if (!w_loaded) {
+                    try readTensorPackedF32(store, w_meta, s.w, w_packed);
+                    w_loaded = true;
+                }
+                try fillWeightBlock(w_block[0 .. k_dim_g * oc_count], w_packed, k_dim_g, c_out, oc_start, oc_count);
+                break :blk try getOrCreatePackedWeights(ctx.packed_w, matmul, key_g, w_block[0 .. k_dim_g * oc_count]);
+            };
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
         }

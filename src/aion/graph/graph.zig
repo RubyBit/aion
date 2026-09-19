@@ -43,6 +43,12 @@ pub const Value = struct {
     /// Producing node if any.
     producer: ?NodeId = null,
 
+    /// The author's name for this value, arena-owned like `shape`. It lives here
+    /// rather than on the Builder because the graph is the only thing alive in
+    /// all three phases a diagnostic can fire in, and the strings were always
+    /// allocated in this arena anyway.
+    name: ?[]const u8 = null,
+
     /// Optional binding to an externally managed tensor.
     external: ?ExternalId = null,
 };
@@ -679,6 +685,7 @@ pub const Graph = struct {
                 .dtype = v.dtype,
                 .shape = sh,
                 .dim_symbols = try dupeDimSymbols(aa, v.dim_symbols),
+                .name = if (v.name) |n| (aa.dupe(u8, n) catch return GraphError.OutOfMemory) else null,
                 .producer = v.producer,
                 .external = v.external,
             }) catch return GraphError.OutOfMemory;

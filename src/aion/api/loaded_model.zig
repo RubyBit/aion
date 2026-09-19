@@ -419,11 +419,29 @@ pub const Model = struct {
     }
 
     pub fn bindInput(self: *Self, name: []const u8, tensor: Tensor) api_errors.ApiError!void {
-        const index = self.findInputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
+        // Binding is where most run-time failures start and the caller knows the
+        // tensor by name, so every rejection here says which input and why.
+        const diag = @import("../diagnostic.zig").current();
+        const index = self.findInputIndex(name) orelse {
+            diag.recordUnknownInput(name);
+            diag.appendDetail("; this model takes:", .{});
+            for (self.input_signatures) |s| diag.appendDetail(" \"{s}\"", .{s.name});
+            return api_errors.ApiError.InvalidArgument;
+        };
         const sig = self.input_signatures[index];
-        if (tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
-        if (tensor.dtype != sig.dtype) return api_errors.ApiError.InvalidArgument;
-        if (tensor.shape.len != sig.rank) return api_errors.ApiError.InvalidArgument;
+        if (tensor.store != self.store) {
+            diag.recordInput(.{ .code = "ForeignTensor", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
+            diag.appendDetail("; tensor belongs to another context", .{});
+            return api_errors.ApiError.InvalidArgument;
+        }
+        if (tensor.dtype != sig.dtype) {
+            diag.recordInput(.{ .code = "InputDTypeMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
+            return api_errors.ApiError.InvalidArgument;
+        }
+        if (tensor.shape.len != sig.rank) {
+            diag.recordInput(.{ .code = "InputRankMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
+            return api_errors.ApiError.InvalidArgument;
+        }
         self.bound_inputs[index] = tensor;
         // A manual bind on a role-driven control input permanently reclaims it from
         // position auto-management (the escape hatch for custom schedules).
@@ -1234,18 +1252,36 @@ pub const Model = struct {
         @memset(self.run_symbol_bindings, null);
         @memset(self.run_direct_input_ids, types_mod.invalid_tensor_id);
 
+        const diag = @import("../diagnostic.zig").current();
         var shape_cursor: usize = 0;
         var i: usize = 0;
         while (i < self.input_signatures.len) : (i += 1) {
-            const tensor = self.bound_inputs[i] orelse return error.InvalidArgument;
             const sig = self.input_signatures[i];
+            const tensor = self.bound_inputs[i] orelse {
+                diag.recordInput(.{ .code = "InputNotBound", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank });
+                return error.InvalidArgument;
+            };
             const terms = self.template.inputShapeTerms(i);
-            if (tensor.dtype != sig.dtype or tensor.shape.len != sig.rank) return error.InvalidArgument;
+            if (tensor.dtype != sig.dtype) {
+                diag.recordInput(.{ .code = "InputDTypeMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
+                return error.InvalidArgument;
+            }
+            if (tensor.shape.len != sig.rank) {
+                diag.recordInput(.{ .code = "InputRankMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
+                return error.InvalidArgument;
+            }
 
             var d: usize = 0;
             while (d < tensor.shape.len) : (d += 1) {
-                const dim = try self.specializationDim(i, d);
-                try signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], @intCast(dim), self.run_symbol_bindings);
+                const dim = self.specializationDim(i, d) catch {
+                    diag.recordInput(.{ .code = "InputShapeMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape, .axis = d });
+                    return error.InvalidArgument;
+                };
+                signatures.bindInputDimExprs(self.template.dim_exprs, terms[d], @intCast(dim), self.run_symbol_bindings) catch {
+                    diag.recordInput(.{ .code = "InputShapeMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape, .axis = d });
+                    diag.appendDetail(" with the shape this model was compiled for", .{});
+                    return error.InvalidArgument;
+                };
                 self.run_input_shapes[shape_cursor] = dim;
                 shape_cursor += 1;
             }

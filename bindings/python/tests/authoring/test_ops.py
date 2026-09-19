@@ -217,7 +217,10 @@ def test_validation_diagnostic_survives_builder_destruction(ctx):
     assert error.diagnostic.operation == "MaxPool2D"
     assert error.diagnostic.code == "RankMismatch"
     assert "input[0]" in error.message
-    assert "NHWC" in error.message
+    # Op attributes are reflected off the op union rather than hand-written per
+    # op, so the field names are the op's own.
+    assert "kernel_h=2" in error.message
+    assert "ceil_mode=false" in error.message
 
 
 def test_diagnostic_message_names_the_failing_entry_point(ctx):

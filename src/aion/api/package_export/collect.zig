@@ -44,8 +44,8 @@ pub fn collectOutputs(allocator: std.mem.Allocator, outputs: []const types_mod.N
 pub fn collectDebugNames(allocator: std.mem.Allocator, builder: *const types_mod.Builder) ![]package_file.DebugName {
     var out: std.ArrayList(package_file.DebugName) = .empty;
     errdefer out.deinit(allocator);
-    for (builder.value_names.items, 0..) |name_opt, idx| {
-        if (name_opt) |name| {
+    for (builder.graph.values.items, 0..) |value, idx| {
+        if (value.name) |name| {
             try out.append(allocator, .{ .value = @intCast(idx), .name = try allocator.dupe(u8, name) });
         }
     }

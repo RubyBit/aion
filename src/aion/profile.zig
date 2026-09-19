@@ -139,6 +139,7 @@ pub const Session = struct {
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, name: []const u8) Session {
+        capture_transfers = config.mode != .off;
         var out: Session = .{ .allocator = allocator, .config = config, .name = name };
         out.events.ensureTotalCapacity(allocator, config.event_capacity) catch {};
         return out;
@@ -205,7 +206,33 @@ pub const Session = struct {
         self.reportOperations();
         self.reportKernels();
         self.reportGaps();
+        self.reportTransfers();
         if (self.config.mode == .timeline) self.reportTimeline();
+    }
+
+    /// Transfers since the last report. Counted separately from the timeline
+    /// because they happen outside the execution window, so they have no place
+    /// on a track that only spans the program.
+    fn reportTransfers(_: *const Session) void {
+        const t = takeTransfers();
+        if (!t.any()) return;
+        std.debug.print("  transfers (outside the execution window):\n", .{});
+        if (t.h2d_count != 0) printTransfer("host->device", t.h2d_ns, t.h2d_count, t.h2d_bytes);
+        if (t.d2h_count != 0) printTransfer("device->host", t.d2h_ns, t.d2h_count, t.d2h_bytes);
+    }
+
+    /// A latency-bound transfer moves almost nothing, so the size has to stay
+    /// readable at a few bytes -- rounding it to MiB would hide exactly the case
+    /// worth seeing. The rate is what separates latency from bandwidth.
+    fn printTransfer(label: []const u8, ns: u64, count: u64, bytes: u64) void {
+        const elapsed_ms = @as(f64, @floatFromInt(ns)) / 1e6;
+        const size_mib = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+        const gbs: f64 = if (ns == 0) 0 else @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(ns));
+        if (bytes < 1024 * 1024) {
+            std.debug.print("    {s}  {d:>8.3} ms  x{d:<5} {d:>10} B   {d:>7.2} GB/s\n", .{ label, elapsed_ms, count, bytes, gbs });
+        } else {
+            std.debug.print("    {s}  {d:>8.3} ms  x{d:<5} {d:>8.2} MiB   {d:>7.2} GB/s\n", .{ label, elapsed_ms, count, size_mib, gbs });
+        }
     }
 
     fn reportPhases(self: *const Session) void {
@@ -415,6 +442,54 @@ pub const Session = struct {
         return if (index < self.tracks.items.len) self.tracks.items[index].name else "unknown";
     }
 };
+
+/// Host<->device transfers bracket a program rather than sitting inside it: the
+/// input migration happens before `executeProgram` and the output readback after
+/// the caller asks for a tensor, by which point a session scoped to execution has
+/// already been torn down. They accumulate here instead and are reported with the
+/// next session, which is what makes the cost that dominates a small GPU model
+/// visible at all.
+pub const Transfers = struct {
+    h2d_bytes: u64 = 0,
+    h2d_ns: u64 = 0,
+    h2d_count: u64 = 0,
+    d2h_bytes: u64 = 0,
+    d2h_ns: u64 = 0,
+    d2h_count: u64 = 0,
+
+    pub fn any(self: Transfers) bool {
+        return self.h2d_count != 0 or self.d2h_count != 0;
+    }
+};
+
+pub const Direction = enum { h2d, d2h };
+
+/// Producers check this before reading a clock, so an unprofiled run pays one
+/// predictable branch per transfer and nothing else.
+pub var capture_transfers: bool = false;
+
+threadlocal var pending_transfers: Transfers = .{};
+
+pub fn recordTransfer(dir: Direction, bytes: u64, ns: u64) void {
+    switch (dir) {
+        .h2d => {
+            pending_transfers.h2d_bytes += bytes;
+            pending_transfers.h2d_ns += ns;
+            pending_transfers.h2d_count += 1;
+        },
+        .d2h => {
+            pending_transfers.d2h_bytes += bytes;
+            pending_transfers.d2h_ns += ns;
+            pending_transfers.d2h_count += 1;
+        },
+    }
+}
+
+pub fn takeTransfers() Transfers {
+    const out = pending_transfers;
+    pending_transfers = .{};
+    return out;
+}
 
 pub fn nowNs() u64 {
     const timestamp: std.Io.Timestamp = std.Io.Clock.awake.now(std.Options.debug_io);

@@ -46,8 +46,6 @@ pub const Builder = struct {
     ctx: *Context,
     graph: graph_mod.Graph,
 
-    // Optional per-value names for diagnostics/debugging.
-    value_names: std.ArrayList(?[]const u8) = .empty,
 
     // --- scope stack -------------------------------------------------------
     // Scopes nest, so a module tree produces `state_dict`-style paths
@@ -123,7 +121,6 @@ pub const Builder = struct {
             .allocator = allocator,
             .ctx = ctx,
             .graph = graph,
-            .value_names = .empty,
             .scope_path = .empty,
             .scope_counters = .empty,
             .root_counter = 0,
@@ -141,7 +138,6 @@ pub const Builder = struct {
         self.auto_scope_counts.deinit(self.allocator);
         self.scope_path.deinit(self.allocator);
         self.scope_counters.deinit(self.allocator);
-        self.value_names.deinit(self.allocator);
         self.dim_symbols.deinit(self.allocator);
         self.symbol_names.deinit(self.allocator);
         self.graph.deinit();
@@ -411,29 +407,16 @@ pub const Builder = struct {
 
     pub fn valueName(self: *const Self, t: TensorRef) ?[]const u8 {
         const idx: usize = @intCast(t.value);
-        if (idx >= self.value_names.items.len) return null;
-        return self.value_names.items[idx];
-    }
-
-    fn ensureNameSlot(self: *Self, vid: ValueId) Error!void {
-        const idx: usize = @intCast(vid);
-        if (idx < self.value_names.items.len) return;
-
-        const old_len: usize = self.value_names.items.len;
-        const new_len: usize = idx + 1;
-        try self.value_names.ensureTotalCapacity(self.allocator, new_len);
-        self.value_names.items.len = new_len;
-        var i: usize = old_len;
-        while (i < new_len) : (i += 1) {
-            self.value_names.items[i] = null;
-        }
+        if (idx >= self.graph.values.items.len) return null;
+        return self.graph.values.items[idx].name;
     }
 
     pub fn name(self: *Self, t: TensorRef, value_name: []const u8) Error!TensorRef {
-        try self.ensureNameSlot(t.value);
+        const idx: usize = @intCast(t.value);
+        if (idx >= self.graph.values.items.len) return Error.InvalidArgument;
         const duped: []u8 = self.graph.arenaAlloc().alloc(u8, value_name.len) catch return Error.OutOfMemory;
         @memcpy(duped, value_name);
-        self.value_names.items[@intCast(t.value)] = duped;
+        self.graph.values.items[idx].name = duped;
         return t;
     }
 
@@ -468,9 +451,8 @@ pub const Builder = struct {
         //
         // Important: do NOT use `autoNameIfUnnamed` here, since that would consume
         // an op index and perturb op numbering (e.g. `matmul#0`).
-        try self.ensureNameSlot(v);
         const idx: usize = @intCast(v);
-        if (self.value_names.items[idx] == null) {
+        if (idx < self.graph.values.items.len and self.graph.values.items[idx].name == null) {
             const arena = self.graph.arenaAlloc();
             const scope: []const u8 = self.scope_path.items;
             const generated_name = if (param_name) |pn|
@@ -482,7 +464,7 @@ pub const Builder = struct {
                 std.fmt.allocPrint(arena, "{s}/param@{d}", .{ scope, v }) catch return Error.OutOfMemory
             else
                 std.fmt.allocPrint(arena, "param@{d}", .{v}) catch return Error.OutOfMemory;
-            self.value_names.items[idx] = generated_name;
+            self.graph.values.items[idx].name = generated_name;
         }
 
         return .{ .value = v };
@@ -503,8 +485,8 @@ pub const Builder = struct {
         var it = self.params.keyIterator();
         while (it.next()) |v| {
             const idx: usize = @intCast(v.*);
-            if (idx >= self.value_names.items.len) continue;
-            const existing = self.value_names.items[idx] orelse continue;
+            if (idx >= self.graph.values.items.len) continue;
+            const existing = self.graph.values.items[idx].name orelse continue;
             if (std.mem.eql(u8, existing, param_name)) return true;
         }
         return false;
@@ -1277,10 +1259,9 @@ pub const Builder = struct {
             try infer_mod.inferNode(&self.graph, node);
         }
 
-        try self.ensureNameSlot(vid);
-
         const idx: usize = @intCast(vid);
-        if (self.value_names.items[idx] != null) return;
+        if (idx >= self.graph.values.items.len) return;
+        if (self.graph.values.items[idx].name != null) return;
 
         const n: usize = self.nextOpIndex();
 
@@ -1289,6 +1270,6 @@ pub const Builder = struct {
         else
             std.fmt.allocPrint(self.graph.arenaAlloc(), "{s}#{d}", .{ tag, n }) catch return Error.OutOfMemory;
 
-        self.value_names.items[idx] = generated_name;
+        self.graph.values.items[idx].name = generated_name;
     }
 };

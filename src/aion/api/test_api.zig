@@ -4181,3 +4181,109 @@ test "api: two threads on one context see only their own diagnostic" {
     try std.testing.expectEqualStrings("InvalidKernel", shared.a_code);
     try std.testing.expectEqualStrings("EmptyOutput", shared.b_code);
 }
+
+test "api: binding a model input names the input and the mismatch" {
+    // Binding is the most common run-time failure and used to report a bare
+    // InvalidArgument. Each rejection must say WHICH input and WHAT disagreed.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const x = try bld.name(try bld.input(.f32, &[_]usize{ 1, 4 }), "x");
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{try bld.copy(x)}, .{});
+    defer model.deinit();
+
+    const diagnostic = @import("../diagnostic.zig");
+    var vals: [4]f32 = @splat(0.0);
+
+    // Unknown name: says what the model does take.
+    diagnostic.current().clear();
+    const ok_shape = try ctx.fromF32(&[_]usize{ 1, 4 }, &vals);
+    try std.testing.expectError(error.InvalidArgument, model.bindInput("nope", ok_shape));
+    try std.testing.expectEqualStrings("UnknownInput", diagnostic.current().code);
+    try std.testing.expectEqualStrings("bind_input", diagnostic.current().operation);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "\"nope\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "\"x\"") != null);
+
+    // Wrong rank: names the input and reports both ranks.
+    diagnostic.current().clear();
+    const bad_rank = try ctx.fromF32(&[_]usize{ 1, 2, 2 }, &vals);
+    try std.testing.expectError(error.InvalidArgument, model.bindInput("x", bad_rank));
+    try std.testing.expectEqualStrings("InputRankMismatch", diagnostic.current().code);
+    const msg = diagnostic.current().message();
+    try std.testing.expect(std.mem.indexOf(u8, msg, "input \"x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "rank=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "{ 1, 2, 2 }") != null);
+
+    // Wrong dtype: names the input and both dtypes.
+    diagnostic.current().clear();
+    const ints: [4]i32 = @splat(0);
+    const bad_dtype = try ctx.fromPackedScalar(.i32, &[_]usize{ 1, 4 }, std.mem.sliceAsBytes(ints[0..]));
+    try std.testing.expectError(error.InvalidArgument, model.bindInput("x", bad_dtype));
+    try std.testing.expectEqualStrings("InputDTypeMismatch", diagnostic.current().code);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "dtype=i32") != null);
+}
+
+test "api: a diagnostic names the values the author named" {
+    // An integer value id means nothing to whoever wrote the graph, so the
+    // message has to use their names. They live on the graph, which is the only
+    // structure alive in every phase a diagnostic can fire in.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const diagnostic = @import("../diagnostic.zig");
+    diagnostic.current().clear();
+
+    const w = try bld.name(try bld.input(.f32, &[_]usize{ 3, 3 }), "attn_weights");
+    const idx = try bld.name(try bld.input(.i32, &[_]usize{ 2, 2 }), "positions");
+    try std.testing.expectError(error.Unsupported, bld.gather(w, idx, 1, 2));
+
+    const msg = diagnostic.current().message();
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"attn_weights\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"positions\"") != null);
+
+    // An unnamed value still reports its id rather than nothing.
+    diagnostic.current().clear();
+    var bld2 = api.Builder.init(&ctx);
+    defer bld2.deinit();
+    const anon = try bld2.input(.f32, &[_]usize{ 3, 3 });
+    try std.testing.expectError(error.RankMismatch, bld2.maxPool2D(anon, .{ .kernel_h = 2, .kernel_w = 2 }));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "input[0] value 0") != null);
+}
+
+test "api: a diagnostic reports any op's attributes, not a hand-picked few" {
+    // Attributes come from reflecting over the op union, so an op the diagnostic
+    // module has never been told about still reports its own configuration. Two
+    // of these (Conv2D, Softmax) printed nothing at all when the module carried a
+    // hand-written case per op.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    const diagnostic = @import("../diagnostic.zig");
+
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        diagnostic.current().clear();
+        const img = try bld.input(.f32, &[_]usize{ 1, 4, 4, 2 });
+        const kern = try bld.input(.f32, &[_]usize{ 3, 3, 9, 4 }); // c_in disagrees
+        try std.testing.expectError(error.ShapeMismatch, bld.conv2d(img, kern, null, 2, 1, 1, 1, 1, 0, 0, 0, 1));
+        const msg = diagnostic.current().message();
+        try std.testing.expect(std.mem.indexOf(u8, msg, "stride_h=2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "pad_top=1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "groups=1") != null);
+    }
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        diagnostic.current().clear();
+        const ints = try bld.input(.i32, &[_]usize{ 2, 3 });
+        try std.testing.expectError(error.Unsupported, bld.softmax(ints, -1));
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "axis=-1") != null);
+    }
+}

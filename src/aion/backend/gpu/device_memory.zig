@@ -47,6 +47,7 @@ fn alignUp(n: usize) usize {
 }
 
 const dm = @import("../../runtime/device_memory.zig");
+const profile = @import("../../profile.zig");
 const DeviceMemory = dm.DeviceMemory;
 const DeviceHandle = dm.DeviceHandle;
 const DeviceError = dm.DeviceError;
@@ -166,6 +167,8 @@ pub const WgpuDeviceMemory = struct {
     }
 
     fn copyH2D(ctx: *anyopaque, handle: DeviceHandle, dst_offset: usize, src: []const u8) DeviceError!void {
+        const t0: u64 = if (profile.capture_transfers) profile.nowNs() else 0;
+        defer if (profile.capture_transfers) profile.recordTransfer(.h2d, src.len, profile.nowNs() - t0);
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
         if (dst_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
@@ -200,6 +203,12 @@ pub const WgpuDeviceMemory = struct {
     /// not be related, ordered, or contiguous; an over-budget batch is chunked,
     /// and a single region larger than the budget simply gets its own chunk.
     fn copyD2HMany(ctx: *anyopaque, regions: []const dm.D2HRegion) DeviceError!void {
+        const t0: u64 = if (profile.capture_transfers) profile.nowNs() else 0;
+        defer if (profile.capture_transfers) {
+            var moved: usize = 0;
+            for (regions) |r| moved += r.dst.len;
+            profile.recordTransfer(.d2h, moved, profile.nowNs() - t0);
+        };
         const self: *Self = @ptrCast(@alignCast(ctx));
         var i: usize = 0;
         while (i < regions.len) {

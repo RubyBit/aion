@@ -55,7 +55,7 @@ __all__ = [
 ]
 
 # Python package version (may be independent of the core runtime version).
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 
 def tensor(

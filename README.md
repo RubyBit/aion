@@ -11,7 +11,7 @@
    ` :          \:
     `<_____A_____>
 
-      A I O N (v0.0.2)
+      A I O N (v0.0.3)
 ```
 
 The tensor manipulation library to rule them all.

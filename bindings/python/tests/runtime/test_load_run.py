@@ -32,3 +32,22 @@ def test_load_model_q8_weights_run(tiny_q8_model):
             out = m.run_numpy({"x": tiny_q8_model.x})["y"]
             expected = tiny_q8_model.x @ tiny_q8_model.w
             np.testing.assert_allclose(out, expected, rtol=5e-2, atol=5e-2)
+
+
+def test_output_handles_are_snapshots_of_their_run(tiny_model):
+    # An output handle names one run's value. It used to share a host buffer with
+    # every other fetch of that output, so it silently changed to whatever the next
+    # fetch copied in (Silero's cached `prob` handle read one value forever).
+    w = tiny_model.w
+    x1 = tiny_model.x
+    x2 = (x1 * -3.0 + 1.0).astype(np.float32)
+    with aion.Context(thread_count=1) as ctx:
+        with aion.LoadedModel.load(ctx, str(tiny_model.path)) as m:
+            m.run_numpy({"x": x1})
+            first = m.output_tensor("y")
+            m.run_numpy({"x": x2})  # fetches `y` again internally
+            second = m.output_tensor("y")
+            np.testing.assert_allclose(first.numpy(), x1 @ w, rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(second.numpy(), x2 @ w, rtol=1e-6, atol=1e-6)
+            first.close()
+            second.close()

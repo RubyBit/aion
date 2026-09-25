@@ -3092,6 +3092,15 @@ test "api: builder.param auto-generates persisted debug names" {
     try std.testing.expect(found);
 }
 
+/// `cache`'s current contents, read through the store (its shape may have grown).
+fn expectCacheHolds(ctx: *api.Context, cache: api.Tensor, want: []const f32) !void {
+    const t = try ctx.store.getConst(cache.id);
+    const now: api.Tensor = .{ .store = &ctx.store, .id = cache.id, .dtype = t.dtype, .shape = t.shape };
+    var buf: [16]f32 = undefined;
+    try now.read(buf[0..want.len]);
+    try std.testing.expectEqualSlices(f32, want, buf[0..want.len]);
+}
+
 test "api: sequenceAppend mutates cache in-place" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -3114,7 +3123,6 @@ test "api: sequenceAppend mutates cache in-place" {
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
-    try std.testing.expectEqual(cache_t.id, out_t.id);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 4, 1, 2 }, out_t.getShape());
 
     var out_vals: [8]f32 = undefined;
@@ -3129,6 +3137,8 @@ test "api: sequenceAppend mutates cache in-place" {
         6.0,
         7.0,
     }, out_vals[0..]);
+    // In place: the cache parameter itself now holds what the output reports.
+    try expectCacheHolds(&ctx, cache_t, out_vals[0..]);
 }
 
 test "api: sequenceAppend rolling policy wraps" {
@@ -3157,7 +3167,6 @@ test "api: sequenceAppend rolling policy wraps" {
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
-    try std.testing.expectEqual(cache_t.id, out_t.id);
 
     var out_vals: [4]f32 = undefined;
     try out_t.read(&out_vals);
@@ -3167,6 +3176,8 @@ test "api: sequenceAppend rolling policy wraps" {
         2.0,
         90.0,
     }, out_vals[0..]);
+    // In place: the cache parameter itself now holds what the output reports.
+    try expectCacheHolds(&ctx, cache_t, out_vals[0..]);
 }
 
 test "api: sequenceAppend growable policy expands physical capacity" {
@@ -3196,7 +3207,6 @@ test "api: sequenceAppend growable policy expands physical capacity" {
     defer model.deinit();
 
     const out_t: api.Tensor = try model.runOutputTensor(0);
-    try std.testing.expectEqual(cache_t.id, out_t.id);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 8, 1, 1 }, out_t.getShape());
 
     var out_vals: [8]f32 = undefined;
@@ -3211,6 +3221,8 @@ test "api: sequenceAppend growable policy expands physical capacity" {
         91.0,
         0.0,
     }, out_vals[0..]);
+    // In place: the cache parameter itself now holds what the output reports.
+    try expectCacheHolds(&ctx, cache_t, out_vals[0..]);
 }
 
 test "api: attention matches deterministic windowed-causal averages" {
@@ -4690,4 +4702,75 @@ test "api: a quantized weight's f32 source stays the caller's" {
     var back: [8 * 64]f32 = undefined;
     try src.read(&back);
     try std.testing.expectEqualSlices(f32, &w_vals, &back);
+}
+
+test "api: output tensors are snapshots of their run, and a held one outlives later runs" {
+    // An output handle names one run's value. Reusing one host buffer for every
+    // fetch made an earlier handle silently change to a later run's value, and a
+    // shape change freed the bytes a held handle still pointed at.
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W = try bld.param(try ctx.fromF32(&[_]usize{ 2, 2 }, &[_]f32{ 2, 0, 0, 2 }));
+    const Y = try bld.name(try bld.matmul(X, W, 1.0, 0.0), "y");
+    try bld.symbolicDim(X, 0, "rows");
+
+    const runRows = struct {
+        fn go(c: *api.Context, m: *api.Model, comptime rows: usize, v: f32) !void {
+            const xv: [rows * 2]f32 = @splat(v);
+            try m.bindInput("x", try c.fromF32(&[_]usize{ rows, 2 }, &xv));
+            try m.run();
+        }
+    }.go;
+    const first = struct {
+        fn go(t: api.Tensor) !f32 {
+            var buf: [8]f32 = undefined;
+            try t.read(buf[0..try t.elemCount()]);
+            return buf[0];
+        }
+    }.go;
+
+    {
+        var model = try ctx.compileOn(.cpu, &bld, &[_]api.TensorRef{Y}, .{});
+
+        // Held across later runs AND later fetches: keeps its own run's value.
+        try runRows(&ctx, &model, 1, 1.0);
+        const a = try model.outputTensor("y");
+        a.hold();
+        try runRows(&ctx, &model, 1, 3.0);
+        const b = try model.outputTensor("y");
+        try std.testing.expect(a.id != b.id);
+        try std.testing.expectEqual(@as(f32, 2.0), try first(a));
+        try std.testing.expectEqual(@as(f32, 6.0), try first(b));
+
+        // Unheld fetches share one buffer: a fetch-read loop allocates nothing.
+        try runRows(&ctx, &model, 1, 4.0);
+        const c = try model.outputTensor("y");
+        try std.testing.expectEqual(b.id, c.id);
+        try std.testing.expectEqual(@as(f32, 8.0), try first(c));
+
+        // A shape change must not free a held snapshot.
+        try runRows(&ctx, &model, 3, 5.0);
+        const d = try model.outputTensor("y");
+        try std.testing.expectEqual(@as(usize, 3), d.shape[0]);
+        try std.testing.expectEqual(@as(f32, 10.0), try first(d));
+        try std.testing.expectEqual(@as(f32, 2.0), try first(a));
+
+        // Releasing the last hold frees it.
+        a.release();
+        try std.testing.expect(!(try ctx.store.tensorHasBacking(a.id)));
+
+        // A held output outlives its model.
+        try runRows(&ctx, &model, 1, 7.0);
+        const e = try model.outputTensor("y");
+        e.hold();
+        model.deinit();
+        try std.testing.expectEqual(@as(f32, 14.0), try first(e));
+        e.release();
+        try std.testing.expect(!(try ctx.store.tensorHasBacking(e.id)));
+    }
 }

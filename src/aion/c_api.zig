@@ -917,7 +917,7 @@ pub export fn aion_loaded_model_output_tensor(
         return .AION_OUT_OF_MEMORY;
     };
     // The handle holds what it names, as every handle does (see `aion_tensor_destroy`).
-    t.store.holdTensor(t.id);
+    t.hold();
     handle.* = .{ .owner = ctx, .tensor = t };
     out_tensor.?.* = handle;
     return .AION_OK;

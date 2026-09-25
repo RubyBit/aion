@@ -386,6 +386,11 @@ class LoadedModel:
         reset_model_state(self._ctx_owner.ptr, self._require_handle())
 
     def output_tensor(self, name: str) -> "Tensor":
+        """The most recent run's output ``name``, as a snapshot you own.
+
+        Later runs never change it, so fetch again after each ``run()`` for the
+        new value, and ``close()`` a handle you are done with.
+        """
         if not isinstance(name, str):
             raise TypeError("name must be a str")
         from .tensor import Tensor

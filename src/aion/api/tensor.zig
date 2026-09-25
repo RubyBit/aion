@@ -31,6 +31,12 @@ pub const Tensor = struct {
         return self.id;
     }
 
+    /// Take a hold of your own on a tensor something else owns (a model output),
+    /// keeping it alive and unchanged until the matching `release`.
+    pub fn hold(self: Self) void {
+        self.store.holdTensor(self.id);
+    }
+
     /// Give up the caller's hold. Its data is freed once nothing else holds it — a
     /// builder, a model it is bound to — and no compiled program reads it.
     pub fn release(self: Self) void {

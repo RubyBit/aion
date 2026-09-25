@@ -412,6 +412,7 @@ pub fn Kernel(comptime t: Tuning) type {
 }
 
 test "sme f32 gemm matches a reference across shapes and edges" {
+    if (comptime !compiledFor()) return error.SkipZigTest;
     if (!usable()) return error.SkipZigTest;
     try gemmCases(Kernel(.{ .kc = 128, .mc = 128, .nc = 128 }));
     try gemmCases(Kernel(.{ .kc = 512, .mc = 288, .nc = 512 }));
@@ -478,6 +479,7 @@ fn gemmCases(comptime K: type) !void {
 }
 
 test "sme indirect gemm matches a reference across row panels and scattered rows" {
+    if (comptime !compiledFor()) return error.SkipZigTest;
     if (!usable()) return error.SkipZigTest;
     try indirectCases(Kernel(.{ .kc = 256, .mc = 288, .nc = 256 }));
 }

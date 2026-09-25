@@ -306,6 +306,9 @@ AION_API AionStatus aion_loaded_model_reset_state(AionLoadedModel* m);
    uses retained_history_tokens, the prior positions the model needs kept (physical
    capacity is the runtime's business). Unused fields are ignored per kind. */
 AION_API AionStatus aion_loaded_model_set_state_input_policy(AionLoadedModel* m, const char* name, uint32_t kind, uint64_t initial_capacity_tokens, uint64_t growth_numerator, uint64_t growth_denominator, uint64_t max_capacity_tokens, uint64_t retained_history_tokens);
+/* The most recent run's output `name`, as a host snapshot the caller owns
+   (release with aion_tensor_destroy). Later runs never change it: fetch again
+   after each run for the new value. */
 AION_API AionStatus aion_loaded_model_output_tensor(AionLoadedModel* m, const char* name, AionTensor** out_tensor);
 
 /* Tokens consumed so far by position auto-management (0 when disabled). */

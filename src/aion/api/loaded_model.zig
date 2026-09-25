@@ -240,6 +240,7 @@ pub const Model = struct {
         self.allocator.free(self.output_aliases);
         self.allocator.free(self.input_alias_output_indices);
         self.allocator.free(self.output_alias_input_indices);
+        for (self.output_host_mirror_tids) |tid| if (tid != types_mod.invalid_tensor_id) self.store.releaseHold(tid);
         self.allocator.free(self.output_host_mirror_tids);
         for (self.bound_inputs) |t| if (t) |bound| bound.release();
         self.allocator.free(self.bound_inputs);
@@ -876,6 +877,10 @@ pub const Model = struct {
         }
     }
 
+    /// The most recent run's output `name`, as a host snapshot: later runs never
+    /// change it. The model owns it, so without a hold of your own (`Tensor.hold`)
+    /// it is reused by the next fetch of the same output; a held one is never
+    /// reused and stays valid until released.
     pub fn outputTensor(self: *Self, name: []const u8) api_errors.ApiError!Tensor {
         const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
         const output_index = self.findOutputIndex(name) orelse return api_errors.ApiError.InvalidArgument;
@@ -895,39 +900,41 @@ pub const Model = struct {
     }
 
     /// Fetch the most recent run's output by position (in declared output order).
+    /// Same snapshot contract as `outputTensor`.
     pub fn outputTensorAt(self: *Self, index: usize) api_errors.ApiError!Tensor {
         const cache_index = self.last_run_cache_index orelse return api_errors.ApiError.InvalidArgument;
         if (index >= self.output_signatures.len) return api_errors.ApiError.InvalidArgument;
         return self.resolveOutputTensor(cache_index, index);
     }
 
-    /// Resolve an output to a host-readable tensor. Device outputs are copied
-    /// explicitly into a lazy host mirror; CPU outputs are returned directly.
+    /// Resolve an output to a host tensor holding the last run's value: a snapshot,
+    /// never a view of the program's slot. Slots are rewritten by the next run, can
+    /// live on a device, and die with an evicted program, so every output is copied
+    /// into a host mirror -- including a pass-through input, which the caller can
+    /// rewrite.
     fn resolveOutputTensor(self: *Self, cache_index: usize, output_index: usize) api_errors.ApiError!Tensor {
         const entry: *const CacheEntry = &self.cache_entries.items[cache_index];
-        const tid = entry.program.outputs[output_index];
-        const on_device = (self.store.tensorDevice(tid) catch DeviceRef{}).kind != .cpu;
-        const evictable = self.store.tensorIsWorkspace(tid) catch false;
-        if (on_device or evictable) return self.mirrorOutputToHost(output_index, tid);
-        const t = try self.store.getConst(tid);
-        return .{ .store = self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+        return self.mirrorOutputToHost(output_index, entry.program.outputs[output_index]);
     }
 
-    /// Gather a device-exclusive output into a lazy, reusable host mirror.
-    /// Recreate the mirror if the source shape changed.
+    /// Copy an output into its host mirror. The model holds each mirror once; a
+    /// mirror someone else also holds belongs to an earlier fetch and is left alone,
+    /// so a new one replaces it -- the old one lives on until its last holder lets go.
     fn mirrorOutputToHost(self: *Self, output_index: usize, src_tid: TensorId) api_errors.ApiError!Tensor {
         const src_meta = try self.store.getConst(src_tid);
         const need_new = blk: {
             const cur = self.output_host_mirror_tids[output_index];
             if (cur == types_mod.invalid_tensor_id) break :blk true;
             const m = self.store.getConst(cur) catch break :blk true;
+            if ((m.holders orelse 1) > 1) break :blk true;
             break :blk m.dtype != src_meta.dtype or !signatures.sameUsize(m.shape, src_meta.shape);
         };
         if (need_new) {
+            const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, src_meta.dtype, src_meta.shape);
+            self.store.trackHolders(tid);
             const old = self.output_host_mirror_tids[output_index];
-            if (old != types_mod.invalid_tensor_id) self.store.releaseTensorData(old) catch {};
-            self.output_host_mirror_tids[output_index] =
-                try initializers.createTensorSingleTile(self.store, self.target.tiles, src_meta.dtype, src_meta.shape);
+            if (old != types_mod.invalid_tensor_id) self.store.releaseHold(old);
+            self.output_host_mirror_tids[output_index] = tid;
         }
         const mirror_tid = self.output_host_mirror_tids[output_index];
         try self.store.copyTensorData(mirror_tid, src_tid);

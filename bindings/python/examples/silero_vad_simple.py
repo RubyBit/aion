@@ -65,7 +65,6 @@ def main() -> None:
 
         x_t = aion.Tensor.empty(ctx, (1, chunk_input_len), dtype=aion.float32)
 
-        prob_t = None
         probs = np.zeros(args.chunks, dtype=np.float32)
 
         try:
@@ -83,10 +82,11 @@ def main() -> None:
                     model.bind_input(x_name, x_t)
                     model.run()
 
-                    if prob_t is None:
-                        prob_t = model.output_tensor(prob_name)
-
+                    # An output handle is a snapshot of one run: fetch it again
+                    # after every run.
+                    prob_t = model.output_tensor(prob_name)
                     probs[chunk_idx] = prob_t.item()
+                    prob_t.close()
 
                     if args.print_probs:
                         t_ms = (chunk_idx * args.num_samples * 1000.0) / 16_000.0
@@ -94,8 +94,6 @@ def main() -> None:
 
             t1 = time.perf_counter_ns()
         finally:
-            if prob_t is not None:
-                prob_t.close()
             x_t.close()
 
     total_chunks = args.chunks * args.bench_iters

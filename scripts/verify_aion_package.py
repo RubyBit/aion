@@ -47,7 +47,7 @@ from typing import Dict, List, Tuple
 # that only changes a section's record layout needs just the version raised.
 class aw:  # noqa: N801 - kept lowercase as a drop-in constants namespace
     MAGIC = b"AION"
-    VERSION = 13
+    VERSION = 14
     HEADER_SIZE = 72
     SECTION_DESC_SIZE = 24
     INVALID_INDEX_U32 = 0xFFFFFFFF

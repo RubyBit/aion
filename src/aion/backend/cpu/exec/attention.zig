@@ -35,6 +35,33 @@ const ConstTileCache = struct {
     valid: bool = false,
     tile_index: usize = 0,
     tile: tensor_store.TileRefConst = undefined,
+    /// The last row address resolved through this cache (see `rowBytesRank4Const`).
+    span: RowSpan = .{},
+};
+
+/// A run of `idx1` whose rows are a fixed stride apart in one tile.
+///
+/// Attention's inner loop asks for one KV row per key, and resolving each from
+/// scratch — three divisions, a tile index, a cache probe, four stride checks —
+/// cost several times the dot product it feeds. Consecutive keys almost always
+/// land in the same tile at the same `(idx0, idx2)`, where the next row is one
+/// stride on, so this remembers the run and the walk becomes a multiply and add.
+const RowSpan = struct {
+    valid: bool = false,
+    idx0: usize = 0,
+    idx2: usize = 0,
+    lo: usize = 0,
+    hi: usize = 0,
+    base: usize = 0,
+    stride: usize = 0,
+    row_bytes: usize = 0,
+    /// The tile's bytes, held so a hit does not rebuild the buffer view. Safe for
+    /// exactly as long as the span is: both die when the cached tile changes.
+    bytes: []const u8 = &[_]u8{},
+
+    fn covers(self: RowSpan, idx0: usize, idx1: usize, idx2: usize) bool {
+        return self.valid and self.idx0 == idx0 and self.idx2 == idx2 and idx1 >= self.lo and idx1 < self.hi;
+    }
 };
 
 const MutTileCache = struct {
@@ -47,6 +74,7 @@ fn releaseConstCache(store: tensor_store.TensorStore, cache: *ConstTileCache) vo
     if (cache.valid) {
         store.releaseConst(cache.tile.token);
         cache.valid = false;
+        cache.span.valid = false;
     }
 }
 
@@ -68,6 +96,7 @@ fn acquireConstTileCached(
         cache.tile = try store.acquireTileConstLinear(id, tile_index);
         cache.tile_index = tile_index;
         cache.valid = true;
+        cache.span.valid = false;
     }
     return cache.tile;
 }
@@ -151,17 +180,29 @@ fn readI32Rank2(
     return ptr.*;
 }
 
-fn rowSliceRank4ConstF32(
+/// One row of a rank-4 `[d0, d1, d2, d3]` tensor as bytes, walking `idx1` cheaply.
+///
+/// The full resolve runs only when `cache`'s remembered span does not already
+/// cover this row; inside a span the row is `base + (idx1 - lo) * stride`.
+fn rowBytesRank4Const(
     store: tensor_store.TensorStore,
     id: executable.TensorId,
     meta: tensor_store.TensorMeta,
+    dtype: types.DType,
     idx0: usize,
     idx1: usize,
     idx2: usize,
     row_len: usize,
     cache: *ConstTileCache,
-) ExecuteProgramError![]align(1) const f32 {
-    if (meta.rank != 4 or meta.dtype != .f32) return BackendError.InvalidArgument;
+) ExecuteProgramError![]const u8 {
+    if (cache.span.covers(idx0, idx1, idx2)) {
+        const sp = cache.span;
+        const off: usize = sp.base + (idx1 - sp.lo) * sp.stride;
+        return sp.bytes[off..][0..sp.row_bytes];
+    }
+
+    const elem_size: usize = dtype.info().block_bytes;
+    if (meta.rank != 4 or meta.dtype != dtype) return BackendError.InvalidArgument;
     if (meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
     if (row_len != meta.shape[3]) return BackendError.InvalidArgument;
     if (idx0 >= meta.shape[0] or idx1 >= meta.shape[1] or idx2 >= meta.shape[2]) return BackendError.InvalidArgument;
@@ -176,29 +217,58 @@ fn rowSliceRank4ConstF32(
     const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
 
     const view = tile.bufferView();
-    if (view.layout.rank != 4 or view.dtype != .f32) return BackendError.InvalidArgument;
+    if (view.layout.rank != 4 or view.dtype != dtype) return BackendError.InvalidArgument;
 
     const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
     const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
     const s2: usize = try asPositiveStride(view.layout.strides_bytes[2]);
     const s3: usize = try asPositiveStride(view.layout.strides_bytes[3]);
-    if (s3 != @sizeOf(f32)) return BackendError.InvalidArgument;
+    if (s3 != elem_size) return BackendError.InvalidArgument;
 
     const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
     const l1: usize = idx1 - coords[1] * meta.tile_shape[1];
     const l2: usize = idx2 - coords[2] * meta.tile_shape[2];
 
     const off0: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
     const off2: usize = std.math.mul(usize, l2, s2) catch return BackendError.InvalidArgument;
-    const off01: usize = std.math.add(usize, off0, off1) catch return BackendError.InvalidArgument;
-    const off: usize = std.math.add(usize, off01, off2) catch return BackendError.InvalidArgument;
+    const row_base: usize = std.math.add(usize, off0, off2) catch return BackendError.InvalidArgument;
+    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
+    const off: usize = std.math.add(usize, row_base, off1) catch return BackendError.InvalidArgument;
 
-    const row_bytes: usize = std.math.mul(usize, row_len, @sizeOf(f32)) catch return BackendError.InvalidArgument;
+    const row_bytes: usize = std.math.mul(usize, row_len, elem_size) catch return BackendError.InvalidArgument;
     const row_end: usize = std.math.add(usize, off, row_bytes) catch return BackendError.InvalidArgument;
     if (row_end > view.bytes.len) return BackendError.InvalidArgument;
 
-    return simd.bytesAsSliceConstUnaligned(f32, view.bytes[off..row_end]);
+    // Remember the run this row sits in: the rest of its tile along axis 1, as far
+    // as the last row that still fits the buffer.
+    const span_lo: usize = coords[1] * meta.tile_shape[1];
+    const rows_that_fit: usize = if (s1 == 0) 1 else (view.bytes.len - row_base - row_bytes) / s1 + 1;
+    cache.span = .{
+        .valid = true,
+        .idx0 = idx0,
+        .idx2 = idx2,
+        .lo = span_lo,
+        .hi = @min(@min(span_lo + meta.tile_shape[1], meta.shape[1]), span_lo + rows_that_fit),
+        .base = row_base,
+        .stride = s1,
+        .row_bytes = row_bytes,
+        .bytes = view.bytes,
+    };
+    return view.bytes[off..row_end];
+}
+
+fn rowSliceRank4ConstF32(
+    store: tensor_store.TensorStore,
+    id: executable.TensorId,
+    meta: tensor_store.TensorMeta,
+    idx0: usize,
+    idx1: usize,
+    idx2: usize,
+    row_len: usize,
+    cache: *ConstTileCache,
+) ExecuteProgramError![]align(1) const f32 {
+    const bytes = try rowBytesRank4Const(store, id, meta, .f32, idx0, idx1, idx2, row_len, cache);
+    return simd.bytesAsSliceConstUnaligned(f32, bytes);
 }
 
 fn rowSliceRank4ConstF16(
@@ -211,44 +281,8 @@ fn rowSliceRank4ConstF16(
     row_len: usize,
     cache: *ConstTileCache,
 ) ExecuteProgramError![]align(1) const f16 {
-    if (meta.rank != 4 or meta.dtype != .f16) return BackendError.InvalidArgument;
-    if (meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
-    if (row_len != meta.shape[3]) return BackendError.InvalidArgument;
-    if (idx0 >= meta.shape[0] or idx1 >= meta.shape[1] or idx2 >= meta.shape[2]) return BackendError.InvalidArgument;
-
-    const coords: [4]usize = .{
-        idx0 / meta.tile_shape[0],
-        idx1 / meta.tile_shape[1],
-        idx2 / meta.tile_shape[2],
-        0,
-    };
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 4 or view.dtype != .f16) return BackendError.InvalidArgument;
-
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-    const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
-    const s2: usize = try asPositiveStride(view.layout.strides_bytes[2]);
-    const s3: usize = try asPositiveStride(view.layout.strides_bytes[3]);
-    if (s3 != @sizeOf(f16)) return BackendError.InvalidArgument;
-
-    const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
-    const l1: usize = idx1 - coords[1] * meta.tile_shape[1];
-    const l2: usize = idx2 - coords[2] * meta.tile_shape[2];
-
-    const off0: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
-    const off2: usize = std.math.mul(usize, l2, s2) catch return BackendError.InvalidArgument;
-    const off01: usize = std.math.add(usize, off0, off1) catch return BackendError.InvalidArgument;
-    const off: usize = std.math.add(usize, off01, off2) catch return BackendError.InvalidArgument;
-
-    const row_bytes: usize = std.math.mul(usize, row_len, @sizeOf(f16)) catch return BackendError.InvalidArgument;
-    const row_end: usize = std.math.add(usize, off, row_bytes) catch return BackendError.InvalidArgument;
-    if (row_end > view.bytes.len) return BackendError.InvalidArgument;
-
-    return simd.bytesAsSliceConstUnaligned(f16, view.bytes[off..row_end]);
+    const bytes = try rowBytesRank4Const(store, id, meta, .f16, idx0, idx1, idx2, row_len, cache);
+    return simd.bytesAsSliceConstUnaligned(f16, bytes);
 }
 
 fn rowSliceRank4MutF32(
@@ -309,93 +343,77 @@ inline fn vecStore(ptr: [*]align(1) f32, v: Vec) void {
     @as(*align(1) [simd_lanes]f32, @ptrCast(ptr)).* = v;
 }
 
-inline fn dotRowF32(a: []align(1) const f32, b: []align(1) const f32, n: usize) f32 {
-    var acc: f32 = 0.0;
+/// Independent accumulator chains a row dot is split across.
+///
+/// A head dimension of 64 is only sixteen 4-lane FMAs, and chaining them serially
+/// costs the FMA's latency for each — the dot ends up latency-bound rather than
+/// throughput-bound. Four chains overlap them at no extra register cost.
+const DOT_CHAINS: usize = 4;
+
+/// `sum(a[i] * b[i])` for rows of any mix of f32 and f16.
+/// Whether an attention step is big enough to hand to the pool.
+///
+/// One decoded token against a short cache is a few hundred thousand element
+/// visits spread over `h_q` units — real work, but less than a fork and join
+/// costs, and it lands between two matmuls that wanted the caches. Prefill and
+/// long contexts clear this by orders of magnitude.
+fn worthSplitting(batch: usize, l_q: usize, h_q: usize, dims: usize, keys: usize) bool {
+    const visits = batch *| l_q *| h_q *| dims *| keys;
+    return visits >= MIN_PARALLEL_VISITS;
+}
+
+const MIN_PARALLEL_VISITS: usize = 2 << 20;
+
+inline fn dotRowsTyped(
+    comptime A: type,
+    comptime B: type,
+    a: [*]align(1) const A,
+    b: [*]align(1) const B,
+    n: usize,
+) f32 {
+    const VA = @Vector(simd_lanes, A);
+    const VB = @Vector(simd_lanes, B);
+
+    var acc: [DOT_CHAINS]Vec = @splat(@as(Vec, @splat(0.0)));
     var i: usize = 0;
-
-    if (n >= simd_lanes) {
-        var vacc: Vec = @splat(0.0);
-        const vec_end: usize = n - (n % simd_lanes);
-        while (i < vec_end) : (i += simd_lanes) {
-            vacc += vecLoad(a[i..].ptr) * vecLoad(b[i..].ptr);
+    const step: usize = simd_lanes * DOT_CHAINS;
+    while (i + step <= n) : (i += step) {
+        inline for (0..DOT_CHAINS) |c| {
+            const off = i + c * simd_lanes;
+            const av: Vec = @floatCast(@as(*align(1) const VA, @ptrCast(a + off)).*);
+            const bv: Vec = @floatCast(@as(*align(1) const VB, @ptrCast(b + off)).*);
+            acc[c] = @mulAdd(Vec, av, bv, acc[c]);
         }
-        acc += @reduce(.Add, vacc);
+    }
+    while (i + simd_lanes <= n) : (i += simd_lanes) {
+        const av: Vec = @floatCast(@as(*align(1) const VA, @ptrCast(a + i)).*);
+        const bv: Vec = @floatCast(@as(*align(1) const VB, @ptrCast(b + i)).*);
+        acc[0] = @mulAdd(Vec, av, bv, acc[0]);
     }
 
+    var total: Vec = acc[0];
+    inline for (1..DOT_CHAINS) |c| total += acc[c];
+    var sum: f32 = @reduce(.Add, total);
     while (i < n) : (i += 1) {
-        acc += a[i] * b[i];
+        sum += @as(f32, @floatCast(a[i])) * @as(f32, @floatCast(b[i]));
     }
-    return acc;
+    return sum;
+}
+
+inline fn dotRowF32(a: []align(1) const f32, b: []align(1) const f32, n: usize) f32 {
+    return dotRowsTyped(f32, f32, a.ptr, b.ptr, n);
 }
 
 inline fn dotRowF16F16(a: []align(1) const f16, b: []align(1) const f16, n: usize) f32 {
-    const VF = Vec;
-    const VH = @Vector(simd_lanes, f16);
-
-    var acc: f32 = 0.0;
-    var i: usize = 0;
-    if (n >= simd_lanes) {
-        var vacc: VF = @splat(0.0);
-        const vec_end: usize = n - (n % simd_lanes);
-        while (i < vec_end) : (i += simd_lanes) {
-            const ah: VH = @as(*align(1) const VH, @ptrCast(a[i..].ptr)).*;
-            const bh: VH = @as(*align(1) const VH, @ptrCast(b[i..].ptr)).*;
-            const af: VF = @floatCast(ah);
-            const bf: VF = @floatCast(bh);
-            vacc = @mulAdd(VF, af, bf, vacc);
-        }
-        acc += @reduce(.Add, vacc);
-    }
-    while (i < n) : (i += 1) {
-        acc += @as(f32, @floatCast(a[i])) * @as(f32, @floatCast(b[i]));
-    }
-    return acc;
+    return dotRowsTyped(f16, f16, a.ptr, b.ptr, n);
 }
 
 inline fn dotRowF32F16(a: []align(1) const f32, b: []align(1) const f16, n: usize) f32 {
-    const VF = Vec;
-    const VH = @Vector(simd_lanes, f16);
-
-    var acc: f32 = 0.0;
-    var i: usize = 0;
-    if (n >= simd_lanes) {
-        var vacc: VF = @splat(0.0);
-        const vec_end: usize = n - (n % simd_lanes);
-        while (i < vec_end) : (i += simd_lanes) {
-            const av: VF = @as(*align(1) const VF, @ptrCast(a[i..].ptr)).*;
-            const bh: VH = @as(*align(1) const VH, @ptrCast(b[i..].ptr)).*;
-            const bf: VF = @floatCast(bh);
-            vacc = @mulAdd(VF, av, bf, vacc);
-        }
-        acc += @reduce(.Add, vacc);
-    }
-    while (i < n) : (i += 1) {
-        acc += a[i] * @as(f32, @floatCast(b[i]));
-    }
-    return acc;
+    return dotRowsTyped(f32, f16, a.ptr, b.ptr, n);
 }
 
 inline fn dotRowF16F32(a: []align(1) const f16, b: []align(1) const f32, n: usize) f32 {
-    const VF = Vec;
-    const VH = @Vector(simd_lanes, f16);
-
-    var acc: f32 = 0.0;
-    var i: usize = 0;
-    if (n >= simd_lanes) {
-        var vacc: VF = @splat(0.0);
-        const vec_end: usize = n - (n % simd_lanes);
-        while (i < vec_end) : (i += simd_lanes) {
-            const ah: VH = @as(*align(1) const VH, @ptrCast(a[i..].ptr)).*;
-            const bv: VF = @as(*align(1) const VF, @ptrCast(b[i..].ptr)).*;
-            const af: VF = @floatCast(ah);
-            vacc = @mulAdd(VF, af, bv, vacc);
-        }
-        acc += @reduce(.Add, vacc);
-    }
-    while (i < n) : (i += 1) {
-        acc += @as(f32, @floatCast(a[i])) * b[i];
-    }
-    return acc;
+    return dotRowsTyped(f16, f32, a.ptr, b.ptr, n);
 }
 
 inline fn dotRowsDynamic(
@@ -592,6 +610,38 @@ const Panel = struct {
     rows: usize,
 };
 
+/// The same rows as `panelF32`, converted out of an f16 cache into `dst`.
+///
+/// The panel kernels read f32 at a constant row stride. An f16 cache is the
+/// common case for decode and was the only reason it fell to the generic
+/// executor, so convert one key block at a time — `dst` is per-worker scratch
+/// and stays in L1 across the queries that share the block.
+fn panelF16(
+    store: tensor_store.TensorStore,
+    id: executable.TensorId,
+    meta: tensor_store.TensorMeta,
+    b: usize,
+    t: usize,
+    h: usize,
+    d: usize,
+    cache: *ConstTileCache,
+    dst: []f32,
+    max_rows: usize,
+) ExecuteProgramError!Panel {
+    if (meta.rank != 4 or meta.dtype != .f16) return BackendError.InvalidArgument;
+    if (t >= meta.shape[1] or b >= meta.shape[0] or h >= meta.shape[2]) return BackendError.InvalidArgument;
+
+    var rows: usize = 0;
+    while (rows < max_rows and t + rows < meta.shape[1]) : (rows += 1) {
+        const src = try rowBytesRank4Const(store, id, meta, .f16, b, t + rows, h, d, cache);
+        const half: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, src);
+        if (half.len < d or dst.len < (rows + 1) * d) return BackendError.InvalidArgument;
+        for (dst[rows * d ..][0..d], half[0..d]) |*o, v| o.* = @floatCast(v);
+    }
+    if (rows == 0) return BackendError.InvalidArgument;
+    return .{ .data = dst[0 .. rows * d], .row_stride = d, .rows = rows };
+}
+
 fn panelF32(
     store: tensor_store.TensorStore,
     id: executable.TensorId,
@@ -661,6 +711,8 @@ const Worker = struct {
     kt: []f32, // packed K panel
     qt: []f32, // packed Q panel
     acc_local: []f32, // [row_block, d_v] when segs == 1
+    kbuf: []f32, // [key_block, d_k] when the K cache is f16
+    vbuf: []f32, // [key_block, d_v] when the V cache is f16
 
     q_cache: ConstTileCache = .{},
     k_cache: ConstTileCache = .{},
@@ -848,14 +900,24 @@ const BlockedCtx = struct {
             while (j < d_k) : (j += 1) dst[j] = q_row[j] * self.s.scale;
         }
 
-        const narrow: bool = rows < self.kernels.tuning.mr;
+        // Packing K buys a register-blocked GEMM, but the pack only pays once
+        // several row tiles reuse it. A decode unit is one GQA group — a single
+        // tile — so there the narrow kernel's one K stream wins outright.
+        const narrow: bool = rows < 2 * self.kernels.tuning.mr;
 
         var t: usize = t_start;
         while (t < t_end) {
             if (self.stop.load(.acquire)) return;
 
-            const kp: Panel = try panelF32(self.store, self.s.k, self.k_meta, u.b, t, u.hkv, d_k, &w.k_cache);
-            const vp: Panel = try panelF32(self.store, self.s.v, self.v_meta, u.b, t, u.hkv, d_v, &w.v_cache);
+            const room: usize = @min(self.key_block, t_end - t);
+            const kp: Panel = if (self.k_meta.dtype == .f16)
+                try panelF16(self.store, self.s.k, self.k_meta, u.b, t, u.hkv, d_k, &w.k_cache, w.kbuf, room)
+            else
+                try panelF32(self.store, self.s.k, self.k_meta, u.b, t, u.hkv, d_k, &w.k_cache);
+            const vp: Panel = if (self.v_meta.dtype == .f16)
+                try panelF16(self.store, self.s.v, self.v_meta, u.b, t, u.hkv, d_v, &w.v_cache, w.vbuf, room)
+            else
+                try panelF32(self.store, self.s.v, self.v_meta, u.b, t, u.hkv, d_v, &w.v_cache);
             const n: usize = @min(@min(kp.rows, vp.rows), @min(self.key_block, t_end - t));
             if (n == 0) return BackendError.InvalidArgument;
 
@@ -962,6 +1024,8 @@ const BlockedCtx = struct {
             .kt = take(self.scratch, &off, alignUp(self.key_block, self.kernels.tuning.nr) * d_k),
             .qt = take(self.scratch, &off, alignUp(self.row_block, self.kernels.tuning.mr) * d_k),
             .acc_local = take(self.scratch, &off, self.row_block * d_v),
+            .kbuf = take(self.scratch, &off, if (self.k_meta.dtype == .f16) self.key_block * d_k else 0),
+            .vbuf = take(self.scratch, &off, if (self.v_meta.dtype == .f16) self.key_block * d_v else 0),
         };
         defer w.release(self.store);
 
@@ -1002,7 +1066,7 @@ const BlockedCtx = struct {
     /// fewer units than threads (decode), so this is a handful of rows.
     fn mergeUnits(self: *@This()) ExecuteProgramError!void {
         const d_v: usize = self.d_v;
-        var w: Worker = .{ .qp = &.{}, .scores = &.{}, .kt = &.{}, .qt = &.{}, .acc_local = &.{} };
+        var w: Worker = .{ .qp = &.{}, .scores = &.{}, .kt = &.{}, .qt = &.{}, .acc_local = &.{}, .kbuf = &.{}, .vbuf = &.{} };
         defer w.release(self.store);
 
         var m_out: [MAX_ROWS]f32 = undefined;
@@ -1086,8 +1150,9 @@ const BlockedCtx = struct {
     }
 };
 
-/// Blocked path preconditions. f16 caches and rolling time mapping keep the
-/// generic executor (this path's panels assume physically contiguous key rows).
+/// Blocked path preconditions. A rolling time mapping keeps the generic executor
+/// (this path's panels assume physically contiguous key rows); an f16 cache is
+/// converted a key block at a time by `panelF16`.
 fn blockedEligible(
     q_dtype: DType,
     k_dtype: DType,
@@ -1096,7 +1161,9 @@ fn blockedEligible(
     d_k: usize,
     d_v: usize,
 ) bool {
-    if (q_dtype != .f32 or k_dtype != .f32 or v_dtype != .f32) return false;
+    if (q_dtype != .f32) return false;
+    if (k_dtype != .f32 and k_dtype != .f16) return false;
+    if (v_dtype != .f32 and v_dtype != .f16) return false;
     if (map_mode != .identity) return false;
     if (d_k == 0 or d_v == 0) return false;
     return true;
@@ -1288,7 +1355,7 @@ const ExecCtx = struct {
                                     }
                                 else
                                     null;
-                                const k_row_f16: ?[]align(1) const f16 = if (self.k_dtype == .f16)
+                                const k_row_f16: ?[]align(1) const f16 = if (self.k_meta.dtype == .f16)
                                     rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
                                         self.fail(e);
                                         return;
@@ -1337,7 +1404,7 @@ const ExecCtx = struct {
                                     }
                                 else
                                     null;
-                                const v_row_f16: ?[]align(1) const f16 = if (self.v_dtype == .f16)
+                                const v_row_f16: ?[]align(1) const f16 = if (self.v_meta.dtype == .f16)
                                     rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
                                         self.fail(e);
                                         return;
@@ -1382,7 +1449,7 @@ const ExecCtx = struct {
                                     }
                                 else
                                     null;
-                                const k_row_f16: ?[]align(1) const f16 = if (self.k_dtype == .f16)
+                                const k_row_f16: ?[]align(1) const f16 = if (self.k_meta.dtype == .f16)
                                     rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
                                         self.fail(e);
                                         return;
@@ -1413,7 +1480,7 @@ const ExecCtx = struct {
                                     }
                                 else
                                     null;
-                                const v_row_f16: ?[]align(1) const f16 = if (self.v_dtype == .f16)
+                                const v_row_f16: ?[]align(1) const f16 = if (self.v_meta.dtype == .f16)
                                     rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
                                         self.fail(e);
                                         return;
@@ -1507,7 +1574,10 @@ fn execBlocked(
     const per_worker: usize = row_block * sh.d_k + row_block * key_block +
         alignUp(key_block, kernels.tuning.nr) * sh.d_k +
         alignUp(row_block, kernels.tuning.mr) * sh.d_k +
-        row_block * sh.d_v;
+        row_block * sh.d_v +
+        // Room to convert an f16 key block to the f32 the panel kernels read.
+        (if (sh.k_meta.dtype == .f16) key_block * sh.d_k else 0) +
+        (if (sh.v_meta.dtype == .f16) key_block * sh.d_v else 0);
 
     const scratch: []f32 = allocator.alloc(f32, per_worker * workers) catch return false;
     defer allocator.free(scratch);
@@ -1731,8 +1801,8 @@ pub fn execAttentionTiled(
     };
 
     if (pool) |p| {
-        if (thread_count > 1 and total_work >= 2) {
-            p.parallelForAny(@ptrCast(&ctx), total_work, 1, ExecCtx.runWork);
+        if (thread_count > 1 and total_work >= 2 and worthSplitting(batch, l_q, h_q, d_k + d_v, k_cap)) {
+            p.parallelForDynamic(@ptrCast(&ctx), total_work, 1, ExecCtx.runWork);
             if (ctx.err_any) |e| return @errorCast(e);
             return;
         }

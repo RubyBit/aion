@@ -19,180 +19,9 @@ pub const Q8_0_BLOCK_BYTES: usize = 34;
 pub const MatvecTuning = struct {
     /// SIMD lane width selected by `matvec_registry`.
     lanes: usize,
-    dot_enc: DotEnc = .f32,
+    /// The byte dot the prepared activation is multiplied with.
+    dot_enc: matmul_q_i8.DotEnc,
 };
-
-pub const DotEnc = enum { f32, vex, evex, sdot };
-
-/// Compute `C[0, :] = alpha * A[0, :] @ B + beta * C[0, :]` for q8_0 B without
-/// pre-packing, where:
-/// - A is f32 with shape [1, K] (contiguous over K)
-/// - B is q8_0 in block-major [K/32, N] layout (same as packBTileQ8_0 input)
-/// - C is f32 with shape [1, N]
-fn matvecQ8_0KMajorImpl(comptime LANES: comptime_int, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
-    if (params.m == 0) return;
-    if ((params.k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
-
-    const m: usize = params.m;
-    const n: usize = params.n;
-    const k: usize = params.k;
-    const alpha: f32 = params.alpha;
-    const beta: f32 = params.beta;
-
-    const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
-    const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
-    if (c.len < m * n) return BackendError.InvalidArgument;
-    if (a.len < m * k) return BackendError.InvalidArgument;
-
-    const blocks_per_col: usize = k / Q8_0_BLOCK_ELEMS;
-    const needed_b: usize = blocks_per_col * n * Q8_0_BLOCK_BYTES;
-    if (b_bytes.len < needed_b) return BackendError.InvalidArgument;
-
-    comptime {
-        if ((Q8_0_BLOCK_ELEMS % LANES) != 0) @compileError("q8 matvec helper requires Q8_0_BLOCK_ELEMS to be divisible by SIMD lanes");
-    }
-
-    // Small-M direct q8 GEMV/GEMM. Two properties matter for streaming (M = a few
-    // frames): (1) each B block is dequantized ONCE and reused across all M rows
-    // (no pack-B repack, no per-row B re-read); (2) B is traversed CONTIGUOUSLY.
-    // B is block-major [k_blocks, n], so for a fixed k-block the columns are
-    // adjacent — we tile the output columns (NT) and sweep k-blocks within a tile,
-    // keeping the NT*M accumulators hot while reading B sequentially. (Reading one
-    // column down all its k-blocks instead would stride by n and is bandwidth-bound,
-    // which capped scaling at ~4 cores.)
-    const MAX_DIRECT_M: usize = 16;
-    const NT: usize = 16; // output-column tile
-    if (m > MAX_DIRECT_M) return BackendError.InvalidArgument;
-
-    const chunks_per_block: comptime_int = Q8_0_BLOCK_ELEMS / LANES;
-    const VF = @Vector(LANES, f32);
-    const VI8 = @Vector(LANES, i8);
-    const b_ptr: [*]const u8 = b_bytes.ptr;
-
-    var jt: usize = 0;
-    while (jt < n) : (jt += NT) {
-        const nt: usize = @min(NT, n - jt);
-        var acc: [MAX_DIRECT_M][NT]f32 = undefined;
-        for (0..m) |row| {
-            for (0..nt) |jj| acc[row][jj] = 0.0;
-        }
-        var kb: usize = 0;
-        while (kb < blocks_per_col) : (kb += 1) {
-            const a_kb: usize = kb * Q8_0_BLOCK_ELEMS;
-            const kb_base: usize = kb * n + jt;
-            var jj: usize = 0;
-            while (jj < nt) : (jj += 1) {
-                const block_ptr: [*]const u8 = b_ptr + (kb_base + jj) * Q8_0_BLOCK_BYTES; // contiguous in jj
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-                const v_scale: VF = @splat(@as(f32, @as(f16, @bitCast(scale_bits))));
-                var bf: [Q8_0_BLOCK_ELEMS]f32 = undefined; // dequant once, reused by all rows
-                inline for (0..chunks_per_block) |chunk| {
-                    const lane_off: usize = chunk * LANES;
-                    const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + lane_off)).*;
-                    @as(*align(1) VF, @ptrCast(&bf[lane_off])).* = @as(VF, @floatFromInt(qv)) * v_scale;
-                }
-                var row: usize = 0;
-                while (row < m) : (row += 1) {
-                    const a_seg: [*]align(1) const f32 = a.ptr + row * k + a_kb;
-                    var sv: VF = @splat(0.0);
-                    inline for (0..chunks_per_block) |chunk| {
-                        const lane_off: usize = chunk * LANES;
-                        const av: VF = @as(*align(1) const VF, @ptrCast(a_seg + lane_off)).*;
-                        const bv: VF = @as(*align(1) const VF, @ptrCast(&bf[lane_off])).*;
-                        sv = @mulAdd(VF, av, bv, sv);
-                    }
-                    acc[row][jj] += @reduce(.Add, sv);
-                }
-            }
-        }
-        for (0..m) |row| {
-            var jj: usize = 0;
-            while (jj < nt) : (jj += 1) {
-                const idx: usize = row * n + jt + jj;
-                if (beta == 0.0) {
-                    c[idx] = alpha * acc[row][jj];
-                } else {
-                    c[idx] = alpha * acc[row][jj] + beta * c[idx];
-                }
-            }
-        }
-    }
-}
-
-/// Accumulate one K tile of an M=1 q8 matvec into SIMD scratch.  Tiled matmul
-/// execution calls this for every K tile owned by the same output-N worker, so
-/// horizontal reduction and the output read/write happen once for the complete
-/// dot product instead of once per storage tile.
-fn matvecQ8_0KMajorAccumulateImpl(
-    comptime LANES: comptime_int,
-    params: MatMulParams,
-    c_bytes: []u8,
-    a_bytes: []const u8,
-    b_bytes: []const u8,
-    acc_bytes: []align(32) u8,
-    first_k_tile: bool,
-    last_k_tile: bool,
-) BackendError!void {
-    if (params.m != 1 or (params.k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
-
-    const n = params.n;
-    const k = params.k;
-    const blocks = k / Q8_0_BLOCK_ELEMS;
-    const VF = @Vector(LANES, f32);
-    const VI8 = @Vector(LANES, i8);
-    const chunks_per_block: comptime_int = Q8_0_BLOCK_ELEMS / LANES;
-    const scratch_need = n * @sizeOf(VF);
-    if (acc_bytes.len < scratch_need) return BackendError.InvalidArgument;
-    if (a_bytes.len < k * @sizeOf(f32) or b_bytes.len < blocks * n * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
-    if (last_k_tile and c_bytes.len < n * @sizeOf(f32)) return BackendError.InvalidArgument;
-
-    const a = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
-    const c = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
-    const acc_store: []align(32) VF = @alignCast(std.mem.bytesAsSlice(VF, acc_bytes[0..scratch_need]));
-    const NT: usize = 16;
-
-    var jt: usize = 0;
-    while (jt < n) : (jt += NT) {
-        const nt = @min(NT, n - jt);
-        var vacc: [NT]VF = undefined;
-        var jj: usize = 0;
-        while (jj < nt) : (jj += 1) {
-            vacc[jj] = if (first_k_tile) @splat(0.0) else acc_store[jt + jj];
-        }
-
-        var kb: usize = 0;
-        while (kb < blocks) : (kb += 1) {
-            const a_base = kb * Q8_0_BLOCK_ELEMS;
-            const b_base = kb * n + jt;
-            jj = 0;
-            while (jj < nt) : (jj += 1) {
-                const block_ptr = b_bytes.ptr + (b_base + jj) * Q8_0_BLOCK_BYTES;
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-                const scale: VF = @splat(@as(f32, @as(f16, @bitCast(scale_bits))));
-                inline for (0..chunks_per_block) |chunk| {
-                    const off = chunk * LANES;
-                    const qv: VI8 = @as(*align(1) const VI8, @ptrCast(block_ptr + 2 + off)).*;
-                    const av: VF = @as(*align(1) const VF, @ptrCast(a.ptr + a_base + off)).*;
-                    vacc[jj] = @mulAdd(VF, av, @as(VF, @floatFromInt(qv)) * scale, vacc[jj]);
-                }
-            }
-        }
-
-        jj = 0;
-        while (jj < nt) : (jj += 1) {
-            if (last_k_tile) {
-                const dot = @reduce(.Add, vacc[jj]);
-                const out_idx = jt + jj;
-                c[out_idx] = if (params.beta == 0.0)
-                    params.alpha * dot
-                else
-                    params.alpha * dot + params.beta * c[out_idx];
-            } else {
-                acc_store[jt + jj] = vacc[jj];
-            }
-        }
-    }
-}
 
 fn matvecQ8_0KMajorDotAccumulateImpl(
     comptime enc: matmul_q_i8.DotEnc,
@@ -210,10 +39,12 @@ fn matvecQ8_0KMajorDotAccumulateImpl(
     const n = params.n;
     const k = params.k;
     const blocks = k / Q8_0_BLOCK_ELEMS;
-    const VF = @Vector(8, f32);
-    const VI = @Vector(8, i32);
+    // A folded block dot is four lanes wide (see `matmul_q_i8.dotI8Narrow`), and
+    // the running sums that consume it follow.
+    const VF = @Vector(4, f32);
+    const VI = @Vector(4, i32);
     const scratch_need = n * @sizeOf(VF);
-    const prepared_block_bytes = Q8_0_BLOCK_ELEMS + @sizeOf(f32);
+    const prepared_block_bytes = matmul_q_i8.PREP_BLOCK_BYTES;
     const prepared_need = blocks * prepared_block_bytes;
     if (acc_bytes.len < scratch_need) return BackendError.InvalidArgument;
     if (prepared_a.len < prepared_need) return BackendError.InvalidArgument;
@@ -223,33 +54,51 @@ fn matvecQ8_0KMajorDotAccumulateImpl(
     const a = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
     const c = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
     const acc: []align(32) VF = @alignCast(std.mem.bytesAsSlice(VF, acc_bytes[0..scratch_need]));
-    if (first_k_tile) @memset(acc, @as(VF, @splat(0.0)));
 
-    var kb: usize = 0;
-    while (kb < blocks) : (kb += 1) {
-        const prepared_block = prepared_a[kb * prepared_block_bytes ..][0..prepared_block_bytes];
-        const aq_ptr: [*]i8 = @ptrCast(prepared_block.ptr);
-        const scale_ptr: *align(1) f32 = @ptrCast(prepared_block.ptr + Q8_0_BLOCK_ELEMS);
-        if (prepare_a) scale_ptr.* = matmul_q_i8.quantizeABlock(a.ptr + kb * Q8_0_BLOCK_ELEMS, aq_ptr);
-        const a_scale = scale_ptr.*;
-        const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(aq_ptr)).*;
-        var correction: VI = @splat(0);
-        if (comptime matmul_q_i8.encNeedsBias(enc)) {
-            inline for (0..8) |g| {
-                inline for (0..4) |kk| correction[g] += @as(i32, aq_ptr[g * 4 + kk]);
+    // Quantise this K tile's activation once, then sweep columns in tiles small
+    // enough to keep their running sums in registers. Accumulating straight into
+    // `acc` instead costs a 32-byte read and write per column per block — 64
+    // bytes of accumulator traffic for every 34 bytes of weight, which is more
+    // than the weights themselves.
+    if (prepare_a) matmul_q_i8.prepareARow(prepared_a.ptr, a.ptr, blocks);
+
+    const NT: usize = 4;
+    var jt: usize = 0;
+    while (jt + NT <= n) : (jt += NT) {
+        var reg: [NT]VF = undefined;
+        inline for (0..NT) |jj| reg[jj] = if (first_k_tile) @splat(0.0) else acc[jt + jj];
+        var kb: usize = 0;
+        while (kb < blocks) : (kb += 1) {
+            const slot = prepared_a[kb * prepared_block_bytes ..];
+            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
+            const correction = matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            const row = b_bytes.ptr + (kb * n + jt) * Q8_0_BLOCK_BYTES;
+            inline for (0..NT) |jj| {
+                const bp = row + jj * Q8_0_BLOCK_BYTES;
+                const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
+                const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+                const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - correction;
+                reg[jj] += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
             }
-            correction *= @as(VI, @splat(128));
         }
+        inline for (0..NT) |jj| acc[jt + jj] = reg[jj];
+    }
 
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            const block_ptr = b_bytes.ptr + (kb * n + j) * Q8_0_BLOCK_BYTES;
-            const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(block_ptr)).*;
-            const scale: VF = @splat(a_scale * @as(f32, @as(f16, @bitCast(scale_bits))));
-            const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(block_ptr + 2)).*;
-            const dots = matmul_q_i8.dotI8(enc, @as(VI, @splat(0)), qv, aqv) - correction;
-            acc[j] += @as(VF, @floatFromInt(dots)) * scale;
+    while (jt < n) : (jt += 1) {
+        var reg: VF = if (first_k_tile) @splat(0.0) else acc[jt];
+        var kb: usize = 0;
+        while (kb < blocks) : (kb += 1) {
+            const slot = prepared_a[kb * prepared_block_bytes ..];
+            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
+            const bp = b_bytes.ptr + (kb * n + jt) * Q8_0_BLOCK_BYTES;
+            const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
+            const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+            const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            reg += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
         }
+        acc[jt] = reg;
     }
 
     if (last_k_tile) {
@@ -261,19 +110,188 @@ fn matvecQ8_0KMajorDotAccumulateImpl(
     }
 }
 
+/// Deepest K a single-call dot matvec quantises its activation for up front.
+const DOT_MAX_K: usize = 8192;
+const PREP_BLOCK_BYTES: usize = matmul_q_i8.PREP_BLOCK_BYTES;
+
+threadlocal var dot_prep: [(DOT_MAX_K / Q8_0_BLOCK_ELEMS) * PREP_BLOCK_BYTES]u8 align(32) = undefined;
+
+inline fn storeDot(c: []align(1) f32, params: MatMulParams, idx: usize, dot: f32) void {
+    c[idx] = if (params.beta == 0.0) params.alpha * dot else params.alpha * dot + params.beta * c[idx];
+}
+
+/// q8 matvec with integer dot products and register-resident sums; the form
+/// every M and K takes in one call.
+///
+/// The accumulating form above parks one vector per column in memory and reads
+/// and writes it for every block — 64 bytes of accumulator traffic per 34 bytes
+/// of weight, which is what made it lose as the whole-call kernel.
+///
+/// A column tile narrow enough to stay in the register file fixes that, and the
+/// activation is quantised once per call rather than once per column tile, so B
+/// is the only thing streamed. Whole tiles run unconditionally: a `jj < nt` test
+/// inside the unrolled body makes every accumulator write conditional, and the
+/// sums then spill to memory, which is the whole point of tiling them.
+///
+/// Tiling columns does stride B by `n * 34`, and reading it straight through is
+/// worth 40% on the loads alone. Both ways of holding the sums that a contiguous
+/// sweep needs lose far more than that, measured on a 1B q8 decode against 32
+/// tok/s for this kernel:
+///
+///   contiguous, a scalar sum per column   4.1 tok/s  reduces every block's dot
+///   contiguous, a vector sum per column   4.3 tok/s  16 KiB of L1 traffic, 64
+///                                                    bytes for every 34 of B
+///
+/// The sums' residency dominates the read pattern, and the register file holds
+/// only a few columns' worth. Getting contiguous reads *and* register sums needs
+/// B stored per output column, `[n][k_blocks]` rather than `[k_blocks][n]` — a
+/// packing change, not a kernel one.
+fn matvecQ8_0DotRegImpl(
+    comptime enc: matmul_q_i8.DotEnc,
+    comptime NT: usize,
+    params: MatMulParams,
+    c_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+) BackendError!void {
+    const m = params.m;
+    const n = params.n;
+    const k = params.k;
+    const blocks = k / Q8_0_BLOCK_ELEMS;
+
+    const a = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
+    const c = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
+    if (a.len < m * k or c.len < m * n) return BackendError.InvalidArgument;
+    if (b_bytes.len < blocks * n * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+
+    // One row at a time, its activation quantised in chunks of K the buffer holds:
+    // every M and K gets the same integer dot, rather than a deep or multi-row call
+    // quietly falling back to f32. A row past the first re-reads B, which only the
+    // shapes a decode never issues pay.
+    const chunk_blocks: usize = DOT_MAX_K / Q8_0_BLOCK_ELEMS;
+    for (0..m) |r| {
+        const c_row = c[r * n ..][0..n];
+        var kb0: usize = 0;
+        while (kb0 < blocks) : (kb0 += chunk_blocks) {
+            const nb = @min(chunk_blocks, blocks - kb0);
+            matmul_q_i8.prepareARow(&dot_prep, a.ptr + r * k + kb0 * Q8_0_BLOCK_ELEMS, nb);
+            const first = kb0 == 0;
+            dotColumns(enc, NT, c_row, params, first, b_bytes.ptr + kb0 * n * Q8_0_BLOCK_BYTES, n, nb);
+        }
+    }
+}
+
+/// Every column of one row over `nb` K blocks of B starting at `b`, against the
+/// prepared activation in `dot_prep`. The first chunk stores through alpha and
+/// beta; later ones add their share.
+fn dotColumns(
+    comptime enc: matmul_q_i8.DotEnc,
+    comptime NT: usize,
+    c: []align(1) f32,
+    params: MatMulParams,
+    first: bool,
+    b: [*]const u8,
+    n: usize,
+    nb: usize,
+) void {
+    // A folded block dot is four lanes wide (see `matmul_q_i8.dotI8Narrow`), and
+    // the running sums that consume it follow.
+    const VF = @Vector(4, f32);
+    const VI = @Vector(4, i32);
+    const store = struct {
+        fn at(cc: []align(1) f32, p: MatMulParams, is_first: bool, idx: usize, dot: f32) void {
+            if (is_first) storeDot(cc, p, idx, dot) else cc[idx] += p.alpha * dot;
+        }
+    }.at;
+
+    var jt: usize = 0;
+    while (jt + NT <= n) : (jt += NT) {
+        var acc: [NT]VF = @splat(@as(VF, @splat(0.0)));
+        var kb: usize = 0;
+        while (kb < nb) : (kb += 1) {
+            const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
+            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
+            const correction = matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            const row = b + (kb * n + jt) * Q8_0_BLOCK_BYTES;
+            inline for (0..NT) |jj| {
+                const bp = row + jj * Q8_0_BLOCK_BYTES;
+                const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
+                const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+                const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - correction;
+                acc[jj] += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
+            }
+        }
+        inline for (0..NT) |jj| store(c, params, first, jt + jj, @reduce(.Add, acc[jj]));
+    }
+
+    while (jt < n) : (jt += 1) {
+        var acc: VF = @splat(0.0);
+        var kb: usize = 0;
+        while (kb < nb) : (kb += 1) {
+            const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
+            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
+            const bp = b + (kb * n + jt) * Q8_0_BLOCK_BYTES;
+            const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
+            const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+            const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            acc += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
+        }
+        store(c, params, first, jt, @reduce(.Add, acc));
+    }
+}
+
 pub fn MatvecKernel(comptime t: MatvecTuning) type {
     return struct {
         pub fn matvecQ8_0KMajor(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) BackendError!void {
-            return matvecQ8_0KMajorImpl(t.lanes, params, c_bytes, a_bytes, b_bytes);
+            if (params.m == 0) return;
+            if ((params.k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
+            return matvecQ8_0DotRegImpl(t.dot_enc, 4, params, c_bytes, a_bytes, b_bytes);
         }
 
         pub fn matvecQ8_0KMajorAccumulate(params: MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8, acc_bytes: []align(32) u8, prepared_a: []align(32) u8, prepare_a: bool, first_k_tile: bool, last_k_tile: bool) BackendError!void {
-            return switch (t.dot_enc) {
-                .f32 => matvecQ8_0KMajorAccumulateImpl(t.lanes, params, c_bytes, a_bytes, b_bytes, acc_bytes, first_k_tile, last_k_tile),
-                .vex => matvecQ8_0KMajorDotAccumulateImpl(.vex, params, c_bytes, a_bytes, b_bytes, acc_bytes, prepared_a, prepare_a, first_k_tile, last_k_tile),
-                .evex => matvecQ8_0KMajorDotAccumulateImpl(.evex, params, c_bytes, a_bytes, b_bytes, acc_bytes, prepared_a, prepare_a, first_k_tile, last_k_tile),
-                .sdot => matvecQ8_0KMajorDotAccumulateImpl(.sdot, params, c_bytes, a_bytes, b_bytes, acc_bytes, prepared_a, prepare_a, first_k_tile, last_k_tile),
-            };
+            return matvecQ8_0KMajorDotAccumulateImpl(t.dot_enc, params, c_bytes, a_bytes, b_bytes, acc_bytes, prepared_a, prepare_a, first_k_tile, last_k_tile);
         }
     };
+}
+
+// Past `DOT_MAX_K` the activation is quantized in chunks; a chunk boundary sits on
+// a block boundary, so it must change nothing about the integer dot.
+test "matvec_q: int8 results hold past the prepared-activation chunk and above M = 1" {
+    const testing = std.testing;
+    const m: usize = 2;
+    const n: usize = 4;
+    const k: usize = DOT_MAX_K + 64;
+    const blocks = k / Q8_0_BLOCK_ELEMS;
+
+    const a = try testing.allocator.alloc(f32, m * k);
+    defer testing.allocator.free(a);
+    for (a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) * 0.01;
+    const b = try testing.allocator.alloc(u8, blocks * n * Q8_0_BLOCK_BYTES);
+    defer testing.allocator.free(b);
+    for (0..blocks * n) |bi| {
+        std.mem.writeInt(u16, b[bi * Q8_0_BLOCK_BYTES ..][0..2], @bitCast(@as(f16, 0.02)), .little);
+        for (b[bi * Q8_0_BLOCK_BYTES + 2 ..][0..32], 0..) |*q, t| q.* = @truncate(bi *% 5 +% t *% 3);
+    }
+
+    var got: [m * n]f32 = undefined;
+    const K = MatvecKernel(.{ .lanes = 4, .dot_enc = .portable });
+    try K.matvecQ8_0KMajor(.{ .m = m, .n = n, .k = k }, std.mem.sliceAsBytes(&got), std.mem.sliceAsBytes(a), b);
+
+    for (0..m) |r| {
+        for (0..n) |c| {
+            var want: f64 = 0;
+            for (0..blocks) |kb| {
+                var aq: [32]i8 = undefined;
+                const a_scale = matmul_q_i8.quantizeABlock(a[r * k + kb * 32 ..].ptr, &aq);
+                const bp = b[(kb * n + c) * Q8_0_BLOCK_BYTES ..];
+                var dot: i64 = 0;
+                for (0..32) |t| dot += @as(i64, aq[t]) * @as(i8, @bitCast(bp[2 + t]));
+                const b_scale: f64 = @as(f16, @bitCast(std.mem.readInt(u16, bp[0..2], .little)));
+                want += @as(f64, a_scale) * b_scale * @as(f64, @floatFromInt(dot));
+            }
+            try testing.expectApproxEqRel(want, @as(f64, got[r * n + c]), 1e-5);
+        }
+    }
 }

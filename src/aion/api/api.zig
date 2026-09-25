@@ -7,6 +7,7 @@
 //! - No allocations during execution of compiled models.
 
 pub const Context = @import("context.zig").Context;
+pub const RowSource = @import("context.zig").RowSource;
 pub const TilePolicy = @import("context.zig").TilePolicy;
 pub const LoadedModel = @import("context.zig").LoadedModel;
 pub const Weights = @import("context.zig").Weights;

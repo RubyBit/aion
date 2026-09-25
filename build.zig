@@ -89,13 +89,13 @@ pub fn build(b: *std.Build) void {
     // and need `-Dmultiversion=false`, the same deal x86 pre-Haswell gets.
     const arm_floor: std.Target.aarch64.Feature = .v8_2a;
     const armFloorQuery = struct {
-        fn make(base: std.Target.Query, extra: []const std.Target.aarch64.Feature, floor: std.Target.aarch64.Feature) std.Target.Query {
+        fn make(base: std.Target.Query, comptime extra: []const tier_kinds.Feature, floor: std.Target.aarch64.Feature) std.Target.Query {
             var q = base;
             q.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic };
             q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_add.addFeature(@intFromEnum(floor));
-            for (extra) |f| q.cpu_features_add.addFeature(@intFromEnum(f));
+            inline for (extra) |f| q.cpu_features_add.addFeature(@intFromEnum(@field(std.Target.aarch64.Feature, @tagName(f))));
             return q;
         }
     }.make;
@@ -260,48 +260,24 @@ pub fn build(b: *std.Build) void {
         }
     };
 
+    // One object per tier in `tier_kinds`, compiled for exactly the features it
+    // lists; dispatch selects it only when the CPU reports all of them.
     if (want_x86_multiversion) {
-        // quant_enc: 0 = f32-accumulate, 1 = AVX-VNNI (VEX vpdpbusd), 2 = AVX-512-VNNI (EVEX).
-        const X86Tier = struct { name: []const u8, lanes: u32, model: *const std.Target.Cpu.Model, add: []const std.Target.x86.Feature, quant: tier_kinds.QuantGemm };
-        const tiers = [_]X86Tier{
-            .{ .name = "v3", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{}, .quant = .f32_accumulate },
-            .{ .name = "v3_vnni", .lanes = 8, .model = &std.Target.x86.cpu.x86_64_v3, .add = &.{.avxvnni}, .quant = .avx_vnni },
-            .{ .name = "v4", .lanes = 16, .model = &std.Target.x86.cpu.x86_64_v4, .add = &.{.avx512vnni}, .quant = .avx512_vnni },
-        };
-        for (tiers) |tier| {
+        inline for (tier_kinds.x86_tiers) |tier| {
             var q = target.query;
-            q.cpu_model = .{ .explicit = tier.model };
+            q.cpu_model = .{ .explicit = &@field(std.Target.x86.cpu, tier.x86_model) };
             q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
-            for (tier.add) |f| q.cpu_features_add.addFeature(@intFromEnum(f));
-            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant, .simd, b.resolveTargetQuery(q));
+            inline for (tier.requires) |f| q.cpu_features_add.addFeature(@intFromEnum(@field(std.Target.x86.Feature, @tagName(f))));
+            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant, tier.f32_gemm, b.resolveTargetQuery(q));
         }
     } else if (want_arm_multiversion) {
-        // NEON f32 is a fixed 128-bit 4-lane FMA everywhere, so unlike x86 there is
-        // no lane-width axis: a tier buys the int8 encoding, on top of the shared
-        // ARMv8.2-A floor. quant_enc: 0 = f32-accumulate, 3 = FEAT_DotProd (sdot,
-        // grouped-by-4 dot), 4 = FEAT_I8MM (smmla, int8 2×2 matrix-multiply).
-        //
         // The floor is not just the main module's: the tiers carry the hot f32
         // matmul/conv kernels, and compiling those at plain ARMv8.0 instead cost
         // ~9% single-thread and ~16% at 10 threads on VGG-19.
-        const ArmTier = struct {
-            name: []const u8,
-            add: []const std.Target.aarch64.Feature,
-            quant: tier_kinds.QuantGemm,
-            f32_gemm: tier_kinds.F32Gemm = .simd,
-        };
-        const tiers = [_]ArmTier{
-            .{ .name = "arm_baseline", .add = &.{}, .quant = .f32_accumulate },
-            .{ .name = "arm_dotprod", .add = &.{.dotprod}, .quant = .dotprod },
-            .{ .name = "arm_i8mm", .add = &.{ .dotprod, .i8mm }, .quant = .i8mm },
-            // SME implies v8.2 and the whole int8 set, so this tier keeps `smmla`
-            // and swaps only the f32 GEMM for the outer-product kernel.
-            .{ .name = "arm_sme", .add = &.{ .dotprod, .i8mm, .sme, .sme2 }, .quant = .i8mm, .f32_gemm = .sme },
-        };
-        for (tiers) |tier| {
-            const q = armFloorQuery(target.query, tier.add, arm_floor);
-            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, 4, tier.quant, tier.f32_gemm, b.resolveTargetQuery(q));
+        inline for (tier_kinds.arm_tiers) |tier| {
+            const q = armFloorQuery(target.query, tier.requires, arm_floor);
+            TierBuild.add(b, &tier_objs, &n_tiers, optimize, pic, tier.name, tier.lanes, tier.quant, tier.f32_gemm, b.resolveTargetQuery(q));
         }
     }
 

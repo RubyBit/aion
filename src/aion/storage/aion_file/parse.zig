@@ -33,34 +33,21 @@ const RegionRecord = types.RegionRecord;
 const GraphMeta = types.GraphMeta;
 const Package = types.Package;
 
-/// Parse a `.aion` file and return a `Package`. The returned Package owns its data
-/// (slices are copied out of `bytes`), so the caller remains responsible for the buffer.
+// Freeing is the package type's; a partly parsed section frees the same way.
+const freeInitializers = types.freeInitializers;
+const freeValues = types.freeValues;
+const freeRegions = types.freeRegions;
+const freeNodes = types.freeNodes;
+const freeNode = types.freeNode;
+const freeNamedValues = types.freeNamedValues;
+const freeMetadata = types.freeMetadata;
+const freeDebugNames = types.freeDebugNames;
+const freeDimSymbols = types.freeDimSymbols;
+
+/// Parse a `.aion` file and return a `Package`. Everything but the tensor payloads
+/// (and quantized params) is copied out; those stay views of `bytes`, which must
+/// outlive every read of them — a mapped file (`MappedPackage`) is what loading uses.
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) PackageError!Package {
-    return parseImpl(allocator, bytes, null);
-}
-
-/// Parse and transfer ownership of `bytes` into the returned Package.
-///
-/// Large-initializer slices (notably `Initializer.data` and `QuantizedEncoding.params`)
-/// borrow directly into `bytes` rather than being copied out; `Package.deinit` frees
-/// `bytes` after tearing down its other owned allocations. Use this when loading
-/// multi-GB packages to avoid a peak-memory doubling during parse.
-///
-/// Ownership is transferred unconditionally: on error `bytes` is freed inside the
-/// implementation before the error returns, so the caller must not `free(bytes)`
-/// themselves after calling this.
-pub fn parseTakeOwned(allocator: std.mem.Allocator, bytes: []u8) PackageError!Package {
-    return parseImpl(allocator, bytes, bytes);
-}
-
-fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u8) PackageError!Package {
-    // If the caller transferred bytes to us, we must free them on any error path that
-    // returns before the Package takes ownership. `pending_bytes` tracks "do we still
-    // owe the caller that free?"; we null it once the Package holds the bytes and its
-    // own deinit takes over.
-    var pending_bytes: ?[]u8 = source_bytes;
-    errdefer if (pending_bytes) |b| allocator.free(b);
-
     var pkg: Package = undefined;
     var graph_meta: GraphMeta = undefined;
 
@@ -99,7 +86,7 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
             try allocator.alloc(DimExpr, 0);
         errdefer allocator.free(dim_exprs);
 
-        const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.tensors)].?), source_bytes != null);
+        const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.tensors)].?));
         errdefer freeInitializers(allocator, initializers);
 
         const values = try parseValuesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.values)].?));
@@ -160,12 +147,9 @@ fn parseImpl(allocator: std.mem.Allocator, bytes: []const u8, source_bytes: ?[]u
             .debug_names = debug_names,
             .io_aliases = io_aliases,
             .input_roles = input_roles,
-            .source_bytes = source_bytes,
         };
-
-        // From this point, the Package owns all allocations above (and optionally
-        // `source_bytes`). Any later error should be handled by `pkg.deinit()`.
-        pending_bytes = null;
+        // From this point, the Package owns all allocations above. Any later error
+        // should be handled by `pkg.deinit()`.
     }
 
     errdefer pkg.deinit();
@@ -343,7 +327,6 @@ fn parseInitializersSection(
     allocator: std.mem.Allocator,
     strings: [][]u8,
     bytes: []const u8,
-    borrow_data: bool,
 ) PackageError![]Initializer {
     var cursor: usize = 0;
     const count = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
@@ -363,26 +346,16 @@ fn parseInitializersSection(
         const params_raw = try readBytes(bytes, &cursor, params_len);
         const data_raw = try readBytes(bytes, &cursor, data_len);
 
-        // `data` and (for quantized kinds) `params` are the largest per-initializer
-        // payloads; when the caller has transferred ownership of the file bytes to the
-        // Package, these can be zero-copy borrows instead of duplicated allocations.
-        const data: []u8 = if (borrow_data)
-            @constCast(data_raw)
-        else
-            allocator.dupe(u8, data_raw) catch return PackageError.OutOfMemory;
-        errdefer if (!borrow_data) allocator.free(data);
+        // The payload, and a quantized one's params, stay views of the file bytes.
+        const data = data_raw;
 
         slot.* = switch (kind) {
-            0 => .{ .encoding = .{ .plain = std.enums.fromInt(DType, plain_dtype_raw) orelse return PackageError.InvalidFormat }, .data = data },
+            0 => .{ .encoding = .{ .plain = std.enums.fromInt(DType, plain_dtype_raw) orelse return PackageError.InvalidFormat }, .data = .{ .bytes = data } },
             1 => blk: {
                 if (scheme_idx == invalid_index or scheme_idx >= strings.len) return PackageError.InvalidFormat;
                 const scheme = allocator.dupe(u8, strings[scheme_idx]) catch return PackageError.OutOfMemory;
                 errdefer allocator.free(scheme);
-                const params: []u8 = if (borrow_data)
-                    @constCast(params_raw)
-                else
-                    allocator.dupe(u8, params_raw) catch return PackageError.OutOfMemory;
-                errdefer if (!borrow_data) allocator.free(params);
+                const params = params_raw;
                 break :blk .{
                     .encoding = .{ .quantized = .{
                         .scheme = scheme,
@@ -392,7 +365,7 @@ fn parseInitializersSection(
                         .quant_axis = quant_axis,
                         .params = params,
                     } },
-                    .data = data,
+                    .data = .{ .bytes = data },
                 };
             },
             else => return PackageError.InvalidFormat,
@@ -790,67 +763,6 @@ fn parseGraphMetaSection(bytes: []const u8) PackageError!GraphMeta {
     };
     if (cursor != bytes.len) return PackageError.InvalidFormat;
     return meta;
-}
-
-fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) void {
-    for (initializers) |*init| {
-        switch (init.encoding) {
-            .plain => {},
-            .quantized => |q| {
-                allocator.free(q.scheme);
-                allocator.free(q.params);
-            },
-        }
-        allocator.free(init.data);
-    }
-    allocator.free(initializers);
-}
-
-fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
-    for (values) |value| allocator.free(value.shape_terms);
-    allocator.free(values);
-}
-
-fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
-    for (regions) |region| {
-        freeNodes(allocator, region.nodes);
-        allocator.free(region.outputs);
-    }
-    allocator.free(regions);
-}
-
-fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
-    for (nodes) |node| freeNode(allocator, node);
-    allocator.free(nodes);
-}
-
-fn freeNode(allocator: std.mem.Allocator, node: NodeRecord) void {
-    allocator.free(node.inputs);
-    if (node.extra_outputs.len != 0) allocator.free(node.extra_outputs);
-    types.deinitNodeOp(allocator, node.op);
-}
-
-fn freeNamedValues(allocator: std.mem.Allocator, values: []NamedValue) void {
-    for (values) |sig| allocator.free(sig.name);
-    allocator.free(values);
-}
-
-fn freeMetadata(allocator: std.mem.Allocator, metadata: []MetadataEntry) void {
-    for (metadata) |entry| {
-        allocator.free(entry.key);
-        allocator.free(entry.value);
-    }
-    allocator.free(metadata);
-}
-
-fn freeDebugNames(allocator: std.mem.Allocator, debug_names: []DebugName) void {
-    for (debug_names) |entry| allocator.free(entry.name);
-    allocator.free(debug_names);
-}
-
-fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
-    for (symbols) |sym| allocator.free(sym.name);
-    allocator.free(symbols);
 }
 
 /// An op's shape attribute, read as the (sizes, symbols) pair `graph.Op` carries.

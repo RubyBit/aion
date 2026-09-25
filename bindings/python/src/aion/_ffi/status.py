@@ -32,15 +32,27 @@ def _last_error_message(ctx: ContextHandle | None) -> str:
     return ffi.string(buf).decode("utf-8", errors="replace")
 
 
+# An exception a Python callback raised while the core was calling it (a
+# `LazyWeight`'s fill); the call that fails because of it names it as the cause.
+_callback_error: BaseException | None = None
+
+
+def note_callback_error(error: BaseException) -> None:
+    global _callback_error
+    _callback_error = error
+
+
 def raise_for_status(
     status: int,
     ctx: ContextHandle | None = None,
     *,
     what: str | None = None,
 ) -> None:
+    global _callback_error
     typed_status = AionStatus(int(status))
     if typed_status == AionStatus.AION_OK:
         return
+    cause, _callback_error = _callback_error, None
     message = _last_error_message(ctx) or _status_string(int(status))
     diagnostic = None
     if ctx is not None:
@@ -57,7 +69,7 @@ def raise_for_status(
     # only label the call ourselves when it does not.
     if what and diagnostic is None:
         message = f"{what}: {message}"
-    raise AionError(typed_status, message, diagnostic)
+    raise AionError(typed_status, message, diagnostic) from cause
 
 
 __all__ = ["raise_for_status"]

@@ -40,10 +40,7 @@ class GatedMLP(Module):
     """`down(gate(act, gate_proj(x), up(x)))` — SwiGLU (`silu`) / GeGLU (`gelu`).
 
     `gate` and `up` are two separate projections, the way every checkpoint ships
-    them. Pre-concatenating the pair into one `[in, 2*ffn]` weight is a *fusion*,
-    not a layout, and it belongs to the compiler: `opt/fuse_horizontal_matmul`
-    rewrites matmuls sharing an operand into one wide matmul plus a slice each,
-    numerically identically. So there is nothing to choose here.
+    them.
 
     The gate is one `gate` op whatever the activation, so the graph records the
     gated unit the author meant instead of a unary and a multiply for a compiler

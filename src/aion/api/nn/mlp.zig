@@ -64,11 +64,7 @@ pub const FeedForward = struct {
 /// and GeGLU (`.gelu`) transformers.
 ///
 /// `gate` and `up` are two separate projections, which is how every checkpoint
-/// ships them. Pre-concatenating the pair into one `[in, 2*ffn]` weight is a
-/// *fusion*, not a layout, and it is the compiler's: `opt/horizontal_matmul`
-/// rewrites matmuls sharing an operand into one wide matmul plus a slice each,
-/// numerically identically. So there is nothing to choose here and nothing to
-/// probe for — one shape, one code path.
+/// ships them: one shape, one code path.
 ///
 /// The gate is emitted as the activation-and-multiply pair it is; `fuse_steps.zig`
 /// folds it into one kernel where one exists. Keeping that decision out of the graph

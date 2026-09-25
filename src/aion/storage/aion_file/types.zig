@@ -91,7 +91,30 @@ pub const TensorEncoding = union(enum) {
 
 pub const Initializer = struct {
     encoding: TensorEncoding,
-    data: []const u8,
+    data: TensorData,
+};
+
+/// A tensor's payload. A parsed file holds its bytes; an export reads each tensor
+/// from where it lives while the file is written, so it never holds a second copy.
+pub const TensorData = union(enum) {
+    bytes: []const u8,
+    source: Source,
+
+    pub const Source = struct {
+        len: usize,
+        ctx: *anyopaque,
+        id: u32,
+        /// Fill `out` with payload bytes `[offset, offset + out.len)`; the writer
+        /// asks in whole blocks (or elements), a bounded chunk at a time.
+        read: *const fn (ctx: *anyopaque, id: u32, offset: usize, out: []u8) PackageError!void,
+    };
+
+    pub fn len(self: TensorData) usize {
+        return switch (self) {
+            .bytes => |b| b.len,
+            .source => |s| s.len,
+        };
+    }
 };
 
 pub const ValueSource = enum(u8) {
@@ -221,13 +244,6 @@ pub const Package = struct {
     io_aliases: []IoAlias,
     input_roles: []InputRole = &[_]InputRole{},
 
-    /// When non-null, this Package owns the raw file-byte buffer and some of its
-    /// internal slices (notably `Initializer.data`, the largest by far) are borrows
-    /// into this buffer instead of separately-allocated copies. `deinit` frees the
-    /// buffer once. Set by `parseTakeOwned`; `parse` leaves it null and keeps the
-    /// original copy-on-parse semantics.
-    source_bytes: ?[]u8 = null,
-
     const Self = @This();
 
     pub fn graphMeta(self: *const Self) GraphMeta {
@@ -246,32 +262,21 @@ pub const Package = struct {
         };
     }
 
-    /// Free the raw file-byte buffer once tensor data has been copied elsewhere.
-    ///
-    /// After this runs, every `Initializer.data` (and borrowed `QuantizedEncoding.params`)
-    /// slice in this Package is emptied — callers must not read them afterwards. This
-    /// exists to reclaim the 4–5 GB file buffer the moment weights have been imported
-    /// into the storage manager, halving peak RSS for loaded models.
-    pub fn releaseSourceBytes(self: *Self) void {
-        const buf = self.source_bytes orelse return;
+    /// Forget the tensor payloads (and quantized params), which are views of whatever
+    /// the package was parsed from or built over: call it before that goes, once they
+    /// have been copied out. What the package owns is untouched.
+    pub fn dropPayloads(self: *Self) void {
         for (self.initializers) |*init| {
-            init.data = &[_]u8{};
+            init.data = .{ .bytes = &.{} };
             switch (init.encoding) {
-                .quantized => |*q| {
-                    q.params = &[_]u8{};
-                },
-                else => {},
+                .quantized => |*q| q.params = &.{},
+                .plain => {},
             }
         }
-        self.allocator.free(buf);
-        self.source_bytes = null;
     }
 
     pub fn deinit(self: *Self) void {
-        // If we own `source_bytes`, most `Initializer.data` and `QuantizedEncoding.params`
-        // slices borrow into that buffer; skip freeing them individually.
-        const borrowed_init_data: bool = self.source_bytes != null;
-        freeInitializersImpl(self.allocator, self.initializers, borrowed_init_data);
+        freeInitializers(self.allocator, self.initializers);
         freeValues(self.allocator, self.values);
         freeNodes(self.allocator, self.nodes);
         freeRegions(self.allocator, self.regions);
@@ -283,7 +288,6 @@ pub const Package = struct {
         freeDebugNames(self.allocator, self.debug_names);
         self.allocator.free(self.io_aliases);
         if (self.input_roles.len != 0) self.allocator.free(self.input_roles);
-        if (self.source_bytes) |buf| self.allocator.free(buf);
         self.* = undefined;
     }
 
@@ -391,7 +395,7 @@ fn validateInitializer(init: Initializer) PackageError!void {
             if (q.logical_dtype.info().is_quantized) return PackageError.InvalidFormat;
         },
     }
-    if (init.data.len == 0) return PackageError.InvalidFormat;
+    if (init.data.len() == 0) return PackageError.InvalidFormat;
 }
 
 fn validateUniqueSignatureNames(inputs: []const NamedValue, outputs: []const NamedValue) PackageError!void {
@@ -616,30 +620,21 @@ fn validateNode(pkg: *const Package, node: NodeRecord) PackageError!void {
     }
 }
 
-fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) void {
-    freeInitializersImpl(allocator, initializers, false);
-}
-
-fn freeInitializersImpl(allocator: std.mem.Allocator, initializers: []Initializer, borrowed_data: bool) void {
-    for (initializers) |*init| {
-        switch (init.encoding) {
-            .plain => {},
-            .quantized => |q| {
-                allocator.free(q.scheme);
-                if (!borrowed_data) allocator.free(q.params);
-            },
-        }
-        if (!borrowed_data) allocator.free(init.data);
-    }
+/// A package owns its initializers' schemes; payloads and params are views.
+pub fn freeInitializers(allocator: std.mem.Allocator, initializers: []Initializer) void {
+    for (initializers) |init| switch (init.encoding) {
+        .plain => {},
+        .quantized => |q| allocator.free(q.scheme),
+    };
     allocator.free(initializers);
 }
 
-fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
+pub fn freeValues(allocator: std.mem.Allocator, values: []ValueRecord) void {
     for (values) |value| allocator.free(value.shape_terms);
     allocator.free(values);
 }
 
-fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
+pub fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
     for (regions) |region| {
         freeNodes(allocator, region.nodes);
         allocator.free(region.outputs);
@@ -647,21 +642,23 @@ fn freeRegions(allocator: std.mem.Allocator, regions: []RegionRecord) void {
     if (regions.len != 0) allocator.free(regions);
 }
 
-fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
-    for (nodes) |node| {
-        allocator.free(node.inputs);
-        if (node.extra_outputs.len != 0) allocator.free(@constCast(node.extra_outputs));
-        deinitNodeOp(allocator, node.op);
-    }
+pub fn freeNodes(allocator: std.mem.Allocator, nodes: []NodeRecord) void {
+    for (nodes) |node| freeNode(allocator, node);
     allocator.free(nodes);
 }
 
-fn freeNamedValues(allocator: std.mem.Allocator, values: []NamedValue) void {
+pub fn freeNode(allocator: std.mem.Allocator, node: NodeRecord) void {
+    allocator.free(node.inputs);
+    if (node.extra_outputs.len != 0) allocator.free(@constCast(node.extra_outputs));
+    deinitNodeOp(allocator, node.op);
+}
+
+pub fn freeNamedValues(allocator: std.mem.Allocator, values: []NamedValue) void {
     for (values) |sig| allocator.free(sig.name);
     allocator.free(values);
 }
 
-fn freeMetadata(allocator: std.mem.Allocator, metadata: []MetadataEntry) void {
+pub fn freeMetadata(allocator: std.mem.Allocator, metadata: []MetadataEntry) void {
     for (metadata) |entry| {
         allocator.free(entry.key);
         allocator.free(entry.value);
@@ -669,12 +666,12 @@ fn freeMetadata(allocator: std.mem.Allocator, metadata: []MetadataEntry) void {
     allocator.free(metadata);
 }
 
-fn freeDebugNames(allocator: std.mem.Allocator, debug_names: []DebugName) void {
+pub fn freeDebugNames(allocator: std.mem.Allocator, debug_names: []DebugName) void {
     for (debug_names) |entry| allocator.free(entry.name);
     allocator.free(debug_names);
 }
 
-fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
+pub fn freeDimSymbols(allocator: std.mem.Allocator, symbols: []DimSymbol) void {
     for (symbols) |sym| allocator.free(sym.name);
     allocator.free(symbols);
 }

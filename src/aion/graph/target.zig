@@ -31,7 +31,7 @@ pub const Target = struct {
 
     /// The target a device profits from: its tiling plus its default pass set.
     pub fn init(device: DeviceRef, tiles: TilePolicy) Target {
-        return .{ .device = device, .tiles = tiles, .passes = opt.defaults(tiles) };
+        return .{ .device = device, .tiles = tiles, .passes = opt.defaults() };
     }
 
     /// A host target with `tiles`. The same as `init(.{}, tiles)`, named because most

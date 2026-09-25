@@ -11,7 +11,7 @@ from ._gpu_runtime import register_wgpu_runtime
 register_wgpu_runtime()
 
 from . import nn
-from .builder import Builder, DynamicAxes, TensorRef
+from .builder import Builder, DynamicAxes, LazyWeight, TensorRef
 from .context import Context, get_default_context, reset_default_context
 from .device import DeviceLike, GpuOptions, _gpu_adapter_from_device
 from .dtype import float16, float32, int8, int32, normalize_dtype, q4_0, q8_0
@@ -34,6 +34,7 @@ __all__ = [
     "Context",
     "GpuOptions",
     "InputSpec",
+    "LazyWeight",
     "LoadedModel",
     "TensorSpec",
     "Tensor",

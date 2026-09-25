@@ -3078,14 +3078,34 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     defer allocator.free(a_buf);
     for (0..m * k) |i| a_buf[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 50)) * 0.01;
 
-    // Reference: C = A @ dequant_b.T
+    // The kernel quantizes A to int8 per K block so its inner product is a byte
+    // dot (see `matmul_nt_q.zig`). Quantizing it here too keeps the reference a
+    // test of the kernel's arithmetic; q8's own error is the storage tests' job.
+    const dequant_a: []f32 = try allocator.alloc(f32, m * k);
+    defer allocator.free(dequant_a);
+    for (0..m) |mi| {
+        var blk: usize = 0;
+        while (blk < k / 32) : (blk += 1) {
+            const base: usize = mi * k + blk * 32;
+            var amax: f32 = 0.0;
+            for (0..32) |c| amax = @max(amax, @abs(a_buf[base + c]));
+            const scale: f32 = if (amax == 0.0) 0.0 else amax / 127.0;
+            const inv: f32 = if (amax == 0.0) 0.0 else 127.0 / amax;
+            for (0..32) |c| {
+                const q: f32 = std.math.clamp(@round(a_buf[base + c] * inv), -127.0, 127.0);
+                dequant_a[base + c] = q * scale;
+            }
+        }
+    }
+
+    // Reference: C = dequant_a @ dequant_b.T
     const c_ref: []f32 = try allocator.alloc(f32, m * n);
     defer allocator.free(c_ref);
     for (0..m) |mi| {
         for (0..n) |ni| {
             var acc: f32 = 0.0;
             for (0..k) |kk| {
-                acc += a_buf[mi * k + kk] * dequant_b[ni * k + kk];
+                acc += dequant_a[mi * k + kk] * dequant_b[ni * k + kk];
             }
             c_ref[mi * n + ni] = acc;
         }
@@ -3129,8 +3149,8 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     const out_vals: []align(1) f32 = asF32Slice(out_buf);
 
     for (0..m * n) |i| {
-        // SIMD accumulation order differs from the scalar reference, so tolerance is
-        // dominated by f32 rounding rather than q8_0 error.
+        // Both sides now see the same quantized operands, so what is left is
+        // f32 rounding under a different accumulation order.
         try std.testing.expectApproxEqAbs(c_ref[i], out_vals[i], 1e-4);
     }
 }

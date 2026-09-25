@@ -63,23 +63,34 @@ pub fn detect() cpuid_root.CpuInfo {
         info.physical_cores = info.logical_processors;
     }
 
+    // A feature is usable only if the OS saves the registers it writes: a CPU can
+    // report AVX-512 under an OS or hypervisor that leaves ZMM state off (XCR0).
+    const xcr0: u64 = if (max_leaf >= 1 and ((cpuid(1, 0).ecx >> 27) & 1) != 0) xgetbv0() else 0;
+    const os_avx: bool = (xcr0 & 0x6) == 0x6; // XMM, YMM
+    const os_avx512: bool = os_avx and (xcr0 & 0xE0) == 0xE0; // opmask, ZMM_Hi256, Hi16_ZMM
+
     if (max_leaf >= 7) {
         const l7_0 = cpuid(7, 0);
-        // AVX2: EBX bit 5
-        info.features.avx2 = ((l7_0.ebx >> 5) & 1) != 0;
-        // AVX512F: EBX bit 16
-        info.features.avx512f = ((l7_0.ebx >> 16) & 1) != 0;
-        // AVX512-VNNI: leaf 7 sub-leaf 0, ECX bit 11
-        info.features.avx512_vnni = ((l7_0.ecx >> 11) & 1) != 0;
+        const bit = struct {
+            fn at(reg: u32, n: u5) bool {
+                return ((reg >> n) & 1) != 0;
+            }
+        }.at;
+        info.features.avx2 = os_avx and bit(l7_0.ebx, 5);
+        info.features.avx512f = os_avx512 and bit(l7_0.ebx, 16);
+        info.features.avx512dq = os_avx512 and bit(l7_0.ebx, 17);
+        info.features.avx512cd = os_avx512 and bit(l7_0.ebx, 28);
+        info.features.avx512bw = os_avx512 and bit(l7_0.ebx, 30);
+        info.features.avx512vl = os_avx512 and bit(l7_0.ebx, 31);
+        info.features.avx512vnni = os_avx512 and bit(l7_0.ecx, 11);
         // AMX-INT8: leaf 7 sub-leaf 0, EDX bit 25
-        info.features.amx_int8 = ((l7_0.edx >> 25) & 1) != 0;
+        info.features.amx_int8 = bit(l7_0.edx, 25);
 
         // AVX-VNNI (the VEX-encoded form on Alder/Raptor Lake — distinct from
         // AVX512-VNNI) is reported in leaf 7 SUB-LEAF 1, EAX bit 4. l7_0.eax holds
         // the max sub-leaf, so only probe sub-leaf 1 when it exists.
         if (l7_0.eax >= 1) {
-            const l7_1 = cpuid(7, 1);
-            info.features.avx_vnni = ((l7_1.eax >> 4) & 1) != 0;
+            info.features.avxvnni = os_avx and bit(cpuid(7, 1).eax, 4);
         }
     }
 
@@ -88,6 +99,19 @@ pub fn detect() cpuid_root.CpuInfo {
 }
 
 const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+/// XCR0: which register states the OS saves across context switches.
+fn xgetbv0() u64 {
+    if (builtin.cpu.arch != .x86_64) return 0;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("xgetbv"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+        : [idx] "{ecx}" (@as(u32, 0)),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
 
 fn cpuid(leaf: u32, subleaf: u32) CpuidRegs {
     var eax: u32 = leaf;

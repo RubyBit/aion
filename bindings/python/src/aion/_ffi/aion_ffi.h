@@ -293,7 +293,19 @@ void aion_builder_destroy(AionBuilder* b);
 AionStatus aion_builder_input(AionBuilder* b, AionDType dtype, size_t rank, const size_t* shape, AionValueId* out_value);
 AionStatus aion_builder_param(AionBuilder* b, const AionTensor* tensor, AionValueId* out_value);
 AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name);
-AionStatus aion_builder_param_named(AionBuilder* b, const AionTensor* tensor, const char* name, AionValueId* out_value);
+typedef struct AionParamOptions {
+    AionDType quantize_to;
+} AionParamOptions;
+typedef int (*AionRowFill)(void* user, size_t row0, float* out, size_t count);
+typedef struct AionWeight {
+    const AionTensor* tensor;
+    size_t rank;
+    const size_t* shape;
+    AionRowFill fill;
+    void* user;
+} AionWeight;
+AionStatus aion_builder_param_named(AionBuilder* b, const AionWeight* weight, const char* name, const AionParamOptions* opts, AionValueId* out_value);
+extern "Python" int _aion_row_fill(void* user, size_t row0, float* out, size_t count);
 AionStatus aion_builder_begin_scope(AionBuilder* b, const char* name, size_t* out_depth);
 AionStatus aion_builder_begin_auto_scope(AionBuilder* b, const char* base, size_t* out_depth, char* buf, size_t cap, size_t* out_len);
 AionStatus aion_builder_end_scope(AionBuilder* b, size_t depth);

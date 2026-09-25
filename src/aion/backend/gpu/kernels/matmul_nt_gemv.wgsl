@@ -2,7 +2,7 @@
 //
 // Matvec for MatMulNT (M == 1, the decode hot path):
 //   C[n] = alpha * sum_k A[k] * B[n, k]  +  beta * C[n]
-// with B either q8_0 [N, K] (ggml blocks: f16 scale + 32 i8, 34 bytes) or f32.
+// with B either q8_0 [N, K] (blocks of an f16 scale + 32 i8, 34 bytes) or f32.
 //
 // Layout trick for q8_0: a single 34-byte block is only 2-byte aligned, so the
 // kernel walks BLOCK PAIRS (68 bytes = 17 u32 words, always word-aligned when
@@ -125,4 +125,68 @@ fn gemv_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 
     let total = reduceRow(lidx, lane, acc);
     if (in_bounds && lane == 0u) { store(n, total); }
+}
+
+// B in `lanes32` order (types.QuantBlockOrder): for each group of 32 rows and each
+// block, the group's 32 f16 scales (16 words), then 8 chunks holding the 32 rows'
+// 4 bytes side by side. One thread owns one row, so the 32 threads reading chunk j
+// read 32 consecutive words — one 128-byte line per load, where the block-pair
+// layout above spreads each load over a line per thread. Segments are 272 words,
+// so everything is word-aligned and nothing is shifted into place.
+//
+// K is split across `L_SLICES` slices of the workgroup; the slices' partials are
+// summed in shared memory. More slices for narrow N keep the GPU occupied: its
+// core count is not visible through WebGPU, so `gemv_q8_lanes32_wide` (32 slices)
+// is picked host-side when N alone yields few workgroups.
+const L_W: u32 = 32u;
+const L_SEG: u32 = 272u; // words per (group, block) segment: 32 * 34 / 4
+
+var<workgroup> lpart: array<f32, 1024>;
+
+fn lanesRow(wid: u32, lane: u32, slice: u32, slices: u32) -> f32 {
+    let blocks = p.k / 32u;
+    let gbase = wid * blocks * L_SEG;
+    var acc = 0.0;
+    for (var kb = slice; kb < blocks; kb += slices) {
+        let seg = gbase + kb * L_SEG;
+        let sw = unpack2x16float(b[seg + lane / 2u]);
+        let d = select(sw.x, sw.y, (lane & 1u) == 1u);
+        let av = kb * 8u;
+        var s = 0.0;
+        for (var j = 0u; j < 8u; j += 1u) {
+            s += dot(i8x4f(b[seg + 16u + j * L_W + lane]), a[av + j]);
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+
+fn lanesReduce(lidx: u32, lane: u32, slice: u32, slices: u32, acc: f32) -> f32 {
+    lpart[lidx] = acc;
+    workgroupBarrier();
+    var s = slices / 2u;
+    while (s > 0u) {
+        if (slice < s) { lpart[lidx] = lpart[lidx] + lpart[lidx + s * L_W]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    return lpart[lane];
+}
+
+@compute @workgroup_size(256)
+fn gemv_q8_lanes32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let lane = lidx % L_W;
+    let slice = lidx / L_W;
+    let total = lanesReduce(lidx, lane, slice, 8u, lanesRow(wid.x, lane, slice, 8u));
+    let n = wid.x * L_W + lane;
+    if (slice == 0u && n < p.n) { store(n, total); }
+}
+
+@compute @workgroup_size(1024)
+fn gemv_q8_lanes32_wide(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+    let lane = lidx % L_W;
+    let slice = lidx / L_W;
+    let total = lanesReduce(lidx, lane, slice, 32u, lanesRow(wid.x, lane, slice, 32u));
+    let n = wid.x * L_W + lane;
+    if (slice == 0u && n < p.n) { store(n, total); }
 }

@@ -30,8 +30,9 @@ pub const SVL: usize = 16;
 pub const MR: usize = 2 * SVL;
 pub const NR: usize = 2 * SVL;
 
+/// The kernel loads with SME2's multi-vector `ld1w`, so SME alone is not enough.
 const have_sme = builtin.cpu.arch.isAARCH64() and
-    std.Target.aarch64.featureSetHas(builtin.cpu.features, .sme);
+    std.Target.aarch64.featureSetHasAll(builtin.cpu.features, .{ .sme, .sme2 });
 
 var svl_cache: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
@@ -52,7 +53,7 @@ fn streamingSvlBytes() usize {
     return svl;
 }
 
-/// Whether this module was compiled for a target with FEAT_SME. Comptime, so a
+/// Whether this module was compiled for SME and SME2. Comptime, so a
 /// build without it never instantiates the kernel or emits its inline asm.
 pub fn compiledFor() bool {
     return have_sme;

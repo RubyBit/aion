@@ -374,7 +374,7 @@ pub const Matmul = struct {
         const m_dim: u32 = @intCast(dc.shape_mem[rank - 2]);
         const n_dim: u32 = @intCast(dc.shape_mem[rank - 1]);
         const k_dim: u32 = @intCast(da.shape_mem[rank - 1]);
-        // q8_0 B is quantized along K (ggml MatMul-B convention): block grid
+        // q8_0 B is quantized along K (the MatMul-B convention): block grid
         // [K/32, N]. K must be block-aligned.
         if (k_dim % Q8_BLOCK_ELEMS != 0) return error.Unsupported;
 

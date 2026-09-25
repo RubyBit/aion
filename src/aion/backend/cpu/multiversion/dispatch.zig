@@ -14,43 +14,29 @@ const dt = @import("table.zig");
 const matmul_shapes = @import("../registry/matmul_shapes.zig");
 const cpuid = @import("../tuning/cpuid.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
-const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 
 const L2_MIN_FOR_MEDIUM: usize = 1 * 1024 * 1024;
 
-// x86 tier accessors (defined by the x86 tier objects). v3 (AVX2 + FMA) is the
-// floor: the multiversion main module itself requires AVX2, so a CPU without it
-// faults before dispatch ever runs and there is no sub-v3 tier to fall back to.
-extern fn aion_cpu_kernels_v3() callconv(.c) *const dt.DispatchTable;
-extern fn aion_cpu_kernels_v3_vnni() callconv(.c) *const dt.DispatchTable;
-extern fn aion_cpu_kernels_v4() callconv(.c) *const dt.DispatchTable;
-// aarch64 tier accessors (defined by the aarch64 tier objects).
-extern fn aion_cpu_kernels_arm_baseline() callconv(.c) *const dt.DispatchTable;
-extern fn aion_cpu_kernels_arm_dotprod() callconv(.c) *const dt.DispatchTable;
-extern fn aion_cpu_kernels_arm_i8mm() callconv(.c) *const dt.DispatchTable;
-extern fn aion_cpu_kernels_arm_sme() callconv(.c) *const dt.DispatchTable;
+const tier_kinds = @import("tier_kinds.zig");
 
-/// Pick the kernel tier whose ISA the detected CPU supports. Each arch's accessors
-/// are only referenced inside its own comptime branch, so the other arch's `extern`
-/// symbols are never emitted and need no tier objects.
+const tiers = if (builtin.cpu.arch.isX86())
+    &tier_kinds.x86_tiers
+else if (builtin.cpu.arch.isAARCH64())
+    &tier_kinds.arm_tiers
+else
+    @compileError("kernel_dispatch: unsupported arch");
+
+/// The best tier the CPU can run (`tier_kinds.best`). Only this arch's accessors
+/// are referenced, so the other arch's objects are never needed.
 pub fn selectTable(info: cpuid.CpuInfo) *const dt.DispatchTable {
-    if (comptime builtin.cpu.arch.isX86()) {
-        // Feature precedence mirrors cpu_target.preferredF32Lanes.
-        if (info.features.avx512f or info.features.avx512_vnni) return aion_cpu_kernels_v4();
-        if (info.features.avx2 and info.features.avx_vnni) return aion_cpu_kernels_v3_vnni();
-        return aion_cpu_kernels_v3();
-    } else if (comptime builtin.cpu.arch.isAARCH64()) {
-        // FEAT_SME first: it is the only tier whose f32 GEMM is not NEON, and one
-        // `fmopa` does a whole 16x16 outer product. Below it, NEON f32 width is
-        // fixed and the int8 quant path is what varies — FEAT_I8MM (`smmla`) beats
-        // FEAT_DotProd (`sdot`) beats the f32-accumulate baseline.
-        if (info.features.sme) return aion_cpu_kernels_arm_sme();
-        if (info.features.i8mm) return aion_cpu_kernels_arm_i8mm();
-        if (info.features.dotprod) return aion_cpu_kernels_arm_dotprod();
-        return aion_cpu_kernels_arm_baseline();
-    } else {
-        @compileError("kernel_dispatch: unsupported arch");
+    const chosen = tier_kinds.best(tiers, info.features);
+    inline for (tiers, 0..) |tier, i| {
+        if (i == chosen) {
+            const accessor = @extern(*const fn () callconv(.c) *const dt.DispatchTable, .{ .name = "aion_cpu_kernels_" ++ tier.name });
+            return accessor();
+        }
     }
+    unreachable;
 }
 
 /// Choose the packed-f32 cache-blocking variant for this L2 size.
@@ -72,21 +58,5 @@ pub fn pickMatmul(table: *const dt.DispatchTable, l2_bytes: usize) matmul_regist
     const small_fp: usize = small.tuning.kc * small.tuning.nc * @sizeOf(f32);
     const best_fp: usize = best.tuning.kc * best.tuning.nc * @sizeOf(f32);
     if (l2_bytes >= L2_MIN_FOR_MEDIUM and best_fp == small_fp) return table.matmul[dt.TILE_MEDIUM];
-    return best;
-}
-
-/// Quant analogue of `pickMatmul`; uses packed-B footprint as the budget metric,
-/// matching `matmul_q_registry.selectForTarget`.
-pub fn pickQuant(table: *const dt.DispatchTable, l2_bytes: usize) matmul_q_registry.QuantKernels {
-    if (l2_bytes == 0) return table.matmul_q[dt.TILE_MEDIUM];
-
-    const budget: usize = matmul_shapes.l2Budget75(l2_bytes);
-    var best: matmul_q_registry.QuantKernels = table.matmul_q[dt.TILE_SMALL];
-    for (table.matmul_q) |k| {
-        if (k.packed_b_bytes <= budget) best = k;
-    }
-
-    const small_fp: usize = table.matmul_q[dt.TILE_SMALL].packed_b_bytes;
-    if (l2_bytes >= L2_MIN_FOR_MEDIUM and best.packed_b_bytes == small_fp) return table.matmul_q[dt.TILE_MEDIUM];
     return best;
 }

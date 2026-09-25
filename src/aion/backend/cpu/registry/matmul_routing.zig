@@ -15,12 +15,14 @@ pub fn isMatvecShape(m: usize) bool {
 /// chunk is only a few frames (small M) and pack-B otherwise dominates per-chunk.
 pub const Q8_DIRECT_MAX_M: usize = 16;
 
-/// Direct K-major q8 matvec avoids pack-B cost, but packed kernels can be faster on
-/// tiny workloads. Use direct mode only once the tile is large enough to amortize its
-/// less cache-friendly B traversal, and only when parallel execution is available.
-pub fn shouldUseQ8DirectMatvec(params: MatMulParams, thread_count: usize) bool {
-    if (params.m == 0 or params.m > Q8_DIRECT_MAX_M) return false;
-    if (thread_count <= 1) return false;
-    const work: usize = std.math.mul(usize, params.k, params.n) catch return false;
-    return work >= (64 * 1024);
+/// Whether a small-M q8 matmul should read B where it lies rather than repacking it.
+///
+/// Packing B pays for itself only when the packed copy gets reused. At these
+/// shapes it never does: a decode step visits every weight tile exactly once, so
+/// the repack is pure overhead. Worse, the storage tiling splits B into many
+/// tiles and the test used to be on the tile — which reads every tile of a large
+/// weight as "small" and sends all of them down the packing path. A 1B-parameter
+/// decode repacked the whole model per token, for 3.8 tok/s against 11.5.
+pub fn shouldUseQ8DirectMatvec(params: MatMulParams) bool {
+    return params.m != 0 and params.m <= Q8_DIRECT_MAX_M;
 }

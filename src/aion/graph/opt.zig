@@ -14,7 +14,6 @@
 const std = @import("std");
 
 const graph_mod = @import("graph.zig");
-const plan = @import("plan.zig");
 const manager_mod = @import("../storage/manager.zig");
 const executable = @import("../runtime/executable.zig");
 const infer_mod = @import("infer.zig");
@@ -24,8 +23,8 @@ const target_mod = @import("target.zig");
 const alias_views = @import("opt/alias_views.zig");
 const editor_mod = @import("opt/editor.zig");
 const fuse_steps = @import("opt/fuse_steps.zig");
-const horizontal_matmul = @import("opt/horizontal_matmul.zig");
 const pointwise_conv = @import("opt/pointwise_conv.zig");
+const weight_layout = @import("opt/weight_layout.zig");
 const rewriter_mod = @import("opt/rewriter.zig");
 const step_uses = @import("opt/step_uses.zig");
 
@@ -44,33 +43,21 @@ pub const layoutsIdentical = alias_views.layoutsIdentical;
 pub const Pass = enum {
     /// 1x1 Conv1D -> MatMul, so it takes the autotuned GEMM path.
     pointwise_conv,
-    /// Parallel projections off one input -> one wide MatMul + slices.
-    horizontal_matmul,
     /// `x + norm(y)` -> one norm step carrying the residual.
     add_norm,
     /// `act(a) * b` -> one gated elementwise step.
     gate,
     /// Drop view steps that copy between byte-identical layouts.
     alias_views,
+    /// q8 matmul weights -> the target's `[n, k]` block order + MatMulNT.
+    weight_layout,
 };
 
 pub const Policy = std.EnumSet(Pass);
 
-/// The passes a target profits from.
-///
-/// The three fusions are off on CPU. `add_norm`/`gate` because their unfused forms
-/// are the numerical oracle the fused GPU kernels are tested against, and the CPU
-/// is not launch-bound anyway. `horizontal_matmul` because it was measured: on GPU
-/// decode it is worth ~2%/token, but on CPU it only adds slice copies (~1-2% loss
-/// at decode, 1.1% at seq 64) since there is no dispatch cost to save.
-pub fn defaults(tiles: plan.TilePolicy) Policy {
-    var p: Policy = .full;
-    if (tiles.target_kind == .cpu) {
-        p.remove(.horizontal_matmul);
-        p.remove(.add_norm);
-        p.remove(.gate);
-    }
-    return p;
+/// Every pass: each one is a win on every target.
+pub fn defaults() Policy {
+    return .full;
 }
 
 pub const Ctx = struct {
@@ -78,7 +65,7 @@ pub const Ctx = struct {
     mgr: *StorageManager,
     /// Where this compile is going. A pass that derives a weight keys it on the device,
     /// because a derived weight belongs to `(sources, tiling, device)` and not to any one
-    /// compiled program (see `opt/horizontal_matmul.concatColumns`).
+    /// compiled program (see `opt/weight_layout.relayout`).
     target: target_mod.Target,
 };
 
@@ -92,8 +79,8 @@ pub fn graphPasses(ctx: Ctx, g: *Graph) Error!void {
     if (ctx.target.passes.contains(.pointwise_conv)) {
         try rewriter_mod.rewrite(ctx.gpa, g, pointwise_conv.Rule{});
     }
-    if (ctx.target.passes.contains(.horizontal_matmul)) {
-        try rewriter_mod.rewrite(ctx.gpa, g, horizontal_matmul.Rule{
+    if (ctx.target.passes.contains(.weight_layout)) {
+        try rewriter_mod.rewrite(ctx.gpa, g, weight_layout.Rule{
             .mgr = ctx.mgr,
             .target = ctx.target,
         });

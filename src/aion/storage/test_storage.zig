@@ -646,7 +646,8 @@ test "storage file: model package write/parse roundtrip" {
 
     pkg.initializers[0] = .{
         .encoding = .{ .plain = .f32 },
-        .data = try allocator.dupe(u8, std.mem.sliceAsBytes(w_vals[0..])),
+        // A package's payloads are views; this one is the test's own values.
+        .data = .{ .bytes = std.mem.sliceAsBytes(w_vals[0..]) },
     };
 
     pkg.values[0] = .{
@@ -708,7 +709,7 @@ test "storage file: model package write/parse roundtrip" {
     try std.testing.expectEqual(@as(usize, 1), parsed.io_aliases.len);
     try std.testing.expectEqual(@as(u32, 0), parsed.io_aliases[0].input);
     try std.testing.expectEqual(@as(u32, 0), parsed.io_aliases[0].output);
-    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w_vals[0..]), parsed.initializers[0].data);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w_vals[0..]), parsed.initializers[0].data.bytes);
 }
 
 // Four op attributes can carry free axes, but only a reshape's and a slice's are
@@ -1104,4 +1105,45 @@ test "storage cache: rolling growth rehashes retained logical rows" {
     var got: [7]f32 = undefined;
     try sm.readToPackedScalar(tid, std.mem.sliceAsBytes(&got));
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 3, 4, 5, 0 }, &got);
+}
+
+// A tensor created on a device is written from packed bytes either straight from the
+// caller (tiles that are runs of the packed layout) or through a staged retile, and
+// must come back byte-identical when moved to the host.
+test "storage: device-created tensor takes packed bytes and moves back to host" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const Case = struct { dtype: DType, shape: [2]usize, tile: [2]usize, quant_axis: u8 = 0 };
+    const cases = [_]Case{
+        .{ .dtype = .f32, .shape = .{ 4, 6 }, .tile = .{ 2, 6 } },
+        .{ .dtype = .f32, .shape = .{ 4, 6 }, .tile = .{ 4, 3 } },
+        .{ .dtype = .q8_0, .shape = .{ 4, 64 }, .tile = .{ 2, 64 }, .quant_axis = 1 },
+        .{ .dtype = .q8_0, .shape = .{ 4, 64 }, .tile = .{ 4, 32 }, .quant_axis = 1 },
+        .{ .dtype = .q8_0, .shape = .{ 64, 4 }, .tile = .{ 32, 4 }, .quant_axis = 0 },
+    };
+    for (cases) |case| {
+        var mock = dm.MockDeviceMemory.init(allocator);
+        defer mock.deinit();
+        var sm = manager_mod.StorageManager.init(allocator);
+        defer sm.deinit();
+        const gpu: manager_mod.DeviceRef = .{ .kind = .gpu, .index = 0 };
+        const entries = [_]manager_mod.StorageManager.DeviceEntry{.{ .mem = mock.device(), .policy = .{} }};
+        sm.setDeviceRegistry(.{}, &entries);
+
+        const opts: storage.TiledTensor.InitOptions = .{ .quant_axis = case.quant_axis };
+        const t = try sm.createDeviceTensor(case.dtype, &case.shape, &case.tile, opts, gpu);
+        const len = try (try sm.getConst(t)).packedByteLen();
+        const bytes = try allocator.alloc(u8, len);
+        defer allocator.free(bytes);
+        for (bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+        try sm.writePackedAtPlacement(t, bytes);
+        try std.testing.expectEqual(len, mock.bytes_h2d);
+        try sm.moveTensor(t, .{}, null, &case.tile, 64);
+        try std.testing.expect((try sm.tensorDevice(t)).kind == .cpu);
+
+        const got = try allocator.alloc(u8, len);
+        defer allocator.free(got);
+        if (case.dtype.info().is_quantized) try sm.readToPackedQuant(t, got) else try sm.readToPackedScalar(t, got);
+        try std.testing.expectEqualSlices(u8, bytes, got);
+    }
 }

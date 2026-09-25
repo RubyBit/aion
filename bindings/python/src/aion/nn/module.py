@@ -72,18 +72,11 @@ class Parameter:
         data: WeightData,
         *,
         dtype: DTypeLike = float32,
-        shape: Optional[Shape] = None,
-        quant_axis: Optional[int] = None,
     ) -> None:
         self.data: WeightData = data
-        # Passed through to `Builder.param_named`. `shape`/`quant_axis` matter for
-        # quantized weights: an embedding table blocks along its feature axis, not
-        # the matmul reduction axis.
+        # Passed through to `Builder.param_named`, which leaves a quantized weight's
+        # blocking to the op that reads it.
         self.kwargs: dict[str, Any] = {"dtype": dtype}
-        if shape is not None:
-            self.kwargs["shape"] = shape
-        if quant_axis is not None:
-            self.kwargs["quant_axis"] = quant_axis
         self._cache: weakref.WeakKeyDictionary[Builder, TensorRef] = weakref.WeakKeyDictionary()
 
     @property

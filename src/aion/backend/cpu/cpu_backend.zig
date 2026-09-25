@@ -60,6 +60,9 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 /// build_options module is passed on the CLI with multiversion=false) the
 /// in-module `selectForTarget` path is used and the `extern` tier accessors
 /// are never referenced — so no tier objects need to be linked.
+/// The single-target build's quantized kernels: those of the ISA it was compiled for.
+const compiled_quantized = dispatch_table.quantizedFor(cpu_target.compiled);
+
 const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch.isAARCH64()) and
     @import("build_options").multiversion;
 
@@ -70,6 +73,8 @@ pub const CpuBackend = struct {
 
     /// Shared L2 per core cluster as detected at init, 0 when unknown.
     l2_bytes: usize = 0,
+    /// L1D as detected at init (the smallest core's), 0 when unknown.
+    l1d_bytes: usize = 0,
 
     pool: ?thread_pool.ThreadPool = null,
     thread_count: usize = 1,
@@ -89,11 +94,12 @@ pub const CpuBackend = struct {
 
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
-    matmul_qx0: matmul_q_registry.QuantKernels = matmul_q_registry.candidates[1].kernels,
+    /// The packed GEMM for quantized weights, and the family it falls back within.
+    matmul_q: matmul_q_registry.Choice = .of(compiled_quantized.gemm, 0),
 
-    matmul_nt: matmul_nt_registry.Kernels = matmul_nt_registry.candidates[0].kernels,
+    matmul_nt: matmul_nt_registry.Kernels = compiled_quantized.nt,
 
-    matvec: matvec_registry.Kernels = matvec_registry.candidates[0].kernels,
+    matvec: matvec_registry.Kernels = compiled_quantized.matvec,
 
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
     relpos_mha_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
@@ -135,6 +141,12 @@ pub const CpuBackend = struct {
         };
     }
 
+    /// The row grouping this backend's NT q8 kernel reads (see
+    /// `types.QuantBlockOrder`): its byte dot's lane count.
+    pub fn quantBlockOrder(self: *const Self) types.QuantBlockOrder {
+        return types.QuantBlockOrder.withGroup(self.matmul_nt.tuning.lanes) orelse .row_major;
+    }
+
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {
         if (opts.thread_count == 0) return error.InvalidArgument;
 
@@ -168,10 +180,12 @@ pub const CpuBackend = struct {
             }
             const l2_bytes: usize = topo_info.caches.l2_bytes;
             self.l2_bytes = l2_bytes;
+            self.l1d_bytes = topo_info.caches.l1d_bytes;
             self.matmul_f32 = kernel_dispatch.pickMatmul(table, l2_bytes);
-            self.matmul_qx0 = kernel_dispatch.pickQuant(table, l2_bytes);
-            self.matmul_nt = table.matmul_nt;
-            self.matvec = table.matvec;
+            const quantized = table.quantized;
+            self.matmul_q = .of(quantized.gemm, l2_bytes);
+            self.matmul_nt = quantized.nt;
+            self.matvec = quantized.matvec;
             self.attention_kernels = table.attention;
             self.relpos_mha_kernels = table.relpos_mha;
             self.depthwise_conv1d = table.conv1d;
@@ -180,10 +194,12 @@ pub const CpuBackend = struct {
         } else {
             const target = cpu_target.fromCpuInfo(topo_info);
             self.l2_bytes = target.caches.l2_bytes;
+            self.l1d_bytes = target.caches.l1d_bytes;
             self.matmul_f32 = matmul_registry.selectForTarget(target).kernels;
-            self.matmul_qx0 = matmul_q_registry.selectForTarget(target).kernels;
-            self.matmul_nt = matmul_nt_registry.selectForTarget(target).kernels;
-            self.matvec = matvec_registry.selectForTarget(target).kernels;
+            const quantized = compiled_quantized;
+            self.matmul_q = .of(quantized.gemm, self.l2_bytes);
+            self.matmul_nt = quantized.nt;
+            self.matvec = quantized.matvec;
             self.attention_kernels = attention_registry.selectForTarget(target).kernels;
             self.relpos_mha_kernels = attention_registry.selectForTarget(target).kernels;
             self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
@@ -214,12 +230,11 @@ pub const CpuBackend = struct {
             var j: usize = 0;
             while (j < i) : (j += 1) allocator.free(mm[j]);
         }
-        // Cover both the comptime registry maxima and the actually-selected kernels'
-        // needs. The multiversion VNNI quant kernel has its own packed-B + activation
-        // scratch sizing that the registry maxima don't account for.
+        // Cover the f32 registry maxima, the selected f32 kernel, and every member of
+        // the quantized family a tile may fall back to.
         const scratch_bytes: usize = @max(
-            @max(matmul_registry.maxScratchBytes(), matmul_q_registry.maxScratchBytes()),
-            @max(self.matmul_f32.scratch_bytes, self.matmul_qx0.scratch_bytes),
+            @max(matmul_registry.maxScratchBytes(), self.matmul_q.scratchBytes()),
+            self.matmul_f32.scratch_bytes,
         );
         while (i < effective_thread_count) : (i += 1) {
             mm[i] = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_bytes);
@@ -411,7 +426,7 @@ pub const CpuBackend = struct {
                     .pool = pool_ptr,
                     .thread_count = self.thread_count,
                     .matmul_f32 = self.matmul_f32,
-                    .matmul_qx0 = self.matmul_qx0,
+                    .matmul_q = self.matmul_q,
                     .matvec = self.matvec,
                     .matmul_scratch = self.matmul_scratch_f32,
                 };
@@ -628,6 +643,9 @@ pub const CpuBackend = struct {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 const nt_ctx: exec_matmul_nt.MatMulNtExecCtx = .{
                     .matmul_nt = self.matmul_nt,
+                    .scratch = if (self.matmul_scratch_f32.len != 0) self.matmul_scratch_f32[0] else &[_]u8{},
+                    .l2_bytes = self.l2_bytes,
+                    .l1d_bytes = self.l1d_bytes,
                 };
                 try exec_matmul_nt.execMatMulNTTiled(&nt_ctx, pool_ptr, self.thread_count, s, store);
             },

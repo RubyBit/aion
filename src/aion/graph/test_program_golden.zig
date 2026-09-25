@@ -247,17 +247,17 @@ const golden_matmul_square =
     \\
 ;
 
+// A 512-wide N tile takes this whole matvec in one tile, so B is used where it
+// lies instead of being retiled and copied first.
 const golden_matvec =
-    \\steps=2
-    \\  [0] ReTileCopyScalar
-    \\  [1] MatMulTiled
+    \\steps=1
+    \\  [0] MatMulTiled
     \\blocks=0
     \\outputs=[2]
     \\tensors:
     \\  #0 f32 rank=2 shape=[1,256] tile=[1,256] counts=[1,1]
     \\  #1 f32 rank=2 shape=[256,512] tile=[256,512] counts=[1,1]
-    \\  #2 f32 rank=2 shape=[1,512] tile=[1,256] counts=[1,2]
-    \\  #3 f32 rank=2 shape=[256,512] tile=[256,256] counts=[1,2]
+    \\  #2 f32 rank=2 shape=[1,512] tile=[1,512] counts=[1,1]
     \\
 ;
 

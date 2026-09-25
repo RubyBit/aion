@@ -7,6 +7,7 @@ const types = @import("../backend/types.zig");
 
 const api_tensor = @import("tensor.zig");
 const api_context = @import("context.zig");
+const RowSource = api_context.RowSource;
 
 pub const Context = api_context.Context;
 pub const ValueId = graph_mod.ValueId;
@@ -46,7 +47,6 @@ pub const Builder = struct {
     ctx: *Context,
     graph: graph_mod.Graph,
 
-
     // --- scope stack -------------------------------------------------------
     // Scopes nest, so a module tree produces `state_dict`-style paths
     // (`Block#0/attn#0/q_proj#0/weight`). `scope_path` holds the joined path of
@@ -68,6 +68,12 @@ pub const Builder = struct {
     // model weight from a constant the Builder had to invent, structurally rather
     // than by inspecting names.
     params: std.AutoHashMapUnmanaged(ValueId, ParamKind) = .{},
+
+    // Weights the builder quantizes itself (see `ParamOptions.quantize`), keyed by
+    // the input they occupy: pending until an op reading them fixes their axis.
+    quantized: std.AutoArrayHashMapUnmanaged(ValueId, QuantizedParam) = .{},
+    // How many nodes of the root list and of the open region `bindReaders` has seen.
+    readers_seen: struct { root: usize = 0, region: usize = 0 } = .{},
 
     // Cached synthesized constants, so a model that needs the same identity vector
     // or scalar in 35 places binds it once. Keyed by width / by f32 bit pattern.
@@ -103,6 +109,25 @@ pub const Builder = struct {
         synthesized,
     };
 
+    const QuantizedParam = struct {
+        dtype: types.DType,
+        state: union(enum) {
+            /// Where its f32 values come from, read once the axis is known.
+            pending: RowSource,
+            /// The axis it was quantized along; every later reader must agree.
+            bound: usize,
+        },
+    };
+
+    pub const ParamOptions = struct {
+        /// Bind an f32 tensor as this quantized dtype instead. Its blocks run along
+        /// the axis the ops reading it contract over, which only they know, so it
+        /// is quantized when the first such op is added (or at compile or export,
+        /// if none is). The builder holds the f32 tensor until then; the caller's
+        /// own hold is the caller's to release.
+        quantize: ?types.DType = null,
+    };
+
     /// Handle for one open scope. Pass it back to `endScope` to close it; the
     /// recorded `path_len`/`depth` make closing idempotent-ish and self-correcting
     /// if scopes are closed out of order.
@@ -131,6 +156,17 @@ pub const Builder = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Give up the builder's holds: every bound parameter, and every source still
+        // waiting to be quantized. Programs compiled from it keep their own.
+        var params = self.params.keyIterator();
+        while (params.next()) |v| {
+            if (self.graph.values.items[@intCast(v.*)].external) |tid| self.ctx.store.releaseHold(@intCast(tid));
+        }
+        for (self.quantized.values()) |q| switch (q.state) {
+            .pending => |source| if (source == .tensor) source.tensor.release(),
+            .bound => {},
+        };
+        self.quantized.deinit(self.allocator);
         self.params.deinit(self.allocator);
         self.zero_vecs.deinit(self.allocator);
         self.one_vecs.deinit(self.allocator);
@@ -436,16 +472,101 @@ pub const Builder = struct {
     /// These names persist into the package as `debug_names`, which is the key the
     /// weight-swap API (`LoadedModel.overwriteInitializerByDebugName`) looks up —
     /// so a stable, hierarchical name is what makes swapping usable.
-    pub fn paramNamed(self: *Self, t: api_tensor.Tensor, param_name: []const u8) Error!TensorRef {
+    pub fn paramNamed(self: *Self, t: api_tensor.Tensor, param_name: []const u8, opts: ParamOptions) Error!TensorRef {
         if (param_name.len == 0) return Error.InvalidArgument;
-        return self.paramInner(t, param_name, .user);
+        const dtype = opts.quantize orelse return self.paramInner(t, param_name, .user);
+        if (t.dtype != .f32 or !dtype.info().is_quantized) return Error.InvalidArgument;
+
+        t.store.holdTensor(t.id);
+        return self.pendingParam(dtype, t.shape, param_name, .{ .tensor = t });
+    }
+
+    /// Declare a `dtype` weight of `shape` whose f32 rows `reader` fills on demand,
+    /// quantized the way `ParamOptions.quantize` is: when an op reading it fixes the
+    /// axis. Rows are read a chunk at a time, so no whole f32 copy of the weight ever
+    /// exists. `reader` must stay valid until then, or until the builder is gone.
+    pub fn paramRows(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, reader: RowSource.Reader) Error!TensorRef {
+        if (param_name.len == 0 or !dtype.info().is_quantized) return Error.InvalidArgument;
+        return self.pendingParam(dtype, shape, param_name, .{ .reader = reader });
+    }
+
+    fn pendingParam(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, source: RowSource) Error!TensorRef {
+        const v: ValueId = try self.graph.addInput(dtype, shape);
+        self.quantized.put(self.allocator, v, .{ .dtype = dtype, .state = .{ .pending = source } }) catch return Error.OutOfMemory;
+        self.params.put(self.allocator, v, .user) catch return Error.OutOfMemory;
+        try self.nameParam(v, param_name);
+        return .{ .value = v };
     }
 
     fn paramInner(self: *Self, t: api_tensor.Tensor, param_name: ?[]const u8, kind: ParamKind) Error!TensorRef {
         const v: ValueId = try self.graph.addInput(t.dtype, t.shape);
         try self.graph.bindExternalParam(v, @intCast(t.id));
+        t.store.holdTensor(t.id);
         self.params.put(self.allocator, v, kind) catch return Error.OutOfMemory;
+        try self.nameParam(v, param_name);
+        return .{ .value = v };
+    }
 
+    /// Bind the weights no op pinned an axis for, along the matmul-B one.
+    pub fn bindQuantizedParams(self: *Self) Error!void {
+        try self.bindReaders();
+        for (self.quantized.keys(), self.quantized.values()) |v, *q| {
+            if (q.state != .pending) continue;
+            const rank = self.graph.values.items[@intCast(v)].shape.len;
+            try self.quantizeParam(v, q, if (rank >= 2) rank - 2 else 0);
+        }
+    }
+
+    /// Quantize each pending weight the nodes added since the last call read along a
+    /// fixed axis, and hold each bound one to its axis, so a conflicting reader fails
+    /// at the op that adds it: one tensor has one layout.
+    fn bindReaders(self: *Self) Error!void {
+        const nodes = self.graph.currentNodes();
+        const seen = if (self.graph.active_region) &self.readers_seen.region else &self.readers_seen.root;
+        for (nodes[seen.*..]) |node| {
+            for (node.inputs, 0..) |in, slot| {
+                const q = self.quantized.getPtr(in) orelse continue;
+                const axis = readAxis(node.op, slot, self.graph.values.items[@intCast(in)].shape.len) orelse continue;
+                switch (q.state) {
+                    .bound => |bound| if (bound != axis) return Error.InvalidArgument,
+                    .pending => try self.quantizeParam(in, q, axis),
+                }
+            }
+        }
+        seen.* = nodes.len;
+    }
+
+    fn quantizeParam(self: *Self, v: ValueId, q: *QuantizedParam, axis: usize) Error!void {
+        const source = q.state.pending;
+        const t = self.ctx.quantize(q.dtype, self.graph.values.items[@intCast(v)].shape, axis, source) catch |e| return switch (e) {
+            error.OutOfMemory => Error.OutOfMemory,
+            else => Error.InvalidArgument,
+        };
+        // Its creation hold is the builder's on the parameter; the source is done with.
+        try self.graph.bindExternalParam(v, @intCast(t.id));
+        if (source == .tensor) source.tensor.release();
+        q.state = .{ .bound = axis };
+    }
+
+    /// The axis an op contracts `slot`'s operand over, where that fixes blocking.
+    fn readAxis(op: graph_mod.Op, slot: usize, rank: usize) ?usize {
+        if (rank == 0) return null;
+        return switch (op) {
+            .MatMul => if (slot == 1 and rank >= 2) rank - 2 else rank - 1,
+            .MatMulNT => rank - 1,
+            // A gathered slice must hold whole blocks: the innermost axis not cut.
+            .Gather => |g| blk: {
+                if (slot != 0) break :blk null;
+                const signed: i64 = g.axis;
+                const cut: usize = @intCast(if (signed < 0) signed + @as(i64, @intCast(rank)) else signed);
+                if (cut != rank - 1) break :blk rank - 1;
+                break :blk if (rank >= 2) rank - 2 else null;
+            },
+            else => null,
+        };
+    }
+
+    fn nameParam(self: *Self, v: ValueId, param_name: ?[]const u8) Error!void {
         // Give parameters (external-bound inputs) a stable debug name so loaded
         // models can find and swap them later.
         //
@@ -466,8 +587,6 @@ pub const Builder = struct {
                 std.fmt.allocPrint(arena, "param@{d}", .{v}) catch return Error.OutOfMemory;
             self.graph.values.items[idx].name = generated_name;
         }
-
-        return .{ .value = v };
     }
 
     /// Where `t` came from, or null if it is not a bound parameter.
@@ -549,6 +668,7 @@ pub const Builder = struct {
         const arena = self.graph.arenaAlloc();
         const const_name = std.fmt.allocPrint(arena, name_fmt, .{key}) catch return Error.OutOfMemory;
         const ref: TensorRef = try self.paramInner(t, null, .synthesized);
+        t.release(); // the builder made it, so its hold as the parameter is the only one
         return self.name(ref, const_name);
     }
 
@@ -563,7 +683,7 @@ pub const Builder = struct {
     /// plain `[in, out]` weight multiplies a `[batch, seq, in]` activation directly.
     /// Nothing is reshaped to make that work — the weight reaches the kernel exactly
     /// as it was bound, which is what keeps a quantized weight usable (its packing
-    /// cannot survive a reshape) and keeps it eligible for horizontal matmul fusion.
+    /// cannot survive a reshape) and keeps it eligible for weight-layout passes.
     ///
     /// `a` may not be the shorter operand: its batch dims are the output's, so a
     /// rank-2 activation against a `[1, in, out]` weight is left-padded instead.
@@ -1184,7 +1304,8 @@ pub const Builder = struct {
     /// Begin a sub-region. Ops added until `endRegion` become the region body
     /// (used for `If` branches and `Loop` bodies). Regions do not nest.
     pub fn beginRegion(self: *Self) Error!void {
-        return self.graph.beginRegion();
+        try self.graph.beginRegion();
+        self.readers_seen.region = 0;
     }
 
     /// Close the active region, declaring its outputs. Returns a region id for
@@ -1193,6 +1314,7 @@ pub const Builder = struct {
         var ids: [16]ValueId = undefined;
         if (outputs.len == 0 or outputs.len > ids.len) return Error.InvalidArgument;
         for (outputs, 0..) |o, i| ids[i] = o.value;
+        try self.bindReaders();
         return self.graph.endRegion(ids[0..outputs.len]);
     }
 
@@ -1258,6 +1380,7 @@ pub const Builder = struct {
         if (self.graph.lastNode()) |node| {
             try infer_mod.inferNode(&self.graph, node);
         }
+        try self.bindReaders();
 
         const idx: usize = @intCast(vid);
         if (idx >= self.graph.values.items.len) return;

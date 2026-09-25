@@ -2,6 +2,8 @@
 """Context lifecycle + the process-wide default context."""
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 import aion
@@ -41,6 +43,30 @@ def test_context_close_auto_closes_live_children():
     _t = aion.Tensor.empty(ctx, (2, 2), dtype=aion.float32)
     # Should not raise even though child tensor is still live.
     ctx.close()
+
+
+def test_children_closed_after_their_context_leave_it_alone(tiny_model, monkeypatch):
+    # At interpreter exit the garbage collector clears the context's weak set of
+    # children before finalizers run, so the context can close first. Its teardown
+    # freed everything a child points at, so a child closed after it must not call
+    # into the library at all.
+    ctx = aion.Context(thread_count=1)
+    m = aion.LoadedModel.load(ctx, str(tiny_model.path))
+    x = aion.Tensor(tiny_model.x, ctx=ctx)
+    m.bind_input("x", x)
+    m.run()
+    b = aion.Builder(ctx)
+    ctx._children.clear()
+    ctx.close()
+
+    calls = []
+    for module, name in (("tensor", "destroy_tensor"), ("model", "destroy_model"), ("builder", "destroy_builder")):
+        # By module path: `aion.tensor` is also the name of a function.
+        monkeypatch.setattr(importlib.import_module(f"aion.{module}"), name, lambda handle, name=name: calls.append(name))
+    for child in (x, m, b):
+        child.close()
+        child.__del__()
+    assert calls == []
 
 
 def test_load_model_uses_default_context_when_thread_count_omitted(tiny_model_path):

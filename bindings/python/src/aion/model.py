@@ -83,7 +83,9 @@ class LoadedModel:
         if self._closed:
             return
         handle = self._m
-        if handle is not None:
+        # A context closes its children first; one closed after it (a finalizer at
+        # interpreter exit) points into freed storage and must not call in.
+        if handle is not None and not self._ctx_owner._closed:
             destroy_model(handle)
         try:
             self._ctx_owner._unregister_child(self)
@@ -109,14 +111,9 @@ class LoadedModel:
         self.close()
 
     def __del__(self) -> None:  # pragma: no cover
-        # Best-effort only; the attached builder (if any) is a context child and
-        # is torn down in the context's controlled sequence — don't close it here
-        # (finalizer order vs the context is unspecified).
         try:
             if not getattr(self, "_closed", True):
-                handle = getattr(self, "_m", None)
-                if handle is not None:
-                    destroy_model(handle)
+                self.close()
         except Exception:
             pass
 

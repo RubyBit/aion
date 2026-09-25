@@ -48,6 +48,11 @@ pub const AionGpuBackend = enum(c_int) {
     AION_GPU_BACKEND_GL = 4,
 };
 
+/// Options for binding a parameter; zero-initialized binds it as is.
+pub const AionParamOptions = extern struct {
+    quantize_to: AionDType = .AION_DTYPE_F32,
+};
+
 /// Per-GPU creation options mirrored from `api.GpuOptions`.
 /// `adapter_index < 0` means "auto" (no explicit adapter).
 pub const AionGpuOptions = extern struct {
@@ -422,7 +427,8 @@ pub export fn aion_tensor_create(
 
 pub export fn aion_tensor_destroy(t_opt: ?*AionTensor) callconv(.c) void {
     const t: *AionTensor = t_opt orelse return;
-    // Underlying tensor storage is owned by the context; this only frees the handle.
+    // A handle is one hold; the storage goes with the last (see `Tensor.release`).
+    t.tensor.release();
     library_allocator.destroy(t);
 }
 
@@ -910,6 +916,8 @@ pub export fn aion_loaded_model_output_tensor(
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };
+    // The handle holds what it names, as every handle does (see `aion_tensor_destroy`).
+    t.store.holdTensor(t.id);
     handle.* = .{ .owner = ctx, .tensor = t };
     out_tensor.?.* = handle;
     return .AION_OK;
@@ -1253,18 +1261,57 @@ pub export fn aion_builder_name(b_opt: ?*AionBuilder, value: AionValueId, name: 
 /// Unlike `aion_builder_param`, whose generated name is positional and shifts when
 /// construction order changes, this produces the stable key that load/swap-by-name
 /// depends on.
+/// Fills `count` f32 values — whole rows from `row0` on — and returns 0.
+pub const AionRowFill = *const fn (user: ?*anyopaque, row0: usize, out: [*]f32, count: usize) callconv(.c) c_int;
+
+/// A C row filler, as the core's `RowSource.Reader` calls it.
+const CRowReader = struct {
+    fill_fn: AionRowFill,
+    user: ?*anyopaque,
+
+    fn fill(ctx: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
+        const self: *const CRowReader = @ptrCast(@alignCast(ctx));
+        if (self.fill_fn(self.user, row0, out.ptr, out.len) != 0) return error.Failed;
+    }
+};
+
+/// A weight to bind: an existing tensor, or a quantized weight's shape and rows.
+pub const AionWeight = extern struct {
+    tensor: ?*const AionTensor = null,
+    rank: usize = 0,
+    shape: [*c]const usize = null,
+    fill: ?AionRowFill = null,
+    user: ?*anyopaque = null,
+};
+
 pub export fn aion_builder_param_named(
     b_opt: ?*AionBuilder,
-    tensor: ?*const AionTensor,
+    weight_opt: ?*const AionWeight,
     name: ?[*:0]const u8,
+    opts: ?*const AionParamOptions,
     out_value: ?*AionValueId,
 ) callconv(.c) AionStatus {
     const b: *AionBuilder = b_opt orelse return .AION_INVALID_ARGUMENT;
     b.owner.clearLastError();
-    const t: *const AionTensor = tensor orelse return .AION_INVALID_ARGUMENT;
+    const weight: AionWeight = (weight_opt orelse return .AION_INVALID_ARGUMENT).*;
     if (name == null or out_value == null) return .AION_INVALID_ARGUMENT;
 
-    const ref = b.builder.paramNamed(t.tensor, std.mem.span(name.?)) catch |e| {
+    const o: AionParamOptions = if (opts) |p| p.* else .{};
+    const quantize: ?types.DType = if (o.quantize_to == .AION_DTYPE_F32) null else dtypeFromC(o.quantize_to) orelse return .AION_INVALID_ARGUMENT;
+    const ref = blk: {
+        if (weight.tensor) |t| {
+            if (weight.fill != null) return .AION_INVALID_ARGUMENT;
+            break :blk b.builder.paramNamed(t.tensor, std.mem.span(name.?), .{ .quantize = quantize });
+        }
+        // Rows alone: only a quantized weight is read that way.
+        const fill = weight.fill orelse return .AION_INVALID_ARGUMENT;
+        const dtype = quantize orelse return .AION_INVALID_ARGUMENT;
+        if (weight.rank == 0 or weight.shape == null) return .AION_INVALID_ARGUMENT;
+        // Lives as long as the builder, which is as long as the core may call it.
+        const reader = b.str_arena.allocator().create(CRowReader) catch return .AION_OUT_OF_MEMORY;
+        reader.* = .{ .fill_fn = fill, .user = weight.user };
+        break :blk b.builder.paramRows(dtype, weight.shape[0..weight.rank], std.mem.span(name.?), .{ .ctx = reader, .fill = CRowReader.fill });
+    } catch |e| {
         b.owner.setLastError("builder_param_named", e);
         return mapError(e);
     };

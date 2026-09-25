@@ -87,7 +87,7 @@ fn capTileToBinding(policy: plan_mod.TilePolicy, dtype: types.DType, out: []usiz
     if (policy.max_binding_bytes == 0) return;
     const info = dtype.info();
     // Quantized layouts have block-alignment rules of their own; their callers
-    // pick binding-aware tiles directly (see `chooseQuantEmbeddingTableTiles`).
+    // pick binding-aware tiles directly (see `chooseQuantRowTiles`).
     if (info.is_quantized) return;
     // Same 3/4 margin the quantized table path uses: headroom for allocation
     // rounding and any other per-binding limit.
@@ -132,7 +132,7 @@ pub fn chooseTileShapeForTensor(
         out[rank - 2] = tiles[0];
         out[rank - 1] = tiles[1];
     } else if (is_quant and rank == 2 and quant_axis == 1) {
-        const tiles = chooseQuantEmbeddingTableTiles(policy, dtype, shape[0], shape[1]);
+        const tiles = chooseQuantRowTiles(policy, dtype, shape[0], shape[1]);
         out[0] = tiles[0];
         out[1] = tiles[1];
     } else {
@@ -145,34 +145,20 @@ pub fn chooseTileShapeForTensor(
 /// This is used to avoid users having to reason about quant block alignment.
 /// The returned tile shape is [tk, tn].
 pub fn chooseQuantMatMulBTiles(policy: plan_mod.TilePolicy, k: usize, n: usize, b_dtype: types.DType) [2]usize {
-    // Pick a "typical" m to drive the heuristic; B is reused across many m.
-    const m_hint = plan_mod.matMulMHint(policy);
-    const tiles = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, b_dtype);
-    return .{ tiles.tk, tiles.tn };
+    // The N tile is its own decision (see `chooseQuantBTileN`); driving the
+    // general matmul heuristic with a stand-in M gave square-ish 64-wide tiles,
+    // which is far too narrow for a matrix the kernel streams.
+    //
+    // This applies wherever a quantized matmul-B tensor is created — model load,
+    // `Tensor` creation, device migration — not only at export, so the tile has
+    // to serve every M the matrix will see.
+    return .{ plan_mod.chooseMatMulTk(policy, k, b_dtype), plan_mod.chooseQuantBTileN(policy, n) };
 }
 
-/// Suggested tiling for a rank-2 quantized embedding table of shape [V, D] with
-/// `quant_axis == 1` (per-row quantization).
-///
-/// Returns `[tv, td]` such that `td == D` and `tv` is a conservative row-count per tile.
-/// Keeping `td == D` means each row of the table is exactly one contiguous run of
-/// `D / block_elems` blocks inside a tile — the layout a row-gather kernel wants.
-pub fn chooseQuantEmbeddingTableTiles(policy: plan_mod.TilePolicy, dtype: types.DType, v: usize, d: usize) [2]usize {
-    var tv: usize = @max(@as(usize, 1), @min(v, policy.base_1d));
-    // Keep whole rows (dim1 = d) but cap the row count so a single tile fits the
-    // device binding limit. A multi-GB quantized vocab table is split along v; the
-    // gather op then resolves the right tile per row.
-    if (policy.max_binding_bytes > 0) {
-        const info = dtype.info();
-        const per_row: usize = (d / info.block_elems) * info.block_bytes;
-        if (per_row > 0) {
-            // 3/4 margin leaves headroom for allocation rounding / other limits.
-            const budget: usize = policy.max_binding_bytes / 4 * 3;
-            const cap_rows: usize = @max(@as(usize, 1), budget / per_row);
-            tv = @min(tv, cap_rows);
-        }
-    }
-    return .{ tv, d };
+/// Suggested tiling for a rank-2 quantized tensor of shape [R, C] blocked along rows
+/// (`quant_axis == 1`); see `plan.chooseQuantRowTiles`.
+pub fn chooseQuantRowTiles(policy: plan_mod.TilePolicy, dtype: types.DType, r: usize, c: usize) [2]usize {
+    return plan_mod.chooseQuantRowTiles(policy, dtype, r, c);
 }
 
 /// Same policy with and without a declared binding limit, so a test can compare

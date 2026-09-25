@@ -3,7 +3,7 @@
 // Fused matvec for the PLAIN MatMul (K-major B), M == 1 — the Gemma decode hot
 // path. Computes one B tile's contribution:
 //   C[n] = alpha * sum_k A[k] * B[k, n]  +  beta * C[n]
-// with B in q8_0 quantized ALONG K (ggml MatMul-B convention): blocks tile a
+// with B in q8_0 quantized ALONG K (the MatMul-B convention): blocks tile a
 // [K/32, N] grid, row-major, so consecutive blocks run along N. This is the
 // layout `dequant.wgsl :: q8_kmajor_to_f32` materializes to scratch — here we
 // fold the dequant INTO the dot product so B is read exactly once and no f32

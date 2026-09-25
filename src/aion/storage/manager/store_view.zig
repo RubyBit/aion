@@ -48,6 +48,7 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
                 .tile_shape = t.tile_shape,
                 .tile_counts = t.tile_counts,
                 .tile_strides = t.tile_strides,
+                .block_order = t.block_order,
             };
         }
 

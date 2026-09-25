@@ -18,6 +18,8 @@
 // is validated at backend init before any table pointer is used.
 
 const matmul_registry = @import("../registry/matmul_registry.zig");
+const std = @import("std");
+const types = @import("../../types.zig");
 const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 const matmul_nt_registry = @import("../registry/matmul_nt_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
@@ -25,9 +27,10 @@ const attention_registry = @import("../registry/attention_registry.zig");
 const conv1d_registry = @import("../registry/conv1d_registry.zig");
 const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
+const cpu_target = @import("../registry/cpu_target.zig");
 
 /// Bumped whenever the `DispatchTable` layout or any kernel-struct ABI changes.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 6;
 
 /// Ordering of the tiled (packed-GEMM) kernel arrays below.
 pub const TILE_SMALL = 0;
@@ -41,16 +44,34 @@ pub const TILE_LARGE = 2;
 /// all three cache-blocking variants so the main module can still pick a tile by
 /// runtime L2 size; every other family selects purely on lane width, so one entry
 /// per tier suffices.
+/// The kernels that read a quantized weight. A backend takes all of them together,
+/// so no family multiplies differently.
+pub const Quantized = struct {
+    gemm: matmul_q_registry.Set,
+    matvec: matvec_registry.Kernels,
+    nt: matmul_nt_registry.Kernels,
+};
+
+/// Every quantized family for `t`. Tier objects and the single-target build both
+/// take theirs from here, so they select alike.
+pub fn quantizedFor(comptime t: cpu_target.Target) Quantized {
+    return .{
+        .gemm = if (t.int8_mm) matmul_q_registry.mmSet(.smmla) else matmul_q_registry.setForTarget(t),
+        .matvec = matvec_registry.selectForTarget(t).kernels,
+        .nt = matmul_nt_registry.selectForTarget(t).kernels,
+    };
+}
+
 pub const DispatchTable = struct {
     abi_version: u32,
     lanes: u32,
 
     /// [small, medium, large] for this tier's lane width.
     matmul: [3]matmul_registry.F32Kernels,
-    matmul_q: [3]matmul_q_registry.QuantKernels,
 
-    matmul_nt: matmul_nt_registry.Kernels,
-    matvec: matvec_registry.Kernels,
+    /// Every kernel that reads a quantized weight.
+    quantized: Quantized,
+
     attention: attention_registry.Kernels,
     relpos_mha: attention_registry.Kernels,
     conv1d: conv1d_registry.Kernels,

@@ -54,7 +54,8 @@ class Conv2DOpts(TypedDict):
 
 
 class Linear(Module):
-    """`y = x @ w (+ b)`, with `w` in matmul-B layout `[in, out]`.
+    """`y = x @ w (+ b)`, with `w` in matmul-B layout `[in, out]`; or, with
+    ``nt=True``, `y = x @ w.T (+ b)` with `w` as `[out, in]`.
 
     Pass ``dtype=aion.q8_0`` to quantize the weight in the core (bias stays float).
     """
@@ -71,14 +72,13 @@ class Linear(Module):
         nt: bool = False,
     ) -> None:
         self._layer_name = name
+        # `nt` is how a tied embedding head is written: one `[vocab, dim]` table
+        # serves both the lookup and the output projection.
+        self.nt = bool(nt)
         self.weight = Parameter(weight, dtype=dtype)
         self.bias = Parameter(bias, dtype=float32) if bias is not None else None
         self.alpha = float(alpha)
         self.beta = float(beta)
-        # Contract against the weight's *rows* (`[out, in]`) instead of its
-        # columns: what a tied embedding head needs, so one `[vocab, dim]` table
-        # serves both the lookup and the output projection.
-        self.nt = bool(nt)
 
     def forward(self, x: TensorRef) -> TensorRef:
         b = builder_of(x)
@@ -93,9 +93,7 @@ class Linear(Module):
 class Embedding(Module):
     """Row lookup into a `[vocab, dim]` table.
 
-    A quantized table blocks along the feature axis (`quant_axis=1`), not the
-    matmul reduction axis. `weight_value` hands the bound table back so a tied
-    output head can reuse it.
+    `weight_value` hands the bound table back so a tied output head can reuse it.
     """
 
     def __init__(
@@ -106,12 +104,7 @@ class Embedding(Module):
         dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
-        from ..dtype import is_quantized, normalize_dtype
-
-        kwargs = {}
-        if is_quantized(normalize_dtype(dtype)):
-            kwargs = {"shape": _shape_of(table), "quant_axis": 1}
-        self.weight = Parameter(table, dtype=dtype, **kwargs)
+        self.weight = Parameter(table, dtype=dtype)
 
     def weight_value(self, b) -> TensorRef:
         with self._scoped(b):

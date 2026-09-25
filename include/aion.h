@@ -26,7 +26,8 @@
 //
 // Notes on lifetimes:
 // - All tensors are owned by the Aion context's internal storage manager.
-// - `aion_tensor_destroy()` frees only the *handle*, not the underlying storage.
+// - `aion_tensor_destroy()` frees the *handle* and gives up its hold: the storage
+//   is freed once no handle, builder, or model holds it and no program reads it.
 // - Destroy all models/tensors before destroying the context.
 
 #include <stddef.h>
@@ -474,10 +475,37 @@ AION_API AionStatus aion_builder_input(AionBuilder* b, AionDType dtype, size_t r
 AION_API AionStatus aion_builder_param(AionBuilder* b, const AionTensor* tensor, AionValueId* out_value);
 AION_API AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name);
 
+// Options for binding a parameter. Zero-initialized means "bind as is".
+typedef struct AionParamOptions {
+    // Bind an f32 tensor as this quantized dtype (q8_0 or q4_0) instead. Its
+    // blocks run along the axis the ops reading it contract over, settled when
+    // the first such op is added (or at compile/export if none is); a reader
+    // that disagrees fails where it is added. AION_DTYPE_F32 leaves it as it is.
+    AionDType quantize_to;
+} AionParamOptions;
+
+// Fills `count` f32 values, whole rows (the last axis) from row `row0` on, and
+// returns 0; anything else fails the quantization that asked.
+typedef int (*AionRowFill)(void* user, size_t row0, float* out, size_t count);
+
+// A weight to bind: an existing `tensor`, or — for one quantized with
+// `AionParamOptions.quantize_to` — its `shape` and rows, which `fill` supplies a
+// bounded chunk at a time when the weight is quantized, so no whole f32 copy of
+// it ever exists. `fill`/`user` must stay valid until then, or until the builder
+// is destroyed.
+typedef struct AionWeight {
+    const AionTensor* tensor;
+    size_t rank;
+    const size_t* shape;
+    AionRowFill fill;
+    void* user;
+} AionWeight;
+
 // Bind a weight under a semantic, scope-qualified name (`layers.3/attn/weight`).
 // Unlike aion_builder_param, whose generated name is positional and shifts when
 // construction order changes, this is the stable key load/swap-by-name uses.
-AION_API AionStatus aion_builder_param_named(AionBuilder* b, const AionTensor* tensor, const char* name, AionValueId* out_value);
+AION_API AionStatus aion_builder_param_named(AionBuilder* b, const AionWeight* weight, const char* name, const AionParamOptions* opts, AionValueId* out_value);
+
 
 // Scopes nest, so a module tree produces `state_dict`-style parameter paths.
 // begin_* hands back the depth it opened at; pass that to end_scope, which closes

@@ -10,6 +10,7 @@ const exec_utils = @import("utils.zig");
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const DType = types.DType;
+const QuantBlockOrder = types.QuantBlockOrder;
 
 /// q8_0 block: 2-byte f16 scale + 32 i8 values, 34 bytes total.
 const Q8_0_BLOCK_ELEMS: usize = 32;
@@ -52,55 +53,35 @@ fn copyRowVectorized(dst: []u8, src: []const u8) void {
     }
 }
 
-/// Dequantize one q8_0-encoded table row of `d` elements into `dst` scalar bytes.
-///
-/// The source is assumed to be `d / 32` contiguous q8_0 blocks (valid because the
-/// table's `TiledTensor` carries `quant_axis = 1` and `tile_shape[1] = D`, so one row
-/// of a tile is a contiguous run of blocks). The output dtype (`.f16` or `.f32`)
-/// determines `dst`'s element size; callers size `dst` accordingly.
-fn dequantQ8_0Row(dst: []u8, src: []const u8, d: usize, out_dtype: DType) BackendError!void {
+/// Dequantize row `r` of a q8_0 table tile, `d` elements, into `dst` scalar bytes.
+/// Each block is read through the tile's block order, so a row-major and a
+/// grouped table read the same way. `dst` holds `.f16` or `.f32`.
+fn dequantQ8_0Row(dst: []u8, tile: []const u8, order: QuantBlockOrder, r: usize, d: usize, out_dtype: DType) BackendError!void {
     if ((d % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
     const blocks: usize = d / Q8_0_BLOCK_ELEMS;
-    if (src.len < blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
-
-    switch (out_dtype) {
-        .f32 => {
-            if (dst.len < d * @sizeOf(f32)) return BackendError.InvalidArgument;
-            const out_ptr: [*]align(1) f32 = @ptrCast(dst.ptr);
-            var b: usize = 0;
-            while (b < blocks) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(src.ptr + block_off)).*;
-                const scale: f32 = @as(f32, @as(f16, @bitCast(scale_bits)));
-                const q_ptr: [*]align(1) const i8 = @ptrCast(src.ptr + block_off + 2);
-                const out_row: [*]align(1) f32 = out_ptr + b * Q8_0_BLOCK_ELEMS;
-                var i: usize = 0;
-                while (i < Q8_0_BLOCK_ELEMS) : (i += 1) {
-                    out_row[i] = @as(f32, @floatFromInt(q_ptr[i])) * scale;
-                }
-            }
-        },
-        .f16 => {
-            if (dst.len < d * @sizeOf(f16)) return BackendError.InvalidArgument;
-            const out_ptr: [*]align(1) f16 = @ptrCast(dst.ptr);
-            var b: usize = 0;
-            while (b < blocks) : (b += 1) {
-                const block_off: usize = b * Q8_0_BLOCK_BYTES;
-                const scale_bits: u16 = @as(*align(1) const u16, @ptrCast(src.ptr + block_off)).*;
-                const scale_f16: f16 = @bitCast(scale_bits);
-                const q_ptr: [*]align(1) const i8 = @ptrCast(src.ptr + block_off + 2);
-                const out_row: [*]align(1) f16 = out_ptr + b * Q8_0_BLOCK_ELEMS;
-                // Accumulate through f32 to avoid intermediate f16 overflow on large
-                // magnitudes, then round to f16 on store.
-                const scale_f32: f32 = @floatCast(scale_f16);
-                var i: usize = 0;
-                while (i < Q8_0_BLOCK_ELEMS) : (i += 1) {
-                    const v: f32 = @as(f32, @floatFromInt(q_ptr[i])) * scale_f32;
-                    out_row[i] = @floatCast(v);
-                }
-            }
-        },
+    const g = order.groupRows();
+    if (tile.len < (r / g + 1) * g * blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+    const elem_bytes: usize = switch (out_dtype) {
+        .f16 => 2,
+        .f32 => 4,
         else => return BackendError.InvalidArgument,
+    };
+    if (dst.len < d * elem_bytes) return BackendError.InvalidArgument;
+
+    var block: [Q8_0_BLOCK_BYTES]u8 = undefined;
+    for (0..blocks) |b| {
+        order.loadBlock(tile, blocks, r, b, &block);
+        const scale: f32 = @as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little)));
+        const q: *const [Q8_0_BLOCK_ELEMS]i8 = @ptrCast(block[2..]);
+        for (q, 0..) |v, i| {
+            // Through f32, so an f16 output rounds once rather than overflowing midway.
+            const x: f32 = @as(f32, @floatFromInt(v)) * scale;
+            const e = b * Q8_0_BLOCK_ELEMS + i;
+            switch (out_dtype) {
+                .f32 => std.mem.bytesAsValue(f32, dst[e * 4 ..][0..4]).* = x,
+                else => std.mem.bytesAsValue(f16, dst[e * 2 ..][0..2]).* = @floatCast(x),
+            }
+        }
     }
 }
 
@@ -278,7 +259,10 @@ pub fn execGatherRowsTiled(
                             if (next_ti0 == table_cached_ti0) {
                                 const next_local_r: usize = next_row - next_ti0 * self.table_meta.tile_shape[0];
                                 if (next_local_r < rows_in_tile) {
-                                    const pf_off: usize = next_local_r * self.table_row_bytes;
+                                    const pf_off: usize = if (self.table_is_quant)
+                                        self.table_meta.block_order.scaleAt(td / Q8_0_BLOCK_ELEMS, next_local_r, 0)
+                                    else
+                                        next_local_r * self.table_row_bytes;
                                     if (pf_off < table_view.bytes.len) {
                                         @prefetch(table_view.bytes[pf_off..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
                                     }
@@ -292,7 +276,9 @@ pub fn execGatherRowsTiled(
                         if (self.table_is_quant) {
                             try dequantQ8_0Row(
                                 out_view.bytes[dst_off .. dst_off + out_bytes_per_row],
-                                table_view.bytes[src_off .. src_off + self.table_row_bytes],
+                                table_view.bytes,
+                                self.table_meta.block_order,
+                                local_r,
                                 td,
                                 self.out_meta.dtype,
                             );

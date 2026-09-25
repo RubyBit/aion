@@ -5,6 +5,30 @@ const types = @import("../../types.zig");
 
 const BackendError = types.BackendError;
 
+/// One position's rotation pairs, held while every head reuses them.
+///
+/// The angles depend on the position alone, so computing them per head repeated
+/// a transcendental 36 times over for a 32-head layer. Chunked so the table is a
+/// fixed stack cost whatever the head width.
+const TABLE_PAIRS: usize = 64;
+
+const Rotation = struct {
+    cos: [TABLE_PAIRS]f32 = undefined,
+    sin: [TABLE_PAIRS]f32 = undefined,
+
+    /// Fills `n` pairs from `freq`, returning the frequency the next chunk starts at.
+    fn fill(self: *Rotation, pos: f32, freq: f32, freq_step: f32, n: usize) f32 {
+        var f: f32 = freq;
+        for (0..n) |i| {
+            const sc: fast_math.SinCosF32 = fast_math.sinCosFastF32(pos * f);
+            self.cos[i] = sc.cos;
+            self.sin[i] = sc.sin;
+            f *= freq_step;
+        }
+        return f;
+    }
+};
+
 pub fn runTileF32(
     out_view: types.BufferViewMut,
     x_view: types.BufferViewConst,
@@ -38,27 +62,34 @@ pub fn runTileF32(
         var ll: usize = 0;
         while (ll < tl) : (ll += 1) {
             const pos: f32 = @floatFromInt(pos_vals[lb * pl + ll]);
+            const base: usize = ((lb * tl + ll) * tn) * th;
 
             var ln: usize = 0;
             while (ln < tn) : (ln += 1) {
-                const row_off: usize = (((lb * tl + ll) * tn) + ln) * th;
-                const x_row: []align(1) const f32 = x_vals[row_off .. row_off + th];
-                const out_row: []align(1) f32 = out_vals[row_off .. row_off + th];
+                const row_off: usize = base + ln * th;
+                @memcpy(out_vals[row_off .. row_off + th], x_vals[row_off .. row_off + th]);
+            }
 
-                @memcpy(out_row, x_row);
+            if (rope_pairs == 0) continue;
 
-                if (rope_pairs == 0) continue;
+            var rot: Rotation = .{};
+            var freq: f32 = scale_factor;
+            var pair0: usize = 0;
+            while (pair0 < rope_pairs) : (pair0 += TABLE_PAIRS) {
+                const n: usize = @min(TABLE_PAIRS, rope_pairs - pair0);
+                freq = rot.fill(pos, freq, freq_step, n);
 
-                var i: usize = 0;
-                var freq: f32 = scale_factor;
-                while (i < rope_pairs) : (i += 1) {
-                    const xl: f32 = x_row[i];
-                    const xr: f32 = x_row[pairs_total + i];
-                    const angle: f32 = pos * freq;
-                    const sc: fast_math.SinCosF32 = fast_math.sinCosFastF32(angle);
-                    out_row[i] = xl * sc.cos - xr * sc.sin;
-                    out_row[pairs_total + i] = xl * sc.sin + xr * sc.cos;
-                    freq *= freq_step;
+                ln = 0;
+                while (ln < tn) : (ln += 1) {
+                    const row_off: usize = base + ln * th;
+                    const x_row = x_vals[row_off .. row_off + th];
+                    const out_row = out_vals[row_off .. row_off + th];
+                    for (0..n) |i| {
+                        const xl: f32 = @as(f32, x_row[pair0 + i]);
+                        const xr: f32 = @as(f32, x_row[pairs_total + pair0 + i]);
+                        out_row[pair0 + i] = @as(f32, xl * rot.cos[i] - xr * rot.sin[i]);
+                        out_row[pairs_total + pair0 + i] = @as(f32, xl * rot.sin[i] + xr * rot.cos[i]);
+                    }
                 }
             }
         }
@@ -98,27 +129,34 @@ pub fn runTileF16(
         var ll: usize = 0;
         while (ll < tl) : (ll += 1) {
             const pos: f32 = @floatFromInt(pos_vals[lb * pl + ll]);
+            const base: usize = ((lb * tl + ll) * tn) * th;
 
             var ln: usize = 0;
             while (ln < tn) : (ln += 1) {
-                const row_off: usize = (((lb * tl + ll) * tn) + ln) * th;
-                const x_row: []align(1) const f16 = x_vals[row_off .. row_off + th];
-                const out_row: []align(1) f16 = out_vals[row_off .. row_off + th];
+                const row_off: usize = base + ln * th;
+                @memcpy(out_vals[row_off .. row_off + th], x_vals[row_off .. row_off + th]);
+            }
 
-                @memcpy(out_row, x_row);
+            if (rope_pairs == 0) continue;
 
-                if (rope_pairs == 0) continue;
+            var rot: Rotation = .{};
+            var freq: f32 = scale_factor;
+            var pair0: usize = 0;
+            while (pair0 < rope_pairs) : (pair0 += TABLE_PAIRS) {
+                const n: usize = @min(TABLE_PAIRS, rope_pairs - pair0);
+                freq = rot.fill(pos, freq, freq_step, n);
 
-                var i: usize = 0;
-                var freq: f32 = scale_factor;
-                while (i < rope_pairs) : (i += 1) {
-                    const xl: f32 = @floatCast(x_row[i]);
-                    const xr: f32 = @floatCast(x_row[pairs_total + i]);
-                    const angle: f32 = pos * freq;
-                    const sc: fast_math.SinCosF32 = fast_math.sinCosFastF32(angle);
-                    out_row[i] = @floatCast(xl * sc.cos - xr * sc.sin);
-                    out_row[pairs_total + i] = @floatCast(xl * sc.sin + xr * sc.cos);
-                    freq *= freq_step;
+                ln = 0;
+                while (ln < tn) : (ln += 1) {
+                    const row_off: usize = base + ln * th;
+                    const x_row = x_vals[row_off .. row_off + th];
+                    const out_row = out_vals[row_off .. row_off + th];
+                    for (0..n) |i| {
+                        const xl: f32 = @floatCast(x_row[pair0 + i]);
+                        const xr: f32 = @floatCast(x_row[pairs_total + pair0 + i]);
+                        out_row[pair0 + i] = @floatCast(xl * rot.cos[i] - xr * rot.sin[i]);
+                        out_row[pairs_total + pair0 + i] = @floatCast(xl * rot.sin[i] + xr * rot.cos[i]);
+                    }
                 }
             }
         }

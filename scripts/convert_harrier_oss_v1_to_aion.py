@@ -275,10 +275,7 @@ def _f32(arr: np.ndarray) -> np.ndarray:
 
 # Weights are held as *data*: `nn` layers bind and quantize them themselves, so
 # nothing here needs a Builder. Q/K/V and gate/up stay separate, the way the
-# checkpoint ships them — pre-concatenating them is a *fusion*, and the compiler
-# does that (`opt/fuse_horizontal_matmul` rewrites matmuls sharing an operand
-# into one wide matmul plus slices, numerically identically) and then frees the
-# sources.
+# checkpoint ships them.
 
 
 @dataclass

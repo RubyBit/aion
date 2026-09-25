@@ -10,6 +10,14 @@ const fast = @import("../backend/cpu/kernels/fast_math.zig");
 
 const nn = api.nn;
 
+/// `vals` of `shape` quantized to q8_0 in one call over every block. Caller frees.
+fn quantizeWhole(allocator: std.mem.Allocator, shape: []const usize, axis: usize, vals: []const f32) ![]u8 {
+    const out = try allocator.alloc(u8, vals.len / 32 * 34);
+    errdefer allocator.free(out);
+    try quantize.quantizeBlocks(.q8_0, shape, axis, vals, 0, 0, out);
+    return out;
+}
+
 fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
     return try dir.createFile(std.testing.io, sub_path, flags);
 }
@@ -1922,7 +1930,7 @@ fn packQ8WeightKN(allocator: std.mem.Allocator, vals: []const f32, k: usize, n: 
     return buf;
 }
 
-test "api: weight-swap writes through a fused projection (in-place handle refused)" {
+test "api: weight-swap writes through a re-laid projection (in-place handle refused)" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const K: usize = 64;
     const Nq: usize = 32;
@@ -1932,7 +1940,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer export_ctx.deinit();
 
-    // Two q8_0 projections off a shared input — the compiler fuses them at load.
+    // Two q8_0 projections off a shared input — the compiler re-lays them at load.
     const qv = try allocator.alloc(f32, K * Nq);
     defer allocator.free(qv);
     for (qv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.1;
@@ -1949,7 +1957,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir, "fused_swap.aion", .{ .read = true, .truncate = true });
+    const file = try createTestFile(tmp.dir, "relaid_swap.aion", .{ .read = true, .truncate = true });
     defer file.close(std.testing.io);
 
     var bld = api.Builder.init(&export_ctx);
@@ -1966,7 +1974,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
 
     var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer load_ctx.deinit();
-    var model = try load_ctx.loadModel(file, .{ .passes = .initOne(.horizontal_matmul) });
+    var model = try load_ctx.loadModel(file, .{ .passes = .initOne(.weight_layout) });
     defer model.deinit();
 
     const xv = try allocator.alloc(f32, M * K);
@@ -1993,10 +2001,10 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     }
     try std.testing.expect(any_nonzero);
 
-    // "q" was fused into the combined weight: no standalone in-place handle...
+    // "q" lives in its re-laid weight: no standalone in-place handle...
     try std.testing.expectError(error.InvalidArgument, model.initializerTensorByDebugName("q"));
 
-    // ...but its current value is still readable — materialized out of the fused
+    // ...but its current value is still readable — materialized out of the re-laid
     // weight (the read counterpart of write-through). It must be non-zero here.
     const zero_packed = try allocator.alloc(u8, (K / 32) * Nq * 34);
     defer allocator.free(zero_packed);
@@ -2030,7 +2038,7 @@ test "api: weight-swap writes through a fused projection (in-place handle refuse
     }
     // q's output collapses to zero (write-through landed in q's columns)...
     for (oq_after) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
-    // ...and k's output is untouched (isolation across the fused weight).
+    // ...and k's output is untouched.
     for (ok_after, ok_before) |a, b| try std.testing.expectApproxEqAbs(b, a, 1e-6);
 
     // Read-back now reflects the swap: q materializes as all-zero.
@@ -2571,8 +2579,9 @@ test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
         .{ .name = "y", .tensor = Y },
     }, .{});
 
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var found: bool = false;
     for (pkg.debug_names) |entry| {
@@ -2630,8 +2639,9 @@ test "api.module: custom module can use introspection scope helpers" {
 
     try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
 
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var found: bool = false;
     for (pkg.debug_names) |entry| {
@@ -2694,8 +2704,9 @@ test "api: explicit builder scope prefixes debug names" {
         .{ .name = "y", .tensor = Y2 },
     }, .{});
 
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var found: bool = false;
     for (pkg.debug_names) |entry| {
@@ -2744,8 +2755,9 @@ test "api: an explicit builder scope nests above the nn auto module scope" {
         .{ .name = "y", .tensor = Y },
     }, .{});
 
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var found: bool = false;
     for (pkg.debug_names) |entry| {
@@ -3002,8 +3014,8 @@ test "api: paramNamed gives params a semantic, scope-qualified debug name" {
         const inner = try bld.beginScope("q_proj");
         defer bld.endScope(inner);
 
-        W = try bld.paramNamed(w_t, "weight");
-        B = try bld.paramNamed(b_t, "bias");
+        W = try bld.paramNamed(w_t, "weight", .{});
+        B = try bld.paramNamed(b_t, "bias", .{});
         MM = try bld.matmul(X, W, 1.0, 0.0);
         Y = try bld.add(MM, B);
     }
@@ -3016,13 +3028,14 @@ test "api: paramNamed gives params a semantic, scope-qualified debug name" {
     try std.testing.expectEqualStrings("layers.3/q_proj/add#1", bld.valueName(Y).?);
 
     // An empty name is rejected rather than silently producing a trailing slash.
-    try std.testing.expectError(error.InvalidArgument, bld.paramNamed(b_t, ""));
+    try std.testing.expectError(error.InvalidArgument, bld.paramNamed(b_t, "", .{}));
 
     // The semantic names persist into the package, which is what makes
     // swap-by-debug-name usable.
     try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var saw_w: bool = false;
     var saw_b: bool = false;
@@ -3065,8 +3078,9 @@ test "api: builder.param auto-generates persisted debug names" {
     const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
     try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
 
-    var pkg = try package_file.readPackageFile(allocator, file);
-    defer pkg.deinit();
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    const pkg = &mapped.package;
 
     var found: bool = false;
     for (pkg.debug_names) |entry| {
@@ -3306,6 +3320,29 @@ test "api: attention validates H_q % H_kv == 0" {
 }
 
 /// Dequantize a `[K, N]` q8_0 weight packed by `packQ8WeightKN` back to f32.
+/// `a` as the CPU's q8 matmul sees it: quantized to int8 per 32-element K block
+/// and back. Both operands of a q8 matmul are quantized once a weight is re-laid
+/// (`opt/weight_layout.zig`), so a reference that keeps A exact is
+/// measuring the quantizer, not the matmul.
+fn quantizeRoundTripRows(allocator: std.mem.Allocator, a: []const f32, rows: usize, cols: usize) ![]f32 {
+    const out = try allocator.alloc(f32, rows * cols);
+    for (0..rows) |r| {
+        var b: usize = 0;
+        while (b < cols / 32) : (b += 1) {
+            const base = r * cols + b * 32;
+            var amax: f32 = 0;
+            for (0..32) |i| amax = @max(amax, @abs(a[base + i]));
+            const scale: f32 = if (amax == 0) 0 else amax / 127.0;
+            const inv: f32 = if (amax == 0) 0 else 127.0 / amax;
+            for (0..32) |i| {
+                const q = std.math.clamp(@round(a[base + i] * inv), -127.0, 127.0);
+                out[base + i] = q * scale;
+            }
+        }
+    }
+    return out;
+}
+
 fn dequantQ8KN(allocator: std.mem.Allocator, packed_bytes: []const u8, k: usize, n: usize) ![]f32 {
     const kb = k / 32;
     const out = try allocator.alloc(f32, k * n);
@@ -3403,10 +3440,12 @@ test "api: export/load keeps q8_0 weights packed (dtype + byte size) and runs" {
     }
     const w_deq = try dequantQ8KN(allocator, w_packed, K, N);
     defer allocator.free(w_deq);
+    const x_deq = try quantizeRoundTripRows(allocator, &xv, M, K);
+    defer allocator.free(x_deq);
     for (0..M) |m| {
         for (0..N) |j| {
             var acc: f32 = bias[m * N + j];
-            for (0..K) |kk| acc += xv[m * K + kk] * w_deq[kk * N + j];
+            for (0..K) |kk| acc += x_deq[m * K + kk] * w_deq[kk * N + j];
             try std.testing.expectApproxEqAbs(acc, got[m * N + j], 1e-3);
         }
     }
@@ -3553,14 +3592,16 @@ test "api: fromF32Quantized authors a q8_0 matmul matching the dequant reference
     }
 
     // Reference: dequantize the SAME packed bytes the core produced and matmul.
-    const w_packed = try quantize.quantizeF32(allocator, .q8_0, &[_]usize{ K, N }, 0, wv);
+    const w_packed = try quantizeWhole(allocator, &[_]usize{ K, N }, 0, wv);
     defer allocator.free(w_packed);
     const w_deq = try dequantQ8KN(allocator, w_packed, K, N);
     defer allocator.free(w_deq);
+    const x_deq = try quantizeRoundTripRows(allocator, &xv, M, K);
+    defer allocator.free(x_deq);
     for (0..M) |m| {
         for (0..N) |j| {
             var acc: f32 = 0;
-            for (0..K) |kk| acc += xv[m * K + kk] * w_deq[kk * N + j];
+            for (0..K) |kk| acc += x_deq[m * K + kk] * w_deq[kk * N + j];
             try std.testing.expectApproxEqAbs(acc, got[m * N + j], 1e-3);
         }
     }
@@ -3799,9 +3840,8 @@ test "api: symbolic compile still optimizes (parallel projections fuse) across s
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
 
-    // Two projections off a SHARED input with a symbolic row count. The
-    // horizontal-matmul fusion pass runs during each per-shape compile (it is NOT
-    // disabled for symbolic models); outputs must stay correct at every shape.
+    // Two projections off a SHARED input with a symbolic row count; outputs must
+    // stay correct at every per-shape compile.
     const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, K }), "x");
     var wqv: [K * Nq]f32 = undefined;
     for (&wqv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.1;
@@ -3967,7 +4007,7 @@ test "api: authoring survives compilation" {
 }
 
 // ---------------------------------------------------------------------------
-// Two models, one store: a weight one of them fused away
+// Two models, one store: a weight one of them re-laid away
 // ---------------------------------------------------------------------------
 
 /// Two q8_0 projections off one input, summed. `Context.compile` bakes the params as
@@ -3985,6 +4025,10 @@ const SharedProj = struct {
     k: api.TensorRef,
     /// A second copy of q's original bytes: the swap below overwrites q's own tensor.
     q_backup: api.Tensor,
+    /// Somewhere to materialize k into. A weight a layout pass re-laid has no
+    /// standalone storage, so its bytes come back through `readInitializer*`
+    /// rather than from a handle.
+    scratch: api.Tensor,
     x: api.Tensor,
 
     fn init(allocator: std.mem.Allocator) !*SharedProj {
@@ -4005,6 +4049,7 @@ const SharedProj = struct {
 
         const wq = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, q_packed);
         self.q_backup = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, q_packed);
+        self.scratch = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, q_packed);
         const wk = try self.ctx.fromPackedQuant(.q8_0, &[_]usize{ K, N }, 0, k_packed);
 
         self.bld = api.Builder.init(&self.ctx);
@@ -4042,11 +4087,11 @@ const SharedProj = struct {
     }
 };
 
-// Folding makes the fused weight the canonical store and frees the sources, which is only
-// sound while every program reads the fused weight. A model on the same store that did
-// NOT fuse names the sources directly, so their bytes are materialized back out — the
+// Re-laying makes the derived weight the canonical store and frees the sources, which is
+// only sound while every program reads the derived weight. A model on the same store that
+// did NOT re-lay names the sources directly, so their bytes are materialized back out — the
 // alternative is a program reading released memory.
-test "api: a weight one model fused away is still readable by a model that did not" {
+test "api: a weight one model re-laid away is still readable by a model that did not" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const P = SharedProj;
     const self = try P.init(allocator);
@@ -4055,20 +4100,21 @@ test "api: a weight one model fused away is still readable by a model that did n
     var reference: [P.M * P.N]f32 = undefined;
     try self.runWith(.empty, &reference);
 
-    var fused: [P.M * P.N]f32 = undefined;
-    try self.runWith(.initOne(.horizontal_matmul), &fused);
-    try std.testing.expectEqualSlices(f32, &reference, &fused);
+    var relaid: [P.M * P.N]f32 = undefined;
+    try self.runWith(.initOne(.weight_layout), &relaid);
+    // A different kernel contracts the re-laid weight, so it need not match bit for bit.
+    for (reference, relaid) |r, v| try std.testing.expectApproxEqAbs(r, v, 1e-4);
 
-    // The fusing model is gone, so nothing reads the fused weight and nothing reads the
-    // sources either — this is exactly when reclaim frees them. A fresh unfused compile
+    // The re-laying model is gone, so nothing reads the derived weight and nothing reads
+    // the sources either — this is exactly when reclaim frees them. A fresh plain compile
     // has to get them back.
     var after: [P.M * P.N]f32 = undefined;
     try self.runWith(.empty, &after);
     try std.testing.expectEqualSlices(f32, &reference, &after);
 }
 
-// The reverse order is the one a per-model scan gets wrong: the unfused model is still
-// alive when the fusing one reclaims, and its program still names the sources.
+// The reverse order is the one a per-model scan gets wrong: the plain model is still
+// alive when the re-laying one reclaims, and its program still names the sources.
 test "api: reclaim leaves a weight another live model still reads" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const P = SharedProj;
@@ -4085,10 +4131,11 @@ test "api: reclaim leaves a weight another live model still reads" {
         try t.read(&reference);
     }
 
-    // Compiling and running a fusing model folds the same weights and triggers reclaim.
-    var fused: [P.M * P.N]f32 = undefined;
-    try self.runWith(.initOne(.horizontal_matmul), &fused);
-    try std.testing.expectEqualSlices(f32, &reference, &fused);
+    // Compiling and running a re-laying model folds the same weights and triggers reclaim.
+    var relaid: [P.M * P.N]f32 = undefined;
+    try self.runWith(.initOne(.weight_layout), &relaid);
+    // A different kernel contracts the re-laid weight, so it need not match bit for bit.
+    for (reference, relaid) |r, v| try std.testing.expectApproxEqAbs(r, v, 1e-4);
 
     // `plain` never recompiled: it reads the same weights it was compiled against.
     try plain.run();
@@ -4120,9 +4167,12 @@ test "api: a compiled model's weights can be swapped in place" {
         try t.read(&reference);
     }
 
-    // Point "q" at k's weight. Same layout, so this is a byte copy into q's tensor.
-    const k_tensor = try model.initializerTensorByValue(self.k.value);
-    try model.overwriteInitializerByValue(self.q.value, k_tensor);
+    // Point "q" at k's weight. On a target whose layout pass re-lays quantized
+    // weights these have no standalone storage, so k's bytes are read out of the
+    // re-laid tensor and written back into q's — which is the round trip the
+    // pass's mapping has to get right, in both directions.
+    try model.readInitializerByValue(self.k.value, self.scratch);
+    try model.overwriteInitializerByValue(self.q.value, self.scratch);
 
     var swapped: [P.M * P.N]f32 = undefined;
     try model.run();
@@ -4286,4 +4336,358 @@ test "api: a diagnostic reports any op's attributes, not a hand-picked few" {
         try std.testing.expectError(error.Unsupported, bld.softmax(ints, -1));
         try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "axis=-1") != null);
     }
+}
+
+// A quantized weight declared from values blocks along whatever its reader
+// contracts over, so the author never names an axis: each case must match the
+// same weight quantized along that axis by hand, bit for bit.
+test "api: a quantized weight blocks along the axis its reader contracts over" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [8 * 64]f32 = undefined;
+    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.05;
+    var x_vals: [2 * 64]f32 = undefined;
+    for (&x_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    const x = try ctx.fromF32(&[_]usize{ 2, 64 }, &x_vals);
+    const idx = try ctx.fromArray([1][2]i32{.{ 5, 1 }});
+
+    const Case = enum { matmul, matmul_nt, gather };
+    for ([_]Case{ .matmul, .matmul_nt, .gather }, [_]usize{ 0, 1, 1 }) |case, axis| {
+        // matmul reads `[64, 8]`; the other two read `[8, 64]` row-wise.
+        const shape: [2]usize = if (case == .matmul) .{ 64, 8 } else .{ 8, 64 };
+        var out: [2][16]f32 = undefined;
+        for (0..2) |by_hand| {
+            var bld = api.Builder.init(&ctx);
+            defer bld.deinit();
+            const w = if (by_hand == 1)
+                try bld.param(try ctx.fromF32Quantized(.q8_0, &shape, axis, &w_vals))
+            else
+                try bld.paramNamed(try ctx.fromF32(&shape, &w_vals), "w", .{ .quantize = .q8_0 });
+            const y = switch (case) {
+                .matmul => try bld.matmul(try bld.param(x), w, 1.0, 0.0),
+                .matmul_nt => try bld.matmulNT(try bld.param(x), w, 1.0, 0.0),
+                .gather => try bld.sliceLastDim(try bld.gather(w, try bld.param(idx), 0, 0), 0, 8),
+            };
+            var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
+            defer model.deinit();
+            try model.run();
+            try (try model.outputTensorAt(0)).read(&out[by_hand]);
+
+            const ext = bld.innerGraph().values.items[@intCast(w.value)].external.?;
+            try std.testing.expectEqual(@as(u8, @intCast(axis)), (try ctx.store.getConst(@intCast(ext))).quant_axis);
+        }
+        try std.testing.expectEqualSlices(f32, &out[1], &out[0]);
+    }
+}
+
+// A tensor's data lives while something holds it — its creator, a builder that binds
+// it, a model it is bound to — or a compiled program reads it, and goes with the last.
+test "api: a tensor's data goes when its last holder lets go" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var vals: [64]f32 = @splat(0.5);
+
+    // Nothing else holds it: released, it is gone.
+    const lone = try ctx.fromF32(&[_]usize{ 1, 64 }, &vals);
+    lone.release();
+    try std.testing.expect(!try ctx.store.tensorHasBacking(lone.id));
+
+    // A builder holds what it binds, and a compiled program what it reads.
+    var w_vals: [8 * 64]f32 = @splat(0.25);
+    const w = try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals);
+    const x = try ctx.fromF32(&[_]usize{ 1, 64 }, &vals);
+    var bld = api.Builder.init(&ctx);
+    const y = try bld.matmulNT(try bld.name(try bld.input(.f32, &[_]usize{ 1, 64 }), "x"), try bld.param(w), 1.0, 0.0);
+    w.release();
+    try std.testing.expect(try ctx.store.tensorHasBacking(w.id));
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
+    // The program may read `w` through a derived copy; either way the builder going
+    // leaves the model its weight (checked by the run below).
+    bld.deinit();
+
+    // A model holds its bound input for as long as it is bound.
+    try model.bindInput("x", x);
+    x.release();
+    try model.run();
+    var got: [8]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&got);
+    for (got) |g| try std.testing.expectApproxEqAbs(@as(f32, 8.0), g, 1e-4);
+    model.deinit();
+    model = undefined;
+    try std.testing.expect(!try ctx.store.tensorHasBacking(x.id));
+    // Nothing holds or reads `w` now, so neither its bytes nor a copy derived from it stay.
+    try std.testing.expect(!try ctx.store.tensorHasBacking(w.id));
+    try std.testing.expect(ctx.store.derivedLocate(w.id) == null);
+}
+
+// The converter's case: an f32 weight is declared, handed off and never touched again,
+// so once its reader quantizes it the f32 copy must not outlive the op that did.
+test "api: a quantized weight's released f32 source goes once it is quantized" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var w_vals: [8 * 64]f32 = @splat(0.25);
+    var x_vals: [64]f32 = @splat(0.5);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const src = try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals);
+    const w = try bld.paramNamed(src, "w", .{ .quantize = .q8_0 });
+    src.release();
+    try std.testing.expect(try ctx.store.tensorHasBacking(src.id));
+    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    try std.testing.expect(!try ctx.store.tensorHasBacking(src.id));
+}
+
+// Quantizing streams a weight through in chunks of rows, so a chunk boundary must
+// change no byte: past one chunk, along either kind of axis and from every kind of
+// source, the result is the whole-tensor quantizer's exactly.
+test "api: a weight quantized a chunk at a time is byte-identical to quantizing it whole" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const Case = struct { shape: []const usize, axis: usize };
+    const cases = [_]Case{
+        .{ .shape = &.{ 4096, 2048 }, .axis = 0 },
+        .{ .shape = &.{ 4096, 2048 }, .axis = 1 },
+        .{ .shape = &.{ 3, 1024, 2048 }, .axis = 1 },
+    };
+    for (cases) |case| {
+        var n: usize = 1;
+        for (case.shape) |d| n *= d;
+        const vals = try allocator.alloc(f32, n);
+        defer allocator.free(vals);
+        for (vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i *% 2654435761) % 2001)) - 1000)) * 0.001;
+        const want = try quantizeWhole(allocator, case.shape, case.axis, vals);
+        defer allocator.free(want);
+        const got = try allocator.alloc(u8, want.len);
+        defer allocator.free(got);
+
+        const Rows = struct {
+            vals: []const f32,
+            row_len: usize,
+            fn fill(ctx_ptr: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                @memcpy(out, self.vals[row0 * self.row_len ..][0..out.len]);
+            }
+        };
+        var rows = Rows{ .vals = vals, .row_len = case.shape[case.shape.len - 1] };
+        const src_tensor = try ctx.fromF32(case.shape, vals);
+        defer src_tensor.release();
+        const sources = [_]api.RowSource{
+            .{ .values = vals },
+            .{ .tensor = src_tensor },
+            .{ .reader = .{ .ctx = &rows, .fill = Rows.fill } },
+        };
+        for (sources) |source| {
+            const t = try ctx.quantize(.q8_0, case.shape, case.axis, source);
+            defer t.release();
+            try t.readPackedQuant(got);
+            try std.testing.expectEqualSlices(u8, want, got);
+        }
+    }
+}
+
+// An exported package points at the weights where they already live, and the writer
+// streams them into the file, so exporting never holds a second copy of the model.
+test "api: an exported package reads its weights from the store as it writes them" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const package_export = @import("package_export.zig");
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [8 * 64]f32 = undefined;
+    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 9)) * 0.1;
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const x = try bld.name(try bld.input(.f32, &[_]usize{ 1, 64 }), "x");
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
+    const y = try bld.matmulNT(x, w, 1.0, 0.0);
+    const outputs = [_]api.NamedTensorRef{.{ .name = "y", .tensor = y }};
+
+    var pkg = try package_export.buildPackage(allocator, &ctx.store, &bld, &outputs, .{});
+    defer pkg.deinit();
+    for (pkg.initializers) |init| try std.testing.expect(init.data == .source);
+
+    // What streams out is what a load reads back.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "streamed.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try package_file.writeFile(file, &pkg);
+    var model = try ctx.loadModel(file, .{});
+    defer model.deinit();
+    const xv: [64]f32 = @splat(0.5);
+    try model.bindInput("x", try ctx.fromF32(&[_]usize{ 1, 64 }, &xv));
+    try model.run();
+    var got: [8]f32 = undefined;
+    try (try model.outputTensor("y")).read(&got);
+    for (0..8) |r| {
+        var want: f32 = 0;
+        for (0..64) |kk| want += 0.5 * w_vals[r * 64 + kk];
+        try std.testing.expectApproxEqAbs(want, got[r], 2e-2 * @max(1.0, @abs(want)));
+    }
+}
+
+// Binding waits only for the op that fixes the axis, so the f32 source is needed
+// just until then — not held for the whole model until a compile or export.
+test "api: a quantized weight is bound when its first reader is added" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [8 * 64]f32 = @splat(0.25);
+    var x_vals: [64]f32 = @splat(0.5);
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
+    try std.testing.expect(bld.innerGraph().values.items[@intCast(w.value)].external == null);
+    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    const ext = bld.innerGraph().values.items[@intCast(w.value)].external orelse return error.TestExpectedBound;
+    try std.testing.expectEqual(@as(u8, 1), (try ctx.store.getConst(@intCast(ext))).quant_axis);
+}
+
+// A weight can be declared by its rows alone: the builder reads them when the op
+// that fixes the axis is added, never before, and gets the same bytes as the values.
+test "api: a weight declared by a row reader quantizes like its values" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [8 * 64]f32 = undefined;
+    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.05;
+    const Rows = struct {
+        vals: []const f32,
+        reads: usize = 0,
+        fn fill(ctx_ptr: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.reads += 1;
+            @memcpy(out, self.vals[row0 * 64 ..][0..out.len]);
+        }
+    };
+    var rows = Rows{ .vals = &w_vals };
+    var x_vals: [64]f32 = @splat(0.5);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramRows(.q8_0, &[_]usize{ 8, 64 }, "w", .{ .ctx = &rows, .fill = Rows.fill });
+    try std.testing.expectEqual(@as(usize, 0), rows.reads);
+    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    try std.testing.expect(rows.reads > 0);
+
+    const ext = bld.innerGraph().values.items[@intCast(w.value)].external.?;
+    const got = try allocator.alloc(u8, 8 * 64 / 32 * 34);
+    defer allocator.free(got);
+    try ctx.store.readToPackedQuant(@intCast(ext), got);
+    const want = try quantizeWhole(allocator, &[_]usize{ 8, 64 }, 1, &w_vals);
+    defer allocator.free(want);
+    try std.testing.expectEqualSlices(u8, want, got);
+}
+
+test "api: a quantized weight read along two axes is rejected" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [64 * 64]f32 = undefined;
+    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 5)) * 0.1;
+    var x_vals: [64]f32 = @splat(0.5);
+    const x = try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 64, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
+    const xr = try bld.param(x);
+    _ = try bld.matmul(xr, w, 1.0, 0.0);
+    // The first reader fixed the axis, so the second fails where it is added.
+    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+}
+
+// A compiled program holds the tensor its weight was quantized into, so a reader
+// added after the compile along another axis is refused just the same.
+test "api: a quantized weight read along a second axis after a compile is rejected" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [64 * 64]f32 = undefined;
+    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 5)) * 0.1;
+    var x_vals: [64]f32 = @splat(0.5);
+    const x = try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 64, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
+    const xr = try bld.param(x);
+    var first = try ctx.compile(&bld, &[_]api.TensorRef{try bld.matmul(xr, w, 1.0, 0.0)}, .{});
+    defer first.deinit();
+
+    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+}
+
+// With no reader to decide, a weight takes the matmul-B axis; a reader that needs
+// another and arrives after that compile is refused the same way.
+test "api: a quantized weight keeps the axis a compile defaulted it to" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var w_vals: [64 * 64]f32 = @splat(0.25);
+    var x_vals: [64]f32 = @splat(0.5);
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 64, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
+    var first = try ctx.compile(&bld, &[_]api.TensorRef{w}, .{});
+    defer first.deinit();
+    const xr = try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals));
+    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+}
+
+// The name is qualified where the weight is declared, as `paramNamed` does, so a
+// reader in another scope — a tied output head — leaves it where it belongs.
+test "api: a quantized weight keeps the scope it was declared in" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [4 * 32]f32 = @splat(0.25);
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const scope = try bld.beginScope("embed");
+    const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 4, 32 }, &w_vals), "weight", .{ .quantize = .q8_0 });
+    bld.endScope(scope);
+    const head = try bld.beginScope("head");
+    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 32 }, w_vals[0..32])), w, 1.0, 0.0);
+    bld.endScope(head);
+    try std.testing.expectEqualStrings("embed/weight", bld.valueName(w).?);
+}
+
+// The builder quantizes from the caller's f32 tensor and leaves it alone: it is
+// still the caller's to read, reuse or free after the compile.
+test "api: a quantized weight's f32 source stays the caller's" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var w_vals: [8 * 64]f32 = @splat(0.25);
+    var x_vals: [64]f32 = @splat(0.5);
+    const src = try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const w = try bld.paramNamed(src, "w", .{ .quantize = .q8_0 });
+    const y = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
+    defer model.deinit();
+    try model.run();
+
+    var got: [8]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&got);
+    for (got) |g| try std.testing.expectApproxEqRel(@as(f32, 8.0), g, 1e-2);
+    var back: [8 * 64]f32 = undefined;
+    try src.read(&back);
+    try std.testing.expectEqualSlices(f32, &w_vals, &back);
 }

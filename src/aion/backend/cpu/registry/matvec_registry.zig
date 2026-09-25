@@ -65,7 +65,7 @@ pub const Candidate = struct {
     kernels: Kernels,
 };
 
-fn kernelsFor(comptime t: Tuning, comptime dot_enc: matvec_q.DotEnc) Kernels {
+fn kernelsFor(comptime t: Tuning, comptime dot_enc: cpu_target.DotEnc) Kernels {
     // The quantized kernel below stays at the ISA width; only the f32/f16 loop
     // trades register pressure for loads in flight.
     const K = matvec_tuned.Kernel(.{ .nr = 2 * t.accLanes(), .lanes = t.accLanes(), .nc = t.nc, .prefetch_k_dist = t.prefetch_k_dist });
@@ -81,47 +81,15 @@ fn kernelsFor(comptime t: Tuning, comptime dot_enc: matvec_q.DotEnc) Kernels {
     };
 }
 
-pub const candidates = [_]Candidate{
-    // `nc` is how much of a B row one pass consumes, so it wants to cover a whole
-    // row of whatever tile B arrives in — short of that, every k still jumps.
-    // 256 matched the program tiler's usual width; past it nothing more is won.
-    .{ .id = .simd128, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4, .acc_lanes = 8 }, .f32) },
-    .{ .id = .simd256, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, .f32) },
-    .{ .id = .simd512, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, .f32) },
-};
-
-fn candidateForId(id: VariantId) Candidate {
-    for (candidates) |c| {
-        if (c.id == id) return c;
-    }
-    return candidates[0];
+/// The kernels at `target`'s width, with its byte dot for q8.
+pub fn selectForTarget(comptime target: cpu_target.Target) Candidate {
+    return candidateAt(target.simd_width, comptime cpu_target.emittable(target.int8_dot));
 }
 
-pub fn selectForTarget(target: cpu_target.Target) Candidate {
-    // The self-hosted x86 assembler cannot emit VPDPBUSD or its {vex}
-    // prefix. Eliminate these variants at comptime: runtime dispatch alone
-    // still instantiates their assembly, even on CPUs without VNNI.
-    if (comptime builtin.cpu.arch.isX86() and builtin.zig_backend != .stage2_x86_64) {
-        return switch (target.quant_dot) {
-            .vex => candidateForIdDot(target.simd_width, .vex),
-            .evex => candidateForIdDot(target.simd_width, .evex),
-            else => candidateForId(target.simd_width),
-        };
-    }
-    if (comptime builtin.cpu.arch.isAARCH64()) {
-        return if (target.quant_dot == .sdot) candidateForIdDot(target.simd_width, .sdot) else candidateForId(target.simd_width);
-    }
-    return candidateForId(target.simd_width);
-}
-
-fn candidateForIdDot(id: VariantId, comptime enc: matvec_q.DotEnc) Candidate {
+pub fn candidateAt(comptime id: VariantId, comptime enc: cpu_target.DotEnc) Candidate {
     return switch (id) {
         .simd128 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 8, .lanes = 4, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4, .acc_lanes = 8 }, enc) },
         .simd256 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 16, .lanes = 8, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, enc) },
         .simd512 => .{ .id = id, .kernels = kernelsFor(.{ .nr = 32, .lanes = 16, .nc = matvec_tuned.NC_MAX, .prefetch_k_dist = 4 }, enc) },
     };
-}
-
-pub fn selectHeuristic(info: cpuid.CpuInfo) Candidate {
-    return selectForTarget(cpu_target.fromCpuInfo(info));
 }

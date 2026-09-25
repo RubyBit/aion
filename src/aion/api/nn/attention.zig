@@ -217,9 +217,7 @@ pub const KVCache = struct {
 /// (prefill, encoders); `attend` takes the cache indices or omits them.
 ///
 /// Holds the four projections and the attention hyperparameters. Q, K and V are
-/// separate, the way checkpoints ship them; concatenating them into one wide
-/// projection is a fusion the compiler performs (`opt/horizontal_matmul`),
-/// not a weight layout this API asks you to pick.
+/// separate, the way checkpoints ship them.
 ///
 /// Grouped-query attention falls out of `kv_heads < heads`; the op requires
 /// `heads % kv_heads == 0`.

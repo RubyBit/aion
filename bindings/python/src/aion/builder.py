@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import contextlib
 from types import TracebackType
-from collections.abc import Generator
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence, Tuple, Union, overload
+from collections.abc import Callable, Generator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Tuple, Union, overload
 
 from .context import Context
 from .device import DeviceLike, _normalize_device
@@ -99,7 +100,23 @@ if TYPE_CHECKING:
     from .model import LoadedModel
 
 # A weight source: an existing Tensor, a numpy array, or a nested Python list.
-type WeightData = Tensor | ArrayLike
+@dataclass(frozen=True)
+class LazyWeight:
+    """A weight known by its `shape`, whose rows the core asks for as it quantizes it:
+    `fill(row0, out)` writes whole rows from `row0` on into the float32 array `out`.
+
+    A large checkpoint weight passed this way is read a chunk at a time and never
+    held whole in f32. Bind it with a quantized dtype; the ops reading it choose the
+    axis it blocks along, as for any quantized weight.
+    """
+
+    shape: tuple[int, ...]
+    fill: Callable[[int, Any], None]
+
+
+type WeightData = Tensor | ArrayLike | LazyWeight
+
+_QUANTIZED = (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0)
 # Which input axes are dynamic (vary at runtime): a sequence of axis indices
 # (auto-named symbols) or a {axis: symbol_name} mapping (reuse a name to tie axes
 # across inputs to the same runtime size). The declared int at each axis is the
@@ -309,6 +326,8 @@ class Builder:
         self._closed = False
         # Keep param tensors alive for the builder's lifetime.
         self._params: list[Tensor] = []
+        # What the core calls back for a `LazyWeight`'s rows; lives with the builder.
+        self._row_sources: list[object] = []
         self._symbol_counter = 0
         # value id -> evaluated result. Safe to memoize: the graph is append-only,
         # so what a value computes to cannot change once computed.
@@ -332,7 +351,9 @@ class Builder:
         if self._closed:
             return
         handle = self._b
-        if handle is not None:
+        # A context closes its children first; one closed after it (a finalizer at
+        # interpreter exit) points into freed storage and must not call in.
+        if handle is not None and not self._ctx_owner._closed:
             destroy_builder(handle)
         try:
             self._ctx_owner._unregister_child(self)
@@ -356,9 +377,7 @@ class Builder:
     def __del__(self) -> None:  # pragma: no cover
         try:
             if not getattr(self, "_closed", True):
-                handle = getattr(self, "_b", None)
-                if handle is not None:
-                    destroy_builder(handle)
+                self.close()
         except Exception:
             pass
 
@@ -411,9 +430,9 @@ class Builder:
 
         A float `dtype` binds the data directly; a quantized `dtype`
         (``aion.q8_0``) quantizes it in the core first, blocking along `quant_axis`
-        (default: the matmul-B reduction axis, rank-2; pass the last axis for an
-        embedding table). When `data` is already a `Tensor`, `dtype`/`shape`/
-        `quant_axis` are ignored.
+        (default: the matmul-B reduction axis, rank-2). `param_named` can leave the
+        axis to the ops that read the weight instead. When `data` is already a
+        `Tensor`, `dtype`/`shape`/`quant_axis` are ignored.
         """
         t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
         self._params.append(t)
@@ -452,13 +471,30 @@ class Builder:
     ) -> TensorRef:
         """Bind a weight under a semantic, scope-qualified name (`.../weight`).
 
+        A quantized `dtype` with no `quant_axis` is quantized by the core once the
+        ops reading the weight fix the axis its blocks must run along.
+
         The name persists into the package as a `debug_name`, which is the key the
         load- and swap-by-name paths use. Prefer this over `param`, whose generated
         name is positional and shifts if construction order changes.
         """
+        dt = _as_dtype(dtype)
+        if isinstance(data, LazyWeight):
+            if dt not in _QUANTIZED or quant_axis is not None:
+                raise ValueError("a LazyWeight binds as a quantized dtype, blocked by the ops reading it")
+            value, keep = builder_param_named(self._ctx_owner.ptr, self.ptr, name, rows=data, quantize_to=int(dt))
+            self._row_sources.append(keep)
+            return TensorRef(self, value)
+        if not isinstance(data, Tensor) and quant_axis is None and dt in _QUANTIZED:
+            # The core quantizes it once an op reading it fixes the axis, holding the
+            # f32 copy until then; ours goes now, so that copy lives no longer.
+            with Tensor(data, ctx=self._ctx_owner, dtype=float32) as t:
+                value, _ = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr, quantize_to=int(dt))
+                return TensorRef(self, value)
         t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
         self._params.append(t)
-        return TensorRef(self, builder_param_named(self._ctx_owner.ptr, self.ptr, t.ptr, name))
+        value, _ = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr)
+        return TensorRef(self, value)
 
     # --- scopes ------------------------------------------------------------
 
@@ -1062,6 +1098,8 @@ def _infer_shape(data: WeightData) -> tuple[int, ...]:
     except ImportError:
         np = None
     if np is not None and isinstance(data, np.ndarray):
+        return tuple(int(x) for x in data.shape)
+    if isinstance(data, LazyWeight):
         return tuple(int(x) for x in data.shape)
     from .tensor import _flatten_nested
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
+const matmul_q_i8 = @import("matmul_q_i8.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -13,7 +14,19 @@ pub const Tuning = struct {
     /// only needs `lanes`, but keeping `nr` here makes this the shared NT tuning
     /// contract for future f16/q8/fused variants.
     nr: usize,
+
+    /// The q8 kernel's byte dot.
+    dot_enc: matmul_q_i8.DotEnc,
 };
+
+/// One N tile of a q8 NT matmul, with A prepared by `matmul_nt_q.prepareActivation`;
+/// see `matmul_nt_q.matmulNtQ8_0Impl`.
+pub const MatMulNtQ8_0Fn = *const fn (
+    params: MatMulParams,
+    c_bytes: []u8,
+    a_bytes: []const u8,
+    b_bytes: []const u8,
+) BackendError!void;
 
 /// Compute `C = alpha * A @ B^T + beta * C` for one N tile, where A is `[m, k]` f32
 /// (row-major over K) and B is `[n, k]` f32 (row-major over K, i.e. already transposed

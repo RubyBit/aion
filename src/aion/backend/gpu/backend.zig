@@ -76,6 +76,9 @@ const TensorMeta = tensor_store_mod.TensorMeta;
 const Frame = frame_mod.Frame;
 
 pub const GpuBackend = struct {
+    /// The row grouping this backend's NT q8 kernel reads (see `types.QuantBlockOrder`).
+    pub const quant_block_order = matmul_nt.block_order;
+
     allocator: std.mem.Allocator,
     gpu: *wgpu.Gpu,
     devmem: wgpu_dm.WgpuDeviceMemory,
@@ -593,8 +596,8 @@ pub const GpuBackend = struct {
         // record/execute overlap and smaller ones submit too often.
         const SUBMIT_CHUNK: usize = 32;
         var since_submit: usize = 0;
-        for (prog.steps) |step| {
-            try runner.runStep(step);
+        for (prog.steps) |placed| {
+            try runner.runStep(placed);
             since_submit += 1;
             if (since_submit >= SUBMIT_CHUNK) {
                 const t_chunk_submit: u64 = if (generic_profile) profile_mod.nowNs() else 0;

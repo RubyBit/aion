@@ -33,7 +33,6 @@ Run:  uv run --project bindings/python \
 from __future__ import annotations
 
 import argparse
-import gc
 import math
 import os
 import sys
@@ -135,6 +134,28 @@ class _WeightLoader:
     def get_f32(self, name: str) -> np.ndarray:
         return self._file.get_tensor(name).float().numpy()
 
+    def rows(self, name: str) -> aion.LazyWeight:
+        """`name` as it is stored, read into f32 a chunk of rows at a time."""
+        stored = self._file.get_slice(name)
+        shape = tuple(stored.get_shape())
+
+        def fill(row0: int, out: np.ndarray) -> None:
+            out[:] = stored[row0 : row0 + out.size // shape[-1]].float().numpy().reshape(-1)
+
+        return aion.LazyWeight(shape, fill)
+
+    def rows_t(self, name: str) -> aion.LazyWeight:
+        """A PyTorch linear's `[out, in]` weight as matmul-B `[in, out]` (see `_mm_b`),
+        read a chunk of rows at a time: rows of the transpose are its columns."""
+        stored = self._file.get_slice(name)
+        out_f, in_f = stored.get_shape()
+
+        def fill(row0: int, out: np.ndarray) -> None:
+            cols = stored[:, row0 : row0 + out.size // out_f].float().numpy()
+            out[:] = cols.T.reshape(-1)
+
+        return aion.LazyWeight((in_f, out_f), fill)
+
 
 # --------------------- C-ABI Builder authoring helpers -----------------------
 
@@ -206,9 +227,7 @@ def _rms(gamma: Optional[np.ndarray], name: str, width: Optional[int] = None) ->
 
 # Weights are held as *data*: `nn` layers bind and quantize them themselves, so
 # nothing here needs a Builder. Q/K/V and gate/up stay separate, the way the
-# checkpoint ships them — pre-concatenating them is a *fusion*, and the compiler
-# does that (`opt/fuse_horizontal_matmul` rewrites matmuls sharing an operand into
-# one wide matmul plus slices, numerically identically) and then frees the sources.
+# checkpoint ships them.
 
 
 @dataclass
@@ -235,65 +254,91 @@ class _LayerWeights:
     k_norm: Optional[np.ndarray] = None
 
 
-@dataclass
 class _SharedWeights:
-    embed_tokens: np.ndarray
-    embed_tokens_per_layer: np.ndarray
-    per_layer_model_projection: np.ndarray
-    per_layer_projection_norm: np.ndarray
-    final_norm: np.ndarray
+    """The model-wide weights, each read from the checkpoint when it is used. The
+    matmul weights and tables are `LazyWeight`s: the core reads their rows a chunk at a
+    time as it quantizes them, so none is ever held whole in f32."""
+
+    _LN = "model.language_model"
+
+    def __init__(self, loader: "_WeightLoader") -> None:
+        self._loader = loader
+
+    @property
+    def embed_tokens(self) -> aion.LazyWeight:
+        return self._loader.rows(f"{self._LN}.embed_tokens.weight")
+
+    @property
+    def embed_tokens_per_layer(self) -> aion.LazyWeight:
+        return self._loader.rows(f"{self._LN}.embed_tokens_per_layer.weight")
+
+    @property
+    def per_layer_model_projection(self) -> aion.LazyWeight:
+        return self._loader.rows_t(f"{self._LN}.per_layer_model_projection.weight")
+
+    @property
+    def per_layer_projection_norm(self) -> np.ndarray:
+        return _f32(self._loader.get_f32(f"{self._LN}.per_layer_projection_norm.weight"))
+
+    @property
+    def final_norm(self) -> np.ndarray:
+        return _f32(self._loader.get_f32(f"{self._LN}.norm.weight"))
 
 
-@dataclass
 class _TowerWeights:
-    values: Dict[str, np.ndarray]
+    """The vision/audio towers' weights, read from the checkpoint as they are used."""
+
+    def __init__(self, loader: "_WeightLoader", names: List[str]) -> None:
+        self._loader = loader
+        self.values = frozenset(names)
 
     def get(self, name: str) -> np.ndarray:
-        try:
-            return self.values[name]
-        except KeyError as exc:
-            raise KeyError(f"multimodal checkpoint tensor is missing: {name}") from exc
+        if name not in self.values:
+            raise KeyError(f"multimodal checkpoint tensor is missing: {name}")
+        return _f32(self._loader.get_f32(name))
 
 
-def _load_weights(loader: _WeightLoader) -> Tuple[_SharedWeights, List[_LayerWeights]]:
+def _load_layer(loader: _WeightLoader, layer: int) -> _LayerWeights:
     ln = "model.language_model"
+    pfx = f"{ln}.layers.{layer}"
 
-    shared = _SharedWeights(
-        embed_tokens=_f32(loader.get_f32(f"{ln}.embed_tokens.weight")),
-        embed_tokens_per_layer=_f32(loader.get_f32(f"{ln}.embed_tokens_per_layer.weight")),
-        per_layer_model_projection=_mm_b(loader.get_f32(f"{ln}.per_layer_model_projection.weight")),
-        per_layer_projection_norm=_f32(loader.get_f32(f"{ln}.per_layer_projection_norm.weight")),
-        final_norm=_f32(loader.get_f32(f"{ln}.norm.weight")),
+    lw = _LayerWeights(
+        input_ln=_f32(loader.get_f32(f"{pfx}.input_layernorm.weight")),
+        post_attn_ln=_f32(loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
+        pre_ffn_ln=_f32(loader.get_f32(f"{pfx}.pre_feedforward_layernorm.weight")),
+        post_ffn_ln=_f32(loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
+        post_pli_ln=_f32(loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
+        skip_scale=float(loader.get_f32(f"{pfx}.layer_scalar").reshape(-1)[0]),
+        q_proj=loader.rows_t(f"{pfx}.self_attn.q_proj.weight"),
+        o_proj=loader.rows_t(f"{pfx}.self_attn.o_proj.weight"),
+        q_norm=_f32(loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
+        # The FFN width is elastic per layer, and comes off the weight itself.
+        gate_proj=loader.rows_t(f"{pfx}.mlp.gate_proj.weight"),
+        up_proj=loader.rows_t(f"{pfx}.mlp.up_proj.weight"),
+        down_proj=loader.rows_t(f"{pfx}.mlp.down_proj.weight"),
+        pli_gate=loader.rows_t(f"{pfx}.per_layer_input_gate.weight"),
+        pli_proj=loader.rows_t(f"{pfx}.per_layer_projection.weight"),
     )
+    if layer in SOURCE_LAYERS:
+        lw.k_proj = loader.rows_t(f"{pfx}.self_attn.k_proj.weight")
+        lw.v_proj = loader.rows_t(f"{pfx}.self_attn.v_proj.weight")
+        lw.k_norm = _f32(loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
+    return lw
 
-    layers: List[_LayerWeights] = []
-    for layer in range(NUM_LAYERS):
-        pfx = f"{ln}.layers.{layer}"
 
-        lw = _LayerWeights(
-            input_ln=_f32(loader.get_f32(f"{pfx}.input_layernorm.weight")),
-            post_attn_ln=_f32(loader.get_f32(f"{pfx}.post_attention_layernorm.weight")),
-            pre_ffn_ln=_f32(loader.get_f32(f"{pfx}.pre_feedforward_layernorm.weight")),
-            post_ffn_ln=_f32(loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
-            post_pli_ln=_f32(loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
-            skip_scale=float(loader.get_f32(f"{pfx}.layer_scalar").reshape(-1)[0]),
-            q_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.q_proj.weight")),
-            o_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
-            q_norm=_f32(loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
-            # The FFN width is elastic per layer, and comes off the weight itself.
-            gate_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.gate_proj.weight")),
-            up_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.up_proj.weight")),
-            down_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
-            pli_gate=_mm_b(loader.get_f32(f"{pfx}.per_layer_input_gate.weight")),
-            pli_proj=_mm_b(loader.get_f32(f"{pfx}.per_layer_projection.weight")),
-        )
-        if layer in SOURCE_LAYERS:
-            lw.k_proj = _mm_b(loader.get_f32(f"{pfx}.self_attn.k_proj.weight"))
-            lw.v_proj = _mm_b(loader.get_f32(f"{pfx}.self_attn.v_proj.weight"))
-            lw.k_norm = _f32(loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
-        layers.append(lw)
+class _Layers:
+    """The decoder layers, each read from the checkpoint as the forward reaches it and
+    let go once it is bound: holding all 35 at once is what a 16 GB machine cannot."""
 
-    return shared, layers
+    def __init__(self, loader: _WeightLoader) -> None:
+        self._loader = loader
+
+    def __len__(self) -> int:
+        return NUM_LAYERS
+
+    def __iter__(self):
+        for layer in range(NUM_LAYERS):
+            yield _load_layer(self._loader, layer)
 
 
 def _load_tower_weights(loader: _WeightLoader) -> _TowerWeights:
@@ -303,7 +348,7 @@ def _load_tower_weights(loader: _WeightLoader) -> _TowerWeights:
         raise SystemExit("checkpoint has no Gemma 4 vision tower")
     if not any(key.startswith("model.audio_tower.") for key in keys):
         raise SystemExit("checkpoint has no Gemma 4 audio tower")
-    return _TowerWeights({key: _f32(loader.get_f32(key)) for key in keys})
+    return _TowerWeights(loader, keys)
 
 
 def _linear_weight(towers: _TowerWeights, prefix: str) -> np.ndarray:
@@ -494,7 +539,31 @@ def _last_index(b: Builder, tokens: TensorRef, x: TensorRef) -> TensorRef:
     return b.sub(b.dim(x, 1), b.compare("le", col, col))
 
 
-def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights], towers: _TowerWeights):
+# The two embedding tables are the model's largest weights (the per-layer one is
+# 9.4 GB in f32), so each is bound in a function of its own: its module, and the f32
+# table the module holds, go the moment the function returns.
+def _token_embedding(b: Builder, shared: _SharedWeights, tokens: TensorRef) -> Tuple[TensorRef, TensorRef]:
+    """The scaled token embedding, and the bound table the tied output head reuses."""
+    embed = nn.Embedding(shared.embed_tokens, dtype=aion.q8_0, name="embed_tokens")
+    return _scaled(b, embed(tokens), math.sqrt(EMBED_DIM)), embed.weight_value(b)
+
+
+def _per_layer_inputs(b: Builder, shared: _SharedWeights, tokens: TensorRef, x: TensorRef) -> TensorRef:
+    """PLI: a token-identity half from the ids, and a context half projected from the
+    merged embedding `x`."""
+    pli_proj = nn.Linear(shared.per_layer_model_projection, dtype=aion.q8_0,
+                         name="per_layer_model_projection")
+    pli_proj_scaled = _scaled(b, pli_proj(x), 1.0 / math.sqrt(EMBED_DIM))
+    pli_proj_norm = _rms(shared.per_layer_projection_norm, "per_layer_projection_norm")(
+        pli_proj_scaled.reshape(("batch", "seq", NUM_LAYERS, PLI_DIM)))
+    pli_emb = nn.Embedding(shared.embed_tokens_per_layer, dtype=aion.q8_0,
+                           name="embed_tokens_per_layer")
+    pli_emb_r = _scaled(b, pli_emb(tokens), math.sqrt(PLI_DIM)).reshape(
+        ("batch", "seq", NUM_LAYERS, PLI_DIM))
+    return _scaled(b, pli_proj_norm + pli_emb_r, 1.0 / math.sqrt(2.0))
+
+
+def _emit_forward(b: Builder, shared: _SharedWeights, layers: _Layers, towers: _TowerWeights):
     """Emit the full forward graph. Returns (logits, {src: (k_in, k_out, v_in, v_out)})."""
     # Public runtime inputs.
     tokens = _input(b, "tokens", aion.int32, ("batch", "seq"))
@@ -550,8 +619,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     # ---- Embedding + PLI encoder ----
     # The token table is tied to the output head, so it is bound once here and the
     # head reuses that very parameter rather than a second copy of it.
-    embed = nn.Embedding(shared.embed_tokens, dtype=aion.q8_0, name="embed_tokens")
-    emb_scaled = _scaled(b, embed(tokens), math.sqrt(EMBED_DIM))         # [B,S,1536]
+    emb_scaled, embed_table = _token_embedding(b, shared, tokens)        # [B,S,1536]
 
     _dbg(b, emb_scaled, "emb_scaled")
 
@@ -600,18 +668,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     # MERGED one, soft tokens included, which is what the reference feeds its
     # text model. Building it before the merge would leave every image/audio slot
     # projecting PAD.
-    pli_proj = nn.Linear(shared.per_layer_model_projection, dtype=aion.q8_0,
-                         name="per_layer_model_projection")
-    pli_proj_scaled = _scaled(b, pli_proj(x), 1.0 / math.sqrt(EMBED_DIM))
-    pli_proj_norm = _rms(shared.per_layer_projection_norm, "per_layer_projection_norm")(
-        pli_proj_scaled.reshape(("batch", "seq", NUM_LAYERS, PLI_DIM)))
-
-    pli_emb = nn.Embedding(shared.embed_tokens_per_layer, dtype=aion.q8_0,
-                           name="embed_tokens_per_layer")
-    pli_emb_r = _scaled(b, pli_emb(tokens), math.sqrt(PLI_DIM)).reshape(
-        ("batch", "seq", NUM_LAYERS, PLI_DIM))
-
-    pli = _scaled(b, pli_proj_norm + pli_emb_r, 1.0 / math.sqrt(2.0))     # [B,S,35,256]
+    pli = _per_layer_inputs(b, shared, tokens, x)                        # [B,S,35,256]
     _dbg(b, pli, "pli")
     k_cache_cur: Dict[int, TensorRef] = dict(k_cache_in)
     v_cache_cur: Dict[int, TensorRef] = dict(v_cache_in)
@@ -745,7 +802,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: List[_LayerWeights
     x = _rms(shared.final_norm, "norm")(x)
     # Tied head: contract against the embedding table's *rows*, reusing the very
     # parameter `embed` bound rather than a second copy of the table.
-    logits = b.matmul_nt(x, embed.weight_value(b))
+    logits = b.matmul_nt(x, embed_table)
     logits = b.div(logits, b.constant(FINAL_LOGIT_SOFTCAP)).tanh()
     logits = _scaled(b, logits, FINAL_LOGIT_SOFTCAP)
 
@@ -822,16 +879,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     with aion.Context(thread_count=1) as ctx:
         with Builder(ctx) as b:
+            # Weights are read as the forward binds them and quantized by their
+            # first reader, so the converter holds about one weight at a time.
             with _WeightLoader(args.in_safetensors) as loader:
-                shared, layers = _load_weights(loader)
-                towers = _load_tower_weights(loader)
-            out = _emit_forward(b, shared, layers, towers)
-            _finalize(b, *out)
-            # Binding/quantization copies weights into Aion-owned storage. Drop
-            # the checkpoint-side f32 arrays before export, which itself packs
-            # initializer sections and temporarily needs another large buffer.
-            del shared, layers, towers
-            gc.collect()
+                out = _emit_forward(b, _SharedWeights(loader), _Layers(loader), _load_tower_weights(loader))
+                _finalize(b, *out)
             b.export(os.path.abspath(args.out_aion), None)
 
     print(f"[gemma4-e2b] wrote {args.out_aion}")

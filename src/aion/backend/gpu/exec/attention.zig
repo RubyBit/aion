@@ -10,7 +10,9 @@
 //!     only cache GROWTH needs the host, where K/V lengths are read at record time
 //!     to pre-touch `mapSequenceStep` (same protocol as the CPU executor and the
 //!     GPU KV-append) before metadata is re-fetched. Defaults are position == row
-//!     and all T keys live, with no host round-trip.
+//!     and all T keys live, with no host round-trip. A prefill tile of f32 q over
+//!     one k/v tile takes kernels/attention_block.wgsl: the same math, with a block
+//!     of query rows per workgroup sharing each K/V tile.
 //!   - `RelPosMHATiled` -> `execRelPosMHA` (kernels/relpos_mha.wgsl).
 //!
 //! v1 scope: f32 q/out; dk <= 512 (the kernels stage the q row in shared memory)
@@ -36,6 +38,7 @@ const KernelDesc = pipelines.KernelDesc;
 /// `enable` directives first and does not need forward declarations.
 const window_wgsl = @embedFile("../kernels/window.wgsl");
 const attn_kernel: KernelDesc = .{ .name = "attention", .wgsl = @embedFile("../kernels/attention.wgsl") ++ window_wgsl };
+const block_kernel: KernelDesc = .{ .name = "attention_block", .wgsl = @embedFile("../kernels/attention_block.wgsl") ++ window_wgsl };
 const merge_kernel: KernelDesc = .{ .name = "attention_merge", .wgsl = @embedFile("../kernels/attention_merge.wgsl") };
 const relpos_kernel: KernelDesc = .{ .name = "relpos_mha", .wgsl = @embedFile("../kernels/relpos_mha.wgsl") ++ window_wgsl };
 
@@ -112,11 +115,48 @@ const MAX_SEGS_DEFAULT: usize = 64;
 // measured SLOWER (rh=1 1.84 ms vs rh=4 2.79 ms), because at decode it costs workgroups.
 // `chooseRowBlock` derives it, and nothing overrides that.
 
+/// Rows and value dims per block-kernel workgroup; must match `R` and `DVS` in
+/// attention_block.wgsl.
+const BLOCK_ROWS: usize = 32;
+const BLOCK_DV_SLICE: usize = 256;
+/// Query positions from which a tile takes the block kernel: below it the block is
+/// mostly empty rows, and the decode kernel's key split fills the device instead.
+const BLOCK_MIN_L: usize = 8;
+
+/// Heads per block-kernel row block: the most of one kv head's group that divide
+/// the tile's heads, leaving at least four positions per block.
+fn blockHeads(gqa: usize, th: usize) usize {
+    var rh: usize = @min(@min(gqa, th), BLOCK_ROWS / 4);
+    while (rh > 1 and ((gqa % rh) != 0 or (th % rh) != 0)) rh -= 1;
+    return rh;
+}
+
 fn ceilDiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
 }
 
 const RowBlock = struct { rh: usize, rl: usize };
+
+/// Keys one workgroup scores per pass; must match `WG` in attention.wgsl.
+const KEY_CHUNK: usize = 256;
+
+/// Keys the longest sequence has live, when the lengths are on the host to read at
+/// record time; otherwise the capacity, which bounds them.
+fn liveKeys(ctx: Ctx, lengths: ?tensor_store_mod.TensorId, t_cap: usize) ExecuteProgramError!usize {
+    const id = lengths orelse return t_cap;
+    if (!ctx.control.isHostPlaced(id)) return t_cap;
+    const lease = try ctx.control.readI32(id);
+    defer lease.release();
+    var longest: usize = 0;
+    for (lease.vals) |v| longest = @max(longest, @as(usize, @intCast(@max(v, 0))));
+    return @min(longest, t_cap);
+}
+
+fn largestBlock(gqa: usize, th: usize, tl: usize, rows_cap: usize) RowBlock {
+    var rh: usize = @min(@min(gqa, th), rows_cap);
+    while (rh > 1 and ((gqa % rh) != 0 or (th % rh) != 0)) rh -= 1;
+    return .{ .rh = rh, .rl = @max(@as(usize, 1), @min(tl, rows_cap / rh)) };
+}
 
 /// Pick the (heads x rows) block each workgroup handles.
 ///
@@ -132,6 +172,10 @@ const RowBlock = struct { rh: usize, rl: usize };
 fn chooseRowBlock(gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize, d_k: usize) RowBlock {
     const max_segs: usize = @min(@max(@as(usize, 1), span_hint / MIN_SEG_KEYS), MAX_SEGS_DEFAULT);
     const rows_cap: usize = @min(MAX_ROWS, @max(@as(usize, 1), Q_STAGE_FLOATS / @max(d_k, 1)));
+    // A range one workgroup scores in a single pass has no scan to parallelize:
+    // more blocks would only repeat the q staging and barrier chains per block.
+    // Take the largest block, sharing each K/V read across the most rows.
+    if (span_hint <= KEY_CHUNK) return largestBlock(gqa, th, tl, rows_cap);
 
     var hedge: ?RowBlock = null;
     var target: usize = rows_cap;
@@ -475,11 +519,50 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
 
         const rows_total: usize = tb * tl * th;
 
+        // Prefill: a block of query rows shares every K/V tile it reads.
+        if (!q_f16 and kv_tiles == 1 and tl >= BLOCK_MIN_L) {
+            try recordBlockAttention(ctx, frame, s, .{
+                .q = dq,
+                .out = dout,
+                .idx_bufs = idx_bufs,
+                .idx_sizes = idx_sizes,
+                .kv_elem = kv_elem,
+                .t_cap = t_cap,
+                .params = .{
+                    .base_b = @intCast(coords[0] * out_meta.tile_shape[0]),
+                    .base_h = @intCast(coords[2] * out_meta.tile_shape[2]),
+                    .tl = @intCast(tl),
+                    .th = @intCast(th),
+                    .dk = @intCast(d_k),
+                    .dv = @intCast(d_v),
+                    .t_cap = std.math.cast(u32, t_cap) orelse return error.Unsupported,
+                    .h_kv = @intCast(h_kv),
+                    .gqa = @intCast(h_q / h_kv),
+                    .win_left = s.window.left,
+                    .win_right = s.window.right,
+                    .win_chunk = s.window.chunk,
+                    .ring = @intFromBool(is_ring),
+                    .ring_modulus = std.math.cast(u32, ring_modulus) orelse return error.Unsupported,
+                    .kv_f16 = @intFromBool(kv_f16),
+                    .scale = s.scale,
+                    .soft_cap = s.attn_logits_soft_cap,
+                    .base_l = @intCast(coords[1] * out_meta.tile_shape[1]),
+                    .has_pos = @intFromBool(has_pos),
+                    .has_lengths = @intFromBool(has_lengths),
+                    .rh = @intCast(blockHeads(h_q / h_kv, th)),
+                    .rl = @intCast(BLOCK_ROWS / blockHeads(h_q / h_kv, th)),
+                    .kv_tile_t = std.math.cast(u32, t_cap) orelse return error.Unsupported,
+                },
+            }, tb);
+            continue;
+        }
+
         // `rh` query heads x `rl` query rows per workgroup, all sharing one K/V panel.
         // The split is sized off the range a row ACTUALLY scans — with a sliding
-        // window that is the window, not the cache capacity.
+        // window that is the window, not the cache capacity; with host-visible
+        // lengths, the keys written so far, not the slots allocated for them.
         const gqa: usize = h_q / h_kv;
-        const span_hint: usize = s.window.maxKeys(t_cap);
+        const span_hint: usize = s.window.maxKeys(try liveKeys(ctx, s.kv_lengths, t_cap));
         const rb: RowBlock = chooseRowBlock(gqa, th, tl, tb, span_hint, d_k);
         const rh: usize = rb.rh;
         const rl: usize = rb.rl;
@@ -491,7 +574,7 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
         const grid_l: usize = ceilDiv(tl, rl);
         const blocks: usize = tb * grid_h * grid_l;
         var segs: usize = 1;
-        if (blocks < MIN_BLOCKS and span_hint >= 2 * MIN_SEG_KEYS) {
+        if (blocks < MIN_BLOCKS and span_hint > KEY_CHUNK) {
             // Prefer segments that fill a whole 256-key chunk; shrink only as far as
             // needed to fill the device, since a short segment leaves threads idle in
             // the score phase.
@@ -621,4 +704,44 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled) 
             @intCast(tb),
         });
     }
+}
+
+const BlockOperands = struct {
+    q: device_store.TileRef,
+    out: device_store.TileRef,
+    idx_bufs: [2]c.WGPUBuffer,
+    idx_sizes: [2]u64,
+    kv_elem: usize,
+    t_cap: usize,
+    params: CachedParams,
+};
+
+/// One `attn_block` dispatch over this q/out tile and the single k/v tile.
+fn recordBlockAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttentionTiled, ops: BlockOperands, tb: usize) ExecuteProgramError!void {
+    const hs = ctx.store;
+    const dk_c = ctx.store.acquireTileDeviceConstLinear(s.k, 0) catch return error.ExecutionFailed;
+    defer hs.releaseConst(dk_c.token);
+    const dv_c = ctx.store.acquireTileDeviceConstLinear(s.v, 0) catch return error.ExecutionFailed;
+    defer hs.releaseConst(dv_c.token);
+    if (!context.storageBindingFits(ctx, dk_c.len) or !context.storageBindingFits(ctx, dv_c.len)) return error.Unsupported;
+    if (packedElemsSized(dk_c.rank, dk_c.shape_mem[0..4], dk_c.strides_mem[0..4], ops.kv_elem) == null) return error.Unsupported;
+    if (packedElemsSized(dv_c.rank, dv_c.shape_mem[0..4], dv_c.strides_mem[0..4], ops.kv_elem) == null) return error.Unsupported;
+    if (dk_c.shape_mem[1] != ops.t_cap or dv_c.shape_mem[1] != ops.t_cap) return error.Unsupported;
+
+    const p = ops.params;
+    const built = try ctx.pipes.get(block_kernel, "attn_block");
+    const bufs = [_]c.WGPUBuffer{
+        ctx.devmem.bufferFor(ops.q.handle).?,
+        ctx.devmem.bufferFor(dk_c.handle).?,
+        ctx.devmem.bufferFor(dv_c.handle).?,
+        ops.idx_bufs[0],
+        ops.idx_bufs[1],
+        ctx.devmem.bufferFor(ops.out.handle).?,
+    };
+    const sizes = [_]u64{ ops.q.len, dk_c.len, dv_c.len, ops.idx_sizes[0], ops.idx_sizes[1], ops.out.len };
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&p), .{
+        @intCast(ceilDiv(p.th, p.rh) * ceilDiv(p.dv, BLOCK_DV_SLICE)),
+        @intCast(ceilDiv(p.tl, p.rl)),
+        @intCast(tb),
+    });
 }

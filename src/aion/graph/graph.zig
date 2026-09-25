@@ -902,12 +902,13 @@ pub const Graph = struct {
     /// region is open, otherwise the graph's last node. Lets the authoring
     /// `Builder` infer the node it just added. Null if none exists in scope.
     pub fn lastNode(self: *const Self) ?Node {
-        if (self.active_region) {
-            if (self.active_region_nodes.items.len == 0) return null;
-            return self.active_region_nodes.items[self.active_region_nodes.items.len - 1];
-        }
-        if (self.nodes.items.len == 0) return null;
-        return self.nodes.items[self.nodes.items.len - 1];
+        const nodes = self.currentNodes();
+        return if (nodes.len == 0) null else nodes[nodes.len - 1];
+    }
+
+    /// The node list appends go to: the active region's while one is open.
+    pub fn currentNodes(self: *const Self) []const Node {
+        return if (self.active_region) self.active_region_nodes.items else self.nodes.items;
     }
 
     pub fn beginRegion(self: *Self) GraphError!void {

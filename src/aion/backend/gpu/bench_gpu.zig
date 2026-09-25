@@ -63,8 +63,7 @@ const Args = struct {
     /// Print the first N lowered steps in order (--dump-steps N).
     dump_steps: usize = 0,
     /// Override the matmul tile caps (0 = policy default). The N cap decides how
-    /// many dispatches a wide projection becomes, and whether the splits that
-    /// horizontal fusion introduces land inside one tile or across several.
+    /// many dispatches a wide projection becomes.
     mn_cap: usize = 0,
     k_cap: usize = 0,
     // GPU selection. Defaults to high-power so the discrete GPU is benched (the
@@ -115,7 +114,6 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (std.mem.eql(u8, arg, "--ablate-scales")) a.model.ablate.scales = true;
     if (std.mem.eql(u8, arg, "--ablate-rope")) a.model.ablate.rope = true;
     if (std.mem.eql(u8, arg, "--ablate-kv")) a.model.ablate.kv_write = true;
-    if (std.mem.eql(u8, arg, "--no-hfuse")) a.model.disable.insert(.horizontal_matmul);
     if (valueFor(arg, "--mn-cap", it)) |v| a.mn_cap = std.fmt.parseInt(usize, v, 10) catch 0;
     if (valueFor(arg, "--k-cap", it)) |v| a.k_cap = std.fmt.parseInt(usize, v, 10) catch 0;
     if (std.mem.eql(u8, arg, "--high")) a.opts.power = .high;
@@ -540,8 +538,8 @@ fn benchDecode(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize,
 }
 
 /// Build a model-like command stream of distinct GEMVs. Each weight has its own
-/// storage so the working set exceeds cache; horizontal fusion is disabled so
-/// the benchmark measures the existing kernel rather than a rewritten graph.
+/// storage so the working set exceeds cache; passes are off so the benchmark
+/// measures the kernel this graph names rather than a rewritten one.
 fn benchDecodeChain(alloc: std.mem.Allocator, gb: *gpu.GpuBackend, a: Args, n: usize, k: usize, count: usize) !void {
     var mgr = StorageManager.init(alloc);
     defer mgr.deinit();

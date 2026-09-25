@@ -11,7 +11,6 @@ const tanh_k = @import("kernels/tanh.zig");
 const sqrt_k = @import("kernels/sqrt.zig");
 const softmax_k = @import("kernels/softmax.zig");
 const reduce_k = @import("kernels/reduce.zig");
-const matmul_q_k = @import("kernels/matmul_q.zig");
 const matmul_registry = @import("registry/matmul_registry.zig");
 const matmul_q_registry = @import("registry/matmul_q_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
@@ -55,18 +54,8 @@ fn matmulKernelsById(id: matmul_registry.VariantId) matmul_registry.F32Kernels {
     @panic("missing matmul kernel variant");
 }
 
-fn quantMatmulKernelsById(id: matmul_q_registry.VariantId) matmul_q_registry.QuantKernels {
-    inline for (matmul_q_registry.candidates) |c| {
-        if (c.id == id) return c.kernels;
-    }
-    @panic("missing quant matmul kernel variant");
-}
-
-fn matvecKernelsById(id: matvec_registry.VariantId) matvec_registry.Kernels {
-    inline for (matvec_registry.candidates) |c| {
-        if (c.id == id) return c.kernels;
-    }
-    @panic("missing matvec kernel variant");
+fn matvecKernelsById(comptime id: matvec_registry.VariantId) matvec_registry.Kernels {
+    return matvec_registry.candidateAt(id, .portable).kernels;
 }
 
 fn attentionKernelsById(id: attention_registry.VariantId) attention_registry.Kernels {
@@ -569,7 +558,7 @@ test "cpu kernels: tuned q8_0 matmul via registry" {
     var c: [m * n]f32 = @splat(0.0);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = matmul_q_registry.int8Set(.portable)[matmul_q_registry.MEDIUM];
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
@@ -615,7 +604,7 @@ test "cpu kernels: tuned q4_0 matmul via registry" {
     var c: [m * n]f32 = @splat(0.0);
     naiveMatmulF32(params, c_ref[0..], a[0..], b_f32[0..]);
 
-    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = matmul_q_registry.int8Set(.portable)[matmul_q_registry.MEDIUM];
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
@@ -666,7 +655,7 @@ test "cpu kernels: matvec q8_0" {
     }
 
     var c: [n]f32 = @splat(0.0);
-    const kernels: matmul_q_registry.QuantKernels = quantMatmulKernelsById(.medium);
+    const kernels: matmul_q_registry.QuantKernels = matmul_q_registry.int8Set(.portable)[matmul_q_registry.MEDIUM];
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
@@ -721,8 +710,75 @@ test "cpu kernels: direct matvec q8_0 k-major" {
     }
 
     var c: [n]f32 = @splat(0.0);
-    const kernels = matvec_registry.candidates[1].kernels;
+    const kernels = matvecKernelsById(.simd256);
     try kernels.matvec_q8_0_kmajor(params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]), bq[0..]);
+    try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
+}
+
+test "cpu kernels: q8_0 k-major matvec accumulates across K tiles" {
+    // The multi-thread decode path splits K across calls and keeps the running
+    // sums in scratch, writing C only on the last one. A width that is not a
+    // multiple of the kernel's column tile exercises its tail as well.
+    const n: usize = 22;
+    const k_tile: usize = 64;
+    const tiles: usize = 3;
+    const k: usize = k_tile * tiles;
+
+    var prng = std.Random.DefaultPrng.init(0x3333);
+    const rnd = prng.random();
+
+    var a: [k]f32 = undefined;
+    for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const k_blocks: usize = k / 32;
+    var bq: [k_blocks * n * Q8_BYTES]u8 = undefined;
+    var b_f32: [k * n]f32 = undefined;
+    var kb: usize = 0;
+    while (kb < k_blocks) : (kb += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var block: [32]f32 = undefined;
+            var t: usize = 0;
+            while (t < 32) : (t += 1) {
+                const v: f32 = (rnd.float(f32) - 0.5) * 2.0;
+                block[t] = v;
+                b_f32[(kb * 32 + t) * n + j] = v;
+            }
+            const off: usize = (kb * n + j) * Q8_BYTES;
+            const dst: *[Q8_BYTES]u8 = @ptrCast(bq[off..][0..Q8_BYTES]);
+            quantizeQ8_0FromF32Block32(&block, dst);
+        }
+    }
+
+    var c_ref: [n]f32 = @splat(0.0);
+    for (0..n) |j| {
+        var acc: f32 = 0.0;
+        for (0..k) |kk| acc += a[kk] * b_f32[kk * n + j];
+        c_ref[j] = acc;
+    }
+
+    var c: [n]f32 = @splat(0.0);
+    var acc_scratch: [n * 64]u8 align(32) = undefined;
+    var prep: [(k_tile / 32) * (32 + @sizeOf(f32)) * 4]u8 align(32) = undefined;
+    const kernels = matvecKernelsById(.simd256);
+
+    var ti: usize = 0;
+    while (ti < tiles) : (ti += 1) {
+        // B is [k_blocks, n]; this tile owns its own slice of those rows.
+        const blocks_per_tile = k_tile / 32;
+        const b_off = ti * blocks_per_tile * n * Q8_BYTES;
+        try kernels.matvec_q8_0_kmajor_accumulate(
+            .{ .m = 1, .n = n, .k = k_tile, .alpha = 1.0, .beta = 0.0 },
+            std.mem.sliceAsBytes(c[0..]),
+            std.mem.sliceAsBytes(a[ti * k_tile ..][0..k_tile]),
+            bq[b_off..][0 .. blocks_per_tile * n * Q8_BYTES],
+            acc_scratch[0..],
+            prep[0..],
+            true,
+            ti == 0,
+            ti + 1 == tiles,
+        );
+    }
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
 

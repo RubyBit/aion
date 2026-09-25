@@ -401,8 +401,10 @@ test "plan: a quantized weight's own tiling is adopted rather than demanded" {
     const y = try g.addMatMul(x_in, w_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    // Compiling for the GPU policy must succeed and keep the authored tiling.
-    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, gpu_policy));
+    // Compiling for the GPU policy must succeed and keep the authored tiling. No
+    // optional passes: this is about the MatMul lowering, which a layout pass
+    // would otherwise replace.
+    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, program.Target.init(.{ .kind = .gpu }, gpu_policy).withPasses(.empty));
     defer prog.deinit();
 
     var saw: bool = false;
@@ -418,4 +420,27 @@ test "plan: a quantized weight's own tiling is adopted rather than demanded" {
         }
     }
     try std.testing.expect(saw);
+}
+
+test "plan: a quantized B keeps its N axis parallelisable at every width" {
+    const policy: plan_mod.TilePolicy = .{};
+
+    // A projection wide enough to hit the cap still leaves the minimum tiles.
+    try std.testing.expectEqual(@as(usize, 512), plan_mod.chooseQuantBTileN(policy, 2048));
+    try std.testing.expect(2048 / plan_mod.chooseQuantBTileN(policy, 2048) >= policy.quant_b_min_tiles);
+
+    // A vocabulary-sized head is capped, not widened to a quarter of itself.
+    try std.testing.expectEqual(@as(usize, 512), plan_mod.chooseQuantBTileN(policy, 32000));
+
+    // A narrow matrix is split rather than taken whole, so M=1 still has an axis
+    // to parallelise over.
+    try std.testing.expect(plan_mod.chooseQuantBTileN(policy, 512) < 512);
+    try std.testing.expect(512 / plan_mod.chooseQuantBTileN(policy, 512) >= policy.quant_b_min_tiles);
+
+    // Never wider than the matrix, never zero, always SIMD-friendly.
+    for ([_]usize{ 1, 15, 16, 48, 64, 300, 1000 }) |n| {
+        const tn = plan_mod.chooseQuantBTileN(policy, n);
+        try std.testing.expect(tn >= 1 and tn <= n);
+        if (tn >= 16) try std.testing.expectEqual(@as(usize, 0), tn % 16);
+    }
 }

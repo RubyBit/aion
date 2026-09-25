@@ -141,6 +141,37 @@ fn gather_q8_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     }
 }
 
+// Grouped-order twin of `gather_q8_rows_f32`, for a table re-laid into a
+// `QuantBlockOrder.lanes*` order: `p.wpr` is the rows per group (even), and one
+// work item dequantizes one 32-element block of one output row.
+@compute @workgroup_size(64)
+fn gather_q8g_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * WG;
+    let blocks = p.d / 32u;
+    let g = p.wpr;
+    for (var i = gid.x; i < p.total; i += stride) {
+        let r = i / blocks;
+        let kb = i % blocks;
+        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        let lr = src_row - p.p0;
+        let lane = lr % g;
+        // The group's segment for block kb: g scales, then eight chunks of g words.
+        let seg = ((lr / g) * blocks + kb) * g * 34u / 4u;
+        let halves = unpack2x16float(table[seg + lane / 2u]);
+        let d = select(halves.x, halves.y, lane % 2u == 1u);
+        let e0 = r * p.d + kb * 32u;
+        for (var c = 0u; c < 8u; c += 1u) {
+            let q = i8x4f(table[seg + g / 2u + c * g + lane]) * d;
+            let e = e0 + c * 4u;
+            o[e] = q.x;
+            o[e + 1u] = q.y;
+            o[e + 2u] = q.z;
+            o[e + 3u] = q.w;
+        }
+    }
+}
+
 // Device-side row scatter: buf[idx[0], :] = src[:]. The destination row resolves
 // ON DEVICE (the emit index of an in-graph decode loop) so no host read forces a
 // control-flow sync. Reuses this module's bindings: `table` = the packed src row

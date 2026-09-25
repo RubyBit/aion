@@ -17,15 +17,34 @@ const RegionDir = enum { into_derived, out_of_derived };
 
 /// Copy one source region between a derived weight's packed bytes and its own.
 fn copyRegion(whole: []u8, part: []u8, view: derived_mod.View, dir: RegionDir) void {
-    const n = view.len * view.block_bytes;
-    var r: usize = 0;
-    while (r < view.rows) : (r += 1) {
-        const at_whole = (r * view.row_stride + view.offset) * view.block_bytes;
-        const at_part = r * n;
-        switch (dir) {
-            .into_derived => @memcpy(whole[at_whole..][0..n], part[at_part..][0..n]),
-            .out_of_derived => @memcpy(part[at_part..][0..n], whole[at_whole..][0..n]),
-        }
+    const bb = view.block_bytes;
+    switch (view.mapping) {
+        .relayout => |lay| {
+            // One block at a time: neither side keeps a column contiguous in the
+            // other's order, and the derived side may split a block's bytes.
+            for (0..view.len) |c| {
+                const at = lay.tileOf(view.rows, c);
+                const tile = whole[at.base..];
+                for (0..view.rows) |kb| {
+                    const block = part[lay.sourceAt(view.rows, view.len, c, kb) * bb ..][0..bb];
+                    switch (dir) {
+                        .into_derived => lay.order.storeBlock(tile, view.rows, at.row, kb, block),
+                        .out_of_derived => lay.order.loadBlock(tile, view.rows, at.row, kb, block),
+                    }
+                }
+            }
+        },
+        .stripe => {
+            const n = view.len * bb;
+            for (0..view.rows) |r| {
+                const at_whole = (r * view.row_stride + view.offset) * bb;
+                const at_part = r * n;
+                switch (dir) {
+                    .into_derived => @memcpy(whole[at_whole..][0..n], part[at_part..][0..n]),
+                    .out_of_derived => @memcpy(part[at_part..][0..n], whole[at_whole..][0..n]),
+                }
+            }
+        },
     }
 }
 
@@ -83,13 +102,14 @@ pub fn unfoldTensor(mgr: *StorageManager, id: TensorId) StorageError!void {
 }
 
 /// Collect storage after program reference counts change.
-/// First remove an unreferenced derived weight when every source is whole; otherwise
-/// reclaim unreferenced source copies because the derived weight is canonical.
+/// First remove an unreferenced derived weight when every source is whole, or when
+/// nothing holds or reads its sources any more; otherwise reclaim unreferenced source
+/// copies because the derived weight is canonical.
 pub fn collectDerived(mgr: *StorageManager) void {
     var i: usize = 0;
     while (i < mgr.derived.entries.items.len) {
         const e = mgr.derived.entries.items[i];
-        if (mgr.tensorProgramRefs(e.result) == 0 and sourcesAreWhole(mgr, e)) {
+        if (mgr.tensorProgramRefs(e.result) == 0 and (sourcesAreWhole(mgr, e) or sourcesAreUnreferenced(mgr, e))) {
             mgr.releaseTensorData(e.result) catch {};
             mgr.derived.remove(mgr.allocator, i);
             continue;
@@ -103,6 +123,12 @@ pub fn collectDerived(mgr: *StorageManager) void {
 
 /// Every source of `e` holds its own bytes, so the derived weight is not the only
 /// copy of anything.
+/// No source is held or read any more, so neither is anything derived from them.
+fn sourcesAreUnreferenced(mgr: *const StorageManager, e: derived_mod.Entry) bool {
+    for (e.sources) |s| if (!mgr.tensorUnreferenced(s.tid)) return false;
+    return true;
+}
+
 fn sourcesAreWhole(mgr: *const StorageManager, e: derived_mod.Entry) bool {
     for (e.sources) |s| {
         if (!(mgr.tensorHasBacking(s.tid) catch return false)) return false;

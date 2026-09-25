@@ -108,7 +108,6 @@ fn printUsage() void {
             "  --seq N          token suite: query rows per step (default: 1)\n" ++
             "  --pli-vocab N    token suite: per-layer-input table rows (default: full)\n" ++
             "  --no-head        token suite: skip the tied logits head\n" ++
-            "  --no-hfuse       token suite: disable horizontal MatMul fusion (A/B a pass)\n" ++
             "  --steps          token suite: print the step histogram\n" ++
             "  --batch N        Batch size for batched matmul (default: 4)\n" ++
             "  --heads N        Multi-head attention heads (default: 8)\n" ++
@@ -198,8 +197,6 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !BenchOptions
             opts.model.pli_vocab = try parseUsize(v);
         } else if (std.mem.eql(u8, a, "--no-head")) {
             opts.model.head = false;
-        } else if (std.mem.eql(u8, a, "--no-hfuse")) {
-            opts.model.disable.insert(.horizontal_matmul);
         } else if (std.mem.eql(u8, a, "--steps")) {
             opts.show_steps = true;
         } else if (std.mem.eql(u8, a, "--threads")) {
@@ -1949,7 +1946,7 @@ fn quantizeQ8_0FromF32Block32(vals: *const [32]f32, out: *[Q8_0_BLOCK_BYTES]u8) 
         if (a > max_abs) max_abs = a;
     }
 
-    // ggml-ish: scale is per-block.
+    // One scale per block.
     const scale: f32 = if (max_abs == 0.0) 1.0 else (max_abs / 127.0);
     const scale_f16: f16 = @floatCast(scale);
 

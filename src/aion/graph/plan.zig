@@ -14,6 +14,17 @@ pub const TilePolicy = struct {
     /// `TilePolicy{}` is unchanged from before this field existed.
     target_kind: BackendKind = .cpu,
 
+    /// How an `[n, k]` q8 weight groups its rows: the order the backend's NT
+    /// kernel was built to read, which the backend reports. `row_major` groups none.
+    quant_block_order: types.QuantBlockOrder = .row_major,
+
+    /// Widest N tile a streamed quantized B may take. Past 512 the accumulating
+    /// matvec's per-tile scratch runs out.
+    quant_b_tn_cap: usize = 512,
+
+    /// Fewest tiles the N axis of a quantized B must still yield.
+    quant_b_min_tiles: usize = 4,
+
     /// Default square tile side for rank-2 tensors.
     ///
     /// Note: transpose materialization is simplest when tiles are square.
@@ -45,7 +56,7 @@ pub const TilePolicy = struct {
     /// Default tile length for rank-1 tensors.
     base_1d: usize = 256,
 
-    /// Required alignment for quantized K blocks (ggml q4/q8 use 32).
+    /// Required alignment for quantized K blocks (q4_0 and q8_0 blocks are 32 wide).
     quant_k_block: usize = 32,
 
     /// Tile alignment in bytes for `TiledTensor` backing.
@@ -300,6 +311,45 @@ fn chooseQuantTileCap(policy: TilePolicy, k: usize, b_dtype: DType) usize {
     return cap;
 }
 
+/// N tile for a quantized B, which the kernel streams rather than stages.
+///
+/// This is a balance between two costs, not a guess at M. Too narrow and a
+/// kernel call covers so little that per-call work dominates: a 64-wide tile on
+/// a 1B q8 model is 17 KiB a call and ~59k calls per token, which measured 19.4
+/// tok/s against 33.0 once widened. Too wide and the N axis stops yielding tiles
+/// to spread across cores — which binds hardest at M=1, where N is the only axis
+/// left to parallelise over, and matters least for a large-M GEMM, which gets
+/// its tiles from M.
+///
+/// So: as wide as the cap allows, but never so wide that N yields fewer than
+/// `quant_b_min_tiles` tiles.
+pub fn chooseQuantBTileN(policy: TilePolicy, n: usize) usize {
+    const want = @max(policy.base_square_2d, @min(policy.quant_b_tn_cap, n / policy.quant_b_min_tiles));
+    return @max(@as(usize, 1), @min(n, roundDownToMultiple(want, 16)));
+}
+
+/// Tiling for a rank-2 quantized tensor blocked along its rows (`quant_axis == 1`):
+/// an embedding table, or a weight the NT matmul contracts against row-wise.
+///
+/// Returns `[tr, tc]` with `tc == C`, so a row is exactly one contiguous run of
+/// `C / block_elems` blocks inside its tile — what a row-gather or a row-streaming
+/// matvec wants, and what the NT lowering requires outright. `tr` is capped so one
+/// tile still binds on the device: a multi-GB vocab table splits along rows.
+pub fn chooseQuantRowTiles(policy: TilePolicy, dtype: DType, r: usize, c: usize) [2]usize {
+    var tr: usize = @max(@as(usize, 1), @min(r, policy.base_1d));
+    if (policy.max_binding_bytes > 0) {
+        const info = dtype.info();
+        const per_row: usize = (c / info.block_elems) * info.block_bytes;
+        if (per_row > 0) {
+            // 3/4 margin leaves headroom for allocation rounding / other limits.
+            const budget: usize = policy.max_binding_bytes / 4 * 3;
+            const cap_rows: usize = @max(@as(usize, 1), budget / per_row);
+            tr = @min(tr, cap_rows);
+        }
+    }
+    return .{ tr, c };
+}
+
 pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
     // GPU: keep K in a single (large, bounded) tile so the kernel accumulates all
     // of K within one dispatch instead of round-tripping C through global memory
@@ -321,7 +371,10 @@ pub fn chooseMatMulTk(policy: TilePolicy, k: usize, b_dtype: DType) usize {
         return @min(base_f16, k);
     }
 
-    const base: usize = @min(@as(usize, 256), @max(policy.quant_k_block, k));
+    // A quantized B is streamed, not staged, so a wider K tile costs nothing
+    // beyond the calls it saves. 512 is where that stops: 1024 exceeds the
+    // scratch the accumulating matvec carries for a single tile.
+    const base: usize = @min(@as(usize, 512), @max(policy.quant_k_block, k));
     if (!b_dtype.info().is_quantized) return @min(base, k);
 
     const be: usize = b_dtype.info().block_elems;
@@ -363,9 +416,11 @@ pub fn chooseMatMulTiles(policy: TilePolicy, m: usize, n: usize, k: usize, b_dty
     if (m <= 4) {
         const tm: usize = @max(@as(usize, 1), m);
 
-        // Keep N tiles reasonably large to amortize per-tile overhead, but not so large
-        // that we destroy parallelism. 256 matches CPU kernel NC.
-        var tn_target: usize = @min(@as(usize, 256), n);
+        // Keep N tiles large enough to amortize per-tile overhead, but not so
+        // large that we destroy parallelism. At 512 a 2048-wide projection still
+        // has four N tiles, and a 1B decode measured faster at ten threads as
+        // well as one — per-call cost was dominating both.
+        var tn_target: usize = @min(@as(usize, 512), n);
         if (tn_target >= 16) {
             tn_target = roundDownToMultiple(tn_target, 16);
             if (tn_target == 0) tn_target = 16;

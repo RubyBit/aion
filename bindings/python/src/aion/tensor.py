@@ -407,7 +407,9 @@ class Tensor:
         if self._closed:
             return
         handle = self._t
-        if handle is not None:
+        # A context closes its children first; one closed after it (a finalizer at
+        # interpreter exit) points into freed storage and must not call in.
+        if handle is not None and not self._ctx_owner._closed:
             destroy_tensor(handle)
         try:
             self._ctx_owner._unregister_child(self)
@@ -430,9 +432,7 @@ class Tensor:
     def __del__(self) -> None:  # pragma: no cover
         try:
             if not getattr(self, "_closed", True):
-                handle = getattr(self, "_t", None)
-                if handle is not None:
-                    destroy_tensor(handle)
+                self.close()
         except Exception:
             pass
 

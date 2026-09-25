@@ -123,18 +123,15 @@ pub inline fn sigmoidApproxVecF32(comptime lanes: usize, x_in: @Vector(lanes, f3
     const zero: @Vector(lanes, f32) = @splat(@as(f32, 0.0));
     const one: @Vector(lanes, f32) = @splat(@as(f32, 1.0));
 
+    // Both branches of the stable form share `exp(-|x|)`: at `x >= 0` that is
+    // `exp(-x)` over `1 + exp(-x)`, and below zero it is `exp(x)` over
+    // `1 + exp(x)`, which is the same denominator with itself as the numerator.
+    // Selecting between two separately evaluated branches did the exp and the
+    // divide — the two expensive parts — twice for every lane.
     const mask: @Vector(lanes, bool) = x_in >= zero;
-
-    // x >= 0: 1/(1+exp(-x))
-    const e_pos: @Vector(lanes, f32) = expApproxVecF32(lanes, -x_in);
-    const pos: @Vector(lanes, f32) = one / (one + e_pos);
-
-    // x < 0: exp(x)/(1+exp(x))
-    const e_neg: @Vector(lanes, f32) = expApproxVecF32(lanes, x_in);
-    const neg: @Vector(lanes, f32) = e_neg / (one + e_neg);
-
-    const y: @Vector(lanes, f32) = @select(f32, mask, pos, neg);
-    return clampVecF32(lanes, y, 0.0, 1.0);
+    const e: @Vector(lanes, f32) = expApproxVecF32(lanes, -@abs(x_in));
+    const num: @Vector(lanes, f32) = @select(f32, mask, one, e);
+    return clampVecF32(lanes, num / (one + e), 0.0, 1.0);
 }
 
 pub inline fn tanhApproxF32(x: f32) f32 {

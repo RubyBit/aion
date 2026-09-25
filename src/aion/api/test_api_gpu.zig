@@ -540,3 +540,116 @@ test "api: topk matches between gpu and cpu, values and indices" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 3.0, 2.0, 2.0 }, top.v[0..3]);
     try std.testing.expectEqualSlices(i32, &[_]i32{ 42, 100, 9000 }, top.i[0..3]);
 }
+
+/// Runs the model in `file` on `dev` for one fixed input, returning its output.
+fn runBranchModel(ctx: *api.Context, file: std.Io.File, dev: api.DeviceSelector, x: []const f32, out: []f32) !void {
+    var model = try ctx.loadModel(file, .{ .device = dev });
+    defer model.deinit();
+    try model.bindInput("x", try ctx.fromF32(&.{ 1, 4, 64 }, x));
+    try model.run();
+    try (try model.outputTensor("out")).read(out);
+}
+
+// Weights load where the model runs, so on a GPU the `If` predicate below starts on
+// the device while the host is what reads it; the quantized weight stays on the device.
+test "api: a loaded weight read by the host as a predicate matches cpu on gpu" {
+    const alloc = std.testing.allocator;
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "branch.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var w_v: [64 * 64]f32 = undefined;
+    for (&w_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.03;
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const x = try bld.name(try bld.input(.f32, &.{ 1, 4, 64 }), "x");
+        const cond = try bld.paramNamed(try ctx.from(&.{1}, &[_]i32{1}), "cond", .{});
+        const w = try bld.paramNamed(try ctx.fromF32(&.{ 64, 64 }, &w_v), "w", .{ .quantize = .q8_0 });
+        try bld.beginRegion();
+        const then_r = try bld.endRegion(&.{try bld.matmulNT(x, w, 1.0, 0.0)});
+        try bld.beginRegion();
+        const else_r = try bld.endRegion(&.{x});
+        const out = try bld.ifThenElse(cond, then_r, else_r);
+        try ctx.exportModel(file, &bld, &.{.{ .name = "out", .tensor = out }}, .{});
+    }
+
+    var x_v: [4 * 64]f32 = undefined;
+    for (&x_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) * 0.1 - 0.8;
+    var cpu: [4 * 64]f32 = undefined;
+    var gpu: [4 * 64]f32 = undefined;
+    try runBranchModel(&ctx, file, .cpu, &x_v, &cpu);
+    try runBranchModel(&ctx, file, .{ .gpu = 0 }, &x_v, &gpu);
+    // The taken branch is the matmul, not the identity.
+    try std.testing.expect(!std.mem.eql(f32, &cpu, &x_v));
+    // The cpu quantizes activations to int8 for a q8 matmul; the gpu keeps them f32.
+    for (cpu, gpu) |c, g| try std.testing.expectApproxEqAbs(c, g, 1e-2);
+}
+
+/// Runs the tied-table model in `file` on `dev`: the looked-up rows, then `x @ tableᵀ`.
+fn runTiedModel(ctx: *api.Context, file: std.Io.File, dev: api.DeviceSelector, ids: []const i32, x: []const f32, rows: []f32, prod: []f32) !void {
+    var model = try ctx.loadModel(file, .{ .device = dev });
+    defer model.deinit();
+    try model.bindInput("ids", try ctx.from(&.{ 1, ids.len }, ids));
+    try model.bindInput("x", try ctx.fromF32(&.{ 2, 64 }, x));
+    try model.run();
+    try (try model.outputTensor("rows")).read(rows);
+    try (try model.outputTensor("prod")).read(prod);
+}
+
+// A table both looked up and contracted is re-laid once and read in that order by
+// the lookup too, so each backend's lookup reads its own grouped order.
+test "api: a tied q8 table looks up the same rows on gpu and cpu" {
+    const alloc = std.testing.allocator;
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "tied.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    const n: usize = 128;
+    var t_v: [n * 64]f32 = undefined;
+    // Rows cycle through three magnitudes, so a row's block scale differs from its neighbours'.
+    for (&t_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) * 0.02 * @as(f32, @floatFromInt((i / 64) % 3 + 1));
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const ids = try bld.name(try bld.input(.i32, &.{ 1, 4 }), "ids");
+        const x = try bld.name(try bld.input(.f32, &.{ 2, 64 }), "x");
+        const table = try bld.paramNamed(try ctx.fromF32(&.{ n, 64 }, &t_v), "table", .{ .quantize = .q8_0 });
+        const rows = try bld.gather(table, ids, 0, 0);
+        const prod = try bld.matmulNT(x, table, 1.0, 0.0);
+        try ctx.exportModel(file, &bld, &.{ .{ .name = "rows", .tensor = rows }, .{ .name = "prod", .tensor = prod } }, .{});
+    }
+
+    const ids = [_]i32{ 0, 33, 127, 64 };
+    // Not periodic: a repeating x lines up the cpu's int8 rounding errors.
+    var x_v: [2 * 64]f32 = undefined;
+    var seed: u64 = 12345;
+    for (&x_v) |*v| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        v.* = (@as(f32, @floatFromInt((seed >> 33) % 2000)) - 1000.0) * 0.0006;
+    }
+    var rows: [2][4 * 64]f32 = undefined;
+    var prod: [2][2 * n]f32 = undefined;
+    try runTiedModel(&ctx, file, .cpu, &ids, &x_v, &rows[0], &prod[0]);
+    try runTiedModel(&ctx, file, .{ .gpu = 0 }, &ids, &x_v, &rows[1], &prod[1]);
+    // Dequantizing a block is one multiply per value on either device.
+    try std.testing.expectEqualSlices(f32, &rows[0], &rows[1]);
+    for (rows[0][0..64], t_v[0..64]) |got, want| try std.testing.expectApproxEqAbs(want, got, 0.01);
+    // The cpu rounds x to int8 for a q8 matmul and the gpu keeps it f32; over 64
+    // terms that rounding stays well under this.
+    for (prod[0], prod[1]) |c, g| try std.testing.expectApproxEqAbs(c, g, 3e-2);
+}

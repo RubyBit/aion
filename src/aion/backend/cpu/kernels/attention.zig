@@ -115,9 +115,28 @@ pub fn Kernel(comptime tuning: Tuning) type {
             var r0: usize = 0;
             while (r0 < m_q) : (r0 += MR) {
                 const r_end: usize = @min(r0 + MR, m_q);
+
+                // `packQBlock` fills whole tiles only, so a trailing one has no
+                // packed panel and the edge path below would run it a lane at a
+                // time. The narrow kernel reads those rows where they lie.
+                if (r_end - r0 < MR) {
+                    Self.calcScoresNarrowF32(
+                        r_end - r0,
+                        n_k,
+                        k_dim,
+                        qs[r0 * q_stride ..],
+                        q_stride,
+                        ks,
+                        k_stride,
+                        scores[r0 * score_stride ..],
+                        score_stride,
+                    );
+                    continue;
+                }
+
                 var c0: usize = 0;
                 while (c0 < n_k) : (c0 += NR) {
-                    if (c0 + NR > n_k or r0 + MR > m_q) {
+                    if (c0 + NR > n_k) {
                         var r: usize = r0;
                         while (r < r_end) : (r += 1) {
                             const q_p: []align(1) const f32 = qs[r * q_stride ..];
@@ -293,32 +312,49 @@ pub fn Kernel(comptime tuning: Tuning) type {
 
                 var r0: usize = 0;
                 while (r0 < m_tile) : (r0 += MR) {
-                    const r1: usize = @min(r0 + MR, m_tile);
-
-                    var vAcc: [MR]Self.Vec = undefined;
-                    var r: usize = r0;
-                    while (r < r1) : (r += 1) {
-                        const ri: usize = r - r0;
-                        vAcc[ri] = Self.vecLoad(acc[r * acc_stride + j ..].ptr);
-                    }
-
-                    var k: usize = 0;
-                    while (k < n_v) : (k += 1) {
-                        const vV: Self.Vec = Self.vecLoad(vs[k * v_stride + j ..].ptr);
-                        r = r0;
-                        while (r < r1) : (r += 1) {
-                            const ri: usize = r - r0;
-                            vAcc[ri] += @as(Self.Vec, @splat(scores[r * score_stride + k])) * vV;
-                        }
-                    }
-
-                    r = r0;
-                    while (r < r1) : (r += 1) {
-                        const ri: usize = r - r0;
-                        Self.vecStore(acc[r * acc_stride + j ..].ptr, vAcc[ri]);
+                    const n: usize = @min(MR, m_tile - r0);
+                    switch (n) {
+                        1 => accumulateN(1, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        2 => accumulateN(2, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        3 => accumulateN(3, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        4 => accumulateN(4, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        5 => accumulateN(5, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        6 => accumulateN(6, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        7 => accumulateN(7, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
+                        else => accumulateN(MR, r0, j, n_v, scores, score_stride, vs, v_stride, acc, acc_stride),
                     }
                 }
             }
+        }
+
+        /// `N` accumulator rows with the count comptime-known. Walking them with a
+        /// runtime index spills the array to the stack, which costs a load and a
+        /// store on every FMA of the inner product.
+        fn accumulateN(
+            comptime N: usize,
+            r0: usize,
+            j: usize,
+            n_v: usize,
+            scores: []const f32,
+            score_stride: usize,
+            vs: []align(1) const f32,
+            v_stride: usize,
+            acc: []f32,
+            acc_stride: usize,
+        ) void {
+            var vAcc: [N]Self.Vec = undefined;
+            inline for (0..N) |ri| vAcc[ri] = Self.vecLoad(acc[(r0 + ri) * acc_stride + j ..].ptr);
+
+            var k: usize = 0;
+            while (k < n_v) : (k += 1) {
+                const vV: Self.Vec = Self.vecLoad(vs[k * v_stride + j ..].ptr);
+                inline for (0..N) |ri| {
+                    const sc: Self.Vec = @splat(scores[(r0 + ri) * score_stride + k]);
+                    vAcc[ri] = @mulAdd(Self.Vec, sc, vV, vAcc[ri]);
+                }
+            }
+
+            inline for (0..N) |ri| Self.vecStore(acc[(r0 + ri) * acc_stride + j ..].ptr, vAcc[ri]);
         }
     };
 }

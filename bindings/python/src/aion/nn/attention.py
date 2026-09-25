@@ -158,9 +158,7 @@ class Attention(Module):
     """Grouped-query attention — over a KV cache (decode) or a plain sequence
     (prefill, encoders); `attend` takes the cache indices or omits them.
 
-    Q, K and V are separate projections, the way checkpoints ship them;
-    concatenating them into one wide projection is a fusion the compiler performs
-    (`opt/fuse_horizontal_matmul`), not a weight layout to pick here.
+    Q, K and V are separate projections, the way checkpoints ship them.
 
     `k_proj`/`v_proj` are optional, all-or-nothing: omitting them means this layer
     does not write a cache, it only reads one another layer produced. Gemma 4 shares

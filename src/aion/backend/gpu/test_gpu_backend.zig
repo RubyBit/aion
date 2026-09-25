@@ -327,18 +327,33 @@ fn expectSliceTopology(mgr: *StorageManager, prog: *const aion.program.Program, 
 
 /// Build the same program twice (fresh storage each time), run it on the CPU
 /// backend and the GPU backend, and compare the packed f32 outputs.
-fn expectGpuMatchesCpu(comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg, out_len: usize, tol: f32) !void {
+/// Normalized mean squared error, `mse(a, b) / mse(a, 0)`.
+///
+/// Scale-free, which an absolute tolerance is not: bounding a matmul's disagreement
+/// in absolute terms really bounds its operands' magnitudes, so the number has to be
+/// re-picked whenever the test data changes.
+fn nmse(a: []const f32, b: []const f32) f64 {
+    var num: f64 = 0.0;
+    var den: f64 = 0.0;
+    for (a, b) |av, bv| {
+        const d: f64 = @as(f64, av) - @as(f64, bv);
+        num += d * d;
+        den += @as(f64, av) * @as(f64, av);
+    }
+    return if (den == 0.0) num else num / den;
+}
+
+fn runOnBothBackends(
+    comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg,
+    cpu_result: []f32,
+    gpu_result: []f32,
+) !void {
     const alloc = std.testing.allocator;
 
     var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
     defer device.deinit();
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
-
-    const cpu_result = try alloc.alloc(f32, out_len);
-    defer alloc.free(cpu_result);
-    const gpu_result = try alloc.alloc(f32, out_len);
-    defer alloc.free(gpu_result);
 
     {
         var mgr = StorageManager.init(alloc);
@@ -371,12 +386,42 @@ fn expectGpuMatchesCpu(comptime buildFn: fn (std.mem.Allocator, *StorageManager)
         };
         try readPlacedOutput(&mgr, built.out, std.mem.sliceAsBytes(gpu_result));
     }
+}
+
+fn expectGpuMatchesCpu(comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg, out_len: usize, tol: f32) !void {
+    const alloc = std.testing.allocator;
+    const cpu_result = try alloc.alloc(f32, out_len);
+    defer alloc.free(cpu_result);
+    const gpu_result = try alloc.alloc(f32, out_len);
+    defer alloc.free(gpu_result);
+    try runOnBothBackends(buildFn, cpu_result, gpu_result);
 
     for (cpu_result, gpu_result, 0..) |cv, gv, i| {
         std.testing.expectApproxEqAbs(cv, gv, tol) catch |e| {
             std.debug.print("mismatch at [{d}]: cpu={d} gpu={d}\n", .{ i, cv, gv });
             return e;
         };
+    }
+}
+
+/// For comparisons where the two backends quantize different operands, so what is
+/// bounded is a relative error and not a distance.
+fn expectGpuMatchesCpuNmse(
+    comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg,
+    out_len: usize,
+    max_nmse: f64,
+) !void {
+    const alloc = std.testing.allocator;
+    const cpu_result = try alloc.alloc(f32, out_len);
+    defer alloc.free(cpu_result);
+    const gpu_result = try alloc.alloc(f32, out_len);
+    defer alloc.free(gpu_result);
+    try runOnBothBackends(buildFn, cpu_result, gpu_result);
+
+    const got = nmse(cpu_result, gpu_result);
+    if (!(got <= max_nmse)) {
+        std.debug.print("nmse {d} exceeds {d}\n", .{ got, max_nmse });
+        return error.TestUnexpectedResult;
     }
 }
 
@@ -760,7 +805,7 @@ test "gpu backend: copy (buffer-to-buffer) matches CPU" {
 
 // ---- MatMulNT (q8_0 / f32 weights) ------------------------------------------
 
-/// Pack f32 rows [n, k] into ggml q8_0 blocks (f16 scale + 32 i8 per 32 elems).
+/// Pack f32 rows [n, k] into q8_0 blocks (f16 scale + 32 i8 per 32 elems).
 fn packQ8(alloc: std.mem.Allocator, vals: []const f32, n: usize, k: usize) ![]u8 {
     const bpr = k / 32;
     const out = try alloc.alloc(u8, n * bpr * 34);
@@ -821,8 +866,67 @@ fn buildNt(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n
 fn buildNtQ8Gemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNt(alloc, mgr, 1, 128, 100, 32, true);
 }
+/// What the CPU and GPU q8 NT kernels may differ by, as NMSE.
+///
+/// They quantize different operands: the CPU one, at its default int8 setting,
+/// takes A to int8 so its inner product is a byte dot, while the GPU one
+/// dequantizes B into f32. So the gap is one operand's quantization: one q8 value
+/// off by one is a step of `2 / 2^7` against a block max, that error squared
+/// because NMSE is squared, over the mean square of a K-term sum (~0.25 per term).
+fn ntQ8MaxNmse(k: usize) f64 {
+    const step: f64 = 2.0 / 128.0;
+    return (step * step) / (0.25 * @as(f64, @floatFromInt(k)));
+}
+
+/// An NT q8 matmul compiled the way a GPU device lays weights out: the policy asks
+/// for `lanes32`, so the layout pass re-lays B and the GPU reads it coalesced.
+fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n: usize) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const av = try makeInput(&g, mgr, &.{ m, k }, &.{ m, k }, 20);
+    const b_vals = try alloc.alloc(f32, n * k);
+    defer alloc.free(b_vals);
+    for (b_vals, 0..) |*v, i| {
+        const p: u32 = @intCast((i * 2654435761 + 21) % 1000);
+        v.* = (@as(f32, @floatFromInt(p)) - 500.0) * 0.004;
+    }
+    const packed_b = try packQ8(alloc, b_vals, n, k);
+    defer alloc.free(packed_b);
+    const b_id = try mgr.createTiledTensor(.q8_0, &.{ n, k }, &.{ n, k }, .{ .tile_alignment = 64, .quant_axis = 1 });
+    try mgr.writeFromPackedQuant(b_id, packed_b);
+    const bv = try g.addInput(.q8_0, &.{ n, k });
+    try g.bindExternal(bv, b_id);
+    try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMulNT(av, bv, 1.0, 0.0)});
+
+    var policy: plan.TilePolicy = .{ .target_kind = .webgpu };
+    policy.quant_block_order = .lanes32;
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, policy));
+    for (prog.steps) |step| switch (step.op) {
+        .MatMulNTTiled => |st| try std.testing.expectEqual(aion.types.QuantBlockOrder.lanes32, (try mgr.getConst(st.b)).block_order),
+        else => {},
+    };
+    return .{ .prog = prog, .out = prog.outputs[0] };
+}
+
+// 2048 rows are 64 groups (the 8-slice GEMV); 64 rows are 2 (the 32-slice one);
+// M = 24 dequantizes the grouped B for the GEMM.
+fn buildNtLanesGemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 1, 96, 2048);
+}
+fn buildNtLanesGemvNarrow(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 1, 96, 64);
+}
+fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 24, 96, 64);
+}
+test "gpu backend: matmul NT q8_0 in lanes32 order matches CPU" {
+    try expectGpuMatchesCpuNmse(buildNtLanesGemv, 2048, ntQ8MaxNmse(96));
+    try expectGpuMatchesCpuNmse(buildNtLanesGemvNarrow, 64, ntQ8MaxNmse(96));
+    try expectGpuMatchesCpuNmse(buildNtLanesGemm, 24 * 64, ntQ8MaxNmse(96));
+}
+
 test "gpu backend: matmul NT q8_0 matvec (M=1) matches CPU" {
-    try expectGpuMatchesCpu(buildNtQ8Gemv, 100, 2e-3);
+    try expectGpuMatchesCpuNmse(buildNtQ8Gemv, 100, ntQ8MaxNmse(128));
 }
 
 // M > 1 exercises the dequant-to-scratch + f32 GEMM path (single edge-sized
@@ -831,7 +935,7 @@ fn buildNtQ8Gemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNt(alloc, mgr, 24, 128, 100, 100, true);
 }
 test "gpu backend: matmul NT q8_0 GEMM (M=24) matches CPU" {
-    try expectGpuMatchesCpu(buildNtQ8Gemm, 24 * 100, 2e-3);
+    try expectGpuMatchesCpuNmse(buildNtQ8Gemm, 24 * 100, ntQ8MaxNmse(128));
 }
 
 fn buildNtF32Gemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -850,7 +954,7 @@ test "gpu backend: matmul NT f32 GEMM (M=16, multi-N-tile) matches CPU" {
 
 // ---- MatMul (plain, K-major q8_0 B) — the Gemma decode GEMV -----------------
 
-/// Pack f32 [k, n] (row-major) into ggml q8_0 blocks quantized ALONG K: block
+/// Pack f32 [k, n] (row-major) into q8_0 blocks quantized ALONG K: block
 /// grid [k/32, n], row-major, block (bk, col) holds B[bk*32 .. +31, col]. This
 /// is the layout `matmul_gemv.wgsl` / `q8_kmajor_to_f32` consume.
 fn packQ8Kmajor(alloc: std.mem.Allocator, vals: []const f32, k: usize, n: usize) ![]u8 {
@@ -1401,6 +1505,44 @@ test "gpu backend: cached GQA attention (f16 caches, sliding window, soft cap) m
     // f16 cache rounding is identical on both sides, but the CPU soft cap uses
     // a tanh approximation while the GPU uses hardware tanh.
     try expectGpuMatchesCpu(buildMHACachedF16, 1 * 2 * 2 * 16, 5e-3);
+}
+
+// Prefill over a cache the way a decoder layer runs it: many query rows at once,
+// so the block kernel takes them. Gemma-shaped: 8 heads over one kv head at 256
+// dims, f16 caches, positions offset into the cache, a sliding window with a soft
+// cap, and a ragged 37-row query that leaves the last block partly empty.
+fn buildPrefillSliding(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 1, 37, 8, 256 }, &.{ 1, 37, 8, 256 }, 80);
+    const k = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 256 }, &.{ 1, 64, 1, 256 }, 81);
+    const v = try makeInputF16(&g, mgr, &.{ 1, 64, 1, 256 }, &.{ 1, 64, 1, 256 }, 82);
+    var positions: [37]i32 = undefined;
+    for (&positions, 0..) |*x, i| x.* = @intCast(20 + i);
+    const pos = try makeInputI32(&g, mgr, &.{ 1, 37 }, &.{ 1, 37 }, &positions);
+    const end = try makeInputI32(&g, mgr, &.{1}, &.{1}, &.{57});
+    const out = try g.addAttention(q, k, v, pos, end, 0.0625, .sliding(31, 0), 30.0);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+
+test "gpu backend: prefill attention (f16 cache, sliding window, soft cap) matches CPU" {
+    try expectGpuMatchesCpu(buildPrefillSliding, 1 * 37 * 8 * 256, 1e-4);
+}
+
+// The widest head the block kernel takes (512, a global layer's), with a group
+// of 3 heads per kv head so a block is 3 heads x 10 positions.
+fn buildPrefillWide(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 1, 20, 6, 512 }, &.{ 1, 20, 6, 512 }, 83);
+    const k = try makeInputF16(&g, mgr, &.{ 1, 20, 2, 512 }, &.{ 1, 20, 2, 512 }, 84);
+    const v = try makeInputF16(&g, mgr, &.{ 1, 20, 2, 512 }, &.{ 1, 20, 2, 512 }, 85);
+    const out = try g.addAttention(q, k, v, null, null, 0.044194, .causal, 0.0);
+    return finishProgGpuTiled(alloc, &g, mgr, out);
+}
+
+test "gpu backend: prefill attention (512-wide heads, 3-head groups) matches CPU" {
+    try expectGpuMatchesCpu(buildPrefillWide, 1 * 20 * 6 * 512, 1e-4);
 }
 
 // ---- conv ----
@@ -3153,4 +3295,37 @@ fn buildGatherNDNegativeIndices(alloc: std.mem.Allocator, mgr: *StorageManager) 
 
 test "gpu backend: general gather (ONNX negative indices) matches CPU" {
     try expectGpuMatchesCpu(buildGatherNDNegativeIndices, 4 * 3, 0.0);
+}
+
+// A readback larger than the staging budget is read in pieces: every byte arrives,
+// odd tails included, and the pooled staging buffer stays within the budget.
+test "gpu backend: batched readback splits regions past the staging budget" {
+    const alloc = std.testing.allocator;
+    var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+    const dev = gb.devmem.device();
+
+    const lens = [_]usize{ 10, (70 << 20) + 2, 4099 };
+    var bufs: [lens.len][]u8 = undefined;
+    var got: [lens.len][]u8 = undefined;
+    var regions: [lens.len]aion.device_memory.D2HRegion = undefined;
+    for (lens, 0..) |len, i| {
+        bufs[i] = try alloc.alloc(u8, len);
+        got[i] = try alloc.alloc(u8, len);
+        for (bufs[i], 0..) |*b, j| b.* = @truncate(j *% 131 +% i);
+        const h = try dev.alloc(len, 64);
+        try dev.copyH2D(h, 0, bufs[i]);
+        regions[i] = .{ .dst = got[i], .handle = h };
+    }
+    defer for (bufs, got, regions) |b, g, r| {
+        alloc.free(b);
+        alloc.free(g);
+        dev.free(r.handle);
+    };
+
+    try dev.copyD2HMany(&regions);
+    for (bufs, got) |b, g| try std.testing.expectEqualSlices(u8, b, g);
+    try std.testing.expect(gb.devmem.staging_cap <= 32 << 20);
 }

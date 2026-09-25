@@ -27,6 +27,47 @@ fn futexIo() std.Io {
 ///
 /// Terminology:
 /// - `thread_count_total` includes the calling thread (tid=0) plus worker threads (tid=1..).
+/// How long a worker spins for the next job, and the submitter for the workers,
+/// before falling back to a futex sleep.
+///
+/// The two are not the same trade. A spinning WORKER competes for a core with a
+/// worker still running the current job, so a long budget is actively harmful on
+/// a graph of long steps: at ~1 ms VGG-19 on ten threads went from 37.6 ms to
+/// 54.8 ms an image. A spinning SUBMITTER has nothing else to do — it has
+/// finished its own share and is waiting on the slowest worker — so it only risks
+/// the core it already holds, and sleeping there costs a syscall plus a wake on
+/// every one of a decode step's ~150 dispatches. Hence short for workers, long
+/// for the submitter; the latter is worth ~1.5% at eight threads.
+/// `publishTo` keeps the wake side syscall-free in the common case.
+const WORKER_SPIN_NS: u64 = 50 * std.time.ns_per_us;
+const SUBMIT_SPIN_NS: u64 = 400 * std.time.ns_per_us;
+
+/// A spin budget in time, not iterations: one `spinLoopHint` is ~11 ns on an
+/// Apple core and several times that on recent x86, so a count would mean a
+/// different wait on every CPU. The clock is read only once the wait outlasts a
+/// few spins, so a job that is already there costs nothing extra.
+const Spin = struct {
+    budget_ns: u64,
+    deadline: u64 = 0,
+    spins: u32 = 0,
+
+    const CHECK_EVERY: u32 = 16;
+
+    /// Spin once; false once the budget is spent and the caller should sleep.
+    fn again(self: *Spin) bool {
+        std.atomic.spinLoopHint();
+        self.spins +%= 1;
+        if (self.spins % CHECK_EVERY != 0) return true;
+        const t = nowNs();
+        if (self.deadline == 0) self.deadline = t + self.budget_ns;
+        return t < self.deadline;
+    }
+};
+
+fn nowNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(futexIo()).toNanoseconds());
+}
+
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
 
@@ -44,7 +85,21 @@ pub const ThreadPool = struct {
 
     const WorkerSlot = struct {
         job_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-        _padding: [worker_slot_padding_bytes]u8 = @splat(0),
+        /// Set by the worker just before it sleeps on `job_seq`, so a publisher
+        /// can skip the wake syscall for a worker that is still spinning. A decode
+        /// step publishes hundreds of times per token; waking unconditionally cost
+        /// a syscall per worker per publish whether or not anyone was asleep.
+        sleeping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// The last sequence this worker finished. The submitter waits on these
+        /// rather than on one shared counter: seven workers decrementing a single
+        /// line hand its ownership around seven times per join, where seven lines
+        /// each stay with their own worker.
+        done_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// Mirror of `sleeping` for the other direction: set while the submitter
+        /// is parked on `done_seq`, so a finishing worker skips the wake syscall
+        /// in the overwhelmingly common case where the submitter is still spinning.
+        submit_sleeping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        _padding: [worker_slot_padding_bytes - 2 * @sizeOf(std.atomic.Value(bool)) - @sizeOf(std.atomic.Value(u32))]u8 = @splat(0),
     };
 
     comptime {
@@ -56,7 +111,9 @@ pub const ThreadPool = struct {
         // Per-worker job sequence (futex address). Only workers that will execute
         // work for the current job are woken.
         worker_slots: []align(worker_slot_cache_line_bytes) WorkerSlot = &[_]WorkerSlot{},
-        pending_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// Next unclaimed index, for jobs that hand work out on demand.
+        next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        dynamic: bool = false,
         ready_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -150,6 +207,7 @@ pub const ThreadPool = struct {
         // Wake all workers (each waits on its own futex word).
         var idx: usize = 0;
         while (idx < shared.worker_slots.len) : (idx += 1) {
+            // Unconditional here: shutdown must not race a worker into sleeping.
             const seq = workerJobSeq(shared, idx);
             const v = seq.load(.acquire);
             seq.store(v + 1, .release);
@@ -211,12 +269,37 @@ pub const ThreadPool = struct {
         if (failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(failure))));
     }
 
+    /// Like `parallelForAny`, but threads claim ranges on demand rather than each
+    /// taking a fixed share — for jobs whose cost per index is uniform but whose
+    /// cores are not. The split is therefore not reproducible; every index still
+    /// runs exactly once, on exactly one thread.
+    pub fn parallelForDynamic(
+        self: *ThreadPool,
+        ctx: *anyopaque,
+        n: usize,
+        grain: usize,
+        func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
+    ) void {
+        self.runParallel(ctx, n, grain, func, true);
+    }
+
     pub fn parallelForAny(
         self: *ThreadPool,
         ctx: *anyopaque,
         n: usize,
         grain: usize,
         func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
+    ) void {
+        self.runParallel(ctx, n, grain, func, false);
+    }
+
+    fn runParallel(
+        self: *ThreadPool,
+        ctx: *anyopaque,
+        n: usize,
+        grain: usize,
+        func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
+        dynamic: bool,
     ) void {
         if (n == 0) return;
 
@@ -254,39 +337,37 @@ pub const ThreadPool = struct {
         shared.func = func;
 
         shared.job_thread_count_total = threads_job_total;
-
-        // Reset pending count to the number of workers we will actually wake.
-        shared.pending_workers.store(@intCast(workers_job), .release);
+        shared.dynamic = dynamic;
+        if (dynamic) shared.next_index.store(0, .release);
 
         // Publish job to selected workers by incrementing their per-worker sequence.
         var w: usize = 0;
-        while (w < workers_job) : (w += 1) {
-            const seq_ptr = workerJobSeq(shared, w);
-            const seq = seq_ptr.load(.acquire);
-            seq_ptr.store(seq + 1, .release);
-            futexIo().futexWake(u32, &seq_ptr.raw, 1);
-        }
+        while (w < workers_job) : (w += 1) publishTo(shared, w);
 
         // Run main thread work (tid=0)
         {
             const prev_tls = pushTlsExecution(shared, 0);
             defer popTlsExecution(prev_tls);
-            runForTid(ctx, n, shared.grain, func, 0, threads_job_total);
+            if (shared.dynamic) {
+                runClaiming(ctx, n, shared.grain, func, 0, &shared.next_index);
+            } else {
+                runForTid(ctx, n, shared.grain, func, 0, threads_job_total);
+            }
         }
 
-        // Wait for workers to finish
-        var spin_wait: usize = 0;
-        while (true) {
-            const pending = shared.pending_workers.load(.acquire);
-            if (pending == 0) break;
-
-            if (spin_wait < 1000) {
-                std.atomic.spinLoopHint();
-                spin_wait += 1;
-                continue;
+        // Wait for workers to finish: each publishes the sequence it completed.
+        var w2: usize = 0;
+        while (w2 < workers_job) : (w2 += 1) {
+            const slot = &shared.worker_slots[w2];
+            const want = slot.job_seq.load(.acquire);
+            var spin: Spin = .{ .budget_ns = SUBMIT_SPIN_NS };
+            while (slot.done_seq.load(.acquire) != want) {
+                if (spin.again()) continue;
+                slot.submit_sleeping.store(true, .release);
+                const seen = slot.done_seq.load(.acquire);
+                if (seen != want) futexIo().futexWaitUncancelable(u32, &slot.done_seq.raw, seen);
+                slot.submit_sleeping.store(false, .release);
             }
-
-            futexIo().futexWaitUncancelable(u32, &shared.pending_workers.raw, pending);
         }
     }
 
@@ -307,17 +388,17 @@ pub const ThreadPool = struct {
 
         while (true) {
             // Wait for new job (per-worker futex word).
-            var spin_wait: usize = 0;
+            var spin: Spin = .{ .budget_ns = WORKER_SPIN_NS };
             var seq = seq_ptr.load(.acquire);
 
             while (seq == last_seq) {
-                if (spin_wait < 5000) {
-                    std.atomic.spinLoopHint();
-                    spin_wait += 1;
+                if (spin.again()) {
                     seq = seq_ptr.load(.acquire);
                     continue;
                 }
+                shared.worker_slots[idx].sleeping.store(true, .seq_cst);
                 futexIo().futexWaitUncancelable(u32, &seq_ptr.raw, last_seq);
+                shared.worker_slots[idx].sleeping.store(false, .seq_cst);
                 seq = seq_ptr.load(.acquire);
             }
 
@@ -331,15 +412,18 @@ pub const ThreadPool = struct {
             {
                 const prev_tls = pushTlsExecution(shared, tid);
                 defer popTlsExecution(prev_tls);
-                runForTid(shared.ctx, shared.n, shared.grain, shared.func, tid, tc);
+                if (shared.dynamic) {
+                    runClaiming(shared.ctx, shared.n, shared.grain, shared.func, tid, &shared.next_index);
+                } else {
+                    runForTid(shared.ctx, shared.n, shared.grain, shared.func, tid, tc);
+                }
             }
 
-            // Notify completion
-            const prev = shared.pending_workers.fetchSub(1, .release);
-            if (prev == 1) {
-                // Futex waiters are not guaranteed to wake on value change unless a wake is
-                // issued. Only the transition to zero matters to the submitter.
-                futexIo().futexWake(u32, &shared.pending_workers.raw, 1);
+            // Notify completion on this worker's own line.
+            const slot = &shared.worker_slots[idx];
+            slot.done_seq.store(last_seq, .release);
+            if (slot.submit_sleeping.load(.acquire)) {
+                futexIo().futexWake(u32, &slot.done_seq.raw, 1);
             }
         }
     }
@@ -372,6 +456,22 @@ pub const ThreadPool = struct {
         return &shared.worker_slots[idx].job_seq;
     }
 
+    /// Publish a new sequence to one worker, waking it only if it went to sleep.
+    ///
+    /// The store and the `sleeping` read are `seq_cst` because they are different
+    /// atomics and a missed wake is a hang, not a slowdown: release/acquire alone
+    /// would let the read float above the store and observe a worker as awake that
+    /// is already parked. A worker that parks without seeing the store is still
+    /// covered — `futexWait` compares the sequence itself and returns at once.
+    fn publishTo(shared: *Shared, idx: usize) void {
+        const slot = &shared.worker_slots[idx];
+        const seq = slot.job_seq.load(.acquire);
+        slot.job_seq.store(seq + 1, .seq_cst);
+        if (slot.sleeping.load(.seq_cst)) {
+            futexIo().futexWake(u32, &slot.job_seq.raw, 1);
+        }
+    }
+
     fn runInlineSerial(
         ctx: *anyopaque,
         n: usize,
@@ -387,6 +487,29 @@ pub const ThreadPool = struct {
             const end: usize = @min(n, start + g);
             func(ctx, start, end, tid);
             start = end;
+        }
+    }
+
+    /// Claim `grain`-sized ranges from a shared counter until the job is done.
+    ///
+    /// An equal share per thread gates every step on the slowest core, which on a
+    /// machine with both performance and efficiency cores is the one that was given
+    /// as much work as a core twice its speed. Claiming on demand lets the fast
+    /// cores take more. Each index is still executed exactly once, so results do
+    /// not depend on who ran what — only `parallelForAny` promises a fixed split.
+    fn runClaiming(
+        ctx: *anyopaque,
+        n: usize,
+        grain: usize,
+        func: *const fn (ctx: *anyopaque, start: usize, end: usize, tid: usize) void,
+        tid: usize,
+        next: *std.atomic.Value(usize),
+    ) void {
+        const g: usize = @max(@as(usize, 1), grain);
+        while (true) {
+            const start = next.fetchAdd(g, .acq_rel);
+            if (start >= n) return;
+            func(ctx, start, @min(n, start + g), tid);
         }
     }
 
@@ -518,6 +641,47 @@ test "thread pool: deterministic partitioning across shapes" {
                 try std.testing.expectEqual(expectedTidForIndex(i, case.n, expected_threads), ctx.tids[i]);
             }
         }
+    }
+}
+
+test "thread pool: dynamic claiming runs every index exactly once" {
+    try skipIfRequested();
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
+    defer pool.deinit();
+
+    var hits: [1031]std.atomic.Value(u32) = undefined;
+
+    const Ctx = struct {
+        hits: []std.atomic.Value(u32),
+        /// One thread dawdles so the others must claim what a fixed split gave it.
+        slow_tid: usize,
+    };
+    const run = struct {
+        fn f(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
+            const c: *Ctx = @ptrCast(@alignCast(ctx_any));
+            if (tid == c.slow_tid) yieldMany(8);
+            for (start..end) |i| _ = c.hits[i].fetchAdd(1, .monotonic);
+        }
+    }.f;
+
+    const shapes = [_][2]usize{ .{ 1, 1 }, .{ 3, 1 }, .{ 4, 0 }, .{ 17, 5 }, .{ 256, 1 }, .{ 1031, 7 }, .{ 1031, 2000 } };
+    for (0..64) |iter| {
+        for (shapes) |shape| {
+            const n = shape[0];
+            for (hits[0..n]) |*h| h.* = .init(0);
+            var ctx: Ctx = .{ .hits = hits[0..n], .slow_tid = iter % 4 };
+            pool.parallelForDynamic(@ptrCast(&ctx), n, shape[1], run);
+            for (hits[0..n]) |*h| try std.testing.expectEqual(@as(u32, 1), h.load(.monotonic));
+
+            // A static job in between must not inherit the claim counter.
+            for (hits[0..n]) |*h| h.* = .init(0);
+            pool.parallelForAny(@ptrCast(&ctx), n, shape[1], run);
+            for (hits[0..n]) |*h| try std.testing.expectEqual(@as(u32, 1), h.load(.monotonic));
+        }
+        // Past the spin budgets now and then, so jobs also land on parked workers.
+        if (iter % 16 == 0) std.Io.sleep(futexIo(), .fromMilliseconds(2), .awake) catch {};
     }
 }
 

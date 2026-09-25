@@ -16,7 +16,7 @@ from .handles import (
     ModelHandle,
     TensorHandle,
 )
-from .status import raise_for_status
+from .status import note_callback_error, raise_for_status
 
 ValueId = NewType("ValueId", int)
 RegionId = NewType("RegionId", int)
@@ -321,13 +321,49 @@ def builder_name(
     raise_for_status(status, ctx, what="aion_builder_name")
 
 
+@ffi.def_extern()
+def _aion_row_fill(user: Any, row0: int, out: Any, count: int) -> int:
+    """The core asking a lazily read weight for rows `row0 ..` (see `LazyWeight`)."""
+    import numpy as np
+
+    try:
+        weight = ffi.from_handle(user)
+        weight.fill(int(row0), np.frombuffer(ffi.buffer(out, int(count) * 4), dtype=np.float32))
+        return 0
+    except BaseException as error:
+        # The op that asked fails, and raises this as its cause.
+        note_callback_error(error)
+        return 1
+
+
 def builder_param_named(
-    ctx: ContextHandle, builder: BuilderHandle, tensor: TensorHandle, name: str
-) -> ValueId:
+    ctx: ContextHandle,
+    builder: BuilderHandle,
+    name: str,
+    *,
+    tensor: TensorHandle | None = None,
+    rows: Any = None,
+    quantize_to: int = 0,
+) -> tuple[ValueId, Any]:
+    """Bind `tensor`, or a weight read by `rows` (a `LazyWeight`). Returns the value
+    and, for `rows`, the handle the caller must keep alive as long as the builder."""
+    weight = ffi.new("AionWeight*")
+    keep: Any = None
+    if tensor is not None:
+        weight.tensor = tensor.raw
+    else:
+        shape = ffi.new("size_t[]", [int(d) for d in rows.shape])
+        keep = (ffi.new_handle(rows), shape)
+        weight.rank = len(rows.shape)
+        weight.shape = shape
+        weight.fill = lib._aion_row_fill
+        weight.user = keep[0]
+    opts = ffi.new("AionParamOptions*")
+    opts.quantize_to = int(quantize_to)
     out = ffi.new("AionValueId*")
-    status = lib.aion_builder_param_named(builder.raw, tensor.raw, _string(name), out)
+    status = lib.aion_builder_param_named(builder.raw, weight, _string(name), opts, out)
     raise_for_status(status, ctx, what="aion_builder_param_named")
-    return ValueId(int(out[0]))
+    return ValueId(int(out[0])), keep
 
 
 def _read_str(fn: Callable[..., int], *args: Any) -> str:

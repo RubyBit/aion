@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const types = @import("types.zig");
+const file_io = @import("io.zig");
 
 const DType = types.DType;
 const ElemwiseBinaryOp = types.ElemwiseBinaryOp;
@@ -45,25 +46,25 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
     var sections: std.ArrayList(EncodedSection) = .empty;
     defer sections.deinit(scratch);
 
-    try sections.append(scratch, .{ .section_type = .strings, .flags = SectionFlags.required, .bytes = try encodeStringsSection(scratch, &interner) });
-    try sections.append(scratch, .{ .section_type = .tensors, .flags = SectionFlags.required, .bytes = try encodeInitializersSection(scratch, &interner, pkg.initializers) });
-    try sections.append(scratch, .{ .section_type = .values, .flags = SectionFlags.required, .bytes = try encodeValuesSection(scratch, pkg.values) });
-    try sections.append(scratch, .{ .section_type = .nodes, .flags = SectionFlags.required, .bytes = try encodeNodesSection(scratch, pkg.nodes) });
-    if (pkg.regions.len != 0) try sections.append(scratch, .{ .section_type = .regions, .flags = 0, .bytes = try encodeRegionsSection(scratch, pkg.regions) });
-    try sections.append(scratch, .{ .section_type = .signatures, .flags = SectionFlags.required, .bytes = try encodeSignaturesSection(scratch, &interner, pkg.inputs, pkg.outputs) });
-    try sections.append(scratch, .{ .section_type = .graph_meta, .flags = SectionFlags.required, .bytes = try encodeGraphMetaSection(scratch, pkg.graphMeta()) });
-    if (pkg.dim_symbols.len != 0) try sections.append(scratch, .{ .section_type = .dim_symbols, .flags = 0, .bytes = try encodeDimSymbolsSection(scratch, &interner, pkg.dim_symbols) });
-    if (pkg.dim_exprs.len != 0) try sections.append(scratch, .{ .section_type = .dim_exprs, .flags = 0, .bytes = try encodeDimExprsSection(scratch, pkg.dim_exprs) });
-    if (pkg.metadata.len != 0) try sections.append(scratch, .{ .section_type = .metadata, .flags = 0, .bytes = try encodeMetadataSection(scratch, &interner, pkg.metadata) });
-    if (pkg.debug_names.len != 0) try sections.append(scratch, .{ .section_type = .debug_names, .flags = 0, .bytes = try encodeDebugNamesSection(scratch, &interner, pkg.debug_names) });
-    if (pkg.io_aliases.len != 0) try sections.append(scratch, .{ .section_type = .io_aliases, .flags = 0, .bytes = try encodeIoAliasesSection(scratch, pkg.io_aliases) });
-    if (pkg.input_roles.len != 0) try sections.append(scratch, .{ .section_type = .input_roles, .flags = 0, .bytes = try encodeInputRolesSection(scratch, pkg.input_roles) });
+    try sections.append(scratch, .{ .section_type = .strings, .flags = SectionFlags.required, .body = .{ .bytes = try encodeStringsSection(scratch, &interner) } });
+    try sections.append(scratch, .{ .section_type = .tensors, .flags = SectionFlags.required, .body = .{ .tensors = .{ .headers = try encodeInitializerHeaders(scratch, &interner, pkg.initializers), .inits = pkg.initializers } } });
+    try sections.append(scratch, .{ .section_type = .values, .flags = SectionFlags.required, .body = .{ .bytes = try encodeValuesSection(scratch, pkg.values) } });
+    try sections.append(scratch, .{ .section_type = .nodes, .flags = SectionFlags.required, .body = .{ .bytes = try encodeNodesSection(scratch, pkg.nodes) } });
+    if (pkg.regions.len != 0) try sections.append(scratch, .{ .section_type = .regions, .flags = 0, .body = .{ .bytes = try encodeRegionsSection(scratch, pkg.regions) } });
+    try sections.append(scratch, .{ .section_type = .signatures, .flags = SectionFlags.required, .body = .{ .bytes = try encodeSignaturesSection(scratch, &interner, pkg.inputs, pkg.outputs) } });
+    try sections.append(scratch, .{ .section_type = .graph_meta, .flags = SectionFlags.required, .body = .{ .bytes = try encodeGraphMetaSection(scratch, pkg.graphMeta()) } });
+    if (pkg.dim_symbols.len != 0) try sections.append(scratch, .{ .section_type = .dim_symbols, .flags = 0, .body = .{ .bytes = try encodeDimSymbolsSection(scratch, &interner, pkg.dim_symbols) } });
+    if (pkg.dim_exprs.len != 0) try sections.append(scratch, .{ .section_type = .dim_exprs, .flags = 0, .body = .{ .bytes = try encodeDimExprsSection(scratch, pkg.dim_exprs) } });
+    if (pkg.metadata.len != 0) try sections.append(scratch, .{ .section_type = .metadata, .flags = 0, .body = .{ .bytes = try encodeMetadataSection(scratch, &interner, pkg.metadata) } });
+    if (pkg.debug_names.len != 0) try sections.append(scratch, .{ .section_type = .debug_names, .flags = 0, .body = .{ .bytes = try encodeDebugNamesSection(scratch, &interner, pkg.debug_names) } });
+    if (pkg.io_aliases.len != 0) try sections.append(scratch, .{ .section_type = .io_aliases, .flags = 0, .body = .{ .bytes = try encodeIoAliasesSection(scratch, pkg.io_aliases) } });
+    if (pkg.input_roles.len != 0) try sections.append(scratch, .{ .section_type = .input_roles, .flags = 0, .body = .{ .bytes = try encodeInputRolesSection(scratch, pkg.input_roles) } });
 
     const dir_offset: usize = header_size;
     const dir_size: usize = sections.items.len * section_desc_size;
     var total_size: usize = dir_offset + dir_size;
     for (sections.items) |section| {
-        total_size = std.math.add(usize, total_size, section.bytes.len) catch return PackageError.InvalidArgument;
+        total_size = std.math.add(usize, total_size, section.body.len()) catch return PackageError.InvalidArgument;
     }
 
     var writer: WriteCursor = .{ .file = file };
@@ -71,10 +72,10 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
 
     var next_offset: usize = dir_offset + dir_size;
     for (sections.items) |section| {
-        try writeSectionDesc(&writer, section.section_type, section.flags, @intCast(next_offset), @intCast(section.bytes.len));
-        next_offset += section.bytes.len;
+        try writeSectionDesc(&writer, section.section_type, section.flags, @intCast(next_offset), @intCast(section.body.len()));
+        next_offset += section.body.len();
     }
-    for (sections.items) |section| try writer.writeAll(section.bytes);
+    for (sections.items) |section| try section.body.write(&writer);
 
     var io_backend: std.Io.Threaded = .init_single_threaded;
     const io = io_backend.io();
@@ -84,7 +85,65 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
 const EncodedSection = struct {
     section_type: SectionType,
     flags: u32,
-    bytes: []u8,
+    body: Body,
+
+    const Body = union(enum) {
+        bytes: []u8,
+        /// Each tensor's encoded header, followed on write by its payload.
+        tensors: struct { headers: []const []const u8, inits: []const Initializer },
+
+        fn len(self: Body) usize {
+            switch (self) {
+                .bytes => |b| return b.len,
+                .tensors => |t| {
+                    var n: usize = @sizeOf(u32);
+                    for (t.headers, t.inits) |h, init| n += h.len + init.data.len();
+                    return n;
+                },
+            }
+        }
+
+        /// About how much of a payload read from a source is held at once.
+        const stream_chunk: usize = 64 << 20;
+
+        /// Payloads read from a source stream through one bounded buffer.
+        fn write(self: Body, writer: *WriteCursor) PackageError!void {
+            const t = switch (self) {
+                .bytes => |b| return writer.writeAll(b),
+                .tensors => |t| t,
+            };
+            var widest: usize = 0;
+            for (t.inits) |init| if (init.data == .source) {
+                widest = @max(widest, @min(init.data.len(), stream_chunk));
+            };
+            const buf = std.heap.page_allocator.alloc(u8, widest) catch return PackageError.OutOfMemory;
+            defer std.heap.page_allocator.free(buf);
+
+            var count: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &count, @intCast(t.inits.len), .little);
+            try writer.writeAll(&count);
+            for (t.headers, t.inits) |h, init| {
+                try writer.writeAll(h);
+                switch (init.data) {
+                    .bytes => |b| try writer.writeAll(b),
+                    .source => |src| {
+                        // Whole units — a quant block, or one element — per read.
+                        const unit: usize = switch (init.encoding) {
+                            .quantized => |q| q.block_bytes,
+                            .plain => |dtype| dtype.info().block_bytes,
+                        };
+                        const chunk = @max(unit, stream_chunk / unit * unit);
+                        var at: usize = 0;
+                        while (at < src.len) : (at += chunk) {
+                            const part = buf[0..@min(chunk, src.len - at)];
+                            try src.read(src.ctx, src.id, at, part);
+                            try writer.writeAll(part);
+                        }
+                    },
+                }
+            }
+        }
+    };
 };
 
 fn encodeStringsSection(allocator: std.mem.Allocator, interner: *const StringInterner) PackageError![]u8 {
@@ -129,11 +188,12 @@ fn encodeDimExprsSection(allocator: std.mem.Allocator, exprs: []const DimExpr) P
     return out.toOwnedSlice(allocator);
 }
 
-fn encodeInitializersSection(allocator: std.mem.Allocator, interner: *const StringInterner, initializers: []const Initializer) PackageError![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try appendInt(&out, allocator, u32, @intCast(initializers.len));
-    for (initializers) |init| {
+/// Each tensor's fields and params, the part of its record before the payload.
+fn encodeInitializerHeaders(allocator: std.mem.Allocator, interner: *const StringInterner, initializers: []const Initializer) PackageError![]const []const u8 {
+    const headers = allocator.alloc([]const u8, initializers.len) catch return PackageError.OutOfMemory;
+    for (initializers, headers) |init, *header| {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
         switch (init.encoding) {
             .plain => |dtype| {
                 try appendInt(&out, allocator, u8, 0);
@@ -145,8 +205,7 @@ fn encodeInitializersSection(allocator: std.mem.Allocator, interner: *const Stri
                 try appendInt(&out, allocator, u32, @intCast(dtype.info().block_bytes));
                 try appendInt(&out, allocator, i32, 0);
                 try appendInt(&out, allocator, u32, 0);
-                try appendInt(&out, allocator, u64, @intCast(init.data.len));
-                try out.appendSlice(allocator, init.data);
+                try appendInt(&out, allocator, u64, @intCast(init.data.len()));
             },
             .quantized => |q| {
                 try appendInt(&out, allocator, u8, 1);
@@ -158,13 +217,13 @@ fn encodeInitializersSection(allocator: std.mem.Allocator, interner: *const Stri
                 try appendInt(&out, allocator, u32, q.block_bytes);
                 try appendInt(&out, allocator, i32, q.quant_axis);
                 try appendInt(&out, allocator, u32, @intCast(q.params.len));
-                try appendInt(&out, allocator, u64, @intCast(init.data.len));
+                try appendInt(&out, allocator, u64, @intCast(init.data.len()));
                 try out.appendSlice(allocator, q.params);
-                try out.appendSlice(allocator, init.data);
             },
         }
+        header.* = out.toOwnedSlice(allocator) catch return PackageError.OutOfMemory;
     }
-    return out.toOwnedSlice(allocator);
+    return headers;
 }
 
 fn encodeValuesSection(allocator: std.mem.Allocator, values: []const ValueRecord) PackageError![]u8 {
@@ -581,9 +640,7 @@ const WriteCursor = struct {
     offset: u64 = 0,
 
     fn writeAll(self: *WriteCursor, bytes: []const u8) PackageError!void {
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        const io = io_backend.io();
-        self.file.writePositionalAll(io, bytes, self.offset) catch return PackageError.IoFailure;
+        try file_io.writeAt(self.file, bytes, self.offset);
         self.offset += @intCast(bytes.len);
     }
 };

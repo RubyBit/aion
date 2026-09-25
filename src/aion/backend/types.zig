@@ -42,7 +42,7 @@ pub const DType = enum(u8) {
             .f32 => .{ .block_elems = 1, .block_bytes = 4, .is_quantized = false },
             .f16 => .{ .block_elems = 1, .block_bytes = 2, .is_quantized = false },
             .i8 => .{ .block_elems = 1, .block_bytes = 1, .is_quantized = false },
-            // ggml-compatible block layouts
+            // Block layouts: an f16 scale, then the block's quantized values.
             .q4_0 => .{ .block_elems = 32, .block_bytes = 18, .is_quantized = true }, // 2B scale + 16B nibbles
             .q8_0 => .{ .block_elems = 32, .block_bytes = 34, .is_quantized = true }, // 2B scale + 32B int8
             .i32 => .{ .block_elems = 1, .block_bytes = 4, .is_quantized = false },
@@ -135,6 +135,82 @@ pub const ReduceOp = enum(u8) {
 pub const PadMode = enum(u8) {
     zero,
     reflect,
+};
+
+/// How an `[n, k]` q8_0 tensor's blocks are laid out inside a tile.
+///
+/// `row_major` is the plain contract: one row is an unbroken run of
+/// `cols / 32` 34-byte blocks. `lanes*` groups `W` rows so an integer dot's `W`
+/// output lanes are `W` rows at once: for each block index, the group holds its
+/// `W` f16 scales, then the 32 quantized values in eight 4-byte chunks, each
+/// chunk with its `W` rows side by side. One `W`-lane dot then covers `W` rows
+/// and the scaling after it is paid once per block for all of them, not once
+/// per row. `W` is whatever the target's kernel reads best — a CPU's dot lane
+/// count, a GPU's 32 threads per 128-byte load. The blocks' bytes are unchanged,
+/// only placed.
+pub const QuantBlockOrder = enum(u8) {
+    row_major,
+    lanes4,
+    lanes8,
+    lanes16,
+    lanes32,
+
+    pub const BLOCK_BYTES: usize = 34;
+    const CHUNK_BYTES: usize = 4;
+    const CHUNKS: usize = 32 / CHUNK_BYTES;
+
+    /// Rows per group: one for `row_major`.
+    pub fn groupRows(self: QuantBlockOrder) usize {
+        return switch (self) {
+            .row_major => 1,
+            .lanes4 => 4,
+            .lanes8 => 8,
+            .lanes16 => 16,
+            .lanes32 => 32,
+        };
+    }
+
+    /// The order grouping `rows` rows, if there is one.
+    pub fn withGroup(rows: usize) ?QuantBlockOrder {
+        return switch (rows) {
+            1 => .row_major,
+            4 => .lanes4,
+            8 => .lanes8,
+            16 => .lanes16,
+            32 => .lanes32,
+            else => null,
+        };
+    }
+
+    /// Byte offset, inside its tile, of the group segment holding row `r`'s
+    /// block `kb`, for rows of `blocks` blocks. A segment is `groupRows()` blocks.
+    fn segment(self: QuantBlockOrder, blocks: usize, r: usize, kb: usize) usize {
+        const g = self.groupRows();
+        return ((r / g) * blocks + kb) * g * BLOCK_BYTES;
+    }
+
+    /// Offset of row `r`'s block `kb` scale.
+    pub fn scaleAt(self: QuantBlockOrder, blocks: usize, r: usize, kb: usize) usize {
+        return self.segment(blocks, r, kb) + (r % self.groupRows()) * 2;
+    }
+
+    /// Offset of row `r`'s block `kb` values `[4 * chunk, 4 * chunk + 4)`.
+    pub fn chunkAt(self: QuantBlockOrder, blocks: usize, r: usize, kb: usize, chunk: usize) usize {
+        const g = self.groupRows();
+        return self.segment(blocks, r, kb) + 2 * g + (chunk * g + r % g) * CHUNK_BYTES;
+    }
+
+    /// Write a whole 34-byte block to its place in `tile`.
+    pub fn storeBlock(self: QuantBlockOrder, tile: []u8, blocks: usize, r: usize, kb: usize, block: []const u8) void {
+        @memcpy(tile[self.scaleAt(blocks, r, kb)..][0..2], block[0..2]);
+        for (0..CHUNKS) |c| @memcpy(tile[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES], block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES]);
+    }
+
+    /// Read a whole 34-byte block back out of `tile`.
+    pub fn loadBlock(self: QuantBlockOrder, tile: []const u8, blocks: usize, r: usize, kb: usize, block: []u8) void {
+        @memcpy(block[0..2], tile[self.scaleAt(blocks, r, kb)..][0..2]);
+        for (0..CHUNKS) |c| @memcpy(block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES], tile[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES]);
+    }
 };
 
 pub const MatMulParams = struct {

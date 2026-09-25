@@ -31,6 +31,12 @@ pub const Tensor = struct {
         return self.id;
     }
 
+    /// Give up the caller's hold. Its data is freed once nothing else holds it — a
+    /// builder, a model it is bound to — and no compiled program reads it.
+    pub fn release(self: Self) void {
+        self.store.releaseHold(self.id);
+    }
+
     pub fn getDType(self: Self) DType {
         return self.dtype;
     }

@@ -32,6 +32,7 @@ pub fn buildPackage(
     outputs: []const NamedTensorRef,
     opts: ExportModelOptions,
 ) !Package {
+    try builder.bindQuantizedParams();
     const graph = builder.innerGraph();
     try infer_mod.infer(graph);
 

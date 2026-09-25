@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// VNNI int8 GEMM for q8_0 / q4_0 weights (compute-bound prefill / large-M).
-//
-// The mainstream quant kernel (`matmul_q.zig`) dequantizes B to f32 and uses
-// f32 FMA, which can never emit a dot-product instruction. This kernel does a
-// genuine int8-accumulate GEMM so it can use VPDPBUSD (x86 AVX-VNNI / AVX-512-VNNI),
-// the unsigned×signed byte dot-product that accumulates 4 products into each i32 lane.
+// The int8 GEMM for q8_0 / q4_0 weights (compute-bound prefill / large-M): A is
+// quantized per block and multiplied with the CPU's byte dot, e.g. VPDPBUSD (x86
+// AVX-VNNI / AVX-512-VNNI), which accumulates 4 byte products into each i32 lane.
 //
 // Math (per 32-element K block):
 //   * Activations A[i,blk] are quantized to int8 with a per-(row,block) scale
@@ -18,9 +15,9 @@
 //   * C[i,j] += a_scale[i,blk]·b_scale[j,blk]·(vpdpbusd − 128·sum_b[j,blk]).
 //
 // `DotEnc` selects emission: `.vex` (AVX-VNNI, runs on Alder/Raptor Lake — no AVX-512),
-// `.evex` (AVX-512-VNNI), or `.portable` (scalar, identical semantics — for tests and
-// any non-VNNI use). The broadcast-A layout is intended to extend to ARM `sdot` via a
-// new `DotEnc` variant later; everything above `dotI8` is ISA-neutral.
+// `.evex` (AVX-512-VNNI), `.avx2` (the AVX2 byte multiplies, below VNNI), `.sdot`
+// (aarch64), or `.portable` (scalar, identical semantics). Everything above `dotI8`
+// is ISA-neutral.
 
 const std = @import("std");
 const types = @import("../../types.zig");
@@ -46,9 +43,10 @@ pub const PB_BLOCK_BYTES: usize = PB_SCALES_BYTES + PB_SUMB_BYTES + PB_Q_BYTES; 
 /// Byte-dot instruction selection:
 ///   * `.vex`  — x86 AVX-VNNI (`{vex} vpdpbusd`), runs on Alder/Raptor Lake.
 ///   * `.evex` — x86 AVX-512-VNNI (`vpdpbusd`).
+///   * `.avx2` — x86 AVX2 without VNNI (`vpmaddubsw` + `vpmaddwd`), signed×signed.
 ///   * `.sdot` — aarch64 FEAT_DotProd (`sdot`), signed×signed.
 ///   * `.portable` — scalar, signed semantics (matches `.sdot`); for tests / any CPU.
-pub const DotEnc = enum { vex, evex, sdot, portable };
+pub const DotEnc = enum { vex, evex, avx2, sdot, portable };
 
 /// True for encodings whose dot is unsigned×signed (x86 VPDPBUSD needs an unsigned
 /// first operand). Those require the `+128` bias on activations and a `-128·Σb`
@@ -89,6 +87,31 @@ pub inline fn dotI8(
                   [s] "x" (b),
                   [acc0] "0" (acc),
             );
+        },
+        .avx2 => {
+            // The weight's sign moves onto `a`, so the unsigned x signed byte multiply
+            // sees |b| (a -128 read as 128) and the pairs fold to fours. Exact while
+            // `a` stays within ±127, which a quantized activation does.
+            const ub = asm ("vpabsb %[b], %[out]"
+                : [out] "=x" (-> @Vector(32, u8)),
+                : [b] "x" (b),
+            );
+            const sa = asm ("vpsignb %[b], %[a], %[out]"
+                : [out] "=x" (-> @Vector(32, i8)),
+                : [a] "x" (a),
+                  [b] "x" (b),
+            );
+            const pairs = asm ("vpmaddubsw %[s], %[u], %[out]"
+                : [out] "=x" (-> @Vector(16, i16)),
+                : [u] "x" (ub),
+                  [s] "x" (sa),
+            );
+            const quads = asm ("vpmaddwd %[ones], %[p], %[out]"
+                : [out] "=x" (-> @Vector(8, i32)),
+                : [p] "x" (pairs),
+                  [ones] "x" (@as(@Vector(16, i16), @splat(1))),
+            );
+            return acc + quads;
         },
         .sdot => return dotSdot(acc, a, b),
         .portable => {
@@ -149,6 +172,61 @@ pub inline fn quantizeABlock(a_blk: [*]align(1) const f32, out_i8: [*]i8) f32 {
         out_i8[t] = @intCast(qi);
     }
     return scale;
+}
+
+/// One q8 block's dot, folded to four lanes.
+///
+/// A block dot's eight lanes get summed by the caller anyway, so folding them
+/// here halves everything that follows it — the widen to f32, the scale, the
+/// accumulate — which is most of the work a q8 matvec does per block. On SDOT
+/// the fold is free: both halves accumulate into the same register.
+pub inline fn dotI8Narrow(
+    comptime enc: DotEnc,
+    acc: @Vector(4, i32),
+    a: @Vector(32, i8),
+    b: @Vector(32, i8),
+) @Vector(4, i32) {
+    if (comptime enc == .sdot) {
+        const aa: [32]i8 = a;
+        const bb: [32]i8 = b;
+        return sdot4(sdot4(acc, aa[0..16].*, bb[0..16].*), aa[16..32].*, bb[16..32].*);
+    }
+    // Callers pass the weight first here; the AVX2 dot needs the activation first.
+    const wide: [8]i32 = if (comptime enc == .avx2) dotI8(enc, @splat(0), b, a) else dotI8(enc, @splat(0), a, b);
+    return acc + @as(@Vector(4, i32), wide[0..4].*) + @as(@Vector(4, i32), wide[4..8].*);
+}
+
+/// One activation block prepared for `dotI8`: the 32 int8s, then the f32 scale
+/// that reconstructs them. Kernels that quantize A up front — the decode matvec
+/// and the NT GEMM — share this slot layout so they can share the helpers below.
+pub const PREP_BLOCK_BYTES: usize = Q8_0_BLOCK_ELEMS + @sizeOf(f32);
+
+/// Quantize `blocks` K blocks of one activation row into consecutive slots.
+pub inline fn prepareARow(out: [*]u8, a_row: [*]align(1) const f32, blocks: usize) void {
+    for (0..blocks) |kb| {
+        const slot = out + kb * PREP_BLOCK_BYTES;
+        const scale: *align(1) f32 = @ptrCast(slot + Q8_0_BLOCK_ELEMS);
+        scale.* = quantizeABlock(a_row + kb * Q8_0_BLOCK_ELEMS, @ptrCast(slot));
+    }
+}
+
+/// The `128 * sum(a)` an unsigned x signed dot has to give back, per lane group.
+/// Signed dots (SDOT, portable) need no correction, so this folds to zero.
+pub inline fn prepBias(comptime enc: DotEnc, slot: [*]const u8) @Vector(8, i32) {
+    if (comptime !encNeedsBias(enc)) return @splat(0);
+    const aq: [*]const i8 = @ptrCast(slot);
+    var bias: @Vector(8, i32) = @splat(0);
+    inline for (0..8) |g| {
+        inline for (0..4) |kk| bias[g] += @as(i32, aq[g * 4 + kk]);
+    }
+    return bias * @as(@Vector(8, i32), @splat(128));
+}
+
+/// `prepBias` folded to match `dotI8Narrow`.
+pub inline fn prepBiasNarrow(comptime enc: DotEnc, slot: [*]const u8) @Vector(4, i32) {
+    if (comptime !encNeedsBias(enc)) return @splat(0);
+    const wide: [8]i32 = prepBias(enc, slot);
+    return @as(@Vector(4, i32), wide[0..4].*) + @as(@Vector(4, i32), wide[4..8].*);
 }
 
 pub const QuantSource = enum { q8_0, q4_0 };
@@ -778,6 +856,25 @@ test "vnni dotI8: vex (unsigned×signed, +128 bias) matches portable signed afte
         }
         const debiased = r_vex - @as(@Vector(8, i32), @splat(128)) * sumb;
         try testing.expect(@reduce(.And, debiased == r_port));
+    }
+}
+
+// The AVX2 dot is exact only while the activation stays within ±127, so the
+// weights here span all of i8, -128 included, and the activations the quantizer's range.
+test "avx2 dotI8 matches portable, in both operand orders" {
+    if (comptime !(builtin.cpu.arch.isX86() and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xA2A2);
+    const rnd = prng.random();
+    for (0..256) |_| {
+        var act: [32]i8 = undefined;
+        var w: [32]i8 = undefined;
+        for (&act) |*x| x.* = rnd.intRangeAtMost(i8, -127, 127);
+        for (&w) |*x| x.* = @bitCast(rnd.int(u8));
+        w[0] = -128;
+        const zero: @Vector(8, i32) = @splat(0);
+        try testing.expect(@reduce(.And, dotI8(.avx2, zero, act, w) == dotI8(.portable, zero, act, w)));
+        const narrow_zero: @Vector(4, i32) = @splat(0);
+        try testing.expect(@reduce(.And, dotI8Narrow(.avx2, narrow_zero, w, act) == dotI8Narrow(.portable, narrow_zero, w, act)));
     }
 }
 

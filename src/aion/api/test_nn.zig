@@ -240,9 +240,7 @@ test "api.nn: GatedMLP silu path multiplies the two projections" {
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
 
-    // in=1, ffn=2. Concatenating gate and up into one wide weight is a fusion the
-    // compiler performs (`opt/horizontal_matmul`), so this layer only ever
-    // describes the two projections and has one code path.
+    // in=1, ffn=2.
     const gate = [_]f32{ 1.0, 2.0 }; // [1, 2]
     const up = [_]f32{ 10.0, 20.0 }; // [1, 2]
     const down = [_]f32{ 1.0, 1.0 }; // [2, 1] sums the two ffn lanes
@@ -267,10 +265,7 @@ test "api.nn: GatedMLP silu path multiplies the two projections" {
 
 test "api.nn: a q8_0 GatedMLP runs against a rank-3 activation" {
     // The shape a real transformer has: a `[batch, seq, dim]` residual stream and
-    // quantized `[1, K, N]` projections. Weights are stored rank-aligned with the
-    // activation, which is also what keeps them eligible for
-    // `opt/horizontal_matmul` (it only fuses *externally bound* weights, and
-    // rank-padding a weight would replace it with an Unsqueeze result).
+    // quantized `[1, K, N]` projections, stored rank-aligned with the activation.
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
@@ -417,8 +412,7 @@ test "api.nn: a symbolic-shape model loads with a 2-D quantized weight" {
         }, .{ .name = "embed" });
         const X = try emb.forward(&fx.bld, Tokens);
 
-        // Exactly one projection: nothing for horizontal fusion to group, so the
-        // quantized weight has to be tiled for the matmul as it was stored.
+        // The quantized weight has to be tiled for the matmul as it was stored.
         const fc = try nn.Linear.bind(&fx.bld, .{
             .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ k, n }, 0, &w_vals),
         }, .{ .name = "fc" });

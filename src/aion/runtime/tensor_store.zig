@@ -17,6 +17,8 @@ pub const SequenceCachePolicyInfo = struct {
     rolling_history_tokens: usize = 0,
 };
 
+pub const QuantBlockOrder = types.QuantBlockOrder;
+
 pub const TensorMeta = struct {
     dtype: types.DType,
     rank: u8,
@@ -24,6 +26,8 @@ pub const TensorMeta = struct {
     tile_shape: []const usize,
     tile_counts: []const usize,
     tile_strides: []const usize,
+    /// Only ever grouped on a tensor a layout pass derived; never serialized.
+    block_order: QuantBlockOrder = .row_major,
 };
 
 pub const INLINE_RANK: usize = 8;
@@ -264,7 +268,7 @@ pub const max_rank: usize = 8;
 /// convenience: the alternative — rank-padding the weight with a view op — is a
 /// materializing copy that quantized tensors cannot express at all, and it replaces
 /// an externally-bound weight with a node result, costing it eligibility for
-/// horizontal matmul fusion.
+/// weight-layout passes.
 ///
 /// Supplying an explicit mask is important for growable tensors: physical
 /// capacity may exceed the graph-specialized logical extent.

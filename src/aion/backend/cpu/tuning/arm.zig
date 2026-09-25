@@ -18,10 +18,12 @@ pub fn detect() cpuid_root.CpuInfo {
         const HWCAP_ASIMDDP = 1 << 20;
         const HWCAP2_I8MM = 1 << 13;
         const HWCAP2_SME = 1 << 23;
+        const HWCAP2_SME2 = 1 << 37;
 
         info.features.dotprod = (hwcaps & HWCAP_ASIMDDP) != 0;
         info.features.i8mm = (hwcaps2 & HWCAP2_I8MM) != 0;
         info.features.sme = (hwcaps2 & HWCAP2_SME) != 0;
+        info.features.sme2 = (hwcaps2 & HWCAP2_SME2) != 0;
     } else if (builtin.os.tag == .windows) {
         const kernel32 = struct {
             extern "kernel32" fn IsProcessorFeaturePresent(feature: u32) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
@@ -31,6 +33,7 @@ pub fn detect() cpuid_root.CpuInfo {
         info.features.dotprod = sysctlBool("hw.optional.arm.FEAT_DotProd");
         info.features.i8mm = sysctlBool("hw.optional.arm.FEAT_I8MM");
         info.features.sme = sysctlBool("hw.optional.arm.FEAT_SME");
+        info.features.sme2 = sysctlBool("hw.optional.arm.FEAT_SME2");
     }
 
     info.caches = detectCaches();

@@ -70,7 +70,7 @@ pub const Params = struct {
         comptime assertParameter(W, field);
         const name = @tagName(field);
         const t = try self.resolve(bld, name) orelse return error.InvalidArgument;
-        return bld.paramNamed(t, name);
+        return bld.paramNamed(t, name, .{});
     }
 
     /// Bind an optional parameter (a bias a model may not have), or null.
@@ -78,7 +78,7 @@ pub const Params = struct {
         comptime assertParameter(W, field);
         const name = @tagName(field);
         const t = try self.resolve(bld, name) orelse return null;
-        return try bld.paramNamed(t, name);
+        return try bld.paramNamed(t, name, .{});
     }
 
     /// Whether the source has `<outer>/<leaf>`, without binding anything.

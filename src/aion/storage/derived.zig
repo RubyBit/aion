@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //! Provenance for weights an optimization pass derived from other weights.
 //!
-//! A pass that rewrites weights (concatenating, folding, repacking) makes the derived
+//! A pass that rewrites weights (retiling, repacking) makes the derived
 //! tensor the canonical store and lets the model layer reclaim the sources. Two things
 //! then have to keep working: a weight swap must land where the program reads, and a read
 //! must materialize a weight that no longer has storage of its own.
@@ -19,22 +19,54 @@
 const std = @import("std");
 
 const storage = @import("storage.zig");
+const types = @import("../backend/types.zig");
 
 const StorageError = storage.StorageError;
 const DeviceRef = storage.DeviceRef;
 const TensorId = u32;
 
-pub const Kind = enum { column_concat, retile };
+pub const Kind = enum { retile, relayout };
 
-/// One source's bytes inside a derived tensor, in packed block space: each row of the
-/// derived tensor holds `row_stride` blocks, of which this source owns
-/// `[offset, offset+len)`.
+/// How a source's blocks are arranged inside the derived tensor.
+pub const Mapping = union(enum) {
+    /// Derived row `r` holds this source's blocks at `[offset, offset+len)`, so a
+    /// source is a vertical stripe of the result.
+    stripe,
+    /// A weight re-laid by `opt/weight_layout`, which no stripe describes.
+    relayout: Relayout,
+};
+
+/// The derived tensor is `[len, rows]` blocks: row `c` holds all `rows` blocks of
+/// output column `c`, in `order` inside tiles of `tile_rows` rows.
+pub const Relayout = struct {
+    /// The source is block-major `[rows, len]` — its block `(kb, c)` is derived
+    /// block `(c, kb)`. Otherwise it is already `[len, rows]`.
+    transposed: bool,
+    order: types.QuantBlockOrder,
+    tile_rows: usize,
+
+    /// Byte offset of the tile holding column `c`, and `c`'s row inside it; the
+    /// order places the blocks within the tile.
+    pub fn tileOf(self: Relayout, blocks: usize, c: usize) struct { base: usize, row: usize } {
+        const row = c % self.tile_rows;
+        return .{ .base = (c - row) * blocks * types.QuantBlockOrder.BLOCK_BYTES, .row = row };
+    }
+
+    /// Source block index of column `c`'s block `kb`, for `cols` columns.
+    pub fn sourceAt(self: Relayout, blocks: usize, cols: usize, c: usize, kb: usize) usize {
+        return if (self.transposed) kb * cols + c else c * blocks + kb;
+    }
+};
+
+/// One source's bytes inside a derived tensor, in packed block space. The source
+/// occupies `rows * len` blocks either way; `mapping` says where they land.
 pub const View = struct {
     rows: usize,
     row_stride: usize,
     offset: usize,
     len: usize,
     block_bytes: usize,
+    mapping: Mapping = .stripe,
 
     pub fn sourceBytes(self: View) usize {
         return self.rows * self.len * self.block_bytes;

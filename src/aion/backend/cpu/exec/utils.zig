@@ -36,19 +36,23 @@ pub fn tileByteSize(meta: tensor_store.TensorMeta) usize {
     };
 }
 
-/// Heuristic: parallelize tiled ops when either (a) we have enough tiles to hand out
-/// work, or (b) the total byte volume is large enough to amortize scheduling overhead.
+/// How far under `min_total_bytes` the tile-count fallback still applies.
+const PARALLEL_FALLBACK_RATIO: usize = 4;
+
+/// Heuristic: parallelize tiled ops when either (a) the total byte volume is large
+/// enough to amortize scheduling overhead outright, or (b) it is within
+/// `PARALLEL_FALLBACK_RATIO` of that and there are enough tiles to hand out.
 pub fn shouldParallelTiles(thread_count: usize, tile_total: usize, tile_bytes: usize, min_total_bytes: usize) bool {
     if (thread_count <= 1) return false;
     if (tile_total == 0) return false;
     const total_bytes: usize = tile_bytes * tile_total;
     if (total_bytes >= min_total_bytes) return true;
-    // For small total byte volumes, avoid parallel launch overhead unless we have
-    // enough tiles to keep a meaningful subset of workers busy.
-    //
-    // Previous logic (`tile_total >= 2`) was too eager on high-thread-count CPUs,
-    // especially in decode-time graphs with many tiny ops, and could regress
-    // throughput due to synchronization/scheduling overhead.
+    // Below that, having tiles to hand out is not the same as having work to do.
+    // A decode activation is a few kilobytes and still tiles into eights, so
+    // counting tiles alone forked every norm, rope and residual across every
+    // worker: at six threads that turned 2.6 ms of per-token work into 7.6 ms.
+    // So the fallback also wants a fraction of the volume, not just the count.
+    if (total_bytes * PARALLEL_FALLBACK_RATIO < min_total_bytes) return false;
     const half_threads_ceil: usize = (thread_count + 1) / 2;
     const min_tiles_for_parallel: usize = @max(@as(usize, 2), @min(@as(usize, 8), half_threads_ceil));
     return tile_total >= min_tiles_for_parallel;

@@ -196,6 +196,14 @@ pub const Model = struct {
 
     const Self = @This();
 
+    /// Bind `t` to input `index`: the model holds what it has bound, and lets go of
+    /// what it replaces.
+    fn setBoundInput(self: *Self, index: usize, t: Tensor) void {
+        self.store.holdTensor(t.id);
+        if (self.bound_inputs[index]) |old| old.release();
+        self.bound_inputs[index] = t;
+    }
+
     fn debugDumpBoundInputs(self: *const Self, trace: bool) void {
         if (!trace) return;
         std.debug.print("[aion][run] bound inputs (name -> dtype/shape/tile):\n", .{});
@@ -225,6 +233,7 @@ pub const Model = struct {
         for (self.cache_entries.items) |*entry| self.destroyCacheEntry(entry);
         self.cache_entries.deinit(self.allocator);
         self.session.deinit();
+        for (self.params.by_value) |tid| if (tid != params_mod.invalid) self.store.releaseHold(tid);
         self.params.deinit(self.allocator);
         self.allocator.free(self.input_signatures);
         self.allocator.free(self.output_signatures);
@@ -232,6 +241,7 @@ pub const Model = struct {
         self.allocator.free(self.input_alias_output_indices);
         self.allocator.free(self.output_alias_input_indices);
         self.allocator.free(self.output_host_mirror_tids);
+        for (self.bound_inputs) |t| if (t) |bound| bound.release();
         self.allocator.free(self.bound_inputs);
         self.allocator.free(self.aliased_input_bind_versions);
         self.allocator.free(self.auto_input_tids);
@@ -354,9 +364,9 @@ pub const Model = struct {
         if (old_tid == new_tid) return;
         if (self.store.tensorIsWorkspace(new_tid) catch true) return api_errors.ApiError.InvalidArgument;
 
-        // A fused weight isn't referenced by the program (the combined tensor is), so
-        // retargeting its id would patch nothing. Write the new contents through to
-        // the fused weight's sub-region instead; the alias mapping stays put.
+        // A derived-away weight isn't referenced by the program (the derived tensor is),
+        // so retargeting its id would patch nothing. Write the new contents through
+        // its recorded view instead.
         if (self.store.derivedLocate(old_tid) != null) {
             return self.store.writeDerivedSource(old_tid, new_tid) catch api_errors.ApiError.InvalidArgument;
         }
@@ -365,6 +375,9 @@ pub const Model = struct {
         if (!ok) return api_errors.ApiError.InvalidArgument;
 
         self.params.set(value_index, new_tid);
+        // A model holds every weight it names (see `init`), so it swaps holds too.
+        self.store.holdTensor(new_tid);
+        self.store.releaseHold(old_tid);
         for (self.cache_entries.items) |*entry| {
             retarget.retargetProgramTensorIds(&entry.program, old_tid, new_tid);
             // The program now names `new_tid` where it named `old_tid`, and reclaim
@@ -442,7 +455,7 @@ pub const Model = struct {
             diag.recordInput(.{ .code = "InputRankMismatch", .name = sig.name, .want_dtype = @tagName(sig.dtype), .want_rank = sig.rank, .got_dtype = @tagName(tensor.dtype), .got_shape = tensor.shape });
             return api_errors.ApiError.InvalidArgument;
         }
-        self.bound_inputs[index] = tensor;
+        self.setBoundInput(index, tensor);
         // A manual bind on a role-driven control input permanently reclaims it from
         // position auto-management (the escape hatch for custom schedules).
         self.role_auto_bound[index] = false;
@@ -1188,6 +1201,10 @@ pub const Model = struct {
         const session = try backend.createSession(store.tensorStore());
         errdefer session.deinit();
 
+        // Programs are compiled per shape and can be evicted, so it is the model, not
+        // any one program, that keeps its weights: it holds each for its lifetime.
+        for (params.by_value) |tid| if (tid != params_mod.invalid) store.holdTensor(tid);
+
         return .{
             .allocator = allocator,
             .backend = backend,
@@ -1334,7 +1351,7 @@ pub const Model = struct {
         const meta = self.store.getConst(tid) catch return error.InvalidArgument;
         const t = Tensor{ .store = self.store, .id = tid, .dtype = .i32, .shape = meta.shape };
         t.write(values) catch return error.InvalidArgument;
-        self.bound_inputs[index] = t;
+        self.setBoundInput(index, t);
         self.role_auto_bound[index] = true;
     }
 
@@ -1466,7 +1483,7 @@ pub const Model = struct {
 
             const tid = self.auto_input_tids[i];
             const meta = try self.store.getConst(tid);
-            self.bound_inputs[i] = .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape };
+            self.setBoundInput(i, .{ .store = self.store, .id = tid, .dtype = meta.dtype, .shape = meta.shape });
 
             // Seed the zero slot into the cache entry exactly once; from then on the
             // alias sync carries state. Bumping only on a fresh allocation avoids

@@ -46,6 +46,26 @@ fn alignUp(n: usize) usize {
     return (n + COPY_ALIGN - 1) / COPY_ALIGN * COPY_ALIGN;
 }
 
+/// Walks D2H regions in pieces that fit what is left of a staging budget. A
+/// partial piece is a whole number of words, since the budget left always is.
+const PieceCursor = struct {
+    region: usize = 0,
+    at: usize = 0,
+
+    const Piece = struct { region: usize, at: usize, len: usize };
+
+    fn next(self: *PieceCursor, regions: []const dm.D2HRegion, room: usize) ?Piece {
+        while (self.region < regions.len and self.at == regions[self.region].dst.len) {
+            self.region += 1;
+            self.at = 0;
+        }
+        if (self.region == regions.len or room == 0) return null;
+        const piece: Piece = .{ .region = self.region, .at = self.at, .len = @min(regions[self.region].dst.len - self.at, room) };
+        self.at += piece.len;
+        return piece;
+    }
+};
+
 const dm = @import("../../runtime/device_memory.zig");
 const profile = @import("../../profile.zig");
 const DeviceMemory = dm.DeviceMemory;
@@ -172,19 +192,31 @@ pub const WgpuDeviceMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
         if (dst_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
-        // A trailing 1..3 bytes go as one zero-padded word (`alloc` left room).
+        // wgpu stages each write whole, so a tile goes in pieces: one large weight
+        // must not hold a staging copy of itself beside its host and device ones.
         const head = src.len / COPY_ALIGN * COPY_ALIGN;
-        if (head != 0) fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset), src.ptr, head);
+        var at: usize = 0;
+        while (at < head) {
+            const n = @min(head - at, H2D_FLUSH_BYTES);
+            fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset + at), src.ptr + at, n);
+            self.noteStaged(n);
+            at += n;
+        }
+        // A trailing 1..3 bytes go as one zero-padded word (`alloc` left room).
         if (head != src.len) {
             var word: [COPY_ALIGN]u8 = @splat(0);
             @memcpy(word[0 .. src.len - head], src[head..]);
             fns.wgpuQueueWriteBuffer(self.gpu.queue, buf, @intCast(dst_offset + head), &word, word.len);
+            self.noteStaged(word.len);
         }
-        // Bound wgpu's write-staging: an empty submit flushes the pending
-        // writes, the wait lets wgpu recycle their staging buffers. Ordering is
-        // unaffected (writeBuffer data was already ordered before any later
-        // submit), so this is safe even mid-frame.
-        self.h2d_since_flush += src.len;
+    }
+
+    /// Bound wgpu's write-staging: an empty submit flushes the pending writes, the
+    /// wait lets wgpu recycle their staging buffers. Ordering is unaffected
+    /// (writeBuffer data was already ordered before any later submit), so this is
+    /// safe even mid-frame.
+    fn noteStaged(self: *Self, bytes: usize) void {
+        self.h2d_since_flush += bytes;
         if (self.h2d_since_flush >= H2D_FLUSH_BYTES) {
             fns.wgpuQueueSubmit(self.gpu.queue, 0, null);
             _ = fns.wgpuDevicePoll(self.gpu.device, 1, null);
@@ -200,8 +232,8 @@ pub const WgpuDeviceMemory = struct {
     /// Read any set of device regions in as few waits as the staging budget
     /// allows. Mapping a buffer costs a full device round trip regardless of
     /// size, so the batch — not the region — is what we sync on. Regions need
-    /// not be related, ordered, or contiguous; an over-budget batch is chunked,
-    /// and a single region larger than the budget simply gets its own chunk.
+    /// not be related, ordered, or contiguous; one larger than the budget is read
+    /// in budget-sized pieces, so the pooled staging buffer never outgrows it.
     fn copyD2HMany(ctx: *anyopaque, regions: []const dm.D2HRegion) DeviceError!void {
         const t0: u64 = if (profile.capture_transfers) profile.nowNs() else 0;
         defer if (profile.capture_transfers) {
@@ -210,36 +242,29 @@ pub const WgpuDeviceMemory = struct {
             profile.recordTransfer(.d2h, moved, profile.nowNs() - t0);
         };
         const self: *Self = @ptrCast(@alignCast(ctx));
-        var i: usize = 0;
-        while (i < regions.len) {
+        for (regions) |r| if (r.src_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
+
+        var cur: PieceCursor = .{};
+        while (true) {
+            // Plan one chunk; the copy and read passes replay it from `start`.
+            const start = cur;
             var staged: usize = 0;
-            var end: usize = i;
-            while (end < regions.len) : (end += 1) {
-                const r = regions[end];
-                if (r.dst.len == 0) continue;
-                if (r.src_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
-                // Stage whole words (`alloc` rounded each source up).
-                const need = alignUp(r.dst.len);
-                if (staged != 0 and staged + need > D2H_STAGE_MAX) break;
-                staged += need;
-            }
-            if (staged == 0) {
-                i = end;
-                continue;
-            }
+            while (cur.next(regions, D2H_STAGE_MAX - staged)) |piece| staged += alignUp(piece.len);
+            if (staged == 0) return;
             const staging = try self.ensureStaging(staged);
 
             const enc = fns.wgpuDeviceCreateCommandEncoder(self.gpu.device, null);
+            var walk = start;
             var off: usize = 0;
-            for (regions[i..end]) |r| {
-                if (r.dst.len == 0) continue;
+            while (off < staged) {
+                const piece = walk.next(regions, D2H_STAGE_MAX - off).?;
+                const r = regions[piece.region];
                 const buf = self.bufFor(r.handle) orelse {
                     fns.wgpuCommandEncoderRelease(enc);
                     return DeviceError.InvalidArgument;
                 };
-                const need = alignUp(r.dst.len);
-                fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(r.src_offset), staging, @intCast(off), need);
-                off += need;
+                fns.wgpuCommandEncoderCopyBufferToBuffer(enc, buf, @intCast(r.src_offset + piece.at), staging, @intCast(off), alignUp(piece.len));
+                off += alignUp(piece.len);
             }
             const cmd = fns.wgpuCommandEncoderFinish(enc, null);
             fns.wgpuCommandEncoderRelease(enc);
@@ -251,14 +276,14 @@ pub const WgpuDeviceMemory = struct {
             self.gpu.mapBlocking(staging, c.WGPUMapMode_Read, 0, staged) catch return DeviceError.InvalidArgument;
             const mapped = fns.wgpuBufferGetConstMappedRange(staging, 0, staged) orelse return DeviceError.InvalidArgument;
             const base: [*]const u8 = @ptrCast(mapped);
-            var read: usize = 0;
-            for (regions[i..end]) |r| {
-                if (r.dst.len == 0) continue;
-                self.copyHostBytes(r.dst, base[read .. read + r.dst.len]);
-                read += alignUp(r.dst.len);
+            walk = start;
+            off = 0;
+            while (off < staged) {
+                const piece = walk.next(regions, D2H_STAGE_MAX - off).?;
+                self.copyHostBytes(regions[piece.region].dst[piece.at..][0..piece.len], base[off .. off + piece.len]);
+                off += alignUp(piece.len);
             }
             fns.wgpuBufferUnmap(staging);
-            i = end;
         }
     }
 

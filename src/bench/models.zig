@@ -108,10 +108,6 @@ pub const DecodeOptions = struct {
     /// Replace components with shape-preserving no-ops to measure their marginal cost
     /// in the full dependent decode step.
     ablate: Ablate = .{},
-    /// Passes to switch OFF, on top of the target defaults. Exposed so the bench can
-    /// size what a pass costs as well as what it saves: horizontal MatMul fusion buys
-    /// one wide GEMV but pays 115 more SliceND dispatches per token.
-    disable: aion.program.OptPolicy = .empty,
 };
 
 pub const Ablate = struct {
@@ -254,7 +250,7 @@ const Ctx = struct {
     /// whether its bytes belong in the roofline: the token table does (it is the
     /// tied logits head), the per-layer table does not (one gathered row per token).
     fn table(self: *Ctx, v_rows: usize, d: usize, streamed: bool) !ValueId {
-        const tile = tiling.chooseQuantEmbeddingTableTiles(self.policy, .q8_0, v_rows, d);
+        const tile = tiling.chooseQuantRowTiles(self.policy, .q8_0, v_rows, d);
         const id = try self.mgr.createTiledTensor(.q8_0, &.{ v_rows, d }, &tile, .{
             .tile_alignment = self.policy.tile_alignment,
             .quant_axis = 1,
@@ -472,8 +468,7 @@ pub fn gemma4E2BDecode(
 
         const x_norm = try ctx.rms(x, embed);
 
-        // Q/K/V stay separate here, as the checkpoint ships them; fusing them is
-        // `opt/horizontal_matmul`'s job and part of what this bench measures.
+        // Q/K/V stay separate here, as the checkpoint ships them.
         var q = try g.addMatMul(x_norm, try ctx.weight(embed, q_width), 1.0, 0.0);
         q = try g.addViewReshape(q, &.{ bsz, seq, G4.num_heads, hd });
         q = try ctx.rms(q, hd);
@@ -512,8 +507,8 @@ pub fn gemma4E2BDecode(
         o = try g.addMatMul(o, try ctx.weight(q_width, embed), 1.0, 0.0);
         x = try g.addElemwiseBinary(.add, x, try ctx.rms(o, embed));
 
-        // Match the model's separate gate/up projections and authored GEGLU gate so
-        // horizontal matmul fusion sees the production graph pattern.
+        // Match the model's separate gate/up projections and authored GEGLU gate, so
+        // the passes see the production graph pattern.
         const ff_in = try ctx.rms(x, embed);
         const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
         const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
@@ -552,10 +547,7 @@ pub fn gemma4E2BDecode(
     }
     try g.setOutputs(&.{out_v});
 
-    // The bench ablates passes by name (`--no-hfuse` and friends).
-    var bench_target: aion.program.Target = .init(target, policy);
-    bench_target.passes.setIntersection(opts.disable.complement());
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, bench_target);
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(target, policy));
     return .{ .prog = prog, .out = prog.outputs[0], .stats = stats };
 }
 

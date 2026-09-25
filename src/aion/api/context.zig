@@ -43,6 +43,25 @@ pub const InputRoleDecl = api_package_export.InputRoleDecl;
 pub const InputRoleKind = package_file.InputRoleKind;
 pub const ExportModelOptions = api_package_export.ExportModelOptions;
 pub const CompileOptions = api_package_export.CompileOptions;
+
+/// Where a weight's f32 values come from when it is quantized, read a chunk of rows
+/// at a time (a row is its last axis): values in hand, a host f32 tensor, or rows a
+/// caller fills on demand — from a checkpoint on disk, say — so a whole f32 copy of
+/// the weight never has to exist.
+pub const RowSource = union(enum) {
+    values: []const f32,
+    tensor: api_tensor.Tensor,
+    reader: Reader,
+
+    pub const Reader = struct {
+        ctx: *anyopaque,
+        /// Fill `out` with rows `row0 ..` (whole rows, row-major).
+        fill: *const fn (ctx: *anyopaque, row0: usize, out: []f32) error{Failed}!void,
+    };
+};
+
+/// About how many f32 values one quantization chunk holds: 16 MiB.
+const quant_chunk_elems: usize = 4 << 20;
 pub const CacheConfig = cache_mod.CacheConfig;
 pub const CachePolicy = cache_mod.CachePolicy;
 pub const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
@@ -106,12 +125,9 @@ pub const Context = struct {
             .allocator = allocator,
             .cpu = cpu,
             .store = sm,
-            // A quantized weight is tiled once, where it is created, and can never be
-            // re-tiled — so on a context that registers a GPU, author for the GPU:
-            // that is what the weight is there to run on. Scalar tensors are
-            // re-tileable either way, so a CPU model here costs a copy, not a failure.
-            .policy = opts.tile_policy_override orelse
-                plan_mod.tilePolicyForTarget(if (opts.gpus.len != 0) .webgpu else .cpu),
+            // Scalar tensors are re-tileable either way, so a CPU model on a GPU
+            // context costs a copy, not a failure (see `cpuPolicy`).
+            .policy = opts.tile_policy_override orelse cpuPolicy(&cpu, opts),
             .gpu_devices = if (build_options.enable_gpu) &.{} else {},
             .device_entries = &.{},
         };
@@ -172,6 +188,17 @@ pub const Context = struct {
                 } else return error.InvalidArgument;
             },
         }
+    }
+
+    /// A quantized weight is tiled once, where it is created, and can never be
+    /// re-tiled — so on a context that registers a GPU, author for the GPU: that
+    /// is what the weight is there to run on. Otherwise lay weights out the way
+    /// this CPU's kernels read them.
+    fn cpuPolicy(cpu: *const cpu_backend_mod.CpuBackend, opts: Options) plan_mod.TilePolicy {
+        if (opts.gpus.len != 0) return plan_mod.tilePolicyForTarget(.webgpu);
+        var p = plan_mod.tilePolicyForTarget(.cpu);
+        p.quant_block_order = cpu.quantBlockOrder();
+        return p;
     }
 
     /// `init` alias kept for callers/tests that name the CPU path explicitly.
@@ -285,26 +312,17 @@ pub const Context = struct {
         // Resolve the target device: its backend runs the model and its tile policy
         // shapes both the imported weights and the per-shape JIT compiles.
         const dev = try self.resolveDevice(opts.device);
-        // `parseTakeOwned` transfers ownership of `bytes` into the returned Package
-        // (Initializer.data slices borrow into it). `pkg.deinit` frees the buffer.
-        const bytes = try package_file.readAlloc(self.allocator, file);
-        // `parseTakeOwned` consumes `bytes` unconditionally (frees on error,
-        // transfers ownership to `pkg` on success), so we don't guard `bytes` with
-        // its own errdefer — that would double-free with `pkg.deinit()` / the
-        // streaming import's `releaseSourceBytes()`. Nothing between here and the
-        // call below can fail.
-        const hash = std.hash.Wyhash.hash(0, bytes);
-        var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
-        errdefer pkg.deinit();
-        // Stream weights into the store one initializer at a time, reading each back
-        // from the file and releasing the whole-file buffer up front. This keeps peak
-        // RSS at ~1x the weight size instead of ~2x (the file image and the populated
-        // store never coexist). `importInitializersStreaming` consumes `bytes` via
-        // `pkg.releaseSourceBytes()`, so the `bytes` errdefer above is now a no-op
-        // (frees an emptied buffer) and `pkg.deinit()` owns any later teardown.
-        var params = try api_initializers.importParamsStreaming(self.allocator, &self.store, dev.policy, &pkg, file, bytes);
+        var mapped = try package_file.MappedPackage.open(self.allocator, file);
+        errdefer mapped.package.deinit();
+        const hash, var params = import: {
+            // The weights are copied from the mapping into the store, which is all the
+            // mapping is for: it goes when they are in.
+            defer mapped.unmap();
+            const hash = std.hash.Wyhash.hash(0, mapped.bytes());
+            break :import .{ hash, try api_initializers.importParams(self.allocator, &self.store, dev.policy, &mapped.package, dev.ref) };
+        };
         errdefer params.deinit(self.allocator);
-        return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = pkg }, params, hash, opts);
+        return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = mapped.package }, params, hash, opts);
     }
 
     /// Load an AION package as a weights-only container.
@@ -312,14 +330,15 @@ pub const Context = struct {
     /// This parses the package and imports initializer tensors into the current
     /// context's storage, but does not instantiate or run the package graph.
     pub fn loadWeights(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!Weights {
-        const bytes = try package_file.readAlloc(self.allocator, file);
-        errdefer self.allocator.free(bytes);
-        const hash = std.hash.Wyhash.hash(0, bytes);
-        var pkg = try package_file.parseTakeOwned(self.allocator, bytes);
-        errdefer pkg.deinit();
-        var params = try api_initializers.importParams(self.allocator, &self.store, self.policy, &pkg);
+        var mapped = try package_file.MappedPackage.open(self.allocator, file);
+        errdefer mapped.package.deinit();
+        const hash, var params = import: {
+            defer mapped.unmap();
+            const hash = std.hash.Wyhash.hash(0, mapped.bytes());
+            break :import .{ hash, try api_initializers.importParams(self.allocator, &self.store, self.policy, &mapped.package, .{}) };
+        };
         errdefer params.deinit(self.allocator);
-        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, pkg, params, hash);
+        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, mapped.package, params, hash);
     }
 
     pub fn loadModelPath(self: *Self, path: []const u8, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
@@ -363,6 +382,7 @@ pub const Context = struct {
         try api_tiling.fillDefaultTileShape(self.policy, dtype, shape, tile_slice);
 
         const tid: manager_mod.TensorId = try self.store.createTiledTensor(dtype, shape, tile_slice, .{ .tile_alignment = self.policy.tile_alignment });
+        self.store.trackHolders(tid);
         const t = try self.store.getConst(tid);
         return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
@@ -370,6 +390,7 @@ pub const Context = struct {
     /// Create a new tensor with an explicit tile shape.
     pub fn tensorTiled(self: *Self, dtype: DType, shape: []const usize, tile_shape: []const usize) api_errors.ApiError!api_tensor.Tensor {
         const tid: manager_mod.TensorId = try self.store.createTiledTensor(dtype, shape, tile_shape, .{ .tile_alignment = self.policy.tile_alignment });
+        self.store.trackHolders(tid);
         const t = try self.store.getConst(tid);
         return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
@@ -389,6 +410,13 @@ pub const Context = struct {
     /// compiler: quantized tensors are the one thing `ensureTilingMaybeRetile`
     /// refuses to re-tile, so a wrong tiling here is a compile error at first use.
     pub fn fromPackedQuant(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
+        var t = try self.quantTensor(dtype, shape, quant_axis);
+        try t.writePackedQuant(packed_bytes);
+        return t;
+    }
+
+    /// An empty block-quantized tensor, tiled by the shared chooser.
+    fn quantTensor(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize) api_errors.ApiError!api_tensor.Tensor {
         if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
         if (quant_axis >= shape.len) return api_errors.ApiError.InvalidArgument;
         if (shape.len > api_tiling.MAX_RANK) return api_errors.ApiError.InvalidArgument;
@@ -404,24 +432,74 @@ pub const Context = struct {
             tile_shape,
             .{ .tile_alignment = self.policy.tile_alignment, .quant_axis = @intCast(quant_axis) },
         );
+        self.store.trackHolders(tid);
         const ct = try self.store.getConst(tid);
-        var t0: api_tensor.Tensor = .{ .store = &self.store, .id = tid, .dtype = ct.dtype, .shape = ct.shape };
-        try t0.writePackedQuant(packed_bytes);
-        return t0;
+        return .{ .store = &self.store, .id = tid, .dtype = ct.dtype, .shape = ct.shape };
     }
 
     /// Author a block-quantized tensor from row-major f32 `values`, blocking
     /// along `quant_axis` (the matmul-B K axis is rank-2; an embedding table
     /// blocked along its feature dim uses the last axis).
     pub fn fromF32Quantized(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, values: []const f32) api_errors.ApiError!api_tensor.Tensor {
-        if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
-        const packed_bytes: []u8 = quantize_mod.quantizeF32(self.allocator, dtype, shape, quant_axis, values) catch |e| return switch (e) {
-            error.OutOfMemory => api_errors.ApiError.OutOfMemory,
-            error.Unsupported => api_errors.ApiError.UnsupportedFeature,
-            error.InvalidArgument => api_errors.ApiError.InvalidArgument,
-        };
-        defer self.allocator.free(packed_bytes);
-        return self.fromPackedQuant(dtype, shape, quant_axis, packed_bytes);
+        return self.quantize(dtype, shape, quant_axis, .{ .values = values });
+    }
+
+    /// Quantize a weight's f32 `source` into a new tensor of `dtype`, blocking along
+    /// `quant_axis`, a bounded chunk of rows at a time and straight into its tiles:
+    /// neither the whole f32 weight nor its packed bytes are ever held a second time.
+    pub fn quantize(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, source: RowSource) api_errors.ApiError!api_tensor.Tensor {
+        var total: usize = 1;
+        for (shape) |d| total = std.math.mul(usize, total, d) catch return api_errors.ApiError.InvalidArgument;
+        switch (source) {
+            .values => |v| if (v.len != total) return api_errors.ApiError.InvalidArgument,
+            .tensor => |t| if (t.dtype != .f32 or !std.mem.eql(usize, t.shape, shape)) return api_errors.ApiError.InvalidArgument,
+            .reader => {},
+        }
+        const t = try self.quantTensor(dtype, shape, quant_axis);
+        errdefer t.release();
+
+        // A chunk is whole rows and whole blocks: any rows when blocks run along a row,
+        // else 32 steps of the quant axis over everything inside it.
+        const di = dtype.info();
+        const row_len = shape[shape.len - 1];
+        var group: usize = 1;
+        if (quant_axis != shape.len - 1) {
+            group = di.block_elems;
+            for (shape[quant_axis + 1 .. shape.len - 1]) |d| group *= d;
+        }
+        const rows = total / row_len;
+        const chunk_rows = @max(group, (quant_chunk_elems / row_len) / group * group);
+        const chunk_elems = @min(chunk_rows, rows) * row_len;
+
+        const staged: []f32 = if (source == .values) &.{} else self.allocator.alloc(f32, chunk_elems) catch return api_errors.ApiError.OutOfMemory;
+        defer if (source != .values) self.allocator.free(staged);
+        const packed_chunk = self.allocator.alloc(u8, chunk_elems / di.block_elems * di.block_bytes) catch return api_errors.ApiError.OutOfMemory;
+        defer self.allocator.free(packed_chunk);
+
+        var row0: usize = 0;
+        while (row0 < rows) : (row0 += chunk_rows) {
+            const n = @min(chunk_rows, rows - row0) * row_len;
+            const first = row0 * row_len;
+            const values: []const f32 = switch (source) {
+                .values => |v| v[first..][0..n],
+                .tensor => |src| blk: {
+                    src.store.readScalarRange(src.id, first, std.mem.sliceAsBytes(staged[0..n])) catch return api_errors.ApiError.InvalidArgument;
+                    break :blk staged[0..n];
+                },
+                .reader => |r| blk: {
+                    r.fill(r.ctx, row0, staged[0..n]) catch return api_errors.ApiError.InvalidArgument;
+                    break :blk staged[0..n];
+                },
+            };
+            const out = packed_chunk[0 .. n / di.block_elems * di.block_bytes];
+            quantize_mod.quantizeBlocks(dtype, shape, quant_axis, values, first, first / di.block_elems, out) catch |e| return switch (e) {
+                error.OutOfMemory => api_errors.ApiError.OutOfMemory,
+                error.Unsupported => api_errors.ApiError.UnsupportedFeature,
+                error.InvalidArgument => api_errors.ApiError.InvalidArgument,
+            };
+            try self.store.writeQuantBlocks(t.id, first / di.block_elems, out);
+        }
+        return t;
     }
 
     /// Convenience: allocate and initialize an f32 tensor from typed values.
@@ -604,6 +682,10 @@ pub const Context = struct {
 
         const dev = try self.resolveDevice(dev_sel);
 
+        b.bindQuantizedParams() catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidArgument,
+        };
         const g: *graph_mod.Graph = b.innerGraph();
         try infer_mod.infer(g);
 

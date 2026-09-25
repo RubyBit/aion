@@ -138,6 +138,42 @@ def test_gated_mlp_multiplies_the_two_projections(b):
     assert np.allclose(got, silu(1.0) * 10.0 + silu(2.0) * 20.0, atol=1e-4)
 
 
+def nmse(a, b):
+    """Normalized mean squared error. Scale-free: an absolute bound would really
+    be a bound on the operands' magnitudes."""
+    return float(np.sum((a - b) ** 2) / np.sum(a**2))
+
+
+def run_linear(w, x, *, nt):
+    with aion.Context(thread_count=1) as c, aion.Builder(ctx=c) as bb:
+        xi = bb.input(x.shape).rename("x")
+        return run(bb, nn.Linear(w, dtype=aion.q8_0, nt=nt)(xi), {"x": x})
+
+
+def test_nt_weights_match_their_transpose():
+    # `nt` contracts against a weight's rows, so `[out, in]` with `nt` and its
+    # transpose without it describe the same layer — and the same arithmetic,
+    # whichever kernel each picks. Sized past one q8 block and one N tile so the
+    # tiled path is what runs.
+    rng = np.random.default_rng(0)
+    w = (rng.standard_normal((320, 96)) * 0.1).astype(np.float32)
+    x = (rng.standard_normal((2, 5, 96)) * 0.5).astype(np.float32)
+
+    got = run_linear(w, x, nt=True)
+    ref = run_linear(np.ascontiguousarray(w.T), x, nt=False)
+    exact = x @ w.T
+    assert got.shape == ref.shape == exact.shape
+
+    # They agree to float association, not merely to q8's error.
+    assert nmse(got, ref) < 1e-12
+
+    # And neither is quietly garbage. A q8 step is `blockmax / 127` and its error
+    # is uniform across it, so an operand adds `(step**2 / 12) / mean(v**2)` to the
+    # NMSE of a dot; for normal data a 32-wide block's max is ~2.2 sigma, giving
+    # ~4.8 / (12 * 127**2) = 2.5e-5 for each of the weight and the activation.
+    assert nmse(exact, got) < 2e-4
+
+
 def test_gated_mlp_rejects_mismatched_gate_and_up_widths():
     with pytest.raises(ValueError, match="same output width"):
         nn.GatedMLP(
@@ -410,3 +446,91 @@ def test_relpos_self_attention_infers_head_geometry_from_pos_emb():
 
     assert layer.heads == 3
     assert layer.head_dim == 4
+
+
+@pytest.mark.parametrize("nt", [False, True])
+def test_a_quantized_weight_blocks_the_way_its_reader_contracts(b, nt):
+    # Nothing names an axis: the core picks the one the matmul contracts over,
+    # which must be exactly what an explicit `quant_axis` would have chosen.
+    rng = np.random.default_rng(2)
+    w = (rng.standard_normal((64, 64)) * 0.1).astype(np.float32)
+    x = (rng.standard_normal((3, 64)) * 0.5).astype(np.float32)
+
+    def build(builder, **axis):
+        xi = builder.input((3, 64)).rename("x")
+        wi = builder.param_named(w, "w", dtype=aion.q8_0, **axis)
+        return run(builder, builder.matmul_nt(xi, wi) if nt else builder.matmul(xi, wi), {"x": x})
+
+    got = build(b)
+    with aion.Builder(ctx=b._ctx_owner) as b2:
+        want = build(b2, quant_axis=1 if nt else 0)
+    np.testing.assert_array_equal(got, want)
+
+
+def test_a_quantized_weight_read_along_two_axes_is_rejected(b):
+    w = b.param_named(np.ones((64, 64), dtype=np.float32), "w", dtype=aion.q8_0)
+    x = b.input((1, 64)).rename("x")
+    b.matmul(x, w)
+    # The first reader fixed the axis, so the second fails where it is added.
+    with pytest.raises(aion.AionError):
+        b.matmul_nt(x, w)
+
+
+def _lazy(arr, reads):
+    """`arr` as a LazyWeight, counting the chunks the core asks for."""
+    rows = arr.reshape(-1, arr.shape[-1])
+
+    def fill(row0, out):
+        reads.append(row0)
+        n = out.size // arr.shape[-1]
+        out[:] = rows[row0 : row0 + n].reshape(-1)
+
+    return aion.LazyWeight(tuple(arr.shape), fill)
+
+
+def test_lazy_weights_match_their_values(ctx):
+    # A layer handed a LazyWeight reads its rows only when it is used, and computes
+    # exactly what the same layer handed the values does.
+    rng = np.random.default_rng(3)
+    w = (rng.standard_normal((96, 64)) * 0.1).astype(np.float32)
+    table = (rng.standard_normal((50, 64)) * 0.1).astype(np.float32)
+    x = (rng.standard_normal((2, 96)) * 0.5).astype(np.float32)
+    ids = np.array([[3, 7, 49]], dtype=np.int32)
+
+    outs = []
+    for lazy in (False, True):
+        reads = []
+        with aion.Builder(ctx=ctx) as bb:
+            xi = bb.input(x.shape).rename("x")
+            ii = bb.input(ids.shape, dtype=aion.int32).rename("ids")
+            lin = nn.Linear(_lazy(w, reads) if lazy else w, dtype=aion.q8_0)
+            emb = nn.Embedding(_lazy(table, reads) if lazy else table, dtype=aion.q8_0)
+            assert reads == []
+            y = lin(xi)
+            e = emb(ii)
+            assert (len(reads) > 0) == lazy
+            model = bb.compile({"y": y, "e": e})
+            try:
+                got = model.run_numpy({"x": x, "ids": ids})
+            finally:
+                model.close()
+        outs.append(got)
+    np.testing.assert_array_equal(outs[0]["y"], outs[1]["y"])
+    np.testing.assert_array_equal(outs[0]["e"], outs[1]["e"])
+
+
+def test_lazy_weight_needs_a_quantized_dtype(b):
+    with pytest.raises(ValueError, match="quantized"):
+        b.param_named(aion.LazyWeight((4, 32), lambda row0, out: None), "w")
+
+
+def test_a_lazy_weights_fill_error_is_the_failing_ops_cause(b):
+    def fill(row0, out):
+        raise RuntimeError("checkpoint is gone")
+
+    w = nn.Linear(aion.LazyWeight((64, 32), fill), dtype=aion.q8_0)
+    x = b.input((1, 64)).rename("x")
+    with pytest.raises(aion.AionError) as info:
+        w(x)
+    assert isinstance(info.value.__cause__, RuntimeError)
+    assert "checkpoint is gone" in str(info.value.__cause__)

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const parse_mod = @import("parse.zig");
 
@@ -62,14 +63,27 @@ pub const MappedPackage = struct {
         var map = file.createMemoryMap(io, .{
             .len = len,
             .protection = .{ .read = true, .write = false },
-            // Pages come in as tensors are copied out, not all up front.
-            .populate = false,
+            // Pages come in as tensors are copied out, not all up front. Windows is
+            // the exception in name only: std maps `populate` to `SEC_COMMIT`, which
+            // a file-backed section requires (without it NtCreateSection fails with
+            // INVALID_PARAMETER_6 and std silently reads the whole file into memory),
+            // and which still faults pages in lazily. Drop the special case once
+            // https://codeberg.org/ziglang/zig/issues/36960 is fixed.
+            .populate = builtin.os.tag == .windows,
         }) catch |e| return switch (e) {
             error.OutOfMemory => PackageError.OutOfMemory,
             else => PackageError.IoFailure,
         };
         errdefer map.destroy(io);
         return .{ .map = map, .package = try parse_mod.parse(gpa, map.memory[0..len]) };
+    }
+
+    /// Whether the OS actually mapped the file. When it cannot, std falls back to
+    /// reading the whole file into memory -- correct, but it silently costs the
+    /// file's size in private memory, so this is what the platform test pins.
+    pub fn isMapped(self: *const MappedPackage) bool {
+        const map = self.map orelse return false;
+        return map.section != null;
     }
 
     /// The whole file, as mapped; only valid before `unmap`.

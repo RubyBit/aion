@@ -2593,6 +2593,32 @@ test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
     try std.testing.expect(found);
 }
 
+test "api: a package file is memory-mapped, not read into memory" {
+    // std falls back to reading the whole file when mapping fails, which is correct
+    // but silent (the log line is Debug-only). On Windows it failed on every load:
+    // a file-backed section without SEC_COMMIT is rejected (INVALID_PARAMETER_6).
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "mapped.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W = try bld.param(try ctx.fromF32(&[_]usize{ 2, 2 }, &[_]f32{ 1, 0, 0, 1 }));
+    try ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
+        .{ .name = "y", .tensor = try bld.matmul(X, W, 1.0, 0.0) },
+    }, .{});
+
+    var mapped = try package_file.MappedPackage.open(allocator, file);
+    defer mapped.deinit();
+    try std.testing.expect(mapped.isMapped());
+}
+
 test "api.module: custom module can use introspection scope helpers" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 

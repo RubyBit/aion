@@ -4505,21 +4505,28 @@ test "api: a weight quantized a chunk at a time is byte-identical to quantizing 
         const got = try allocator.alloc(u8, want.len);
         defer allocator.free(got);
 
-        const Rows = struct {
-            vals: []const f32,
-            row_len: usize,
-            fn fill(ctx_ptr: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
-                const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                @memcpy(out, self.vals[row0 * self.row_len ..][0..out.len]);
-            }
+        // The same values stored transposed (last two axes swapped), read back through
+        // a strided view that undoes the swap: what a PyTorch `[out, in]` weight is.
+        const rank = case.shape.len;
+        const rows_n = case.shape[rank - 2];
+        const cols_n = case.shape[rank - 1];
+        const transposed = try allocator.alloc(f32, n);
+        defer allocator.free(transposed);
+        const plane = rows_n * cols_n;
+        for (0..n / plane) |b| for (0..rows_n) |r| for (0..cols_n) |c| {
+            transposed[b * plane + c * rows_n + r] = vals[b * plane + r * cols_n + c];
         };
-        var rows = Rows{ .vals = vals, .row_len = case.shape[case.shape.len - 1] };
+        var strides: [3]isize = undefined;
+        if (rank == 3) strides[0] = @intCast(plane);
+        strides[rank - 2] = 1;
+        strides[rank - 1] = @intCast(rows_n);
+
         const src_tensor = try ctx.fromF32(case.shape, vals);
         defer src_tensor.release();
-        const sources = [_]api.RowSource{
-            .{ .values = vals },
+        const sources = [_]api.WeightSource{
             .{ .tensor = src_tensor },
-            .{ .reader = .{ .ctx = &rows, .fill = Rows.fill } },
+            .{ .view = .contiguous(.f32, case.shape, std.mem.sliceAsBytes(vals)) },
+            .{ .view = .{ .data = @ptrCast(transposed.ptr), .elem = .f32, .shape = case.shape, .strides = strides[0..rank] } },
         };
         for (sources) |source| {
             const t = try ctx.quantize(.q8_0, case.shape, case.axis, source);
@@ -4589,33 +4596,30 @@ test "api: a quantized weight is bound when its first reader is added" {
     try std.testing.expectEqual(@as(u8, 1), (try ctx.store.getConst(@intCast(ext))).quant_axis);
 }
 
-// A weight can be declared by its rows alone: the builder reads them when the op
-// that fixes the axis is added, never before, and gets the same bytes as the values.
-test "api: a weight declared by a row reader quantizes like its values" {
+// A weight can be bound from a host view: the builder reads it when the op that fixes
+// the axis is added, never before, and a bf16 view gets the same bytes as the f32
+// values it widens to.
+test "api: a weight bound from a bf16 host view quantizes like its values" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
+    // Values bf16 holds exactly, so widening them back is lossless.
     var w_vals: [8 * 64]f32 = undefined;
-    for (&w_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.05;
-    const Rows = struct {
-        vals: []const f32,
-        reads: usize = 0,
-        fn fill(ctx_ptr: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            self.reads += 1;
-            @memcpy(out, self.vals[row0 * 64 ..][0..out.len]);
-        }
-    };
-    var rows = Rows{ .vals = &w_vals };
+    var w_bf16: [8 * 64]u16 = undefined;
+    for (&w_vals, &w_bf16, 0..) |*v, *h, i| {
+        v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.125;
+        h.* = @intCast(@as(u32, @bitCast(v.*)) >> 16);
+    }
     var x_vals: [64]f32 = @splat(0.5);
 
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
-    const w = try bld.paramRows(.q8_0, &[_]usize{ 8, 64 }, "w", .{ .ctx = &rows, .fill = Rows.fill });
-    try std.testing.expectEqual(@as(usize, 0), rows.reads);
+    const view: api.HostView = .contiguous(.bf16, &[_]usize{ 8, 64 }, std.mem.sliceAsBytes(&w_bf16));
+    const w = try bld.paramView(.q8_0, view, "w", null);
+    // Nothing is read yet: no stored tensor exists until an op fixes the axis.
+    try std.testing.expect(bld.innerGraph().values.items[@intCast(w.value)].external == null);
     _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
-    try std.testing.expect(rows.reads > 0);
 
     const ext = bld.innerGraph().values.items[@intCast(w.value)].external.?;
     const got = try allocator.alloc(u8, 8 * 64 / 32 * 34);

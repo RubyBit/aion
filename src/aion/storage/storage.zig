@@ -892,6 +892,12 @@ pub const TiledTensor = struct {
         return @constCast(self).copyScalarRange(first_elem, .{ .out_of_tiles = out });
     }
 
+    /// Write elements `[first_elem, first_elem + bytes.len / elem_bytes)` of the packed
+    /// row-major layout; the ranged counterpart of `writeFromPackedScalar`.
+    pub fn writeScalarRange(self: *Self, first_elem: usize, packed_bytes: []const u8) StorageError!void {
+        return self.copyScalarRange(first_elem, .{ .into_tiles = packed_bytes });
+    }
+
     /// Writes a packed quant tensor into this tiled storage.
     ///
     /// Packed-quant convention (arbitrary rank):

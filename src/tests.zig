@@ -16,6 +16,7 @@ comptime {
     _ = @import("aion/runtime/device_memory.zig");
     _ = @import("aion/runtime/executable.zig");
     _ = @import("aion/api/tiling.zig");
+    _ = @import("aion/api/host_view.zig");
     // Only GPU files import this, so without an explicit entry its comptime
     // guard against a host-byte accessor would go unchecked in a CPU build.
     _ = @import("aion/runtime/device_store.zig");

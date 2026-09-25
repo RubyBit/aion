@@ -448,6 +448,13 @@ pub const StorageManager = struct {
         return t.readQuantBlocks(first_block, out);
     }
 
+    /// Write a range of `id`'s row-major elements (see `TiledTensor.writeScalarRange`).
+    pub fn writeScalarRange(self: *Self, id: TensorId, first_elem: usize, packed_bytes: []const u8) StorageError!void {
+        if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
+        const t: *TiledTensor = try self.getMut(id);
+        return t.writeScalarRange(first_elem, packed_bytes);
+    }
+
     /// Read a range of `id`'s row-major elements (see `TiledTensor.readScalarRange`).
     pub fn readScalarRange(self: *const Self, id: TensorId, first_elem: usize, out: []u8) StorageError!void {
         const t: *const TiledTensor = try self.getConst(id);

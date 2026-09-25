@@ -6,6 +6,13 @@ const backend_utils = @import("../backend/utils.zig");
 const manager_mod = @import("../storage/manager.zig");
 const api_tiling = @import("tiling.zig");
 const device_mod = @import("device.zig");
+const host_view = @import("host_view.zig");
+
+pub const HostView = host_view.HostView;
+pub const HostViewMut = host_view.HostViewMut;
+
+/// Elements one host-view copy stages at a time: 1 Mi.
+const view_chunk_elems: usize = 1 << 20;
 
 pub const DType = types.DType;
 pub const TensorId = manager_mod.TensorId;
@@ -148,6 +155,46 @@ pub const Tensor = struct {
     pub fn packedByteLen(self: Self) StorageError!usize {
         const elems = try self.elemCount();
         return backend_utils.requiredBytesForElems(self.dtype, elems) catch StorageError.InvalidArgument;
+    }
+
+    /// Copy a host view of the same shape in, converting its elements to this
+    /// tensor's dtype (floats among floats; integers to their own width).
+    pub fn writeView(self: Self, allocator: std.mem.Allocator, view: HostView) StorageError!void {
+        const elem = host_view.Elem.of(self.dtype) orelse return StorageError.InvalidArgument;
+        if (!std.mem.eql(usize, self.shape, view.shape) or !view.elem.convertsTo(elem)) return StorageError.InvalidArgument;
+        const total = view.count();
+        if (view.elem == elem and view.isContiguous()) {
+            return self.writePackedScalar(view.data[0 .. total * elem.bytes()]);
+        }
+        const chunk = allocator.alloc(u8, @min(total, view_chunk_elems) * elem.bytes()) catch return StorageError.OutOfMemory;
+        defer allocator.free(chunk);
+        var first: usize = 0;
+        while (first < total) {
+            const n = @min(view_chunk_elems, total - first);
+            view.read(self.dtype, first, chunk[0 .. n * elem.bytes()]) catch return StorageError.InvalidArgument;
+            try self.store.writeScalarRange(self.id, first, chunk[0 .. n * elem.bytes()]);
+            first += n;
+        }
+    }
+
+    /// Copy this tensor out into a host view of the same shape, converting as
+    /// `writeView` does.
+    pub fn readView(self: Self, allocator: std.mem.Allocator, view: HostViewMut) StorageError!void {
+        const elem = host_view.Elem.of(self.dtype) orelse return StorageError.InvalidArgument;
+        if (!std.mem.eql(usize, self.shape, view.shape) or !elem.convertsTo(view.elem)) return StorageError.InvalidArgument;
+        const total = view.count();
+        if (view.elem == elem and view.isContiguous()) {
+            return self.readPackedScalar(view.data[0 .. total * elem.bytes()]);
+        }
+        const chunk = allocator.alloc(u8, @min(total, view_chunk_elems) * elem.bytes()) catch return StorageError.OutOfMemory;
+        defer allocator.free(chunk);
+        var first: usize = 0;
+        while (first < total) {
+            const n = @min(view_chunk_elems, total - first);
+            try self.store.readScalarRange(self.id, first, chunk[0 .. n * elem.bytes()]);
+            view.write(self.dtype, first, chunk[0 .. n * elem.bytes()]) catch return StorageError.InvalidArgument;
+            first += n;
+        }
     }
 
     pub fn copyFrom(self: Self, allocator: std.mem.Allocator, src: Self) StorageError!void {

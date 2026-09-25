@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """NumPy interop for `Tensor` — dtype-generic, driven by the `dtype` table.
 
-The C ABI's `aion_tensor_create/read/write` take a `void*` + element count and a
-dtype tag, so a single contiguous, correctly-aligned host buffer works for any
-scalar dtype (f32/f16/i8/i32). Quantized dtypes have no host array form and raise.
+Arrays cross the C ABI as DLPack views (`_ffi.dlpack`), so any strided array is
+read or written in place; only a dtype the tensor cannot take directly is
+converted first. Quantized dtypes have no host array form and raise.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
 from .dtype import dtype_name, is_quantized, normalize_dtype, numpy_dtype
-from ._ffi.runtime import (
-    create_tensor_from_buffer,
-    read_tensor_into_buffer,
-    write_tensor_from_buffer,
-)
+from ._ffi.dlpack import view_of
+from ._ffi.runtime import create_empty_tensor, read_view, write_view
 from .enums import AionDType
 from .types import ArrayLike, DTypeLike, NDArray
 
@@ -31,24 +28,13 @@ def _require_numpy():
     return np
 
 
-def _as_contiguous(array: ArrayLike, dt: AionDType):
-    """Coerce `array` to a C-contiguous, writable, itemsize-aligned buffer of the
-    numpy dtype matching `dt`. Returns the (possibly copied) numpy array."""
+def _as_array(array: ArrayLike, dt: AionDType):
+    """`array` as a numpy array of the numpy dtype matching `dt` (a copy only when
+    the dtype differs; strides are kept)."""
     np = _require_numpy()
-    np_dt = numpy_dtype(dt)
-
     arr = np.asarray(cast(Any, array))
-    if arr.dtype != np_dt:
-        arr = arr.astype(np_dt, copy=False)
-    if not arr.flags["C_CONTIGUOUS"]:
-        arr = np.ascontiguousarray(arr)
-    if not bool(arr.flags.writeable):
-        # cffi.from_buffer generally requires a writable buffer.
-        arr = np.array(arr, dtype=np_dt, copy=True)
-    # The C ABI enforces natural alignment for the element type.
-    if (int(arr.ctypes.data) % np_dt.itemsize) != 0:
-        arr = np.array(arr, dtype=np_dt, copy=True)
-    return arr
+    np_dt = numpy_dtype(dt)
+    return arr if arr.dtype == np_dt else arr.astype(np_dt)
 
 
 def _tensor_to_numpy(tensor: "Tensor") -> NDArray:
@@ -61,13 +47,8 @@ def _tensor_to_numpy(tensor: "Tensor") -> NDArray:
             f"{dtype_name(dt)}: quantized tensors have no numpy representation"
         )
 
-    shape = tensor.shape
-    out = np.empty(shape, dtype=numpy_dtype(dt))
-    n = int(out.size)
-
-    read_tensor_into_buffer(
-        tensor._ctx_owner.ptr, tensor.ptr, out, n
-    )
+    out = np.empty(tensor.shape, dtype=numpy_dtype(dt))
+    read_view(tensor._ctx_owner.ptr, tensor.ptr, view_of(out))
     return out
 
 
@@ -86,20 +67,19 @@ def _tensor_from_numpy(
             f"{dtype_name(dt)}: use Tensor.quantize for quantized tensors"
         )
 
-    arr = _as_contiguous(array, dt)
+    arr = _as_array(array, dt)
     if arr.ndim == 0:
         # Aion currently represents scalars as one-element vectors.
         arr = arr.reshape(1)
 
-    shape = list(arr.shape)
-    n = int(arr.size)
-    handle = create_tensor_from_buffer(
-        ctx.ptr, dt, shape, arr, n
-    )
+    shape = tuple(int(d) for d in arr.shape)
+    handle = create_empty_tensor(ctx.ptr, dt, shape)
 
     from .tensor import Tensor
 
-    return Tensor._from_handle(ctx, handle, dtype=dt, shape=tuple(shape))
+    t = Tensor._from_handle(ctx, handle, dtype=dt, shape=shape)
+    write_view(ctx.ptr, t.ptr, view_of(arr))
+    return t
 
 
 def _copy_numpy_into_tensor(tensor: "Tensor", array: ArrayLike) -> None:
@@ -112,15 +92,11 @@ def _copy_numpy_into_tensor(tensor: "Tensor", array: ArrayLike) -> None:
             f"{dtype_name(dt)}: quantized tensors have no numpy write path"
         )
 
-    arr = _as_contiguous(array, dt)
-
+    arr = _as_array(array, dt)
     expected_shape = tensor.shape
     if arr.ndim == 0:
         arr = np.full(expected_shape, arr.item(), dtype=numpy_dtype(dt))
     elif tuple(arr.shape) != tuple(expected_shape):
         raise ValueError(f"shape mismatch: tensor {expected_shape} vs array {arr.shape}")
 
-    n = int(arr.size)
-    write_tensor_from_buffer(
-        tensor._ctx_owner.ptr, tensor.ptr, arr, n
-    )
+    write_view(tensor._ctx_owner.ptr, tensor.ptr, view_of(arr))

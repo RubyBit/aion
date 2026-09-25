@@ -8,6 +8,88 @@
    includes the real `include/aion.h` via `set_source()`.
 */
 
+/* DLPack v1.3 (include/dlpack/dlpack.h), the types this binding uses, declared as
+   that header declares them (tools/check_ffi_header.py compares the two). */
+typedef struct {
+  uint32_t major;
+  uint32_t minor;
+} DLPackVersion;
+
+typedef enum {
+  kDLCPU = 1,
+  kDLCUDA = 2,
+  kDLCUDAHost = 3,
+  kDLOpenCL = 4,
+  kDLVulkan = 7,
+  kDLMetal = 8,
+  kDLVPI = 9,
+  kDLROCM = 10,
+  kDLROCMHost = 11,
+  kDLExtDev = 12,
+  kDLCUDAManaged = 13,
+  kDLOneAPI = 14,
+  kDLWebGPU = 15,
+  kDLHexagon = 16,
+  kDLMAIA = 17,
+  kDLTrn = 18,
+} DLDeviceType;
+
+typedef struct {
+  DLDeviceType device_type;
+  int32_t device_id;
+} DLDevice;
+
+typedef enum {
+  kDLInt = 0U,
+  kDLUInt = 1U,
+  kDLFloat = 2U,
+  kDLOpaqueHandle = 3U,
+  kDLBfloat = 4U,
+  kDLComplex = 5U,
+  kDLBool = 6U,
+  kDLFloat8_e3m4 = 7U,
+  kDLFloat8_e4m3 = 8U,
+  kDLFloat8_e4m3b11fnuz = 9U,
+  kDLFloat8_e4m3fn = 10U,
+  kDLFloat8_e4m3fnuz = 11U,
+  kDLFloat8_e5m2 = 12U,
+  kDLFloat8_e5m2fnuz = 13U,
+  kDLFloat8_e8m0fnu = 14U,
+  kDLFloat6_e2m3fn = 15U,
+  kDLFloat6_e3m2fn = 16U,
+  kDLFloat4_e2m1fn = 17U,
+} DLDataTypeCode;
+
+typedef struct {
+  uint8_t code;
+  uint8_t bits;
+  uint16_t lanes;
+} DLDataType;
+
+typedef struct {
+  void* data;
+  DLDevice device;
+  int32_t ndim;
+  DLDataType dtype;
+  int64_t* shape;
+  int64_t* strides;
+  uint64_t byte_offset;
+} DLTensor;
+
+typedef struct DLManagedTensor {
+  DLTensor dl_tensor;
+  void * manager_ctx;
+  void (*deleter)(struct DLManagedTensor * self);
+} DLManagedTensor;
+
+typedef struct DLManagedTensorVersioned {
+  DLPackVersion version;
+  void *manager_ctx;
+  void (*deleter)(struct DLManagedTensorVersioned *self);
+  uint64_t flags;
+  DLTensor dl_tensor;
+} DLManagedTensorVersioned;
+
 typedef struct AionContext AionContext;
 typedef struct AionTensor AionTensor;
 typedef struct AionLoadedModel AionLoadedModel;
@@ -86,28 +168,19 @@ AionStatus aion_context_create(
     AionContext** out_ctx);
 void aion_context_destroy(AionContext* ctx);
 
-AionStatus aion_tensor_create_empty(
-    AionContext* ctx,
-    AionDType dtype,
-    size_t rank,
-    const size_t* shape,
-    AionTensor** out_tensor);
-
-AionStatus aion_tensor_create_empty_tiled(
-    AionContext* ctx,
-    AionDType dtype,
-    size_t rank,
-    const size_t* shape,
-    const size_t* tile_shape,
-    AionTensor** out_tensor);
-
 AionStatus aion_tensor_create(
     AionContext* ctx,
     AionDType dtype,
     size_t rank,
     const size_t* shape,
-    const void* values,
-    size_t values_len,
+    AionTensor** out_tensor);
+
+AionStatus aion_tensor_create_tiled(
+    AionContext* ctx,
+    AionDType dtype,
+    size_t rank,
+    const size_t* shape,
+    const size_t* tile_shape,
     AionTensor** out_tensor);
 
 void aion_tensor_destroy(AionTensor* t);
@@ -119,9 +192,8 @@ AionDType aion_tensor_dtype(const AionTensor* t);
 size_t aion_tensor_rank(const AionTensor* t);
 AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, size_t out_rank);
 
-AionStatus aion_tensor_read(const AionTensor* t, AionDType dtype, void* out_values, size_t out_len);
-AionStatus aion_tensor_write(AionTensor* t, AionDType dtype, const void* values, size_t values_len);
-AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype, void* out_value);
+AionStatus aion_tensor_read(const AionTensor* t, const DLTensor* dst);
+AionStatus aion_tensor_write(AionTensor* t, const DLTensor* src);
 
 typedef struct AionLoadModelOptions {
     uint32_t device_kind;
@@ -296,16 +368,11 @@ AionStatus aion_builder_name(AionBuilder* b, AionValueId value, const char* name
 typedef struct AionParamOptions {
     AionDType quantize_to;
 } AionParamOptions;
-typedef int (*AionRowFill)(void* user, size_t row0, float* out, size_t count);
 typedef struct AionWeight {
     const AionTensor* tensor;
-    size_t rank;
-    const size_t* shape;
-    AionRowFill fill;
-    void* user;
+    DLManagedTensorVersioned* view;
 } AionWeight;
 AionStatus aion_builder_param_named(AionBuilder* b, const AionWeight* weight, const char* name, const AionParamOptions* opts, AionValueId* out_value);
-extern "Python" int _aion_row_fill(void* user, size_t row0, float* out, size_t count);
 AionStatus aion_builder_begin_scope(AionBuilder* b, const char* name, size_t* out_depth);
 AionStatus aion_builder_begin_auto_scope(AionBuilder* b, const char* base, size_t* out_depth, char* buf, size_t cap, size_t* out_len);
 AionStatus aion_builder_end_scope(AionBuilder* b, size_t depth);
@@ -342,5 +409,5 @@ AionStatus aion_builder_compile(AionBuilder* b, AionDeviceKind device_kind, uint
 AionStatus aion_builder_export_path(AionBuilder* b, const char* path);
 AionStatus aion_builder_export_path_absolute(AionBuilder* b, const char* path);
 
-AionStatus aion_tensor_quantize(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const float* values, size_t values_len, AionTensor** out_tensor);
+AionStatus aion_tensor_quantize(AionContext* ctx, AionDType dtype, size_t quant_axis, const DLTensor* src, AionTensor** out_tensor);
 AionStatus aion_tensor_create_quant(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const uint8_t* packed, size_t packed_len, AionTensor** out_tensor);

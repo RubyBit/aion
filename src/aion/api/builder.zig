@@ -7,7 +7,7 @@ const types = @import("../backend/types.zig");
 
 const api_tensor = @import("tensor.zig");
 const api_context = @import("context.zig");
-const RowSource = api_context.RowSource;
+const WeightSource = api_context.WeightSource;
 
 pub const Context = api_context.Context;
 pub const ValueId = graph_mod.ValueId;
@@ -113,10 +113,30 @@ pub const Builder = struct {
         dtype: types.DType,
         state: union(enum) {
             /// Where its f32 values come from, read once the axis is known.
-            pending: RowSource,
+            pending: Pending,
             /// The axis it was quantized along; every later reader must agree.
             bound: usize,
         },
+
+        const Pending = struct {
+            source: WeightSource,
+            /// Tells a view's owner the builder is done with it (see `paramView`).
+            release: ?Release = null,
+
+            /// The source has been read, or never will be: give it back.
+            fn done(self: Pending) void {
+                switch (self.source) {
+                    .tensor => |t| t.release(),
+                    .view => if (self.release) |r| r.func(r.ctx),
+                }
+            }
+        };
+    };
+
+    /// Hands a view back to whoever owns its memory.
+    pub const Release = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque) void,
     };
 
     pub const ParamOptions = struct {
@@ -163,7 +183,7 @@ pub const Builder = struct {
             if (self.graph.values.items[@intCast(v.*)].external) |tid| self.ctx.store.releaseHold(@intCast(tid));
         }
         for (self.quantized.values()) |q| switch (q.state) {
-            .pending => |source| if (source == .tensor) source.tensor.release(),
+            .pending => |pending| pending.done(),
             .bound => {},
         };
         self.quantized.deinit(self.allocator);
@@ -478,21 +498,22 @@ pub const Builder = struct {
         if (t.dtype != .f32 or !dtype.info().is_quantized) return Error.InvalidArgument;
 
         t.store.holdTensor(t.id);
-        return self.pendingParam(dtype, t.shape, param_name, .{ .tensor = t });
+        return self.pendingParam(dtype, t.shape, param_name, .{ .source = .{ .tensor = t } });
     }
 
-    /// Declare a `dtype` weight of `shape` whose f32 rows `reader` fills on demand,
-    /// quantized the way `ParamOptions.quantize` is: when an op reading it fixes the
-    /// axis. Rows are read a chunk at a time, so no whole f32 copy of the weight ever
-    /// exists. `reader` must stay valid until then, or until the builder is gone.
-    pub fn paramRows(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, reader: RowSource.Reader) Error!TensorRef {
-        if (param_name.len == 0 or !dtype.info().is_quantized) return Error.InvalidArgument;
-        return self.pendingParam(dtype, shape, param_name, .{ .reader = reader });
+    /// Bind a quantized weight read from a host view: its values stay where they are
+    /// until the first op reading it fixes the blocking axis, then are read (and
+    /// converted to f32) a chunk at a time, so no whole f32 copy of it ever exists.
+    /// The view -- its data, shape and strides -- must stay valid until then, or
+    /// until the builder is gone; `release`, when given, is called at that point.
+    pub fn paramView(self: *Self, dtype: types.DType, view: api_tensor.HostView, param_name: []const u8, release: ?Release) Error!TensorRef {
+        if (param_name.len == 0 or !dtype.info().is_quantized or !view.elem.convertsTo(.f32)) return Error.InvalidArgument;
+        return self.pendingParam(dtype, view.shape, param_name, .{ .source = .{ .view = view }, .release = release });
     }
 
-    fn pendingParam(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, source: RowSource) Error!TensorRef {
+    fn pendingParam(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, pending: QuantizedParam.Pending) Error!TensorRef {
         const v: ValueId = try self.graph.addInput(dtype, shape);
-        self.quantized.put(self.allocator, v, .{ .dtype = dtype, .state = .{ .pending = source } }) catch return Error.OutOfMemory;
+        self.quantized.put(self.allocator, v, .{ .dtype = dtype, .state = .{ .pending = pending } }) catch return Error.OutOfMemory;
         self.params.put(self.allocator, v, .user) catch return Error.OutOfMemory;
         try self.nameParam(v, param_name);
         return .{ .value = v };
@@ -537,14 +558,14 @@ pub const Builder = struct {
     }
 
     fn quantizeParam(self: *Self, v: ValueId, q: *QuantizedParam, axis: usize) Error!void {
-        const source = q.state.pending;
-        const t = self.ctx.quantize(q.dtype, self.graph.values.items[@intCast(v)].shape, axis, source) catch |e| return switch (e) {
+        const pending = q.state.pending;
+        const t = self.ctx.quantize(q.dtype, self.graph.values.items[@intCast(v)].shape, axis, pending.source) catch |e| return switch (e) {
             error.OutOfMemory => Error.OutOfMemory,
             else => Error.InvalidArgument,
         };
         // Its creation hold is the builder's on the parameter; the source is done with.
         try self.graph.bindExternalParam(v, @intCast(t.id));
-        if (source == .tensor) source.tensor.release();
+        pending.done();
         q.state = .{ .bound = axis };
     }
 

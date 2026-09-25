@@ -44,6 +44,7 @@ import numpy as np
 import aion
 from aion import Builder, TensorRef, nn
 from aion.enums import AionInputRoleKind as RK
+from aion.types import ArrayLike
 
 
 # ------------------------------ Model constants ------------------------------
@@ -114,7 +115,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 class _WeightLoader:
-    """safetensors reader that up-casts bf16 to f32 before handing values to the packer."""
+    """safetensors reader. Small weights are read up-cast to f32; the matmul weights
+    and tables are read in their stored dtype and handed to the core as they are,
+    which widens them a chunk at a time as it quantizes them and frees each one as
+    soon as it has."""
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -134,27 +138,14 @@ class _WeightLoader:
     def get_f32(self, name: str) -> np.ndarray:
         return self._file.get_tensor(name).float().numpy()
 
-    def rows(self, name: str) -> aion.LazyWeight:
-        """`name` as it is stored, read into f32 a chunk of rows at a time."""
-        stored = self._file.get_slice(name)
-        shape = tuple(stored.get_shape())
+    def rows(self, name: str):
+        """`name` as it is stored, in its own dtype."""
+        return self._file.get_tensor(name)
 
-        def fill(row0: int, out: np.ndarray) -> None:
-            out[:] = stored[row0 : row0 + out.size // shape[-1]].float().numpy().reshape(-1)
-
-        return aion.LazyWeight(shape, fill)
-
-    def rows_t(self, name: str) -> aion.LazyWeight:
-        """A PyTorch linear's `[out, in]` weight as matmul-B `[in, out]` (see `_mm_b`),
-        read a chunk of rows at a time: rows of the transpose are its columns."""
-        stored = self._file.get_slice(name)
-        out_f, in_f = stored.get_shape()
-
-        def fill(row0: int, out: np.ndarray) -> None:
-            cols = stored[:, row0 : row0 + out.size // out_f].float().numpy()
-            out[:] = cols.T.reshape(-1)
-
-        return aion.LazyWeight((in_f, out_f), fill)
+    def rows_t(self, name: str):
+        """A PyTorch linear's `[out, in]` weight as matmul-B `[in, out]` (see `_mm_b`):
+        the stored tensor, transposed by strides alone."""
+        return self.rows(name).T
 
 
 # --------------------- C-ABI Builder authoring helpers -----------------------
@@ -238,26 +229,26 @@ class _LayerWeights:
     post_ffn_ln: np.ndarray
     post_pli_ln: np.ndarray
     skip_scale: float
-    q_proj: np.ndarray
-    o_proj: np.ndarray
+    q_proj: ArrayLike
+    o_proj: ArrayLike
     q_norm: np.ndarray
-    gate_proj: np.ndarray
-    up_proj: np.ndarray
-    down_proj: np.ndarray
-    pli_gate: np.ndarray
-    pli_proj: np.ndarray
+    gate_proj: ArrayLike
+    up_proj: ArrayLike
+    down_proj: ArrayLike
+    pli_gate: ArrayLike
+    pli_proj: ArrayLike
     # Only a layer that owns a KV cache projects K/V; the rest read the cache a
     # source layer produced. All-or-nothing, and `nn` reads which case this is off
     # the weights it is handed.
-    k_proj: Optional[np.ndarray] = None
-    v_proj: Optional[np.ndarray] = None
+    k_proj: Optional[ArrayLike] = None
+    v_proj: Optional[ArrayLike] = None
     k_norm: Optional[np.ndarray] = None
 
 
 class _SharedWeights:
     """The model-wide weights, each read from the checkpoint when it is used. The
-    matmul weights and tables are `LazyWeight`s: the core reads their rows a chunk at a
-    time as it quantizes them, so none is ever held whole in f32."""
+    matmul weights and tables are views of the mapped checkpoint: the core reads them a
+    chunk at a time as it quantizes them, so none is ever held whole in f32."""
 
     _LN = "model.language_model"
 
@@ -265,15 +256,15 @@ class _SharedWeights:
         self._loader = loader
 
     @property
-    def embed_tokens(self) -> aion.LazyWeight:
+    def embed_tokens(self) -> ArrayLike:
         return self._loader.rows(f"{self._LN}.embed_tokens.weight")
 
     @property
-    def embed_tokens_per_layer(self) -> aion.LazyWeight:
+    def embed_tokens_per_layer(self) -> ArrayLike:
         return self._loader.rows(f"{self._LN}.embed_tokens_per_layer.weight")
 
     @property
-    def per_layer_model_projection(self) -> aion.LazyWeight:
+    def per_layer_model_projection(self) -> ArrayLike:
         return self._loader.rows_t(f"{self._LN}.per_layer_model_projection.weight")
 
     @property

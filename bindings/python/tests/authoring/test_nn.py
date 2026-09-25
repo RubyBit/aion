@@ -476,61 +476,107 @@ def test_a_quantized_weight_read_along_two_axes_is_rejected(b):
         b.matmul_nt(x, w)
 
 
-def _lazy(arr, reads):
-    """`arr` as a LazyWeight, counting the chunks the core asks for."""
-    rows = arr.reshape(-1, arr.shape[-1])
-
-    def fill(row0, out):
-        reads.append(row0)
-        n = out.size // arr.shape[-1]
-        out[:] = rows[row0 : row0 + n].reshape(-1)
-
-    return aion.LazyWeight(tuple(arr.shape), fill)
+def _exact_in(dtype, shape, seed):
+    """Values `dtype` (f16 / bf16) holds exactly, as float32, so every source form
+    of them quantizes to the same bytes."""
+    rng = np.random.default_rng(seed)
+    v = (rng.standard_normal(shape) * 0.1).astype(np.float32)
+    if dtype == "bf16":
+        return (v.view(np.uint32) & np.uint32(0xFFFF0000)).view(np.float32)
+    return v.astype(np.float16).astype(np.float32)
 
 
-def test_lazy_weights_match_their_values(ctx):
-    # A layer handed a LazyWeight reads its rows only when it is used, and computes
-    # exactly what the same layer handed the values does.
-    rng = np.random.default_rng(3)
-    w = (rng.standard_normal((96, 64)) * 0.1).astype(np.float32)
-    table = (rng.standard_normal((50, 64)) * 0.1).astype(np.float32)
-    x = (rng.standard_normal((2, 96)) * 0.5).astype(np.float32)
+def _layer_outputs(ctx, w, table, x, ids):
+    with aion.Builder(ctx=ctx) as bb:
+        xi = bb.input(x.shape).rename("x")
+        ii = bb.input(ids.shape, dtype=aion.int32).rename("ids")
+        y = nn.Linear(w, dtype=aion.q8_0)(xi)
+        e = nn.Embedding(table, dtype=aion.q8_0)(ii)
+        model = bb.compile({"y": y, "e": e})
+        try:
+            return model.run_numpy({"x": x, "ids": ids})
+        finally:
+            model.close()
+
+
+def test_a_quantized_weight_reads_the_same_from_any_host_layout(ctx, tmp_path):
+    # A weight left for its ops to block is read where it lives: an f16 array, a
+    # transposed (strided) view and a read-only memmap all give exactly what the
+    # f32 values do.
+    w = _exact_in("f16", (96, 64), 3)
+    table = _exact_in("f16", (50, 64), 4)
+    x = (np.random.default_rng(5).standard_normal((2, 96)) * 0.5).astype(np.float32)
     ids = np.array([[3, 7, 49]], dtype=np.int32)
 
-    outs = []
-    for lazy in (False, True):
-        reads = []
-        with aion.Builder(ctx=ctx) as bb:
-            xi = bb.input(x.shape).rename("x")
-            ii = bb.input(ids.shape, dtype=aion.int32).rename("ids")
-            lin = nn.Linear(_lazy(w, reads) if lazy else w, dtype=aion.q8_0)
-            emb = nn.Embedding(_lazy(table, reads) if lazy else table, dtype=aion.q8_0)
-            assert reads == []
-            y = lin(xi)
-            e = emb(ii)
-            assert (len(reads) > 0) == lazy
-            model = bb.compile({"y": y, "e": e})
-            try:
-                got = model.run_numpy({"x": x, "ids": ids})
-            finally:
-                model.close()
-        outs.append(got)
-    np.testing.assert_array_equal(outs[0]["y"], outs[1]["y"])
-    np.testing.assert_array_equal(outs[0]["e"], outs[1]["e"])
+    path = tmp_path / "w.bin"
+    w.tofile(path)
+    mapped = np.memmap(path, dtype=np.float32, mode="r", shape=w.shape)
+
+    want = _layer_outputs(ctx, w, table, x, ids)
+    for w_src, table_src in [
+        (w.astype(np.float16), table.astype(np.float16)),
+        (np.ascontiguousarray(w.T).T, np.asfortranarray(table)),
+        (mapped, table),
+    ]:
+        got = _layer_outputs(ctx, w_src, table_src, x, ids)
+        np.testing.assert_array_equal(want["y"], got["y"])
+        np.testing.assert_array_equal(want["e"], got["e"])
 
 
-def test_lazy_weight_needs_a_quantized_dtype(b):
-    with pytest.raises(ValueError, match="quantized"):
-        b.param_named(aion.LazyWeight((4, 32), lambda row0, out: None), "w")
+def test_a_bfloat16_torch_weight_quantizes_like_its_values(ctx):
+    torch = pytest.importorskip("torch")
+    w = _exact_in("bf16", (96, 64), 6)
+    table = _exact_in("bf16", (50, 64), 7)
+    x = (np.random.default_rng(8).standard_normal((2, 96)) * 0.5).astype(np.float32)
+    ids = np.array([[1, 2, 40]], dtype=np.int32)
+
+    want = _layer_outputs(ctx, w, table, x, ids)
+    # A PyTorch `[out, in]` bf16 checkpoint weight, bound as its transpose.
+    w_torch = torch.from_numpy(np.ascontiguousarray(w.T)).to(torch.bfloat16).T
+    got = _layer_outputs(ctx, w_torch, torch.from_numpy(table).to(torch.bfloat16), x, ids)
+    np.testing.assert_array_equal(want["y"], got["y"])
+    np.testing.assert_array_equal(want["e"], got["e"])
 
 
-def test_a_lazy_weights_fill_error_is_the_failing_ops_cause(b):
-    def fill(row0, out):
-        raise RuntimeError("checkpoint is gone")
+def test_the_core_owns_a_viewed_weight_until_it_has_read_it(ctx):
+    # A weight left for its ops to block is handed to the core as a DLPack managed
+    # tensor: it outlives the caller's reference while pending, and is released the
+    # moment it is quantized -- not when the builder closes, which would keep every
+    # f32 source of a whole model alive at once.
+    import gc
+    import weakref
 
-    w = nn.Linear(aion.LazyWeight((64, 32), fill), dtype=aion.q8_0)
-    x = b.input((1, 64)).rename("x")
-    with pytest.raises(aion.AionError) as info:
-        w(x)
-    assert isinstance(info.value.__cause__, RuntimeError)
-    assert "checkpoint is gone" in str(info.value.__cause__)
+    w = _exact_in("f16", (64, 32), 9)
+    x = np.ones((1, 64), dtype=np.float32)
+    with aion.Builder(ctx=ctx) as bb:
+        src = w.copy()
+        alive = weakref.ref(src)
+        wv = bb.param_named(src, "w", dtype=aion.q8_0)
+        del src
+        gc.collect()
+        assert alive() is not None, "released before it was read"
+        y = bb.matmul(bb.input(x.shape).rename("x"), wv)
+        gc.collect()
+        assert alive() is None, "still held after it was quantized"
+        model = bb.compile({"y": y})
+        try:
+            got = model.run_numpy({"x": x})["y"]
+        finally:
+            model.close()
+    want = _layer_outputs(ctx, w, _exact_in("f16", (4, 64), 1), x, np.zeros((1, 1), np.int32))["y"]
+    np.testing.assert_array_equal(want, got)
+
+
+def test_a_viewed_weight_nothing_reads_is_released_with_the_builder(ctx):
+    import gc
+    import weakref
+
+    src = _exact_in("f16", (64, 32), 10)
+    alive = weakref.ref(src)
+    with aion.Builder(ctx=ctx) as bb:
+        bb.param_named(src, "w", dtype=aion.q8_0)
+        del src
+        gc.collect()
+        assert alive() is not None
+    gc.collect()
+    assert alive() is None

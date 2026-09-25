@@ -171,9 +171,10 @@ def mm_b(w_torch: np.ndarray) -> np.ndarray:
 
     Adapting someone else's layout is a converter's job. Rank 2 is all it needs —
     MatMul broadcasts a `[K, N]` weight into a rank-3 `[B, S, K]` activation — and
-    `nn` does the q8_0 quantization, blocking along K.
+    `nn` does the q8_0 quantization, blocking along K. The transpose is a strided
+    view: the core reads it in place as it quantizes, so no copy is made here.
     """
-    return np.ascontiguousarray(w_torch.T)
+    return w_torch.T
 
 
 def ln(loader: _Loader, base: str, name: str) -> nn.LayerNorm:

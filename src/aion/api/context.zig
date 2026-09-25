@@ -48,17 +48,18 @@ pub const CompileOptions = api_package_export.CompileOptions;
 /// at a time (a row is its last axis): values in hand, a host f32 tensor, or rows a
 /// caller fills on demand — from a checkpoint on disk, say — so a whole f32 copy of
 /// the weight never has to exist.
-pub const RowSource = union(enum) {
-    values: []const f32,
+/// Where a weight's values come from when it is quantized: a stored f32 tensor, or a
+/// host view the core reads (converting its elements) a chunk at a time.
+pub const WeightSource = union(enum) {
     tensor: api_tensor.Tensor,
-    reader: Reader,
-
-    pub const Reader = struct {
-        ctx: *anyopaque,
-        /// Fill `out` with rows `row0 ..` (whole rows, row-major).
-        fill: *const fn (ctx: *anyopaque, row0: usize, out: []f32) error{Failed}!void,
-    };
+    view: api_tensor.HostView,
 };
+
+fn shapeCount(shape: []const usize) ?usize {
+    var n: usize = 1;
+    for (shape) |d| n = std.math.mul(usize, n, d) catch return null;
+    return n;
+}
 
 /// About how many f32 values one quantization chunk holds: 16 MiB.
 const quant_chunk_elems: usize = 4 << 20;
@@ -387,6 +388,15 @@ pub const Context = struct {
         return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
     }
 
+    /// A new `dtype` tensor holding a host view's values, converted as
+    /// `Tensor.writeView` does. The view is only read during the call.
+    pub fn fromView(self: *Self, dtype: DType, view: api_tensor.HostView) api_errors.ApiError!api_tensor.Tensor {
+        const t = try self.tensor(dtype, view.shape);
+        errdefer t.release();
+        try t.writeView(self.allocator, view);
+        return t;
+    }
+
     /// Create a new tensor with an explicit tile shape.
     pub fn tensorTiled(self: *Self, dtype: DType, shape: []const usize, tile_shape: []const usize) api_errors.ApiError!api_tensor.Tensor {
         const tid: manager_mod.TensorId = try self.store.createTiledTensor(dtype, shape, tile_shape, .{ .tile_alignment = self.policy.tile_alignment });
@@ -441,19 +451,19 @@ pub const Context = struct {
     /// along `quant_axis` (the matmul-B K axis is rank-2; an embedding table
     /// blocked along its feature dim uses the last axis).
     pub fn fromF32Quantized(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, values: []const f32) api_errors.ApiError!api_tensor.Tensor {
-        return self.quantize(dtype, shape, quant_axis, .{ .values = values });
+        if (values.len != shapeCount(shape) orelse return api_errors.ApiError.InvalidArgument) return api_errors.ApiError.InvalidArgument;
+        return self.quantize(dtype, shape, quant_axis, .{ .view = .contiguous(.f32, shape, std.mem.sliceAsBytes(values)) });
     }
 
     /// Quantize a weight's f32 `source` into a new tensor of `dtype`, blocking along
     /// `quant_axis`, a bounded chunk of rows at a time and straight into its tiles:
     /// neither the whole f32 weight nor its packed bytes are ever held a second time.
-    pub fn quantize(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, source: RowSource) api_errors.ApiError!api_tensor.Tensor {
+    pub fn quantize(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, source: WeightSource) api_errors.ApiError!api_tensor.Tensor {
         var total: usize = 1;
         for (shape) |d| total = std.math.mul(usize, total, d) catch return api_errors.ApiError.InvalidArgument;
         switch (source) {
-            .values => |v| if (v.len != total) return api_errors.ApiError.InvalidArgument,
             .tensor => |t| if (t.dtype != .f32 or !std.mem.eql(usize, t.shape, shape)) return api_errors.ApiError.InvalidArgument,
-            .reader => {},
+            .view => |v| if (!std.mem.eql(usize, v.shape, shape) or !v.elem.convertsTo(.f32)) return api_errors.ApiError.InvalidArgument,
         }
         const t = try self.quantTensor(dtype, shape, quant_axis);
         errdefer t.release();
@@ -471,8 +481,8 @@ pub const Context = struct {
         const chunk_rows = @max(group, (quant_chunk_elems / row_len) / group * group);
         const chunk_elems = @min(chunk_rows, rows) * row_len;
 
-        const staged: []f32 = if (source == .values) &.{} else self.allocator.alloc(f32, chunk_elems) catch return api_errors.ApiError.OutOfMemory;
-        defer if (source != .values) self.allocator.free(staged);
+        const staged: []f32 = self.allocator.alloc(f32, chunk_elems) catch return api_errors.ApiError.OutOfMemory;
+        defer self.allocator.free(staged);
         const packed_chunk = self.allocator.alloc(u8, chunk_elems / di.block_elems * di.block_bytes) catch return api_errors.ApiError.OutOfMemory;
         defer self.allocator.free(packed_chunk);
 
@@ -480,17 +490,11 @@ pub const Context = struct {
         while (row0 < rows) : (row0 += chunk_rows) {
             const n = @min(chunk_rows, rows - row0) * row_len;
             const first = row0 * row_len;
-            const values: []const f32 = switch (source) {
-                .values => |v| v[first..][0..n],
-                .tensor => |src| blk: {
-                    src.store.readScalarRange(src.id, first, std.mem.sliceAsBytes(staged[0..n])) catch return api_errors.ApiError.InvalidArgument;
-                    break :blk staged[0..n];
-                },
-                .reader => |r| blk: {
-                    r.fill(r.ctx, row0, staged[0..n]) catch return api_errors.ApiError.InvalidArgument;
-                    break :blk staged[0..n];
-                },
-            };
+            const values: []f32 = staged[0..n];
+            switch (source) {
+                .tensor => |src| src.store.readScalarRange(src.id, first, std.mem.sliceAsBytes(values)) catch return api_errors.ApiError.InvalidArgument,
+                .view => |v| v.readF32(first, values) catch return api_errors.ApiError.InvalidArgument,
+            }
             const out = packed_chunk[0 .. n / di.block_elems * di.block_bytes];
             quantize_mod.quantizeBlocks(dtype, shape, quant_axis, values, first, first / di.block_elems, out) catch |e| return switch (e) {
                 error.OutOfMemory => api_errors.ApiError.OutOfMemory,

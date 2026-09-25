@@ -93,28 +93,14 @@ from .enums import (
     AionReduceOp,
     AionUnaryOp,
 )
-from .tensor import Tensor
+from ._ffi.dlpack import HostView
+from .tensor import Tensor, _float_view
 from .types import ArrayLike, AttentionWindow, DTypeLike, NDArray, Shape
 
 if TYPE_CHECKING:
     from .model import LoadedModel
 
-# A weight source: an existing Tensor, a numpy array, or a nested Python list.
-@dataclass(frozen=True)
-class LazyWeight:
-    """A weight known by its `shape`, whose rows the core asks for as it quantizes it:
-    `fill(row0, out)` writes whole rows from `row0` on into the float32 array `out`.
-
-    A large checkpoint weight passed this way is read a chunk at a time and never
-    held whole in f32. Bind it with a quantized dtype; the ops reading it choose the
-    axis it blocks along, as for any quantized weight.
-    """
-
-    shape: tuple[int, ...]
-    fill: Callable[[int, Any], None]
-
-
-type WeightData = Tensor | ArrayLike | LazyWeight
+type WeightData = Tensor | ArrayLike
 
 _QUANTIZED = (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0)
 # Which input axes are dynamic (vary at runtime): a sequence of axis indices
@@ -326,8 +312,9 @@ class Builder:
         self._closed = False
         # Keep param tensors alive for the builder's lifetime.
         self._params: list[Tensor] = []
-        # What the core calls back for a `LazyWeight`'s rows; lives with the builder.
-        self._row_sources: list[object] = []
+        # Host memory the core reads when an op fixes a quantized weight's axis, for
+        # the sources whose owner cannot be told when it is done (see `HostView.owned`).
+        self._views: list[HostView] = []
         self._symbol_counter = 0
         # value id -> evaluated result. Safe to memoize: the graph is append-only,
         # so what a value computes to cannot change once computed.
@@ -472,25 +459,23 @@ class Builder:
         """Bind a weight under a semantic, scope-qualified name (`.../weight`).
 
         A quantized `dtype` with no `quant_axis` is quantized by the core once the
-        ops reading the weight fix the axis its blocks must run along.
+        ops reading the weight fix the axis its blocks must run along. Until then
+        the core reads `data` where it lives -- anything exporting ``__dlpack__``
+        (a numpy array or memmap, a PyTorch tensor, bfloat16 included) is viewed in
+        place, strided, never copied whole to f32 -- so do not modify it before the
+        builder is compiled or exported.
 
         The name persists into the package as a `debug_name`, which is the key the
         load- and swap-by-name paths use. Prefer this over `param`, whose generated
         name is positional and shifts if construction order changes.
         """
         dt = _as_dtype(dtype)
-        if isinstance(data, LazyWeight):
-            if dt not in _QUANTIZED or quant_axis is not None:
-                raise ValueError("a LazyWeight binds as a quantized dtype, blocked by the ops reading it")
-            value, keep = builder_param_named(self._ctx_owner.ptr, self.ptr, name, rows=data, quantize_to=int(dt))
-            self._row_sources.append(keep)
-            return TensorRef(self, value)
         if not isinstance(data, Tensor) and quant_axis is None and dt in _QUANTIZED:
-            # The core quantizes it once an op reading it fixes the axis, holding the
-            # f32 copy until then; ours goes now, so that copy lives no longer.
-            with Tensor(data, ctx=self._ctx_owner, dtype=float32) as t:
-                value, _ = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr, quantize_to=int(dt))
-                return TensorRef(self, value)
+            view = _float_view(data, shape if shape is not None else _infer_shape(data))
+            value, keep = builder_param_named(self._ctx_owner.ptr, self.ptr, name, view=view, quantize_to=int(dt))
+            if keep:
+                self._views.append(view)
+            return TensorRef(self, value)
         t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
         self._params.append(t)
         value, _ = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr)
@@ -1099,8 +1084,8 @@ def _infer_shape(data: WeightData) -> tuple[int, ...]:
         np = None
     if np is not None and isinstance(data, np.ndarray):
         return tuple(int(x) for x in data.shape)
-    if isinstance(data, LazyWeight):
-        return tuple(int(x) for x in data.shape)
+    if hasattr(data, "__dlpack__") and hasattr(data, "shape"):
+        return tuple(int(x) for x in data.shape)  # type: ignore[union-attr]
     from .tensor import _flatten_nested
 
     shape, _ = _flatten_nested(data)

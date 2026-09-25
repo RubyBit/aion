@@ -353,6 +353,9 @@ pub fn build(b: *std.Build) void {
     // Install public C header for FFI consumers.
     const install_header = b.addInstallFile(b.path("include/aion.h"), "include/aion.h");
     b.getInstallStep().dependOn(&install_header.step);
+    // aion.h includes the vendored DLPack header (host memory crosses the ABI as a DLTensor).
+    const install_dlpack = b.addInstallFile(b.path("include/dlpack/dlpack.h"), "include/dlpack/dlpack.h");
+    b.getInstallStep().dependOn(&install_dlpack.step);
 
     // wgpu-native is resolved at runtime (dlopen), never linked, so nothing wgpu
     // is bundled into the `aion` static library or its install prefix. The runtime

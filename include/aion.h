@@ -33,6 +33,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Host memory crosses this ABI as a DLPack `DLTensor` (vendored, v1.3): a borrowed,
+// strided view in any dtype the core converts from. See "Host memory" below.
+#include "dlpack/dlpack.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -157,46 +161,39 @@ AION_API AionStatus aion_context_create(
 AION_API void aion_context_destroy(AionContext* ctx);
 
 // -----------------------------------------------------------------------------
-// Tensors (scalar I/O)
+// Tensors
 // -----------------------------------------------------------------------------
 
-AION_API AionStatus aion_tensor_create_empty(
+// Host memory: every function that takes or fills host data does it through a
+// `DLTensor` view (dlpack/dlpack.h). The view is borrowed for the call only (except
+// a weight view bound with `aion_builder_param_named`, see there), must be on
+// `kDLCPU`, single-lane, and its shape must equal the tensor's. `strides` are in
+// elements and may be NULL (row-major); `byte_offset` is honoured. Element types:
+// float32, float16, bfloat16, int32, int8. Floats convert among themselves (so a
+// bfloat16 checkpoint reads straight into an f32 or f16 tensor, rounding to
+// nearest even when narrowing); integers only copy to their own width.
+
+// Create a tensor of `shape` (contents unspecified; fill it with aion_tensor_write).
+AION_API AionStatus aion_tensor_create(
     AionContext* ctx,
     AionDType dtype,
     size_t rank,
     const size_t* shape,
     AionTensor** out_tensor);
 
-// Like `aion_tensor_create_empty`, but with an explicit per-axis tile shape.
+// Like `aion_tensor_create`, but with an explicit per-axis tile shape.
 //
 // `tile_shape` must have `rank` entries; each entry must be in `1..=shape[d]` and,
 // where dtype is quantized, must align to the dtype's block granularity on the
 // block axis. Use this when a specific tile layout is required by a graph op
 // (e.g. KV caches consumed by `SequenceAppend`, which require the full head_dim
 // contiguous in a single tile).
-AION_API AionStatus aion_tensor_create_empty_tiled(
+AION_API AionStatus aion_tensor_create_tiled(
     AionContext* ctx,
     AionDType dtype,
     size_t rank,
     const size_t* shape,
     const size_t* tile_shape,
-    AionTensor** out_tensor);
-
-// Create a tensor, optionally initializing its contents.
-//
-// If `values == NULL`, this is equivalent to `aion_tensor_create_empty()`.
-// If `values != NULL`, `values_len` is the element count.
-//
-// v1 notes:
-// - Initialization from `values` is supported for scalar (non-quantized) dtypes.
-// - For quantized dtypes, pass `values == NULL` and `values_len == 0`.
-AION_API AionStatus aion_tensor_create(
-    AionContext* ctx,
-    AionDType dtype,
-    size_t rank,
-    const size_t* shape,
-    const void* values,
-    size_t values_len,
     AionTensor** out_tensor);
 
 AION_API void aion_tensor_destroy(AionTensor* t);
@@ -215,32 +212,11 @@ AION_API AionDType aion_tensor_dtype(const AionTensor* t);
 AION_API size_t aion_tensor_rank(const AionTensor* t);
 AION_API AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, size_t out_rank);
 
-// Read tensor contents into a caller-provided buffer.
-//
-// - `dtype` must match `aion_tensor_dtype(t)`.
-// - `out_len` is element count (not bytes).
-//
-// v1 notes:
-// - Only scalar (non-quantized) dtypes are supported.
-AION_API AionStatus aion_tensor_read(const AionTensor* t, AionDType dtype, void* out_values, size_t out_len);
+// Copy host memory `src` into the tensor (scalar dtypes; see "Host memory").
+AION_API AionStatus aion_tensor_write(AionTensor* t, const DLTensor* src);
 
-// Write tensor contents from a caller-provided buffer.
-//
-// - `dtype` must match `aion_tensor_dtype(t)`.
-// - `values_len` is element count (not bytes).
-//
-// v1 notes:
-// - Only scalar (non-quantized) dtypes are supported.
-AION_API AionStatus aion_tensor_write(AionTensor* t, AionDType dtype, const void* values, size_t values_len);
-
-// Read a scalar tensor into a single value.
-//
-// - `dtype` must match `aion_tensor_dtype(t)`.
-// - Tensor must contain exactly 1 element.
-//
-// v1 notes:
-// - Only scalar (non-quantized) dtypes are supported.
-AION_API AionStatus aion_tensor_read_scalar(const AionTensor* t, AionDType dtype, void* out_value);
+// Copy the tensor out into host memory `dst` (scalar dtypes; see "Host memory").
+AION_API AionStatus aion_tensor_read(const AionTensor* t, const DLTensor* dst);
 
 // -----------------------------------------------------------------------------
 // Loaded model runtime (.aion packages)
@@ -487,21 +463,22 @@ typedef struct AionParamOptions {
     AionDType quantize_to;
 } AionParamOptions;
 
-// Fills `count` f32 values, whole rows (the last axis) from row `row0` on, and
-// returns 0; anything else fails the quantization that asked.
-typedef int (*AionRowFill)(void* user, size_t row0, float* out, size_t count);
-
-// A weight to bind: an existing `tensor`, or — for one quantized with
-// `AionParamOptions.quantize_to` — its `shape` and rows, which `fill` supplies a
-// bounded chunk at a time when the weight is quantized, so no whole f32 copy of
-// it ever exists. `fill`/`user` must stay valid until then, or until the builder
-// is destroyed.
+// A weight to bind: exactly one of an existing `tensor`, or host memory `view`.
+//
+// On success the builder OWNS `view`, as a DLPack consumer: it calls
+// `view->deleter` (when non-null) once it no longer needs the memory. On failure
+// ownership stays with the caller. `view->version.major` must be 1.
+//
+// A view bound unquantized is copied in during the call, as a tensor of its own
+// dtype (bfloat16 widens to f32), and released before the call returns. A view
+// bound with `AionParamOptions.quantize_to` is NOT read yet: the ops that read it
+// decide the axis it blocks along, so it is read -- a chunk at a time, converted to
+// f32, never whole -- when the first such op is added (or at compile/export), and
+// released right after, or when the builder is destroyed if nothing ever read it.
+// Until then its memory must not change.
 typedef struct AionWeight {
     const AionTensor* tensor;
-    size_t rank;
-    const size_t* shape;
-    AionRowFill fill;
-    void* user;
+    DLManagedTensorVersioned* view;
 } AionWeight;
 
 // Bind a weight under a semantic, scope-qualified name (`layers.3/attn/weight`).
@@ -586,13 +563,13 @@ AION_API AionStatus aion_builder_compile(AionBuilder* b, AionDeviceKind device_k
 AION_API AionStatus aion_builder_export_path(AionBuilder* b, const char* path);
 AION_API AionStatus aion_builder_export_path_absolute(AionBuilder* b, const char* path);
 
-// Quantized-tensor creation. `aion_tensor_quantize` packs row-major f32 values
-// into a quantized tensor (q8_0 today); `aion_tensor_create_quant` ingests
-// pre-packed quant bytes.
+// Quantized-tensor creation. `aion_tensor_quantize` quantizes host memory `src`
+// (any float dtype, see "Host memory") into a tensor of its shape (q8_0 today);
+// `aion_tensor_create_quant` ingests pre-packed quant bytes.
 // `quant_axis` selects the block axis (every block_elems along it forms one
 // block). For a matmul-B weight this is the K reduction axis (rank-2); for an
 // embedding table blocked along the feature dim it is the last axis.
-AION_API AionStatus aion_tensor_quantize(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const float* values, size_t values_len, AionTensor** out_tensor);
+AION_API AionStatus aion_tensor_quantize(AionContext* ctx, AionDType dtype, size_t quant_axis, const DLTensor* src, AionTensor** out_tensor);
 AION_API AionStatus aion_tensor_create_quant(AionContext* ctx, AionDType dtype, size_t rank, const size_t* shape, size_t quant_axis, const uint8_t* packed, size_t packed_len, AionTensor** out_tensor);
 
 #ifdef __cplusplus

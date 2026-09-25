@@ -7,7 +7,11 @@
 //! - No allocations during execution of compiled models.
 
 pub const Context = @import("context.zig").Context;
-pub const RowSource = @import("context.zig").RowSource;
+pub const WeightSource = @import("context.zig").WeightSource;
+pub const HostView = @import("host_view.zig").HostView;
+pub const HostViewMut = @import("host_view.zig").HostViewMut;
+pub const HostElem = @import("host_view.zig").Elem;
+pub const host_view_max_rank = @import("host_view.zig").max_rank;
 pub const TilePolicy = @import("context.zig").TilePolicy;
 pub const LoadedModel = @import("context.zig").LoadedModel;
 pub const Weights = @import("context.zig").Weights;

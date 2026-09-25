@@ -15,6 +15,8 @@ from .dtype import (
     q8_0,
 )
 from .context import Context
+from ._ffi._raw import ffi
+from ._ffi.dlpack import HostView, view_of, view_of_buffer
 from ._ffi.handles import TensorHandle
 from ._ffi.runtime import (
     create_empty_tensor,
@@ -53,6 +55,26 @@ def _elem_count(shape: Sequence[int]) -> int:
     if len(shape) == 0:
         return 1
     return int(math.prod(int(x) for x in shape))
+
+
+def _float_view(values: object, shape: Sequence[int]) -> HostView:
+    """Float `values` of `shape` as a host view the core reads in place: anything
+    exporting ``__dlpack__`` as it is (any float dtype, strided, bf16 included),
+    else a numpy array or nested list copied to float32."""
+    shp = tuple(int(d) for d in shape)
+    if hasattr(values, "__dlpack__"):
+        view = view_of(values)
+        if view.shape != shp:
+            try:
+                view = view_of(values.reshape(shp))  # type: ignore[attr-defined]
+            except Exception:
+                raise ValueError(f"expected shape {shp}, got {view.shape}") from None
+        return view
+    _, flat = _flatten_nested(values)
+    n = _elem_count(list(shp))
+    if len(flat) != n:
+        raise ValueError(f"expected {n} values for shape {shp}, got {len(flat)}")
+    return view_of_buffer(ffi.new("float[]", [float(v) for v in flat]), AionDType.AION_DTYPE_F32, shp)
 
 
 def _flatten_nested(data) -> tuple[tuple[int, ...], list[float]]:
@@ -511,33 +533,7 @@ class Tensor:
             raise ValueError(f"quant_axis {quant_axis} out of range for rank {len(shp)}")
         n = _elem_count(shp)
 
-        try:
-            import numpy as np
-        except ImportError:
-            np = None
-
-        if np is not None and isinstance(values, np.ndarray):
-            arr = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
-            if arr.size != n:
-                raise ValueError(f"expected {n} values for shape {shp}, got {arr.size}")
-            native_values: object = arr
-            from_buffer = True
-        else:
-            _, flat = _flatten_nested(values)
-            if len(flat) != n:
-                raise ValueError(f"expected {n} values for shape {shp}, got {len(flat)}")
-            native_values = [float(v) for v in flat]
-            from_buffer = False
-
-        handle = quantize_tensor(
-            ctx.ptr,
-            dtype,
-            shp,
-            quant_axis,
-            native_values,
-            n,
-            from_buffer=from_buffer,
-        )
+        handle = quantize_tensor(ctx.ptr, dtype, quant_axis, _float_view(values, shp))
         return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     @classmethod

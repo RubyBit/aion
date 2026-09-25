@@ -197,6 +197,124 @@ fn getShapeSlice(rank: usize, shape_ptr: [*c]const usize) ?[]const usize {
     return shape_ptr[0..rank];
 }
 
+// --- DLPack --------------------------------------------------------------------
+// Host memory crosses the ABI as a DLPack `DLTensor` (include/dlpack/dlpack.h,
+// v1.x, whose layout minor versions never change): borrowed, strided, in any
+// dtype the core converts from. These mirror its C structs field for field.
+
+pub const DLDevice = extern struct {
+    device_type: i32,
+    device_id: i32,
+};
+
+pub const DLDataType = extern struct {
+    code: u8,
+    bits: u8,
+    lanes: u16,
+};
+
+pub const DLTensor = extern struct {
+    data: ?*anyopaque,
+    device: DLDevice,
+    ndim: i32,
+    dtype: DLDataType,
+    shape: ?[*]const i64,
+    strides: ?[*]const i64,
+    byte_offset: u64,
+};
+
+pub const DLPackVersion = extern struct {
+    major: u32,
+    minor: u32,
+};
+
+/// A DLPack tensor together with its owner: whoever consumes it calls `deleter`
+/// (when non-null) once the memory is no longer needed.
+pub const DLManagedTensorVersioned = extern struct {
+    version: DLPackVersion,
+    manager_ctx: ?*anyopaque,
+    deleter: ?*const fn (self: ?*DLManagedTensorVersioned) callconv(.c) void,
+    flags: u64,
+    dl_tensor: DLTensor,
+};
+
+/// The DLPack major version whose layout these mirror; a consumer must refuse others.
+const dlpack_major: u32 = 1;
+
+fn releaseManaged(ctx: *anyopaque) void {
+    const m: *DLManagedTensorVersioned = @ptrCast(@alignCast(ctx));
+    if (m.deleter) |deleter| deleter(m);
+}
+
+const kDLCPU: i32 = 1;
+const kDLInt: u8 = 0;
+const kDLFloat: u8 = 2;
+const kDLBfloat: u8 = 4;
+
+fn elemFromDL(t: DLDataType) ?api.HostElem {
+    if (t.lanes != 1) return null;
+    return switch (t.code) {
+        kDLFloat => switch (t.bits) {
+            32 => .f32,
+            16 => .f16,
+            else => null,
+        },
+        kDLBfloat => if (t.bits == 16) .bf16 else null,
+        kDLInt => switch (t.bits) {
+            32 => .i32,
+            8 => .i8,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Where a view's shape and strides live: a stack buffer for a view used during
+/// the call, or an arena for one that outlives it.
+const ViewDims = struct {
+    shape: []usize,
+    strides: []isize,
+};
+
+/// A CPU DLPack tensor as a host view (`api.HostView`, or `api.HostViewMut` for a
+/// destination), its shape and strides copied into `dims`. Null for anything the
+/// core cannot address.
+fn viewFromDL(comptime V: type, dl_opt: ?*const DLTensor, dims: ViewDims) ?V {
+    const dl = dl_opt orelse return null;
+    if (dl.device.device_type != kDLCPU) return null;
+    const elem = elemFromDL(dl.dtype) orelse return null;
+    if (dl.ndim < 0 or @as(usize, @intCast(dl.ndim)) > dims.shape.len) return null;
+    const rank: usize = @intCast(dl.ndim);
+    for (0..rank) |i| {
+        const d = (dl.shape orelse return null)[i];
+        if (d < 0) return null;
+        dims.shape[i] = @intCast(d);
+    }
+    const strides: ?[]const isize = if (dl.strides) |s| blk: {
+        for (0..rank) |i| dims.strides[i] = @intCast(s[i]);
+        break :blk dims.strides[0..rank];
+    } else null;
+    const base: V.Bytes = @ptrCast(dl.data orelse return null);
+    const view: V = .{
+        .data = base + @as(usize, @intCast(dl.byte_offset)),
+        .elem = elem,
+        .shape = dims.shape[0..rank],
+        .strides = strides,
+    };
+    view.validate() catch return null;
+    return view;
+}
+
+/// Stack room for one call-scoped view's dims.
+const ViewBuf = struct {
+    shape: [api.host_view_max_rank]usize = undefined,
+    strides: [api.host_view_max_rank]isize = undefined,
+
+    fn dims(self: *ViewBuf) ViewDims {
+        return .{ .shape = &self.shape, .strides = &self.strides };
+    }
+};
+
 pub export fn aion_version_major() callconv(.c) u32 {
     return 0;
 }
@@ -305,7 +423,7 @@ pub export fn aion_context_destroy(ctx_opt: ?*AionContext) callconv(.c) void {
     library_allocator.destroy(ctx);
 }
 
-pub export fn aion_tensor_create_empty(
+pub export fn aion_tensor_create(
     ctx_opt: ?*AionContext,
     dtype_c: AionDType,
     rank: usize,
@@ -322,7 +440,7 @@ pub export fn aion_tensor_create_empty(
     const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
 
     const t: api.Tensor = ctx.ctx.tensor(dt, shape) catch |e| {
-        ctx.setLastError("tensor_create_empty", e);
+        ctx.setLastError("tensor_create", e);
         return mapError(e);
     };
 
@@ -335,7 +453,7 @@ pub export fn aion_tensor_create_empty(
     return .AION_OK;
 }
 
-pub export fn aion_tensor_create_empty_tiled(
+pub export fn aion_tensor_create_tiled(
     ctx_opt: ?*AionContext,
     dtype_c: AionDType,
     rank: usize,
@@ -354,66 +472,8 @@ pub export fn aion_tensor_create_empty_tiled(
     const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
 
     const t: api.Tensor = ctx.ctx.tensorTiled(dt, shape, tile_shape) catch |e| {
-        ctx.setLastError("tensor_create_empty_tiled", e);
+        ctx.setLastError("tensor_create_tiled", e);
         return mapError(e);
-    };
-
-    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
-        ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
-        return .AION_OUT_OF_MEMORY;
-    };
-    handle.* = .{ .owner = ctx, .tensor = t };
-    out_tensor.?.* = handle;
-    return .AION_OK;
-}
-
-pub export fn aion_tensor_create(
-    ctx_opt: ?*AionContext,
-    dtype_c: AionDType,
-    rank: usize,
-    shape_ptr: [*c]const usize,
-    values_ptr: ?*const anyopaque,
-    values_len: usize,
-    out_tensor: ?*?*AionTensor,
-) callconv(.c) AionStatus {
-    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
-    ctx.clearLastError();
-
-    if (out_tensor == null) return .AION_INVALID_ARGUMENT;
-    out_tensor.?.* = null;
-
-    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
-    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
-
-    // If no values are provided, behave like create_empty (but keep this API convenient for FFI).
-    const t: api.Tensor = blk: {
-        if (values_ptr == null) {
-            if (values_len != 0) return .AION_INVALID_ARGUMENT;
-            break :blk ctx.ctx.tensor(dt, shape) catch |e| {
-                ctx.setLastError("tensor_create", e);
-                return mapError(e);
-            };
-        }
-        if (values_len == 0) {
-            break :blk ctx.ctx.tensor(dt, shape) catch |e| {
-                ctx.setLastError("tensor_create", e);
-                return mapError(e);
-            };
-        }
-
-        if (dt.info().is_quantized) return .AION_UNSUPPORTED;
-
-        const elem_bytes: usize = dt.info().block_bytes;
-        if (!requireAligned(values_ptr.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
-
-        const total_bytes: usize = std.math.mul(usize, values_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
-        const bytes_ptr: [*]const u8 = @ptrCast(values_ptr.?);
-        const @"packed": []const u8 = bytes_ptr[0..total_bytes];
-
-        break :blk ctx.ctx.fromPackedScalar(dt, shape, @"packed") catch |e| {
-            ctx.setLastError("tensor_create", e);
-            return mapError(e);
-        };
     };
 
     const handle: *AionTensor = library_allocator.create(AionTensor) catch {
@@ -496,109 +556,33 @@ pub export fn aion_tensor_shape(t_opt: ?*const AionTensor, out_dims: [*c]usize, 
     return .AION_OK;
 }
 
-pub export fn aion_tensor_read(
-    t_opt: ?*const AionTensor,
-    dtype_c: AionDType,
-    out_values: ?*anyopaque,
-    out_len: usize,
-) callconv(.c) AionStatus {
-    const t: *const AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
-    const ctx: *AionContext = t.owner;
-    ctx.clearLastError();
-
-    if (out_values == null) return .AION_INVALID_ARGUMENT;
-    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
-    if (t.tensor.getDType() != dt) return .AION_INVALID_ARGUMENT;
-
-    const want: usize = t.tensor.elemCount() catch |e| {
-        ctx.setLastError("tensor_elem_count", e);
-        return mapError(e);
-    };
-    if (out_len != want) return .AION_INVALID_ARGUMENT;
-
-    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
-    const elem_bytes: usize = dt.info().block_bytes;
-    if (!requireAligned(out_values.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
-
-    const total_bytes: usize = std.math.mul(usize, out_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
-    const bytes_ptr: [*]u8 = @ptrCast(out_values.?);
-    const out_bytes: []u8 = bytes_ptr[0..total_bytes];
-
-    t.tensor.readPackedScalar(out_bytes) catch |e| {
-        ctx.setLastError("tensor_read", e);
-        return mapError(e);
-    };
-    return .AION_OK;
-}
-
-pub export fn aion_tensor_write(
-    t_opt: ?*AionTensor,
-    dtype_c: AionDType,
-    values_ptr: ?*const anyopaque,
-    values_len: usize,
-) callconv(.c) AionStatus {
+/// Copy host memory in: `src`'s shape must equal the tensor's, and its elements
+/// convert to the tensor's dtype (floats among floats, integers to their own width).
+pub export fn aion_tensor_write(t_opt: ?*AionTensor, src: ?*const DLTensor) callconv(.c) AionStatus {
     const t: *AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
     const ctx: *AionContext = t.owner;
     ctx.clearLastError();
-
-    if (values_ptr == null) return .AION_INVALID_ARGUMENT;
-    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
-    if (t.tensor.getDType() != dt) return .AION_INVALID_ARGUMENT;
-
-    const want: usize = t.tensor.elemCount() catch |e| {
-        ctx.setLastError("tensor_elem_count", e);
-        return mapError(e);
-    };
-    if (values_len != want) return .AION_INVALID_ARGUMENT;
-
-    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
-    const elem_bytes: usize = dt.info().block_bytes;
-    if (!requireAligned(values_ptr.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
-
-    const total_bytes: usize = std.math.mul(usize, values_len, elem_bytes) catch return .AION_INVALID_ARGUMENT;
-    const bytes_ptr: [*]const u8 = @ptrCast(values_ptr.?);
-    const @"packed": []const u8 = bytes_ptr[0..total_bytes];
-
-    t.tensor.writePackedScalar(@"packed") catch |e| {
+    var buf: ViewBuf = .{};
+    const view = viewFromDL(api.HostView, src, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
+    t.tensor.writeView(library_allocator, view) catch |e| {
         ctx.setLastError("tensor_write", e);
         return mapError(e);
     };
     return .AION_OK;
 }
 
-pub export fn aion_tensor_read_scalar(
-    t_opt: ?*const AionTensor,
-    dtype_c: AionDType,
-    out_value: ?*anyopaque,
-) callconv(.c) AionStatus {
+/// Copy the tensor out into host memory `dst` of the same shape, converting as
+/// `aion_tensor_write` does.
+pub export fn aion_tensor_read(t_opt: ?*const AionTensor, dst: ?*const DLTensor) callconv(.c) AionStatus {
     const t: *const AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
     const ctx: *AionContext = t.owner;
     ctx.clearLastError();
-
-    if (out_value == null) return .AION_INVALID_ARGUMENT;
-    const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
-    if (t.tensor.getDType() != dt) return .AION_INVALID_ARGUMENT;
-
-    const want: usize = t.tensor.elemCount() catch |e| {
-        ctx.setLastError("tensor_elem_count", e);
+    var buf: ViewBuf = .{};
+    const view = viewFromDL(api.HostViewMut, dst, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
+    t.tensor.readView(library_allocator, view) catch |e| {
+        ctx.setLastError("tensor_read", e);
         return mapError(e);
     };
-    if (want != 1) return .AION_INVALID_ARGUMENT;
-
-    if (dt.info().is_quantized) return .AION_UNSUPPORTED;
-    const elem_bytes: usize = dt.info().block_bytes;
-    if (!requireAligned(out_value.?, elem_bytes)) return .AION_INVALID_ARGUMENT;
-
-    var tmp: [8]u8 = undefined;
-    if (elem_bytes > tmp.len) return .AION_UNSUPPORTED;
-    const tmp_slice: []u8 = tmp[0..elem_bytes];
-
-    t.tensor.readPackedScalar(tmp_slice) catch |e| {
-        ctx.setLastError("tensor_read_scalar", e);
-        return mapError(e);
-    };
-    const out_bytes_ptr: [*]u8 = @ptrCast(out_value.?);
-    @memcpy(out_bytes_ptr[0..elem_bytes], tmp_slice);
     return .AION_OK;
 }
 
@@ -1256,34 +1240,28 @@ pub export fn aion_builder_name(b_opt: ?*AionBuilder, value: AionValueId, name: 
     return .AION_OK;
 }
 
+/// A weight to bind: an existing `tensor`, or a host `view` whose ownership the
+/// builder takes on success (see `aion.h`).
+pub const AionWeight = extern struct {
+    tensor: ?*const AionTensor = null,
+    view: ?*DLManagedTensorVersioned = null,
+};
+
+/// The dtype a view binds as when it is not quantized: its own, bf16 widened to f32.
+fn viewDType(elem: api.HostElem) types.DType {
+    return switch (elem) {
+        .f32, .bf16 => .f32,
+        .f16 => .f16,
+        .i32 => .i32,
+        .i8 => .i8,
+    };
+}
+
 /// Bind a weight under a semantic, scope-qualified name (`layers.3/attn/weight`).
 ///
 /// Unlike `aion_builder_param`, whose generated name is positional and shifts when
 /// construction order changes, this produces the stable key that load/swap-by-name
 /// depends on.
-/// Fills `count` f32 values — whole rows from `row0` on — and returns 0.
-pub const AionRowFill = *const fn (user: ?*anyopaque, row0: usize, out: [*]f32, count: usize) callconv(.c) c_int;
-
-/// A C row filler, as the core's `RowSource.Reader` calls it.
-const CRowReader = struct {
-    fill_fn: AionRowFill,
-    user: ?*anyopaque,
-
-    fn fill(ctx: *anyopaque, row0: usize, out: []f32) error{Failed}!void {
-        const self: *const CRowReader = @ptrCast(@alignCast(ctx));
-        if (self.fill_fn(self.user, row0, out.ptr, out.len) != 0) return error.Failed;
-    }
-};
-
-/// A weight to bind: an existing tensor, or a quantized weight's shape and rows.
-pub const AionWeight = extern struct {
-    tensor: ?*const AionTensor = null,
-    rank: usize = 0,
-    shape: [*c]const usize = null,
-    fill: ?AionRowFill = null,
-    user: ?*anyopaque = null,
-};
-
 pub export fn aion_builder_param_named(
     b_opt: ?*AionBuilder,
     weight_opt: ?*const AionWeight,
@@ -1295,22 +1273,40 @@ pub export fn aion_builder_param_named(
     b.owner.clearLastError();
     const weight: AionWeight = (weight_opt orelse return .AION_INVALID_ARGUMENT).*;
     if (name == null or out_value == null) return .AION_INVALID_ARGUMENT;
+    if ((weight.tensor == null) == (weight.view == null)) return .AION_INVALID_ARGUMENT;
 
     const o: AionParamOptions = if (opts) |p| p.* else .{};
     const quantize: ?types.DType = if (o.quantize_to == .AION_DTYPE_F32) null else dtypeFromC(o.quantize_to) orelse return .AION_INVALID_ARGUMENT;
+    const param_name = std.mem.span(name.?);
     const ref = blk: {
-        if (weight.tensor) |t| {
-            if (weight.fill != null) return .AION_INVALID_ARGUMENT;
-            break :blk b.builder.paramNamed(t.tensor, std.mem.span(name.?), .{ .quantize = quantize });
+        if (weight.tensor) |t| break :blk b.builder.paramNamed(t.tensor, param_name, .{ .quantize = quantize });
+        const managed = weight.view.?;
+        if (managed.version.major != dlpack_major) return .AION_UNSUPPORTED;
+        if (quantize) |dtype| {
+            // Read once an op fixes the blocking axis, so its dims live with the
+            // builder, and its owner hears back only then (or when the builder goes).
+            const arena = b.str_arena.allocator();
+            const dims: ViewDims = .{
+                .shape = arena.alloc(usize, api.host_view_max_rank) catch return .AION_OUT_OF_MEMORY,
+                .strides = arena.alloc(isize, api.host_view_max_rank) catch return .AION_OUT_OF_MEMORY,
+            };
+            const view = viewFromDL(api.HostView, &managed.dl_tensor, dims) orelse return .AION_INVALID_ARGUMENT;
+            break :blk b.builder.paramView(dtype, view, param_name, .{ .ctx = managed, .func = releaseManaged });
         }
-        // Rows alone: only a quantized weight is read that way.
-        const fill = weight.fill orelse return .AION_INVALID_ARGUMENT;
-        const dtype = quantize orelse return .AION_INVALID_ARGUMENT;
-        if (weight.rank == 0 or weight.shape == null) return .AION_INVALID_ARGUMENT;
-        // Lives as long as the builder, which is as long as the core may call it.
-        const reader = b.str_arena.allocator().create(CRowReader) catch return .AION_OUT_OF_MEMORY;
-        reader.* = .{ .fill_fn = fill, .user = weight.user };
-        break :blk b.builder.paramRows(dtype, weight.shape[0..weight.rank], std.mem.span(name.?), .{ .ctx = reader, .fill = CRowReader.fill });
+        // Unquantized: copied in now, as the tensor it binds, and handed straight back.
+        var buf: ViewBuf = .{};
+        const view = viewFromDL(api.HostView, &managed.dl_tensor, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
+        const t = b.owner.ctx.fromView(viewDType(view.elem), view) catch |e| {
+            b.owner.setLastError("builder_param_named", e);
+            return mapError(e);
+        };
+        defer t.release();
+        const ref = b.builder.paramNamed(t, param_name, .{}) catch |e| {
+            b.owner.setLastError("builder_param_named", e);
+            return mapError(e);
+        };
+        releaseManaged(managed);
+        break :blk ref;
     } catch |e| {
         b.owner.setLastError("builder_param_named", e);
         return mapError(e);
@@ -2092,32 +2088,29 @@ pub export fn aion_builder_export_path_absolute(b_opt: ?*AionBuilder, path: ?[*:
     return builderExportImpl(b, path, true);
 }
 
-/// Quantize row-major f32 values into a packed-quant tensor (q8_0 today).
+/// Quantize host memory `src` into a new `dtype` tensor of its shape, blocking along
+/// `quant_axis`; `src` converts to f32 as it is read, a chunk at a time.
 pub export fn aion_tensor_quantize(
     ctx_opt: ?*AionContext,
     dtype_c: AionDType,
-    rank: usize,
-    shape_ptr: [*c]const usize,
     quant_axis: usize,
-    values_ptr: [*c]const f32,
-    values_len: usize,
+    src: ?*const DLTensor,
     out_tensor: ?*?*AionTensor,
 ) callconv(.c) AionStatus {
     const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
     ctx.clearLastError();
     if (out_tensor == null) return .AION_INVALID_ARGUMENT;
     out_tensor.?.* = null;
-    if (values_ptr == null) return .AION_INVALID_ARGUMENT;
-
-    const shape: []const usize = getShapeSlice(rank, shape_ptr) orelse return .AION_INVALID_ARGUMENT;
     const dt: types.DType = dtypeFromC(dtype_c) orelse return .AION_INVALID_ARGUMENT;
-    const values: []const f32 = values_ptr[0..values_len];
+    var buf: ViewBuf = .{};
+    const view = viewFromDL(api.HostView, src, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
 
-    const t: api.Tensor = ctx.ctx.fromF32Quantized(dt, shape, quant_axis, values) catch |e| {
+    const t: api.Tensor = ctx.ctx.quantize(dt, view.shape, quant_axis, .{ .view = view }) catch |e| {
         ctx.setLastError("tensor_quantize", e);
         return mapError(e);
     };
     const handle: *AionTensor = library_allocator.create(AionTensor) catch {
+        t.release();
         ctx.setLastError("tensor_handle_alloc", error.OutOfMemory);
         return .AION_OUT_OF_MEMORY;
     };

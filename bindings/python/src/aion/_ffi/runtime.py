@@ -10,6 +10,7 @@ from ..device import GpuOptions, normalize_gpu_backend, normalize_gpu_power
 from ..dtype import c_elem
 from ..enums import AionDType
 from ._raw import ffi, lib
+from .dlpack import HostView, view_of_buffer
 from .handles import ContextHandle, ModelHandle, TensorHandle
 from .status import raise_for_status
 
@@ -197,53 +198,31 @@ def model_output_tensor(
     return TensorHandle(out[0])
 
 
-def create_tensor(
-    ctx: ContextHandle,
-    dtype: AionDType,
-    shape: Sequence[int],
-    values: Iterable[int | float],
-) -> TensorHandle:
-    dims = tuple(int(dim) for dim in shape)
-    c_shape = ffi.NULL if not dims else ffi.new("size_t[]", dims)
-    materialized = list(values)
-    c_values = ffi.new(f"{c_elem(dtype)}[]", materialized)
-    out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_create(
-        ctx.raw, int(dtype), len(dims), c_shape, c_values, len(materialized), out
-    )
-    raise_for_status(status, ctx, what="aion_tensor_create")
-    return TensorHandle(out[0])
-
-
-def create_tensor_from_buffer(
-    ctx: ContextHandle,
-    dtype: AionDType,
-    shape: Sequence[int],
-    buffer: object,
-    element_count: int,
-) -> TensorHandle:
-    dims = tuple(int(dim) for dim in shape)
-    c_shape = ffi.NULL if not dims else ffi.new("size_t[]", dims)
-    c_buffer = ffi.from_buffer(f"{c_elem(dtype)}[]", buffer)
-    out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_create(
-        ctx.raw, int(dtype), len(dims), c_shape, c_buffer, int(element_count), out
-    )
-    raise_for_status(status, ctx, what="aion_tensor_create")
-    return TensorHandle(out[0])
-
-
 def create_empty_tensor(
     ctx: ContextHandle, dtype: AionDType, shape: Sequence[int]
 ) -> TensorHandle:
     dims = tuple(int(dim) for dim in shape)
     c_shape = ffi.NULL if not dims else ffi.new("size_t[]", dims)
     out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_create_empty(
-        ctx.raw, int(dtype), len(dims), c_shape, out
-    )
-    raise_for_status(status, ctx, what="aion_tensor_create_empty")
+    status = lib.aion_tensor_create(ctx.raw, int(dtype), len(dims), c_shape, out)
+    raise_for_status(status, ctx, what="aion_tensor_create")
     return TensorHandle(out[0])
+
+
+def create_tensor(
+    ctx: ContextHandle,
+    dtype: AionDType,
+    shape: Sequence[int],
+    values: Iterable[int | float],
+) -> TensorHandle:
+    """A new tensor holding plain Python `values` (row-major)."""
+    handle = create_empty_tensor(ctx, dtype, shape)
+    try:
+        write_tensor(ctx, handle, values, shape=shape)
+    except BaseException:
+        destroy_tensor(handle)
+        raise
+    return handle
 
 
 def create_empty_tiled_tensor(
@@ -257,41 +236,22 @@ def create_empty_tiled_tensor(
     c_shape = ffi.NULL if not dims else ffi.new("size_t[]", dims)
     c_tiles = ffi.NULL if not tiles else ffi.new("size_t[]", tiles)
     out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_create_empty_tiled(
+    status = lib.aion_tensor_create_tiled(
         ctx.raw, int(dtype), len(dims), c_shape, c_tiles, out
     )
-    raise_for_status(status, ctx, what="aion_tensor_create_empty_tiled")
+    raise_for_status(status, ctx, what="aion_tensor_create_tiled")
     return TensorHandle(out[0])
 
 
 def quantize_tensor(
     ctx: ContextHandle,
     dtype: AionDType,
-    shape: Sequence[int],
     quant_axis: int,
-    values: object,
-    element_count: int,
-    *,
-    from_buffer: bool,
+    source: HostView,
 ) -> TensorHandle:
-    dims = tuple(int(dim) for dim in shape)
-    c_shape = ffi.new("size_t[]", dims)
-    c_values = (
-        ffi.from_buffer("float[]", values)
-        if from_buffer
-        else ffi.new("float[]", [float(v) for v in values])  # type: ignore[union-attr]
-    )
+    """Quantize host memory `source` (any float dtype) into a tensor of its shape."""
     out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_quantize(
-        ctx.raw,
-        int(dtype),
-        len(dims),
-        c_shape,
-        int(quant_axis),
-        c_values,
-        int(element_count),
-        out,
-    )
+    status = lib.aion_tensor_quantize(ctx.raw, int(dtype), int(quant_axis), source.ptr, out)
     raise_for_status(status, ctx, what="aion_tensor_quantize")
     return TensorHandle(out[0])
 
@@ -329,6 +289,20 @@ def tensor_shape(ctx: ContextHandle, tensor: TensorHandle) -> tuple[int, ...]:
     return tuple(int(dims[i]) for i in range(rank))
 
 
+def write_view(ctx: ContextHandle, tensor: TensorHandle, source: HostView) -> None:
+    """Copy host memory into `tensor` (same shape; floats convert among themselves)."""
+    status = lib.aion_tensor_write(tensor.raw, source.ptr)
+    raise_for_status(status, ctx, what="aion_tensor_write")
+
+
+def read_view(ctx: ContextHandle, tensor: TensorHandle, target: HostView) -> None:
+    """Copy `tensor` out into host memory of the same shape."""
+    if target.read_only:
+        raise ValueError("cannot read a tensor into read-only memory")
+    status = lib.aion_tensor_read(tensor.raw, target.ptr)
+    raise_for_status(status, ctx, what="aion_tensor_read")
+
+
 def read_tensor(
     ctx: ContextHandle,
     tensor: TensorHandle,
@@ -336,8 +310,7 @@ def read_tensor(
 ) -> list[int | float]:
     dtype = tensor_dtype(tensor)
     buf = ffi.new(f"{c_elem(dtype)}[]", int(element_count))
-    status = lib.aion_tensor_read(tensor.raw, int(dtype), buf, int(element_count))
-    raise_for_status(status, ctx, what="aion_tensor_read")
+    read_view(ctx, tensor, view_of_buffer(buf, dtype, tensor_shape(ctx, tensor)))
     if dtype == AionDType.AION_DTYPE_F32:
         return [float(buf[i]) for i in range(element_count)]
     if dtype == AionDType.AION_DTYPE_F16:
@@ -348,44 +321,18 @@ def read_tensor(
     return [int(buf[i]) for i in range(element_count)]
 
 
-def read_tensor_into_buffer(
-    ctx: ContextHandle,
-    tensor: TensorHandle,
-    buffer: object,
-    element_count: int,
-) -> None:
-    dtype = tensor_dtype(tensor)
-    c_buffer = ffi.from_buffer(f"{c_elem(dtype)}[]", buffer)
-    status = lib.aion_tensor_read(tensor.raw, int(dtype), c_buffer, int(element_count))
-    raise_for_status(status, ctx, what="aion_tensor_read")
-
-
 def write_tensor(
     ctx: ContextHandle,
     tensor: TensorHandle,
     values: Iterable[int | float],
+    *,
+    shape: Sequence[int] | None = None,
 ) -> None:
+    """Write plain Python `values` (row-major) into `tensor`."""
     dtype = tensor_dtype(tensor)
-    materialized = list(values)
-    buf = ffi.new(f"{c_elem(dtype)}[]", materialized)
-    status = lib.aion_tensor_write(
-        tensor.raw, int(dtype), buf, len(materialized)
-    )
-    raise_for_status(status, ctx, what="aion_tensor_write")
-
-
-def write_tensor_from_buffer(
-    ctx: ContextHandle,
-    tensor: TensorHandle,
-    buffer: object,
-    element_count: int,
-) -> None:
-    dtype = tensor_dtype(tensor)
-    c_buffer = ffi.from_buffer(f"{c_elem(dtype)}[]", buffer)
-    status = lib.aion_tensor_write(
-        tensor.raw, int(dtype), c_buffer, int(element_count)
-    )
-    raise_for_status(status, ctx, what="aion_tensor_write")
+    buf = ffi.new(f"{c_elem(dtype)}[]", list(values))
+    dims = tensor_shape(ctx, tensor) if shape is None else tuple(shape)
+    write_view(ctx, tensor, view_of_buffer(buf, dtype, dims))
 
 
 def zero_tensor(
@@ -394,11 +341,8 @@ def zero_tensor(
     element_count: int,
 ) -> None:
     dtype = tensor_dtype(tensor)
-    buf = ffi.new(f"{c_elem(dtype)}[]", int(element_count))
-    status = lib.aion_tensor_write(
-        tensor.raw, int(dtype), buf, int(element_count)
-    )
-    raise_for_status(status, ctx, what="aion_tensor_write")
+    buf = ffi.new(f"{c_elem(dtype)}[]", int(element_count))  # zero-initialized
+    write_view(ctx, tensor, view_of_buffer(buf, dtype, tensor_shape(ctx, tensor)))
 
 
 __all__ = [
@@ -407,7 +351,6 @@ __all__ = [
     "create_empty_tensor",
     "create_empty_tiled_tensor",
     "create_tensor",
-    "create_tensor_from_buffer",
     "destroy_context",
     "destroy_model",
     "destroy_tensor",
@@ -422,7 +365,7 @@ __all__ = [
     "move_tensor",
     "quantize_tensor",
     "read_tensor",
-    "read_tensor_into_buffer",
+    "read_view",
     "reset_model_state",
     "run_model",
     "set_model_position",
@@ -431,6 +374,6 @@ __all__ = [
     "tensor_dtype",
     "tensor_shape",
     "write_tensor",
-    "write_tensor_from_buffer",
+    "write_view",
     "zero_tensor",
 ]

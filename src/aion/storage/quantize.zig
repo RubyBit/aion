@@ -3,7 +3,7 @@
 //!
 //! This is the single source of truth for producing packed-quant bytes from f32
 //! values. It mirrors the packed-quant convention consumed by
-//! `storage.TiledTensor.writeFromPackedQuant` (see its doc comment): along
+//! `storage.Tensor.writeFromPackedQuant` (see its doc comment): along
 //! `quant_axis`, every `block_elems` consecutive elements form one `block_bytes`
 //! block, and `packed_bytes` is row-major over the resulting block-space shape.
 //!

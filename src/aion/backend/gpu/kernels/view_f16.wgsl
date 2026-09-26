@@ -2,7 +2,7 @@
 //
 // View materializations for f16 at ELEMENT granularity — the twins of view.wgsl's
 // u32-word kernels, taken when a word view of the innermost axis does not exist
-// (odd extents, odd slice starts, odd tile boundaries). `shader-f16` gives 2-byte
+// (odd extents, odd slice starts). `shader-f16` gives 2-byte
 // storage addressing, so an invocation owns one element and neighbours never share
 // a destination word: no lane masking, no atomics, no tail handling.
 
@@ -53,23 +53,11 @@ fn strided_copy_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
 }
 
 // Strided gather: each packed dst element pulls from its strided src offset.
-// Covers SliceNDScalar, Transpose2DScalar (rank 2, strides swapped), and the
-// packed -> tiled half of reshape/retile.
+// Covers SliceNDScalar and Transpose2DScalar (rank 2, strides swapped).
 @compute @workgroup_size(64)
 fn gather_nd_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
     for (var idx = gid.x; idx < p.total; idx += stride) {
         o[idx] = x[stridedIndex(idx)];
-    }
-}
-
-// Strided scatter — the write-side twin. A tile's packed elements land at their
-// flat offsets in the packed tensor; neighbouring tiles may own opposite halves of
-// one word, which is exactly what element addressing makes a non-issue.
-@compute @workgroup_size(64)
-fn scatter_nd_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let stride = nwg.x * WG;
-    for (var idx = gid.x; idx < p.total; idx += stride) {
-        o[stridedIndex(idx)] = x[idx];
     }
 }

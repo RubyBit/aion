@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //! Provenance for weights an optimization pass derived from other weights.
 //!
-//! A pass that rewrites weights (retiling, repacking) makes the derived
-//! tensor the canonical store and lets the model layer reclaim the sources. Two things
+//! A pass that re-lays a weight for a kernel (`opt/weight_layout`) makes the derived
+//! tensor the canonical store and lets the model layer reclaim the source. Two things
 //! then have to keep working: a weight swap must land where the program reads, and a read
 //! must materialize a weight that no longer has storage of its own.
 //!
-//! Both are one mechanism here: the pass records WHERE each source's bytes went as a
+//! Both are one mechanism here: the pass records WHERE the source's bytes went as a
 //! `View`, and the swap/read paths are generic over it. Passes do not implement their own
 //! inverse, and the model layer does not switch on which pass ran.
 //!
 //! `record` refuses a derivation whose source is itself derived: resolving a chain means
 //! composing views, and getting that silently wrong writes bytes nothing reads, so
-//! stacking is a loud error until a pass actually needs it. One source folded into
-//! SEVERAL results is allowed — a weight is derived once per (tiling, device) a target
+//! stacking is a loud error until a pass actually needs it. One source derived into
+//! SEVERAL results is allowed — a weight is derived once per (order, device) a target
 //! needed — and a swap then has to reach every copy, which is what `locations` is for.
 
 const std = @import("std");
@@ -25,73 +25,44 @@ const StorageError = storage.StorageError;
 const DeviceRef = storage.DeviceRef;
 const TensorId = u32;
 
-pub const Kind = enum { retile, relayout };
-
-/// How a source's blocks are arranged inside the derived tensor.
-pub const Mapping = union(enum) {
-    /// Derived row `r` holds this source's blocks at `[offset, offset+len)`, so a
-    /// source is a vertical stripe of the result.
-    stripe,
-    /// A weight re-laid by `opt/weight_layout`, which no stripe describes.
-    relayout: Relayout,
-};
-
-/// The derived tensor is `[len, rows]` blocks: row `c` holds all `rows` blocks of
-/// output column `c`, in `order` inside tiles of `tile_rows` rows.
-pub const Relayout = struct {
-    /// The source is block-major `[rows, len]` — its block `(kb, c)` is derived
-    /// block `(c, kb)`. Otherwise it is already `[len, rows]`.
+/// How a source's blocks are arranged inside the derived tensor: the result is
+/// `[cols, blocks]` blocks — row `c` holds all `blocks` blocks of output column `c` —
+/// laid out in `order`.
+pub const View = struct {
+    /// Blocks per row of the result (the reduction length in blocks).
+    blocks: usize,
+    /// Rows of the result (output columns).
+    cols: usize,
+    block_bytes: usize,
+    /// The source is block-major `[blocks, cols]` — its block `(kb, c)` is derived
+    /// block `(c, kb)`. Otherwise it is already `[cols, blocks]`.
     transposed: bool,
     order: types.QuantBlockOrder,
-    tile_rows: usize,
 
-    /// Byte offset of the tile holding column `c`, and `c`'s row inside it; the
-    /// order places the blocks within the tile.
-    pub fn tileOf(self: Relayout, blocks: usize, c: usize) struct { base: usize, row: usize } {
-        const row = c % self.tile_rows;
-        return .{ .base = (c - row) * blocks * types.QuantBlockOrder.BLOCK_BYTES, .row = row };
+    /// Bytes of the source, and equally of the result: a relayout moves blocks, it
+    /// never adds any.
+    pub fn bytes(self: View) usize {
+        return self.blocks * self.cols * self.block_bytes;
     }
 
-    /// Source block index of column `c`'s block `kb`, for `cols` columns.
-    pub fn sourceAt(self: Relayout, blocks: usize, cols: usize, c: usize, kb: usize) usize {
-        return if (self.transposed) kb * cols + c else c * blocks + kb;
+    /// Source block index of column `c`'s block `kb`.
+    pub fn sourceAt(self: View, c: usize, kb: usize) usize {
+        return if (self.transposed) kb * self.cols + c else c * self.blocks + kb;
     }
 };
-
-/// One source's bytes inside a derived tensor, in packed block space. The source
-/// occupies `rows * len` blocks either way; `mapping` says where they land.
-pub const View = struct {
-    rows: usize,
-    row_stride: usize,
-    offset: usize,
-    len: usize,
-    block_bytes: usize,
-    mapping: Mapping = .stripe,
-
-    pub fn sourceBytes(self: View) usize {
-        return self.rows * self.len * self.block_bytes;
-    }
-
-    pub fn derivedBytes(self: View) usize {
-        return self.rows * self.row_stride * self.block_bytes;
-    }
-};
-
-pub const Source = struct { tid: TensorId, view: View };
 
 pub const Entry = struct {
-    kind: Kind,
-    /// The tile shape the result was built for. The bytes are shape-independent but the
-    /// LAYOUT is not: tiling is chosen per target, and a quantized weight cannot be
-    /// retiled downstream, so a result built for one target must not be reused for
-    /// another.
-    tiles: []usize,
+    /// The block order the result was built in. Part of the identity because a
+    /// quantized weight's order is fixed once laid out: a result built for one target's
+    /// kernel must not be handed to another's.
+    order: types.QuantBlockOrder,
     /// The device the result was built for. Part of the identity because a tensor is
     /// resident on exactly one device: handing one model's result to a model on another
     /// device would migrate it away from the first, which is a move, not a share.
     device: DeviceRef,
     result: TensorId,
-    sources: []Source,
+    source: TensorId,
+    view: View,
 };
 
 pub const Located = struct { result: TensorId, view: View };
@@ -100,54 +71,25 @@ pub const Table = struct {
     entries: std.ArrayList(Entry) = .empty,
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
-        for (self.entries.items) |e| {
-            gpa.free(e.tiles);
-            gpa.free(e.sources);
-        }
         self.entries.deinit(gpa);
     }
 
-    /// A previously derived result for exactly these sources, at this tiling, on this device.
-    pub fn find(
-        self: *const Table,
-        kind: Kind,
-        tiles: []const usize,
-        device: DeviceRef,
-        sources: []const TensorId,
-    ) ?TensorId {
+    /// A previously derived result for exactly this source, in this order, on this device.
+    pub fn find(self: *const Table, order: types.QuantBlockOrder, device: DeviceRef, source: TensorId) ?TensorId {
         for (self.entries.items) |e| {
-            if (e.kind != kind or e.sources.len != sources.len) continue;
-            if (!e.device.eql(device)) continue;
-            if (!std.mem.eql(usize, e.tiles, tiles)) continue;
-            for (e.sources, sources) |have, want| {
-                if (have.tid != want) break;
-            } else return e.result;
+            if (e.order == order and e.device.eql(device) and e.source == source) return e.result;
         }
         return null;
     }
 
-    pub fn record(
-        self: *Table,
-        gpa: std.mem.Allocator,
-        kind: Kind,
-        tiles: []const usize,
-        device: DeviceRef,
-        result: TensorId,
-        sources: []const Source,
-    ) StorageError!void {
-        for (sources) |s| {
-            if (self.isDerived(s.tid)) return StorageError.InvalidArgument;
-        }
-        const tiles_copy = gpa.dupe(usize, tiles) catch return StorageError.OutOfMemory;
-        errdefer gpa.free(tiles_copy);
-        const src_copy = gpa.dupe(Source, sources) catch return StorageError.OutOfMemory;
-        errdefer gpa.free(src_copy);
+    pub fn record(self: *Table, gpa: std.mem.Allocator, device: DeviceRef, result: TensorId, source: TensorId, view: View) StorageError!void {
+        if (self.isDerived(source)) return StorageError.InvalidArgument;
         self.entries.append(gpa, .{
-            .kind = kind,
-            .tiles = tiles_copy,
+            .order = view.order,
             .device = device,
             .result = result,
-            .sources = src_copy,
+            .source = source,
+            .view = view,
         }) catch return StorageError.OutOfMemory;
     }
 
@@ -171,9 +113,7 @@ pub const Table = struct {
             while (self.at < self.entries.len) {
                 const e = self.entries[self.at];
                 self.at += 1;
-                for (e.sources) |s| {
-                    if (s.tid == self.tid) return .{ .result = e.result, .view = s.view };
-                }
+                if (e.source == self.tid) return .{ .result = e.result, .view = e.view };
             }
             return null;
         }
@@ -186,9 +126,7 @@ pub const Table = struct {
 
     /// Forget derivation `index`. The caller has already established that the result is
     /// redundant — see `StorageManager.collectDerived`, which owns that rule.
-    pub fn remove(self: *Table, gpa: std.mem.Allocator, index: usize) void {
-        const e = self.entries.orderedRemove(index);
-        gpa.free(e.tiles);
-        gpa.free(e.sources);
+    pub fn remove(self: *Table, index: usize) void {
+        _ = self.entries.orderedRemove(index);
     }
 };

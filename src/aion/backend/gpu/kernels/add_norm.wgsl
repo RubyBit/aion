@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// Fused residual + RMSNorm over the trailing dim (the `AddRMSNormTiled` step):
+// Fused residual + RMSNorm over the trailing dim (an `RMSNorm` step with a residual):
 //   o = addend + (rmsnorm(x) * gamma + beta)
 // One 256-thread workgroup per row.
 //
@@ -41,10 +41,17 @@ fn wg_reduce_sum(lidx: u32, v: f32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn add_rmsnorm_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
-    let ab = wid.x * p.a_row;
+fn add_rmsnorm_row(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
+    let ab = row * p.a_row;
 
     var ss = 0.0;
     for (var c = lidx; c < p.cols; c += WG) { let v = x[xb + c]; ss += v * v; }

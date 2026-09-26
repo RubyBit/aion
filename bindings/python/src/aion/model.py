@@ -132,7 +132,7 @@ class LoadedModel:
         """Load a model onto `device` (default CPU).
 
         The GPU it targets must be registered on `ctx` (see `Context(gpus=...)`
-        or `Context.gpu()`). The model's backend and tiling follow the device;
+        or `Context.gpu()`). The model's backend and weight layout follow the device;
         keep binding CPU input tensors — the runtime migrates them on `run()` and
         flushes outputs back to host for reading. Do NOT bind a device-resident
         tensor (from `tensor.to("gpu")`) as a model input.

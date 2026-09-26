@@ -6,11 +6,10 @@
 //   out[i] = softmax_j(scores[i,:]) @ v
 // over the row's key window (see window_keys).
 //
-// Layouts (per the compile contract): q/k/v/out slices are contiguous [T, D]
-// panels (the [B, T, H, D] tensors are tiled [1, T, 1, D]); pos_emb / biases are
-// indexed via p.pe_base / p.u_base / p.v_base element offsets into their
-// (per-head or whole) tiles; mask is a packed additive [T_q, T_kv] tile. When
-// p.has_mask == 0 the mask binding is a dummy (the backend rebinds q).
+// Layouts: q/k/v/out are packed [B, T, H, D], so a (batch, head) slice is T rows
+// of D, `H * D` apart; pos_emb is [H, P, D], the biases [H, D]; mask is a packed
+// additive [T_q, T_kv]. When p.has_mask == 0 the mask binding is a dummy (the
+// backend rebinds q). The grid is (row blocks, heads, batch).
 //
 // WORK SHAPE — one 256-thread workgroup per (batch, head, row block), mirroring
 // attention.wgsl:
@@ -49,9 +48,9 @@ struct Params {
     t_kv: u32,
     d: u32,
     p_len: u32,
-    pe_base: u32, // element offset of this head's [P, D] panel
-    u_base: u32, // element offset of this head's [D] bias row
-    v_base: u32,
+    heads: u32,
+    _pad0: u32,
+    _pad1: u32,
     has_mask: u32,
     win_left: u32,
     win_right: u32,
@@ -115,6 +114,11 @@ fn reduceSumRows(lidx: u32, rows: u32) {
 fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let row0 = wid.x * p.rl;
     let rows = p.rl;
+    let h = wid.y;
+    let rs = p.heads * p.d; // between consecutive time rows of one (batch, head)
+    let q_base = (wid.z * p.t_q * p.heads + h) * p.d;
+    let kv_base = (wid.z * p.t_kv * p.heads + h) * p.d;
+    let pe_base = h * p.p_len * p.d;
 
     // --- per-row key window + the block's union ---
     var lo_r: array<u32, 4>;
@@ -140,9 +144,9 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
         let r = i / p.d;
         let dd = i % p.d;
         var qi = 0.0;
-        if (row0 + r < p.t_q) { qi = q[(row0 + r) * p.d + dd]; }
-        qu_s[i] = qi + bu[p.u_base + dd];
-        qv_s[i] = qi + bv[p.v_base + dd];
+        if (row0 + r < p.t_q) { qi = q[q_base + (row0 + r) * rs + dd]; }
+        qu_s[i] = qi + bu[h * p.d + dd];
+        qv_s[i] = qi + bv[h * p.d + dd];
     }
     workgroupBarrier();
 
@@ -176,7 +180,7 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
             hp[r] = false;
         }
         if (j < span_hi) {
-            let kb = j * p.d;
+            let kb = kv_base + j * rs;
             var ac: array<f32, 4>;
             var bd: array<f32, 4>;
             var peb: array<u32, 4>;
@@ -186,12 +190,12 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
                 // base_{row0+r} + j, i.e. the band shifts down by one per row. Loop
                 // invariant, so it is computed once per row rather than per element.
                 vr[r] = j >= lo_r[r] && j < hi_r[r];
-                peb[r] = p.pe_base;
+                peb[r] = pe_base;
                 if (vr[r]) {
                     let abs_query = (p.t_kv - p.t_q) + row0 + r;
                     let rel = i32(p.relative_zero_index) + i32(j) - i32(abs_query);
                     if (rel >= 0 && rel < i32(p.p_len)) {
-                        peb[r] = p.pe_base + u32(rel) * p.d;
+                        peb[r] = pe_base + u32(rel) * p.d;
                         hp[r] = true;
                     }
                 }
@@ -242,7 +246,7 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
         let cnt = min(WG, span_hi - t0);
         if (kg < kgc) {
             for (var jj = kg; jj < cnt; jj += kgc) {
-                let vb = (t0 + jj) * p.d;
+                let vb = kv_base + (t0 + jj) * rs;
                 for (var i = 0u; i < dsteps; i += 1u) {
                     let dd = d0 + i * dv_eff;
                     if (dd < p.d) {
@@ -292,7 +296,7 @@ fn relpos_mha_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
         if (kg == 0u) {
             for (var i = 0u; i < dsteps; i += 1u) {
                 let dd = d0 + i * dv_eff;
-                if (dd < p.d) { o[row * p.d + dd] = acc[r * ACC + i] * inv; }
+                if (dd < p.d) { o[q_base + row * rs + dd] = acc[r * ACC + i] * inv; }
             }
         }
     }

@@ -3,7 +3,6 @@ const std = @import("std");
 
 const manager_mod = @import("../../storage/manager.zig");
 const package_file = @import("../../storage/aion_file.zig");
-const plan_mod = @import("../../graph/plan.zig");
 const opt_mod = @import("../../graph/opt.zig");
 const target_mod = @import("../../graph/target.zig");
 const api_tensor = @import("../tensor.zig");
@@ -13,7 +12,6 @@ pub const Tensor = api_tensor.Tensor;
 pub const StorageManager = manager_mod.StorageManager;
 pub const TensorId = manager_mod.TensorId;
 pub const DType = package_file.DType;
-pub const TilePolicy = plan_mod.TilePolicy;
 pub const OptPolicy = opt_mod.Policy;
 pub const Target = target_mod.Target;
 pub const Package = package_file.Package;
@@ -72,7 +70,7 @@ pub const LoadModelOptions = struct {
 
     /// Which device to load/run this model on. Defaults to `.cpu` (byte-identical
     /// to the pre-device behavior). `.gpu = i` requires that GPU to have been
-    /// registered on the `Context` via `Options.gpus`; weights are tiled for it.
+    /// registered on the `Context` via `Options.gpus`; weights are placed on it.
     device: device_mod.DeviceSelector = .cpu,
 
     /// One-shot sizing/policy for role-declared sequence caches.

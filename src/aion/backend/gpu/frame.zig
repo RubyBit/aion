@@ -130,8 +130,8 @@ pub const BindGroupCache = struct {
         return std.mem.eql(u8, e.ubytes[0..e.ulen], ubytes);
     }
 
-    /// Callers pass a tile's logical byte length; bindings cover whole u32 words,
-    /// which is what lets the u16 kernels write an odd tile's last element.
+    /// Callers pass a buffer's logical byte length; bindings cover whole u32 words,
+    /// which is what lets the u16 kernels write an odd buffer's last element.
     fn bindingSize(bytes: u64) u64 {
         return (bytes + 3) / 4 * 4;
     }

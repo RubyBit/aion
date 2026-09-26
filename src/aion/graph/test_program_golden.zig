@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-//! Golden snapshot of compiled `ExecutableProgram` structure + tile geometry.
+//! Golden snapshot of compiled `ExecutableProgram` structure + tensor table.
 //!
 //! Purpose: a mechanical guarantee that backend-agnostic refactors (backend
 //! selection, compile-`target` threading) do NOT change what the CPU compile
 //! pipeline produces. We serialize, for a set of representative graphs, the
-//! ordered step tags plus every tensor's dtype/shape/tile_shape/tile_counts,
+//! ordered step tags plus every tensor's dtype/shape,
 //! and assert the dump is byte-identical to a checked-in golden string.
 //!
 //! If a change here is intentional, regenerate the goldens by flipping
@@ -15,9 +15,7 @@ const std = @import("std");
 
 const graph_mod = @import("graph.zig");
 const program = @import("program.zig");
-const plan_mod = @import("plan.zig");
 const manager_mod = @import("../storage/manager.zig");
-const api_tiling = @import("../api/tiling.zig");
 const types = @import("../backend/types.zig");
 
 /// Set true to print fresh serializations to stderr instead of asserting.
@@ -41,8 +39,7 @@ fn appendDims(list: *std.ArrayList(u8), a: std.mem.Allocator, dims: []const usiz
 }
 
 /// Canonical, deterministic dump of a compiled program + the manager's tensor
-/// table (which holds the baked tile geometry for every tensor created during
-/// compile).
+/// table (every tensor created during compile).
 fn serialize(a: std.mem.Allocator, prog: *const program.Program, mgr: *manager_mod.StorageManager) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(a);
@@ -65,18 +62,14 @@ fn serialize(a: std.mem.Allocator, prog: *const program.Program, mgr: *manager_m
     }
     try list.appendSlice(a, "]\n");
 
-    // Tensor table: iterate ids until out-of-range. Captures every tiling
-    // decision the compiler baked in.
+    // Tensor table: iterate ids until out-of-range. Captures every tensor the
+    // compiler created.
     try list.appendSlice(a, "tensors:\n");
     var id: manager_mod.TensorId = 0;
     while (true) : (id += 1) {
         const t = mgr.getConst(id) catch break;
         try app(&list, a, "  #{d} {s} rank={d} shape=", .{ id, @tagName(t.dtype), t.rank });
         try appendDims(&list, a, t.shape);
-        try list.appendSlice(a, " tile=");
-        try appendDims(&list, a, t.tile_shape);
-        try list.appendSlice(a, " counts=");
-        try appendDims(&list, a, t.tile_counts);
         try list.appendSlice(a, "\n");
     }
 
@@ -84,17 +77,13 @@ fn serialize(a: std.mem.Allocator, prog: *const program.Program, mgr: *manager_m
 }
 
 /// Build context handed to each graph builder: create + bind external input
-/// tensors with default tiling so the graph compiles, while leaving downstream
-/// op tiling for the compiler to choose (and the snapshot to capture).
+/// tensors so the graph compiles.
 const B = struct {
     g: *graph_mod.Graph,
     mgr: *manager_mod.StorageManager,
 
     fn input(self: *B, dtype: types.DType, shape: []const usize) !ValueId {
-        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
-        const tile = tile_mem[0..shape.len];
-        try api_tiling.fillDefaultTileShape(.{}, dtype, shape, tile);
-        const tid = try self.mgr.createTiledTensor(dtype, shape, tile, .{});
+        const tid = try self.mgr.createTensor(dtype, shape, .{});
         const v = try self.g.addInput(dtype, shape);
         try self.g.bindExternal(v, tid);
         return v;
@@ -120,7 +109,7 @@ fn checkGraph(
     const out = try build(&b);
     try g.setOutputs(&[_]ValueId{out});
 
-    var prog = try program.compileGraph(a, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(a, &g, &mgr, .cpu());
     defer prog.deinit();
 
     const dump = try serialize(a, &prog, &mgr);
@@ -146,7 +135,7 @@ fn buildMatmulSquare(b: *B) anyerror!ValueId {
 }
 
 fn buildMatvec(b: *B) anyerror!ValueId {
-    // m == 1 wide-N path in chooseMatMulTiles.
+    // m == 1 wide-N matvec.
     const A = try b.input(.f32, &[_]usize{ 1, 256 });
     const W = try b.input(.f32, &[_]usize{ 256, 512 });
     return b.g.addMatMul(A, W, 1.0, 0.0);
@@ -173,7 +162,7 @@ fn buildElemwiseUnary(b: *B) anyerror!ValueId {
 
 fn buildAttention(b: *B) anyerror!ValueId {
     // Plain-sequence attention (no index operands): pins that the lowering emits
-    // one AttentionTiled with the operands' own tiling and no retile steps.
+    // one Attention step.
     const q = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
     const k = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
     const v = try b.input(.f32, &[_]usize{ 1, 8, 2, 16 });
@@ -192,20 +181,6 @@ fn buildDecodeChain(b: *B) anyerror!ValueId {
     const W = try b.input(.f32, &[_]usize{ 128, 256 });
     const logits = try b.g.addMatMul(normed, W, 1.0, 0.0);
     return b.g.addSoftmax(logits, -1);
-}
-
-test "tilePolicyForTarget: cpu == default, kind is tagged" {
-    const cpu = plan_mod.tilePolicyForTarget(.cpu);
-    const def = plan_mod.TilePolicy{};
-    // CPU-derived policy must be byte-identical to the historical default.
-    try std.testing.expectEqual(def, cpu);
-    try std.testing.expectEqual(plan_mod.BackendKind.cpu, cpu.target_kind);
-
-    // A GPU target threads its kind through so lowering can branch on it later;
-    // tile sizes/caps are unchanged until GPU heuristics are added.
-    const vk = plan_mod.tilePolicyForTarget(.vulkan);
-    try std.testing.expectEqual(plan_mod.BackendKind.vulkan, vk.target_kind);
-    try std.testing.expectEqual(def.softmax_row_cap, vk.softmax_row_cap);
 }
 
 test "golden: matmul square" {
@@ -234,106 +209,102 @@ test "golden: decode chain" {
 // Regenerate by flipping `capture_mode` to true and running this file.
 
 const golden_matmul_square =
-    \\steps=2
-    \\  [0] ReTileCopyScalar
-    \\  [1] MatMulTiled
+    \\steps=1
+    \\  [0] MatMul
     \\blocks=0
     \\outputs=[2]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[64,128] tile=[64,128] counts=[1,1]
-    \\  #1 f32 rank=2 shape=[128,96] tile=[128,96] counts=[1,1]
-    \\  #2 f32 rank=2 shape=[64,96] tile=[64,64] counts=[1,2]
-    \\  #3 f32 rank=2 shape=[128,96] tile=[128,64] counts=[1,2]
+    \\  #0 f32 rank=2 shape=[64,128]
+    \\  #1 f32 rank=2 shape=[128,96]
+    \\  #2 f32 rank=2 shape=[64,96]
     \\
 ;
 
-// A 512-wide N tile takes this whole matvec in one tile, so B is used where it
-// lies instead of being retiled and copied first.
 const golden_matvec =
     \\steps=1
-    \\  [0] MatMulTiled
+    \\  [0] MatMul
     \\blocks=0
     \\outputs=[2]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[1,256] tile=[1,256] counts=[1,1]
-    \\  #1 f32 rank=2 shape=[256,512] tile=[256,512] counts=[1,1]
-    \\  #2 f32 rank=2 shape=[1,512] tile=[1,512] counts=[1,1]
+    \\  #0 f32 rank=2 shape=[1,256]
+    \\  #1 f32 rank=2 shape=[256,512]
+    \\  #2 f32 rank=2 shape=[1,512]
     \\
 ;
 
 const golden_softmax =
     \\steps=1
-    \\  [0] SoftmaxTiled
+    \\  [0] Softmax
     \\blocks=0
     \\outputs=[1]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[32,200] tile=[32,200] counts=[1,1]
-    \\  #1 f32 rank=2 shape=[32,200] tile=[32,200] counts=[1,1]
+    \\  #0 f32 rank=2 shape=[32,200]
+    \\  #1 f32 rank=2 shape=[32,200]
     \\
 ;
 
 const golden_rmsnorm =
     \\steps=1
-    \\  [0] RMSNormTiled
+    \\  [0] RMSNorm
     \\blocks=0
     \\outputs=[3]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[8,128] tile=[8,128] counts=[1,1]
-    \\  #1 f32 rank=1 shape=[128] tile=[128] counts=[1]
-    \\  #2 f32 rank=1 shape=[128] tile=[128] counts=[1]
-    \\  #3 f32 rank=2 shape=[8,128] tile=[8,128] counts=[1,1]
+    \\  #0 f32 rank=2 shape=[8,128]
+    \\  #1 f32 rank=1 shape=[128]
+    \\  #2 f32 rank=1 shape=[128]
+    \\  #3 f32 rank=2 shape=[8,128]
     \\
 ;
 
 const golden_elemwise_unary =
     \\steps=2
-    \\  [0] ElemwiseBinaryTiled
-    \\  [1] UnaryTiled
+    \\  [0] ElemwiseBinary
+    \\  [1] Unary
     \\blocks=0
     \\outputs=[3]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[16,64] tile=[16,64] counts=[1,1]
-    \\  #1 f32 rank=2 shape=[16,64] tile=[16,64] counts=[1,1]
-    \\  #2 f32 rank=2 shape=[16,64] tile=[16,64] counts=[1,1]
-    \\  #3 f32 rank=2 shape=[16,64] tile=[16,64] counts=[1,1]
+    \\  #0 f32 rank=2 shape=[16,64]
+    \\  #1 f32 rank=2 shape=[16,64]
+    \\  #2 f32 rank=2 shape=[16,64]
+    \\  #3 f32 rank=2 shape=[16,64]
     \\
 ;
 
 const golden_attention =
     \\steps=1
-    \\  [0] AttentionTiled
+    \\  [0] Attention
     \\blocks=0
     \\outputs=[3]
     \\tensors:
-    \\  #0 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
-    \\  #1 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
-    \\  #2 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
-    \\  #3 f32 rank=4 shape=[1,8,2,16] tile=[1,8,2,16] counts=[1,1,1,1]
+    \\  #0 f32 rank=4 shape=[1,8,2,16]
+    \\  #1 f32 rank=4 shape=[1,8,2,16]
+    \\  #2 f32 rank=4 shape=[1,8,2,16]
+    \\  #3 f32 rank=4 shape=[1,8,2,16]
     \\
 ;
 
-// No ReshapeScalar step: `[1,1,128]` -> `[1,128]` is one 128-float tile either way,
-// so `alias_views.elideNoopViews` drops the copy and #6 borrows #5's backing. Both
+// No ReshapeScalar step: `[1,1,128]` -> `[1,128]` is the same contiguous run of
+// floats, so `alias_views.elideNoopViews` drops the copy and #6 borrows #5's backing. Both
 // tensors still exist below — the destination keeps its own shape metadata, which is
 // the whole reason the pass aliases instead of rewriting operands to the source id.
 const golden_decode_chain =
     \\steps=4
-    \\  [0] GatherRowsTiled
-    \\  [1] RMSNormTiled
-    \\  [2] MatMulTiled
-    \\  [3] SoftmaxTiled
+    \\  [0] GatherRows
+    \\  [1] RMSNorm
+    \\  [2] MatMul
+    \\  [3] Softmax
     \\blocks=0
     \\outputs=[9]
     \\tensors:
-    \\  #0 f32 rank=2 shape=[256,128] tile=[256,128] counts=[1,1]
-    \\  #1 i32 rank=2 shape=[1,1] tile=[1,1] counts=[1,1]
-    \\  #2 f32 rank=1 shape=[128] tile=[128] counts=[1]
-    \\  #3 f32 rank=1 shape=[128] tile=[128] counts=[1]
-    \\  #4 f32 rank=2 shape=[128,256] tile=[128,256] counts=[1,1]
-    \\  #5 f32 rank=3 shape=[1,1,128] tile=[1,1,128] counts=[1,1,1]
-    \\  #6 f32 rank=2 shape=[1,128] tile=[1,128] counts=[1,1]
-    \\  #7 f32 rank=2 shape=[1,128] tile=[1,128] counts=[1,1]
-    \\  #8 f32 rank=2 shape=[1,256] tile=[1,256] counts=[1,1]
-    \\  #9 f32 rank=2 shape=[1,256] tile=[1,256] counts=[1,1]
+    \\  #0 f32 rank=2 shape=[256,128]
+    \\  #1 i32 rank=2 shape=[1,1]
+    \\  #2 f32 rank=1 shape=[128]
+    \\  #3 f32 rank=1 shape=[128]
+    \\  #4 f32 rank=2 shape=[128,256]
+    \\  #5 f32 rank=3 shape=[1,1,128]
+    \\  #6 f32 rank=2 shape=[1,128]
+    \\  #7 f32 rank=2 shape=[1,128]
+    \\  #8 f32 rank=2 shape=[1,256]
+    \\  #9 f32 rank=2 shape=[1,256]
     \\
 ;

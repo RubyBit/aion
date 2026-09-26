@@ -8,12 +8,11 @@
 // Optional logit soft cap: s = cap * tanh(s / cap).
 //
 // Layouts (all packed, single device buffer each):
-//   q:   [tb, tl, th, dk] f32 — ONE out/q tile per dispatch (p.base_b / p.base_h /
-//        p.base_l give the tile's global offsets)
+//   q:   [B, tl, th, dk] f32
 //   k/v: [B, T, H_kv, D] bound as array<u32> so f16 caches work WITHOUT the
 //        shader-f16 extension: p.kv_f16 selects unpack2x16float (two elements
 //        per word, D even) vs bitcast<f32>(one element per word).
-//   query_positions: [tb, tl] i32 (tile-local), kv_lengths: [B] i32 (global).
+//   query_positions: [B, tl] i32, kv_lengths: [B] i32.
 //
 // Logical->physical time mapping runs in-kernel: identity (none/growable
 // policies — the exec pre-touches growth before recording) or ring modulo.
@@ -21,8 +20,8 @@
 // WORK SHAPE — one 256-thread workgroup per (batch, row block, key segment):
 //
 //   * A row block is `p.rl` query rows x `p.rh` query heads, and the heads never
-//     cross a GQA group (the host guarantees `rh` divides both `gqa` and the tile's
-//     head count). K/V depend only on (batch, kv head), so every row in the block
+//     cross a GQA group (the host guarantees `rh` divides both `gqa` and the head
+//     count). K/V depend only on (batch, kv head), so every row in the block
 //     reads the SAME K/V rows: each K element is loaded once and fanned into all
 //     `rl * rh` dot products, and each V element once into all their accumulators.
 //     One row per workgroup — the obvious mapping — re-reads the whole cache per
@@ -60,10 +59,8 @@ enable f16;
 @group(0) @binding(6) var<uniform>             p: Params;
 
 struct Params {
-    base_b: u32,
-    base_h: u32,
-    tl: u32, // q/out tile-local L count
-    th: u32, // q/out tile-local head count
+    tl: u32, // q/out L count
+    th: u32, // q/out head count
     dk: u32,
     dv: u32,
     t_cap: u32, // physical T of the caches
@@ -78,20 +75,10 @@ struct Params {
     scale: f32,
     soft_cap: f32, // 0 = disabled
     segs: u32, // split-K segment count (1 for attn_row)
-    base_l: u32,
     has_pos: u32,
     has_lengths: u32,
     rl: u32, // rows per block along L
     rh: u32, // heads per block (within one GQA group)
-    // A cache too large for one storage binding is split along time, and k/v bind
-    // ONE tile: `[kv_t0, kv_t0 + kv_tile_t)` of the physical axis. Each tile is a
-    // separate dispatch writing its own partial slots (`seg_base` .. +`segs_local`),
-    // which `attn_merge` combines exactly as it combines ordinary split-K segments.
-    // A single-tile cache is `kv_t0 = 0`, `kv_tile_t = t_cap`.
-    kv_t0: u32,
-    kv_tile_t: u32,
-    seg_base: u32,
-    segs_local: u32,
 };
 
 const WG: u32 = 256u;
@@ -191,10 +178,10 @@ fn stageQF16(b_local: u32, blk_l: u32, blk_h: u32, lidx: u32) {
 }
 
 fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, partial: bool) {
-    let b = p.base_b + b_local;
-    // Every row in the block shares this kv head: `rh` divides `gqa` and the tile's
+    let b = b_local;
+    // Every row in the block shares this kv head: `rh` divides `gqa` and the block's
     // head base is a multiple of `rh`, so the block never straddles a group.
-    let hkv = (p.base_h + blk_h) / p.gqa;
+    let hkv = blk_h / p.gqa;
     // NOT clamped to RMAX on purpose: the grid is sized from rl*rh, so silently
     // dropping rows here would leave outputs unwritten. The host guarantees
     // rl * rh <= RMAX (see MAX_ROWS in exec/attention.zig).
@@ -215,7 +202,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         let h_local = blk_h + r % p.rh;
         if (l_local >= p.tl || h_local >= p.th) { continue; }
 
-        var q_pos = p.base_l + l_local;
+        var q_pos = l_local;
         if (p.has_pos != 0u) { q_pos = u32(pos[b_local * p.tl + l_local]); }
 
         let w = window_keys(p.win_left, p.win_right, p.win_chunk, q_pos, valid_end);
@@ -231,21 +218,12 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
     }
 
     // --- this workgroup's slice of the block's key range ---
-    //
-    // Under the identity time map a tile owns a CONTIGUOUS logical range, so the
-    // scan is narrowed to it. A ring map scatters logical times across tiles, so
-    // there the full span is scanned and the membership test below filters —
-    // correct, at the cost of re-scoring keys other tiles own.
-    var lo = span_lo;
-    var hi = span_hi;
-    if (p.ring == 0u) {
-        lo = max(span_lo, p.kv_t0);
-        hi = min(span_hi, p.kv_t0 + p.kv_tile_t);
-    }
+    let lo = span_lo;
+    let hi = span_hi;
     var t_start = 0u;
     var t_end = 0u;
     if (hi > lo) {
-        let seg_len = (hi - lo + p.segs_local - 1u) / p.segs_local;
+        let seg_len = (hi - lo + p.segs - 1u) / p.segs;
         t_start = lo + seg_local * seg_len;
         t_end = min(t_start + seg_len, hi);
     }
@@ -278,8 +256,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         if (okk) {
             t_phys = tj;
             if (p.ring != 0u) { t_phys = tj % p.ring_modulus; }
-            // Bound by the cache AND by the tile actually bound here.
-            okk = t_phys < p.t_cap && t_phys >= p.kv_t0 && t_phys - p.kv_t0 < p.kv_tile_t;
+            okk = t_phys < p.t_cap;
         }
 
         // --- scores: one K row read, fanned into every row of the block ---
@@ -290,7 +267,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
             vr[r] = false;
         }
         if (okk) {
-            let kb = ((b * p.kv_tile_t + (t_phys - p.kv_t0)) * p.h_kv + hkv) * p.dk;
+            let kb = ((b * p.t_cap + t_phys) * p.h_kv + hkv) * p.dk;
             var dots: array<f32, 4>;
             for (var r = 0u; r < rows; r += 1u) { dots[r] = 0.0; }
             if (p.kv_f16 != 0u) {
@@ -400,7 +377,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         let cnt = min(WG, t_end - t0);
         if (kg < kgc) {
             for (var jj = kg; jj < cnt; jj += kgc) {
-                let vb = ((b * p.kv_tile_t + (t_sh[jj] - p.kv_t0)) * p.h_kv + hkv) * p.dv;
+                let vb = ((b * p.t_cap + t_sh[jj]) * p.h_kv + hkv) * p.dv;
                 for (var i = 0u; i < dsteps; i += 1u) {
                     let d = d0 + i * dv_eff;
                     if (d < p.dv) {
@@ -453,7 +430,7 @@ fn attnCore(b_local: u32, seg_local: u32, blk_l: u32, blk_h: u32, lidx: u32, par
         let row = (b_local * p.tl + l_local) * p.th + h_local;
 
         if (partial) {
-            let e = (row * p.segs + p.seg_base + seg_local) * (p.dv + 2u);
+            let e = (row * p.segs + seg_local) * (p.dv + 2u);
             if (kg == 0u) {
                 for (var i = 0u; i < dsteps; i += 1u) {
                     let d = d0 + i * dv_eff;
@@ -498,22 +475,22 @@ fn attn_row_qf16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 //
 // Decode dispatches only a handful of blocks above — a few rows scanning a
 // thousands-of-tokens cache leaves the GPU idle. The split path carves each row
-// block's key range into `p.segs` segments (grid.z = tb * segs), each writing an
+// block's key range into `p.segs` segments (grid.z = B * segs), each writing an
 // UNNORMALIZED partial — dv accumulator values plus (m, l) — into `o` (bound to the
 // backend scratch). `attn_merge` (attention_merge.wgsl) then log-sum-exp-combines
 // the segments per row. Entry stride is dv + 2 floats at
 //   entry = ((b_local * tl + l) * th + h) * segs + seg.
 @compute @workgroup_size(256)
 fn attn_split(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    stageQF32(wid.z / p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx);
+    stageQF32(wid.z / p.segs, wid.y * p.rl, wid.x * p.rh, lidx);
     workgroupBarrier();
-    attnCore(wid.z / p.segs_local, wid.z % p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx, true);
+    attnCore(wid.z / p.segs, wid.z % p.segs, wid.y * p.rl, wid.x * p.rh, lidx, true);
 }
 
 @compute @workgroup_size(256)
 fn attn_split_qf16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    stageQF16(wid.z / p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx);
+    stageQF16(wid.z / p.segs, wid.y * p.rl, wid.x * p.rh, lidx);
     workgroupBarrier();
-    attnCore(wid.z / p.segs_local, wid.z % p.segs_local, wid.y * p.rl, wid.x * p.rh, lidx, true);
+    attnCore(wid.z / p.segs, wid.z % p.segs, wid.y * p.rl, wid.x * p.rh, lidx, true);
 }
 

@@ -17,7 +17,6 @@ pub const Backend = aion.backend.Backend;
 pub const StorageManager = aion.storage_manager.StorageManager;
 pub const Graph = aion.graph.Graph;
 pub const TensorId = aion.storage_manager.TensorId;
-pub const plan = aion.plan;
 
 const out = std.debug;
 
@@ -127,37 +126,31 @@ pub fn fillTensor(alloc: std.mem.Allocator, mgr: *StorageManager, id: TensorId, 
     try mgr.writeFromPackedScalar(id, std.mem.sliceAsBytes(data));
 }
 
-fn inputF32(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const usize, seed: usize) !aion.graph.ValueId {
+fn inputF32(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, shape: []const usize, seed: usize) !aion.graph.ValueId {
     var n: usize = 1;
     for (shape) |d| n *= d;
-    const id = try mgr.createTiledTensor(.f32, shape, tile, .{});
+    const id = try mgr.createTensor(.f32, shape, .{});
     try fillTensor(alloc, mgr, id, n, seed);
     const v = try g.addInput(.f32, shape);
     try g.bindExternal(v, id);
     return v;
 }
 
-fn inputI32(g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const usize, vals: []const i32) !aion.graph.ValueId {
-    const id = try mgr.createTiledTensor(.i32, shape, tile, .{});
+fn inputI32(g: *Graph, mgr: *StorageManager, shape: []const usize, vals: []const i32) !aion.graph.ValueId {
+    const id = try mgr.createTensor(.i32, shape, .{});
     try mgr.writeFromPackedScalar(id, std.mem.sliceAsBytes(vals));
     const v = try g.addInput(.i32, shape);
     try g.bindExternal(v, id);
     return v;
 }
 
-/// The device a tile policy was derived for. The kernels bench sweeps CPU and GPU with
-/// the same builders, so the target has to follow the policy rather than be assumed.
-fn deviceFor(policy: plan.TilePolicy) aion.storage.DeviceRef {
-    return .{ .kind = if (policy.target_kind == .cpu) .cpu else .gpu };
-}
-
-fn inputI32Pattern(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, shape: []const usize, tile: []const usize, seed: usize) !aion.graph.ValueId {
+fn inputI32Pattern(alloc: std.mem.Allocator, g: *Graph, mgr: *StorageManager, shape: []const usize, seed: usize) !aion.graph.ValueId {
     var n: usize = 1;
     for (shape) |d| n *= d;
     const vals = try alloc.alloc(i32, n);
     defer alloc.free(vals);
     for (vals, 0..) |*v, i| v.* = @intCast((i * 2654435761 + seed * 97) % 1000);
-    return inputI32(g, mgr, shape, tile, vals);
+    return inputI32(g, mgr, shape, vals);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,181 +352,179 @@ pub fn kInfo(op: KOp) KInfo {
     };
 }
 
-/// Build the graph+program for one kernel op with the given tile `policy` (each
-/// backend passes its own). Returns the compiled program and its output tensor.
-pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, policy: plan.TilePolicy) !struct { prog: aion.program.Program, out: TensorId } {
+/// Build the graph+program for one kernel op for `target` (each backend passes its
+/// own). Returns the compiled program and its output tensor.
+pub fn buildK(alloc: std.mem.Allocator, mgr: *StorageManager, op: KOp, target: aion.program.Target) !struct { prog: aion.program.Program, out: TensorId } {
     var g = Graph.init(alloc);
     defer g.deinit();
 
     const out_v: aion.graph.ValueId = switch (op) {
         .add_i32 => blk: {
-            const a = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 1);
-            const b = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 2);
+            const a = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, 1);
+            const b = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, 2);
             break :blk try g.addElemwiseBinary(.add, a, b);
         },
         .lt_i32 => blk: {
-            const a = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 3);
-            const b = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 4);
+            const a = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, 3);
+            const b = try inputI32Pattern(alloc, &g, mgr, &.{ 2048, 2048 }, 4);
             break :blk try g.addElemwiseBinary(.lt, a, b);
         },
         .cast_f16 => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 5);
+            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, 5);
             break :blk try g.addCast(try g.addCast(x, .f16), .f32);
         },
         .cast_i32 => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 6);
+            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, 6);
             break :blk try g.addCast(try g.addCast(x, .i32), .f32);
         },
         .copy => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, &.{ 2048, 2048 }, 7);
+            const x = try inputF32(alloc, &g, mgr, &.{ 2048, 2048 }, 7);
             break :blk try g.addCopy(try g.addRelu(x));
         },
         .reduce_row => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.RED_M, KA.RED_N }, &.{ KA.RED_M, KA.RED_N }, 8);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.RED_M, KA.RED_N }, 8);
             break :blk try g.addReduceAxis(.mean, x, -1);
         },
         .reduce_all => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.RED_M, KA.RED_N }, &.{ KA.RED_M, KA.RED_N }, 9);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.RED_M, KA.RED_N }, 9);
             break :blk try g.addReduce(.sum, x);
         },
         .concat => blk: {
-            const a = try inputF32(alloc, &g, mgr, &.{ KA.CAT_M, KA.CAT_N }, &.{ KA.CAT_M, KA.CAT_N }, 10);
-            const b = try inputF32(alloc, &g, mgr, &.{ KA.CAT_M, KA.CAT_N }, &.{ KA.CAT_M, KA.CAT_N }, 11);
+            const a = try inputF32(alloc, &g, mgr, &.{ KA.CAT_M, KA.CAT_N }, 10);
+            const b = try inputF32(alloc, &g, mgr, &.{ KA.CAT_M, KA.CAT_N }, 11);
             break :blk try g.addConcat(&.{ a, b }, 1);
         },
         .transpose => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.TR, KA.TR }, &.{ KA.TR, KA.TR }, 12);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.TR, KA.TR }, 12);
             break :blk try g.addViewTranspose2D(x);
         },
         .slice => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.SL_SRC, KA.SL_SRC }, &.{ KA.SL_SRC, KA.SL_SRC }, 13);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.SL_SRC, KA.SL_SRC }, 13);
             break :blk try g.addViewSliceND(x, &.{ 1024, 1024 }, &.{ KA.SL, KA.SL });
         },
         .gather => blk: {
-            const table = try inputF32(alloc, &g, mgr, &.{ KA.GA_V, KA.GA_D }, &.{ KA.GA_V, KA.GA_D }, 14);
+            const table = try inputF32(alloc, &g, mgr, &.{ KA.GA_V, KA.GA_D }, 14);
             const idx_vals = try alloc.alloc(i32, KA.GA_ROWS);
             defer alloc.free(idx_vals);
             for (idx_vals, 0..) |*v, i| v.* = @intCast((i * 2654435761 + 5) % KA.GA_V);
-            const idx = try inputI32(&g, mgr, &.{ 1, KA.GA_ROWS }, &.{ 1, KA.GA_ROWS }, idx_vals);
+            const idx = try inputI32(&g, mgr, &.{ 1, KA.GA_ROWS }, idx_vals);
             break :blk try g.addGather(table, idx, 0, 0);
         },
         .rope => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.RO_T, KA.RO_H, KA.RO_D }, &.{ 1, KA.RO_T, KA.RO_H, KA.RO_D }, 15);
+            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.RO_T, KA.RO_H, KA.RO_D }, 15);
             const pos_vals = try alloc.alloc(i32, KA.RO_T);
             defer alloc.free(pos_vals);
             for (pos_vals, 0..) |*v, i| v.* = @intCast(i);
-            const pos = try inputI32(&g, mgr, &.{ 1, KA.RO_T }, &.{ 1, KA.RO_T }, pos_vals);
+            const pos = try inputI32(&g, mgr, &.{ 1, KA.RO_T }, pos_vals);
             break :blk try g.addRoPE1D(x, pos, 10000.0, 1.0, 1.0);
         },
         .kv_append => blk: {
             // Cache is [B, T, H, D] — time is dim 1, so one token is [B, 1, H, D].
-            const cache = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_T, KA.KV_H, KA.KV_D }, &.{ 1, KA.KV_T, KA.KV_H, KA.KV_D }, 16);
-            const new_kv = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.KV_H, KA.KV_D }, &.{ 1, 1, KA.KV_H, KA.KV_D }, 17);
-            const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.KV_T / 2});
+            const cache = try inputF32(alloc, &g, mgr, &.{ 1, KA.KV_T, KA.KV_H, KA.KV_D }, 16);
+            const new_kv = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.KV_H, KA.KV_D }, 17);
+            const end = try inputI32(&g, mgr, &.{1}, &.{KA.KV_T / 2});
             break :blk try g.addSequenceAppend(cache, new_kv, end);
         },
         .argmax => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.AM_ROWS, KA.AM_COLS }, &.{ KA.AM_ROWS, KA.AM_COLS }, 18);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.AM_ROWS, KA.AM_COLS }, 18);
             break :blk try g.addArgMax(x, -1);
         },
         .scatter_row => blk: {
-            const buf = try inputF32(alloc, &g, mgr, &.{ KA.SC_ROWS, KA.SC_D }, &.{ KA.SC_ROWS, KA.SC_D }, 19);
-            const idx = try inputI32(&g, mgr, &.{1}, &.{1}, &.{1234});
-            const src = try inputF32(alloc, &g, mgr, &.{KA.SC_D}, &.{KA.SC_D}, 20);
+            const buf = try inputF32(alloc, &g, mgr, &.{ KA.SC_ROWS, KA.SC_D }, 19);
+            const idx = try inputI32(&g, mgr, &.{1}, &.{1234});
+            const src = try inputF32(alloc, &g, mgr, &.{KA.SC_D}, 20);
             break :blk try g.addScatterRow(buf, idx, src);
         },
         .attention => blk: {
             // Plain sequence, causal, no query-position/KV-length controls.
             // Unified layout: q [B, L_q, H_q, D], k/v [B, T, H_kv, D] — time is
-            // dim 1. q is tiled per head so both backends get parallel work (CPU
-            // threads over out tiles, GPU takes one dispatch per tile); k/v stay
-            // single-tile because the GPU exec binds each cache as ONE buffer.
-            const q = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ 1, KA.AT_T, 1, KA.AT_D }, 21);
-            const k = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 22);
-            const v = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 23);
+            // dim 1.
+            const q = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 21);
+            const k = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 22);
+            const v = try inputF32(alloc, &g, mgr, &.{ KA.AT_B, KA.AT_T, KA.AT_H, KA.AT_D }, 23);
             break :blk try g.addAttention(q, k, v, null, null, 0.125, .causal, 0.0);
         },
         .mha_cached => blk: {
             // Decode: one query row (L_q = 1) against a long GQA cache. The 8
             // output rows over a 4096-key cache are what put the GPU on the
             // split-K (flash-decoding) path.
-            const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
-            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
-            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
-            const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
-            const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
+            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
+            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
+            const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{KA.MC_T - 1});
+            const end = try inputI32(&g, mgr, &.{1}, &.{KA.MC_T});
             break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, .causal, 0.0);
         },
         .mha_window => blk: {
             // Gemma-4 local layer at decode: same cache as `mha_cached`, but with
             // a sliding window + logit soft cap (tanh per score) engaged.
-            const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
-            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
-            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
-            const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{ 1, 1 }, &.{KA.MC_T - 1});
-            const end = try inputI32(&g, mgr, &.{1}, &.{1}, &.{KA.MC_T});
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, 1, KA.MC_HQ, KA.MC_D }, 24);
+            const kc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 25);
+            const vc = try inputF32(alloc, &g, mgr, &.{ 1, KA.MC_T, KA.MC_HKV, KA.MC_D }, 26);
+            const pos = try inputI32(&g, mgr, &.{ 1, 1 }, &.{KA.MC_T - 1});
+            const end = try inputI32(&g, mgr, &.{1}, &.{KA.MC_T});
             break :blk try g.addAttention(q, kc, vc, pos, end, 0.125, .sliding(KA.MC_WIN - 1, 0), KA.MC_SOFT_CAP);
         },
         .relpos => blk: {
             const t = KA.RP_T;
-            const q = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 27);
-            const k = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 28);
-            const v = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 29);
-            const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
-            const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
-            const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 27);
+            const k = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 28);
+            const v = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 29);
+            const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, 30);
+            const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, 31);
+            const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, 32);
             break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, .full, t - 1, 0);
         },
         .relpos_chunked => blk: {
             const t = KA.RP_T;
-            const q = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 27);
-            const k = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 28);
-            const v = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, &.{ 1, t, 1, KA.RP_D }, 29);
-            const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, &.{ 1, 2 * t - 1, KA.RP_D }, 30);
-            const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 31);
-            const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, &.{ KA.RP_H, KA.RP_D }, 32);
+            const q = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 27);
+            const k = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 28);
+            const v = try inputF32(alloc, &g, mgr, &.{ 1, t, KA.RP_H, KA.RP_D }, 29);
+            const pe = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, 2 * t - 1, KA.RP_D }, 30);
+            const u = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, 31);
+            const vb = try inputF32(alloc, &g, mgr, &.{ KA.RP_H, KA.RP_D }, 32);
             break :blk try g.addRelPosMHA(q, k, v, pe, u, vb, null, 0.125, .chunked(KA.RP_CHUNK, KA.RP_LEFT), t - 1, 0);
         },
         .conv1d => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.C1_C }, &.{ 1, KA.C1_L, KA.C1_C }, 33);
-            const w = try inputF32(alloc, &g, mgr, &.{ KA.C1_K, KA.C1_C, KA.C1_C }, &.{ KA.C1_K, KA.C1_C, KA.C1_C }, 34);
-            const b = try inputF32(alloc, &g, mgr, &.{KA.C1_C}, &.{KA.C1_C}, 35);
+            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.C1_C }, 33);
+            const w = try inputF32(alloc, &g, mgr, &.{ KA.C1_K, KA.C1_C, KA.C1_C }, 34);
+            const b = try inputF32(alloc, &g, mgr, &.{KA.C1_C}, 35);
             break :blk try g.addConv1D(x, w, b, 1, 1, KA.C1_K / 2, KA.C1_K / 2, 1);
         },
         .conv1d_dw => blk: {
             // Depthwise causal (Nemotron Conformer): groups == c_in == c_out, k=9.
-            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.CDW_C }, &.{ 1, KA.C1_L, KA.CDW_C }, 36);
-            const w = try inputF32(alloc, &g, mgr, &.{ KA.C1_K, 1, KA.CDW_C }, &.{ KA.C1_K, 1, KA.CDW_C }, 37);
-            const b = try inputF32(alloc, &g, mgr, &.{KA.CDW_C}, &.{KA.CDW_C}, 38);
+            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C1_L, KA.CDW_C }, 36);
+            const w = try inputF32(alloc, &g, mgr, &.{ KA.C1_K, 1, KA.CDW_C }, 37);
+            const b = try inputF32(alloc, &g, mgr, &.{KA.CDW_C}, 38);
             break :blk try g.addConv1D(x, w, b, 1, 1, KA.C1_K - 1, 0, KA.CDW_C);
         },
         .conv2d => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C2_HW, KA.C2_HW, KA.C2_CI }, &.{ 1, KA.C2_HW, KA.C2_HW, KA.C2_CI }, 36);
-            const w = try inputF32(alloc, &g, mgr, &.{ 3, 3, KA.C2_CI, KA.C2_CO }, &.{ 3, 3, KA.C2_CI, KA.C2_CO }, 37);
-            const b = try inputF32(alloc, &g, mgr, &.{KA.C2_CO}, &.{KA.C2_CO}, 38);
+            const x = try inputF32(alloc, &g, mgr, &.{ 1, KA.C2_HW, KA.C2_HW, KA.C2_CI }, 36);
+            const w = try inputF32(alloc, &g, mgr, &.{ 3, 3, KA.C2_CI, KA.C2_CO }, 37);
+            const b = try inputF32(alloc, &g, mgr, &.{KA.C2_CO}, 38);
             break :blk try g.addConv2D(x, w, b, 2, 2, 1, 1, 1, 0, 1, 0, 1);
         },
         .lstm => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_I }, &.{ KA.LS_B, KA.LS_I }, 39);
-            const h = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_H }, &.{ KA.LS_B, KA.LS_H }, 40);
-            const cc = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_H }, &.{ KA.LS_B, KA.LS_H }, 41);
-            const w_ih = try inputF32(alloc, &g, mgr, &.{ KA.LS_I, 4 * KA.LS_H }, &.{ KA.LS_I, 4 * KA.LS_H }, 42);
-            const w_hh = try inputF32(alloc, &g, mgr, &.{ KA.LS_H, 4 * KA.LS_H }, &.{ KA.LS_H, 4 * KA.LS_H }, 43);
-            const b_ih = try inputF32(alloc, &g, mgr, &.{4 * KA.LS_H}, &.{4 * KA.LS_H}, 44);
-            const b_hh = try inputF32(alloc, &g, mgr, &.{4 * KA.LS_H}, &.{4 * KA.LS_H}, 45);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_I }, 39);
+            const h = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_H }, 40);
+            const cc = try inputF32(alloc, &g, mgr, &.{ KA.LS_B, KA.LS_H }, 41);
+            const w_ih = try inputF32(alloc, &g, mgr, &.{ KA.LS_I, 4 * KA.LS_H }, 42);
+            const w_hh = try inputF32(alloc, &g, mgr, &.{ KA.LS_H, 4 * KA.LS_H }, 43);
+            const b_ih = try inputF32(alloc, &g, mgr, &.{4 * KA.LS_H}, 44);
+            const b_hh = try inputF32(alloc, &g, mgr, &.{4 * KA.LS_H}, 45);
             break :blk try g.addLSTMCell(x, h, cc, w_ih, w_hh, b_ih, b_hh);
         },
         .rfft => blk: {
-            const x = try inputF32(alloc, &g, mgr, &.{ KA.FF_ROWS, KA.FF_N }, &.{ KA.FF_ROWS, KA.FF_N }, 46);
+            const x = try inputF32(alloc, &g, mgr, &.{ KA.FF_ROWS, KA.FF_N }, 46);
             break :blk try g.addRFFT(x);
         },
         .stft => blk: {
-            const sig = try inputF32(alloc, &g, mgr, &.{ KA.ST_B, KA.ST_S }, &.{ KA.ST_B, KA.ST_S }, 47);
-            const win = try inputF32(alloc, &g, mgr, &.{KA.ST_NFFT}, &.{KA.ST_NFFT}, 48);
+            const sig = try inputF32(alloc, &g, mgr, &.{ KA.ST_B, KA.ST_S }, 47);
+            const win = try inputF32(alloc, &g, mgr, &.{KA.ST_NFFT}, 48);
             break :blk try g.addSTFT(sig, win, KA.ST_NFFT, KA.ST_HOP, true);
         },
     };
     try g.setOutputs(&[_]aion.graph.ValueId{out_v});
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(deviceFor(policy), policy));
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0] };
 }

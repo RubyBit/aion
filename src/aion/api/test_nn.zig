@@ -412,7 +412,7 @@ test "api.nn: a symbolic-shape model loads with a 2-D quantized weight" {
         }, .{ .name = "embed" });
         const X = try emb.forward(&fx.bld, Tokens);
 
-        // The quantized weight has to be tiled for the matmul as it was stored.
+        // The quantized weight feeds the matmul in the layout it was stored in.
         const fc = try nn.Linear.bind(&fx.bld, .{
             .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ k, n }, 0, &w_vals),
         }, .{ .name = "fc" });
@@ -1308,12 +1308,12 @@ test "api.nn: pooling format roundtrip and strict u16 node headers" {
     var parsed = try package.parse(allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqualDeep(pool.opts, parsed.nodes[0].op.MaxPool2D);
-    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, bytes[4..8], .little));
-    for ([_]u32{ 13, 15 }) |version| {
+    try std.testing.expectEqual(@as(u32, 15), std.mem.readInt(u32, bytes[4..8], .little));
+    for ([_]u32{ 14, 16 }) |version| {
         std.mem.writeInt(u32, bytes[4..8], version, .little);
         try std.testing.expectError(error.UnsupportedVersion, package.parse(allocator, bytes));
     }
-    std.mem.writeInt(u32, bytes[4..8], 14, .little);
+    std.mem.writeInt(u32, bytes[4..8], 15, .little);
     const sections = std.mem.readInt(u32, bytes[8..12], .little);
     const directory: usize = @intCast(std.mem.readInt(u64, bytes[16..24], .little));
     var node_offset: ?usize = null;

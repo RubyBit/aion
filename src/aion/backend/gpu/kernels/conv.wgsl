@@ -6,12 +6,10 @@
 // planned optimization once profiles justify it.
 //
 // Layouts (packed):
-//   conv1d: x [l_in, c_in] (one batch, p.x_base pre-offsets the batch row),
-//           w [k, c_in_g, c_out], bias [c_out], out tile [l_cnt, c_cnt]
-//   conv2d: x [h_in, w_in, c_in], w [kh, kw, c_in_g, c_out], bias [c_out],
-//           out tile [oh_cnt, ow_cnt, c_cnt]
-// The out tile may be an edge tile (base_* / *_cnt describe its window); w and
-// bias index by GLOBAL output channel.
+//   conv1d: x [batch, l_in, c_in], w [k, c_in_g, c_out], bias [c_out],
+//           out [batch, l_cnt, c_cnt]
+//   conv2d: x [batch, h_in, w_in, c_in], w [kh, kw, c_in_g, c_out], bias [c_out],
+//           out [batch, oh_cnt, ow_cnt, c_cnt]
 //
 // Padding: zero (skip out-of-range taps) or reflect (mirror around the edges,
 // matching the CPU reflectIndex1D: x < 0 -> -x, x >= L -> 2L-2-x, repeated).
@@ -25,7 +23,7 @@
 
 struct Params {
     // Input geometry. Conv1d uses h_* for the length axis (w_in/kw/etc = 1).
-    x_base: u32, // element offset of this batch's [h_in(, w_in), c_in] block
+    x_batch: u32, // elements of one batch of x, [h_in(, w_in), c_in]
     h_in: u32,
     w_in: u32,
     c_in: u32,
@@ -43,14 +41,14 @@ struct Params {
     dil_w: u32,
     pad_top: u32,
     pad_left: u32,
-    // Output tile window.
-    base_h: u32,
-    base_w: u32,
-    base_c: u32,
+    // Output geometry.
+    batch: u32,
+    _pad0: u32,
+    _pad1: u32,
     oh_cnt: u32,
     ow_cnt: u32,
     c_cnt: u32,
-    total: u32, // oh_cnt * ow_cnt * c_cnt
+    total: u32, // batch * oh_cnt * ow_cnt * c_cnt
     reflect: u32,
     has_bias: u32,
 };
@@ -67,7 +65,7 @@ fn reflect_idx(idx: i32, len: i32) -> i32 {
     return v;
 }
 
-fn conv_at(oh: u32, ow: u32, co: u32) -> f32 {
+fn conv_at(b: u32, oh: u32, ow: u32, co: u32) -> f32 {
     let g = co / p.c_out_g;
     let c0 = g * p.c_in_g;
 
@@ -91,7 +89,7 @@ fn conv_at(oh: u32, ow: u32, co: u32) -> f32 {
             } else if (wi < 0 || wi >= i32(p.w_in)) {
                 continue;
             }
-            let x_off = p.x_base + ((u32(hi) * p.w_in + u32(wi)) * p.c_in) + c0;
+            let x_off = b * p.x_batch + ((u32(hi) * p.w_in + u32(wi)) * p.c_in) + c0;
             let w_off = ((ki * p.kw + kj) * p.c_in_g) * p.c_out + co;
             for (var ci = 0u; ci < p.c_in_g; ci += 1u) {
                 acc += x[x_off + ci] * w[w_off + ci * p.c_out];
@@ -108,15 +106,15 @@ fn conv_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
         let cc = idx % p.c_cnt;
         let rest = idx / p.c_cnt;
         let owc = rest % p.ow_cnt;
-        let ohc = rest / p.ow_cnt;
-        o[idx] = conv_at(p.base_h + ohc, p.base_w + owc, p.base_c + cc);
+        let rest2 = rest / p.ow_cnt;
+        o[idx] = conv_at(rest2 / p.oh_cnt, rest2 % p.oh_cnt, owc, cc);
     }
 }
 
 // vec4 contraction over the per-group input channels (requires c_in_g % 4 == 0).
 // x channels within a group are contiguous -> 128-bit load; w strides by c_out
 // across input channels, so 4 scalar reads combined via dot.
-fn conv_at_vec4c(oh: u32, ow: u32, co: u32) -> f32 {
+fn conv_at_vec4c(b: u32, oh: u32, ow: u32, co: u32) -> f32 {
     let g = co / p.c_out_g;
     let c0 = g * p.c_in_g;
 
@@ -140,7 +138,7 @@ fn conv_at_vec4c(oh: u32, ow: u32, co: u32) -> f32 {
             } else if (wi < 0 || wi >= i32(p.w_in)) {
                 continue;
             }
-            let x_off = p.x_base + ((u32(hi) * p.w_in + u32(wi)) * p.c_in) + c0;
+            let x_off = b * p.x_batch + ((u32(hi) * p.w_in + u32(wi)) * p.c_in) + c0;
             let w_off = ((ki * p.kw + kj) * p.c_in_g) * p.c_out + co;
             let cs = p.c_out;
             for (var ci = 0u; ci < p.c_in_g; ci += 4u) {
@@ -162,8 +160,8 @@ fn conv_f32_vec4c(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wo
         let cc = idx % p.c_cnt;
         let rest = idx / p.c_cnt;
         let owc = rest % p.ow_cnt;
-        let ohc = rest / p.ow_cnt;
-        o[idx] = conv_at_vec4c(p.base_h + ohc, p.base_w + owc, p.base_c + cc);
+        let rest2 = rest / p.ow_cnt;
+        o[idx] = conv_at_vec4c(rest2 / p.oh_cnt, rest2 % p.oh_cnt, owc, cc);
     }
 }
 
@@ -175,8 +173,8 @@ fn conv_f32_vec4c(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wo
 // One workgroup owns [DW_NCG channel-groups (vec4) x DW_LT output positions].
 // Each thread owns one vec4 channel-group and computes DW_LT length outputs,
 // reusing a shared input halo (each input row read once) and per-tap weights
-// held in a register across all DW_LT outputs. Because c_out % 4 == 0 and the
-// channel tile base is 4-aligned, every channel-group is full (no per-lane tail).
+// held in a register across all DW_LT outputs. Because c_out % 4 == 0, every
+// channel-group is full (no per-lane tail).
 // Causal/zero padding falls out for free: out-of-range halo rows load as zero.
 // ---------------------------------------------------------------------------
 const DW_NCG: u32 = 64u;   // channel-groups (of 4 channels) per workgroup -> 256 ch
@@ -185,9 +183,9 @@ const DW_SPAN_MAX: u32 = 40u; // Xs = 40*64*16 = 40960 B shared (executor gates 
 
 var<workgroup> Xs: array<vec4<f32>, DW_SPAN_MAX * DW_NCG>;
 
-fn store_dw(oh: u32, gc4: u32, acc: vec4<f32>) {
+fn store_dw(b: u32, oh: u32, gc4: u32, acc: vec4<f32>) {
     if (oh >= p.oh_cnt) { return; }
-    let idx = oh * p.c_cnt + gc4 * 4u;
+    let idx = (b * p.oh_cnt + oh) * p.c_cnt + gc4 * 4u;
     o[idx] = acc.x;
     o[idx + 1u] = acc.y;
     o[idx + 2u] = acc.z;
@@ -196,13 +194,14 @@ fn store_dw(oh: u32, gc4: u32, acc: vec4<f32>) {
 
 @compute @workgroup_size(64)
 fn conv_dw_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let gc4 = wid.x * DW_NCG + lid;      // channel-group index within the out tile
-    let lblk = wid.y * DW_LT;            // first tile-local length position
-    let co = p.base_c + gc4 * 4u;        // absolute first output channel of this group
+    let gc4 = wid.x * DW_NCG + lid;      // channel-group index
+    let lblk = wid.y * DW_LT;            // first length position of this workgroup
+    let b = wid.z;                       // batch
+    let co = gc4 * 4u;                   // first output channel of this group
 
     let span = (DW_LT - 1u) * p.stride_h + (p.kh - 1u) * p.dil_h + 1u;
-    let block_c0 = p.base_c + wid.x * DW_NCG * 4u;
-    let gfirst = i32((p.base_h + lblk) * p.stride_h) - i32(p.pad_top);
+    let block_c0 = wid.x * DW_NCG * 4u;
+    let gfirst = i32(lblk * p.stride_h) - i32(p.pad_top);
 
     // Cooperative halo load: fill Xs[row * DW_NCG + cg] for this channel block.
     var s = lid;
@@ -214,7 +213,7 @@ fn conv_dw_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         let cch = block_c0 + cg * 4u;
         var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         if (gr >= 0 && gr < i32(p.h_in) && cch + 3u < p.c_in) {
-            let base = p.x_base + u32(gr) * p.c_in + cch;
+            let base = b * p.x_batch + u32(gr) * p.c_in + cch;
             v = vec4<f32>(x[base], x[base + 1u], x[base + 2u], x[base + 3u]);
         }
         Xs[s] = v;
@@ -258,20 +257,20 @@ fn conv_dw_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         ki = ki + 1u;
     }
 
-    store_dw(lblk + 0u, gc4, a0);
-    store_dw(lblk + 1u, gc4, a1);
-    store_dw(lblk + 2u, gc4, a2);
-    store_dw(lblk + 3u, gc4, a3);
-    store_dw(lblk + 4u, gc4, a4);
-    store_dw(lblk + 5u, gc4, a5);
-    store_dw(lblk + 6u, gc4, a6);
-    store_dw(lblk + 7u, gc4, a7);
-    store_dw(lblk + 8u, gc4, a8);
-    store_dw(lblk + 9u, gc4, a9);
-    store_dw(lblk + 10u, gc4, a10);
-    store_dw(lblk + 11u, gc4, a11);
-    store_dw(lblk + 12u, gc4, a12);
-    store_dw(lblk + 13u, gc4, a13);
-    store_dw(lblk + 14u, gc4, a14);
-    store_dw(lblk + 15u, gc4, a15);
+    store_dw(b, lblk + 0u, gc4, a0);
+    store_dw(b, lblk + 1u, gc4, a1);
+    store_dw(b, lblk + 2u, gc4, a2);
+    store_dw(b, lblk + 3u, gc4, a3);
+    store_dw(b, lblk + 4u, gc4, a4);
+    store_dw(b, lblk + 5u, gc4, a5);
+    store_dw(b, lblk + 6u, gc4, a6);
+    store_dw(b, lblk + 7u, gc4, a7);
+    store_dw(b, lblk + 8u, gc4, a8);
+    store_dw(b, lblk + 9u, gc4, a9);
+    store_dw(b, lblk + 10u, gc4, a10);
+    store_dw(b, lblk + 11u, gc4, a11);
+    store_dw(b, lblk + 12u, gc4, a12);
+    store_dw(b, lblk + 13u, gc4, a13);
+    store_dw(b, lblk + 14u, gc4, a14);
+    store_dw(b, lblk + 15u, gc4, a15);
 }

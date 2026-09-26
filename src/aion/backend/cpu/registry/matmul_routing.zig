@@ -19,10 +19,9 @@ pub const Q8_DIRECT_MAX_M: usize = 16;
 ///
 /// Packing B pays for itself only when the packed copy gets reused. At these
 /// shapes it never does: a decode step visits every weight tile exactly once, so
-/// the repack is pure overhead. Worse, the storage tiling splits B into many
-/// tiles and the test used to be on the tile — which reads every tile of a large
-/// weight as "small" and sends all of them down the packing path. A 1B-parameter
-/// decode repacked the whole model per token, for 3.8 tok/s against 11.5.
+/// the repack is pure overhead. (When storage still split B into tiles, the test
+/// read every tile of a large weight as "small" and sent the whole model down the
+/// packing path per token: 3.8 tok/s against 11.5.)
 pub fn shouldUseQ8DirectMatvec(params: MatMulParams) bool {
     return params.m != 0 and params.m <= Q8_DIRECT_MAX_M;
 }

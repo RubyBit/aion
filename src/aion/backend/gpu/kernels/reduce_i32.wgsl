@@ -16,8 +16,12 @@ var<workgroup> scratch: array<i32, 256>;
 fn reduce_sum_row(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
-    let xb = wid.x * p.x_row;
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
     var total = 0;
     for (var c = lidx; c < p.cols; c += WG) {
         total += x[xb + c];
@@ -34,6 +38,6 @@ fn reduce_sum_row(
         stride /= 2u;
     }
     if (lidx == 0u) {
-        o[wid.x] = scratch[0];
+        o[row] = scratch[0];
     }
 }

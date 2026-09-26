@@ -49,7 +49,8 @@ pub fn readAlloc(allocator: std.mem.Allocator, file: std.Io.File) PackageError![
 
 /// A package file mapped read-only, and the package parsed from it. The package's
 /// tensor payloads are views of the mapping, so they are read straight from the page
-/// cache — clean pages the OS can drop — rather than from a copy of the file.
+/// cache — clean pages the OS can drop — rather than from a copy of the file. A loader
+/// that keeps weights as views of it takes the mapping over with `takeMap`.
 pub const MappedPackage = struct {
     /// Null once `unmap` has run.
     map: ?std.Io.File.MemoryMap,
@@ -86,16 +87,19 @@ pub const MappedPackage = struct {
         return map.section != null;
     }
 
-    /// The whole file, as mapped; only valid before `unmap`.
-    pub fn bytes(self: *const MappedPackage) []const u8 {
-        return self.map.?.memory;
+    /// Hand the mapping to the caller, who then owns it and must keep it alive while
+    /// the package's payload views are read. Null once taken or unmapped.
+    pub fn takeMap(self: *MappedPackage) ?std.Io.File.MemoryMap {
+        const map = self.map;
+        self.map = null;
+        return map;
     }
 
-    /// Release the mapping once the payloads have been copied out; the package keeps
-    /// what it owns and is still the caller's to `deinit`. Idempotent.
+    /// Drop the payload views and release the mapping if this still owns it; the
+    /// package keeps what it owns and is still the caller's to `deinit`. Idempotent.
     pub fn unmap(self: *MappedPackage) void {
-        var map = self.map orelse return;
         self.package.dropPayloads();
+        var map = self.map orelse return;
         var io_backend = fileIo(self.package.allocator);
         map.destroy(io_backend.io());
         self.map = null;

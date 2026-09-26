@@ -137,7 +137,7 @@ pub const PadMode = enum(u8) {
     reflect,
 };
 
-/// How an `[n, k]` q8_0 tensor's blocks are laid out inside a tile.
+/// How an `[n, k]` q8_0 tensor's blocks are laid out.
 ///
 /// `row_major` is the plain contract: one row is an unbroken run of
 /// `cols / 32` 34-byte blocks. `lanes*` groups `W` rows so an integer dot's `W`
@@ -182,7 +182,7 @@ pub const QuantBlockOrder = enum(u8) {
         };
     }
 
-    /// Byte offset, inside its tile, of the group segment holding row `r`'s
+    /// Byte offset, inside the tensor, of the group segment holding row `r`'s
     /// block `kb`, for rows of `blocks` blocks. A segment is `groupRows()` blocks.
     fn segment(self: QuantBlockOrder, blocks: usize, r: usize, kb: usize) usize {
         const g = self.groupRows();
@@ -200,16 +200,16 @@ pub const QuantBlockOrder = enum(u8) {
         return self.segment(blocks, r, kb) + 2 * g + (chunk * g + r % g) * CHUNK_BYTES;
     }
 
-    /// Write a whole 34-byte block to its place in `tile`.
-    pub fn storeBlock(self: QuantBlockOrder, tile: []u8, blocks: usize, r: usize, kb: usize, block: []const u8) void {
-        @memcpy(tile[self.scaleAt(blocks, r, kb)..][0..2], block[0..2]);
-        for (0..CHUNKS) |c| @memcpy(tile[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES], block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES]);
+    /// Write a whole 34-byte block to its place in `bytes`.
+    pub fn storeBlock(self: QuantBlockOrder, bytes: []u8, blocks: usize, r: usize, kb: usize, block: []const u8) void {
+        @memcpy(bytes[self.scaleAt(blocks, r, kb)..][0..2], block[0..2]);
+        for (0..CHUNKS) |c| @memcpy(bytes[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES], block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES]);
     }
 
-    /// Read a whole 34-byte block back out of `tile`.
-    pub fn loadBlock(self: QuantBlockOrder, tile: []const u8, blocks: usize, r: usize, kb: usize, block: []u8) void {
-        @memcpy(block[0..2], tile[self.scaleAt(blocks, r, kb)..][0..2]);
-        for (0..CHUNKS) |c| @memcpy(block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES], tile[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES]);
+    /// Read a whole 34-byte block back out of `bytes`.
+    pub fn loadBlock(self: QuantBlockOrder, bytes: []const u8, blocks: usize, r: usize, kb: usize, block: []u8) void {
+        @memcpy(block[0..2], bytes[self.scaleAt(blocks, r, kb)..][0..2]);
+        for (0..CHUNKS) |c| @memcpy(block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES], bytes[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES]);
     }
 };
 
@@ -221,6 +221,11 @@ pub const MatMulParams = struct {
 
     /// Leading dimension (row stride) of C. If 0, defaults to n.
     ldc: usize = 0,
+    /// Row stride of A, in elements. If 0, defaults to k.
+    lda: usize = 0,
+    /// Row stride of B -- elements for scalar B, blocks for a K-blocked quantized
+    /// B. If 0, defaults to n.
+    ldb: usize = 0,
 
     alpha: f32 = 1.0,
     beta: f32 = 0.0,

@@ -62,20 +62,27 @@ pub fn writeFile(file: std.Io.File, pkg: *const Package) PackageError!void {
 
     const dir_offset: usize = header_size;
     const dir_size: usize = sections.items.len * section_desc_size;
+    // Each section's offset: back to back, except that the tensors section starts on
+    // `payload_alignment` so its payloads can (see `Body.len`).
+    const offsets = scratch.alloc(usize, sections.items.len) catch return PackageError.OutOfMemory;
     var total_size: usize = dir_offset + dir_size;
-    for (sections.items) |section| {
+    for (sections.items, offsets) |section, *off| {
+        if (section.body == .tensors) total_size = std.mem.alignForward(usize, total_size, types.payload_alignment);
+        off.* = total_size;
         total_size = std.math.add(usize, total_size, section.body.len()) catch return PackageError.InvalidArgument;
     }
 
     var writer: WriteCursor = .{ .file = file };
     try writeHeader(&writer, @intCast(sections.items.len), @intCast(dir_offset), @intCast(total_size));
-
-    var next_offset: usize = dir_offset + dir_size;
-    for (sections.items) |section| {
-        try writeSectionDesc(&writer, section.section_type, section.flags, @intCast(next_offset), @intCast(section.body.len()));
-        next_offset += section.body.len();
+    for (sections.items, offsets) |section, off| {
+        try writeSectionDesc(&writer, section.section_type, section.flags, @intCast(off), @intCast(section.body.len()));
     }
-    for (sections.items) |section| try section.body.write(&writer);
+    var at: usize = dir_offset + dir_size;
+    for (sections.items, offsets) |section, off| {
+        try writer.writeZeros(off - at);
+        try section.body.write(&writer);
+        at = off + section.body.len();
+    }
 
     var io_backend: std.Io.Threaded = .init_single_threaded;
     const io = io_backend.io();
@@ -89,7 +96,8 @@ const EncodedSection = struct {
 
     const Body = union(enum) {
         bytes: []u8,
-        /// Each tensor's encoded header, followed on write by its payload.
+        /// Each tensor's encoded header, followed on write by zero padding to the next
+        /// `payload_alignment` of the section, then its payload.
         tensors: struct { headers: []const []const u8, inits: []const Initializer },
 
         fn len(self: Body) usize {
@@ -97,7 +105,7 @@ const EncodedSection = struct {
                 .bytes => |b| return b.len,
                 .tensors => |t| {
                     var n: usize = @sizeOf(u32);
-                    for (t.headers, t.inits) |h, init| n += h.len + init.data.len();
+                    for (t.headers, t.inits) |h, init| n = std.mem.alignForward(usize, n + h.len, types.payload_alignment) + init.data.len();
                     return n;
                 },
             }
@@ -122,8 +130,12 @@ const EncodedSection = struct {
             var count: [@sizeOf(u32)]u8 = undefined;
             std.mem.writeInt(u32, &count, @intCast(t.inits.len), .little);
             try writer.writeAll(&count);
+            var pos: usize = count.len;
             for (t.headers, t.inits) |h, init| {
                 try writer.writeAll(h);
+                const padded = std.mem.alignForward(usize, pos + h.len, types.payload_alignment);
+                try writer.writeZeros(padded - pos - h.len);
+                pos = padded + init.data.len();
                 switch (init.data) {
                     .bytes => |b| try writer.writeAll(b),
                     .source => |src| {
@@ -642,6 +654,17 @@ const WriteCursor = struct {
     fn writeAll(self: *WriteCursor, bytes: []const u8) PackageError!void {
         try file_io.writeAt(self.file, bytes, self.offset);
         self.offset += @intCast(bytes.len);
+    }
+
+    /// Alignment padding: explicit zeros, not a hole, so the bytes are defined.
+    fn writeZeros(self: *WriteCursor, n: usize) PackageError!void {
+        const zeros: [types.payload_alignment]u8 = @splat(0);
+        var left = n;
+        while (left > 0) {
+            const part = @min(left, zeros.len);
+            try self.writeAll(zeros[0..part]);
+            left -= part;
+        }
     }
 };
 

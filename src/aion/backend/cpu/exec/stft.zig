@@ -6,11 +6,7 @@
 // `[batch, num_frames, n_fft+2]` packed complex (same layout as RFFT). Framing
 // is done on the fly into a small per-group buffer — the overlapped framed
 // signal is never materialized in full.
-//
-// Fast path (the common case: small/single-tile, packed-contiguous tensors):
-// the raw f32 tile buffers are acquired once and indexed directly, and frame
-// groups are processed in parallel across the thread pool. A scalar
-// tile-by-tile fallback handles arbitrary tilings.
+// Frame groups are processed in parallel across the thread pool.
 
 const std = @import("std");
 const backend_mod = @import("../../backend.zig");
@@ -35,24 +31,6 @@ inline fn reflectIndex(i: isize, n: usize) usize {
     const ni: isize = @intCast(n);
     if (m >= ni) m = period - m;
     return @intCast(m);
-}
-
-/// True when every dim is a single tile and the tile is packed row-major f32,
-/// so the whole tensor is one contiguous f32 buffer indexable by flat offset.
-fn packedContiguousF32(meta: tensor_store.TensorMeta, dtype: types.DType, layout: types.Layout) bool {
-    const rank: usize = @as(usize, meta.rank);
-    if (dtype != .f32) return false;
-    for (meta.tile_counts) |tc| {
-        if (tc != 1) return false;
-    }
-    if (@as(usize, layout.rank) != rank) return false;
-    var expect: isize = 4; // f32
-    var d: usize = rank;
-    while (d > 0) : (d -= 1) {
-        if (layout.strides_bytes[d - 1] != expect) return false;
-        expect *= @intCast(meta.shape[d - 1]);
-    }
-    return true;
 }
 
 pub fn execSTFT(
@@ -87,47 +65,19 @@ pub fn execSTFT(
     if (batch == 0 or num_frames == 0) return;
     if (plan.n_fft != n_fft) return BackendError.InvalidArgument;
 
-    // Fast path: single-tile, packed-contiguous f32 buffers + thread-parallel.
-    {
-        const sig_tile = try store.acquireTileConstLinear(s.signal, 0);
-        var release_sig = true;
-        defer if (release_sig) store.releaseConst(sig_tile.token);
-        const win_tile = try store.acquireTileConstLinear(s.window, 0);
-        var release_win = true;
-        defer if (release_win) store.releaseConst(win_tile.token);
-        const out_tile = try store.acquireTileMutLinear(s.out, 0);
-        var release_out = true;
-        defer if (release_out) store.releaseMut(out_tile.token);
+    const sig_view = try store.acquireConst(s.signal);
+    defer store.releaseConst(sig_view.token);
+    const win_view = try store.acquireConst(s.window);
+    defer store.releaseConst(win_view.token);
+    const out_view = try store.acquireMut(s.out);
+    defer store.releaseMut(out_view.token);
 
-        const sig_view = sig_tile.bufferView();
-        const win_view = win_tile.bufferView();
-        const out_view = out_tile.bufferView();
-
-        if (packedContiguousF32(sig_meta, sig_view.dtype, sig_view.layout) and
-            packedContiguousF32(win_meta, win_view.dtype, win_view.layout) and
-            packedContiguousF32(out_meta, out_view.dtype, out_view.layout))
-        {
-            // Tile backing is >= 64-byte aligned, so natural-alignment casts are safe.
-            const sig: []const f32 = @alignCast(simd.bytesAsSliceConstUnaligned(f32, sig_view.bytes));
-            const win: []const f32 = @alignCast(simd.bytesAsSliceConstUnaligned(f32, win_view.bytes));
-            const out: []f32 = @alignCast(simd.bytesAsSliceMutUnaligned(f32, out_view.bytes));
-            if (sig.len < batch * samples or win.len < n_fft or out.len < batch * num_frames * 2 * bins) {
-                return BackendError.InvalidArgument;
-            }
-            try execFast(allocator, pool, thread_count, kernels, plan, s, sig, win, out, batch, samples, num_frames, n_fft, bins);
-            return;
-        }
-
-        // Not contiguous; release and fall through to the scalar path.
-        store.releaseConst(sig_tile.token);
-        release_sig = false;
-        store.releaseConst(win_tile.token);
-        release_win = false;
-        store.releaseMut(out_tile.token);
-        release_out = false;
-    }
-
-    try execScalar(allocator, kernels, plan, s, store, sig_meta, win_meta, out_meta, batch, samples, num_frames, n_fft, bins);
+    // Tensor backing is 64-byte aligned, so natural-alignment casts are safe.
+    const sig: []const f32 = @alignCast(simd.bytesAsSliceConstUnaligned(f32, sig_view.bytes));
+    const win: []const f32 = @alignCast(simd.bytesAsSliceConstUnaligned(f32, win_view.bytes));
+    const out: []f32 = @alignCast(simd.bytesAsSliceMutUnaligned(f32, out_view.bytes));
+    if (sig.len < batch * samples or win.len < n_fft or out.len < batch * num_frames * 2 * bins) return BackendError.InvalidArgument;
+    return execFast(allocator, pool, thread_count, kernels, plan, s, sig, win, out, batch, samples, num_frames, n_fft, bins);
 }
 
 const FastTask = struct {
@@ -266,80 +216,3 @@ fn execFast(
     try FastTask.runItems(@ptrCast(&task), 0, total_items, 0);
 }
 
-fn execScalar(
-    allocator: std.mem.Allocator,
-    kernels: fft_registry.FftKernels,
-    plan: *const fft.Plan,
-    s: executable.StepSTFT,
-    store: tensor_store.TensorStore,
-    sig_meta: tensor_store.TensorMeta,
-    win_meta: tensor_store.TensorMeta,
-    out_meta: tensor_store.TensorMeta,
-    batch: usize,
-    samples: usize,
-    num_frames: usize,
-    n_fft: usize,
-    bins: usize,
-) ExecuteProgramError!void {
-    const lanes: usize = kernels.lanes;
-    const in_buf = allocator.alloc(f32, lanes * n_fft) catch return BackendError.ExecutionFailed;
-    defer allocator.free(in_buf);
-    const out_buf = allocator.alloc(f32, lanes * 2 * bins) catch return BackendError.ExecutionFailed;
-    defer allocator.free(out_buf);
-    const win = allocator.alloc(f32, n_fft) catch return BackendError.ExecutionFailed;
-    defer allocator.free(win);
-    const scratch = allocator.alignedAlloc(u8, .@"64", fft.scratchBytes(plan, lanes)) catch return BackendError.ExecutionFailed;
-    defer allocator.free(scratch);
-
-    var win_cache: exec_utils.TileCacheConstND = .{};
-    defer win_cache.deinit(store);
-    var sig_cache: exec_utils.TileCacheConstND = .{};
-    defer sig_cache.deinit(store);
-    var out_cache: exec_utils.TileCacheMutND = .{};
-    defer out_cache.deinit(store);
-
-    {
-        var j: usize = 0;
-        while (j < n_fft) : (j += 1) {
-            win[j] = try exec_utils.readScalarF32At(store, win_meta, s.window, &[_]usize{j}, &win_cache);
-        }
-    }
-
-    const pad: isize = if (s.center) @intCast(n_fft / 2) else 0;
-
-    var b: usize = 0;
-    while (b < batch) : (b += 1) {
-        var group_start: usize = 0;
-        while (group_start < num_frames) : (group_start += lanes) {
-            const count: usize = @min(lanes, num_frames - group_start);
-
-            var l: usize = 0;
-            while (l < count) : (l += 1) {
-                const t: usize = group_start + l;
-                const frame_origin: isize = @as(isize, @intCast(t * s.hop_length)) - pad;
-                var j: usize = 0;
-                while (j < n_fft) : (j += 1) {
-                    const idx: isize = frame_origin + @as(isize, @intCast(j));
-                    var sample: f32 = 0.0;
-                    if (idx >= 0 and idx < @as(isize, @intCast(samples))) {
-                        sample = try exec_utils.readScalarF32At(store, sig_meta, s.signal, &[_]usize{ b, @intCast(idx) }, &sig_cache);
-                    } else if (s.center) {
-                        sample = try exec_utils.readScalarF32At(store, sig_meta, s.signal, &[_]usize{ b, reflectIndex(idx, samples) }, &sig_cache);
-                    }
-                    in_buf[l * n_fft + j] = sample * win[j];
-                }
-            }
-
-            kernels.process_group(plan, in_buf, out_buf, count, scratch) catch return BackendError.ExecutionFailed;
-
-            l = 0;
-            while (l < count) : (l += 1) {
-                const t: usize = group_start + l;
-                var k: usize = 0;
-                while (k < 2 * bins) : (k += 1) {
-                    try exec_utils.writeScalarFromF32At(store, out_meta, s.out, &[_]usize{ b, t, k }, out_buf[l * 2 * bins + k], &out_cache);
-                }
-            }
-        }
-    }
-}

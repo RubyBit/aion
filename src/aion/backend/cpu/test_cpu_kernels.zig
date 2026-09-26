@@ -250,7 +250,7 @@ fn softmaxRefRowF32(out: []f32, x: []const f32) void {
 }
 
 test "cpu kernels: softmax f32 matches reference (rank-1)" {
-    // This tests the core softmax math used by the tiled exec.
+    // This tests the core softmax math the executor uses.
     var x = [_]f32{ -4.0, -1.0, 0.0, 0.5, 1.0, 2.0, 4.0 };
     var out: [x.len]f32 = @splat(0);
     var ref: [x.len]f32 = @splat(0);
@@ -344,7 +344,7 @@ test "cpu kernels: tuned f32 matmul via registry" {
 
     // Pack B and run per-row (m==1) just like program execution does.
     // This keeps the test independent of any higher-level executor.
-    try kernels.pack_b_tile(scratch, k, n, std.mem.sliceAsBytes(b[0..]));
+    try kernels.pack_b_tile(scratch, k, n, 0, std.mem.sliceAsBytes(b[0..]));
 
     const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes_len]));
 
@@ -562,7 +562,7 @@ test "cpu kernels: tuned q8_0 matmul via registry" {
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
-    try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
+    try kernels.pack_b_tile_q8_0(scratch, k, n, 0, bq[0..]);
     const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
 
@@ -608,7 +608,7 @@ test "cpu kernels: tuned q4_0 matmul via registry" {
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
-    try kernels.pack_b_tile_q4_0(scratch, k, n, bq[0..]);
+    try kernels.pack_b_tile_q4_0(scratch, k, n, 0, bq[0..]);
     const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
 
@@ -659,7 +659,7 @@ test "cpu kernels: matvec q8_0" {
     var scratch: []align(32) u8 = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
     defer std.testing.allocator.free(scratch);
 
-    try kernels.pack_b_tile_q8_0(scratch, k, n, bq[0..]);
+    try kernels.pack_b_tile_q8_0(scratch, k, n, 0, bq[0..]);
     const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch[0..kernels.packed_b_bytes]);
     try kernels.matmul_packed_b(scratch, packed_b_view, params, std.mem.sliceAsBytes(c[0..]), std.mem.sliceAsBytes(a[0..]));
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
@@ -715,74 +715,111 @@ test "cpu kernels: direct matvec q8_0 k-major" {
     try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
 }
 
-test "cpu kernels: q8_0 k-major matvec accumulates across K tiles" {
-    // The multi-thread decode path splits K across calls and keeps the running
-    // sums in scratch, writing C only on the last one. A width that is not a
-    // multiple of the kernel's column tile exercises its tail as well.
-    const n: usize = 22;
-    const k_tile: usize = 64;
-    const tiles: usize = 3;
-    const k: usize = k_tile * tiles;
-
-    var prng = std.Random.DefaultPrng.init(0x3333);
-    const rnd = prng.random();
-
-    var a: [k]f32 = undefined;
-    for (a[0..]) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
-
-    const k_blocks: usize = k / 32;
-    var bq: [k_blocks * n * Q8_BYTES]u8 = undefined;
-    var b_f32: [k * n]f32 = undefined;
-    var kb: usize = 0;
-    while (kb < k_blocks) : (kb += 1) {
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            var block: [32]f32 = undefined;
-            var t: usize = 0;
-            while (t < 32) : (t += 1) {
-                const v: f32 = (rnd.float(f32) - 0.5) * 2.0;
-                block[t] = v;
-                b_f32[(kb * 32 + t) * n + j] = v;
-            }
-            const off: usize = (kb * n + j) * Q8_BYTES;
-            const dst: *[Q8_BYTES]u8 = @ptrCast(bq[off..][0..Q8_BYTES]);
-            quantizeQ8_0FromF32Block32(&block, dst);
-        }
-    }
-
-    var c_ref: [n]f32 = @splat(0.0);
-    for (0..n) |j| {
-        var acc: f32 = 0.0;
-        for (0..k) |kk| acc += a[kk] * b_f32[kk * n + j];
-        c_ref[j] = acc;
-    }
-
-    var c: [n]f32 = @splat(0.0);
-    var acc_scratch: [n * 64]u8 align(32) = undefined;
-    var prep: [(k_tile / 32) * (32 + @sizeOf(f32)) * 4]u8 align(32) = undefined;
-    const kernels = matvecKernelsById(.simd256);
-
-    var ti: usize = 0;
-    while (ti < tiles) : (ti += 1) {
-        // B is [k_blocks, n]; this tile owns its own slice of those rows.
-        const blocks_per_tile = k_tile / 32;
-        const b_off = ti * blocks_per_tile * n * Q8_BYTES;
-        try kernels.matvec_q8_0_kmajor_accumulate(
-            .{ .m = 1, .n = n, .k = k_tile, .alpha = 1.0, .beta = 0.0 },
-            std.mem.sliceAsBytes(c[0..]),
-            std.mem.sliceAsBytes(a[ti * k_tile ..][0..k_tile]),
-            bq[b_off..][0 .. blocks_per_tile * n * Q8_BYTES],
-            acc_scratch[0..],
-            prep[0..],
-            true,
-            ti == 0,
-            ti + 1 == tiles,
-        );
-    }
-    try expectSliceApproxEqAbs(c_ref[0..], c[0..], 2e-1);
-}
-
 comptime {
     _ = BackendError;
     _ = matmul_q_registry;
+}
+
+// A kernel handed a sub-block of a larger A/B/C through `lda`/`ldb`/`ldc` must compute
+// exactly what it computes on a compacted copy of that sub-block, and write nothing
+// outside the C block: that is what lets a whole-tensor executor block a flat matmul.
+test "cpu kernels: matmul kernels read strided sub-blocks exactly like compact ones" {
+    const alloc = std.testing.allocator;
+    // Whole operands A[M, KT], B[KT, NT], C[M, NT]; the block is k in [K0, K0+K), n in [N0, N0+N).
+    const M: usize = 5;
+    const KT: usize = 128;
+    const NT: usize = 96;
+    const K0: usize = 32;
+    const K: usize = 64;
+    const N0: usize = 16;
+    const N: usize = 48;
+
+    var prng = std.Random.DefaultPrng.init(0x5151);
+    const rnd = prng.random();
+    const a = try alloc.alloc(f32, M * KT);
+    defer alloc.free(a);
+    const b = try alloc.alloc(f32, KT * NT);
+    defer alloc.free(b);
+    for (a) |*x| x.* = rnd.float(f32) - 0.5;
+    for (b) |*x| x.* = rnd.float(f32) - 0.5;
+
+    // Compacted copies of the block.
+    const a_c = try alloc.alloc(f32, M * K);
+    defer alloc.free(a_c);
+    const b_c = try alloc.alloc(f32, K * N);
+    defer alloc.free(b_c);
+    for (0..M) |i| @memcpy(a_c[i * K ..][0..K], a[i * KT + K0 ..][0..K]);
+    for (0..K) |kk| @memcpy(b_c[kk * N ..][0..N], b[(K0 + kk) * NT + N0 ..][0..N]);
+
+    const sentinel: f32 = 777.0;
+
+    // f32: pack + GEMM.
+    {
+        const kernels = matmulKernelsById(.medium);
+        const scratch = try alloc.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), kernels.scratch_bytes);
+        defer alloc.free(scratch);
+        const pb_bytes = kernels.tuning.kc * kernels.tuning.nc * @sizeOf(f32);
+        const packed_b: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
+
+        var want: [M * N]f32 = undefined;
+        try kernels.pack_b_tile(scratch, K, N, 0, std.mem.sliceAsBytes(b_c));
+        try kernels.matmul_packed_b(scratch, packed_b, .{ .m = M, .n = N, .k = K }, std.mem.sliceAsBytes(&want), std.mem.sliceAsBytes(a_c));
+
+        var got: [M * NT]f32 = @splat(sentinel);
+        try kernels.pack_b_tile(scratch, K, N, NT, std.mem.sliceAsBytes(b[K0 * NT + N0 ..]));
+        try kernels.matmul_packed_b(scratch, packed_b, .{ .m = M, .n = N, .k = K, .lda = KT, .ldc = NT }, std.mem.sliceAsBytes(got[N0..]), std.mem.sliceAsBytes(a[K0..]));
+        for (0..M) |i| for (0..NT) |j| {
+            const g = got[i * NT + j];
+            if (j >= N0 and j < N0 + N) try std.testing.expectEqual(want[i * N + j - N0], g) else try std.testing.expectEqual(sentinel, g);
+        };
+    }
+
+    // q8_0 B, blocked along K: block rows of NT blocks (whole) vs N blocks (compact).
+    const KB = KT / 32;
+    const bq = try alloc.alloc(u8, KB * NT * Q8_BYTES);
+    defer alloc.free(bq);
+    for (0..KB) |kb| for (0..NT) |j| {
+        var block: [32]f32 = undefined;
+        for (0..32) |t| block[t] = b[(kb * 32 + t) * NT + j];
+        quantizeQ8_0FromF32Block32(&block, @ptrCast(bq[(kb * NT + j) * Q8_BYTES ..][0..Q8_BYTES]));
+    };
+    const kb0 = K0 / 32;
+    const kbn = K / 32;
+    const bq_c = try alloc.alloc(u8, kbn * N * Q8_BYTES);
+    defer alloc.free(bq_c);
+    for (0..kbn) |kb| @memcpy(bq_c[kb * N * Q8_BYTES ..][0 .. N * Q8_BYTES], bq[((kb0 + kb) * NT + N0) * Q8_BYTES ..][0 .. N * Q8_BYTES]);
+    const bq_block = bq[(kb0 * NT + N0) * Q8_BYTES ..];
+
+    // q8_0: matvec reading B in place (the decode path), one row and several.
+    {
+        const mv = matvecKernelsById(.simd256);
+        for ([_]usize{ 1, M }) |rows| {
+            var want: [M * N]f32 = undefined;
+            try mv.matvec_q8_0_kmajor(.{ .m = rows, .n = N, .k = K }, std.mem.sliceAsBytes(want[0 .. rows * N]), std.mem.sliceAsBytes(a_c[0 .. rows * K]), bq_c);
+            var got: [M * NT]f32 = @splat(sentinel);
+            try mv.matvec_q8_0_kmajor(.{ .m = rows, .n = N, .k = K, .lda = KT, .ldb = NT, .ldc = NT }, std.mem.sliceAsBytes(got[N0..]), std.mem.sliceAsBytes(a[K0..]), bq_block);
+            for (0..rows) |i| for (0..NT) |j| {
+                const g = got[i * NT + j];
+                if (j >= N0 and j < N0 + N) try std.testing.expectEqual(want[i * N + j - N0], g) else try std.testing.expectEqual(sentinel, g);
+            };
+        }
+    }
+
+    // q8_0: pack + GEMM.
+    {
+        const qk = matmul_q_registry.int8Set(.portable)[matmul_q_registry.MEDIUM];
+        const scratch = try alloc.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), qk.scratch_bytes);
+        defer alloc.free(scratch);
+        const view: matmul_q_registry.PackedBView = @alignCast(scratch[0..qk.packed_b_bytes]);
+        var want: [M * N]f32 = undefined;
+        try qk.pack_b_tile_q8_0(scratch, K, N, 0, bq_c);
+        try qk.matmul_packed_b(scratch, view, .{ .m = M, .n = N, .k = K }, std.mem.sliceAsBytes(&want), std.mem.sliceAsBytes(a_c));
+        var got: [M * NT]f32 = @splat(sentinel);
+        try qk.pack_b_tile_q8_0(scratch, K, N, NT, bq_block);
+        try qk.matmul_packed_b(scratch, view, .{ .m = M, .n = N, .k = K, .lda = KT, .ldc = NT }, std.mem.sliceAsBytes(got[N0..]), std.mem.sliceAsBytes(a[K0..]));
+        for (0..M) |i| for (0..NT) |j| {
+            const g = got[i * NT + j];
+            if (j >= N0 and j < N0 + N) try std.testing.expectEqual(want[i * N + j - N0], g) else try std.testing.expectEqual(sentinel, g);
+        };
+    }
 }

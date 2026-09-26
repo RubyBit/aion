@@ -12,7 +12,6 @@ const StorageManager = aion.storage_manager.StorageManager;
 const TensorId = aion.storage_manager.TensorId;
 
 const graph_mod = aion.graph;
-const plan_mod = aion.plan;
 const program_mod = aion.program;
 
 const types = aion.types;
@@ -293,8 +292,6 @@ fn benchProgramConv1D(
 
     const l_out: usize = ((l_in + pad_left + pad_right - ((kernel - 1) * dilation + 1)) / stride) + 1;
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const ct = plan_mod.chooseConv1DTiles(policy, l_out, c_out);
 
     const x: []f32 = try allocator.alloc(f32, batch * l_in * c_in);
     defer allocator.free(x);
@@ -306,9 +303,9 @@ fn benchProgramConv1D(
     fillRandomF32(rnd, w);
     fillRandomF32(rnd, b);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, l_in, c_in }, &[_]usize{ 1, ct.tl, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
-    const w_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ kernel, c_in_g, c_out }, &[_]usize{ kernel, c_in_g, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{ct.tc}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ batch, l_in, c_in }, .{});
+    const w_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ kernel, c_in_g, c_out }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
@@ -325,7 +322,7 @@ fn benchProgramConv1D(
     const y = try g.addConv1DWithPadMode(x_in, w_in, b_in, stride, dilation, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -384,8 +381,6 @@ fn benchProgramConv2D(
     const h_out: usize = ((h_in + pad_top + pad_bottom - ((k_h - 1) * dilation_h + 1)) / stride_h) + 1;
     const w_out: usize = ((w_in + pad_left + pad_right - ((k_w - 1) * dilation_w + 1)) / stride_w) + 1;
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const ct = plan_mod.chooseConv2DTiles(policy, h_out, w_out, c_out);
 
     const x: []f32 = try allocator.alloc(f32, batch * h_in * w_in * c_in);
     defer allocator.free(x);
@@ -397,9 +392,9 @@ fn benchProgramConv2D(
     fillRandomF32(rnd, w);
     fillRandomF32(rnd, b);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, h_in, w_in, c_in }, &[_]usize{ 1, ct.th, ct.tw, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
-    const w_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c_out }, &[_]usize{ k_h, k_w, c_in_g, ct.tc }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{ct.tc}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ batch, h_in, w_in, c_in }, .{});
+    const w_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c_out }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
@@ -416,7 +411,7 @@ fn benchProgramConv2D(
     const y = try g.addConv2DWithPadMode(x_in, w_val, b_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, pad_mode, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -438,34 +433,22 @@ fn benchProgramConv2D(
     rep("conv2d {s}", .{label}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
-fn readF32AtTiled(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f32 {
+/// Element `[idx0, idx1]` of an f32 host tensor (`[idx0]` for rank 1).
+fn readF32At(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f32 {
     const t = try sm.getConst(id);
     if (t.dtype != .f32) return error.InvalidArgument;
-
-    const ti0: usize = idx0 / t.tile_shape[0];
-    const ti1: usize = if (t.rank == 1) 0 else (idx1 / t.tile_shape[1]);
-    const in0: usize = idx0 - ti0 * t.tile_shape[0];
-    const in1: usize = if (t.rank == 1) 0 else (idx1 - ti1 * t.tile_shape[1]);
-
-    const tile = try t.acquireTileConst(ti0, ti1);
-    const n_tile: usize = tile.shape_mem[1];
-    const off: usize = (in0 * n_tile + in1) * @sizeOf(f32);
-    return @as(*align(1) const f32, @ptrCast(tile.bytes[off..][0..4].ptr)).*;
+    const cols: usize = if (t.rank == 1) 1 else t.shape[1];
+    const off: usize = (idx0 * cols + idx1) * @sizeOf(f32);
+    return @as(*align(1) const f32, @ptrCast(t.data[off..][0..4].ptr)).*;
 }
 
-fn readF16AtTiled(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f16 {
+/// Element `[idx0, idx1]` of an f16 host tensor (`[idx0]` for rank 1).
+fn readF16At(sm: *const StorageManager, id: TensorId, idx0: usize, idx1: usize) !f16 {
     const t = try sm.getConst(id);
     if (t.dtype != .f16) return error.InvalidArgument;
-
-    const ti0: usize = idx0 / t.tile_shape[0];
-    const ti1: usize = if (t.rank == 1) 0 else (idx1 / t.tile_shape[1]);
-    const in0: usize = idx0 - ti0 * t.tile_shape[0];
-    const in1: usize = if (t.rank == 1) 0 else (idx1 - ti1 * t.tile_shape[1]);
-
-    const tile = try t.acquireTileConst(ti0, ti1);
-    const n_tile: usize = tile.shape_mem[1];
-    const off: usize = (in0 * n_tile + in1) * @sizeOf(f16);
-    return @as(*align(1) const f16, @ptrCast(tile.bytes[off..][0..2].ptr)).*;
+    const cols: usize = if (t.rank == 1) 1 else t.shape[1];
+    const off: usize = (idx0 * cols + idx1) * @sizeOf(f16);
+    return @as(*align(1) const f16, @ptrCast(t.data[off..][0..2].ptr)).*;
 }
 
 fn asF32Slice(buf: []u8) []align(1) f32 {
@@ -488,18 +471,10 @@ fn rep(comptime fmt: []const u8, args: anytype, iters: usize, ns: u64, bytes: f6
     bk.report(.{ .label = label, .iters = iters, .ns = ns, .bytes = bytes, .flops = flops, .chk = chk });
 }
 
-fn defaultTilePolicy() plan_mod.TilePolicy {
-    // Chosen to be representative for CPU cache-friendly tiling and quant block alignment.
-    // Increased base_square_2d to 256 to allow kernels to use L2 blocking effectively.
-    return .{ .base_square_2d = 256, .base_1d = 256, .quant_k_block = 32, .tile_alignment = 64 };
-}
-
 fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, n_elem: usize, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f32 = try allocator.alloc(f32, n_elem);
     defer allocator.free(a);
@@ -508,8 +483,8 @@ fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters:
     fillRandomF32(rnd, a);
     fillRandomF32(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n_elem}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -523,15 +498,15 @@ fn benchProgramElemwiseAdd(allocator: std.mem.Allocator, rnd: std.Random, iters:
     const out = try g.addElemwiseBinary(.add, a_in, b_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, n_elem / 2, 0) +
-        try readF32AtTiled(&sm, out_tid, n_elem - 1, 0);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, n_elem / 2, 0) +
+        try readF32At(&sm, out_tid, n_elem - 1, 0);
     rep("elemwise_add", .{}, iters, ns, @floatFromInt(3 * n_elem * @sizeOf(f32)), 0, chk);
 }
 
@@ -551,14 +526,12 @@ fn benchProgramUnary(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f32 = try allocator.alloc(f32, n_elem);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -569,15 +542,15 @@ fn benchProgramUnary(
     const out = try g.addUnary(op, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, n_elem / 2, 0) +
-        try readF32AtTiled(&sm, out_tid, n_elem - 1, 0);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, n_elem / 2, 0) +
+        try readF32At(&sm, out_tid, n_elem - 1, 0);
     // One input read + one output write.
     rep("unary_{s}", .{label}, iters, ns, @floatFromInt(2 * n_elem * @sizeOf(f32)), 0, chk);
 }
@@ -586,14 +559,12 @@ fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f32 = try allocator.alloc(f32, n_elem);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -604,13 +575,13 @@ fn benchProgramReduceSum(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addReduce(.sum, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const sum: f32 = try readF32AtTiled(&sm, out_tid, 0, 0);
+    const sum: f32 = try readF32At(&sm, out_tid, 0, 0);
     rep("reduce_sum", .{}, iters, ns, @floatFromInt(n_elem * @sizeOf(f32)), 0, sum);
 }
 
@@ -627,14 +598,12 @@ fn benchProgramReduceAxisF32(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t2: [2]usize = plan_mod.chooseTileShape2DSquare(policy, m, n);
 
     const a: []f32 = try allocator.alloc(f32, m * n);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ t2[0], t2[1] }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -645,7 +614,7 @@ fn benchProgramReduceAxisF32(
     const out = try g.addReduceAxis(.mean, a_in, axis);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -678,14 +647,12 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseSoftmaxTiles(policy, m, n);
 
     const x: []f32 = try allocator.alloc(f32, m * n);
     defer allocator.free(x);
     fillRandomF32(rnd, x);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
 
     var g = graph_mod.Graph.init(allocator);
@@ -696,15 +663,15 @@ fn benchProgramSoftmaxF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, m / 2, n / 2) +
+        try readF32At(&sm, out_tid, m - 1, n - 1);
     rep("softmax", .{}, iters, ns, @floatFromInt(2 * m * n * @sizeOf(f32)), 0, chk);
 }
 
@@ -712,8 +679,6 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseNormTiles(policy, m, n);
 
     const x: []f32 = try allocator.alloc(f32, m * n);
     defer allocator.free(x);
@@ -725,9 +690,9 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     fillRandomF32(rnd, gamma);
     fillRandomF32(rnd, beta);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
-    const g_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
+    const g_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
@@ -745,15 +710,15 @@ fn benchProgramLayerNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters
     const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, m / 2, n / 2) +
+        try readF32At(&sm, out_tid, m - 1, n - 1);
     // reads X twice (stats + apply), gamma/beta once, writes Y once.
     rep("layernorm", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f32)), 0, chk);
 }
@@ -762,8 +727,6 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseNormTiles(policy, m, n);
 
     const x: []f32 = try allocator.alloc(f32, m * n);
     defer allocator.free(x);
@@ -775,9 +738,9 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     fillRandomF32(rnd, gamma);
     fillRandomF32(rnd, beta);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
-    const g_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
+    const g_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
@@ -795,15 +758,15 @@ fn benchProgramRMSNormF32(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, m / 2, n / 2) +
+        try readF32At(&sm, out_tid, m - 1, n - 1);
     rep("rmsnorm", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f32)), 0, chk);
 }
 
@@ -833,11 +796,6 @@ fn benchProgramAttentionF32(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    // Explicit benchmark tiling. Attention lowering inherits operand tiling.
-    const q_tile: usize = @max(@as(usize, 1), @min(l_q, 32));
-    const kv_tile: usize = @max(@as(usize, 1), @min(t_cache, 128));
-
     const q: []f32 = try allocator.alloc(f32, batch * l_q * h_q * dk);
     defer allocator.free(q);
     const k_cache: []f32 = try allocator.alloc(f32, batch * h_kv * t_cache * dk);
@@ -863,35 +821,30 @@ fn benchProgramAttentionF32(
         }
     }
 
-    const q_tid: TensorId = try sm.createTiledTensor(
+    const q_tid: TensorId = try sm.createTensor(
         .f32,
         &[_]usize{ batch, l_q, h_q, dk },
-        &[_]usize{ 1, q_tile, 1, dk },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const k_tid: TensorId = try sm.createTiledTensor(
+    const k_tid: TensorId = try sm.createTensor(
         .f32,
         &[_]usize{ batch, t_cache, h_kv, dk },
-        &[_]usize{ 1, kv_tile, 1, dk },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const v_tid: TensorId = try sm.createTiledTensor(
+    const v_tid: TensorId = try sm.createTensor(
         .f32,
         &[_]usize{ batch, t_cache, h_kv, dv },
-        &[_]usize{ 1, kv_tile, 1, dv },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const pos_tid: TensorId = try sm.createTiledTensor(
+    const pos_tid: TensorId = try sm.createTensor(
         .i32,
         &[_]usize{ batch, l_q },
-        &[_]usize{ 1, q_tile },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const end_tid: TensorId = try sm.createTiledTensor(
+    const end_tid: TensorId = try sm.createTensor(
         .i32,
         &[_]usize{batch},
-        &[_]usize{batch},
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
 
     try sm.writeFromPackedScalar(q_tid, std.mem.sliceAsBytes(q));
@@ -925,7 +878,7 @@ fn benchProgramAttentionF32(
     const y = try g.addAttention(q_in, k_in, v_in, p_in, e_in, scale, window, attn_logits_soft_cap);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -977,7 +930,6 @@ fn benchProgramSTFTF32(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
 
     const sig: []f32 = try allocator.alloc(f32, batch * samples);
     defer allocator.free(sig);
@@ -987,10 +939,9 @@ fn benchProgramSTFTF32(
     defer allocator.free(win);
     for (0..n_fft) |i| win[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft)));
 
-    // Single-tile inputs keep setup simple; the op reads via scalar tile access.
-    const sig_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, samples }, &[_]usize{ batch, samples }, .{ .tile_alignment = policy.tile_alignment });
+    const sig_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ batch, samples }, .{});
     try sm.writeFromPackedScalar(sig_tid, std.mem.sliceAsBytes(sig));
-    const win_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{n_fft}, &[_]usize{n_fft}, .{ .tile_alignment = policy.tile_alignment });
+    const win_tid: TensorId = try sm.createTensor(.f32, &[_]usize{n_fft}, .{});
     try sm.writeFromPackedScalar(win_tid, std.mem.sliceAsBytes(win));
 
     var g = graph_mod.Graph.init(allocator);
@@ -1003,7 +954,7 @@ fn benchProgramSTFTF32(
     const y = try g.addSTFT(sig_in, win_in, n_fft, hop, true);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1038,8 +989,6 @@ fn benchProgramRoPE1DF32(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t_l: [1]usize = plan_mod.chooseTileShape1D(policy, seq_len);
 
     const x_elems: usize = batch * seq_len * heads * head_dim;
     const p_elems: usize = batch * seq_len;
@@ -1057,17 +1006,15 @@ fn benchProgramRoPE1DF32(
         }
     }
 
-    const x_tid: TensorId = try sm.createTiledTensor(
+    const x_tid: TensorId = try sm.createTensor(
         .f32,
         &[_]usize{ batch, seq_len, heads, head_dim },
-        &[_]usize{ 1, t_l[0], 1, head_dim },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const p_tid: TensorId = try sm.createTiledTensor(
+    const p_tid: TensorId = try sm.createTensor(
         .i32,
         &[_]usize{ batch, seq_len },
-        &[_]usize{ 1, t_l[0] },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
 
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
@@ -1084,7 +1031,7 @@ fn benchProgramRoPE1DF32(
     const y = try g.addRoPE1D(x_in, p_in, 10000.0, 1.0, 1.0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1109,8 +1056,6 @@ fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, ite
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f16 = try allocator.alloc(f16, n_elem);
     defer allocator.free(a);
@@ -1119,8 +1064,8 @@ fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, ite
     fillRandomF16(rnd, a);
     fillRandomF16(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n_elem}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -1134,15 +1079,15 @@ fn benchProgramElemwiseAddF16(allocator: std.mem.Allocator, rnd: std.Random, ite
     const out = try g.addElemwiseBinary(.add, a_in, b_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem / 2, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem - 1, 0)));
+    const chk: f32 = @as(f32, @floatCast(try readF16At(&sm, out_tid, 0, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, n_elem / 2, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, n_elem - 1, 0)));
     rep("elemwise_add_f16", .{}, iters, ns, @floatFromInt(3 * n_elem * @sizeOf(f16)), 0, chk);
 }
 
@@ -1158,14 +1103,12 @@ fn benchProgramUnaryF16(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f16 = try allocator.alloc(f16, n_elem);
     defer allocator.free(a);
     fillRandomF16(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -1176,15 +1119,15 @@ fn benchProgramUnaryF16(
     const out = try g.addUnary(op, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem / 2, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, n_elem - 1, 0)));
+    const chk: f32 = @as(f32, @floatCast(try readF16At(&sm, out_tid, 0, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, n_elem / 2, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, n_elem - 1, 0)));
     rep("unary_{s}_f16", .{label}, iters, ns, @floatFromInt(2 * n_elem * @sizeOf(f16)), 0, chk);
 }
 
@@ -1192,14 +1135,12 @@ fn benchProgramReduceSumF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t1: [1]usize = plan_mod.chooseTileShape1D(policy, n_elem);
 
     const a: []f16 = try allocator.alloc(f16, n_elem);
     defer allocator.free(a);
     fillRandomF16(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n_elem}, &[_]usize{t1[0]}, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n_elem}, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -1210,13 +1151,13 @@ fn benchProgramReduceSumF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     const out = try g.addReduce(.sum, a_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const sum: f32 = @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0));
+    const sum: f32 = @floatCast(try readF16At(&sm, out_tid, 0, 0));
     rep("reduce_sum_f16", .{}, iters, ns, @floatFromInt(n_elem * @sizeOf(f16)), 0, sum);
 }
 
@@ -1233,14 +1174,12 @@ fn benchProgramReduceAxisF16(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t2: [2]usize = plan_mod.chooseTileShape2DSquare(policy, m, n);
 
     const a: []f16 = try allocator.alloc(f16, m * n);
     defer allocator.free(a);
     fillRandomF16(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ m, n }, &[_]usize{ t2[0], t2[1] }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     var g = graph_mod.Graph.init(allocator);
@@ -1251,7 +1190,7 @@ fn benchProgramReduceAxisF16(
     const out = try g.addReduceAxis(.mean, a_in, axis);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1281,8 +1220,6 @@ fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseNormTiles(policy, m, n);
 
     const x: []f16 = try allocator.alloc(f16, m * n);
     defer allocator.free(x);
@@ -1294,9 +1231,9 @@ fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     fillRandomF16(rnd, gamma);
     fillRandomF16(rnd, beta);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
-    const g_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ m, n }, .{});
+    const g_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
@@ -1314,15 +1251,15 @@ fn benchProgramLayerNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters
     const y = try g.addLayerNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
+    const chk: f32 = @as(f32, @floatCast(try readF16At(&sm, out_tid, 0, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m / 2, n / 2))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m - 1, n - 1)));
     rep("layernorm_f16", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f16)), 0, chk);
 }
 
@@ -1330,8 +1267,6 @@ fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const st = plan_mod.chooseNormTiles(policy, m, n);
 
     const x: []f16 = try allocator.alloc(f16, m * n);
     defer allocator.free(x);
@@ -1343,9 +1278,9 @@ fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     fillRandomF16(rnd, gamma);
     fillRandomF16(rnd, beta);
 
-    const x_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ m, n }, &[_]usize{ st.tm, st.tn }, .{ .tile_alignment = policy.tile_alignment });
-    const g_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{st.tn}, .{ .tile_alignment = policy.tile_alignment });
+    const x_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ m, n }, .{});
+    const g_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n}, .{});
+    const b_tid: TensorId = try sm.createTensor(.f16, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
     try sm.writeFromPackedScalar(g_tid, std.mem.sliceAsBytes(gamma));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(beta));
@@ -1363,15 +1298,15 @@ fn benchProgramRMSNormF16(allocator: std.mem.Allocator, rnd: std.Random, iters: 
     const y = try g.addRMSNorm(x_in, gamma_in, beta_in, 1e-5, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
+    const chk: f32 = @as(f32, @floatCast(try readF16At(&sm, out_tid, 0, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m / 2, n / 2))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m - 1, n - 1)));
     rep("rmsnorm_f16", .{}, iters, ns, @floatFromInt(5 * m * n * @sizeOf(f16)), 0, chk);
 }
 
@@ -1390,8 +1325,6 @@ fn benchProgramRoPE1DF16(
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const t_l: [1]usize = plan_mod.chooseTileShape1D(policy, seq_len);
 
     const x_elems: usize = batch * seq_len * heads * head_dim;
     const p_elems: usize = batch * seq_len;
@@ -1409,17 +1342,15 @@ fn benchProgramRoPE1DF16(
         }
     }
 
-    const x_tid: TensorId = try sm.createTiledTensor(
+    const x_tid: TensorId = try sm.createTensor(
         .f16,
         &[_]usize{ batch, seq_len, heads, head_dim },
-        &[_]usize{ 1, t_l[0], 1, head_dim },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
-    const p_tid: TensorId = try sm.createTiledTensor(
+    const p_tid: TensorId = try sm.createTensor(
         .i32,
         &[_]usize{ batch, seq_len },
-        &[_]usize{ 1, t_l[0] },
-        .{ .tile_alignment = policy.tile_alignment },
+        .{},
     );
 
     try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x));
@@ -1436,7 +1367,7 @@ fn benchProgramRoPE1DF16(
     const y = try g.addRoPE1D(x_in, p_in, 10000.0, 1.0, 1.0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1460,8 +1391,6 @@ fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f16);
 
     const a: []f16 = try allocator.alloc(f16, m * k);
     defer allocator.free(a);
@@ -1470,8 +1399,8 @@ fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     fillRandomF16(rnd, a);
     fillRandomF16(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ m, k }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ k, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -1485,16 +1414,16 @@ fn benchProgramMatmulF16(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, 0, 0))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m / 2, n / 2))) +
-        @as(f32, @floatCast(try readF16AtTiled(&sm, out_tid, m - 1, n - 1)));
+    const chk: f32 = @as(f32, @floatCast(try readF16At(&sm, out_tid, 0, 0))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m / 2, n / 2))) +
+        @as(f32, @floatCast(try readF16At(&sm, out_tid, m - 1, n - 1)));
     rep("matmul_f16", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
@@ -1502,8 +1431,6 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f16);
 
     const a: []f16 = try allocator.alloc(f16, batch * m * k);
     defer allocator.free(a);
@@ -1512,8 +1439,8 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     fillRandomF16(rnd, a);
     fillRandomF16(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ batch, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f16, &[_]usize{ batch, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ batch, m, k }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f16, &[_]usize{ batch, k, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -1527,7 +1454,7 @@ fn benchProgramMatmulBatchedF16(allocator: std.mem.Allocator, rnd: std.Random, i
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1553,8 +1480,6 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
     const a: []f32 = try allocator.alloc(f32, m * k);
     defer allocator.free(a);
@@ -1563,8 +1488,8 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     fillRandomF32(rnd, a);
     fillRandomF32(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, k }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ k, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -1578,16 +1503,16 @@ fn benchProgramMatmulF32(allocator: std.mem.Allocator, rnd: std.Random, iters: u
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, m / 2, n / 2) +
+        try readF32At(&sm, out_tid, m - 1, n - 1);
     rep("matmul_f32", .{}, iters, ns, 0, @floatFromInt(flops_per), chk);
 }
 
@@ -1595,8 +1520,6 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
     const a: []f32 = try allocator.alloc(f32, batch * m * k);
     defer allocator.free(a);
@@ -1605,8 +1528,8 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     fillRandomF32(rnd, a);
     fillRandomF32(rnd, b);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
-    const b_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ batch, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{});
+    const b_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
     try sm.writeFromPackedScalar(b_tid, std.mem.sliceAsBytes(b));
 
@@ -1620,7 +1543,7 @@ fn benchProgramMatmulBatchedF32(allocator: std.mem.Allocator, rnd: std.Random, i
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1646,15 +1569,11 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const quant_m_hint = plan_mod.matMulMHint(policy);
-    const tiles = plan_mod.chooseMatMulTiles(policy, quant_m_hint, n, k, b_dtype);
-
     const a: []f32 = try allocator.alloc(f32, m * k);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ m, k }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     const b_bytes: []u8 = switch (b_dtype) {
@@ -1664,7 +1583,7 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     };
     defer allocator.free(b_bytes);
 
-    const b_tid: TensorId = try sm.createTiledTensor(b_dtype, &[_]usize{ k, n }, &[_]usize{ tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment });
+    const b_tid: TensorId = try sm.createTensor(b_dtype, &[_]usize{ k, n }, .{});
     try sm.writeFromPackedQuant(b_tid, b_bytes);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1677,16 +1596,16 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
     const flops_per: u64 = 2 * @as(u64, @intCast(m)) * @as(u64, @intCast(n)) * @as(u64, @intCast(k));
     const out_tid: TensorId = prog.outputs[0];
-    const chk: f32 = try readF32AtTiled(&sm, out_tid, 0, 0) +
-        try readF32AtTiled(&sm, out_tid, m / 2, n / 2) +
-        try readF32AtTiled(&sm, out_tid, m - 1, n - 1);
+    const chk: f32 = try readF32At(&sm, out_tid, 0, 0) +
+        try readF32At(&sm, out_tid, m / 2, n / 2) +
+        try readF32At(&sm, out_tid, m - 1, n - 1);
 
     const name: []const u8 = if (b_dtype == .q8_0) "q8_0" else "q4_0";
     rep("matmul_{s}", .{name}, iters, ns, 0, @floatFromInt(flops_per), chk);
@@ -1700,7 +1619,7 @@ fn benchProgramMatmulQuant(allocator: std.mem.Allocator, rnd: std.Random, iters:
 // the two weight layouts the runtime can use:
 //   * MatMul   : B stored `[1, K, N]` (block-major over K) — the projection path.
 //   * MatMulNT : B stored `[N, K]`    (per-output-row contiguous K) — the tied-logits
-//                path. `tn` is B's N-axis tile = how finely N parallelizes.
+//                path.
 // Reported as GiB/s of q8_0 weight bytes streamed (the decode-relevant metric).
 // ---------------------------------------------------------------------------
 
@@ -1735,23 +1654,16 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Production-faithful policy (the model loads with `TilePolicy{}` defaults, i.e.
-    // base_square_2d=64) so this reproduces the model's actual decode tiling — NOT
-    // the bench-wide defaultTilePolicy() which bumps base_square_2d to 256.
-    const policy: plan_mod.TilePolicy = .{};
-    const m_hint = plan_mod.matMulMHint(policy);
-    const tiles = plan_mod.chooseMatMulTiles(policy, m_hint, n, k, .q8_0);
-
     const a: []f32 = try allocator.alloc(f32, k);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 1, k }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     const b_bytes: []u8 = try buildQuantB_Q8_0(allocator, rnd, k, n);
     defer allocator.free(b_bytes);
-    const b_tid: TensorId = try sm.createTiledTensor(.q8_0, &[_]usize{ 1, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = policy.tile_alignment, .quant_axis = 1 });
+    const b_tid: TensorId = try sm.createTensor(.q8_0, &[_]usize{ 1, k, n }, .{ .quant_axis = 1 });
     try sm.writeFromPackedQuant(b_tid, b_bytes);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1763,7 +1675,7 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     const out = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1777,24 +1689,21 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
     rep("dec_{s}", .{label}, iters, ns, @floatFromInt((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES), 0, chk);
 }
 
-fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, tn: usize, label: []const u8, be: Backend) !void {
+fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, label: []const u8, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
-
-    const policy: plan_mod.TilePolicy = defaultTilePolicy();
-    const tn_eff: usize = @max(@as(usize, 1), @min(tn, n));
 
     const a: []f32 = try allocator.alloc(f32, k);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, k }, &[_]usize{ 1, 1, k }, .{ .tile_alignment = policy.tile_alignment });
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 1, k }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     const b_bytes: []u8 = try buildQuantB_Q8_0_NT(allocator, rnd, n, k);
     defer allocator.free(b_bytes);
-    // NT B `[N, K]`, quant_axis=1, tile_shape[1] == K (full-K per row).
-    const b_tid: TensorId = try sm.createTiledTensor(.q8_0, &[_]usize{ n, k }, &[_]usize{ tn_eff, k }, .{ .tile_alignment = policy.tile_alignment, .quant_axis = 1 });
+    // NT B `[N, K]`, quant_axis=1.
+    const b_tid: TensorId = try sm.createTensor(.q8_0, &[_]usize{ n, k }, .{ .quant_axis = 1 });
     try sm.writeFromPackedQuant(b_tid, b_bytes);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1806,7 +1715,7 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
     const out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
@@ -1833,19 +1742,18 @@ fn runDecodeSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOpti
         .{ .label = "qkv_FUSED_local", .k = 1536, .n = 2560 }, // q2048+k256+v256 (1 op vs 3)
         .{ .label = "qkv_FUSED_global", .k = 1536, .n = 5120 }, // q4096+k512+v512
     };
-    const tn_sweep = [_]usize{ 64, 256, 1024 };
 
     for (shapes) |s| {
         if (opts.op_filter) |filter| {
             if (!std.mem.eql(u8, filter, s.label)) continue;
         }
         try benchDecodeMatMul(allocator, rnd, opts.iters, s.k, s.n, s.label, be);
-        for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, s.k, s.n, tn, s.label, be);
+        try benchDecodeMatMulNT(allocator, rnd, opts.iters, s.k, s.n, s.label, be);
         std.debug.print("\n", .{});
     }
     // Tied-logits projection: NT only (the real model path), huge N.
     if (opts.op_filter == null or std.mem.eql(u8, opts.op_filter.?, "logits_tied")) {
-        for (tn_sweep) |tn| try benchDecodeMatMulNT(allocator, rnd, opts.iters, 1536, 262144, tn, "logits_tied", be);
+        try benchDecodeMatMulNT(allocator, rnd, opts.iters, 1536, 262144, "logits_tied", be);
     }
 }
 
@@ -2057,12 +1965,12 @@ fn buildQuantB_Q4_0(allocator: std.mem.Allocator, rnd: std.Random, k: usize, n: 
 
 /// One row of the shared kernels sweep on the CPU backend — same op list, shapes,
 /// and report format as `gpu-bench --suite kernels`, so the two are directly
-/// comparable. Ops the CPU executors reject (tile caps) surface as a failed row.
+/// comparable. Ops the CPU executors reject surface as a failed row.
 fn benchKernelCpu(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend, op: bk.KOp) !void {
     const info = bk.kInfo(op);
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
-    var built = try bk.buildK(allocator, &sm, op, defaultTilePolicy());
+    var built = try bk.buildK(allocator, &sm, op, .cpu());
     defer built.prog.deinit();
     const ns = try bk.timeBackend(be, &built.prog, sm.tensorStore(), opts.iters);
 
@@ -2094,9 +2002,8 @@ fn runTokenSuite(allocator: std.mem.Allocator, opts: BenchOptions, be: Backend) 
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cpu_policy = plan_mod.tilePolicyForTarget(.cpu);
     const build_start = nowNs();
-    var built = try bm.gemma4E2BDecode(allocator, &sm, cpu_policy, opts.model, .{ .kind = .cpu, .index = 0 }, null);
+    var built = try bm.gemma4E2BDecode(allocator, &sm, opts.model, .cpu(), null);
     defer built.prog.deinit();
     const build_ms = @as(f64, @floatFromInt(nowNs() - build_start)) / 1.0e6;
 

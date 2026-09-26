@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// ArgMax over the last axis. v1: the input is a single tile (whole tensor) and the
-// output is a single tile of i32 indices. Sufficient for RNNT decode (argmax over
+// ArgMax over the last axis, into a tensor of i32 indices. Sufficient for RNNT decode (argmax over
 // the small joint-logits vocab axis). Output[o] = index in [0, N) of the max of
 // input[o, :] for each of the `outer = prod(shape[:-1])` rows.
 const std = @import("std");
@@ -27,32 +26,21 @@ pub fn execArgMax(
     if (out_meta.dtype != .i32) return BackendError.InvalidArgument;
 
     const in_rank: usize = @as(usize, in_meta.rank);
-    // v1: reduce the last axis only, single tile on input and output.
+    // v1: reduce the last axis only.
     if (s.axis != in_rank - 1) return BackendError.InvalidArgument;
-    var d: usize = 0;
-    while (d < in_rank) : (d += 1) {
-        if (in_meta.tile_counts[d] != 1) return BackendError.InvalidArgument;
-    }
-    d = 0;
-    while (d < @as(usize, out_meta.rank)) : (d += 1) {
-        if (out_meta.tile_counts[d] != 1) return BackendError.InvalidArgument;
-    }
 
     const n: usize = in_meta.shape[in_rank - 1];
     if (n == 0) return BackendError.InvalidArgument;
     var outer: usize = 1;
-    if (in_rank > 1) {
-        d = 0;
-        while (d < in_rank - 1) : (d += 1) outer = std.math.mul(usize, outer, in_meta.shape[d]) catch return BackendError.InvalidArgument;
-    }
+    for (in_meta.shape[0 .. in_rank - 1]) |dim| outer = std.math.mul(usize, outer, dim) catch return BackendError.InvalidArgument;
 
-    const in_tile = try store.acquireTileConstLinear(s.a, 0);
-    defer store.releaseConst(in_tile.token);
-    const out_tile = try store.acquireTileMutLinear(s.out, 0);
-    defer store.releaseMut(out_tile.token);
+    const in_view = try store.acquireConst(s.a);
+    defer store.releaseConst(in_view.token);
+    const out_view = try store.acquireMut(s.out);
+    defer store.releaseMut(out_view.token);
 
-    const in_bytes = in_tile.bufferView().bytes;
-    const out_bytes = out_tile.bufferView().bytes;
+    const in_bytes = in_view.bufferView().bytes;
+    const out_bytes = out_view.bufferView().bytes;
     if (out_bytes.len < outer * 4) return BackendError.InvalidArgument;
     const out_buf: []align(1) i32 = simd.bytesAsSliceMutUnaligned(i32, out_bytes);
 

@@ -16,15 +16,14 @@ const cpu_target = @import("cpu_target.zig");
 /// NT-specific blocking/prefetch tuning without coupling this registry to packed GEMM.
 pub const Tuning = matmul_nt.Tuning;
 
-/// One N-tile of `C = alpha * A @ B^T + beta * C`, with A `[m, k]` f32 and B `[n, k]`
-/// f32 (row-major over K, i.e. already transposed w.r.t. a standard matmul). No pack
-/// step: B's rows are already in the access order the kernel wants.
+/// One column block of `C = alpha * A @ B^T + beta * C`, with A `[m, k]` f32 and B
+/// `[n, k]` f32 (row-major over K, i.e. already transposed w.r.t. a standard matmul).
+/// No pack step: B's rows are already in the access order the kernel wants.
 ///
-/// The slices are the tile, not the whole matrix — the caller (`exec/matmul_nt.zig`)
-/// splits N into tiles and hands each worker `b_bytes`/`c_bytes` for its own tile, so
-/// `params.n` is that tile's column count and there is no tile offset in the ABI.
-/// `params.ldc` is C's row stride (defaulting to `params.n`); every current caller
-/// passes a contiguous `[m, n]` tile.
+/// The slices are the block, not the whole matrix — the caller (`exec/matmul_nt.zig`)
+/// splits N into column chunks and hands each worker `b_bytes`/`c_bytes` for its own,
+/// so `params.n` is that chunk's column count and there is no column offset in the
+/// ABI. `params.ldc` is C's row stride (defaulting to `params.n`).
 pub const MatMulNtF32Fn = *const fn (
     params: types.MatMulParams,
     c_bytes: []u8,

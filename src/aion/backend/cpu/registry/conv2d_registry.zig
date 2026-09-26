@@ -4,7 +4,7 @@ const cpuid = @import("../tuning/cpuid.zig");
 const conv2d_k = @import("../kernels/conv2d.zig");
 const cpu_target = @import("cpu_target.zig");
 
-/// Depthwise Conv2D direct-kernel tuning parameters.
+/// Depthwise convolution direct-kernel tuning parameters (Conv1D and Conv2D).
 ///
 /// We reuse the kernel module's tuning type so registry candidates can directly
 /// refer to `conv2d_k.Kernel(tuning)` instantiations.
@@ -34,9 +34,9 @@ fn kernelsFor(comptime t: Tuning) Kernels {
 }
 
 pub const candidates = [_]Candidate{
-    .{ .id = .simd128, .kernels = kernelsFor(.{ .unroll_3x3 = false, .lanes = 4 }) },
-    .{ .id = .simd256, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 8 }) },
-    .{ .id = .simd512, .kernels = kernelsFor(.{ .unroll_3x3 = true, .lanes = 16 }) },
+    .{ .id = .simd128, .kernels = kernelsFor(.{ .lanes = 4 }) },
+    .{ .id = .simd256, .kernels = kernelsFor(.{ .lanes = 8 }) },
+    .{ .id = .simd512, .kernels = kernelsFor(.{ .lanes = 16 }) },
 };
 
 fn candidateForId(id: VariantId) Candidate {

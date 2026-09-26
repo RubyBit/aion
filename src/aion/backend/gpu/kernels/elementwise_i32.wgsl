@@ -3,7 +3,7 @@
 // Elementwise binary ops over i32 storage buffers: integer arithmetic plus the
 // comparisons (which produce i32 {0,1} — the If/Loop predicate dtype). Same
 // dispatch contract as elementwise.wgsl: one entry point per op, one dispatch
-// per tile, element count from the uniform, grid-stride loop.
+// per tensor, element count from the uniform, grid-stride loop.
 //
 // Semantics mirror the CPU's elemwiseBinaryI32: div-by-zero yields 0 and
 // division truncates toward zero (WGSL `/` on i32 already truncates).

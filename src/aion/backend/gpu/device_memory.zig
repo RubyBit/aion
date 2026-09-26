@@ -26,15 +26,15 @@ const PARALLEL_MEMCPY_MIN_BYTES: usize = 8 * 1024 * 1024;
 /// Flush the queue after this many H2D bytes. Every `wgpuQueueWriteBuffer`
 /// parks its payload in a fresh staging buffer that is only recycled once a
 /// submit completes — with no submit during a bulk upload (model weights are
-/// ~one writeBuffer per tile), wgpu holds staging for EVERY byte uploaded, so
+/// ~one writeBuffer per buffer), wgpu holds staging for EVERY byte uploaded, so
 /// peak memory is ~2x the model and the allocator keeps ~10% of it committed
 /// afterwards (measured: +66 MiB resident on a 635 MiB model). An empty submit
 /// + wait every 32 MiB bounds staging to this threshold; the poll cost is noise
 /// next to the copies themselves.
 const H2D_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 
-/// WebGPU copy sizes/offsets and storage bindings are whole u32 words, so a tile
-/// with an odd byte length (odd-element f16) is backed rounded up — every tile is
+/// WebGPU copy sizes/offsets and storage bindings are whole u32 words, so a buffer
+/// with an odd byte length (odd-element f16) is backed rounded up — every buffer is
 /// its own buffer, so the padding belongs to no one else.
 const COPY_ALIGN: usize = 4;
 
@@ -151,7 +151,7 @@ pub const WgpuDeviceMemory = struct {
         return self.buffers.items[slot];
     }
 
-    /// Resolve an opaque `DeviceHandle` (from a `TileRefDevice`) to its concrete
+    /// Resolve an opaque `DeviceHandle` (from a `device_store.Chunk`) to its concrete
     /// `WGPUBuffer` so the backend can bind it in a compute pass. The backend
     /// owns this `WgpuDeviceMemory`, so it may reach past the abstract interface.
     pub fn bufferFor(self: *Self, handle: DeviceHandle) ?c.WGPUBuffer {
@@ -165,7 +165,7 @@ pub const WgpuDeviceMemory = struct {
     fn alloc(ctx: *anyopaque, bytes: usize, alignment: usize) DeviceError!DeviceHandle {
         _ = alignment; // WebGPU handles buffer alignment internally.
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // Resident tiles are uploaded to, copied from, and bound as storage.
+        // Resident buffers are uploaded to, copied from, and bound as storage.
         const usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc | c.WGPUBufferUsage_CopyDst;
         const buf = wgpu.createBuffer(self.gpu.device, @intCast(alignUp(bytes)), usage) catch return DeviceError.OutOfDeviceMemory;
         self.buffers.append(self.allocator, buf) catch {
@@ -192,7 +192,7 @@ pub const WgpuDeviceMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const buf = self.bufFor(handle) orelse return DeviceError.InvalidArgument;
         if (dst_offset % COPY_ALIGN != 0) return DeviceError.InvalidArgument;
-        // wgpu stages each write whole, so a tile goes in pieces: one large weight
+        // wgpu stages each write whole, so a buffer goes in pieces: one large weight
         // must not hold a staging copy of itself beside its host and device ones.
         const head = src.len / COPY_ALIGN * COPY_ALIGN;
         var at: usize = 0;
@@ -305,7 +305,7 @@ pub const WgpuDeviceMemory = struct {
 
     fn maxBindingBytes(ctx: *anyopaque) u64 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // The state slot is a single storage-bound tile, so the binding-size
+        // The state slot is a single storage-bound buffer, so the binding-size
         // limit is what gates whether it can be device-resident at all.
         return self.gpu.limits.max_storage_binding_bytes;
     }

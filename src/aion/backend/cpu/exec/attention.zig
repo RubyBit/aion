@@ -6,6 +6,7 @@ const types = @import("../../types.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
+const exec_utils = @import("utils.zig");
 
 const attention_registry = @import("../registry/attention_registry.zig");
 const attn_kernels = @import("../kernels/attention.zig");
@@ -24,100 +25,52 @@ const Vec = @Vector(simd_lanes, f32);
 /// growth before dispatch, so metadata is stable), `ring` is a modulo.
 ///
 /// There used to be a third mode that called `store.mapSequenceStep` per key; it was
-/// unreachable — `execAttentionTiled` only ever derives identity or rolling — and it sat
+/// unreachable — `execAttention` only ever derives identity or rolling — and it sat
 /// in the innermost key loop of both score paths.
 const TimeMapMode = enum {
     identity,
     rolling,
 };
 
-const ConstTileCache = struct {
+/// A tensor's bytes, acquired on first use and held until released.
+const ConstViewCache = struct {
     valid: bool = false,
-    tile_index: usize = 0,
-    tile: tensor_store.TileRefConst = undefined,
-    /// The last row address resolved through this cache (see `rowBytesRank4Const`).
-    span: RowSpan = .{},
+    view: tensor_store.ViewConst = undefined,
 };
 
-/// A run of `idx1` whose rows are a fixed stride apart in one tile.
-///
-/// Attention's inner loop asks for one KV row per key, and resolving each from
-/// scratch — three divisions, a tile index, a cache probe, four stride checks —
-/// cost several times the dot product it feeds. Consecutive keys almost always
-/// land in the same tile at the same `(idx0, idx2)`, where the next row is one
-/// stride on, so this remembers the run and the walk becomes a multiply and add.
-const RowSpan = struct {
+const MutViewCache = struct {
     valid: bool = false,
-    idx0: usize = 0,
-    idx2: usize = 0,
-    lo: usize = 0,
-    hi: usize = 0,
-    base: usize = 0,
-    stride: usize = 0,
-    row_bytes: usize = 0,
-    /// The tile's bytes, held so a hit does not rebuild the buffer view. Safe for
-    /// exactly as long as the span is: both die when the cached tile changes.
-    bytes: []const u8 = &[_]u8{},
-
-    fn covers(self: RowSpan, idx0: usize, idx1: usize, idx2: usize) bool {
-        return self.valid and self.idx0 == idx0 and self.idx2 == idx2 and idx1 >= self.lo and idx1 < self.hi;
-    }
+    view: tensor_store.ViewMut = undefined,
 };
 
-const MutTileCache = struct {
-    valid: bool = false,
-    tile_index: usize = 0,
-    tile: tensor_store.TileRefMut = undefined,
-};
-
-fn releaseConstCache(store: tensor_store.TensorStore, cache: *ConstTileCache) void {
+fn releaseConstCache(store: tensor_store.TensorStore, cache: *ConstViewCache) void {
     if (cache.valid) {
-        store.releaseConst(cache.tile.token);
-        cache.valid = false;
-        cache.span.valid = false;
-    }
-}
-
-fn releaseMutCache(store: tensor_store.TensorStore, cache: *MutTileCache) void {
-    if (cache.valid) {
-        store.releaseMut(cache.tile.token);
+        store.releaseConst(cache.view.token);
         cache.valid = false;
     }
 }
 
-fn acquireConstTileCached(
-    store: tensor_store.TensorStore,
-    id: executable.TensorId,
-    tile_index: usize,
-    cache: *ConstTileCache,
-) ExecuteProgramError!tensor_store.TileRefConst {
-    if (!cache.valid or cache.tile_index != tile_index) {
-        if (cache.valid) store.releaseConst(cache.tile.token);
-        cache.tile = try store.acquireTileConstLinear(id, tile_index);
-        cache.tile_index = tile_index;
-        cache.valid = true;
-        cache.span.valid = false;
+fn releaseMutCache(store: tensor_store.TensorStore, cache: *MutViewCache) void {
+    if (cache.valid) {
+        store.releaseMut(cache.view.token);
+        cache.valid = false;
     }
-    return cache.tile;
 }
 
-fn acquireMutTileCached(
-    store: tensor_store.TensorStore,
-    id: executable.TensorId,
-    tile_index: usize,
-    cache: *MutTileCache,
-) ExecuteProgramError!tensor_store.TileRefMut {
-    if (!cache.valid or cache.tile_index != tile_index) {
-        if (cache.valid) store.releaseMut(cache.tile.token);
-        cache.tile = try store.acquireTileMutLinear(id, tile_index);
-        cache.tile_index = tile_index;
+fn acquireConstViewCached(store: tensor_store.TensorStore, id: executable.TensorId, cache: *ConstViewCache) ExecuteProgramError![]const u8 {
+    if (!cache.valid) {
+        cache.view = try store.acquireConst(id);
         cache.valid = true;
     }
-    return cache.tile;
+    return cache.view.bytes;
 }
 
-fn asPositiveStride(v: isize) ExecuteProgramError!usize {
-    return std.math.cast(usize, v) orelse BackendError.InvalidArgument;
+fn acquireMutViewCached(store: tensor_store.TensorStore, id: executable.TensorId, cache: *MutViewCache) ExecuteProgramError![]u8 {
+    if (!cache.valid) {
+        cache.view = try store.acquireMut(id);
+        cache.valid = true;
+    }
+    return cache.view.bytes;
 }
 
 fn readI32Rank1(
@@ -125,26 +78,12 @@ fn readI32Rank1(
     id: executable.TensorId,
     meta: tensor_store.TensorMeta,
     idx0: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError!i32 {
     if (meta.rank != 1 or meta.dtype != .i32) return BackendError.InvalidArgument;
     if (idx0 >= meta.shape[0]) return BackendError.InvalidArgument;
-
-    const coords: [1]usize = .{idx0 / meta.tile_shape[0]};
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 1) return BackendError.InvalidArgument;
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-
-    const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
-    const off: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const end: usize = std.math.add(usize, off, @sizeOf(i32)) catch return BackendError.InvalidArgument;
-    if (end > view.bytes.len) return BackendError.InvalidArgument;
-
-    const ptr: *align(1) const i32 = @ptrCast(view.bytes.ptr + off);
-    return ptr.*;
+    const bytes = try acquireConstViewCached(store, id, cache);
+    return std.mem.bytesAsSlice(i32, bytes)[idx0];
 }
 
 fn readI32Rank2(
@@ -153,37 +92,20 @@ fn readI32Rank2(
     meta: tensor_store.TensorMeta,
     idx0: usize,
     idx1: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError!i32 {
     if (meta.rank != 2 or meta.dtype != .i32) return BackendError.InvalidArgument;
     if (idx0 >= meta.shape[0] or idx1 >= meta.shape[1]) return BackendError.InvalidArgument;
-
-    const coords: [2]usize = .{ idx0 / meta.tile_shape[0], idx1 / meta.tile_shape[1] };
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 2) return BackendError.InvalidArgument;
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-    const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
-
-    const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
-    const l1: usize = idx1 - coords[1] * meta.tile_shape[1];
-
-    const off0: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
-    const off: usize = std.math.add(usize, off0, off1) catch return BackendError.InvalidArgument;
-    const end: usize = std.math.add(usize, off, @sizeOf(i32)) catch return BackendError.InvalidArgument;
-    if (end > view.bytes.len) return BackendError.InvalidArgument;
-
-    const ptr: *align(1) const i32 = @ptrCast(view.bytes.ptr + off);
-    return ptr.*;
+    const bytes = try acquireConstViewCached(store, id, cache);
+    return std.mem.bytesAsSlice(i32, bytes)[idx0 * meta.shape[1] + idx1];
 }
 
-/// One row of a rank-4 `[d0, d1, d2, d3]` tensor as bytes, walking `idx1` cheaply.
-///
-/// The full resolve runs only when `cache`'s remembered span does not already
-/// cover this row; inside a span the row is `base + (idx1 - lo) * stride`.
+/// Element offset of row `(idx0, idx1, idx2)` of a rank-4 `[d0, d1, d2, d3]` tensor.
+fn rowOffset4(meta: tensor_store.TensorMeta, idx0: usize, idx1: usize, idx2: usize) usize {
+    return ((idx0 * meta.shape[1] + idx1) * meta.shape[2] + idx2) * meta.shape[3];
+}
+
+/// One row of a rank-4 `[d0, d1, d2, d3]` tensor as bytes.
 fn rowBytesRank4Const(
     store: tensor_store.TensorStore,
     id: executable.TensorId,
@@ -193,68 +115,14 @@ fn rowBytesRank4Const(
     idx1: usize,
     idx2: usize,
     row_len: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError![]const u8 {
-    if (cache.span.covers(idx0, idx1, idx2)) {
-        const sp = cache.span;
-        const off: usize = sp.base + (idx1 - sp.lo) * sp.stride;
-        return sp.bytes[off..][0..sp.row_bytes];
-    }
-
-    const elem_size: usize = dtype.info().block_bytes;
     if (meta.rank != 4 or meta.dtype != dtype) return BackendError.InvalidArgument;
-    if (meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
     if (row_len != meta.shape[3]) return BackendError.InvalidArgument;
     if (idx0 >= meta.shape[0] or idx1 >= meta.shape[1] or idx2 >= meta.shape[2]) return BackendError.InvalidArgument;
-
-    const coords: [4]usize = .{
-        idx0 / meta.tile_shape[0],
-        idx1 / meta.tile_shape[1],
-        idx2 / meta.tile_shape[2],
-        0,
-    };
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 4 or view.dtype != dtype) return BackendError.InvalidArgument;
-
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-    const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
-    const s2: usize = try asPositiveStride(view.layout.strides_bytes[2]);
-    const s3: usize = try asPositiveStride(view.layout.strides_bytes[3]);
-    if (s3 != elem_size) return BackendError.InvalidArgument;
-
-    const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
-    const l1: usize = idx1 - coords[1] * meta.tile_shape[1];
-    const l2: usize = idx2 - coords[2] * meta.tile_shape[2];
-
-    const off0: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const off2: usize = std.math.mul(usize, l2, s2) catch return BackendError.InvalidArgument;
-    const row_base: usize = std.math.add(usize, off0, off2) catch return BackendError.InvalidArgument;
-    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
-    const off: usize = std.math.add(usize, row_base, off1) catch return BackendError.InvalidArgument;
-
-    const row_bytes: usize = std.math.mul(usize, row_len, elem_size) catch return BackendError.InvalidArgument;
-    const row_end: usize = std.math.add(usize, off, row_bytes) catch return BackendError.InvalidArgument;
-    if (row_end > view.bytes.len) return BackendError.InvalidArgument;
-
-    // Remember the run this row sits in: the rest of its tile along axis 1, as far
-    // as the last row that still fits the buffer.
-    const span_lo: usize = coords[1] * meta.tile_shape[1];
-    const rows_that_fit: usize = if (s1 == 0) 1 else (view.bytes.len - row_base - row_bytes) / s1 + 1;
-    cache.span = .{
-        .valid = true,
-        .idx0 = idx0,
-        .idx2 = idx2,
-        .lo = span_lo,
-        .hi = @min(@min(span_lo + meta.tile_shape[1], meta.shape[1]), span_lo + rows_that_fit),
-        .base = row_base,
-        .stride = s1,
-        .row_bytes = row_bytes,
-        .bytes = view.bytes,
-    };
-    return view.bytes[off..row_end];
+    const elem: usize = dtype.info().block_bytes;
+    const bytes = try acquireConstViewCached(store, id, cache);
+    return bytes[rowOffset4(meta, idx0, idx1, idx2) * elem ..][0 .. row_len * elem];
 }
 
 fn rowSliceRank4ConstF32(
@@ -265,7 +133,7 @@ fn rowSliceRank4ConstF32(
     idx1: usize,
     idx2: usize,
     row_len: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError![]align(1) const f32 {
     const bytes = try rowBytesRank4Const(store, id, meta, .f32, idx0, idx1, idx2, row_len, cache);
     return simd.bytesAsSliceConstUnaligned(f32, bytes);
@@ -279,7 +147,7 @@ fn rowSliceRank4ConstF16(
     idx1: usize,
     idx2: usize,
     row_len: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError![]align(1) const f16 {
     const bytes = try rowBytesRank4Const(store, id, meta, .f16, idx0, idx1, idx2, row_len, cache);
     return simd.bytesAsSliceConstUnaligned(f16, bytes);
@@ -293,46 +161,13 @@ fn rowSliceRank4MutF32(
     idx1: usize,
     idx2: usize,
     row_len: usize,
-    cache: *MutTileCache,
+    cache: *MutViewCache,
 ) ExecuteProgramError![]align(1) f32 {
     if (meta.rank != 4 or meta.dtype != .f32) return BackendError.InvalidArgument;
-    if (meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
     if (row_len != meta.shape[3]) return BackendError.InvalidArgument;
     if (idx0 >= meta.shape[0] or idx1 >= meta.shape[1] or idx2 >= meta.shape[2]) return BackendError.InvalidArgument;
-
-    const coords: [4]usize = .{
-        idx0 / meta.tile_shape[0],
-        idx1 / meta.tile_shape[1],
-        idx2 / meta.tile_shape[2],
-        0,
-    };
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefMut = try acquireMutTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 4 or view.dtype != .f32) return BackendError.InvalidArgument;
-
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-    const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
-    const s2: usize = try asPositiveStride(view.layout.strides_bytes[2]);
-    const s3: usize = try asPositiveStride(view.layout.strides_bytes[3]);
-    if (s3 != @sizeOf(f32)) return BackendError.InvalidArgument;
-
-    const l0: usize = idx0 - coords[0] * meta.tile_shape[0];
-    const l1: usize = idx1 - coords[1] * meta.tile_shape[1];
-    const l2: usize = idx2 - coords[2] * meta.tile_shape[2];
-
-    const off0: usize = std.math.mul(usize, l0, s0) catch return BackendError.InvalidArgument;
-    const off1: usize = std.math.mul(usize, l1, s1) catch return BackendError.InvalidArgument;
-    const off2: usize = std.math.mul(usize, l2, s2) catch return BackendError.InvalidArgument;
-    const off01: usize = std.math.add(usize, off0, off1) catch return BackendError.InvalidArgument;
-    const off: usize = std.math.add(usize, off01, off2) catch return BackendError.InvalidArgument;
-
-    const row_bytes: usize = std.math.mul(usize, row_len, @sizeOf(f32)) catch return BackendError.InvalidArgument;
-    const row_end: usize = std.math.add(usize, off, row_bytes) catch return BackendError.InvalidArgument;
-    if (row_end > view.bytes.len) return BackendError.InvalidArgument;
-
-    return simd.bytesAsSliceMutUnaligned(f32, view.bytes[off..row_end]);
+    const bytes = try acquireMutViewCached(store, id, cache);
+    return simd.bytesAsSliceMutUnaligned(f32, bytes[rowOffset4(meta, idx0, idx1, idx2) * @sizeOf(f32) ..][0 .. row_len * @sizeOf(f32)]);
 }
 
 inline fn vecLoad(ptr: [*]align(1) const f32) Vec {
@@ -567,7 +402,7 @@ inline fn scaleRowF32(row: []align(1) f32, n: usize, scale: f32) void {
 // Blocked (flash-style) f32 path
 // ===========================================================================
 //
-// `ExecCtx` below walks ONE (query row, key) pair at a time and re-derives a tile
+// `ExecCtx` below walks ONE (query row, key) pair at a time and re-derives a row
 // pointer from tensor metadata for every key — divisions, stride casts, overflow
 // and bounds checks around a single d_k-long dot product — and every query row
 // re-streams the whole K/V range from memory. Both costs dominate the arithmetic.
@@ -583,7 +418,7 @@ inline fn scaleRowF32(row: []align(1) f32, n: usize, scale: f32) void {
 //   * skips key blocks entirely outside a block's window range;
 //   * can split ONE group's key range across workers (flash-decoding). That is the
 //     only available parallelism when decode has a single query row, where work
-//     partitioned by output tile leaves every thread but one idle.
+//     partitioned by output rows leaves every thread but one idle.
 //
 // Restricted to f32 q/k/v/out and identity time mapping; f16 caches and
 // rolling mapping fall through to the generic path, which stays authoritative.
@@ -601,9 +436,9 @@ fn alignUp(x: usize, a: usize) usize {
     return ceilDiv(x, a) * a;
 }
 
-/// Rows `t .. t + rows` of one (batch, head) slice inside a SINGLE tile, at a
-/// constant element stride — the shape the panel kernels want. Derived once per
-/// tile instead of once per key.
+/// Rows `t .. t + rows` of one (batch, head) slice, at a constant element
+/// stride — the shape the panel kernels want. Derived once per block instead of
+/// once per key.
 const Panel = struct {
     data: []align(1) const f32,
     row_stride: usize,
@@ -624,7 +459,7 @@ fn panelF16(
     t: usize,
     h: usize,
     d: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
     dst: []f32,
     max_rows: usize,
 ) ExecuteProgramError!Panel {
@@ -650,45 +485,22 @@ fn panelF32(
     t: usize,
     h: usize,
     d: usize,
-    cache: *ConstTileCache,
+    cache: *ConstViewCache,
 ) ExecuteProgramError!Panel {
     if (meta.rank != 4 or meta.dtype != .f32) return BackendError.InvalidArgument;
     if (t >= meta.shape[1] or b >= meta.shape[0] or h >= meta.shape[2]) return BackendError.InvalidArgument;
 
-    const coords: [4]usize = .{
-        b / meta.tile_shape[0],
-        t / meta.tile_shape[1],
-        h / meta.tile_shape[2],
-        0,
-    };
-    const tile_index: usize = try tensor_store.encodeTileIndex(meta, coords[0..]);
-    const tile: tensor_store.TileRefConst = try acquireConstTileCached(store, id, tile_index, cache);
-
-    const view = tile.bufferView();
-    if (view.layout.rank != 4 or view.dtype != .f32) return BackendError.InvalidArgument;
-    const s0: usize = try asPositiveStride(view.layout.strides_bytes[0]);
-    const s1: usize = try asPositiveStride(view.layout.strides_bytes[1]);
-    const s2: usize = try asPositiveStride(view.layout.strides_bytes[2]);
-    const s3: usize = try asPositiveStride(view.layout.strides_bytes[3]);
-    if (s3 != @sizeOf(f32) or (s1 % @sizeOf(f32)) != 0) return BackendError.InvalidArgument;
-
-    const b_l: usize = b - coords[0] * meta.tile_shape[0];
-    const t_l: usize = t - coords[1] * meta.tile_shape[1];
-    const h_l: usize = h - coords[2] * meta.tile_shape[2];
-    const off: usize = b_l * s0 + t_l * s1 + h_l * s2;
-
-    const tile_rows: usize = tile.shape_mem[1];
-    if (t_l >= tile_rows) return BackendError.InvalidArgument;
-    const rows: usize = tile_rows - t_l;
-
+    const bytes = try acquireConstViewCached(store, id, cache);
+    const off: usize = rowOffset4(meta, b, t, h) * @sizeOf(f32);
+    const row_stride: usize = meta.shape[2] * meta.shape[3];
+    const rows: usize = meta.shape[1] - t;
     // Bytes actually spanned by [row 0 .. row rows-1] of this panel.
-    const span: usize = (rows - 1) * s1 + d * @sizeOf(f32);
-    const end: usize = std.math.add(usize, off, span) catch return BackendError.InvalidArgument;
-    if (end > view.bytes.len) return BackendError.InvalidArgument;
+    const end: usize = off + ((rows - 1) * row_stride + d) * @sizeOf(f32);
+    if (end > bytes.len) return BackendError.InvalidArgument;
 
     return .{
-        .data = simd.bytesAsSliceConstUnaligned(f32, view.bytes[off..end]),
-        .row_stride = s1 / @sizeOf(f32),
+        .data = simd.bytesAsSliceConstUnaligned(f32, bytes[off..end]),
+        .row_stride = row_stride,
         .rows = rows,
     };
 }
@@ -714,12 +526,12 @@ const Worker = struct {
     kbuf: []f32, // [key_block, d_k] when the K cache is f16
     vbuf: []f32, // [key_block, d_v] when the V cache is f16
 
-    q_cache: ConstTileCache = .{},
-    k_cache: ConstTileCache = .{},
-    v_cache: ConstTileCache = .{},
-    pos_cache: ConstTileCache = .{},
-    end_cache: ConstTileCache = .{},
-    out_cache: MutTileCache = .{},
+    q_cache: ConstViewCache = .{},
+    k_cache: ConstViewCache = .{},
+    v_cache: ConstViewCache = .{},
+    pos_cache: ConstViewCache = .{},
+    end_cache: ConstViewCache = .{},
+    out_cache: MutViewCache = .{},
 
     fn release(self: *Worker, store: tensor_store.TensorStore) void {
         releaseConstCache(store, &self.q_cache);
@@ -734,7 +546,7 @@ const Worker = struct {
 const BlockedCtx = struct {
     store: tensor_store.TensorStore,
     kernels: attention_registry.Kernels,
-    s: executable.StepAttentionTiled,
+    s: executable.StepAttention,
 
     q_meta: tensor_store.TensorMeta,
     k_meta: tensor_store.TensorMeta,
@@ -901,8 +713,8 @@ const BlockedCtx = struct {
         }
 
         // Packing K buys a register-blocked GEMM, but the pack only pays once
-        // several row tiles reuse it. A decode unit is one GQA group — a single
-        // tile — so there the narrow kernel's one K stream wins outright.
+        // several row blocks reuse it. A decode unit is one GQA group — a single
+        // block — so there the narrow kernel's one K stream wins outright.
         const narrow: bool = rows < 2 * self.kernels.tuning.mr;
 
         var t: usize = t_start;
@@ -1174,7 +986,7 @@ const ExecCtx = struct {
 
     store: tensor_store.TensorStore,
     kernels: attention_registry.Kernels,
-    s: executable.StepAttentionTiled,
+    s: executable.StepAttention,
 
     q_meta: tensor_store.TensorMeta,
     k_meta: tensor_store.TensorMeta,
@@ -1199,9 +1011,6 @@ const ExecCtx = struct {
     k_cap: usize,
     v_cap: usize,
 
-    hq_tiles: usize,
-    tiles_per_b: usize,
-
     stop: std.atomic.Value(bool) = .init(false),
     err_mutex: std.Io.Mutex = .init,
     err_any: ?anyerror = null,
@@ -1216,34 +1025,30 @@ const ExecCtx = struct {
     fn runRange(self: *@This(), start: usize, end: usize) void {
         if (start >= end) return;
 
-        var q_cache: ConstTileCache = .{};
+        var q_cache: ConstViewCache = .{};
         defer releaseConstCache(self.store, &q_cache);
-        var k_cache_tiles: ConstTileCache = .{};
-        defer releaseConstCache(self.store, &k_cache_tiles);
-        var v_cache_tiles: ConstTileCache = .{};
-        defer releaseConstCache(self.store, &v_cache_tiles);
-        var pos_cache: ConstTileCache = .{};
+        var k_cache_view: ConstViewCache = .{};
+        defer releaseConstCache(self.store, &k_cache_view);
+        var v_cache_view: ConstViewCache = .{};
+        defer releaseConstCache(self.store, &v_cache_view);
+        var pos_cache: ConstViewCache = .{};
         defer releaseConstCache(self.store, &pos_cache);
-        var end_cache: ConstTileCache = .{};
+        var end_cache: ConstViewCache = .{};
         defer releaseConstCache(self.store, &end_cache);
-        var out_cache: MutTileCache = .{};
+        var out_cache: MutViewCache = .{};
         defer releaseMutCache(self.store, &out_cache);
 
         var work_idx: usize = start;
         while (work_idx < end) : (work_idx += 1) {
             if (self.stop.load(.acquire)) return;
 
-            const b_tile: usize = work_idx / self.tiles_per_b;
-            const rem: usize = work_idx - b_tile * self.tiles_per_b;
-            const l_tile: usize = rem / self.hq_tiles;
-            const hq_tile: usize = rem - l_tile * self.hq_tiles;
-
-            const b_start: usize = b_tile * self.out_meta.tile_shape[0];
-            const b_end: usize = @min(self.batch, b_start + self.out_meta.tile_shape[0]);
-            const l_start: usize = l_tile * self.out_meta.tile_shape[1];
-            const l_end: usize = @min(self.l_q, l_start + self.out_meta.tile_shape[1]);
-            const hq_start: usize = hq_tile * self.out_meta.tile_shape[2];
-            const hq_end: usize = @min(self.h_q, hq_start + self.out_meta.tile_shape[2]);
+            // Work unit = one output row (b, l, hq).
+            const hq_start: usize = work_idx % self.h_q;
+            const hq_end: usize = hq_start + 1;
+            const l_start: usize = (work_idx / self.h_q) % self.l_q;
+            const l_end: usize = l_start + 1;
+            const b_start: usize = work_idx / (self.h_q * self.l_q);
+            const b_end: usize = b_start + 1;
 
             var b: usize = b_start;
             while (b < b_end) : (b += 1) {
@@ -1349,14 +1154,14 @@ const ExecCtx = struct {
                                 }
 
                                 const k_row_f32: ?[]align(1) const f32 = if (self.k_dtype == .f32)
-                                    rowSliceRank4ConstF32(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF32(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
                                 else
                                     null;
                                 const k_row_f16: ?[]align(1) const f16 = if (self.k_meta.dtype == .f16)
-                                    rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
@@ -1398,14 +1203,14 @@ const ExecCtx = struct {
                                 const alpha: f32 = logits_buf[key_i] * inv;
                                 const v_t: usize = @intCast(v_idx_buf[key_i]);
                                 const v_row_f32: ?[]align(1) const f32 = if (self.v_dtype == .f32)
-                                    rowSliceRank4ConstF32(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF32(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
                                 else
                                     null;
                                 const v_row_f16: ?[]align(1) const f16 = if (self.v_meta.dtype == .f16)
-                                    rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
@@ -1443,14 +1248,14 @@ const ExecCtx = struct {
                                 }
 
                                 const k_row_f32: ?[]align(1) const f32 = if (self.k_dtype == .f32)
-                                    rowSliceRank4ConstF32(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF32(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
                                 else
                                     null;
                                 const k_row_f16: ?[]align(1) const f16 = if (self.k_meta.dtype == .f16)
-                                    rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF16(self.store, self.s.k, self.k_meta, b, k_t, hkv, self.d_k, &k_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
@@ -1474,14 +1279,14 @@ const ExecCtx = struct {
                                 const p_new: f32 = self.kernels.exp_softmax(logit - m_new);
 
                                 const v_row_f32: ?[]align(1) const f32 = if (self.v_dtype == .f32)
-                                    rowSliceRank4ConstF32(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF32(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
                                 else
                                     null;
                                 const v_row_f16: ?[]align(1) const f16 = if (self.v_meta.dtype == .f16)
-                                    rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_tiles) catch |e| {
+                                    rowSliceRank4ConstF16(self.store, self.s.v, self.v_meta, b, v_t, hkv, self.d_v, &v_cache_view) catch |e| {
                                         self.fail(e);
                                         return;
                                     }
@@ -1544,7 +1349,7 @@ fn execBlocked(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
     kernels: attention_registry.Kernels,
-    s: executable.StepAttentionTiled,
+    s: executable.StepAttention,
     store: tensor_store.TensorStore,
     sh: Shapes,
 ) ExecuteProgramError!bool {
@@ -1636,12 +1441,12 @@ fn execBlocked(
     return true;
 }
 
-pub fn execAttentionTiled(
+pub fn execAttention(
     allocator: std.mem.Allocator,
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
     kernels: attention_registry.Kernels,
-    s: executable.StepAttentionTiled,
+    s: executable.StepAttention,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     if (!(s.scale > 0.0) or !std.math.isFinite(s.scale)) return BackendError.InvalidArgument;
@@ -1694,17 +1499,13 @@ pub fn execAttentionTiled(
     const d_v: usize = v_meta.shape[3];
     if (out_meta.shape[3] != d_v) return BackendError.InvalidArgument;
 
-    if (q_meta.tile_counts[3] != 1 or k_meta.tile_counts[3] != 1 or v_meta.tile_counts[3] != 1 or out_meta.tile_counts[3] != 1) {
-        return BackendError.InvalidArgument;
-    }
-
     const groups_per_kv: usize = h_q / h_kv;
 
     // Growable mapping can resize physical storage. Pre-touch per-batch tail once
     // so worker threads run against stable metadata. Only a cache read can grow
     // (a plain sequence is exactly as long as it is), so this is index-gated.
     if (lengths_meta) |em| {
-        var end_cache_pretouch: ConstTileCache = .{};
+        var end_cache_pretouch: ConstViewCache = .{};
         defer releaseConstCache(store, &end_cache_pretouch);
 
         var b0: usize = 0;
@@ -1728,7 +1529,6 @@ pub fn execAttentionTiled(
     if (k_meta.shape[2] != h_kv or v_meta.shape[2] != h_kv) return BackendError.InvalidArgument;
     if (k_meta.shape[3] != d_k or v_meta.shape[3] != d_v) return BackendError.InvalidArgument;
     if (k_meta.shape[1] != v_meta.shape[1]) return BackendError.InvalidArgument;
-    if (k_meta.tile_counts[3] != 1 or v_meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
 
     const k_cap: usize = k_meta.shape[1];
     const v_cap: usize = v_meta.shape[1];
@@ -1745,11 +1545,8 @@ pub fn execAttentionTiled(
     const ring_modulus: usize = if (map_mode == .rolling) k_cap else 0;
     if (map_mode == .rolling and ring_modulus == 0) return BackendError.InvalidArgument;
 
-    const b_tiles: usize = out_meta.tile_counts[0];
-    const l_tiles: usize = out_meta.tile_counts[1];
-    const hq_tiles: usize = out_meta.tile_counts[2];
-    const tiles_per_b: usize = std.math.mul(usize, l_tiles, hq_tiles) catch return BackendError.InvalidArgument;
-    const total_work: usize = std.math.mul(usize, b_tiles, tiles_per_b) catch return BackendError.InvalidArgument;
+    // One work unit per output row (batch, query, head).
+    const total_work: usize = batch * l_q * h_q;
     if (total_work == 0) return;
 
     if (blockedEligible(q_dtype, k_dtype, v_dtype, map_mode, d_k, d_v)) {
@@ -1796,8 +1593,6 @@ pub fn execAttentionTiled(
         .ring_modulus = ring_modulus,
         .k_cap = k_cap,
         .v_cap = v_cap,
-        .hq_tiles = hq_tiles,
-        .tiles_per_b = tiles_per_b,
     };
 
     if (pool) |p| {

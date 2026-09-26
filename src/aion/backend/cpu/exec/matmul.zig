@@ -12,6 +12,8 @@ const matmul_registry = @import("../registry/matmul_registry.zig");
 const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
 const matmul_routing = @import("../registry/matmul_routing.zig");
+const exec_utils = @import("utils.zig");
+const backend_utils = @import("../../utils.zig");
 
 const BackendError = types.BackendError;
 const DType = types.DType;
@@ -31,1522 +33,371 @@ pub const MatMulExecCtx = struct {
     matmul_scratch: [][]align(32) u8,
 };
 
-fn runF16TilePackedB(
-    mk: matmul_registry.F32Kernels,
-    scratch: []align(32) u8,
-    packed_b: []align(32) const f32,
-    params: MatMulParams,
-    c_dtype: DType,
-    c_bytes: []u8,
-    a_bytes: []const u8,
-) BackendError!void {
-    if (params.k > mk.tuning.kc or params.n > mk.tuning.nc) return BackendError.InvalidArgument;
-    if (params.m > mk.tuning.mc) return BackendError.InvalidArgument;
-
-    const c_elem_bytes: usize = switch (c_dtype) {
-        .f32 => @sizeOf(f32),
-        .f16 => @sizeOf(f16),
-        else => return BackendError.InvalidArgument,
-    };
-
-    const a_row_bytes: usize = params.k * @sizeOf(f16);
-    const c_row_bytes: usize = params.n * c_elem_bytes;
-    if (a_bytes.len < params.m * a_row_bytes) return BackendError.InvalidArgument;
-    if (c_bytes.len < params.m * c_row_bytes) return BackendError.InvalidArgument;
-
-    const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-    const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-    const pa_cap_f32_len: usize = mk.tuning.mc * mk.tuning.kc;
-    const pa_cap_bytes_len: usize = pa_cap_f32_len * @sizeOf(f32);
-    if (scratch.len < pb_bytes_len + pa_cap_bytes_len) return BackendError.InvalidArgument;
-    if (packed_b.len < pb_f32_len) return BackendError.InvalidArgument;
-
-    const pa_panel_count: usize = (params.m + mk.tuning.mr - 1) / mk.tuning.mr;
-    const pa_need_f32_len: usize = pa_panel_count * mk.tuning.mr * mk.tuning.kc;
-    if (pa_need_f32_len > pa_cap_f32_len) return BackendError.InvalidArgument;
-
-    const pa_bytes_len: usize = pa_need_f32_len * @sizeOf(f32);
-    const pa_off: usize = pb_bytes_len;
-    const packed_a: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[pa_off .. pa_off + pa_bytes_len]));
-    try mk.pack_a_tile_f16_to_packed_f32(packed_a, params.m, params.k, a_bytes);
-
-    switch (c_dtype) {
-        .f32 => {
-            try mk.matmul_packed_ab(packed_a, packed_b, params, c_bytes);
-        },
-        .f16 => {
-            const lanes: usize = 8;
-            const VF16 = @Vector(lanes, f16);
-            const VF32 = @Vector(lanes, f32);
-
-            const c_out: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, c_bytes);
-            if (c_out.len < params.m * params.n) return BackendError.InvalidArgument;
-
-            const tail_bytes: usize = scratch.len - pb_bytes_len;
-            const a_row_bytes_f16: usize = params.k * @sizeOf(f16);
-            const c_row_bytes_f16: usize = params.n * @sizeOf(f16);
-
-            var row0: usize = 0;
-            while (row0 < params.m) {
-                const rows_left: usize = params.m - row0;
-                var rows_chunk: usize = rows_left;
-                while (rows_chunk > 0) {
-                    const panels: usize = (rows_chunk + mk.tuning.mr - 1) / mk.tuning.mr;
-                    const pa_need_f32: usize = panels * mk.tuning.mr * mk.tuning.kc;
-                    const pa_need_bytes: usize = pa_need_f32 * @sizeOf(f32);
-                    const c_tmp_bytes: usize = rows_chunk * params.n * @sizeOf(f32);
-                    if (pa_need_bytes + c_tmp_bytes <= tail_bytes) break;
-                    if (rows_chunk > mk.tuning.mr) {
-                        rows_chunk -= mk.tuning.mr;
-                    } else {
-                        rows_chunk -= 1;
-                    }
-                }
-                if (rows_chunk == 0) return BackendError.InvalidArgument;
-
-                const panels: usize = (rows_chunk + mk.tuning.mr - 1) / mk.tuning.mr;
-                const pa_need_f32: usize = panels * mk.tuning.mr * mk.tuning.kc;
-                const pa_need_bytes: usize = pa_need_f32 * @sizeOf(f32);
-                const c_tmp_off: usize = pb_bytes_len + pa_need_bytes;
-                const c_tmp_bytes: usize = rows_chunk * params.n * @sizeOf(f32);
-
-                const packed_a_chunk: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[pb_bytes_len .. pb_bytes_len + pa_need_bytes]));
-                const a_off: usize = row0 * a_row_bytes_f16;
-                const a_len: usize = rows_chunk * a_row_bytes_f16;
-                const a_chunk_bytes: []const u8 = a_bytes[a_off .. a_off + a_len];
-                try mk.pack_a_tile_f16_to_packed_f32(packed_a_chunk, rows_chunk, params.k, a_chunk_bytes);
-
-                const c_tmp: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[c_tmp_off .. c_tmp_off + c_tmp_bytes]));
-                const c_off: usize = row0 * c_row_bytes_f16;
-                const c_len: usize = rows_chunk * c_row_bytes_f16;
-                const c_chunk_bytes: []u8 = c_bytes[c_off .. c_off + c_len];
-                const c_chunk: []align(1) f16 = simd.bytesAsSliceMutUnaligned(f16, c_chunk_bytes);
-
-                const c_elems_chunk: usize = rows_chunk * params.n;
-                if (params.beta == 0.0) {
-                    @memset(c_tmp, 0.0);
-                } else {
-                    var i: usize = 0;
-                    while (i + lanes <= c_elems_chunk) : (i += lanes) {
-                        const src_ptr: [*]align(1) const f16 = @ptrCast(c_chunk.ptr + i);
-                        const hv: VF16 = @as(*align(1) const VF16, @ptrCast(src_ptr)).*;
-                        const fv: VF32 = @floatCast(hv);
-                        const dst_ptr: [*]align(1) f32 = @ptrCast(c_tmp.ptr + i);
-                        @as(*align(1) VF32, @ptrCast(dst_ptr)).* = fv;
-                    }
-                    while (i < c_elems_chunk) : (i += 1) {
-                        c_tmp[i] = @as(f32, @floatCast(c_chunk[i]));
-                    }
-                }
-
-                const p_chunk: MatMulParams = .{
-                    .m = rows_chunk,
-                    .n = params.n,
-                    .k = params.k,
-                    .alpha = params.alpha,
-                    .beta = params.beta,
-                };
-                try mk.matmul_packed_ab(packed_a_chunk, packed_b, p_chunk, std.mem.sliceAsBytes(c_tmp));
-
-                var i: usize = 0;
-                while (i + lanes <= c_elems_chunk) : (i += lanes) {
-                    const src_ptr: [*]align(1) const f32 = @ptrCast(c_tmp.ptr + i);
-                    const fv: VF32 = @as(*align(1) const VF32, @ptrCast(src_ptr)).*;
-                    const hv: VF16 = @floatCast(fv);
-                    const dst_ptr: [*]align(1) f16 = @ptrCast(c_chunk.ptr + i);
-                    @as(*align(1) VF16, @ptrCast(dst_ptr)).* = hv;
-                }
-                while (i < c_elems_chunk) : (i += 1) {
-                    c_chunk[i] = @floatCast(c_tmp[i]);
-                }
-
-                row0 += rows_chunk;
-            }
-        },
-        else => return BackendError.InvalidArgument,
-    }
-}
-
-fn matmulF16ViaPackedF32(
-    mk: matmul_registry.F32Kernels,
-    scratch: []align(32) u8,
-    params: MatMulParams,
-    c_dtype: DType,
-    c_bytes: []u8,
-    a_bytes: []const u8,
-    b_bytes: []const u8,
-) BackendError!void {
-    if (params.k > mk.tuning.kc or params.n > mk.tuning.nc) return BackendError.InvalidArgument;
-
-    const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-    const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-    if (scratch.len < pb_bytes_len) return BackendError.InvalidArgument;
-
-    const packed_b_mut: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes_len]));
-    try mk.pack_b_tile_f16_to_packed_f32(packed_b_mut, params.k, params.n, b_bytes);
-
-    return runF16TilePackedB(mk, scratch, packed_b_mut, params, c_dtype, c_bytes, a_bytes);
-}
-
-pub fn execMatMulTiled(ctx: *MatMulExecCtx, s: executable.StepMatMulTiled, store: tensor_store.TensorStore) ExecuteProgramError!void {
+/// `C = alpha * A @ B + beta * C`. A rank-2 B is one weight shared by every row of
+/// A, so A's and C's leading dims fold into M; a batched B runs one 2D matmul per
+/// batch, its size-1 batch dims broadcast.
+///
+/// The kernels compute in f32. An f16 A or C is converted at the edges — A once up
+/// front, C through an f32 copy — which is O(MK + MN) beside the O(MNK) product.
+pub fn execMatMul(ctx: *MatMulExecCtx, s: executable.StepMatMul, store: tensor_store.TensorStore) ExecuteProgramError!void {
     const c_meta = try store.meta(s.c);
     const a_meta = try store.meta(s.a);
     const b_meta = try store.meta(s.b);
-
-    if (c_meta.rank > 2) {
-        return execMatMulTiledBatched(ctx, s, store, c_meta, a_meta, b_meta);
+    switch (b_meta.dtype) {
+        .f32, .f16, .q8_0, .q4_0 => {},
+        else => return BackendError.Unsupported,
     }
-
-    const a_dtype: DType = a_meta.dtype;
-    const b_dtype: DType = b_meta.dtype;
-    const c_dtype: DType = c_meta.dtype;
-
-    const tile_total: usize = c_meta.tile_counts[0] * c_meta.tile_counts[1];
-    if (ctx.pool) |p| {
-        const total_work: usize = tile_total;
-
-        // MatMul tiles are compute-heavy; parallelize if we have enough work.
-        if (ctx.thread_count > 1 and total_work >= 2) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                c_meta: tensor_store.TensorMeta,
-                a_meta: tensor_store.TensorMeta,
-
-                a_dtype: DType,
-                b_dtype: DType,
-                c_dtype: DType,
-
-                s: executable.StepMatMulTiled,
-
-                scratch: [][]align(32) u8,
-                matmul_f32: matmul_registry.F32Kernels,
-                matmul_q: matmul_q_registry.Choice,
-                matvec: matvec_registry.Kernels,
-                thread_count: usize,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (tid >= t.scratch.len) return;
-                    if (t.stop.load(.acquire)) return;
-
-                    const tc0: usize = t.c_meta.tile_counts[0];
-                    const is_matvec: bool = matmul_routing.isMatvecShape(t.c_meta.shape[0]);
-                    const k_tiles: usize = t.a_meta.tile_counts[1];
-
-                    var i: usize = start;
-                    while (i < end) {
-                        if (t.stop.load(.acquire)) return;
-
-                        const tile_idx0: usize = i;
-                        const ti_n: usize = tile_idx0 / tc0;
-                        const group_end: usize = @min(end, (ti_n + 1) * tc0);
-
-                        const ti_m0: usize = tile_idx0 - ti_n * tc0;
-                        const ti_m_end: usize = group_end - ti_n * tc0;
-
-                        // A decode matvec owns one output-N tile on this worker.
-                        // Stream every q8 K tile into one SIMD accumulator so the
-                        // storage tiling does not force per-tile pack/reduce/write
-                        // overhead. The packed path remains available for GEMM and
-                        // isolated small tiles where packing can be amortized.
-                        if (is_matvec and t.b_dtype == .q8_0 and tc0 == 1 and k_tiles > 1) {
-                            var c_tile = t.store.acquireTileMut(t.s.c, 0, ti_n) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseMut(c_tile.token);
-                            const c_view = c_tile.bufferView();
-                            const n_tile: usize = c_view.layout.shape[1];
-                            const acc_reserve = n_tile * 64;
-                            const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[1] / 32) * 36, 32);
-
-                            var fused_ti_k: usize = 0;
-                            while (fused_ti_k < k_tiles) : (fused_ti_k += 1) {
-                                const a_tile = t.store.acquireTileConst(t.s.a, 0, fused_ti_k) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(a_tile.token);
-                                const b_tile = t.store.acquireTileConst(t.s.b, fused_ti_k, ti_n) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(b_tile.token);
-
-                                const a_view = a_tile.bufferView();
-                                const b_view = b_tile.bufferView();
-                                const params: MatMulParams = .{
-                                    .m = 1,
-                                    .n = n_tile,
-                                    .k = a_view.layout.shape[1],
-                                    .alpha = t.s.alpha,
-                                    .beta = t.s.beta,
-                                };
-                                t.matvec.matvec_q8_0_kmajor_accumulate(
-                                    params,
-                                    c_view.bytes,
-                                    a_view.bytes,
-                                    b_view.bytes,
-                                    t.scratch[tid][0..acc_reserve],
-                                    @alignCast(t.scratch[tid][acc_reserve + fused_ti_k * prep_stride ..][0..prep_stride]),
-                                    true,
-                                    fused_ti_k == 0,
-                                    fused_ti_k + 1 == k_tiles,
-                                ) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                            }
-
-                            i = group_end;
-                            continue;
-                        }
-
-                        var ti_k: usize = 0;
-                        while (ti_k < k_tiles) : (ti_k += 1) {
-                            if (t.stop.load(.acquire)) return;
-                            const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
-
-                            const b_tile = t.store.acquireTileConst(t.s.b, ti_k, ti_n) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseConst(b_tile.token);
-                            const b_view = b_tile.bufferView();
-
-                            // Fast path for matvec-shaped problems in tiled execution:
-                            // when there is exactly one M-tile, packing B for reuse is pointless.
-                            if (is_matvec and (t.b_dtype != .f16 or t.c_dtype == .f16)) {
-                                const k_tile: usize = b_view.layout.shape[0];
-                                const n_tile: usize = b_view.layout.shape[1];
-
-                                const ti_m: usize = 0;
-                                var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseMut(c_tile.token);
-                                const c_view0 = c_tile.bufferView();
-
-                                const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(a_tile.token);
-                                const a_view = a_tile.bufferView();
-
-                                const beta_eff: f32 = if (ti_k == 0) t.s.beta else 1.0;
-                                const params: MatMulParams = .{ .m = 1, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_eff };
-
-                                switch (t.b_dtype) {
-                                    .f32 => t.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    },
-                                    .f16 => t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    },
-                                    .q8_0 => {
-                                        if (matmul_routing.shouldUseQ8DirectMatvec(params)) {
-                                            t.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                        } else {
-                                            const qk: matmul_q_registry.QuantKernels = (t.matmul_q.forTile(k_tile, n_tile) orelse {
-                                                    t.fail(BackendError.InvalidArgument);
-                                                    return;
-                                                });
-
-                                            qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-
-                                            const packed_b_view: matmul_q_registry.PackedBView = @alignCast(t.scratch[tid][0..qk.packed_b_bytes]);
-                                            qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                        }
-                                    },
-                                    .q4_0 => {
-                                        const qk: matmul_q_registry.QuantKernels = (t.matmul_q.forTile(k_tile, n_tile) orelse {
-                                                t.fail(BackendError.InvalidArgument);
-                                                return;
-                                            });
-
-                                        if (t.b_dtype == .q4_0) {
-                                            qk.pack_b_tile_q4_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                        } else {
-                                            qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                        }
-
-                                        const packed_b_view: matmul_q_registry.PackedBView = @alignCast(t.scratch[tid][0..qk.packed_b_bytes]);
-                                        qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    },
-                                    else => {
-                                        t.fail(BackendError.Unsupported);
-                                        return;
-                                    },
-                                }
-
-                                continue;
-                            }
-
-                            switch (t.b_dtype) {
-                                .q4_0, .q8_0 => {
-                                    const k_tile: usize = b_view.layout.shape[0];
-                                    const n_tile: usize = b_view.layout.shape[1];
-
-                                    const qk: matmul_q_registry.QuantKernels = (t.matmul_q.forTile(k_tile, n_tile) orelse {
-                                            t.fail(BackendError.InvalidArgument);
-                                            return;
-                                        });
-
-                                    if (t.b_dtype == .q4_0) {
-                                        qk.pack_b_tile_q4_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    } else {
-                                        qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-
-                                    const pb_bytes_len: usize = qk.packed_b_bytes;
-                                    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(t.scratch[tid][0..pb_bytes_len]);
-
-                                    var ti_m: usize = ti_m0;
-                                    while (ti_m < ti_m_end) : (ti_m += 1) {
-                                        if (t.stop.load(.acquire)) return;
-
-                                        var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseMut(c_tile.token);
-                                        const c_view0 = c_tile.bufferView();
-                                        const m_tile: usize = c_view0.layout.shape[0];
-
-                                        const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseConst(a_tile.token);
-                                        const a_view = a_tile.bufferView();
-
-                                        const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
-                                        qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                .f32 => {
-                                    const k_tile: usize = b_view.layout.shape[0];
-                                    const n_tile: usize = b_view.layout.shape[1];
-
-                                    if (k_tile > t.matmul_f32.tuning.kc or n_tile > t.matmul_f32.tuning.nc) {
-                                        var ti_m: usize = ti_m0;
-                                        while (ti_m < ti_m_end) : (ti_m += 1) {
-                                            if (t.stop.load(.acquire)) return;
-
-                                            var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                            defer t.store.releaseMut(c_tile.token);
-
-                                            const c_view0 = c_tile.bufferView();
-                                            const m_total: usize = c_view0.layout.shape[0];
-
-                                            const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
-                                                t.fail(e);
-                                                return;
-                                            };
-                                            defer t.store.releaseConst(a_tile.token);
-                                            const a_view = a_tile.bufferView();
-
-                                            const kk_total: usize = k_tile;
-                                            const jj_total: usize = n_tile;
-
-                                            const pb_f32_len: usize = t.matmul_f32.tuning.kc * t.matmul_f32.tuning.nc;
-                                            const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                                            const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-
-                                            var jj: usize = 0;
-                                            while (jj < jj_total) : (jj += t.matmul_f32.tuning.nc) {
-                                                const n_sub: usize = @min(t.matmul_f32.tuning.nc, jj_total - jj);
-
-                                                var kk: usize = 0;
-                                                while (kk < kk_total) : (kk += t.matmul_f32.tuning.kc) {
-                                                    const k_sub: usize = @min(t.matmul_f32.tuning.kc, kk_total - kk);
-                                                    const beta_eff: f32 = if (kk == 0) beta_tile else 1.0;
-
-                                                    const b_off: usize = (kk * jj_total + jj) * @sizeOf(f32);
-                                                    const b_need: usize = k_sub * n_sub * @sizeOf(f32);
-                                                    if (b_off + b_need > b_view.bytes.len) {
-                                                        t.fail(BackendError.InvalidArgument);
-                                                        return;
-                                                    }
-                                                    const b_sub_bytes: []const u8 = b_view.bytes[b_off .. b_off + b_need];
-                                                    t.matmul_f32.pack_b_tile(t.scratch[tid], k_sub, n_sub, b_sub_bytes) catch |e| {
-                                                        t.fail(e);
-                                                        return;
-                                                    };
-
-                                                    const a_row_bytes: usize = kk_total * @sizeOf(f32);
-                                                    const a_k_off: usize = kk * @sizeOf(f32);
-
-                                                    const c_row_bytes: usize = jj_total * @sizeOf(f32);
-                                                    const c_n_off: usize = jj * @sizeOf(f32);
-
-                                                    var row: usize = 0;
-                                                    while (row < m_total) : (row += 1) {
-                                                        const a_row: []const u8 = a_view.bytes[row * a_row_bytes .. (row + 1) * a_row_bytes];
-                                                        const c_row: []u8 = c_view0.bytes[row * c_row_bytes .. (row + 1) * c_row_bytes];
-
-                                                        const a_sub: []const u8 = a_row[a_k_off .. a_k_off + k_sub * @sizeOf(f32)];
-                                                        const c_sub: []u8 = c_row[c_n_off .. c_n_off + n_sub * @sizeOf(f32)];
-
-                                                        const pp: MatMulParams = .{ .m = 1, .n = n_sub, .k = k_sub, .alpha = t.s.alpha, .beta = beta_eff };
-                                                        t.matmul_f32.matmul_packed_b(t.scratch[tid], packed_b_view, pp, c_sub, a_sub) catch |e| {
-                                                            t.fail(e);
-                                                            return;
-                                                        };
-                                                    }
-                                                }
-                                            }
-
-                                            continue;
-                                        }
-
-                                        continue;
-                                    }
-
-                                    t.matmul_f32.pack_b_tile(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
-
-                                    var ti_m: usize = ti_m0;
-                                    while (ti_m < ti_m_end) : (ti_m += 1) {
-                                        if (t.stop.load(.acquire)) return;
-
-                                        var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseMut(c_tile.token);
-                                        const c_view0 = c_tile.bufferView();
-                                        const m_tile: usize = c_view0.layout.shape[0];
-
-                                        const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseConst(a_tile.token);
-                                        const a_view = a_tile.bufferView();
-
-                                        const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
-
-                                        const pb_f32_len: usize = t.matmul_f32.tuning.kc * t.matmul_f32.tuning.nc;
-                                        const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                                        const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-                                        t.matmul_f32.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                .f16 => {
-                                    const k_tile: usize = b_view.layout.shape[0];
-                                    const n_tile: usize = b_view.layout.shape[1];
-
-                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse t.matmul_f32;
-                                    if (k_tile > mk.tuning.kc or n_tile > mk.tuning.nc) {
-                                        t.fail(BackendError.InvalidArgument);
-                                        return;
-                                    }
-
-                                    const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                                    const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                                    if (t.scratch[tid].len < pb_bytes_len) {
-                                        t.fail(BackendError.InvalidArgument);
-                                        return;
-                                    }
-
-                                    const packed_b_mut: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-                                    mk.pack_b_tile_f16_to_packed_f32(packed_b_mut, k_tile, n_tile, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
-
-                                    var ti_m: usize = ti_m0;
-                                    while (ti_m < ti_m_end) : (ti_m += 1) {
-                                        if (t.stop.load(.acquire)) return;
-
-                                        var c_tile = t.store.acquireTileMut(t.s.c, ti_m, ti_n) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseMut(c_tile.token);
-                                        const c_view0 = c_tile.bufferView();
-                                        const m_tile: usize = c_view0.layout.shape[0];
-                                        const n_tile_m: usize = c_view0.layout.shape[1];
-
-                                        const a_tile = t.store.acquireTileConst(t.s.a, ti_m, ti_k) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        defer t.store.releaseConst(a_tile.token);
-                                        const a_view = a_tile.bufferView();
-
-                                        const k_tile_m: usize = a_view.layout.shape[1];
-                                        const params: MatMulParams = .{ .m = m_tile, .n = n_tile_m, .k = k_tile_m, .alpha = t.s.alpha, .beta = beta_tile };
-
-                                        runF16TilePackedB(mk, t.scratch[tid], packed_b_mut, params, t.c_dtype, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                else => {
-                                    t.fail(BackendError.Unsupported);
-                                    return;
-                                },
-                            }
-                        }
-
-                        i = group_end;
-                    }
-                }
-            };
-
-            var task: Task = .{
-                .store = store,
-                .c_meta = c_meta,
-                .a_meta = a_meta,
-                .a_dtype = a_dtype,
-                .b_dtype = b_dtype,
-                .c_dtype = c_dtype,
-                .s = s,
-                .scratch = ctx.matmul_scratch,
-                .matmul_f32 = ctx.matmul_f32,
-                .matmul_q = ctx.matmul_q,
-                .matvec = ctx.matvec,
-                .thread_count = ctx.thread_count,
-            };
-
-            const threads_total: usize = ctx.thread_count;
-            const tc0: usize = c_meta.tile_counts[0];
-            const max_grain_for_parallelism: usize = @max(@as(usize, 1), total_work / threads_total);
-
-            var grain: usize = @min(@min(tc0, max_grain_for_parallelism), @as(usize, 32));
-            while (grain > 1 and (tc0 % grain) != 0) : (grain -= 1) {}
-
-            p.parallelForAny(@ptrCast(&task), total_work, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
-    }
-
-    // Sequential fallback.
-    var ti_m: usize = 0;
-    while (ti_m < c_meta.tile_counts[0]) : (ti_m += 1) {
-        var ti_n: usize = 0;
-        while (ti_n < c_meta.tile_counts[1]) : (ti_n += 1) {
-            var c_tile = try store.acquireTileMut(s.c, ti_m, ti_n);
-            defer store.releaseMut(c_tile.token);
-
-            const c_view0 = c_tile.bufferView();
-            const m_tile: usize = c_view0.layout.shape[0];
-            const n_tile: usize = c_view0.layout.shape[1];
-
-            var ti_k: usize = 0;
-            while (ti_k < a_meta.tile_counts[1]) : (ti_k += 1) {
-                const a_tile = try store.acquireTileConst(s.a, ti_m, ti_k);
-                defer store.releaseConst(a_tile.token);
-                const b_tile = try store.acquireTileConst(s.b, ti_k, ti_n);
-                defer store.releaseConst(b_tile.token);
-
-                const a_view = a_tile.bufferView();
-                const b_view = b_tile.bufferView();
-                const c_view = c_tile.bufferView();
-
-                const k_tile: usize = a_view.layout.shape[1];
-                const beta_tile: f32 = if (ti_k == 0) s.beta else 1.0;
-                const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = s.alpha, .beta = beta_tile };
-
-                switch (b_dtype) {
-                    .f32 => {
-                        if (matmul_routing.isMatvecShape(m_tile)) {
-                            try ctx.matvec.matvec_f32(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                        } else {
-                            const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
-                                ctx.matmul_f32
-                            else
-                                (matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                            var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                                const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                                const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                                break :blk tmp;
-                            };
-                            defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                            try mk.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
-                            const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                            const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                            const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
-                            try mk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
-                        }
-                    },
-                    .f16 => {
-                        const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse ctx.matmul_f32;
-                        const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                            break :blk tmp;
-                        };
-                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                        if (matmul_routing.isMatvecShape(m_tile) and c_dtype == .f16) {
-                            try ctx.matvec.matvec_f16(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                        } else {
-                            try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view.bytes, a_view.bytes, b_view.bytes);
-                        }
-                    },
-                    .q4_0 => {
-                        const qk: matmul_q_registry.QuantKernels = (ctx.matmul_q.forTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                        var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                            break :blk tmp;
-                        };
-                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                        try qk.pack_b_tile_q4_0(scratch_buf, k_tile, n_tile, b_view.bytes);
-                        const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
-                        try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
-                    },
-                    .q8_0 => {
-                        if (matmul_routing.shouldUseQ8DirectMatvec(params)) {
-                            try ctx.matvec.matvec_q8_0_kmajor(params, c_view.bytes, a_view.bytes, b_view.bytes);
-                        } else {
-                            const qk: matmul_q_registry.QuantKernels = (ctx.matmul_q.forTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                            var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                                const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                                const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                                break :blk tmp;
-                            };
-                            defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                            try qk.pack_b_tile_q8_0(scratch_buf, k_tile, n_tile, b_view.bytes);
-                            const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
-                            try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view.bytes, a_view.bytes);
-                        }
-                    },
-                    else => return BackendError.Unsupported,
-                }
-            }
-        }
+    if (b_meta.rank != 2 and (b_meta.rank != c_meta.rank or a_meta.rank != c_meta.rank)) return BackendError.InvalidArgument;
+
+    const a_view = try store.acquireConst(s.a);
+    defer store.releaseConst(a_view.token);
+    const b_view = try store.acquireConst(s.b);
+    defer store.releaseConst(b_view.token);
+    const c_view = try store.acquireMut(s.c);
+    defer store.releaseMut(c_view.token);
+
+    if (a_meta.dtype == .f32 and c_meta.dtype == .f32) return matmulFlat(ctx, s, c_meta, a_meta, b_meta, c_view.bytes, a_view.bytes, b_view.bytes);
+
+    const a32 = try widen(ctx.allocator, a_meta.dtype, @constCast(a_view.bytes));
+    defer if (a32.ptr != a_view.bytes.ptr) unwiden(ctx.allocator, a32);
+    const c32 = try widen(ctx.allocator, c_meta.dtype, c_view.bytes);
+    defer if (c32.ptr != c_view.bytes.ptr) unwiden(ctx.allocator, c32);
+    try matmulFlat(ctx, s, c_meta, a_meta, b_meta, c32, a32, b_view.bytes);
+    if (c_meta.dtype == .f16) {
+        const dst: []align(1) f16 = std.mem.bytesAsSlice(f16, c_view.bytes);
+        const src: []align(1) const f32 = std.mem.bytesAsSlice(f32, c32);
+        for (dst, src) |*d, v| d.* = @floatCast(v);
     }
 }
 
-fn execMatMulTiledBatched(
-    ctx: *MatMulExecCtx,
-    s: executable.StepMatMulTiled,
-    store: tensor_store.TensorStore,
-    c_meta: tensor_store.TensorMeta,
-    a_meta: tensor_store.TensorMeta,
-    b_meta: tensor_store.TensorMeta,
-) ExecuteProgramError!void {
-    const b_dtype: DType = b_meta.dtype;
-    const c_dtype: DType = c_meta.dtype;
-
-    if (b_dtype == .f16) {
-        return execMatMulTiledBatchedF16Grouped(ctx, s, store, c_meta, a_meta, b_meta, c_dtype);
-    }
-
-    const rank: usize = @as(usize, c_meta.rank);
-    if (rank < 3 or rank > 8) return BackendError.InvalidArgument;
-
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < rank) : (d += 1) {
-        tile_total *= c_meta.tile_counts[d];
-    }
-
-    const k_tiles: usize = a_meta.tile_counts[rank - 1];
-
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and tile_total >= 2) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                c_meta: tensor_store.TensorMeta,
-                a_meta: tensor_store.TensorMeta,
-                b_meta: tensor_store.TensorMeta,
-
-                b_dtype: DType,
-                c_dtype: DType,
-
-                s: executable.StepMatMulTiled,
-                scratch: [][]align(32) u8,
-                matmul_f32: matmul_registry.F32Kernels,
-                matmul_q: matmul_q_registry.Choice,
-                matvec: matvec_registry.Kernels,
-                thread_count: usize,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (tid >= t.scratch.len) return;
-                    if (t.stop.load(.acquire)) return;
-
-                    const rank_local: usize = @as(usize, t.c_meta.rank);
-                    const k_tiles_local: usize = t.a_meta.tile_counts[rank_local - 1];
-
-                    // Decode weights are physically tile-major with adjacent N
-                    // tiles contiguous inside each K wave. Process a worker's
-                    // adjacent output range K-first so its reads follow that
-                    // layout, retaining one full-K accumulator per output tile.
-                    if (rank_local == 3 and t.b_dtype == .q8_0 and t.a_meta.shape[1] == 1 and
-                        t.c_meta.tile_counts[0] == 1 and t.c_meta.tile_counts[1] == 1 and
-                        k_tiles_local > 1)
-                    {
-                        const range_count = end - start;
-                        const max_n_tile = t.c_meta.tile_shape[2];
-                        const acc_stride = std.mem.alignForward(usize, max_n_tile * 32, 32);
-                        const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[2] / 32) * 36, 32);
-                        const prep_base = range_count * acc_stride;
-                        const scratch_need = prep_base + k_tiles_local * prep_stride;
-                        if (scratch_need > t.scratch[tid].len) {
-                            t.fail(BackendError.InvalidArgument);
-                            return;
-                        }
-
-                        var ti_k: usize = 0;
-                        while (ti_k < k_tiles_local) : (ti_k += 1) {
-                            const a_tile_index = tensor_store.projectTileIndex(t.a_meta, &.{0}, &.{ 0, ti_k }, null) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            const a_tile = t.store.acquireTileConstLinear(t.s.a, a_tile_index) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseConst(a_tile.token);
-                            const a_view = a_tile.bufferView();
-
-                            var local: usize = 0;
-                            while (local < range_count) : (local += 1) {
-                                const tile_index = start + local;
-                                const ti_n = tile_index;
-                                const b_tile_index = tensor_store.projectTileIndex(t.b_meta, &.{0}, &.{ ti_k, ti_n }, null) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                const b_tile = t.store.acquireTileConstLinear(t.s.b, b_tile_index) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(b_tile.token);
-                                const b_view = b_tile.bufferView();
-                                const n_tile = b_view.layout.shape[b_view.layout.rank - 1];
-                                const is_last_k = ti_k + 1 == k_tiles_local;
-
-                                var c_bytes: []u8 = &.{};
-                                var c_token: ?usize = null;
-                                defer if (c_token) |token| t.store.releaseMut(token);
-                                if (is_last_k) {
-                                    var c_tile = t.store.acquireTileMutLinear(t.s.c, tile_index) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
-                                    c_token = c_tile.token;
-                                    c_bytes = c_tile.bufferView().bytes;
-                                }
-
-                                const params: MatMulParams = .{
-                                    .m = 1,
-                                    .n = n_tile,
-                                    .k = a_view.layout.shape[2],
-                                    .alpha = t.s.alpha,
-                                    .beta = t.s.beta,
-                                };
-                                t.matvec.matvec_q8_0_kmajor_accumulate(
-                                    params,
-                                    c_bytes,
-                                    a_view.bytes,
-                                    b_view.bytes,
-                                    @alignCast(t.scratch[tid][local * acc_stride ..][0..acc_stride]),
-                                    @alignCast(t.scratch[tid][prep_base + ti_k * prep_stride ..][0..prep_stride]),
-                                    local == 0,
-                                    ti_k == 0,
-                                    is_last_k,
-                                ) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                            }
-                        }
-                        return;
-                    }
-
-                    var coords_buf: [8]usize = undefined;
-                    var cached_a_tile0: ?usize = null;
-
-                    var tile_index: usize = start;
-                    while (tile_index < end) : (tile_index += 1) {
-                        if (t.stop.load(.acquire)) return;
-
-                        const coords: []usize = coords_buf[0..rank_local];
-                        tensor_store.decodeTileCoords(t.c_meta, tile_index, coords) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-
-                        const ti_m: usize = coords[rank_local - 2];
-                        const ti_n: usize = coords[rank_local - 1];
-
-                        var c_tile = t.store.acquireTileMutLinear(t.s.c, tile_index) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseMut(c_tile.token);
-                        const c_view0 = c_tile.bufferView();
-                        const m_tile: usize = c_view0.layout.shape[rank_local - 2];
-                        const n_tile: usize = c_view0.layout.shape[rank_local - 1];
-
-                        if (t.b_dtype == .q8_0 and m_tile == 1 and k_tiles_local > 1) {
-                            const batch: []const usize = coords[0 .. rank_local - 2];
-                            const a_tile_index0: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, 0 }, null) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            const prepare_a = cached_a_tile0 == null or cached_a_tile0.? != a_tile_index0;
-                            const acc_reserve = n_tile * 64;
-                            const prep_stride = std.mem.alignForward(usize, (t.a_meta.tile_shape[rank_local - 1] / 32) * 36, 32);
-                            var fused_ti_k: usize = 0;
-                            while (fused_ti_k < k_tiles_local) : (fused_ti_k += 1) {
-                                const a_tile_index: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, fused_ti_k }, null) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                const b_tile_index: usize = tensor_store.projectTileIndex(t.b_meta, batch, &.{ fused_ti_k, ti_n }, null) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-
-                                const a_tile = t.store.acquireTileConstLinear(t.s.a, a_tile_index) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(a_tile.token);
-                                const b_tile = t.store.acquireTileConstLinear(t.s.b, b_tile_index) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(b_tile.token);
-                                const a_view = a_tile.bufferView();
-                                const b_view = b_tile.bufferView();
-                                const params: MatMulParams = .{
-                                    .m = 1,
-                                    .n = n_tile,
-                                    .k = a_view.layout.shape[rank_local - 1],
-                                    .alpha = t.s.alpha,
-                                    .beta = t.s.beta,
-                                };
-                                t.matvec.matvec_q8_0_kmajor_accumulate(
-                                    params,
-                                    c_view0.bytes,
-                                    a_view.bytes,
-                                    b_view.bytes,
-                                    t.scratch[tid][0..acc_reserve],
-                                    @alignCast(t.scratch[tid][acc_reserve + fused_ti_k * prep_stride ..][0..prep_stride]),
-                                    prepare_a,
-                                    fused_ti_k == 0,
-                                    fused_ti_k + 1 == k_tiles_local,
-                                ) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                            }
-                            cached_a_tile0 = a_tile_index0;
-                            continue;
-                        }
-
-                        var ti_k: usize = 0;
-                        while (ti_k < k_tiles_local) : (ti_k += 1) {
-                            const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
-
-                            const batch: []const usize = coords[0 .. rank_local - 2];
-                            const a_tile_index: usize = tensor_store.projectTileIndex(t.a_meta, batch, &.{ ti_m, ti_k }, null) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            const b_tile_index: usize = tensor_store.projectTileIndex(t.b_meta, batch, &.{ ti_k, ti_n }, null) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-
-                            const a_tile = t.store.acquireTileConstLinear(t.s.a, a_tile_index) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseConst(a_tile.token);
-                            const b_tile = t.store.acquireTileConstLinear(t.s.b, b_tile_index) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseConst(b_tile.token);
-
-                            const a_view = a_tile.bufferView();
-                            const b_view = b_tile.bufferView();
-                            const k_tile: usize = a_view.layout.shape[rank_local - 1];
-                            const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = t.s.alpha, .beta = beta_tile };
-
-                            switch (t.b_dtype) {
-                                .f32 => {
-                                    if (matmul_routing.isMatvecShape(m_tile)) {
-                                        t.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    } else {
-                                        const mk: matmul_registry.F32Kernels = if (k_tile <= t.matmul_f32.tuning.kc and n_tile <= t.matmul_f32.tuning.nc)
-                                            t.matmul_f32
-                                        else
-                                            (matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse {
-                                                t.fail(BackendError.InvalidArgument);
-                                                return;
-                                            });
-
-                                        mk.pack_b_tile(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                        const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                                        const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                                        const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-                                        mk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                .f16 => {
-                                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile) orelse t.matmul_f32;
-                                    if (matmul_routing.isMatvecShape(m_tile) and t.c_dtype == .f16) {
-                                        t.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    } else {
-                                        matmulF16ViaPackedF32(mk, t.scratch[tid], params, t.c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                .q4_0 => {
-                                    const qk: matmul_q_registry.QuantKernels = (t.matmul_q.forTile(k_tile, n_tile) orelse {
-                                            t.fail(BackendError.InvalidArgument);
-                                            return;
-                                        });
-
-                                    qk.pack_b_tile_q4_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
-
-                                    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(t.scratch[tid][0..qk.packed_b_bytes]);
-                                    qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                        t.fail(e);
-                                        return;
-                                    };
-                                },
-                                .q8_0 => {
-                                    if (matmul_routing.shouldUseQ8DirectMatvec(params)) {
-                                        t.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    } else {
-                                        const qk: matmul_q_registry.QuantKernels = (t.matmul_q.forTile(k_tile, n_tile) orelse {
-                                                t.fail(BackendError.InvalidArgument);
-                                                return;
-                                            });
-
-                                        qk.pack_b_tile_q8_0(t.scratch[tid], k_tile, n_tile, b_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-
-                                        const packed_b_view: matmul_q_registry.PackedBView = @alignCast(t.scratch[tid][0..qk.packed_b_bytes]);
-                                        qk.matmul_packed_b(t.scratch[tid], packed_b_view, params, c_view0.bytes, a_view.bytes) catch |e| {
-                                            t.fail(e);
-                                            return;
-                                        };
-                                    }
-                                },
-                                else => {
-                                    t.fail(BackendError.Unsupported);
-                                    return;
-                                },
-                            }
-                        }
-                    }
-                }
-            };
-
-            var task: Task = .{
-                .store = store,
-                .c_meta = c_meta,
-                .a_meta = a_meta,
-                .b_meta = b_meta,
-                .b_dtype = b_dtype,
-                .c_dtype = c_dtype,
-                .s = s,
-                .scratch = ctx.matmul_scratch,
-                .matmul_f32 = ctx.matmul_f32,
-                .matmul_q = ctx.matmul_q,
-                .matvec = ctx.matvec,
-                .thread_count = ctx.thread_count,
-            };
-
-            const threads_total: usize = ctx.thread_count;
-            const max_grain_for_parallelism: usize = @max(@as(usize, 1), tile_total / threads_total);
-            var grain: usize = @min(@as(usize, 32), max_grain_for_parallelism);
-            if (grain == 0) grain = 1;
-
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
-    }
-
-    var coords_buf: [8]usize = undefined;
-
-    var tile_index: usize = 0;
-    while (tile_index < tile_total) : (tile_index += 1) {
-        const coords: []usize = coords_buf[0..rank];
-        try tensor_store.decodeTileCoords(c_meta, tile_index, coords);
-
-        const ti_m: usize = coords[rank - 2];
-        const ti_n: usize = coords[rank - 1];
-
-        var c_tile = try store.acquireTileMutLinear(s.c, tile_index);
-        defer store.releaseMut(c_tile.token);
-        const c_view0 = c_tile.bufferView();
-        const m_tile: usize = c_view0.layout.shape[rank - 2];
-        const n_tile: usize = c_view0.layout.shape[rank - 1];
-
-        var ti_k: usize = 0;
-        while (ti_k < k_tiles) : (ti_k += 1) {
-            const beta_tile: f32 = if (ti_k == 0) s.beta else 1.0;
-
-            const batch: []const usize = coords[0 .. rank - 2];
-            const a_tile_index: usize = try tensor_store.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null);
-            const b_tile_index: usize = try tensor_store.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null);
-
-            const a_tile = try store.acquireTileConstLinear(s.a, a_tile_index);
-            defer store.releaseConst(a_tile.token);
-            const b_tile = try store.acquireTileConstLinear(s.b, b_tile_index);
-            defer store.releaseConst(b_tile.token);
-
-            const a_view = a_tile.bufferView();
-            const b_view = b_tile.bufferView();
-            const k_tile: usize = a_view.layout.shape[rank - 1];
-            const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile, .alpha = s.alpha, .beta = beta_tile };
-
-            switch (b_dtype) {
-                .f32 => {
-                    if (matmul_routing.isMatvecShape(m_tile)) {
-                        try ctx.matvec.matvec_f32(params, c_view0.bytes, a_view.bytes, b_view.bytes);
-                    } else {
-                        const mk: matmul_registry.F32Kernels = if (k_tile <= ctx.matmul_f32.tuning.kc and n_tile <= ctx.matmul_f32.tuning.nc)
-                            ctx.matmul_f32
-                        else
-                            (matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                        var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                            break :blk tmp;
-                        };
-                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                        try mk.pack_b_tile(scratch_buf, k_tile, n_tile, b_view.bytes);
-                        const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                        const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                        const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
-                        try mk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
-                    }
-                },
-                .f16 => {
-                    const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile) orelse ctx.matmul_f32;
-                    const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                        const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                        const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                        break :blk tmp;
-                    };
-                    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                    if (matmul_routing.isMatvecShape(m_tile) and c_dtype == .f16) {
-                        try ctx.matvec.matvec_f16(params, c_view0.bytes, a_view.bytes, b_view.bytes);
-                    } else {
-                        try matmulF16ViaPackedF32(mk, scratch_buf, params, c_dtype, c_view0.bytes, a_view.bytes, b_view.bytes);
-                    }
-                },
-                .q4_0 => {
-                    const qk: matmul_q_registry.QuantKernels = (ctx.matmul_q.forTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                    var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                        const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                        const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                        break :blk tmp;
-                    };
-                    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                    try qk.pack_b_tile_q4_0(scratch_buf, k_tile, n_tile, b_view.bytes);
-                    const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
-                    try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
-                },
-                .q8_0 => {
-                    if (matmul_routing.shouldUseQ8DirectMatvec(params)) {
-                        try ctx.matvec.matvec_q8_0_kmajor(params, c_view0.bytes, a_view.bytes, b_view.bytes);
-                    } else {
-                        const qk: matmul_q_registry.QuantKernels = (ctx.matmul_q.forTile(k_tile, n_tile) orelse return BackendError.InvalidArgument);
-
-                        var scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                            const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                            const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                            break :blk tmp;
-                        };
-                        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                        try qk.pack_b_tile_q8_0(scratch_buf, k_tile, n_tile, b_view.bytes);
-                        const packed_b_view: matmul_q_registry.PackedBView = @alignCast(scratch_buf[0..qk.packed_b_bytes]);
-                        try qk.matmul_packed_b(scratch_buf, packed_b_view, params, c_view0.bytes, a_view.bytes);
-                    }
-                },
-                else => return BackendError.Unsupported,
-            }
-        }
-    }
+/// f32 bytes of a float tensor: the bytes themselves when already f32, a new f32
+/// copy of an f16 one.
+fn widen(allocator: std.mem.Allocator, dtype: DType, bytes: []u8) ExecuteProgramError![]u8 {
+    return switch (dtype) {
+        .f32 => bytes,
+        .f16 => blk: {
+            const src: []align(1) const f16 = std.mem.bytesAsSlice(f16, bytes);
+            const out = allocator.alloc(f32, src.len) catch return BackendError.ExecutionFailed;
+            for (out, src) |*d, v| d.* = v;
+            break :blk std.mem.sliceAsBytes(out);
+        },
+        else => BackendError.Unsupported,
+    };
 }
 
-fn execMatMulTiledBatchedF16Grouped(
-    ctx: *MatMulExecCtx,
-    s: executable.StepMatMulTiled,
-    store: tensor_store.TensorStore,
-    c_meta: tensor_store.TensorMeta,
-    a_meta: tensor_store.TensorMeta,
-    b_meta: tensor_store.TensorMeta,
-    c_dtype: DType,
-) ExecuteProgramError!void {
-    const rank: usize = @as(usize, c_meta.rank);
-    if (rank < 3 or rank > 8) return BackendError.InvalidArgument;
+/// Free a copy `widen` made.
+fn unwiden(allocator: std.mem.Allocator, bytes: []u8) void {
+    allocator.free(@as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes))));
+}
 
-    const prefix_rank: usize = rank - 2;
-    const m_dim: usize = rank - 2;
-    const n_dim: usize = rank - 1;
-
-    const m_tiles: usize = c_meta.tile_counts[m_dim];
-    const n_tiles: usize = c_meta.tile_counts[n_dim];
-    const k_tiles: usize = a_meta.tile_counts[n_dim];
-
-    var prefix_total: usize = 1;
-    var d: usize = 0;
-    while (d < prefix_rank) : (d += 1) {
-        prefix_total *= c_meta.tile_counts[d];
-    }
-    const group_total: usize = prefix_total * n_tiles;
-
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and group_total >= 2) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                c_meta: tensor_store.TensorMeta,
-                a_meta: tensor_store.TensorMeta,
-                b_meta: tensor_store.TensorMeta,
-                c_dtype: DType,
-                s: executable.StepMatMulTiled,
-                scratch: [][]align(32) u8,
-                matmul_f32: matmul_registry.F32Kernels,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn decodePrefix(t: @This(), prefix_idx: usize, out: []usize) void {
-                    var x: usize = prefix_idx;
-                    var rr: usize = 0;
-                    while (rr < out.len) : (rr += 1) {
-                        const d_rev: usize = out.len - 1 - rr;
-                        const tc: usize = t.c_meta.tile_counts[d_rev];
-                        out[d_rev] = x % tc;
-                        x /= tc;
-                    }
-                }
-
-                fn runGroups(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (tid >= t.scratch.len) return;
-                    if (t.stop.load(.acquire)) return;
-
-                    const rank_local: usize = @as(usize, t.c_meta.rank);
-                    const prefix_rank_local: usize = rank_local - 2;
-                    const m_dim_local: usize = rank_local - 2;
-                    const n_dim_local: usize = rank_local - 1;
-                    const m_tiles_local: usize = t.c_meta.tile_counts[m_dim_local];
-                    const n_tiles_local: usize = t.c_meta.tile_counts[n_dim_local];
-                    const k_tiles_local: usize = t.a_meta.tile_counts[n_dim_local];
-
-                    var prefix_coords: [8]usize = @splat(0);
-                    var c_coords: [8]usize = @splat(0);
-                    var a_coords: [8]usize = @splat(0);
-
-                    var g: usize = start;
-                    while (g < end) : (g += 1) {
-                        if (t.stop.load(.acquire)) return;
-
-                        const prefix_idx: usize = g / n_tiles_local;
-                        const ti_n: usize = g % n_tiles_local;
-                        t.decodePrefix(prefix_idx, prefix_coords[0..prefix_rank_local]);
-
-                        var ti_k: usize = 0;
-                        while (ti_k < k_tiles_local) : (ti_k += 1) {
-                            if (t.stop.load(.acquire)) return;
-
-                            const b_idx: usize = tensor_store.projectTileIndex(t.b_meta, prefix_coords[0..prefix_rank_local], &.{ ti_k, ti_n }, null) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            const b_tile = t.store.acquireTileConstLinear(t.s.b, b_idx) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                            defer t.store.releaseConst(b_tile.token);
-                            const b_view = b_tile.bufferView();
-
-                            const k_tile: usize = b_view.layout.shape[m_dim_local];
-                            const n_tile_b: usize = b_view.layout.shape[n_dim_local];
-                            const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(t.matmul_f32, k_tile, n_tile_b) orelse t.matmul_f32;
-                            if (k_tile > mk.tuning.kc or n_tile_b > mk.tuning.nc) {
-                                t.fail(BackendError.InvalidArgument);
-                                return;
-                            }
-
-                            const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                            const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                            if (t.scratch[tid].len < pb_bytes_len) {
-                                t.fail(BackendError.InvalidArgument);
-                                return;
-                            }
-
-                            const packed_b_mut: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, t.scratch[tid][0..pb_bytes_len]));
-                            mk.pack_b_tile_f16_to_packed_f32(packed_b_mut, k_tile, n_tile_b, b_view.bytes) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-
-                            var ti_m: usize = 0;
-                            while (ti_m < m_tiles_local) : (ti_m += 1) {
-                                if (t.stop.load(.acquire)) return;
-
-                                var qd: usize = 0;
-                                while (qd < prefix_rank_local) : (qd += 1) {
-                                    c_coords[qd] = prefix_coords[qd];
-                                    a_coords[qd] = if (t.a_meta.shape[qd] == 1) 0 else prefix_coords[qd];
-                                }
-                                c_coords[m_dim_local] = ti_m;
-                                c_coords[n_dim_local] = ti_n;
-                                a_coords[m_dim_local] = ti_m;
-                                a_coords[n_dim_local] = ti_k;
-
-                                const c_idx: usize = tensor_store.encodeTileIndex(t.c_meta, c_coords[0..rank_local]) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                const a_idx: usize = tensor_store.encodeTileIndex(t.a_meta, a_coords[0..rank_local]) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-
-                                var c_tile = t.store.acquireTileMutLinear(t.s.c, c_idx) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseMut(c_tile.token);
-                                const c_view = c_tile.bufferView();
-
-                                const a_tile = t.store.acquireTileConstLinear(t.s.a, a_idx) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                                defer t.store.releaseConst(a_tile.token);
-                                const a_view = a_tile.bufferView();
-
-                                const m_tile: usize = c_view.layout.shape[m_dim_local];
-                                const n_tile: usize = c_view.layout.shape[n_dim_local];
-                                const k_tile_m: usize = a_view.layout.shape[n_dim_local];
-                                const beta_tile: f32 = if (ti_k == 0) t.s.beta else 1.0;
-                                const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile_m, .alpha = t.s.alpha, .beta = beta_tile };
-
-                                runF16TilePackedB(mk, t.scratch[tid], packed_b_mut, params, t.c_dtype, c_view.bytes, a_view.bytes) catch |e| {
-                                    t.fail(e);
-                                    return;
-                                };
-                            }
-                        }
-                    }
-                }
-            };
-
-            var task: Task = .{
-                .store = store,
-                .c_meta = c_meta,
-                .a_meta = a_meta,
-                .b_meta = b_meta,
-                .c_dtype = c_dtype,
-                .s = s,
-                .scratch = ctx.matmul_scratch,
-                .matmul_f32 = ctx.matmul_f32,
-            };
-
-            const threads_total: usize = ctx.thread_count;
-            const max_grain_for_parallelism: usize = @max(@as(usize, 1), group_total / threads_total);
-            var grain: usize = @min(@as(usize, 16), max_grain_for_parallelism);
-            if (grain == 0) grain = 1;
-
-            p.parallelForAny(@ptrCast(&task), group_total, grain, Task.runGroups);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
+fn matmulFlat(ctx: *MatMulExecCtx, s: executable.StepMatMul, c_meta: tensor_store.TensorMeta, a_meta: tensor_store.TensorMeta, b_meta: tensor_store.TensorMeta, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) ExecuteProgramError!void {
+    const cr: usize = c_meta.rank;
+    const k: usize = a_meta.shape[a_meta.rank - 1];
+    const n: usize = c_meta.shape[cr - 1];
+    if (b_meta.rank == 2) {
+        var m: usize = 1;
+        for (c_meta.shape[0 .. cr - 1]) |d| m *= d;
+        return matmul2D(ctx, s, m, n, k, c_bytes, a_bytes, b_bytes, b_meta.dtype);
     }
 
-    var prefix_coords: [8]usize = @splat(0);
-    var c_coords: [8]usize = @splat(0);
-    var a_coords: [8]usize = @splat(0);
+    const batched: Batched = .init(c_meta, a_meta, b_meta, c_bytes, a_bytes, b_bytes);
+    const m: usize = c_meta.shape[cr - 2];
+    const batches = batched.count();
 
-    var prefix_idx: usize = 0;
-    while (prefix_idx < prefix_total) : (prefix_idx += 1) {
-        var x: usize = prefix_idx;
-        var rr: usize = 0;
-        while (rr < prefix_rank) : (rr += 1) {
-            const d_rev: usize = prefix_rank - 1 - rr;
-            const tc: usize = c_meta.tile_counts[d_rev];
-            prefix_coords[d_rev] = x % tc;
-            x /= tc;
-        }
+    // A GEMM per batch: one grid over every batch's tasks, sized so the whole of it
+    // is about a task per thread.
+    if (!matvecRoute(m, b_meta.dtype)) {
+        const threads_per_batch = std.math.divCeil(usize, @max(ctx.thread_count, 1), batches) catch unreachable;
+        const plan = planGemm(ctx, s, m, n, k, b_meta.dtype, threads_per_batch);
+        const Job = struct {
+            plan: GemmPlan,
+            batched: Batched,
+            scratch: [][]align(32) u8,
 
-        var ti_n: usize = 0;
-        while (ti_n < n_tiles) : (ti_n += 1) {
-            var ti_k: usize = 0;
-            while (ti_k < k_tiles) : (ti_k += 1) {
-                const b_idx: usize = try tensor_store.projectTileIndex(b_meta, prefix_coords[0..prefix_rank], &.{ ti_k, ti_n }, null);
-                const b_tile = try store.acquireTileConstLinear(s.b, b_idx);
-                defer store.releaseConst(b_tile.token);
-                const b_view = b_tile.bufferView();
-
-                const k_tile: usize = b_view.layout.shape[m_dim];
-                const n_tile_b: usize = b_view.layout.shape[n_dim];
-                const mk: matmul_registry.F32Kernels = matmul_registry.selectForTile(ctx.matmul_f32, k_tile, n_tile_b) orelse ctx.matmul_f32;
-
-                const scratch_buf: []align(32) u8 = if (ctx.matmul_scratch.len != 0) ctx.matmul_scratch[0] else blk: {
-                    const scratch_need: usize = @max(matmul_registry.maxScratchBytes(), ctx.matmul_q.scratchBytes());
-                    const tmp = ctx.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), scratch_need) catch return BackendError.ExecutionFailed;
-                    break :blk tmp;
-                };
-                defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch_buf);
-
-                const pb_f32_len: usize = mk.tuning.kc * mk.tuning.nc;
-                const pb_bytes_len: usize = pb_f32_len * @sizeOf(f32);
-                if (scratch_buf.len < pb_bytes_len) return BackendError.InvalidArgument;
-                const packed_b_mut: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch_buf[0..pb_bytes_len]));
-                try mk.pack_b_tile_f16_to_packed_f32(packed_b_mut, k_tile, n_tile_b, b_view.bytes);
-
-                var ti_m: usize = 0;
-                while (ti_m < m_tiles) : (ti_m += 1) {
-                    var qd: usize = 0;
-                    while (qd < prefix_rank) : (qd += 1) {
-                        c_coords[qd] = prefix_coords[qd];
-                        a_coords[qd] = if (a_meta.shape[qd] == 1) 0 else prefix_coords[qd];
-                    }
-                    c_coords[m_dim] = ti_m;
-                    c_coords[n_dim] = ti_n;
-                    a_coords[m_dim] = ti_m;
-                    a_coords[n_dim] = ti_k;
-
-                    const c_idx: usize = try tensor_store.encodeTileIndex(c_meta, c_coords[0..rank]);
-                    const a_idx: usize = try tensor_store.encodeTileIndex(a_meta, a_coords[0..rank]);
-
-                    var c_tile = try store.acquireTileMutLinear(s.c, c_idx);
-                    defer store.releaseMut(c_tile.token);
-                    const c_view = c_tile.bufferView();
-
-                    const a_tile = try store.acquireTileConstLinear(s.a, a_idx);
-                    defer store.releaseConst(a_tile.token);
-                    const a_view = a_tile.bufferView();
-
-                    const m_tile: usize = c_view.layout.shape[m_dim];
-                    const n_tile: usize = c_view.layout.shape[n_dim];
-                    const k_tile_m: usize = a_view.layout.shape[n_dim];
-                    const beta_tile: f32 = if (ti_k == 0) s.beta else 1.0;
-                    const params: MatMulParams = .{ .m = m_tile, .n = n_tile, .k = k_tile_m, .alpha = s.alpha, .beta = beta_tile };
-
-                    try runF16TilePackedB(mk, scratch_buf, packed_b_mut, params, c_dtype, c_view.bytes, a_view.bytes);
+            fn run(x: @This(), lo: usize, hi: usize, tid: usize) BackendError!void {
+                for (lo..hi) |i| {
+                    const off = x.batched.offsets(i / x.plan.tasks);
+                    try gemmTask(x.plan, i % x.plan.tasks, x.scratch[tid], x.batched.c[off.c..], x.batched.a[off.a..], x.batched.b[off.b..]);
                 }
             }
+        };
+        const job: Job = .{ .plan = plan, .batched = batched, .scratch = ctx.matmul_scratch };
+        return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, batches * plan.tasks, exec_utils.parallel_min_bytes, job, Job.run);
+    }
+
+    // Matvec-shaped batches: with a thread's worth of them, each thread takes whole
+    // batches (alone, on its own scratch); otherwise the batches run in turn.
+    const Job = struct {
+        ctx: *MatMulExecCtx,
+        s: executable.StepMatMul,
+        batched: Batched,
+        m: usize,
+        n: usize,
+        k: usize,
+        serial: bool,
+
+        fn run(x: @This(), lo: usize, hi: usize, tid: usize) ExecuteProgramError!void {
+            var solo: MatMulExecCtx = x.ctx.*;
+            if (x.serial) {
+                solo.pool = null;
+                solo.thread_count = 1;
+                solo.matmul_scratch = x.ctx.matmul_scratch[tid .. tid + 1];
+            }
+            for (lo..hi) |bi| {
+                const off = x.batched.offsets(bi);
+                try matmul2D(&solo, x.s, x.m, x.n, x.k, x.batched.c[off.c..], x.batched.a[off.a..], x.batched.b[off.b..], x.batched.b_dtype);
+            }
+        }
+    };
+    const whole_batches = ctx.pool != null and batches >= ctx.thread_count;
+    const job: Job = .{ .ctx = ctx, .s = s, .batched = batched, .m = m, .n = n, .k = k, .serial = whole_batches };
+    if (!whole_batches) return job.run(0, batches, 0);
+    return exec_utils.parallelRange(ExecuteProgramError, ctx.pool, ctx.thread_count, batches, m * n * k * @sizeOf(f32), job, Job.run);
+}
+
+/// The batch coordinates of a batched matmul, as byte offsets into A, B and C.
+const Batched = struct {
+    rank: usize,
+    shape: [MAX_RANK]usize,
+    /// Per batch axis: bytes between consecutive coordinates, 0 where the operand
+    /// broadcasts over it.
+    a_stride: [MAX_RANK]usize,
+    b_stride: [MAX_RANK]usize,
+    c_stride: [MAX_RANK]usize,
+    b_dtype: DType,
+    a: []const u8,
+    b: []const u8,
+    c: []u8,
+
+    const MAX_RANK: usize = 8;
+
+    fn init(c_meta: tensor_store.TensorMeta, a_meta: tensor_store.TensorMeta, b_meta: tensor_store.TensorMeta, c: []u8, a: []const u8, b: []const u8) Batched {
+        const r: usize = c_meta.rank;
+        var x: Batched = .{ .rank = r - 2, .shape = undefined, .a_stride = undefined, .b_stride = undefined, .c_stride = undefined, .b_dtype = b_meta.dtype, .a = a, .b = b, .c = c };
+        // One matrix of each: A and C are f32, B any dtype (a quantized B is packed blocks).
+        var a_run: usize = a_meta.shape[r - 2] * a_meta.shape[r - 1] * @sizeOf(f32);
+        var b_run: usize = backend_utils.requiredBytesForElems(b_meta.dtype, b_meta.shape[r - 2] * b_meta.shape[r - 1]) catch 0;
+        var c_run: usize = c_meta.shape[r - 2] * c_meta.shape[r - 1] * @sizeOf(f32);
+        var axis = r - 2;
+        while (axis > 0) {
+            axis -= 1;
+            x.shape[axis] = c_meta.shape[axis];
+            x.a_stride[axis] = if (a_meta.shape[axis] == 1) 0 else a_run;
+            x.b_stride[axis] = if (b_meta.shape[axis] == 1) 0 else b_run;
+            x.c_stride[axis] = c_run;
+            a_run *= a_meta.shape[axis];
+            b_run *= b_meta.shape[axis];
+            c_run *= c_meta.shape[axis];
+        }
+        return x;
+    }
+
+    fn count(x: Batched) usize {
+        var n: usize = 1;
+        for (x.shape[0..x.rank]) |d| n *= d;
+        return n;
+    }
+
+    const Offsets = struct { a: usize = 0, b: usize = 0, c: usize = 0 };
+
+    /// Batch `bi` of C, and the batch of A and of B it reads.
+    fn offsets(x: Batched, bi: usize) Offsets {
+        var rem = bi;
+        var off: Offsets = .{};
+        var axis: usize = x.rank;
+        while (axis > 0) {
+            axis -= 1;
+            const coord = rem % x.shape[axis];
+            rem /= x.shape[axis];
+            off.a += coord * x.a_stride[axis];
+            off.b += coord * x.b_stride[axis];
+            off.c += coord * x.c_stride[axis];
+        }
+        return off;
+    }
+};
+
+/// Columns a matvec thread takes at a time: a multiple of every kernel's column
+/// step, and wide enough that a call's fixed cost stays small next to its reads.
+const MATVEC_COLUMN_GROUP: usize = 16;
+
+/// Whether `m` rows against a B of `b_dtype` go through a matvec kernel rather than
+/// a packed GEMM: one row of floats, or up to `Q8_DIRECT_MAX_M` rows of q8.
+fn matvecRoute(m: usize, b_dtype: DType) bool {
+    return switch (b_dtype) {
+        .f32, .f16 => m == 1,
+        .q8_0 => matmul_routing.shouldUseQ8DirectMatvec(.{ .m = m, .n = 1, .k = 1 }),
+        else => false,
+    };
+}
+
+/// `C[m, n] = alpha * A[m, k] @ B[k, n] + beta * C` on flat row-major operands.
+fn matmul2D(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k: usize, c: []u8, a: []const u8, b: []const u8, b_dtype: DType) ExecuteProgramError!void {
+    if (m == 0 or n == 0) return;
+    const groups = std.math.divCeil(usize, n, MATVEC_COLUMN_GROUP) catch unreachable;
+
+    if (matvecRoute(m, b_dtype) and b_dtype != .q8_0) {
+        // One row against a float B: the matvec kernels read column ranges of B in place.
+        const Ctx = struct {
+            mv: matvec_registry.Kernels,
+            params: MatMulParams,
+            f16: bool,
+            c: []u8,
+            a: []const u8,
+            b: []const u8,
+
+            fn run(x: @This(), lo: usize, hi: usize, _: usize) BackendError!void {
+                const j0 = lo * MATVEC_COLUMN_GROUP;
+                const cnt = @min(hi * MATVEC_COLUMN_GROUP, x.params.n) - j0;
+                return if (x.f16) x.mv.matvec_f16_range(x.params, j0, cnt, x.c, x.a, x.b) else x.mv.matvec_f32_range(x.params, j0, cnt, x.c, x.a, x.b);
+            }
+        };
+        const eb = b_dtype.info().block_bytes;
+        const ctx2: Ctx = .{ .mv = ctx.matvec, .params = .{ .m = 1, .n = n, .k = k, .alpha = s.alpha, .beta = s.beta }, .f16 = b_dtype == .f16, .c = c, .a = a, .b = b };
+        return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, groups, MATVEC_COLUMN_GROUP * k * eb, ctx2, Ctx.run);
+    }
+
+    if (matvecRoute(m, b_dtype)) {
+        // A few rows against a K-blocked q8 B: read B in place, column ranges per thread.
+        const blk = b_dtype.info();
+        const Ctx = struct {
+            mv: matvec_registry.Kernels,
+            m: usize,
+            n: usize,
+            k: usize,
+            alpha: f32,
+            beta: f32,
+            block_bytes: usize,
+            c: []u8,
+            a: []const u8,
+            b: []const u8,
+
+            fn run(x: @This(), lo: usize, hi: usize, _: usize) BackendError!void {
+                const j0 = lo * MATVEC_COLUMN_GROUP;
+                const cnt = @min(hi * MATVEC_COLUMN_GROUP, x.n) - j0;
+                const params: MatMulParams = .{ .m = x.m, .n = cnt, .k = x.k, .lda = x.k, .ldb = x.n, .ldc = x.n, .alpha = x.alpha, .beta = x.beta };
+                return x.mv.matvec_q8_0_kmajor(params, x.c[j0 * @sizeOf(f32) ..], x.a, x.b[j0 * x.block_bytes ..]);
+            }
+        };
+        const ctx2: Ctx = .{ .mv = ctx.matvec, .m = m, .n = n, .k = k, .alpha = s.alpha, .beta = s.beta, .block_bytes = blk.block_bytes, .c = c, .a = a, .b = b };
+        const col_bytes = (k / blk.block_elems) * blk.block_bytes;
+        return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, groups, MATVEC_COLUMN_GROUP * col_bytes, ctx2, Ctx.run);
+    }
+
+    const plan = planGemm(ctx, s, m, n, k, b_dtype, ctx.thread_count);
+    const Job = struct {
+        plan: GemmPlan,
+        scratch: [][]align(32) u8,
+        c: []u8,
+        a: []const u8,
+        b: []const u8,
+
+        fn run(x: @This(), lo: usize, hi: usize, tid: usize) BackendError!void {
+            for (lo..hi) |task| try gemmTask(x.plan, task, x.scratch[tid], x.c, x.a, x.b);
+        }
+    };
+    const job: Job = .{ .plan = plan, .scratch = ctx.matmul_scratch, .c = c, .a = a, .b = b };
+    // Compute-heavy: a task is worth a thread as soon as there are two of them.
+    return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, plan.tasks, exec_utils.parallel_min_bytes, job, Job.run);
+}
+
+/// A blocked GEMM's grid: `row_groups x col_blocks` tasks, each a `rows x nc` block
+/// of C that walks K in `kc` blocks.
+const GemmPlan = struct {
+    s: executable.StepMatMul,
+    mk: matmul_registry.F32Kernels,
+    qk: matmul_q_registry.QuantKernels,
+    b_dtype: DType,
+    m: usize,
+    n: usize,
+    k: usize,
+    kc: usize,
+    nc: usize,
+    rows: usize,
+    row_groups: usize,
+    tasks: usize,
+};
+
+/// Lay out `threads` tasks over C. B is packed once per row group and A once per
+/// column block, so the grid balances the two: `col_blocks ~ sqrt(threads * n * cost / m)`,
+/// with `cost` what packing a B element costs next to copying an A element (a q4
+/// block is unpacked, a q8 one reordered, floats only copied).
+fn planGemm(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k: usize, b_dtype: DType, threads_in: usize) GemmPlan {
+    const quant = b_dtype.info().is_quantized;
+    const kc: usize = if (quant) ctx.matmul_q.default.tuning.kc else ctx.matmul_f32.tuning.kc;
+    const nc_max: usize = if (quant) ctx.matmul_q.default.tuning.nc else ctx.matmul_f32.tuning.nc;
+    const threads = @max(threads_in, 1);
+    const cost: f64 = switch (b_dtype) {
+        .q4_0 => 3.0,
+        .q8_0 => 1.5,
+        else => 1.0,
+    };
+    const ideal = @sqrt(@as(f64, @floatFromInt(threads)) * @as(f64, @floatFromInt(n)) * cost / @as(f64, @floatFromInt(m)));
+    const max_blocks = std.math.divCeil(usize, n, MATVEC_COLUMN_GROUP) catch unreachable;
+    const want_blocks = std.math.clamp(@as(usize, @intFromFloat(@round(ideal))), 1, max_blocks);
+    const nc: usize = std.math.clamp(std.mem.alignForward(usize, std.math.divCeil(usize, n, want_blocks) catch unreachable, MATVEC_COLUMN_GROUP), MATVEC_COLUMN_GROUP, nc_max);
+    const col_blocks = std.math.divCeil(usize, n, nc) catch unreachable;
+    // Rows split only as far as the threads need, and never into slivers. Rounded
+    // down: a grid a few tasks past a multiple of the threads idles most of them
+    // through a second wave (36 tasks on 32 threads runs like 64).
+    const min_rows: usize = 16;
+    const want_groups = @max(@as(usize, 1), threads / col_blocks);
+    const row_groups_max = @max(@as(usize, 1), m / min_rows);
+    var rows = std.math.divCeil(usize, m, @min(want_groups, row_groups_max)) catch unreachable;
+    rows = @max(rows, 1);
+    const row_groups = std.math.divCeil(usize, m, rows) catch unreachable;
+    return .{
+        .s = s,
+        .mk = ctx.matmul_f32,
+        .qk = ctx.matmul_q.default,
+        .b_dtype = b_dtype,
+        .m = m,
+        .n = n,
+        .k = k,
+        .kc = kc,
+        .nc = nc,
+        .rows = rows,
+        .row_groups = row_groups,
+        .tasks = col_blocks * row_groups,
+    };
+}
+
+/// One task of `plan`: its `rows x nc` block of C, K walked in `kc` blocks -- each
+/// B block packed straight from flat B, then the kernel run on strided A and C.
+fn gemmTask(p: GemmPlan, task: usize, scratch: []align(32) u8, c: []u8, a: []const u8, b: []const u8) BackendError!void {
+    const info = p.b_dtype.info();
+    const j0 = (task / p.row_groups) * p.nc;
+    const r0 = (task % p.row_groups) * p.rows;
+    if (r0 >= p.m or j0 >= p.n) return;
+    const nw = @min(p.nc, p.n - j0);
+    const rw = @min(p.rows, p.m - r0);
+    const c_blk = c[(r0 * p.n + j0) * @sizeOf(f32) ..];
+    var pc: usize = 0;
+    while (pc < p.k) : (pc += p.kc) {
+        const kw = @min(p.kc, p.k - pc);
+        const params: MatMulParams = .{ .m = rw, .n = nw, .k = kw, .lda = p.k, .ldc = p.n, .alpha = p.s.alpha, .beta = if (pc == 0) p.s.beta else 1.0 };
+        const a_blk = a[(r0 * p.k + pc) * @sizeOf(f32) ..];
+        switch (p.b_dtype) {
+            .q8_0, .q4_0 => {
+                // K-blocked B: block row `pc / block_elems`, N blocks apart.
+                const b_blk = b[((pc / info.block_elems) * p.n + j0) * info.block_bytes ..];
+                if (p.b_dtype == .q8_0) try p.qk.pack_b_tile_q8_0(scratch, kw, nw, p.n, b_blk) else try p.qk.pack_b_tile_q4_0(scratch, kw, nw, p.n, b_blk);
+                const view: matmul_q_registry.PackedBView = @alignCast(scratch[0..p.qk.packed_b_bytes]);
+                try p.qk.matmul_packed_b(scratch, view, params, c_blk, a_blk);
+            },
+            .f32, .f16 => {
+                const pb_bytes = p.mk.tuning.kc * p.mk.tuning.nc * @sizeOf(f32);
+                const b_blk = b[(pc * p.n + j0) * info.block_bytes ..];
+                if (p.b_dtype == .f32) {
+                    try p.mk.pack_b_tile(scratch, kw, nw, p.n, b_blk);
+                } else {
+                    const pb: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
+                    try p.mk.pack_b_tile_f16_to_packed_f32(pb, kw, nw, p.n, b_blk);
+                }
+                const view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
+                try p.mk.matmul_packed_b(scratch, view, params, c_blk, a_blk);
+            },
+            else => return BackendError.Unsupported,
         }
     }
 }

@@ -22,14 +22,14 @@ pub fn updateMaxF32(max_buf: []f32, in_view: types.BufferViewConst, rank: usize)
         return;
     }
 
-    const m_tile: usize = in_view.layout.shape[0];
-    const n_tile: usize = in_view.layout.shape[1];
+    const rows: usize = in_view.layout.shape[0];
+    const cols: usize = in_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         var m: f32 = max_buf[r];
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
         var c: usize = 0;
-        while (c < n_tile) : (c += 1) {
+        while (c < cols) : (c += 1) {
             m = @max(m, in[off + c]);
         }
         max_buf[r] = m;
@@ -65,16 +65,16 @@ pub fn expSumStoreF32(sum_buf: []f32, out_view: types.BufferViewMut, in_view: ty
         return;
     }
 
-    const m_tile: usize = in_view.layout.shape[0];
-    const n_tile: usize = in_view.layout.shape[1];
+    const rows: usize = in_view.layout.shape[0];
+    const cols: usize = in_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         const m: f32 = max_buf[r];
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
 
         var acc_v: Vec = @splat(@as(f32, 0.0));
         var c: usize = 0;
-        const vec_end: usize = n_tile - (n_tile % lanes);
+        const vec_end: usize = cols - (cols % lanes);
         while (c < vec_end) : (c += lanes) {
             const xv: Vec = @as(*align(1) const Vec, @ptrCast(in.ptr + off + c)).*;
             const ev: Vec = expFastVec(lanes, xv - @as(Vec, @splat(m)));
@@ -82,7 +82,7 @@ pub fn expSumStoreF32(sum_buf: []f32, out_view: types.BufferViewMut, in_view: ty
             acc_v += ev;
         }
         var acc: f32 = @reduce(.Add, acc_v);
-        while (c < n_tile) : (c += 1) {
+        while (c < cols) : (c += 1) {
             const e: f32 = expFast(in[off + c] - m);
             out[off + c] = e;
             acc += e;
@@ -109,20 +109,20 @@ pub fn normalizeF32(out_view: types.BufferViewMut, sum_buf: []const f32, rank: u
         return;
     }
 
-    const m_tile: usize = out_view.layout.shape[0];
-    const n_tile: usize = out_view.layout.shape[1];
+    const rows: usize = out_view.layout.shape[0];
+    const cols: usize = out_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         const inv: f32 = 1.0 / sum_buf[r];
         const inv_v: Vec = @splat(inv);
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
         var c: usize = 0;
-        const vec_end: usize = n_tile - (n_tile % lanes);
+        const vec_end: usize = cols - (cols % lanes);
         while (c < vec_end) : (c += lanes) {
             const v: Vec = @as(*align(1) const Vec, @ptrCast(out.ptr + off + c)).*;
             @as(*align(1) Vec, @ptrCast(out.ptr + off + c)).* = v * inv_v;
         }
-        while (c < n_tile) : (c += 1) out[off + c] *= inv;
+        while (c < cols) : (c += 1) out[off + c] *= inv;
     }
 }
 
@@ -235,14 +235,14 @@ pub fn updateMaxF16(max_buf: []f32, in_view: types.BufferViewConst, rank: usize)
         return;
     }
 
-    const m_tile: usize = in_view.layout.shape[0];
-    const n_tile: usize = in_view.layout.shape[1];
+    const rows: usize = in_view.layout.shape[0];
+    const cols: usize = in_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         var m: f32 = max_buf[r];
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
         var c: usize = 0;
-        while (c < n_tile) : (c += 1) m = @max(m, @as(f32, @floatCast(in[off + c])));
+        while (c < cols) : (c += 1) m = @max(m, @as(f32, @floatCast(in[off + c])));
         max_buf[r] = m;
     }
 }
@@ -260,15 +260,15 @@ pub fn sumExpF16(sum_buf: []f32, in_view: types.BufferViewConst, max_buf: []cons
         return;
     }
 
-    const m_tile: usize = in_view.layout.shape[0];
-    const n_tile: usize = in_view.layout.shape[1];
+    const rows: usize = in_view.layout.shape[0];
+    const cols: usize = in_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         const m: f32 = max_buf[r];
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
         var acc: f32 = 0.0;
         var c: usize = 0;
-        while (c < n_tile) : (c += 1) acc += expFast(@as(f32, @floatCast(in[off + c])) - m);
+        while (c < cols) : (c += 1) acc += expFast(@as(f32, @floatCast(in[off + c])) - m);
         sum_buf[r] += acc;
     }
 }
@@ -295,15 +295,15 @@ pub fn expNormalizeStoreF16(
         return;
     }
 
-    const m_tile: usize = out_view.layout.shape[0];
-    const n_tile: usize = out_view.layout.shape[1];
+    const rows: usize = out_view.layout.shape[0];
+    const cols: usize = out_view.layout.shape[1];
     var r: usize = 0;
-    while (r < m_tile) : (r += 1) {
+    while (r < rows) : (r += 1) {
         const m: f32 = max_buf[r];
         const inv: f32 = 1.0 / sum_buf[r];
-        const off: usize = r * n_tile;
+        const off: usize = r * cols;
         var c: usize = 0;
-        while (c < n_tile) : (c += 1) {
+        while (c < cols) : (c += 1) {
             out[off + c] = @floatCast(expFast(@as(f32, @floatCast(in[off + c])) - m) * inv);
         }
     }

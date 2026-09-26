@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Elide reshape/retile copies between byte-identical layouts while preserving distinct
+//! Elide reshape copies between byte-identical layouts while preserving distinct
 //! destination metadata and aliasing its backing during workspace planning.
 
 const std = @import("std");
@@ -11,7 +11,6 @@ const editor_mod = @import("editor.zig");
 const Editor = editor_mod.Editor;
 const PlacedStep = executable.PlacedStep;
 const StorageManager = manager_mod.StorageManager;
-const TiledTensor = manager_mod.TiledTensor;
 const TensorId = manager_mod.TensorId;
 
 pub const Error = editor_mod.Error;
@@ -19,38 +18,18 @@ pub const Error = editor_mod.Error;
 /// destination -> source. The destination borrows the source's backing.
 pub const AliasMap = std.AutoHashMap(TensorId, TensorId);
 
-/// Whether tensors have matching tile lengths/offsets and flat row-major byte order.
-/// Offsets alone are insufficient because tile-major layouts can reorder values.
+/// Whether two tensors hold byte-identical layouts: every tensor is packed row-major,
+/// so a reshape changes only the shape its bytes are read with.
 pub fn layoutsIdentical(mgr: *const StorageManager, a_id: TensorId, b_id: TensorId) bool {
     const a = mgr.getConst(a_id) catch return false;
     const b = mgr.getConst(b_id) catch return false;
-    if (a.dtype != b.dtype) return false;
-    if (a.tile_lens.len != b.tile_lens.len) return false;
-    if (a.tile_offsets.len != b.tile_offsets.len) return false;
-    for (a.tile_lens, b.tile_lens) |x, y| if (x != y) return false;
-    for (a.tile_offsets, b.tile_offsets) |x, y| if (x != y) return false;
-    return rowMajorChunked(a) and rowMajorChunked(b);
-}
-
-/// Whether tile-coordinate order preserves flat row-major order.
-/// Every axis before the last split axis must contribute one element per tile.
-fn rowMajorChunked(t: *const TiledTensor) bool {
-    var split: usize = t.rank;
-    while (split > 0) {
-        if (t.tile_shape[split - 1] < t.shape[split - 1]) break;
-        split -= 1;
-    }
-    if (split == 0) return true; // one tile spans every axis
-    for (t.tile_shape[0 .. split - 1]) |extent| {
-        if (extent != 1) return false;
-    }
-    return true;
+    if (a.dtype != b.dtype or a.chunkCount() != 1 or b.chunkCount() != 1) return false;
+    return (a.byteLen() catch return false) == (b.byteLen() catch return false);
 }
 
 fn viewPair(step: *const PlacedStep) ?struct { src: TensorId, dst: TensorId } {
     return switch (step.op) {
         .ReshapeScalar => |s| .{ .src = s.src, .dst = s.dst },
-        .ReTileCopyScalar => |s| .{ .src = s.src, .dst = s.dst },
         else => null,
     };
 }

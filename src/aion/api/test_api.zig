@@ -146,7 +146,7 @@ test "api: topk survives an export/load round-trip" {
 }
 
 test "api: copy moves every element of a rank-4 tensor" {
-    // A tile byte length taken from the leading two dims only silently truncated
+    // A byte length taken from the leading two dims only silently truncated
     // rank-3+ copies, which a KV append then carried into the cache as stale bytes.
     const allocator: std.mem.Allocator = std.testing.allocator;
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
@@ -413,14 +413,12 @@ test "api: elemwise broadcasting accepts a size-1 scalar operand" {
     for (want, 0..) |w, i| try std.testing.expectApproxEqAbs(w, out_vals[i], 1e-6);
 }
 
-test "api: scalar broadcast spans multiple column tiles" {
+test "api: scalar broadcast covers every element of a wide tensor" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer ctx.deinit();
 
-    // Last dim 200 > base_square_2d (64), so out has 4 column tiles while the
-    // scalar has exactly one — the scalar must pair with every tile.
     const rows: usize = 3;
     const cols: usize = 200;
     const x_vals: []f32 = try allocator.alloc(f32, rows * cols);
@@ -2859,7 +2857,7 @@ test "api: a quantized 2-D weight serves a 3-D activation without reshaping" {
     var out: [2 * n]f32 = undefined;
     try out_t.read(&out);
 
-    // Against a q8_0 reference computed from the same values, so a wrong tile walk
+    // Against a q8_0 reference computed from the same values, so a wrong block walk
     // over the broadcast weight cannot agree with itself.
     for (0..2) |row| {
         for (0..n) |col| {
@@ -2870,11 +2868,9 @@ test "api: a quantized 2-D weight serves a 3-D activation without reshaping" {
     }
 }
 
-test "api: an authored q8_0 weight is tiled for the matmul at any rank" {
-    // Quantized tensors are the one thing `ensureTilingMaybeRetile` will not
-    // re-tile, so authoring must land on the tiling the matmul wants — the same one
-    // the loader picks. K/N are large enough that the matmul wants sub-tiles; a
-    // small weight's whole-tensor tile matches by luck and proves nothing.
+test "api: an authored q8_0 weight feeds the matmul at any rank" {
+    // An authored weight takes the same layout as a loaded one. K/N are large enough
+    // that the matmul's blocked paths run, not just its small-shape fallbacks.
     const allocator: std.mem.Allocator = std.testing.allocator;
     const K: usize = 4352;
     const N: usize = 1024;
@@ -3398,6 +3394,67 @@ fn dequantQ8KN(allocator: std.mem.Allocator, packed_bytes: []const u8, k: usize,
     return out;
 }
 
+// A loaded host weight is a view of the file mapping: no copy. Writing to it takes a
+// private copy first, so the write lands in memory and never in the file.
+test "api: loaded host weights are views of the mapping, copied on write" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
+        .{ 1.0, -2.0, 0.5 },
+        .{ 3.0, 4.0, -1.5 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "mapped.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    var bld = api.Builder.init(&export_ctx);
+    defer bld.deinit();
+    const X: api.TensorRef = try bld.name(try bld.input(.f32, &[_]usize{ 1, 2 }), "x");
+    const W: api.TensorRef = try bld.name(try bld.param(w_t), "w");
+    const Y: api.TensorRef = try bld.matmul(X, W, 1.0, 0.0);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var load_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer load_ctx.deinit();
+
+    const run = struct {
+        fn f(ctx: *api.Context, model: *api.LoadedModel) ![3]f32 {
+            try model.bindInput("x", try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }}));
+            try model.run();
+            var out: [3]f32 = undefined;
+            try (try model.outputTensor("y")).read(&out);
+            return out;
+        }
+    }.f;
+
+    {
+        var model = try load_ctx.loadModel(file, .{});
+        defer model.deinit();
+
+        const w = try model.initializerTensorByDebugName("w");
+        const meta = try load_ctx.store.getConst(w.tensorId());
+        try std.testing.expect(meta.mapping != null);
+        try std.testing.expect(!meta.owns_data);
+        try std.testing.expect(std.mem.isAligned(@intFromPtr(meta.data.ptr), 64));
+        try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -8.0, 2.5 }, &try run(&load_ctx, &model));
+
+        try w.writeF32(&[_]f32{ 1, 0, 0, 0, 1, 0 });
+        const after = try load_ctx.store.getConst(w.tensorId());
+        try std.testing.expect(after.mapping == null);
+        try std.testing.expect(after.owns_data);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 2.0, -1.0, 0.0 }, &try run(&load_ctx, &model));
+    }
+
+    // The file still holds the original weight.
+    var again = try load_ctx.loadModel(file, .{});
+    defer again.deinit();
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -8.0, 2.5 }, &try run(&load_ctx, &again));
+}
+
 // Synthetic replacement for the old opt-in real-checkpoint (Gemma) verification:
 // a q8_0 weight exported + loaded must stay q8_0 at its packed byte size (not be
 // silently dequantized/inflated), and the loaded model must execute to the same
@@ -3739,76 +3796,6 @@ test "api: builder control-flow wrappers compile and run (If + Loop, in-process)
         var v: [1]f32 = undefined;
         try (try model.outputTensor("out")).read(&v);
         try std.testing.expectApproxEqAbs(@as(f32, 9.0), v[0], 1e-6);
-    }
-}
-
-test "api: a retile inside an untaken If branch does not corrupt an outer shared constant" {
-    // Regression: a region body that retiles a value defined OUTSIDE it must not
-    // rebind that value for the code after the region. The copy that fills the
-    // retiled tensor lives in the branch's block, so it only runs when the branch
-    // is taken -- a rebinding that escapes makes every later consumer read a
-    // tensor nothing wrote.
-    //
-    // The classic victim is a Builder-shared constant: `zeros(W)` is the identity
-    // beta of EVERY norm of that width in the model. One norm inside a tower that
-    // an `If` skips was enough to feed uninitialized memory to all 175 norms of a
-    // Gemma-4 decoder, which reads as a plausible-looking but wrong model.
-    const allocator: std.mem.Allocator = std.testing.allocator;
-    const W: usize = 512;
-    const M: usize = 4;
-
-    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
-    defer ctx.deinit();
-
-    var bld = api.Builder.init(&ctx);
-    defer bld.deinit();
-
-    var gamma_v: [W]f32 = @splat(1.0);
-    const gamma: api.TensorRef = try bld.param(try ctx.fromF32(&[_]usize{W}, &gamma_v));
-    const beta: api.TensorRef = try bld.zeros(W);
-
-    // The branch norm reads a matmul result, whose tiling the GEMM policy picks;
-    // the outer norm reads an input, which is one whole tile. Different last-dim
-    // tiles are what make the branch retile the shared `beta` at all.
-    const cond = try bld.name(try bld.input(.i32, &[_]usize{1}), "cond");
-    const x = try bld.name(try bld.input(.f32, &[_]usize{ 1, M, W }), "x");
-    var w_v: [W * W]f32 = @splat(0.01);
-    const w = try bld.param(try ctx.fromF32(&[_]usize{ W, W }, &w_v));
-
-    try bld.beginRegion();
-    const branch = try bld.rmsnorm(try bld.matmul(x, w, 1.0, 0.0), gamma, beta, 1e-6, &[_]usize{W});
-    const then_region = try bld.endRegion(&[_]api.TensorRef{branch});
-    try bld.beginRegion();
-    const else_region = try bld.endRegion(&[_]api.TensorRef{try bld.mul(x, try bld.constant(0.0))});
-    const picked = try bld.ifThenElse(cond, then_region, else_region);
-
-    const normed = try bld.name(try bld.rmsnorm(x, gamma, beta, 1e-6, &[_]usize{W}), "normed");
-    const out = try bld.name(try bld.add(normed, try bld.mul(picked, try bld.constant(0.0))), "out");
-
-    var model = try ctx.compile(&bld, &[_]api.TensorRef{out}, .{});
-    defer model.deinit();
-
-    var xv: [M * W]f32 = undefined;
-    for (&xv, 0..) |*v, i| v.* = @floatFromInt((i % 7) + 1);
-    try model.bindInput("x", try ctx.fromF32(&[_]usize{ 1, M, W }, &xv));
-    // cond = 0: the branch that retiles `beta` never runs.
-    try model.bindInput("cond", try ctx.vector([_]i32{0}));
-    try model.run();
-
-    var got: [M * W]f32 = undefined;
-    try (try model.outputTensor("out")).read(&got);
-
-    for (0..M) |r| {
-        var sumsq: f64 = 0.0;
-        for (0..W) |c| {
-            const v: f64 = xv[r * W + c];
-            sumsq += v * v;
-        }
-        const inv: f64 = 1.0 / @sqrt(sumsq / @as(f64, @floatFromInt(W)) + 1e-6);
-        for (0..W) |c| {
-            const want: f32 = @floatCast(@as(f64, xv[r * W + c]) * inv);
-            try std.testing.expectApproxEqAbs(want, got[r * W + c], 1e-4);
-        }
     }
 }
 
@@ -4802,5 +4789,259 @@ test "api: output tensors are snapshots of their run, and a held one outlives la
         try std.testing.expectEqual(@as(f32, 14.0), try first(e));
         e.release();
         try std.testing.expect(!(try ctx.store.tensorHasBacking(e.id)));
+    }
+}
+
+// Big enough to fork the pool, in the shapes each elementwise split handles: identical,
+// a suffix (row) broadcast, a broadcast over a middle axis, and a lower-rank operand.
+// Each row-range split must agree with a plain reference.
+test "api: large elementwise, unary and cast ops agree with a reference under threads" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 4 });
+    defer ctx.deinit();
+
+    const Case = struct { a: []const usize, b: []const usize };
+    const cases = [_]Case{
+        .{ .a = &.{ 4, 64, 1024 }, .b = &.{ 4, 64, 1024 } }, // identical
+        .{ .a = &.{ 4, 64, 1024 }, .b = &.{1024} }, // suffix row
+        .{ .a = &.{ 4, 64, 1024 }, .b = &.{ 4, 1, 1024 } }, // middle-axis broadcast
+        .{ .a = &.{ 1, 256, 1024 }, .b = &.{ 256, 1 } }, // lower rank, last axis broadcast
+    };
+    for (cases) |case| {
+        var na: usize = 1;
+        for (case.a) |d| na *= d;
+        var nb: usize = 1;
+        for (case.b) |d| nb *= d;
+        const av = try allocator.alloc(f32, na);
+        defer allocator.free(av);
+        const bv = try allocator.alloc(f32, nb);
+        defer allocator.free(bv);
+        for (av, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) * 0.03;
+        for (bv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.25;
+
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const x = try bld.name(try bld.input(.f32, case.a), "x");
+        const y = try bld.name(try bld.input(.f32, case.b), "y");
+        const sum = try bld.add(x, y);
+        const gelu = try bld.unary(.gelu, sum);
+        const half = try bld.cast(sum, .f16);
+        var model = try ctx.compileOn(.cpu, &bld, &[_]api.TensorRef{ sum, gelu, half }, .{});
+        defer model.deinit();
+        try model.bindInput("x", try ctx.fromF32(case.a, av));
+        try model.bindInput("y", try ctx.fromF32(case.b, bv));
+        try model.run();
+
+        const got_sum = try allocator.alloc(f32, na);
+        defer allocator.free(got_sum);
+        const got_gelu = try allocator.alloc(f32, na);
+        defer allocator.free(got_gelu);
+        const got_half = try allocator.alloc(f16, na);
+        defer allocator.free(got_half);
+        try (try model.outputTensorAt(0)).read(got_sum);
+        try (try model.outputTensorAt(1)).read(got_gelu);
+        try (try model.outputTensorAt(2)).read(got_half);
+
+        // Reference: numpy-style right-aligned broadcasting of `y` onto `x`'s shape.
+        const rank = case.a.len;
+        const off = rank - case.b.len;
+        for (0..na) |i| {
+            var rem = i;
+            var bi: usize = 0;
+            var bstride: usize = 1;
+            var axis = rank;
+            while (axis > 0) {
+                axis -= 1;
+                const coord = rem % case.a[axis];
+                rem /= case.a[axis];
+                if (axis < off) continue;
+                const bd = case.b[axis - off];
+                if (bd != 1) bi += coord * bstride;
+                bstride *= bd;
+            }
+            const want = av[i] + bv[bi];
+            try std.testing.expectEqual(want, got_sum[i]);
+            try std.testing.expectEqual(@as(f16, @floatCast(want)), got_half[i]);
+            const g = 0.5 * want * (1.0 + std.math.tanh(0.7978845608 * (want + 0.044715 * want * want * want)));
+            try std.testing.expectApproxEqAbs(g, got_gelu[i], 1e-3);
+        }
+    }
+}
+
+// Row-wise ops on tensors big enough to split across threads, along the last axis
+// and along a middle one: softmax, both norms, axis and full reductions, and a 2D
+// transpose. The reference is computed here in f64, so a wrong row split or stride
+// shows up as a whole wrong row, far outside the tolerances.
+test "api: large softmax, norm, reduce and transpose ops agree with a reference under threads" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 4 });
+    defer ctx.deinit();
+
+    const B = 8;
+    const T = 64;
+    const D = 512;
+    const n = B * T * D;
+    const xv = try allocator.alloc(f32, n);
+    defer allocator.free(xv);
+    for (xv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7919) % 211)) - 105)) * 0.02;
+    var gv: [D]f32 = undefined;
+    var bv: [D]f32 = undefined;
+    for (&gv, &bv, 0..) |*g, *b, i| {
+        g.* = 0.5 + @as(f32, @floatFromInt(i % 17)) * 0.05;
+        b.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.1;
+    }
+    const R = 384;
+    const C = 640;
+    const mv = try allocator.alloc(f32, R * C);
+    defer allocator.free(mv);
+    for (mv, 0..) |*v, i| v.* = @floatFromInt(i);
+
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const x = try bld.name(try bld.input(.f32, &.{ B, T, D }), "x");
+    const gamma = try bld.name(try bld.input(.f32, &.{D}), "gamma");
+    const beta = try bld.name(try bld.input(.f32, &.{D}), "beta");
+    const m = try bld.name(try bld.input(.f32, &.{ R, C }), "m");
+    const outs = [_]api.TensorRef{
+        try bld.softmax(x, -1),
+        try bld.softmax(x, 1),
+        try bld.rmsnorm(x, gamma, beta, 1e-6, &.{D}),
+        try bld.layernorm(x, gamma, beta, 1e-5, &.{D}),
+        try bld.reduceAxis(.sum, x, 2),
+        try bld.reduceAxis(.mean, x, 1),
+        try bld.reduce(.mean, x),
+        try bld.transpose2d(m),
+    };
+    var model = try ctx.compileOn(.cpu, &bld, &outs, .{});
+    defer model.deinit();
+    try model.bindInput("x", try ctx.fromF32(&.{ B, T, D }, xv));
+    try model.bindInput("gamma", try ctx.fromF32(&.{D}, &gv));
+    try model.bindInput("beta", try ctx.fromF32(&.{D}, &bv));
+    try model.bindInput("m", try ctx.fromF32(&.{ R, C }, mv));
+    try model.run();
+
+    const got = try allocator.alloc(f32, n);
+    defer allocator.free(got);
+    const at = struct {
+        fn f(b: usize, t: usize, d: usize) usize {
+            return (b * T + t) * D + d;
+        }
+    }.f;
+
+    // Softmax over the last axis, then over T.
+    try (try model.outputTensorAt(0)).read(got);
+    for (0..B) |b| for (0..T) |t| {
+        var mx: f64 = -std.math.inf(f64);
+        for (0..D) |d| mx = @max(mx, xv[at(b, t, d)]);
+        var sum: f64 = 0;
+        for (0..D) |d| sum += @exp(@as(f64, xv[at(b, t, d)]) - mx);
+        for (0..D) |d| try std.testing.expectApproxEqRel(@exp(@as(f64, xv[at(b, t, d)]) - mx) / sum, got[at(b, t, d)], 2e-3);
+    };
+    try (try model.outputTensorAt(1)).read(got);
+    for (0..B) |b| for (0..D) |d| {
+        var mx: f64 = -std.math.inf(f64);
+        for (0..T) |t| mx = @max(mx, xv[at(b, t, d)]);
+        var sum: f64 = 0;
+        for (0..T) |t| sum += @exp(@as(f64, xv[at(b, t, d)]) - mx);
+        for (0..T) |t| try std.testing.expectApproxEqRel(@exp(@as(f64, xv[at(b, t, d)]) - mx) / sum, got[at(b, t, d)], 2e-3);
+    };
+
+    // RMSNorm, then LayerNorm, over D.
+    for ([_]bool{ false, true }, 2..) |centered, slot| {
+        try (try model.outputTensorAt(slot)).read(got);
+        for (0..B) |b| for (0..T) |t| {
+            var mean: f64 = 0;
+            for (0..D) |d| mean += xv[at(b, t, d)];
+            mean /= D;
+            const mu: f64 = if (centered) mean else 0;
+            var sq: f64 = 0;
+            for (0..D) |d| sq += (xv[at(b, t, d)] - mu) * (xv[at(b, t, d)] - mu);
+            const eps: f64 = if (centered) 1e-5 else 1e-6;
+            const inv = 1.0 / @sqrt(sq / D + eps);
+            for (0..D) |d| try std.testing.expectApproxEqAbs((xv[at(b, t, d)] - mu) * inv * gv[d] + bv[d], got[at(b, t, d)], 1e-4);
+        };
+    }
+
+    // Sum over D, mean over T, mean of everything.
+    try (try model.outputTensorAt(4)).read(got[0 .. B * T]);
+    for (0..B) |b| for (0..T) |t| {
+        var sum: f64 = 0;
+        for (0..D) |d| sum += xv[at(b, t, d)];
+        try std.testing.expectApproxEqAbs(sum, got[b * T + t], 1e-3);
+    };
+    try (try model.outputTensorAt(5)).read(got[0 .. B * D]);
+    var total: f64 = 0;
+    for (0..B) |b| for (0..D) |d| {
+        var sum: f64 = 0;
+        for (0..T) |t| sum += xv[at(b, t, d)];
+        total += sum;
+        try std.testing.expectApproxEqAbs(sum / T, got[b * D + d], 1e-4);
+    };
+    try (try model.outputTensorAt(6)).read(got[0..1]);
+    try std.testing.expectApproxEqAbs(total / n, got[0], 1e-4);
+
+    // Transpose: exact.
+    try (try model.outputTensorAt(7)).read(got[0 .. R * C]);
+    for (0..C) |c| for (0..R) |r| try std.testing.expectEqual(mv[r * C + c], got[c * R + r]);
+}
+
+// Shapes that drive every matmul route under threads: decode rows against f32 and q8
+// weights (the column-split matvecs), a q8 weight at a few rows, GEMMs big enough to
+// grid and deep enough to take several K blocks, and a batched B.
+test "api: matmuls agree with a reference under threads on every route" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 4 });
+    defer ctx.deinit();
+
+    const Case = struct { a: []const usize, w: []const usize, q8: bool = false };
+    const cases = [_]Case{
+        .{ .a = &.{ 1, 1, 2048 }, .w = &.{ 2048, 1536 } }, // decode, f32 weight
+        .{ .a = &.{ 1, 1, 1024 }, .w = &.{ 1024, 2048 }, .q8 = true }, // decode, q8 weight
+        .{ .a = &.{ 1, 8, 1024 }, .w = &.{ 1024, 1536 }, .q8 = true }, // a few rows, q8
+        .{ .a = &.{ 256, 1024 }, .w = &.{ 1024, 768 } }, // GEMM, several K blocks
+        .{ .a = &.{ 96, 512 }, .w = &.{ 512, 640 }, .q8 = true }, // GEMM, q8 weight
+        .{ .a = &.{ 4, 64, 128 }, .w = &.{ 4, 128, 96 } }, // batched B
+    };
+    for (cases) |case| {
+        const ra = case.a.len;
+        const rw = case.w.len;
+        const k = case.a[ra - 1];
+        const n = case.w[rw - 1];
+        var rows: usize = 1;
+        for (case.a[0 .. ra - 1]) |d| rows *= d;
+        var nw: usize = 1;
+        for (case.w) |d| nw *= d;
+        const av = try allocator.alloc(f32, rows * k);
+        defer allocator.free(av);
+        const wv = try allocator.alloc(f32, nw);
+        defer allocator.free(wv);
+        for (av, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 101)) - 50)) * 0.01;
+        for (wv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 89)) - 44)) * 0.0113;
+
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const x = try bld.name(try bld.input(.f32, case.a), "x");
+        const w_t = try ctx.fromF32(case.w, wv);
+        const w = try bld.paramNamed(w_t, "w", .{ .quantize = if (case.q8) .q8_0 else null });
+        w_t.release();
+        const y = try bld.matmul(x, w, 1.0, 0.0);
+        var model = try ctx.compileOn(.cpu, &bld, &[_]api.TensorRef{y}, .{});
+        defer model.deinit();
+        try model.bindInput("x", try ctx.fromF32(case.a, av));
+        try model.run();
+        const got = try allocator.alloc(f32, rows * n);
+        defer allocator.free(got);
+        try (try model.outputTensorAt(0)).read(got);
+
+        // Batched B: C's leading dim picks B's batch; otherwise B is shared by every row.
+        const batched = rw == 3;
+        const m_per_batch: usize = if (batched) case.a[ra - 2] else rows;
+        const tol: f32 = if (case.q8) 0.1 else 1e-3;
+        for (0..rows) |r| for (0..n) |j| {
+            const bb: usize = if (batched) r / m_per_batch else 0;
+            var acc: f64 = 0;
+            for (0..k) |kk| acc += @as(f64, av[r * k + kk]) * @as(f64, wv[(bb * k + kk) * n + j]);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), got[r * n + j], tol);
+        };
     }
 }

@@ -13,10 +13,9 @@
 
 const std = @import("std");
 const types = @import("../backend/types.zig");
-const api_tiling = @import("tiling.zig");
 
 pub const DType = types.DType;
-pub const max_rank = api_tiling.MAX_RANK;
+pub const max_rank = @import("../runtime/tensor_store.zig").max_rank;
 
 pub const Error = error{InvalidArgument};
 

@@ -175,14 +175,6 @@ AionStatus aion_tensor_create(
     const size_t* shape,
     AionTensor** out_tensor);
 
-AionStatus aion_tensor_create_tiled(
-    AionContext* ctx,
-    AionDType dtype,
-    size_t rank,
-    const size_t* shape,
-    const size_t* tile_shape,
-    AionTensor** out_tensor);
-
 void aion_tensor_destroy(AionTensor* t);
 
 AionStatus aion_tensor_to(AionTensor* t, AionDeviceKind kind, uint32_t index);

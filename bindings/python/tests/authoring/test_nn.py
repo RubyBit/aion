@@ -153,8 +153,8 @@ def run_linear(w, x, *, nt):
 def test_nt_weights_match_their_transpose():
     # `nt` contracts against a weight's rows, so `[out, in]` with `nt` and its
     # transpose without it describe the same layer — and the same arithmetic,
-    # whichever kernel each picks. Sized past one q8 block and one N tile so the
-    # tiled path is what runs.
+    # whichever kernel each picks. Sized past one q8 block and one N panel so the
+    # blocked kernels are what run.
     rng = np.random.default_rng(0)
     w = (rng.standard_normal((320, 96)) * 0.1).astype(np.float32)
     x = (rng.standard_normal((2, 5, 96)) * 0.5).astype(np.float32)

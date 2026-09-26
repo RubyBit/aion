@@ -7,7 +7,7 @@
 //   h_t = sigmoid(o) * tanh(c_t)
 //   out[b] = [h_t | c_t]           ([batch, 2H])
 //
-// All tensors packed single tiles: x [B, I], h/c [B, H], w_ih [I, 4H],
+// All tensors packed single buffers: x [B, I], h/c [B, H], w_ih [I, 4H],
 // w_hh [H, 4H], biases [4H]. When p.has_bias == 0 the bias bindings are
 // dummies (the backend rebinds w_ih). Weight reads are column-strided —
 // correctness-first; pre-transposed weights are the perf follow-up if LSTM

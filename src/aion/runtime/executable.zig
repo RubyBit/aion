@@ -24,7 +24,7 @@ pub const Placement = struct {
     }
 };
 
-pub const StepMatMulTiled = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
+pub const StepMatMul = struct { c: TensorId, a: TensorId, b: TensorId, alpha: f32, beta: f32 };
 pub const ElementwiseBroadcastKind = enum(u8) {
     identical,
     scalar_a,
@@ -39,7 +39,7 @@ pub const ElementwiseBroadcastPlan = struct {
     a_broadcast_axes: u8,
     b_broadcast_axes: u8,
 };
-pub const StepElemwiseBinaryTiled = struct {
+pub const StepElemwiseBinary = struct {
     op: types.ElemwiseBinaryOp,
     /// Read only when `op == .gate`: the activation applied to `a` before the multiply
     /// (`gate(a, b) = act(a) * b`). Meaningless for every other op.
@@ -49,9 +49,9 @@ pub const StepElemwiseBinaryTiled = struct {
     b: TensorId,
     broadcast: ElementwiseBroadcastPlan,
 };
-pub const StepUnaryTiled = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
-pub const StepSoftmaxTiled = struct { out: TensorId, a: TensorId, axis: i32 };
-pub const StepConv1DTiled = struct {
+pub const StepUnary = struct { op: types.UnaryOp, out: TensorId, a: TensorId };
+pub const StepSoftmax = struct { out: TensorId, a: TensorId, axis: i32 };
+pub const StepConv1D = struct {
     out: TensorId,
     x: TensorId,
     w: TensorId,
@@ -65,7 +65,7 @@ pub const StepConv1DTiled = struct {
 };
 pub const StepMaxPool2D = struct { out: TensorId, x: TensorId, opts: @import("../graph/window.zig").Pool2D };
 
-pub const StepConv2DTiled = struct {
+pub const StepConv2D = struct {
     out: TensorId,
     x: TensorId,
     w: TensorId,
@@ -81,18 +81,17 @@ pub const StepConv2DTiled = struct {
     pad_mode: types.PadMode,
     groups: usize,
 };
-pub const StepLayerNormTiled = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
+pub const StepLayerNorm = struct { out: TensorId, x: TensorId, gamma: TensorId, beta: TensorId, eps: f32 };
 /// `residual` folds a residual add into the apply pass: `out = residual + rmsnorm(x)*gamma
 /// + beta`. It is a SCHEDULE, not a meaning — `opt/fuse_steps.zig` sets it from a
 /// lowered norm-then-add pair, and no graph op or on-disk record mentions it, so one
 /// `.aion` can still compile to a different schedule per backend.
 ///
-/// When present, residual / x / out are identically shaped AND identically tiled, and the
-/// last dim is whole in one tile: the rowwise kernel contract, enforced by `validateStep`
-/// rather than by the step being its own tag. A configuration of the norm, not a second
+/// When present, residual / x / out are identically shaped: the rowwise kernel contract,
+/// enforced by `validateStep` rather than by the step being its own tag. A configuration of the norm, not a second
 /// norm — which is what keeps residual, scale and the LayerNorm variants from becoming a
 /// tag per combination.
-pub const StepRMSNormTiled = struct {
+pub const StepRMSNorm = struct {
     out: TensorId,
     x: TensorId,
     gamma: TensorId,
@@ -103,7 +102,7 @@ pub const StepRMSNormTiled = struct {
 /// Grouped-query attention; see `graph.Op.Attention`.
 ///
 /// Optional query positions and K/V lengths are independent.
-pub const StepAttentionTiled = struct {
+pub const StepAttention = struct {
     out: TensorId,
     q: TensorId,
     k: TensorId,
@@ -121,7 +120,7 @@ pub const StepAttentionTiled = struct {
 /// - pos_emb:      [H, P, D]
 /// - pos_bias_u/_v:[H, D]
 /// - mask (opt):   [T_q, T_kv] additive
-pub const StepRelPosMHATiled = struct {
+pub const StepRelPosMHA = struct {
     out: TensorId,
     q: TensorId,
     k: TensorId,
@@ -145,7 +144,7 @@ pub const StepTopK = struct { values: TensorId, indices: TensorId, a: TensorId, 
 /// In-place row scatter: buf[idx] = src. Output aliases buf (set in lowering).
 pub const StepScatterRow = struct { buf: TensorId, idx: TensorId, src: TensorId };
 pub const StepConcatScalar = struct { out: TensorId, axis: usize, input_count: u8, inputs: [MAX_CONCAT_INPUTS]TensorId };
-pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
+pub const StepCopy = struct { dst: TensorId, src: TensorId };
 
 /// Gather rows from a 2D table using i32 indices.
 ///
@@ -153,7 +152,7 @@ pub const StepCopyTiled = struct { dst: TensorId, src: TensorId };
 /// - table:   [V, D] (f16/f32)
 /// - indices: [B, L] (i32)
 /// - out:     [B, L, D]
-pub const StepGatherRowsTiled = struct { out: TensorId, table: TensorId, indices: TensorId };
+pub const StepGatherRows = struct { out: TensorId, table: TensorId, indices: TensorId };
 
 /// Rotary positional embedding over 1D positions.
 ///
@@ -161,7 +160,7 @@ pub const StepGatherRowsTiled = struct { out: TensorId, table: TensorId, indices
 /// - x:         [B, L, N, H] (f16/f32)
 /// - positions: [B, L] (i32)
 /// - out:       [B, L, N, H]
-pub const StepRoPE1DTiled = struct {
+pub const StepRoPE1D = struct {
     out: TensorId,
     x: TensorId,
     positions: TensorId,
@@ -173,8 +172,8 @@ pub const StepRoPE1DTiled = struct {
 /// General row gather. The first implementation supports the canonical
 /// `axis == batch_dims` forms used by embeddings and batched sequence pooling.
 /// General gather: `out = data[:axis] ++ indices[batch_dims:] ++ data[axis+1:]`.
-/// The row/embedding steps above cover the large tiled tables; this one covers
-/// every remaining axis/batch_dims/rank combination, for single-tile operands.
+/// The row/embedding steps above cover the large (possibly chunked) tables; this one
+/// covers every remaining axis/batch_dims/rank combination.
 pub const StepGatherND = struct {
     out: TensorId,
     data: TensorId,
@@ -183,7 +182,7 @@ pub const StepGatherND = struct {
     batch_dims: u8,
 };
 
-pub const StepGatherTiled = struct {
+pub const StepGather = struct {
     out: TensorId,
     data: TensorId,
     indices: TensorId,
@@ -197,7 +196,7 @@ pub const StepGatherTiled = struct {
 /// - cache:     [B, T, H_kv, D] (f16/f32), written in-place
 /// - new_kv:    [B, new_len, H_kv, D] (f16/f32), read-only
 /// - end_index: [B] (i32), per-batch append start offsets
-pub const StepSequenceAppendTiled = struct {
+pub const StepSequenceAppend = struct {
     cache: TensorId,
     new_kv: TensorId,
     /// The append position, consumed as a device buffer by any backend that
@@ -207,7 +206,7 @@ pub const StepSequenceAppendTiled = struct {
 };
 
 /// Elementwise scalar-dtype cast (f16 <-> f32 in v1).
-pub const StepCastTiled = struct { out: TensorId, x: TensorId, to_dtype: types.DType };
+pub const StepCast = struct { out: TensorId, x: TensorId, to_dtype: types.DType };
 
 /// Matmul with B conceptually transposed: C[m,n] = sum_k A[m,k] * B[n,k].
 ///
@@ -215,7 +214,7 @@ pub const StepCastTiled = struct { out: TensorId, x: TensorId, to_dtype: types.D
 /// - a: f32 with trailing axis `K` (any leading rank; C's leading axes match A's).
 /// - b: q8_0 `[N, K]` with `quant_axis == 1` (per-row blocks).
 /// - c: f32 `[..., N]`.
-pub const StepMatMulNTTiled = struct {
+pub const StepMatMulNT = struct {
     c: TensorId,
     a: TensorId,
     b: TensorId,
@@ -285,9 +284,6 @@ pub const StepSTFT = struct {
     num_frames: usize,
 };
 
-/// Pack/unpack/re-tiling materialization (scalar only, same shape).
-pub const StepReTileCopyScalar = struct { dst: TensorId, src: TensorId };
-
 /// View materializations (scalar only in v0).
 pub const StepReshapeScalar = struct { dst: TensorId, src: TensorId };
 pub const StepTranspose2DScalar = struct { dst: TensorId, src: TensorId };
@@ -304,32 +300,32 @@ pub const StepTransfer = struct {
 };
 
 pub const Step = union(enum) {
-    MatMulTiled: StepMatMulTiled,
-    ElemwiseBinaryTiled: StepElemwiseBinaryTiled,
-    UnaryTiled: StepUnaryTiled,
-    SoftmaxTiled: StepSoftmaxTiled,
-    Conv1DTiled: StepConv1DTiled,
-    Conv2DTiled: StepConv2DTiled,
+    MatMul: StepMatMul,
+    ElemwiseBinary: StepElemwiseBinary,
+    Unary: StepUnary,
+    Softmax: StepSoftmax,
+    Conv1D: StepConv1D,
+    Conv2D: StepConv2D,
     MaxPool2D: StepMaxPool2D,
-    LayerNormTiled: StepLayerNormTiled,
-    RMSNormTiled: StepRMSNormTiled,
-    AttentionTiled: StepAttentionTiled,
-    RelPosMHATiled: StepRelPosMHATiled,
+    LayerNorm: StepLayerNorm,
+    RMSNorm: StepRMSNorm,
+    Attention: StepAttention,
+    RelPosMHA: StepRelPosMHA,
     ArgMax: StepArgMax,
     TopK: StepTopK,
     ScatterRow: StepScatterRow,
     ReduceAll: StepReduceAll,
     ReduceAxis: StepReduceAxis,
     ConcatScalar: StepConcatScalar,
-    CopyTiled: StepCopyTiled,
+    Copy: StepCopy,
 
-    GatherRowsTiled: StepGatherRowsTiled,
-    GatherTiled: StepGatherTiled,
+    GatherRows: StepGatherRows,
+    Gather: StepGather,
     GatherND: StepGatherND,
 
-    RoPE1DTiled: StepRoPE1DTiled,
+    RoPE1D: StepRoPE1D,
 
-    SequenceAppendTiled: StepSequenceAppendTiled,
+    SequenceAppend: StepSequenceAppend,
 
     LSTMCellFused: StepLSTMCellFused,
 
@@ -339,14 +335,12 @@ pub const Step = union(enum) {
     RFFT: StepRFFT,
     STFT: StepSTFT,
 
-    ReTileCopyScalar: StepReTileCopyScalar,
-
     ReshapeScalar: StepReshapeScalar,
     Transpose2DScalar: StepTranspose2DScalar,
     SliceNDScalar: StepSliceNDScalar,
 
-    CastTiled: StepCastTiled,
-    MatMulNTTiled: StepMatMulNTTiled,
+    Cast: StepCast,
+    MatMulNT: StepMatMulNT,
     Transfer: StepTransfer,
 };
 
@@ -404,25 +398,25 @@ pub const TensorUses = struct {
 pub fn tensorUses(step: *Step) TensorUses {
     var out: TensorUses = .{};
     switch (step.*) {
-        .MatMulTiled => |*s| {
+        .MatMul => |*s| {
             out.add(&s.c, if (s.beta == 0) .write else .read_write);
             out.add(&s.a, .read);
             out.add(&s.b, .read);
         },
-        .ElemwiseBinaryTiled => |*s| {
+        .ElemwiseBinary => |*s| {
             out.add(&s.out, .write);
             out.add(&s.a, .read);
             out.add(&s.b, .read);
         },
-        .UnaryTiled => |*s| {
+        .Unary => |*s| {
             out.add(&s.out, .write);
             out.add(&s.a, .read);
         },
-        .SoftmaxTiled => |*s| {
+        .Softmax => |*s| {
             out.add(&s.out, .write);
             out.add(&s.a, .read);
         },
-        .Conv1DTiled => |*s| {
+        .Conv1D => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
             out.add(&s.w, .read);
@@ -432,19 +426,19 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
         },
-        .Conv2DTiled => |*s| {
+        .Conv2D => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
             out.add(&s.w, .read);
             out.addOptional(&s.bias, .read);
         },
-        .LayerNormTiled => |*s| {
+        .LayerNorm => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
             out.add(&s.gamma, .read);
             out.add(&s.beta, .read);
         },
-        .RMSNormTiled => |*s| {
+        .RMSNorm => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
             out.add(&s.gamma, .read);
@@ -453,7 +447,7 @@ pub fn tensorUses(step: *Step) TensorUses {
             // optional operand may not shift the index of any operand before it.
             out.addOptional(&s.residual, .read);
         },
-        .AttentionTiled => |*s| {
+        .Attention => |*s| {
             out.add(&s.out, .write);
             out.add(&s.q, .read);
             out.add(&s.k, .read);
@@ -461,7 +455,7 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.addOptional(&s.query_positions, .read);
             out.addOptional(&s.kv_lengths, .read);
         },
-        .RelPosMHATiled => |*s| {
+        .RelPosMHA => |*s| {
             out.add(&s.out, .write);
             out.add(&s.q, .read);
             out.add(&s.k, .read);
@@ -497,11 +491,11 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.out, .write);
             for (s.inputs[0..s.input_count]) |*id| out.add(id, .read);
         },
-        .CopyTiled => |*s| {
+        .Copy => |*s| {
             out.add(&s.dst, .write);
             out.add(&s.src, .read);
         },
-        .GatherRowsTiled => |*s| {
+        .GatherRows => |*s| {
             out.add(&s.out, .write);
             out.add(&s.table, .read);
             out.add(&s.indices, .read);
@@ -511,17 +505,17 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.data, .read);
             out.add(&s.indices, .read);
         },
-        .GatherTiled => |*s| {
+        .Gather => |*s| {
             out.add(&s.out, .write);
             out.add(&s.data, .read);
             out.add(&s.indices, .read);
         },
-        .RoPE1DTiled => |*s| {
+        .RoPE1D => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
             out.add(&s.positions, .read);
         },
-        .SequenceAppendTiled => |*s| {
+        .SequenceAppend => |*s| {
             out.add(&s.cache, .read_write);
             out.add(&s.new_kv, .read);
             out.add(&s.end_index, .read);
@@ -559,10 +553,6 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.signal, .read);
             out.add(&s.window, .read);
         },
-        .ReTileCopyScalar => |*s| {
-            out.add(&s.dst, .write);
-            out.add(&s.src, .read);
-        },
         .ReshapeScalar => |*s| {
             out.add(&s.dst, .write);
             out.add(&s.src, .read);
@@ -575,11 +565,11 @@ pub fn tensorUses(step: *Step) TensorUses {
             out.add(&s.dst, .write);
             out.add(&s.src, .read);
         },
-        .CastTiled => |*s| {
+        .Cast => |*s| {
             out.add(&s.out, .write);
             out.add(&s.x, .read);
         },
-        .MatMulNTTiled => |*s| {
+        .MatMulNT => |*s| {
             out.add(&s.c, if (s.beta == 0) .write else .read_write);
             out.add(&s.a, .read);
             out.add(&s.b, .read);
@@ -633,8 +623,8 @@ pub const Block = struct {
 pub const WorkspaceSlot = struct {
     owner: TensorId,
     members: []TensorId,
-    tile_capacities: []usize,
-    host_bytes: usize,
+    /// Bytes of the one buffer, host or device: the largest member.
+    bytes: usize,
     placement: Placement,
     /// True only when the compiler populated the owner (for example Iota/Dim)
     /// and materialization must preserve those bytes.
@@ -720,10 +710,7 @@ pub const ExecutableProgram = struct {
         self.allocator.free(self.outputs);
         if (self.tensor_placements.len != 0) self.allocator.free(self.tensor_placements);
         if (self.owned_tensors.len != 0) self.allocator.free(self.owned_tensors);
-        for (self.workspace_slots) |slot| {
-            self.allocator.free(slot.members);
-            self.allocator.free(slot.tile_capacities);
-        }
+        for (self.workspace_slots) |slot| self.allocator.free(slot.members);
         if (self.workspace_slots.len != 0) self.allocator.free(self.workspace_slots);
         self.* = undefined;
     }
@@ -734,7 +721,7 @@ test "placement verifier requires a step to write where it executes" {
     const gpu: Placement = .{ .kind = .webgpu };
     var steps = [_]PlacedStep{.{
         .placement = gpu,
-        .op = .{ .UnaryTiled = .{ .op = .relu, .out = 2, .a = 1 } },
+        .op = .{ .Unary = .{ .op = .relu, .out = 2, .a = 1 } },
     }};
     // `a` is read-only and host-owned, which is a legal upload; `out` is written
     // on the GPU and so cannot be CPU-placed.

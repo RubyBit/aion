@@ -12,7 +12,6 @@ const manager_mod = @import("../../storage/manager.zig");
 const types = @import("../../backend/types.zig");
 const graph_mod = @import("../graph.zig");
 const opt = @import("../opt.zig");
-const plan_mod = @import("../plan.zig");
 const program = @import("../program.zig");
 
 const alias_views = @import("alias_views.zig");
@@ -23,8 +22,7 @@ const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
 const ValueId = graph_mod.ValueId;
 
-const cpu_tiles: plan_mod.TilePolicy = .{ .tile_alignment = 64 };
-const cpu_target: program.Target = .cpu(cpu_tiles);
+const cpu_target: program.Target = .cpu();
 const weight_layout = @import("weight_layout.zig");
 
 /// The `DeviceRef` a backend kind executes on, for tests that sweep both.
@@ -69,7 +67,7 @@ fn f32Tensor(sm: *StorageManager, shape: []const usize, seed: usize) !TensorId {
     const vals = try std.testing.allocator.alloc(f32, n);
     defer std.testing.allocator.free(vals);
     for (vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + seed) % 11)) - 5)) * 0.1;
-    const tid = try sm.createTiledTensor(.f32, shape, shape, .{ .tile_alignment = 64 });
+    const tid = try sm.createTensor(.f32, shape, .{});
     try sm.writeFromPackedScalar(tid, std.mem.sliceAsBytes(vals));
     return tid;
 }
@@ -224,18 +222,18 @@ test "add_norm: residual + rmsnorm is one step on every target" {
         const M = 2;
         const N = 8;
         const res = try g.addInput(.f32, &.{ M, N });
-        try g.bindExternal(res, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
+        try g.bindExternal(res, try sm.createTensor(.f32, &.{ M, N }, .{}));
         const x = try g.addInput(.f32, &.{ M, N });
-        try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ M, N }, &.{ M, N }, .{}));
+        try g.bindExternal(x, try sm.createTensor(.f32, &.{ M, N }, .{}));
         const gamma = try g.addInput(.f32, &.{N});
-        try g.bindExternal(gamma, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
+        try g.bindExternal(gamma, try sm.createTensor(.f32, &.{N}, .{}));
         const beta = try g.addInput(.f32, &.{N});
-        try g.bindExternal(beta, try sm.createTiledTensor(.f32, &.{N}, &.{N}, .{}));
+        try g.bindExternal(beta, try sm.createTensor(.f32, &.{N}, .{}));
 
         const normed = try g.addRMSNorm(x, gamma, beta, 1e-6, &.{N});
         try g.setOutputs(&.{try g.addElemwiseBinary(.add, res, normed)});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .init(deviceFor(target), .{ .target_kind = target }));
+        var prog = try program.compileGraph(allocator, &g, &sm, .init(deviceFor(target), .row_major));
         defer prog.deinit();
 
         var norms: usize = 0;
@@ -243,12 +241,12 @@ test "add_norm: residual + rmsnorm is one step on every target" {
         var fused: usize = 0;
         for (prog.steps) |step| switch (step.op) {
             // The residual is a field, not a tag, so assert on the operand being there.
-            .RMSNormTiled => |s| if (s.residual != null) {
+            .RMSNorm => |s| if (s.residual != null) {
                 fused += 1;
             } else {
                 norms += 1;
             },
-            .ElemwiseBinaryTiled => adds += 1,
+            .ElemwiseBinary => adds += 1,
             else => {},
         };
 
@@ -278,21 +276,21 @@ test "gate: unary + mul becomes one gate step on every target" {
 
             const N = 8;
             const x = try g.addInput(.f32, &.{ 2, N });
-            try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
+            try g.bindExternal(x, try sm.createTensor(.f32, &.{ 2, N }, .{}));
             const y = try g.addInput(.f32, &.{ 2, N });
-            try g.bindExternal(y, try sm.createTiledTensor(.f32, &.{ 2, N }, &.{ 2, N }, .{}));
+            try g.bindExternal(y, try sm.createTensor(.f32, &.{ 2, N }, .{}));
 
             try g.setOutputs(&.{try g.addElemwiseBinary(.mul, try g.addUnary(act, x), y)});
 
-            var prog = try program.compileGraph(allocator, &g, &sm, .init(deviceFor(target), .{ .target_kind = target }));
+            var prog = try program.compileGraph(allocator, &g, &sm, .init(deviceFor(target), .row_major));
             defer prog.deinit();
 
             var unaries: usize = 0;
             var muls: usize = 0;
             var gates: usize = 0;
             for (prog.steps) |step| switch (step.op) {
-                .UnaryTiled => unaries += 1,
-                .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+                .Unary => unaries += 1,
+                .ElemwiseBinary => |s| if (s.op == .gate) {
                     gates += 1;
                     // The activation has to survive, or every gate would be a GEGLU
                     // regardless of what the graph asked for.
@@ -324,20 +322,20 @@ test "gate: a rank-3 gated FFN fuses" {
 
     const shape = [_]usize{ 1, 4, 16 };
     const gate_v = try g.addInput(.f32, &shape);
-    try g.bindExternal(gate_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
+    try g.bindExternal(gate_v, try sm.createTensor(.f32, &shape, .{}));
     const up_v = try g.addInput(.f32, &shape);
-    try g.bindExternal(up_v, try sm.createTiledTensor(.f32, &shape, &shape, .{}));
+    try g.bindExternal(up_v, try sm.createTensor(.f32, &shape, .{}));
 
     try g.setOutputs(&.{try g.addElemwiseBinary(.mul, try g.addUnary(.silu, gate_v), up_v)});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .{ .target_kind = .webgpu }));
+    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .row_major));
     defer prog.deinit();
 
     var unaries: usize = 0;
     var gates: usize = 0;
     for (prog.steps) |step| switch (step.op) {
-        .UnaryTiled => unaries += 1,
-        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+        .Unary => unaries += 1,
+        .ElemwiseBinary => |s| if (s.op == .gate) {
             gates += 1;
             try std.testing.expectEqual(types.UnaryOp.silu, s.act);
         },
@@ -360,21 +358,21 @@ test "gate: an f16 gate compiles and runs as an unfused pair" {
 
     const shape = [_]usize{ 2, 8 };
     const a = try g.addInput(.f16, &shape);
-    try g.bindExternal(a, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
+    try g.bindExternal(a, try sm.createTensor(.f16, &shape, .{}));
     const b = try g.addInput(.f16, &shape);
-    try g.bindExternal(b, try sm.createTiledTensor(.f16, &shape, &shape, .{}));
+    try g.bindExternal(b, try sm.createTensor(.f16, &shape, .{}));
 
     try g.setOutputs(&.{try g.addElemwiseBinary(.mul, try g.addUnary(.silu, a), b)});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .{ .target_kind = .webgpu }));
+    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .row_major));
     defer prog.deinit();
 
     var unaries: usize = 0;
     var muls: usize = 0;
     var gates: usize = 0;
     for (prog.steps) |step| switch (step.op) {
-        .UnaryTiled => unaries += 1,
-        .ElemwiseBinaryTiled => |s| if (s.op == .gate) {
+        .Unary => unaries += 1,
+        .ElemwiseBinary => |s| if (s.op == .gate) {
             gates += 1;
         } else if (s.op == .mul) {
             muls += 1;
@@ -402,7 +400,7 @@ test "alias_views: a no-op reshape is elided" {
     defer g.deinit();
 
     const x = try g.addInput(.f32, &.{ 2, 8 });
-    try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 2, 8 }, &.{ 2, 8 }, .{}));
+    try g.bindExternal(x, try sm.createTensor(.f32, &.{ 2, 8 }, .{}));
     const scaled = try g.addUnary(.relu, x);
     try g.setOutputs(&.{try g.addUnary(.relu, try g.addViewReshape(scaled, &.{ 1, 2, 8 }))});
 
@@ -428,7 +426,7 @@ test "alias_views: a view bound alongside its source keeps its copy" {
     defer g.deinit();
 
     const x = try g.addInput(.f32, &.{ 1, 2, 8 });
-    try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 1, 2, 8 }, &.{ 1, 2, 8 }, .{}));
+    try g.bindExternal(x, try sm.createTensor(.f32, &.{ 1, 2, 8 }, .{}));
     const same = try g.addUnary(.relu, x);
     const viewed = try g.addViewReshape(same, &.{ 1, 2, 8 });
     try g.setOutputs(&.{try g.addElemwiseBinary(.add, same, viewed)});
@@ -451,42 +449,13 @@ test "alias_views: a view producing a program output keeps its copy" {
     defer g.deinit();
 
     const x = try g.addInput(.f32, &.{ 2, 8 });
-    try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{ 2, 8 }, &.{ 2, 8 }, .{}));
+    try g.bindExternal(x, try sm.createTensor(.f32, &.{ 2, 8 }, .{}));
     const relu = try g.addUnary(.relu, x);
     try g.setOutputs(&.{try g.addViewReshape(relu, &.{ 1, 2, 8 })});
 
     var prog = try program.compileGraph(allocator, &g, &sm, (cpu_target.withPasses(.initOne(.alias_views))));
     defer prog.deinit();
     try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .ReshapeScalar));
-}
-
-// Equal tile offsets and lengths can still order values differently: `{2,4}` chunks a
-// `[4,4]` row-major tensor, while `{4,2}` interleaves it.
-test "alias_views: equal tile offsets do not imply equal byte order" {
-    const allocator = std.testing.allocator;
-
-    var sm = StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const shape = [_]usize{ 4, 4 };
-    const chunked = try sm.createTiledTensor(.f32, &shape, &[_]usize{ 2, 4 }, .{});
-    const interleaved = try sm.createTiledTensor(.f32, &shape, &[_]usize{ 4, 2 }, .{});
-
-    // Same dtype, same tile count, same offsets and lengths.
-    const a = try sm.getConst(chunked);
-    const b = try sm.getConst(interleaved);
-    try std.testing.expectEqualSlices(usize, a.tile_lens, b.tile_lens);
-    try std.testing.expectEqualSlices(usize, a.tile_offsets, b.tile_offsets);
-
-    // Same logical values written to both...
-    var vals: [16]f32 = undefined;
-    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
-    try sm.writeFromPackedScalar(chunked, std.mem.sliceAsBytes(vals[0..]));
-    try sm.writeFromPackedScalar(interleaved, std.mem.sliceAsBytes(vals[0..]));
-
-    // ...land at different bytes, so sharing one backing would corrupt the other.
-    try std.testing.expect(!std.mem.eql(u8, a.data, b.data));
-    try std.testing.expect(!alias_views.layoutsIdentical(&sm, chunked, interleaved));
 }
 
 // ---------------------------------------------------------------------------
@@ -506,11 +475,11 @@ test "add_norm + gate: fuse inside a control-flow body" {
     defer g.deinit();
 
     const seed = try g.addInput(.f32, &[_]usize{ 1, N });
-    try g.bindExternal(seed, try sm.createTiledTensor(.f32, &[_]usize{ 1, N }, &[_]usize{ 1, N }, .{}));
+    try g.bindExternal(seed, try sm.createTensor(.f32, &[_]usize{ 1, N }, .{}));
     const gamma = try g.addInput(.f32, &[_]usize{N});
-    try g.bindExternal(gamma, try sm.createTiledTensor(.f32, &[_]usize{N}, &[_]usize{N}, .{}));
+    try g.bindExternal(gamma, try sm.createTensor(.f32, &[_]usize{N}, .{}));
     const beta = try g.addInput(.f32, &[_]usize{N});
-    try g.bindExternal(beta, try sm.createTiledTensor(.f32, &[_]usize{N}, &[_]usize{N}, .{}));
+    try g.bindExternal(beta, try sm.createTensor(.f32, &[_]usize{N}, .{}));
 
     try g.beginRegion();
     // Everything the rules match on has to be body-local: the carry itself is touched by
@@ -525,17 +494,17 @@ test "add_norm + gate: fuse inside a control-flow body" {
 
     try g.setOutputs(&[_]ValueId{try g.addLoop(seed, body, 2)});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .{ .target_kind = .webgpu }));
+    var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = .gpu }, .row_major));
     defer prog.deinit();
 
     var fused_norms: usize = 0;
     var gates: usize = 0;
     for (prog.blocks) |block| {
         for (block.steps) |step| switch (step.op) {
-            .RMSNormTiled => |st| if (st.residual != null) {
+            .RMSNorm => |st| if (st.residual != null) {
                 fused_norms += 1;
             },
-            .ElemwiseBinaryTiled => |st| if (st.op == .gate) {
+            .ElemwiseBinary => |st| if (st.op == .gate) {
                 gates += 1;
             },
             else => {},
@@ -544,8 +513,8 @@ test "add_norm + gate: fuse inside a control-flow body" {
     try std.testing.expectEqual(@as(usize, 1), fused_norms);
     try std.testing.expectEqual(@as(usize, 1), gates);
     // The gate consumed the gelu; the leading relu is nobody's producer here and stays.
-    try std.testing.expectEqual(@as(usize, 1), countBlockStep(&prog, .UnaryTiled));
-    try std.testing.expectEqual(@as(usize, 0), countBlockStep(&prog, .RMSNormTiled) - fused_norms);
+    try std.testing.expectEqual(@as(usize, 1), countBlockStep(&prog, .Unary));
+    try std.testing.expectEqual(@as(usize, 0), countBlockStep(&prog, .RMSNorm) - fused_norms);
     try prog.validatePlacements();
     for (prog.tensor_placements) |entry| {
         try std.testing.expect(try sm.tensorHasBacking(entry.id));
@@ -575,11 +544,11 @@ test "derived: deriving from a derived weight is refused" {
     const w = try derivable(allocator, &sm, 1);
     defer allocator.free(w.bytes);
     const laid = try weight_layout.relayout(allocator, &sm, cpu_target, w.tid);
-    const out = try sm.createTiledTensor(.q8_0, &.{ 32, 64 }, &.{ 32, 64 }, .{ .tile_alignment = 64, .quant_axis = 1 });
-    const view: derived.View = .{ .rows = 32, .row_stride = 2, .offset = 0, .len = 2, .block_bytes = 34 };
+    const out = try sm.createTensor(.q8_0, &.{ 32, 64 }, .{ .quant_axis = 1 });
+    const view: derived.View = .{ .blocks = 2, .cols = 32, .block_bytes = 34, .transposed = false, .order = .row_major };
     try std.testing.expectError(
         error.InvalidArgument,
-        sm.derivedRecord(.retile, &.{ 32, 64 }, cpu_target.device, out, &.{.{ .tid = laid, .view = view }}),
+        sm.derivedRecord(cpu_target.device, out, laid, view),
     );
 }
 
@@ -682,7 +651,7 @@ test "derived: a derivation is collected once it is redundant and unused" {
 
 // A tensor is resident on exactly one device, so two models on two GPUs cannot share one
 // derived weight: handing the second the first's result would migrate it away. The device
-// is part of the memo key for that reason, alongside the tiling.
+// is part of the memo key for that reason, alongside the block order.
 test "derived: a result is keyed by device" {
     const allocator = std.testing.allocator;
     var sm = StorageManager.init(allocator);
@@ -691,14 +660,14 @@ test "derived: a result is keyed by device" {
     const w = try derivable(allocator, &sm, 1);
     defer allocator.free(w.bytes);
 
-    const host = try weight_layout.relayout(allocator, &sm, .cpu(cpu_tiles), w.tid);
-    const gpu0 = try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 0 }, cpu_tiles), w.tid);
-    const gpu1 = try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 1 }, cpu_tiles), w.tid);
+    const host = try weight_layout.relayout(allocator, &sm, .cpu(), w.tid);
+    const gpu0 = try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 0 }, .row_major), w.tid);
+    const gpu1 = try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 1 }, .row_major), w.tid);
 
     try std.testing.expect(host != gpu0);
     try std.testing.expect(gpu0 != gpu1);
     // Same key twice is still one result.
-    try std.testing.expectEqual(gpu0, try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 0 }, cpu_tiles), w.tid));
+    try std.testing.expectEqual(gpu0, try weight_layout.relayout(allocator, &sm, .init(.{ .kind = .gpu, .index = 0 }, .row_major), w.tid));
 
     // A swap reaches every copy, so the extra results are not stale.
     const replacement = try derivable(allocator, &sm, 77);
@@ -741,7 +710,7 @@ test "derived: program references are counted on the store" {
 // weight_layout
 // ---------------------------------------------------------------------------
 
-/// A rank-2 q8 matmul-B `[k, n]`, tiled the way the MatMul lowering tiles one.
+/// A rank-2 q8 matmul-B `[k, n]`.
 fn q8MatmulB(allocator: std.mem.Allocator, sm: *StorageManager, k: usize, n: usize, seed: usize) !TensorId {
     const vals = try allocator.alloc(f32, k * n);
     defer allocator.free(vals);
@@ -749,9 +718,7 @@ fn q8MatmulB(allocator: std.mem.Allocator, sm: *StorageManager, k: usize, n: usi
     const buf = try packQ8MatmulB(allocator, vals, k, n);
     defer allocator.free(buf);
 
-    const t = plan_mod.chooseMatMulTiles(cpu_tiles, plan_mod.matMulMHint(cpu_tiles), n, k, .q8_0);
-    const tid = try sm.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ t.tk, t.tn }, .{
-        .tile_alignment = 64,
+    const tid = try sm.createTensor(.q8_0, &[_]usize{ k, n }, .{
         .quant_axis = 0,
     });
     try sm.writeFromPackedQuant(tid, buf);
@@ -789,8 +756,6 @@ test "weight_layout: a quantized matmul weight is re-laid and contracted row-wis
     const laid = try sm.getConst(at.result);
     try std.testing.expectEqual(@as(u8, 1), laid.quant_axis);
     try std.testing.expectEqualSlices(usize, &[_]usize{ n, k }, laid.shape);
-    // The NT lowering needs every row whole inside its tile.
-    try std.testing.expectEqual(k, laid.tile_shape[1]);
 }
 
 // The NT lowering runs q8 only, so the pass must leave every other quantized
@@ -814,7 +779,7 @@ test "weight_layout: a q4_0 matmul is left alone and runs under default passes" 
         std.mem.writeInt(u16, buf[bi * 18 ..][0..2], @bitCast(@as(f16, 1.0)), .little);
         for (buf[bi * 18 + 2 ..][0..16], 0..) |*q, i| q.* = @truncate(bi *% 37 +% i *% 11);
     }
-    const w = try sm.createTiledTensor(.q4_0, &[_]usize{ k, n }, &[_]usize{ k, n }, .{ .tile_alignment = 64, .quant_axis = 0 });
+    const w = try sm.createTensor(.q4_0, &[_]usize{ k, n }, .{ .quant_axis = 0 });
     try sm.writeFromPackedQuant(w, buf);
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -851,16 +816,13 @@ test "weight_layout: re-laying permutes bytes and requantizes nothing" {
     defer allocator.free(before);
     try sm.readPackedAtPlacement(w, before);
 
-    // For each grouping `W`, within a tile block (kb, col) lands in segment
+    // For each grouping `W`, block (kb, col) lands in segment
     // `(col / W, kb)`: its scale at lane `col % W` of the segment's `W` scales,
     // then each 4-byte chunk `c` at lane `col % W` of the segment's chunk `c`.
     // Every byte arrives — nothing is requantized.
     const blocks = k / 32;
-    const tile_rows = @min(n, cpu_tiles.base_1d);
     for ([_]types.QuantBlockOrder{ .lanes4, .lanes8, .lanes16 }) |order| {
-        var tiles = cpu_tiles;
-        tiles.quant_block_order = order;
-        const laid = try weight_layout.relayout(allocator, &sm, .cpu(tiles), w);
+        const laid = try weight_layout.relayout(allocator, &sm, .init(.{}, order), w);
         try std.testing.expectEqual(order, (try sm.getConst(laid)).block_order);
         const after = try allocator.alloc(u8, blocks * n * 34);
         defer allocator.free(after);
@@ -869,9 +831,8 @@ test "weight_layout: re-laying permutes bytes and requantizes nothing" {
         const W = order.groupRows();
         for (0..blocks) |kb| {
             for (0..n) |col| {
-                const in_tile = col % tile_rows;
-                const seg = (col - in_tile) * blocks * 34 + ((in_tile / W) * blocks + kb) * W * 34;
-                const lane = in_tile % W;
+                const seg = ((col / W) * blocks + kb) * W * 34;
+                const lane = col % W;
                 const src = before[(kb * n + col) * 34 ..][0..34];
                 try std.testing.expectEqualSlices(u8, src[0..2], after[seg + 2 * lane ..][0..2]);
                 for (0..8) |c| {
@@ -886,6 +847,41 @@ test "weight_layout: re-laying permutes bytes and requantizes nothing" {
     defer allocator.free(back);
     try sm.readPackedAtPlacement(w, back);
     try std.testing.expectEqualSlices(u8, before, back);
+}
+
+// The relayout splits its rows across the store's bulk threads. Rows write disjoint
+// bytes, so the pooled result must equal the serial one byte for byte, for both
+// source forms, with enough rows that the workers claim several ranges each.
+test "weight_layout: a pooled relayout matches the serial one byte for byte" {
+    const allocator = std.testing.allocator;
+    const k: usize = 4096;
+    const n: usize = 512;
+    const blocks = k / 32;
+
+    // An `[n, k]` source, already blocked along its rows. Only bytes move, so any
+    // block contents do.
+    const nt_bytes = try allocator.alloc(u8, n * blocks * 34);
+    defer allocator.free(nt_bytes);
+    for (nt_bytes, 0..) |*b, i| b.* = @truncate(i *% 131 +% (i >> 9));
+
+    var results: [2][2][]u8 = undefined;
+    for ([_]usize{ 1, 4 }, 0..) |threads, t| {
+        var sm = StorageManager.init(allocator);
+        defer sm.deinit();
+        sm.bulk_threads = threads;
+
+        const km = try q8MatmulB(allocator, &sm, k, n, 3);
+        const nt = try sm.createTensor(.q8_0, &.{ n, k }, .{ .quant_axis = 1 });
+        try sm.writeFromPackedQuant(nt, nt_bytes);
+
+        for ([_]TensorId{ km, nt }, 0..) |src, s| {
+            const laid = try weight_layout.relayout(allocator, &sm, .init(.{}, .lanes8), src);
+            results[t][s] = try allocator.alloc(u8, n * blocks * 34);
+            try sm.readPackedAtPlacement(laid, results[t][s]);
+        }
+    }
+    defer for (results) |pair| for (pair) |r| allocator.free(r);
+    for (0..2) |s| try std.testing.expectEqualSlices(u8, results[0][s], results[1][s]);
 }
 
 // A swap after the source was reclaimed goes through the recorded mapping, so the
@@ -904,13 +900,11 @@ test "weight_layout: a re-laid weight round-trips a swap in every block order" {
     for (cases) |case| {
         const n = case.n;
         const order = case.got;
-        var tiles = cpu_tiles;
-        tiles.quant_block_order = case.want;
         var sm = StorageManager.init(allocator);
         defer sm.deinit();
 
         const w = try q8MatmulB(allocator, &sm, k, n, 3);
-        const laid = try weight_layout.relayout(allocator, &sm, .cpu(tiles), w);
+        const laid = try weight_layout.relayout(allocator, &sm, .init(.{}, case.want), w);
         try std.testing.expectEqual(order, (try sm.getConst(laid)).block_order);
 
         const replacement = try q8MatmulB(allocator, &sm, k, n, 41);
@@ -951,15 +945,13 @@ test "weight_layout: a lookup of a re-laid table reads the re-laid copy" {
             std.mem.writeInt(u16, blk[0..2], @bitCast(@as(f16, @floatFromInt(bi % 5 + 1)) * 0.01), .little);
             for (blk[2..], 0..) |*q, i| q.* = @truncate(bi *% 29 +% i *% 7);
         }
-        const table = try sm.createTiledTensor(.q8_0, &.{ n, k }, &.{ n, k }, .{ .quant_axis = 1 });
+        const table = try sm.createTensor(.q8_0, &.{ n, k }, .{ .quant_axis = 1 });
         try sm.writeFromPackedQuant(table, table_bytes);
         const a_tid = try f32Tensor(&sm, &.{ m, k }, 5);
         const ids = [_]i32{ 5, 0, 63 };
-        const idx_tid = try sm.createTiledTensor(.i32, &.{ 1, ids.len }, &.{ 1, ids.len }, .{});
+        const idx_tid = try sm.createTensor(.i32, &.{ 1, ids.len }, .{});
         try sm.writeFromPackedScalar(idx_tid, std.mem.sliceAsBytes(&ids));
 
-        var tiles = cpu_tiles;
-        tiles.quant_block_order = order;
         var rows: [2][ids.len * k]f32 = undefined;
         var prods: [2][m * n]f32 = undefined;
         for ([_]opt.Policy{ .empty, .initOne(.weight_layout) }, 0..) |policy, i| {
@@ -973,7 +965,7 @@ test "weight_layout: a lookup of a re-laid table reads the re-laid copy" {
             try g.bindExternal(a, @intCast(a_tid));
             try g.setOutputs(&.{ try g.addGather(t, idx, 0, 0), try g.addMatMulNT(a, t, 1.0, 0.0) });
 
-            var prog = try program.compileGraph(allocator, &g, &sm, program.Target.cpu(tiles).withPasses(policy));
+            var prog = try program.compileGraph(allocator, &g, &sm, program.Target.init(.{}, order).withPasses(policy));
             defer prog.deinit();
             try cpu.backend().executeProgram(&prog, sm.tensorStore());
             try sm.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(&rows[i]));
@@ -981,7 +973,7 @@ test "weight_layout: a lookup of a re-laid table reads the re-laid copy" {
 
             if (i == 1) {
                 for (prog.steps) |step| switch (step.op) {
-                    .GatherRowsTiled => |gr| try std.testing.expectEqual(order, (try sm.getConst(gr.table)).block_order),
+                    .GatherRows => |gr| try std.testing.expectEqual(order, (try sm.getConst(gr.table)).block_order),
                     else => {},
                 };
                 try std.testing.expect(!try sm.tensorHasBacking(table));
@@ -1013,7 +1005,7 @@ test "weight_layout: results follow the arithmetic, not the pass" {
             seed = seed *% 6364136223846793005 +% 1442695040888963407;
             v.* = (@as(f32, @floatFromInt((seed >> 33) % 2000)) - 1000.0) * 0.0005;
         }
-        const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ m, k }, .{ .tile_alignment = 64 });
+        const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{});
         try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a_vals));
         const w = try q8MatmulB(allocator, &sm, k, n, 1);
 
@@ -1047,9 +1039,7 @@ test "weight_layout: results follow the arithmetic, not the pass" {
         var cpu = try cpu_backend_mod.CpuBackend.initWithOptions(allocator, .{});
         defer cpu.deinit();
         // Laid out the way this backend's kernel reads, as a context would.
-        var tiles = cpu_tiles;
-        tiles.quant_block_order = cpu.quantBlockOrder();
-        const target: program.Target = .cpu(tiles);
+        const target: program.Target = .init(.{}, cpu.quantBlockOrder());
         for ([_]opt.Policy{ .empty, .initOne(.weight_layout) }) |policy| {
             var g = Graph.init(allocator);
             defer g.deinit();

@@ -8,9 +8,9 @@
 //     out_r  = xl*sin + xr*cos
 //   remaining elements copy through unchanged.
 //
-// One work item per OUTPUT ELEMENT of a packed [tb, tl, tn, th] tile (each
+// One work item per OUTPUT ELEMENT of a packed [tb, tl, tn, th] tensor (each
 // element of a rotated pair recomputes sincos — cheap next to the loads).
-// positions is the matching packed [tb, tl] i32 tile. Grid-stride dispatch.
+// positions is the matching packed [tb, tl] i32 tensor. Grid-stride dispatch.
 // NOTE: the CPU uses a fast sincos approximation, so CPU-vs-GPU differences are
 // bounded by that approximation (~1e-6 relative), not exact equality.
 
@@ -27,7 +27,7 @@ enable f16;
 @group(0) @binding(2) var<storage, read_write> oh: array<f16>;
 @group(0) @binding(3) var<uniform>             p: Params;
 
-// count = tile elements; th = head dim; tn = heads in tile;
+// count = elements; th = head dim; tn = heads;
 // pairs_total = th/2; rope_pairs = rotated pair count.
 struct Params {
     count: u32,
@@ -58,7 +58,7 @@ fn rope_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups
             continue;
         }
 
-        let l_index = row / p.tn; // (b, l) flat index into the positions tile
+        let l_index = row / p.tn; // (b, l) flat index into the positions
         let position = f32(pos[l_index]);
         let freq = p.scale_factor * pow(p.freq_step, f32(i));
         let angle = position * freq;
@@ -94,7 +94,7 @@ fn rope_f16(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups
             continue;
         }
 
-        let l_index = row / p.tn; // (b, l) flat index into the positions tile
+        let l_index = row / p.tn; // (b, l) flat index into the positions
         let position = f32(pos[l_index]);
         let freq = p.scale_factor * pow(p.freq_step, f32(i));
         let angle = position * freq;

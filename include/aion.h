@@ -181,21 +181,6 @@ AION_API AionStatus aion_tensor_create(
     const size_t* shape,
     AionTensor** out_tensor);
 
-// Like `aion_tensor_create`, but with an explicit per-axis tile shape.
-//
-// `tile_shape` must have `rank` entries; each entry must be in `1..=shape[d]` and,
-// where dtype is quantized, must align to the dtype's block granularity on the
-// block axis. Use this when a specific tile layout is required by a graph op
-// (e.g. KV caches consumed by `SequenceAppend`, which require the full head_dim
-// contiguous in a single tile).
-AION_API AionStatus aion_tensor_create_tiled(
-    AionContext* ctx,
-    AionDType dtype,
-    size_t rank,
-    const size_t* shape,
-    const size_t* tile_shape,
-    AionTensor** out_tensor);
-
 AION_API void aion_tensor_destroy(AionTensor* t);
 
 // Migrate a tensor to `(kind, index)` (move semantics: the source-device copy
@@ -227,7 +212,7 @@ AION_API AionStatus aion_tensor_read(const AionTensor* t, const DLTensor* dst);
 // zero-initialized memory and set the fields you need (note the two
 // enabled-by-default flags below).
 // - device_kind/device_index: place the model on a device. The model's backend
-//   and tile policy follow the device; bound CPU inputs are auto-migrated on
+//   and weight layout follow the device; bound CPU inputs are auto-migrated on
 //   run and outputs are flushed back to host for reading.
 // - auto_init_inputs: 1 = auto-allocate + zero unbound inputs (default when
 //   opts == NULL).

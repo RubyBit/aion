@@ -7,7 +7,7 @@
 //!
 //! 1. *Transposed.* A q8 `[K, N]` matmul-B holds its blocks block-major,
 //!    `[K/32][N]`: the blocks one output column needs are `N * 34` bytes apart.
-//!    A matvec reading them either strides — re-reading each tile once per
+//!    A matvec reading them either strides — re-reading each cache line once per
 //!    column group — or gives up register-resident sums. Transposed to `[N, K]`
 //!    it is one unbroken run per column and gets both. Measured on 257 MB of
 //!    weights, one core: 30 GB/s block-major against 60 GB/s as `[N, K]`.
@@ -16,7 +16,7 @@
 //!    gives one row per lane only if the rows' bytes share a vector. Grouping as
 //!    many rows as the target's dot has lanes gives both: one stream, and the
 //!    per-block scaling paid once for the group. The target names the grouping
-//!    its kernel reads (`TilePolicy.quant_block_order`).
+//!    its kernel reads (`Target.quant_block_order`).
 //!
 //! The weight itself is unchanged: both forms block along the same reduction
 //! axis in the same groups of 32 with the same scales, so nothing is requantized
@@ -30,12 +30,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const graph_mod = @import("../graph.zig");
-const plan = @import("../plan.zig");
 const manager_mod = @import("../../storage/manager.zig");
 const derived = @import("../../storage/derived.zig");
 const types = @import("../../backend/types.zig");
 const rewriter_mod = @import("rewriter.zig");
 const target_mod = @import("../target.zig");
+const thread_pool = @import("../../runtime/thread_pool.zig");
 
 
 const Graph = graph_mod.Graph;
@@ -43,7 +43,7 @@ const Node = graph_mod.Node;
 const ValueId = graph_mod.ValueId;
 const Rewriter = rewriter_mod.Rewriter;
 const StorageManager = manager_mod.StorageManager;
-const TiledTensor = @import("../../storage/storage.zig").TiledTensor;
+const Tensor = @import("../../storage/storage.zig").Tensor;
 const TensorId = manager_mod.TensorId;
 const Target = target_mod.Target;
 
@@ -66,6 +66,9 @@ pub const Rule = struct {
     target: Target,
 
     pub fn run(self: Rule, rw: *Rewriter) Error!void {
+        var workers: Workers = .{ .threads = self.mgr.bulk_threads };
+        defer workers.deinit();
+
         // A row lookup of a weight a matmul re-lays reads the re-laid copy too, so
         // the source is left unread and freed instead of kept beside it.
         var laid_rows: std.AutoHashMapUnmanaged(TensorId, void) = .empty;
@@ -79,7 +82,7 @@ pub const Rule = struct {
         for (rw.input()) |node| {
             if (lookupTable(rw.g, node)) |table| if (laid_rows.contains(table)) {
                 const t = try self.mgr.getConst(table);
-                const laid = try relayout(rw.gpa, self.mgr, self.target, table);
+                const laid = try relayoutWith(rw.gpa, self.mgr, self.target, table, &workers);
                 const weight = try rw.bound(t.dtype, t.shape, @intCast(laid));
                 try rw.add(.{ .op = node.op, .inputs = try rw.ids(&.{ weight, node.inputs[1] }), .output = node.output });
                 changed = true;
@@ -89,7 +92,7 @@ pub const Rule = struct {
                 try rw.add(node);
                 continue;
             };
-            const laid = relayout(rw.gpa, self.mgr, self.target, c.b_tid) catch {
+            const laid = relayoutWith(rw.gpa, self.mgr, self.target, c.b_tid, &workers) catch {
                 try rw.add(node);
                 continue;
             };
@@ -146,7 +149,7 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: 
         if (t.quant_axis != 1) return null;
         const k_nt: usize = t.shape[1];
         if (k_nt % info.block_elems != 0) return null;
-        if (layoutFor(target, t.dtype, t.shape[0], k_nt).order != target.tiles.quant_block_order or target.tiles.quant_block_order == .row_major) return null;
+        if (orderFor(target, t.shape[0]) != target.quant_block_order or target.quant_block_order == .row_major) return null;
         return .{ .b_tid = b_tid, .dtype = t.dtype, .k = k_nt, .n = t.shape[0], .alpha = scale.alpha, .beta = scale.beta, .already_nt = true };
     }
     if (t.quant_axis != 0) return null;
@@ -154,7 +157,7 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: 
     if (k % info.block_elems != 0) return null;
     // A target reads its own grouping fastest; a weight that cannot take it stays
     // as it is rather than moving to a layout the target never asked for.
-    if (layoutFor(target, t.dtype, t.shape[1], k).order != target.tiles.quant_block_order) return null;
+    if (orderFor(target, t.shape[1]) != target.quant_block_order) return null;
 
     return .{
         .b_tid = b_tid,
@@ -166,28 +169,88 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: 
     };
 }
 
-/// The tile an `[n, k]` weight gets on `target`, and the block order
-/// inside it: the one the target's kernel reads, wherever every tile splits into
-/// whole groups of it.
-fn layoutFor(target: Target, dtype: types.DType, n: usize, k: usize) struct { tile: [2]usize, order: types.QuantBlockOrder } {
-    const tile = plan.chooseQuantRowTiles(target.tiles, dtype, n, k);
-    const want = target.tiles.quant_block_order;
-    const g = want.groupRows();
-    return .{ .tile = tile, .order = if (tile[0] % g == 0 and n % g == 0) want else .row_major };
+/// The block order an `[n, k]` weight takes on `target`: the one its kernel reads,
+/// wherever the rows split into whole groups of it. A device chunk holds a multiple
+/// of 32 rows (`storage/layout.zig`), a whole number of any group, so the order never
+/// depends on how the weight is chunked.
+fn orderFor(target: Target, n: usize) types.QuantBlockOrder {
+    const want = target.quant_block_order;
+    return if (n % want.groupRows() == 0) want else .row_major;
 }
 
-/// Bytes of rows re-laid per step: the most of a weight on the host at once.
-/// Small under test, so test-sized weights span several chunks.
-const relayout_chunk_bytes: usize = if (builtin.is_test) 512 else 16 << 20;
+/// Bytes of rows re-laid per step when the rows have to be staged on the host: the
+/// most of a weight held twice at once. Small under test, so test-sized weights span
+/// several steps.
+const relayout_step_bytes: usize = if (builtin.is_test) 512 else 16 << 20;
+
+/// Rows a worker claims at a time: enough bytes that claiming costs nothing next to
+/// the copy.
+const relayout_grain_bytes: usize = 256 << 10;
+
+/// The pool one pass's relayouts share, made on the first one that can use it. A
+/// weight is re-laid once per (source, order, device), so most compiles never make it.
+const Workers = struct {
+    threads: usize,
+    pool: ?thread_pool.ThreadPool = null,
+
+    fn get(self: *Workers, gpa: std.mem.Allocator) ?*thread_pool.ThreadPool {
+        if (self.threads < 2) return null;
+        if (self.pool == null) self.pool = thread_pool.ThreadPool.init(gpa, .{ .thread_count = self.threads }) catch return null;
+        return &self.pool.?;
+    }
+
+    fn deinit(self: *Workers) void {
+        if (self.pool) |*p| p.deinit();
+    }
+};
+
+/// Rows `[first, first + count)` of a relayout: each result row gathers its blocks
+/// from the source through `view` and stores them through its order. Rows touch
+/// disjoint bytes of `dst` (a group's rows interleave, but never on the same byte),
+/// so any split of them across threads is exact.
+const RelayJob = struct {
+    dst: []u8,
+    src: []const u8,
+    view: derived.View,
+    /// The result row `dst` starts at, and the source block `src` starts at.
+    first: usize,
+    base: usize,
+
+    fn rows(self: *const RelayJob, lo: usize, hi: usize) void {
+        const bb = self.view.block_bytes;
+        for (lo..hi) |r| {
+            for (0..self.view.blocks) |kb| {
+                const from = (self.view.sourceAt(self.first + r, kb) - self.base) * bb;
+                self.view.order.storeBlock(self.dst, self.view.blocks, r, kb, self.src[from..][0..bb]);
+            }
+        }
+    }
+
+    fn run(raw: *anyopaque, lo: usize, hi: usize, _: usize) void {
+        rows(@ptrCast(@alignCast(raw)), lo, hi);
+    }
+};
 
 /// A q8 `[K, N]` matmul-B as `[N, K]` with `quant_axis == 1`, or an `[N, K]` one
-/// interleaved, without requantization. Memoized by source, tiling, and device: a
-/// quantized weight cannot be retiled downstream, and a tensor lives on one device.
+/// interleaved, without requantization. Memoized by source, order, and device: a
+/// quantized weight's order is fixed once laid out, and a tensor lives on one device.
 pub fn relayout(
     gpa: std.mem.Allocator,
     mgr: *StorageManager,
     target: Target,
     source: TensorId,
+) Error!TensorId {
+    var workers: Workers = .{ .threads = mgr.bulk_threads };
+    defer workers.deinit();
+    return relayoutWith(gpa, mgr, target, source, &workers);
+}
+
+fn relayoutWith(
+    gpa: std.mem.Allocator,
+    mgr: *StorageManager,
+    target: Target,
+    source: TensorId,
+    workers: *Workers,
 ) Error!TensorId {
     const src = try mgr.getConst(source);
     const info = src.dtype.info();
@@ -201,71 +264,56 @@ pub fn relayout(
     const n: usize = if (from_nt) src.shape[0] else src.shape[1];
     if (k % info.block_elems != 0) return Error.InvalidArgument;
 
-    const layout = layoutFor(target, src.dtype, n, k);
-    if (from_nt and layout.order == .row_major) return Error.InvalidArgument;
-    const tile = layout.tile;
-    // The order inside the tile is as much the layout as the tile shape is.
-    const key = [_]usize{ tile[0], tile[1], @intFromEnum(layout.order) };
-    if (mgr.derivedFind(.relayout, &key, target.device, &.{source})) |tid| return tid;
+    const order = orderFor(target, n);
+    if (from_nt and order == .row_major) return Error.InvalidArgument;
+    if (mgr.derivedFind(order, target.device, source)) |tid| return tid;
 
     const blocks: usize = k / info.block_elems;
     const bb: usize = info.block_bytes;
     const row_bytes = blocks * bb;
-    const opts: TiledTensor.InitOptions = .{
-        .tile_alignment = target.tiles.tile_alignment,
-        .quant_axis = 1,
-        .block_order = layout.order,
-    };
+    // Every block of the result is written below, so its bytes start unfilled.
+    const opts: Tensor.InitOptions = .{ .quant_axis = 1, .block_order = order, .zero_fill = false };
     // Made where it will be read, so a device target never stages the whole copy.
     const out = if (mgr.deviceMemoryFor(target.device) != null)
-        try mgr.createDeviceTensor(src.dtype, &.{ n, k }, &tile, opts, target.device)
+        try mgr.createDeviceTensor(src.dtype, &.{ n, k }, opts, target.device)
     else
-        try mgr.createTiledTensor(src.dtype, &.{ n, k }, &tile, opts);
-    const mapping: derived.Relayout = .{ .transposed = !from_nt, .order = layout.order, .tile_rows = tile[0] };
+        try mgr.createTensor(src.dtype, &.{ n, k }, opts);
+    const view: derived.View = .{ .blocks = blocks, .cols = n, .block_bytes = bb, .transposed = !from_nt, .order = order };
+    const pool = workers.get(gpa);
 
-    // Re-laid a chunk of rows at a time, whole groups each, so a chunk is one byte
-    // range of both its source rows and its tile: only chunks are ever on the host.
-    // A `[k, n]` source is read whole instead, since each of its rows is strided.
-    const g = layout.order.groupRows();
-    const chunk_rows = if (from_nt) @max(g, relayout_chunk_bytes / row_bytes / g * g) else n;
-    const in_buf = gpa.alloc(u8, @min(chunk_rows, n) * row_bytes) catch return Error.OutOfMemory;
+    // A host source is read where it lies (the mapped file, for a loaded model). Any
+    // other — on a device, or folded into another derived weight — is staged: a step
+    // of rows at a time from `[n, k]`, or whole from `[k, n]`, whose rows are strided.
+    const in_place: ?[]const u8 = if (src.device.kind == .cpu and try mgr.tensorHasBacking(source)) (try mgr.backingConst(source)).data[0 .. n * row_bytes] else null;
+    const g = order.groupRows();
+    const step_rows = if (in_place != null or !from_nt) n else @max(g, relayout_step_bytes / row_bytes / g * g);
+    const in_buf: []u8 = if (in_place != null) &.{} else gpa.alloc(u8, @min(step_rows, n) * row_bytes) catch return Error.OutOfMemory;
     defer gpa.free(in_buf);
-    if (!from_nt) try mgr.readPackedAtPlacement(source, in_buf);
-    const out_buf = gpa.alloc(u8, @min(chunk_rows, tile[0]) * row_bytes) catch return Error.OutOfMemory;
-    defer gpa.free(out_buf);
+    if (in_place == null and !from_nt) try mgr.readPackedAtPlacement(source, in_buf);
+    // A host result is written in place; a device one is staged a step at a time.
+    const out_t = try mgr.getMut(out);
+    const host = out_t.device.kind == .cpu;
+    const dev_step = if (host) 0 else @max(g, relayout_step_bytes / row_bytes / g * g);
+    const out_buf: []u8 = if (host) &.{} else gpa.alloc(u8, @min(dev_step, n) * row_bytes) catch return Error.OutOfMemory;
+    defer if (!host) gpa.free(out_buf);
 
-    const tile_counts = (try mgr.getConst(out)).tile_counts[0];
-    for (0..tile_counts) |ti| {
-        const row0 = ti * tile[0];
-        const rows = @min(tile[0], n - row0);
-        var c0: usize = 0;
-        while (c0 < rows) : (c0 += chunk_rows) {
-            const first = row0 + c0;
-            const count = @min(chunk_rows, rows - c0);
-            const base = if (from_nt) first * blocks else 0;
-            if (from_nt) try mgr.readQuantBlocksAtPlacement(source, base, in_buf[0 .. count * row_bytes]);
-            // Through the order: the chunk starts on a group, so its offsets are the tile's.
-            const dst = out_buf[0 .. count * row_bytes];
-            for (0..count) |r| {
-                for (0..blocks) |kb| {
-                    const from = (mapping.sourceAt(blocks, n, first + r, kb) - base) * bb;
-                    layout.order.storeBlock(dst, blocks, r, kb, in_buf[from..][0..bb]);
-                }
-            }
-            try mgr.writeTileAtPlacement(out, ti, c0 * row_bytes, dst);
+    var first: usize = 0;
+    while (first < n) {
+        const count = @min(if (host) step_rows else @min(step_rows, dev_step), n - first);
+        const base = if (from_nt and in_place == null) first * blocks else 0;
+        if (from_nt and in_place == null) try mgr.readQuantBlocksAtPlacement(source, base, in_buf[0 .. count * row_bytes]);
+        // Through the order: the step starts on a group, so its offsets are the result's.
+        const dst = if (host) out_t.data[first * row_bytes ..][0 .. count * row_bytes] else out_buf[0 .. count * row_bytes];
+        const job: RelayJob = .{ .dst = dst, .src = in_place orelse in_buf, .view = view, .first = first, .base = base };
+        if (pool) |p| {
+            p.parallelForDynamic(@constCast(@ptrCast(&job)), count, @max(1, relayout_grain_bytes / row_bytes), RelayJob.run);
+        } else {
+            RelayJob.rows(&job, 0, count);
         }
+        if (!host) try mgr.writeAtPlacement(out, first * row_bytes, dst);
+        first += count;
     }
 
-    try mgr.derivedRecord(.relayout, &key, target.device, out, &.{.{
-        .tid = source,
-        .view = .{
-            .rows = blocks,
-            .row_stride = n,
-            .offset = 0,
-            .len = n,
-            .block_bytes = bb,
-            .mapping = .{ .relayout = mapping },
-        },
-    }});
+    try mgr.derivedRecord(target.device, out, source, view);
     return out;
 }

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// Device-side row gather: o[r, :] = table[idx[r], :] for a single-buffer table.
-// The row index resolves ON DEVICE (no host read of the indices → no forced
-// sync when a GPU op produced them, e.g. an in-graph decode loop feeding an
-// argmax / a reshaped carry into the gather). Replaces the record-time
-// one-copy-per-row path (which costs ~1 µs of encoder overhead per row plus that
-// host read) when the table is a single tile.
+// Device-side row gather: o[r, :] = table[idx[r], :]. The row index resolves ON
+// DEVICE (no host read of the indices → no forced sync when a GPU op produced
+// them, e.g. an in-graph decode loop feeding an argmax / a reshaped carry into the
+// gather).
 //
 // Every entry point shares one binding layout so they coexist in this module:
 // `table`, `idx` and `o` are bound as raw words and moved by bitcast, which is
@@ -14,14 +12,11 @@
 // [0, v) — the device cannot report errors; the CPU backend still validates the
 // same graphs at execute time.
 //
-// Operands too large for one storage binding are split into row-major tiles, and
-// each binding holds ONE of them, so the caller dispatches per tile pair:
-//   `p.p0`/`p.p1` = the bound table tile's `[row_begin, row_end)` in table rows;
-//                   a work item whose index falls outside it skips.
-//   `p.p2`        = the bound output tile's first row (batch, for the batched
-//                   gather) in the full output, so `idx` still indexes globally
-//                   while `o` is written tile-locally.
-// Single-tile operands are just the cases `[0, v)` and `0`.
+// A table (or scatter buffer) too large for one storage binding is split along
+// dim 0 into chunks of whole rows, and each binding holds ONE of them, so the
+// caller dispatches per chunk: `p.p0`/`p.p1` = the bound chunk's
+// `[row_begin, row_end)`; a work item whose row falls outside it skips. A table in
+// one buffer is the case `[0, v)`.
 
 enable f16;
 
@@ -56,14 +51,13 @@ struct Params {
     v: u32,
     wpr: u32,
     total: u32,
-    // gather_*: table tile row range [p0, p1). sequence_append_u32: ring window
-    // and total words. Unused by an entry point that does not name them.
+    // gather_* / scatter_*: the bound chunk's row range [p0, p1).
+    // sequence_append_*: ring window and total words. Unused by an entry point
+    // that does not name them.
     p0: u32,
     p1: u32,
-    p2: u32,
-    /// gather_batched_words: first gathered row this output tile holds, so the
-    /// output may also split along G. 0 for every other entry point.
-    p3: u32,
+    _p2: u32,
+    _p3: u32,
     // Scalar pads, not a vec3: a vec3<u32> would force 16-byte alignment and
     // make this struct 64 bytes, silently disagreeing with the 48-byte Zig
     // `GatherParams` that fills it.
@@ -82,8 +76,8 @@ fn gather_rows_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / p.d;
         let col = i % p.d;
-        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
-        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        let src_row = u32(clamp(gather_wrap(idx[r], p.v), 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another chunk
         o[i] = bitcast<f32>(table[(src_row - p.p0) * p.d + col]);
     }
 }
@@ -110,8 +104,8 @@ fn gather_q8_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / pairs_per_row;
         let pi = i % pairs_per_row;
-        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
-        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        let src_row = u32(clamp(gather_wrap(idx[r], p.v), 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another chunk
         let base = (src_row - p.p0) * p.wpr + pi * 17u;
         let e0 = r * p.d + pi * 64u;
 
@@ -152,8 +146,8 @@ fn gather_q8g_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / blocks;
         let kb = i % blocks;
-        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
-        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        let src_row = u32(clamp(gather_wrap(idx[r], p.v), 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another chunk
         let lr = src_row - p.p0;
         let lane = lr % g;
         // The group's segment for block kb: g scales, then eight chunks of g words.
@@ -178,12 +172,12 @@ fn gather_q8g_rows_f32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
 // (u32 words), `idx` = the destination index, `o` = the destination buffer
 // (written via bitcast so any 4-byte scalar — f32 / i32 — moves dtype-agnostically).
 // Reuses Params fields: `p.d` = words per row, `p.v` = row count (clamp bound),
-// `p.total` = words per row, `p.p0`/`p.p1` = the bound buf tile's row range.
+// `p.total` = words per row, `p.p0`/`p.p1` = the bound buf chunk's row range.
 @compute @workgroup_size(64)
 fn scatter_row_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
     let row = u32(clamp(gather_wrap(idx[0], p.v), 0, i32(p.v) - 1));
-    if (row < p.p0 || row >= p.p1) { return; } // row lives in another buf tile
+    if (row < p.p0 || row >= p.p1) { return; } // row lives in another chunk
     let dst0 = (row - p.p0) * p.d;
     for (var i = gid.x; i < p.total; i += stride) {
         o[dst0 + i] = bitcast<f32>(table[i]);
@@ -192,17 +186,12 @@ fn scatter_row_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
 
 // Device-side KV append for packed single-buffer caches. Bindings are reused as:
 // `table` = new_kv words, `idx` = per-batch append offsets, `o` = cache words.
-// Params are reinterpreted as {batch, tile_t, new_t, heads, row_words,
-// ring_window, total_words, tile_t0}. A zero ring window selects ordinary fixed
-// storage. A cache too large for one binding is split along TIME and `o` binds
-// ONE tile: `tile_t0`/`tile_t` are its range, so each tile is a dispatch that
-// writes only the appended rows landing inside it. A single-tile cache is
-// `{0, cache_t}`.
+// Params are reinterpreted as {batch, cache_t, new_t, heads, row_words,
+// ring_window, total_words}. A zero ring window selects ordinary fixed storage.
 @compute @workgroup_size(64)
 fn sequence_append_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let batch = p.rows;
-    let tile_t = p.d;
-    let tile_t0 = p.p2;
+    let cache_t = p.d;
     let new_t = p.v;
     let heads = p.wpr;
     let row_words = p.total;
@@ -218,33 +207,30 @@ fn sequence_append_u32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
         if (b >= batch) { continue; }
         var dst_t = u32(max(idx[b], 0)) + l;
         if (ring_window != 0u) { dst_t = dst_t % ring_window; }
-        // Tiles partition [0, cache_t), so this also drops a position past the end.
-        if (dst_t >= tile_t0 && dst_t - tile_t0 < tile_t) {
-            let dst = (((b * tile_t + (dst_t - tile_t0)) * heads + h) * row_words) + word;
+        // A position past the end is dropped.
+        if (dst_t < cache_t) {
+            let dst = (((b * cache_t + dst_t) * heads + h) * row_words) + word;
             o[dst] = bitcast<f32>(table[i]);
         }
     }
 }
 
-// Batched row gather: o[b, g, :] = data[b, idx[b, g], :] — the `GatherTiled`
-// lowering for axis 1 with one batch dim. Single-tile operands, so no row-range
+// Batched row gather: o[b, g, :] = data[b, idx[b, g], :] — the `Gather`
+// lowering for axis 1 with one batch dim. Whole-buffer operands, so no row-range
 // parameters: `p.rows` = B, `p.d` = row width, `p.v` = rows per batch,
 // `p.wpr` = gathered rows per batch, `p.total` = B*G*W output elements.
 // One work item = one output element.
 @compute @workgroup_size(64)
 fn gather_batched_words(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
-    let per_batch = p.total / p.rows; // words per batch in THIS tile
+    let per_batch = p.total / p.rows; // words per batch
     for (var i = gid.x; i < p.total; i += stride) {
         let b = i / per_batch;
         let rem = i % per_batch;
         let g = rem / p.d;
         let w = rem % p.d;
-        let gb = p.p2 + b;  // batch index in the full tensor
-        let gg = p.p3 + g;  // gathered row in the full tensor
-        if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
-        let src = u32(clamp(gather_wrap(idx[gb * p.wpr + gg], p.v), 0, i32(p.v) - 1));
-        o[i] = bitcast<f32>(table[((gb - p.p0) * p.v + src) * p.d + w]);
+        let src = u32(clamp(gather_wrap(idx[b * p.wpr + g], p.v), 0, i32(p.v) - 1));
+        o[i] = bitcast<f32>(table[(b * p.v + src) * p.d + w]);
     }
 }
 
@@ -259,8 +245,8 @@ fn gather_rows_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
     for (var i = gid.x; i < p.total; i += stride) {
         let r = i / p.d;
         let col = i % p.d;
-        let src_row = u32(clamp(gather_wrap(idx[p.p2 + r], p.v), 0, i32(p.v) - 1));
-        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another tile
+        let src_row = u32(clamp(gather_wrap(idx[r], p.v), 0, i32(p.v) - 1));
+        if (src_row < p.p0 || src_row >= p.p1) { continue; } // row lives in another chunk
         oh[i] = table_h[(src_row - p.p0) * p.d + col];
     }
 }
@@ -269,7 +255,7 @@ fn gather_rows_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
 fn scatter_row_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
     let row = u32(clamp(gather_wrap(idx[0], p.v), 0, i32(p.v) - 1));
-    if (row < p.p0 || row >= p.p1) { return; } // row lives in another buf tile
+    if (row < p.p0 || row >= p.p1) { return; } // row lives in another chunk
     let dst0 = (row - p.p0) * p.d;
     for (var i = gid.x; i < p.total; i += stride) {
         oh[dst0 + i] = table_h[i];
@@ -279,8 +265,7 @@ fn scatter_row_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
 @compute @workgroup_size(64)
 fn sequence_append_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let batch = p.rows;
-    let tile_t = p.d;
-    let tile_t0 = p.p2;
+    let cache_t = p.d;
     let new_t = p.v;
     let heads = p.wpr;
     let row_elems = p.total;
@@ -296,9 +281,9 @@ fn sequence_append_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
         if (b >= batch) { continue; }
         var dst_t = u32(max(idx[b], 0)) + l;
         if (ring_window != 0u) { dst_t = dst_t % ring_window; }
-        // Tiles partition [0, cache_t), so this also drops a position past the end.
-        if (dst_t >= tile_t0 && dst_t - tile_t0 < tile_t) {
-            let dst = (((b * tile_t + (dst_t - tile_t0)) * heads + h) * row_elems) + elem;
+        // A position past the end is dropped.
+        if (dst_t < cache_t) {
+            let dst = (((b * cache_t + dst_t) * heads + h) * row_elems) + elem;
             oh[dst] = table_h[i];
         }
     }
@@ -307,17 +292,14 @@ fn sequence_append_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
 @compute @workgroup_size(64)
 fn gather_batched_f16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let stride = nwg.x * WG;
-    let per_batch = p.total / p.rows; // elements per batch in THIS tile
+    let per_batch = p.total / p.rows; // elements per batch
     for (var i = gid.x; i < p.total; i += stride) {
         let b = i / per_batch;
         let rem = i % per_batch;
         let g = rem / p.d;
         let w = rem % p.d;
-        let gb = p.p2 + b;  // batch index in the full tensor
-        let gg = p.p3 + g;  // gathered row in the full tensor
-        if (gb < p.p0 || gb >= p.p1) { continue; } // batch lives in another data tile
-        let src = u32(clamp(gather_wrap(idx[gb * p.wpr + gg], p.v), 0, i32(p.v) - 1));
-        oh[i] = table_h[((gb - p.p0) * p.v + src) * p.d + w];
+        let src = u32(clamp(gather_wrap(idx[b * p.wpr + g], p.v), 0, i32(p.v) - 1));
+        oh[i] = table_h[(b * p.v + src) * p.d + w];
     }
 }
 

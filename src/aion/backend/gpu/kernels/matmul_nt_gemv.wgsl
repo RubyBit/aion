@@ -23,8 +23,9 @@
 @group(0) @binding(2) var<storage, read_write> cmat: array<f32>;
 @group(0) @binding(3) var<uniform>             p: Params;
 
-// b_wpr = u32 words per B row; k in elements; n = rows in this B/C tile.
-struct Params { k: u32, n: u32, b_wpr: u32, _pad: u32, alpha: f32, beta: f32 };
+// b_wpr = u32 words per B row; k in elements; n = rows in this B chunk, whose
+// outputs start at cmat[c_off] (a B past the binding limit is chunked along N).
+struct Params { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32 };
 
 const TPR: u32 = 32u; // lanes per output row
 const RPW: u32 = 8u;  // output rows per workgroup
@@ -56,10 +57,11 @@ fn reduceRow(lidx: u32, lane: u32, acc: f32) -> f32 {
 
 fn store(n: u32, total: f32) {
     let v = p.alpha * total;
+    let i = p.c_off + n;
     if (p.beta == 0.0) {
-        cmat[n] = v;
+        cmat[i] = v;
     } else {
-        cmat[n] = v + p.beta * cmat[n];
+        cmat[i] = v + p.beta * cmat[i];
     }
 }
 

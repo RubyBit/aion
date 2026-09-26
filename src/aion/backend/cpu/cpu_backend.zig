@@ -12,7 +12,6 @@ const cpu_target = @import("registry/cpu_target.zig");
 const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
-const conv1d_registry = @import("registry/conv1d_registry.zig");
 const conv2d_registry = @import("registry/conv2d_registry.zig");
 const fft_registry = @import("registry/fft_registry.zig");
 const fft_kernels = @import("kernels/fft.zig");
@@ -89,9 +88,6 @@ pub const CpuBackend = struct {
     // Per-thread scratch for reductions (sum/mean). Size == thread_count.
     reduce_scratch_f32: []f32 = &[_]f32{},
 
-    // Per-thread scratch for softmax reductions (max + sum). Size == 2*thread_count.
-    softmax_scratch_f32: []f32 = &[_]f32{},
-
     matmul_f32: matmul_registry.F32Kernels = matmul_registry.candidates[1].kernels,
 
     /// The packed GEMM for quantized weights, and the family it falls back within.
@@ -104,7 +100,6 @@ pub const CpuBackend = struct {
     attention_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
     relpos_mha_kernels: attention_registry.Kernels = attention_registry.candidates[0].kernels,
 
-    depthwise_conv1d: conv1d_registry.Kernels = conv1d_registry.candidates[0].kernels,
     depthwise_conv2d: conv2d_registry.Kernels = conv2d_registry.candidates[0].kernels,
 
     fft: fft_registry.FftKernels = fft_registry.candidates[1].kernels,
@@ -155,7 +150,7 @@ pub const CpuBackend = struct {
         const topo_info = cpuid.detect();
         // Respect user-requested thread count up to the system's logical CPUs.
         // For decode-heavy workloads on hybrid CPUs, SMT threads can still help,
-        // and higher-level tile heuristics decide when to parallelize small ops.
+        // and higher-level view heuristics decide when to parallelize small ops.
         const effective_thread_count: usize = @max(@as(usize, 1), @min(opts.thread_count, hw_threads));
 
         var self: Self = .{
@@ -165,7 +160,6 @@ pub const CpuBackend = struct {
             .trace_exec = traceEnabled(),
             .profile_config = profile.Config.fromEnv(),
             .reduce_scratch_f32 = &[_]f32{},
-            .softmax_scratch_f32 = &[_]f32{},
             .matmul_scratch_f32 = &[_][]align(32) u8{},
         };
 
@@ -188,7 +182,6 @@ pub const CpuBackend = struct {
             self.matvec = quantized.matvec;
             self.attention_kernels = table.attention;
             self.relpos_mha_kernels = table.relpos_mha;
-            self.depthwise_conv1d = table.conv1d;
             self.depthwise_conv2d = table.conv2d;
             self.fft = table.fft;
         } else {
@@ -202,7 +195,6 @@ pub const CpuBackend = struct {
             self.matvec = quantized.matvec;
             self.attention_kernels = attention_registry.selectForTarget(target).kernels;
             self.relpos_mha_kernels = attention_registry.selectForTarget(target).kernels;
-            self.depthwise_conv1d = conv1d_registry.selectForTarget(target).kernels;
             self.depthwise_conv2d = conv2d_registry.selectForTarget(target).kernels;
             self.fft = fft_registry.selectForTarget(target).kernels;
         }
@@ -213,12 +205,10 @@ pub const CpuBackend = struct {
             self.thread_count = effective_thread_count;
         }
 
-        // Allocate reduction + softmax scratch. Sized to thread_count; for single-thread
+        // Allocate reduction scratch. Sized to thread_count; for single-thread
         // this is still 1 slot (not zero), so ops don't need a per-call fallback.
         self.reduce_scratch_f32 = try allocator.alloc(f32, effective_thread_count);
         errdefer allocator.free(self.reduce_scratch_f32);
-        self.softmax_scratch_f32 = try allocator.alloc(f32, effective_thread_count * 2);
-        errdefer allocator.free(self.softmax_scratch_f32);
 
         // Allocate matmul scratch once per thread. Avoids per-call alloc/free in the
         // sequential fallback (single-thread mode was previously hitting alignedAlloc/free
@@ -231,7 +221,7 @@ pub const CpuBackend = struct {
             while (j < i) : (j += 1) allocator.free(mm[j]);
         }
         // Cover the f32 registry maxima, the selected f32 kernel, and every member of
-        // the quantized family a tile may fall back to.
+        // the quantized family a view may fall back to.
         const scratch_bytes: usize = @max(
             @max(matmul_registry.maxScratchBytes(), self.matmul_q.scratchBytes()),
             self.matmul_f32.scratch_bytes,
@@ -280,11 +270,6 @@ pub const CpuBackend = struct {
         if (self.reduce_scratch_f32.len != 0) {
             self.allocator.free(self.reduce_scratch_f32);
             self.reduce_scratch_f32 = &[_]f32{};
-        }
-
-        if (self.softmax_scratch_f32.len != 0) {
-            self.allocator.free(self.softmax_scratch_f32);
-            self.softmax_scratch_f32 = &[_]f32{};
         }
         self.thread_count = 1;
     }
@@ -346,10 +331,10 @@ pub const CpuBackend = struct {
     fn readI32Scalar(store: tensor_store.TensorStore, id: executable.TensorId) ExecuteProgramError!i32 {
         const meta: tensor_store.TensorMeta = try store.meta(id);
         if (meta.dtype != .i32 or meta.rank != 1 or meta.shape.len != 1 or meta.shape[0] != 1) return error.InvalidArgument;
-        const tile: tensor_store.TileRefConst = try store.acquireTileConstLinear(id, 0);
-        defer store.releaseConst(tile.token);
-        if (tile.bytes.len < @sizeOf(i32)) return error.InvalidArgument;
-        return std.mem.readInt(i32, tile.bytes[0..@sizeOf(i32)], .little);
+        const view: tensor_store.ViewConst = try store.acquireConst(id);
+        defer store.releaseConst(view.token);
+        if (view.bytes.len < @sizeOf(i32)) return error.InvalidArgument;
+        return std.mem.readInt(i32, view.bytes[0..@sizeOf(i32)], .little);
     }
 
     fn readPredicate(store: tensor_store.TensorStore, id: executable.TensorId) ExecuteProgramError!bool {
@@ -362,33 +347,17 @@ pub const CpuBackend = struct {
         return @intCast(raw);
     }
 
-    fn totalTileCount(meta: tensor_store.TensorMeta) ExecuteProgramError!usize {
-        var total: usize = 1;
-        for (meta.tile_counts) |count| {
-            total = std.math.mul(usize, total, count) catch return error.InvalidArgument;
-        }
-        return total;
-    }
-
     fn copyTensorSameLayout(store: tensor_store.TensorStore, dst: executable.TensorId, src: executable.TensorId) ExecuteProgramError!void {
         const dst_meta: tensor_store.TensorMeta = try store.meta(dst);
         const src_meta: tensor_store.TensorMeta = try store.meta(src);
-        if (dst_meta.dtype != src_meta.dtype or dst_meta.rank != src_meta.rank) return error.InvalidArgument;
-        if (dst_meta.shape.len != src_meta.shape.len or dst_meta.tile_shape.len != src_meta.tile_shape.len or dst_meta.tile_counts.len != src_meta.tile_counts.len) return error.InvalidArgument;
-        for (dst_meta.shape, 0..) |v, i| if (v != src_meta.shape[i]) return error.InvalidArgument;
-        for (dst_meta.tile_shape, 0..) |v, i| if (v != src_meta.tile_shape[i]) return error.InvalidArgument;
-        for (dst_meta.tile_counts, 0..) |v, i| if (v != src_meta.tile_counts[i]) return error.InvalidArgument;
+        if (dst_meta.dtype != src_meta.dtype or !std.mem.eql(usize, dst_meta.shape, src_meta.shape)) return error.InvalidArgument;
 
-        const tile_count: usize = try totalTileCount(dst_meta);
-        var tile_index: usize = 0;
-        while (tile_index < tile_count) : (tile_index += 1) {
-            const src_tile: tensor_store.TileRefConst = try store.acquireTileConstLinear(src, tile_index);
-            defer store.releaseConst(src_tile.token);
-            const dst_tile: tensor_store.TileRefMut = try store.acquireTileMutLinear(dst, tile_index);
-            defer store.releaseMut(dst_tile.token);
-            if (dst_tile.bytes.len != src_tile.bytes.len) return error.InvalidArgument;
-            @memcpy(dst_tile.bytes, src_tile.bytes);
-        }
+        const src_view = try store.acquireConst(src);
+        defer store.releaseConst(src_view.token);
+        const dst_view = try store.acquireMut(dst);
+        defer store.releaseMut(dst_view.token);
+        if (dst_view.bytes.len != src_view.bytes.len) return error.InvalidArgument;
+        @memcpy(dst_view.bytes, src_view.bytes);
     }
 
     fn copyTensorLists(store: tensor_store.TensorStore, dst: []const executable.TensorId, src: []const executable.TensorId) ExecuteProgramError!void {
@@ -419,7 +388,7 @@ pub const CpuBackend = struct {
 
     fn execStep(self: *Self, prog: *const executable.ExecutableProgram, step: executable.Step, store: tensor_store.TensorStore, cache: *exec_conv.ConvCache) ExecuteProgramError!void {
         switch (step) {
-            .MatMulTiled => |s| {
+            .MatMul => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 var mm_ctx: exec_matmul.MatMulExecCtx = .{
                     .allocator = self.allocator,
@@ -430,38 +399,37 @@ pub const CpuBackend = struct {
                     .matvec = self.matvec,
                     .matmul_scratch = self.matmul_scratch_f32,
                 };
-                try exec_matmul.execMatMulTiled(&mm_ctx, s, store);
+                try exec_matmul.execMatMul(&mm_ctx, s, store);
             },
 
-            .ElemwiseBinaryTiled => |s| {
+            .ElemwiseBinary => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try ElemwiseExec.execElemwiseBinaryTiled(pool_ptr, self.thread_count, s, store);
+                try ElemwiseExec.execElemwiseBinary(pool_ptr, self.thread_count, s, store);
             },
 
-            .UnaryTiled => |s| {
+            .Unary => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_unary.execUnaryTiled(pool_ptr, self.thread_count, s, store);
+                try exec_unary.execUnary(pool_ptr, self.thread_count, s, store);
             },
 
-            .SoftmaxTiled => |s| {
+            .Softmax => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_softmax.execSoftmaxTiled(pool_ptr, self.thread_count, self.softmax_scratch_f32, s, store);
+                try exec_softmax.execSoftmax(pool_ptr, self.thread_count, s, store);
             },
 
-            .Conv1DTiled => |s| {
+            .Conv1D => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 var conv_ctx: exec_conv.ConvExecCtx = .{
                     .allocator = self.allocator,
                     .pool = pool_ptr,
                     .thread_count = self.thread_count,
                     .matmul_f32 = self.matmul_f32,
-                    .depthwise_conv1d = self.depthwise_conv1d,
                     .depthwise_conv2d = self.depthwise_conv2d,
                     .matmul_scratch = self.matmul_scratch_f32,
                     .cache = cache,
                     .l2_bytes = self.l2_bytes,
                 };
-                try exec_conv.execConv1DTiled(&conv_ctx, s, store);
+                try exec_conv.execConv1D(&conv_ctx, s, store);
             },
 
             .MaxPool2D => |s| try @import("exec/pool.zig").exec(
@@ -471,40 +439,39 @@ pub const CpuBackend = struct {
                 s,
                 store,
             ),
-            .Conv2DTiled => |s| {
+            .Conv2D => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 var conv_ctx: exec_conv.ConvExecCtx = .{
                     .allocator = self.allocator,
                     .pool = pool_ptr,
                     .thread_count = self.thread_count,
                     .matmul_f32 = self.matmul_f32,
-                    .depthwise_conv1d = self.depthwise_conv1d,
                     .depthwise_conv2d = self.depthwise_conv2d,
                     .matmul_scratch = self.matmul_scratch_f32,
                     .cache = cache,
                     .l2_bytes = self.l2_bytes,
                 };
-                try exec_conv.execConv2DTiled(&conv_ctx, s, store);
+                try exec_conv.execConv2D(&conv_ctx, s, store);
             },
 
-            .LayerNormTiled => |s| {
+            .LayerNorm => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_layernorm.execLayerNormTiled(pool_ptr, self.thread_count, s, store);
+                try exec_layernorm.execLayerNorm(pool_ptr, self.thread_count, s, store);
             },
 
-            .RMSNormTiled => |s| {
+            .RMSNorm => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_layernorm.execRMSNormTiled(pool_ptr, self.thread_count, s, store);
+                try exec_layernorm.execRMSNorm(pool_ptr, self.thread_count, s, store);
             },
 
-            .AttentionTiled => |s| {
+            .Attention => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_attention.execAttentionTiled(self.allocator, pool_ptr, self.thread_count, self.attention_kernels, s, store);
+                try exec_attention.execAttention(self.allocator, pool_ptr, self.thread_count, self.attention_kernels, s, store);
             },
 
-            .RelPosMHATiled => |s| {
+            .RelPosMHA => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_relpos_mha.execRelPosMHATiled(self.allocator, pool_ptr, self.thread_count, self.relpos_mha_kernels, s, store);
+                try exec_relpos_mha.execRelPosMHA(self.allocator, pool_ptr, self.thread_count, self.relpos_mha_kernels, s, store);
             },
 
             .ArgMax => |s| {
@@ -520,9 +487,9 @@ pub const CpuBackend = struct {
                 try exec_scatter.execScatterRow(s, store);
             },
 
-            .CopyTiled => |s| {
+            .Copy => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try ElemwiseExec.execCopyTiled(pool_ptr, self.thread_count, s, store);
+                try ElemwiseExec.execCopy(pool_ptr, self.thread_count, s, store);
             },
 
             .LSTMCellFused => |s| {
@@ -593,53 +560,48 @@ pub const CpuBackend = struct {
 
             .ReduceAxis => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_utils.reduceAxisScalar(pool_ptr, self.thread_count, self.reduce_scratch_f32, s.op, s.out, s.a, s.axis, store);
+                try exec_utils.reduceAxisScalar(pool_ptr, self.thread_count, s.op, s.out, s.a, s.axis, store);
             },
 
             .ConcatScalar => |s| {
                 try exec_utils.concatScalar(s, store);
             },
 
-            .ReTileCopyScalar => |s| {
-                try exec_utils.retileCopyScalar(store, s.dst, s.src);
-            },
             .ReshapeScalar => |s| {
                 try exec_utils.reshapeCopyScalar(store, s.dst, s.src);
             },
             .Transpose2DScalar => |s| {
-                try exec_utils.transpose2DCopyScalar(store, s.dst, s.src);
+                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
+                try exec_utils.transpose2DCopyScalar(pool_ptr, self.thread_count, store, s.dst, s.src);
             },
             .SliceNDScalar => |s| {
                 const rank: usize = @as(usize, s.rank);
                 try exec_utils.sliceNDCopyScalar(store, s.dst, s.src, s.starts[0..rank]);
             },
 
-            .GatherRowsTiled => |s| {
+            .GatherRows => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_gather.execGatherRowsTiled(pool_ptr, self.thread_count, s, store);
+                try exec_gather.execGatherRows(pool_ptr, self.thread_count, s, store);
             },
             .GatherND => |s| try @import("exec/gather.zig").execGatherND(s, store),
-            .GatherTiled => |s| {
+            .Gather => |s| try exec_gather.execGather(s, store),
+
+            .RoPE1D => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_gather.execGatherTiled(pool_ptr, self.thread_count, s, store);
+                try exec_rope.execRoPE1D(pool_ptr, self.thread_count, s, store);
             },
 
-            .RoPE1DTiled => |s| {
+            .SequenceAppend => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_rope.execRoPE1DTiled(pool_ptr, self.thread_count, s, store);
+                try exec_sequence_append.execSequenceAppend(pool_ptr, self.thread_count, s, store);
             },
 
-            .SequenceAppendTiled => |s| {
+            .Cast => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_sequence_append.execSequenceAppendTiled(pool_ptr, self.thread_count, s, store);
+                try exec_cast.execCast(pool_ptr, self.thread_count, s, store);
             },
 
-            .CastTiled => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_cast.execCastTiled(pool_ptr, self.thread_count, s, store);
-            },
-
-            .MatMulNTTiled => |s| {
+            .MatMulNT => |s| {
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 const nt_ctx: exec_matmul_nt.MatMulNtExecCtx = .{
                     .matmul_nt = self.matmul_nt,
@@ -647,7 +609,7 @@ pub const CpuBackend = struct {
                     .l2_bytes = self.l2_bytes,
                     .l1d_bytes = self.l1d_bytes,
                 };
-                try exec_matmul_nt.execMatMulNTTiled(&nt_ctx, pool_ptr, self.thread_count, s, store);
+                try exec_matmul_nt.execMatMulNT(&nt_ctx, pool_ptr, self.thread_count, s, store);
             },
         }
     }

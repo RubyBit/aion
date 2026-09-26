@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 // ScatterRow: in-place row write `buf[idx] = src`. The output aliases buf (set up
-// in lowering). v1: buf/idx/src are each a single tile. The "row" is buf[1:]
+// in lowering). The "row" is buf[1:]
 // flattened (scalar for rank-1 buf). Used to emit decode tokens into an output
 // buffer at a dynamic index.
 const std = @import("std");
@@ -34,35 +34,28 @@ pub fn execScatterRow(
     if (buf_meta.dtype.info().is_quantized) return BackendError.InvalidArgument;
     if (idx_meta.dtype != .i32) return BackendError.InvalidArgument;
 
-    const buf_rank: usize = @as(usize, buf_meta.rank);
-    var d: usize = 0;
-    while (d < buf_rank) : (d += 1) {
-        if (buf_meta.tile_counts[d] != 1) return BackendError.InvalidArgument;
-    }
-
     const m: usize = buf_meta.shape[0];
     var row_size: usize = 1;
-    d = 1;
-    while (d < buf_rank) : (d += 1) row_size *= buf_meta.shape[d];
+    for (buf_meta.shape[1..buf_meta.rank]) |dim| row_size *= dim;
     const elem_bytes: usize = try scalarBytes(buf_meta.dtype);
     const row_bytes: usize = row_size * elem_bytes;
 
-    const idx_tile = try store.acquireTileConstLinear(s.idx, 0);
-    defer store.releaseConst(idx_tile.token);
-    const idx_bytes = idx_tile.bufferView().bytes;
+    const idx_view = try store.acquireConst(s.idx);
+    defer store.releaseConst(idx_view.token);
+    const idx_bytes = idx_view.bufferView().bytes;
     if (idx_bytes.len < 4) return BackendError.InvalidArgument;
     const idx_val: i32 = std.mem.readInt(i32, idx_bytes[0..4], .little);
     if (idx_val < 0 or @as(usize, @intCast(idx_val)) >= m) return BackendError.InvalidArgument;
     const row: usize = @intCast(idx_val);
 
-    const src_tile = try store.acquireTileConstLinear(s.src, 0);
-    defer store.releaseConst(src_tile.token);
-    const src_bytes = src_tile.bufferView().bytes;
+    const src_view = try store.acquireConst(s.src);
+    defer store.releaseConst(src_view.token);
+    const src_bytes = src_view.bufferView().bytes;
     if (src_bytes.len < row_bytes) return BackendError.InvalidArgument;
 
-    const buf_tile = try store.acquireTileMutLinear(s.buf, 0);
-    defer store.releaseMut(buf_tile.token);
-    const buf_bytes = buf_tile.bufferView().bytes;
+    const buf_view = try store.acquireMut(s.buf);
+    defer store.releaseMut(buf_view.token);
+    const buf_bytes = buf_view.bufferView().bytes;
     if (buf_bytes.len < (row + 1) * row_bytes) return BackendError.InvalidArgument;
 
     @memcpy(buf_bytes[row * row_bytes .. row * row_bytes + row_bytes], src_bytes[0..row_bytes]);

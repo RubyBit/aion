@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 
-//! Compile-time graph validation: inference errors, shape rejection, and
-//! tiling decisions. Nothing here executes a backend — numeric conformance
+//! Compile-time graph validation: inference errors and shape rejection. Nothing here executes a backend — numeric conformance
 //! lives in `backend/cpu/test_cpu_backend.zig`, and lowered-structure golden
 //! snapshots live in `test_program_golden.zig`.
 
@@ -10,36 +9,8 @@ const std = @import("std");
 const manager_mod = @import("../storage/manager.zig");
 const graph_mod = @import("graph.zig");
 const infer_mod = @import("infer.zig");
-const plan_mod = @import("plan.zig");
 
-test "gpu general and matmul tile caps are independent" {
-    var policy = plan_mod.tilePolicyForTarget(.webgpu);
-    policy.base_square_2d = 32;
-    policy.matmul_mn_tile_cap = 512;
-    policy.matmul_k_tile_cap = 128;
-
-    try std.testing.expectEqual([2]usize{ 32, 32 }, plan_mod.chooseTileShape2DSquare(policy, 1024, 1024));
-    const mm = plan_mod.chooseMatMulTiles(policy, 1024, 1024, 1024, .f32);
-    try std.testing.expectEqual(@as(usize, 512), mm.tm);
-    try std.testing.expectEqual(@as(usize, 512), mm.tn);
-    try std.testing.expectEqual(@as(usize, 128), mm.tk);
-    try std.testing.expectEqual(@as(usize, 512), plan_mod.matMulMHint(policy));
-}
 const program = @import("program.zig");
-
-test "plan: chooseTileShape2DSquare handles skinny matrices" {
-    const policy: plan_mod.TilePolicy = .{};
-
-    const t0: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 1, 128);
-    try std.testing.expectEqual(@as(usize, 1), t0[0]);
-    try std.testing.expectEqual(@min(@as(usize, 128), policy.base_1d), t0[1]);
-    try std.testing.expect(t0[1] > 1);
-
-    const t1: [2]usize = plan_mod.chooseTileShape2DSquare(policy, 256, 1);
-    try std.testing.expectEqual(@min(@as(usize, 256), policy.base_1d), t1[0]);
-    try std.testing.expectEqual(@as(usize, 1), t1[1]);
-    try std.testing.expect(t1[0] > 1);
-}
 
 test "graph: matmul rejects mismatched non-quant dtypes" {
     const allocator: std.mem.Allocator = std.testing.allocator;
@@ -54,8 +25,8 @@ test "graph: matmul rejects mismatched non-quant dtypes" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f16, &[_]usize{ m, k }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ k, n }, .{});
 
     // Contents are irrelevant; compilation should fail before execution.
     var a_zero: [a_bytes_len]u8 = @splat(0);
@@ -74,8 +45,7 @@ test "graph: matmul rejects mismatched non-quant dtypes" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, .cpu(policy)));
+    try std.testing.expectError(infer_mod.InferError.DTypeMismatch, program.compileGraph(allocator, &g, &sm, .cpu()));
 }
 
 test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
@@ -84,11 +54,11 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 1, 3, 2 }, &[_]usize{ 1, 1, 1, 2 }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, &[_]usize{ 1, 1, 2, 2 }, .{ .tile_alignment = 64 });
-    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, 1 }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{ .tile_alignment = 64 });
+    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 1, 3, 2 }, .{});
+    const k_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, .{});
+    const v_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 2, 4, 2 }, .{});
+    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ 1, 1 }, .{});
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{1}, .{});
 
     var q_init: [1 * 1 * 3 * 2]f32 = @splat(0.0);
     var k_init: [1 * 2 * 4 * 2]f32 = @splat(0.0);
@@ -120,8 +90,7 @@ test "graph: cached grouped-query attention enforces H_q % H_kv == 0" {
     const out: graph_mod.ValueId = try g.addAttention(q_in, k_in, v_in, pos_in, end_in, 1.0, .causal, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, .cpu(policy)));
+    try std.testing.expectError(infer_mod.InferError.ShapeMismatch, program.compileGraph(allocator, &g, &sm, .cpu()));
 }
 
 test "graph: attention controls are independent and a bounded window needs aligned runs" {
@@ -171,79 +140,6 @@ test "graph: attention controls are independent and a bounded window needs align
     }
 }
 
-test "graph: rope1d retiles a head-dim-split input instead of rejecting it" {
-    // A *computed* `[B, L, H, D]` q/k — the shape every attention layer feeds RoPE —
-    // is square-tiled across its last two axes by the default policy once it passes
-    // `small_tensor_threshold`, which splits D. RoPE needs whole head-dim vectors
-    // (it rotates i against i + D/2), and used to reject that tiling outright,
-    // failing any prefill long enough to cross the threshold. It must retile now.
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const l: usize = 2;
-    const k_in_dim: usize = 2;
-    const heads: usize = 2;
-    const head_dim: usize = 4;
-
-    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const x_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ 1, l, k_in_dim }, &[_]usize{ 1, 1, k_in_dim }, .{ .tile_alignment = 64 });
-    const w_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ k_in_dim, heads * head_dim }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
-    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ 1, l }, &[_]usize{ 1, l }, .{ .tile_alignment = 64 });
-
-    var x_init: [1 * l * k_in_dim]f32 = @splat(0.0);
-    var w_init: [k_in_dim * heads * head_dim]f32 = @splat(0.0);
-    var pos_init: [l]i32 = .{ 0, 1 };
-    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(x_init[0..]));
-    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(w_init[0..]));
-    try sm.writeFromPackedScalar(pos_tid, std.mem.sliceAsBytes(pos_init[0..]));
-
-    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const x_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ 1, l, k_in_dim });
-    const w_in: graph_mod.ValueId = try g.addInput(.f32, &[_]usize{ k_in_dim, heads * head_dim });
-    const pos_in: graph_mod.ValueId = try g.addInput(.i32, &[_]usize{ 1, l });
-    try g.bindExternal(x_in, @intCast(x_tid));
-    try g.bindExternal(w_in, @intCast(w_tid));
-    try g.bindExternal(pos_in, @intCast(pos_tid));
-
-    // Projected then split into heads: a computed value, so its tiling is the
-    // policy's, not an input signature's.
-    const proj: graph_mod.ValueId = try g.addMatMul(x_in, w_in, 1.0, 0.0);
-    const q: graph_mod.ValueId = try g.addViewReshape(proj, &[_]usize{ 1, l, heads, head_dim });
-    const out: graph_mod.ValueId = try g.addRoPE1D(q, pos_in, 10000.0, 1.0, 1.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{out});
-
-    // `small_tensor_threshold = 1` forces the square-tiling path that splits D;
-    // `base_square_2d = 2` makes the split observable at these tiny sizes.
-    const policy: plan_mod.TilePolicy = .{
-        .base_square_2d = 2,
-        .base_1d = 2,
-        .small_tensor_threshold = 1,
-        .tile_alignment = 64,
-    };
-    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
-    defer prog.deinit();
-
-    // The lowered step must see whole head-dim vectors on both x and out.
-    var saw_rope: bool = false;
-    for (prog.steps) |step| {
-        switch (step.op) {
-            .RoPE1DTiled => |s| {
-                saw_rope = true;
-                for ([_]manager_mod.TensorId{ s.x, s.out }) |tid| {
-                    const t = try sm.getConst(tid);
-                    try std.testing.expectEqual(@as(usize, head_dim), t.tile_shape[3]);
-                    try std.testing.expectEqual(@as(usize, 1), t.tile_counts[3]);
-                }
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_rope);
-}
-
 const executable = @import("../runtime/executable.zig");
 const types = @import("../backend/types.zig");
 
@@ -263,11 +159,11 @@ test "placement: a device-written control predicate gets a transfer" {
         defer g.deinit();
 
         const a = try g.addInput(.i32, &.{1});
-        try g.bindExternal(a, try sm.createTiledTensor(.i32, &.{1}, &.{1}, .{}));
+        try g.bindExternal(a, try sm.createTensor(.i32, &.{1}, .{}));
         const b = try g.addInput(.i32, &.{1});
-        try g.bindExternal(b, try sm.createTiledTensor(.i32, &.{1}, &.{1}, .{}));
+        try g.bindExternal(b, try sm.createTensor(.i32, &.{1}, .{}));
         const x = try g.addInput(.f32, &.{4});
-        try g.bindExternal(x, try sm.createTiledTensor(.f32, &.{4}, &.{4}, .{}));
+        try g.bindExternal(x, try sm.createTensor(.f32, &.{4}, .{}));
 
         // The predicate is computed by a step, so the device owns it.
         const cond = try g.addElemwiseBinary(.add, a, b);
@@ -280,7 +176,7 @@ test "placement: a device-written control predicate gets a transfer" {
         const out = try g.addIf(cond, then_r, else_r);
         try g.setOutputs(&.{out});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = if (target == .cpu) .cpu else .gpu }, .{ .target_kind = target }));
+        var prog = try program.compileGraph(allocator, &g, &sm, .init(.{ .kind = if (target == .cpu) .cpu else .gpu }, .row_major));
         defer prog.deinit();
 
         var transfers: usize = 0;
@@ -307,140 +203,5 @@ test "placement: a device-written control predicate gets a transfer" {
         }
 
         try prog.validatePlacements();
-    }
-}
-
-test "plan: a skinny matmul keeps whole tiles and needs no retile" {
-    // A tiny m used to collapse the square-tile side to 1, splitting a constant
-    // B into n one-column tiles and forcing a ReTileCopyScalar on every run.
-    const policy: plan_mod.TilePolicy = .{};
-    for ([_][2]usize{ .{ 1, 10 }, .{ 1, 4 }, .{ 4, 32 }, .{ 2, 63 }, .{ 32, 2 }, .{ 63, 3 } }) |mn| {
-        const t = plan_mod.chooseMatMulTiles(policy, mn[0], mn[1], 256, .f32);
-        try std.testing.expect(t.tm > 1 or mn[0] == 1);
-        try std.testing.expect(t.tn > 1 or mn[1] == 1);
-    }
-
-    const allocator: std.mem.Allocator = std.testing.allocator;
-    const k: usize = 256;
-    const n: usize = 10;
-
-    var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ k, n }, .{ .tile_alignment = 64 });
-    const x_init: [k]f32 = @splat(0.0);
-    const w_init: [k * n]f32 = @splat(0.0);
-    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(@constCast(x_init[0..])));
-    try sm.writeFromPackedScalar(w_tid, std.mem.sliceAsBytes(@constCast(w_init[0..])));
-
-    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-    const x_in = try g.addInput(.f32, &[_]usize{ 1, k });
-    const w_in = try g.addInput(.f32, &[_]usize{ k, n });
-    try g.bindExternal(x_in, @intCast(x_tid));
-    try g.bindExternal(w_in, @intCast(w_tid));
-    const y = try g.addMatMul(x_in, w_in, 1.0, 0.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, .cpu(.{}));
-    defer prog.deinit();
-
-    var saw_matmul: bool = false;
-    for (prog.steps) |step| {
-        try std.testing.expect(step.op != .ReTileCopyScalar);
-        switch (step.op) {
-            .MatMulTiled => |s| {
-                saw_matmul = true;
-                const bt = try sm.getConst(s.b);
-                try std.testing.expectEqual(@as(usize, 1), bt.tile_counts[1]);
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_matmul);
-}
-
-test "plan: a quantized weight's own tiling is adopted rather than demanded" {
-    // A quantized B cannot be re-tiled, so a weight authored against one policy
-    // (say a CPU context) must still compile for another (a GPU target). The
-    // lowering adopts its tiling instead of insisting on the chooser's.
-    const allocator: std.mem.Allocator = std.testing.allocator;
-    const k: usize = 256;
-    const n: usize = 256;
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const cpu_policy: plan_mod.TilePolicy = plan_mod.tilePolicyForTarget(.cpu);
-    const authored = plan_mod.chooseMatMulTiles(cpu_policy, plan_mod.matMulMHint(cpu_policy), n, k, .q8_0);
-    const gpu_policy: plan_mod.TilePolicy = plan_mod.tilePolicyForTarget(.webgpu);
-    const wanted = plan_mod.chooseMatMulTiles(gpu_policy, plan_mod.matMulMHint(gpu_policy), n, k, .q8_0);
-    // The premise: the two policies really do disagree for this shape.
-    try std.testing.expect(authored.tk != wanted.tk or authored.tn != wanted.tn);
-
-    const b_tid = try sm.createTiledTensor(.q8_0, &[_]usize{ k, n }, &[_]usize{ authored.tk, authored.tn }, .{
-        .tile_alignment = 64,
-        .quant_axis = 0,
-    });
-    const packed_len = try @import("../backend/utils.zig").requiredBytesForElems(.q8_0, k * n);
-    const buf = try allocator.alloc(u8, packed_len);
-    defer allocator.free(buf);
-    @memset(buf, 0);
-    try sm.writeFromPackedQuant(b_tid, buf);
-
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, k }, &[_]usize{ 1, k }, .{ .tile_alignment = 64 });
-    const x_init: [k]f32 = @splat(0.0);
-    try sm.writeFromPackedScalar(x_tid, std.mem.sliceAsBytes(@constCast(x_init[0..])));
-
-    var g: graph_mod.Graph = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-    const x_in = try g.addInput(.f32, &[_]usize{ 1, k });
-    const w_in = try g.addInput(.q8_0, &[_]usize{ k, n });
-    try g.bindExternal(x_in, @intCast(x_tid));
-    try g.bindExternal(w_in, @intCast(b_tid));
-    const y = try g.addMatMul(x_in, w_in, 1.0, 0.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{y});
-
-    // Compiling for the GPU policy must succeed and keep the authored tiling. No
-    // optional passes: this is about the MatMul lowering, which a layout pass
-    // would otherwise replace.
-    var prog: program.Program = try program.compileGraph(allocator, &g, &sm, program.Target.init(.{ .kind = .gpu }, gpu_policy).withPasses(.empty));
-    defer prog.deinit();
-
-    var saw: bool = false;
-    for (prog.steps) |step| {
-        switch (step.op) {
-            .MatMulTiled => |s| {
-                saw = true;
-                const bt = try sm.getConst(s.b);
-                try std.testing.expectEqual(authored.tk, bt.tile_shape[0]);
-                try std.testing.expectEqual(authored.tn, bt.tile_shape[1]);
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw);
-}
-
-test "plan: a quantized B keeps its N axis parallelisable at every width" {
-    const policy: plan_mod.TilePolicy = .{};
-
-    // A projection wide enough to hit the cap still leaves the minimum tiles.
-    try std.testing.expectEqual(@as(usize, 512), plan_mod.chooseQuantBTileN(policy, 2048));
-    try std.testing.expect(2048 / plan_mod.chooseQuantBTileN(policy, 2048) >= policy.quant_b_min_tiles);
-
-    // A vocabulary-sized head is capped, not widened to a quarter of itself.
-    try std.testing.expectEqual(@as(usize, 512), plan_mod.chooseQuantBTileN(policy, 32000));
-
-    // A narrow matrix is split rather than taken whole, so M=1 still has an axis
-    // to parallelise over.
-    try std.testing.expect(plan_mod.chooseQuantBTileN(policy, 512) < 512);
-    try std.testing.expect(512 / plan_mod.chooseQuantBTileN(policy, 512) >= policy.quant_b_min_tiles);
-
-    // Never wider than the matrix, never zero, always SIMD-friendly.
-    for ([_]usize{ 1, 15, 16, 48, 64, 300, 1000 }) |n| {
-        const tn = plan_mod.chooseQuantBTileN(policy, n);
-        try std.testing.expect(tn >= 1 and tn <= n);
-        if (tn >= 16) try std.testing.expectEqual(@as(usize, 0), tn % 16);
     }
 }

@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-//! Matmul execution for the GPU backend: the tile loop, per-shape autotuning, and
-//! on-device timing. Owns the autotune cache (one `Matmul` lives on the backend).
+//! Matmul execution for the GPU backend: one GEMM dispatch per step, per-shape
+//! autotuning, and on-device timing. Owns the autotune cache (one `Matmul` lives on the backend).
 //! Uses the generic `autotune` helper + the generated kernels from `configs.zig`.
-//!
-//! v1 scope: rank-2 (non-batched) f32 matmul. Mirrors the CPU tile loop — for each
-//! output tile (ti_m, ti_n), accumulate over the k-tiles, applying the original
-//! beta only on the first k-tile (1.0 thereafter).
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -28,10 +24,10 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const TensorMeta = tensor_store_mod.TensorMeta;
 const MatmulConfig = codegen.MatmulConfig;
 const Generated = codegen.Generated;
-const StepMatMul = executable.StepMatMulTiled;
+const StepMatMul = executable.StepMatMul;
 
 /// Shared dequant module (also used by the MatMulNT executor). We use its
-/// `q8_to_f32` entry to materialize a q8_0 B tile as f32 for the plain GEMM.
+/// `q8_to_f32` entry to materialize a q8_0 B as f32 for the plain GEMM.
 const dequant_kernel: pipelines.KernelDesc = .{ .name = "dequant", .wgsl = @embedFile("../kernels/dequant.wgsl") };
 /// Fused q8_0 (K-major) matvec for M==1 (decode): folds the dequant into the dot
 /// so B is read once, no f32 scratch. See kernels/matmul_gemv.wgsl.
@@ -52,7 +48,7 @@ const GemvParams = extern struct { k: u32, n: u32, _p0: u32 = 0, _p1: u32 = 0, a
 /// Field order matches `struct Params` in dequant.wgsl.
 const DequantParams = extern struct { n: u32, k: u32, src_wpr: u32, dst_row: u32, count: u32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 
-/// Uniform params for the tiled GEMM kernel; field order matches the WGSL
+/// Uniform params for the GEMM kernel; field order matches the WGSL
 /// `struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32> }`.
 /// Shared with the MatMulNT executor (matmul_nt.zig), which drives the same GEMM
 /// pipelines over a dequantized scratch B.
@@ -60,15 +56,19 @@ pub const MatMulParams = extern struct {
     m: u32,
     n: u32,
     k: u32,
-    _d3: u32 = 0,
+    /// Elements between consecutive batches of A (workgroup z); 0 broadcasts.
+    a_batch: u32 = 0,
     a_row: u32,
     b_row: u32,
     c_row: u32,
-    _s3: u32 = 0,
+    /// Same for B. C's batches are always `m * c_row` apart.
+    b_batch: u32 = 0,
     alpha: f32,
     beta: f32,
-    _a2: f32 = 0,
-    _a3: f32 = 0,
+    /// Element offset of C's first output: an NT weight chunked along N writes
+    /// its columns of one C.
+    c_off: u32 = 0,
+    _a3: u32 = 0,
 };
 
 fn syncDevice(ctx: Ctx) void {
@@ -85,60 +85,71 @@ pub fn eligibleConfig(cfg: MatmulConfig, limits: wgpu.Limits, a_row_bytes: isize
     return @rem(a_row_bytes, 16) == 0 and @rem(b_row_bytes, 16) == 0;
 }
 
-fn tileBytes(meta: TensorMeta) ?u64 {
-    var elems: u64 = 1;
-    for (meta.tile_shape) |d| {
-        const dim = std.math.cast(u64, d) orelse return null;
-        elems = std.math.mul(u64, elems, dim) catch return null;
-    }
-    const bytes_per_elem = std.math.cast(u64, meta.dtype.info().block_bytes) orelse return null;
-    return std.math.mul(u64, elems, bytes_per_elem) catch return null;
+/// One GEMM over whole tensors: `batch` independent `[m, k] @ [k, n]` products,
+/// batch `z` of A/B starting `z * a_batch` / `z * b_batch` elements in (0 broadcasts).
+const Gemm = struct {
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+    a_batch: usize,
+    b_batch: usize,
+};
+
+/// The GEMM a `C[.., M, N] = A[.., M, K] @ B[.., K, N]` step is. Leading dims of A
+/// and B each either match C's or are all 1 (broadcast); B's are right-aligned. A
+/// broadcast B folds A's batches into M, so the common activations-times-weight
+/// case is one plain 2-D GEMM.
+fn gemmShape(c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!Gemm {
+    const r: usize = c_meta.rank;
+    const br: usize = b_meta.rank;
+    if (r < 2 or a_meta.rank != r or br < 2 or br > r) return error.Unsupported;
+    const m = c_meta.shape[r - 2];
+    const n = c_meta.shape[r - 1];
+    const k = a_meta.shape[r - 1];
+    if (a_meta.shape[r - 2] != m or b_meta.shape[br - 2] != k or b_meta.shape[br - 1] != n) return error.Unsupported;
+
+    var batch: usize = 1;
+    for (c_meta.shape[0 .. r - 2]) |d| batch *= d;
+    const a_full = std.mem.eql(usize, a_meta.shape[0 .. r - 2], c_meta.shape[0 .. r - 2]);
+    const a_ones = for (a_meta.shape[0 .. r - 2]) |d| {
+        if (d != 1) break false;
+    } else true;
+    const b_lead = b_meta.shape[0 .. br - 2];
+    const b_full = b_lead.len == r - 2 and std.mem.eql(usize, b_lead, c_meta.shape[0 .. r - 2]);
+    const b_ones = for (b_lead) |d| {
+        if (d != 1) break false;
+    } else true;
+    if (!(a_full or a_ones) or !(b_full or b_ones)) return error.Unsupported;
+
+    if (batch == 1 or (b_ones and a_full)) return .{ .m = batch * m, .n = n, .k = k, .batch = 1, .a_batch = 0, .b_batch = 0 };
+    return .{
+        .m = m,
+        .n = n,
+        .k = k,
+        .batch = batch,
+        .a_batch = if (a_ones) 0 else m * k,
+        .b_batch = if (b_ones) 0 else k * n,
+    };
 }
 
-fn ensureTileBindingFits(ctx: Ctx, meta: TensorMeta) ExecuteProgramError!void {
-    const bytes = tileBytes(meta) orelse return error.Unsupported;
-    if (bytes > ctx.gpu.limits.max_storage_binding_bytes) return error.Unsupported;
-}
-
-fn fullStorageTiles(meta: TensorMeta) bool {
-    if (meta.shape.len != meta.tile_shape.len) return false;
-    for (meta.shape, meta.tile_shape) |shape, tile| {
-        if (tile == 0 or shape % tile != 0) return false;
-    }
-    return true;
-}
-
-fn fullTileCompatible(cfg: MatmulConfig, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) bool {
+/// Plain configs (no bounds checks) assume every dim is a whole number of blocks.
+fn blockAligned(cfg: MatmulConfig, g: Gemm) bool {
     if (cfg.bounds_check) return true;
-    if (c_meta.tile_shape.len != 2 or a_meta.tile_shape.len != 2 or b_meta.tile_shape.len != 2) return false;
-    if (!fullStorageTiles(c_meta) or !fullStorageTiles(a_meta) or !fullStorageTiles(b_meta)) return false;
-    return c_meta.tile_shape[0] % cfg.bm == 0 and
-        c_meta.tile_shape[1] % cfg.bn == 0 and
-        a_meta.tile_shape[0] % cfg.bm == 0 and
-        a_meta.tile_shape[1] % cfg.bk == 0 and
-        b_meta.tile_shape[0] % cfg.bk == 0 and
-        b_meta.tile_shape[1] % cfg.bn == 0;
+    return g.m % cfg.bm == 0 and g.n % cfg.bn == 0 and g.k % cfg.bk == 0;
 }
 
-fn forcedConfigIndex(generated: []const Generated, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!?usize {
+fn forcedConfigIndex(generated: []const Generated, limits: wgpu.Limits, row_bytes: [2]isize, g: Gemm) ExecuteProgramError!?usize {
     const raw = env_util.getOwned(std.heap.page_allocator, "AION_MATMUL_CONFIG") orelse return null;
     defer std.heap.page_allocator.free(raw);
 
-    const maybe_idx = std.fmt.parseInt(usize, raw, 10) catch null;
-    if (maybe_idx) |idx| {
-        if (idx >= generated.len) return error.Unsupported;
-        const cfg = generated[idx].cfg;
-        if (!fullTileCompatible(cfg, c_meta, a_meta, b_meta) or !eligibleConfig(cfg, limits, a_row_bytes, b_row_bytes)) return error.Unsupported;
-        return idx;
-    }
-
-    for (generated, 0..) |g, idx| {
-        if (std.mem.eql(u8, raw, g.entry)) {
-            if (!fullTileCompatible(g.cfg, c_meta, a_meta, b_meta) or !eligibleConfig(g.cfg, limits, a_row_bytes, b_row_bytes)) return error.Unsupported;
-            return idx;
-        }
-    }
-    return error.Unsupported;
+    const idx = std.fmt.parseInt(usize, raw, 10) catch for (generated, 0..) |gen, i| {
+        if (std.mem.eql(u8, raw, gen.entry)) break i;
+    } else return error.Unsupported;
+    if (idx >= generated.len) return error.Unsupported;
+    const cfg = generated[idx].cfg;
+    if (!blockAligned(cfg, g) or !eligibleConfig(cfg, limits, row_bytes[0], row_bytes[1])) return error.Unsupported;
+    return idx;
 }
 
 test "matmul eligibility respects device limits" {
@@ -162,8 +173,8 @@ pub const Matmul = struct {
     /// The implicit-GEMM conv kernels, rendered into the same arena.
     generated_conv: []const Generated,
 
-    /// Pooled f32 scratch holding one dequantized B tile [k, n] for the q8_0-B
-    /// GEMM path. Grows monotonically; freed in `deinit`.
+    /// Pooled f32 scratch holding a dequantized B [k, n] for the q8_0-B GEMM path.
+    /// Grows monotonically; freed in `deinit`.
     dq_scratch: ?c.WGPUBuffer = null,
     dq_scratch_cap: u64 = 0,
 
@@ -218,82 +229,26 @@ pub const Matmul = struct {
         const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
         const b_meta = hs.meta(s.b) catch return error.ExecutionFailed;
         if (c_meta.dtype != .f32 or a_meta.dtype != .f32) return error.Unsupported;
-        // Quantized B (q8_0): dequant each B tile to f32 scratch, then plain GEMM.
-        if (b_meta.dtype == .q8_0) return self.execQuantB(ctx, frame, s, c_meta, a_meta, b_meta);
+        // Every operand is one device buffer; a tensor past the binding limit is
+        // chunked, which this kernel does not address.
+        inline for (.{ c_meta, a_meta, b_meta }) |m| if (m.chunks != 1) return error.Unsupported;
+        const g = try gemmShape(c_meta, a_meta, b_meta);
+        if (g.m == 0 or g.n == 0) return;
+        if (b_meta.dtype == .q8_0) return self.execQuantB(ctx, frame, s, g);
         if (b_meta.dtype != .f32) return error.Unsupported;
-        // Batched matmul (rank > 2): the last two dims are the M×N matrix; leading
-        // dims are batch (broadcast when a/b have size 1 there). Mirrors the CPU
-        // `execMatMulTiledBatched`.
-        if (c_meta.tile_counts.len != 2 or a_meta.tile_counts.len != 2 or b_meta.tile_counts.len != 2) {
-            return self.execBatched(ctx, frame, s, c_meta, a_meta, b_meta);
-        }
-        try ensureTileBindingFits(ctx, c_meta);
-        try ensureTileBindingFits(ctx, a_meta);
-        try ensureTileBindingFits(ctx, b_meta);
 
-        const idx = try self.chooseConfig(ctx, s, c_meta, a_meta, b_meta);
-        const g = self.generated[idx];
-        const built = try ctx.pipes.get(g.desc, g.entry);
-
-        const tc_m = c_meta.tile_counts[0];
-        const tc_n = c_meta.tile_counts[1];
-        var ti_m: usize = 0;
-        while (ti_m < tc_m) : (ti_m += 1) {
-            var ti_n: usize = 0;
-            while (ti_n < tc_n) : (ti_n += 1) {
-                try recordOutputTile(ctx, frame, s, g, built, ti_m, ti_n, c_meta, a_meta, b_meta);
-            }
-        }
-    }
-
-    /// Batched matmul: iterate every output tile by linear index, broadcasting
-    /// leading batch dims, and record the last-two-dims GEMM per tile. Uses a
-    /// single universally-safe (bounds-checked, non-vec4) config rather than the
-    /// per-shape autotuner — batched matmuls in these models are small, and the
-    /// bounds-checked kernel handles any M/N/K tile without alignment constraints.
-    fn execBatched(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!void {
-        const rank = c_meta.tile_counts.len;
-        if (rank < 3 or rank > 8) return error.Unsupported;
-        const b_rank = b_meta.tile_counts.len;
-        if (a_meta.tile_counts.len != rank or b_rank < 2 or b_rank > rank) return error.Unsupported;
-
-        try ensureTileBindingFits(ctx, c_meta);
-        try ensureTileBindingFits(ctx, a_meta);
-        try ensureTileBindingFits(ctx, b_meta);
-
-        const idx = try self.batchedConfigIndex(ctx);
-        const g = self.generated[idx];
-        const built = try ctx.pipes.get(g.desc, g.entry);
+        // Batched products are small in these models: one bounds-checked config
+        // rather than a tune per shape.
+        const idx = if (g.batch == 1) try self.chooseConfig(ctx, s, g) else try self.safeConfigIndex(ctx);
         self.last_choice = idx;
-
-        var tile_total: usize = 1;
-        for (c_meta.tile_counts) |cnt| tile_total *= cnt;
-        const k_tiles = a_meta.tile_counts[rank - 1];
-
-        var coords_buf: [8]usize = undefined;
-
-        var ci: usize = 0;
-        while (ci < tile_total) : (ci += 1) {
-            const coords = coords_buf[0..rank];
-            tensor_store_mod.decodeTileCoords(c_meta, ci, coords) catch return error.ExecutionFailed;
-            const ti_m = coords[rank - 2];
-            const ti_n = coords[rank - 1];
-
-            var ti_k: usize = 0;
-            while (ti_k < k_tiles) : (ti_k += 1) {
-                const beta: f32 = if (ti_k == 0) s.beta else 1.0;
-
-                const batch: []const usize = coords[0 .. rank - 2];
-                const a_lin = tensor_store_mod.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null) catch return error.ExecutionFailed;
-                try recordTileGemmLinear(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
-            }
-        }
+        const gen = self.generated[idx];
+        const built = try ctx.pipes.get(gen.desc, gen.entry);
+        try recordGemm(ctx, frame, s, gen, built, g);
     }
 
     /// First bounds-checked, non-vec4 config that fits this device's limits — a
-    /// correct fallback for any tile shape (no block-alignment / vec4 stride needs).
-    fn batchedConfigIndex(self: *Matmul, ctx: Ctx) ExecuteProgramError!usize {
+    /// correct fallback for any shape (no block-alignment / vec4 stride needs).
+    fn safeConfigIndex(self: *Matmul, ctx: Ctx) ExecuteProgramError!usize {
         for (self.generated, 0..) |gg, idx| {
             const cfg = gg.cfg;
             if (cfg.vec4_load or !cfg.bounds_check) continue;
@@ -302,93 +257,35 @@ pub const Matmul = struct {
         return error.Unsupported;
     }
 
-    /// Matmul with a q8_0 B (weights in normal [.., K, N] layout, blocks along N):
-    /// dequant each B tile to an f32 scratch [K, n] then run the plain GEMM. Handles
-    /// rank-2 and batched uniformly by iterating output tiles by linear index.
-    /// A/C are f32 (checked by caller). Requires n_tile % 64 == 0 (word-aligned
-    /// q8_0 block pairs per row); other shapes fall back to `Unsupported`.
-    fn execQuantB(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!void {
-        const rank = c_meta.tile_counts.len;
-        if (rank < 2 or rank > 8) return error.Unsupported;
-        const b_rank = b_meta.tile_counts.len;
-        if (a_meta.tile_counts.len != rank or b_rank < 2 or b_rank > rank) return error.Unsupported;
-
-        // c/a fit checked with the f32 helper; b is q8_0 (tileBytes would misjudge
-        // its packed size), so its per-tile device length is checked at record time.
-        try ensureTileBindingFits(ctx, c_meta);
-        try ensureTileBindingFits(ctx, a_meta);
-
-        const idx = try self.batchedConfigIndex(ctx);
-        const g = self.generated[idx];
-        const built = try ctx.pipes.get(g.desc, g.entry);
-        self.last_choice = idx;
-
-        var tile_total: usize = 1;
-        for (c_meta.tile_counts) |cnt| tile_total *= cnt;
-        const k_tiles = a_meta.tile_counts[rank - 1];
-
-        var coords_buf: [8]usize = undefined;
-
-        var ci: usize = 0;
-        while (ci < tile_total) : (ci += 1) {
-            const coords = coords_buf[0..rank];
-            tensor_store_mod.decodeTileCoords(c_meta, ci, coords) catch return error.ExecutionFailed;
-            const ti_m = coords[rank - 2];
-            const ti_n = coords[rank - 1];
-
-            var ti_k: usize = 0;
-            while (ti_k < k_tiles) : (ti_k += 1) {
-                const beta: f32 = if (ti_k == 0) s.beta else 1.0;
-                const batch: []const usize = coords[0 .. rank - 2];
-                const a_lin = tensor_store_mod.projectTileIndex(a_meta, batch, &.{ ti_m, ti_k }, null) catch return error.ExecutionFailed;
-                const b_lin = tensor_store_mod.projectTileIndex(b_meta, batch, &.{ ti_k, ti_n }, null) catch return error.ExecutionFailed;
-                try self.recordQuantTileGemm(ctx, frame, s, g, built, ci, a_lin, b_lin, beta, rank);
-            }
-        }
-    }
-
-    fn recordQuantTileGemm(
-        self: *Matmul,
-        ctx: Ctx,
-        frame: *Frame,
-        s: StepMatMul,
-        g: Generated,
-        built: pipelines.Built,
-        c_lin: usize,
-        a_lin: usize,
-        b_lin: usize,
-        beta: f32,
-        rank: usize,
-    ) ExecuteProgramError!void {
-        const hs = ctx.store;
-        const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-        const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-        const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
-        defer {
-            hs.releaseConst(da.token);
-            hs.releaseConst(db.token);
-            hs.releaseMut(dc.token);
-        }
-        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, dc.len)) return error.Unsupported;
-
-        const m_dim: u32 = @intCast(dc.shape_mem[rank - 2]);
-        const n_dim: u32 = @intCast(dc.shape_mem[rank - 1]);
-        const k_dim: u32 = @intCast(da.shape_mem[rank - 1]);
-        // q8_0 B is quantized along K (the MatMul-B convention): block grid
-        // [K/32, N]. K must be block-aligned.
+    /// Matmul with a q8_0 B (normal [K, N] layout, blocks along K). M == 1 (decode)
+    /// fuses the dequant into the dot product; otherwise B is dequantized to an f32
+    /// scratch once and the plain GEMM runs. B is a weight, so batches of A fold
+    /// into M; a batched quantized B is not supported.
+    fn execQuantB(self: *Matmul, ctx: Ctx, frame: *Frame, s: StepMatMul, g: Gemm) ExecuteProgramError!void {
+        if (g.batch != 1) return error.Unsupported;
+        const m_dim = std.math.cast(u32, g.m) orelse return error.Unsupported;
+        const n_dim = std.math.cast(u32, g.n) orelse return error.Unsupported;
+        const k_dim = std.math.cast(u32, g.k) orelse return error.Unsupported;
         if (k_dim % Q8_BLOCK_ELEMS != 0) return error.Unsupported;
 
-        // M==1 (decode): fuse dequant into the dot product (one B read, no
-        // scratch). A is [1, k_dim] so we read it as vec4; a_row is irrelevant.
-        // Even N uses the coalesced column-PAIR kernel; odd N the per-column one.
-        if (m_dim == 1 and context.storageBindingFits(ctx, db.len)) {
-            const params: GemvParams = .{ .k = k_dim, .n = n_dim, .alpha = s.alpha, .beta = beta };
+        const hs = ctx.store;
+        const da = hs.acquireConst(s.a) catch return error.ExecutionFailed;
+        defer hs.releaseConst(da.token);
+        const db = hs.acquireConst(s.b) catch return error.ExecutionFailed;
+        defer hs.releaseConst(db.token);
+        const dc = hs.acquireMut(s.c) catch return error.ExecutionFailed;
+        defer hs.releaseMut(dc.token);
+        inline for (.{ da.len, db.len, dc.len }) |len| if (!context.storageBindingFits(ctx, len)) return error.Unsupported;
+
+        if (m_dim == 1) {
+            const params: GemvParams = .{ .k = k_dim, .n = n_dim, .alpha = s.alpha, .beta = s.beta };
             const bufs = [_]c.WGPUBuffer{
                 ctx.devmem.bufferFor(da.handle).?,
                 ctx.devmem.bufferFor(db.handle).?,
                 ctx.devmem.bufferFor(dc.handle).?,
             };
             const sizes = [_]u64{ da.len, db.len, dc.len };
+            // Even N uses the coalesced column-PAIR kernel; odd N the per-column one.
             if (n_dim % 2 == 0) {
                 // The group count is pairs/COLS, so a small N leaves most of the GPU
                 // idle at the wide kernel's COLS=32. Below the occupancy threshold the
@@ -411,14 +308,12 @@ pub const Matmul = struct {
             }
             return;
         }
-        // Beyond here (M>1 dequant+GEMM) still needs the paired layout → N even.
+        // The dequant kernel works on column pairs.
         if (n_dim % 2 != 0) return error.Unsupported;
 
-        // 1) Dequant the q8_0 B tile [k_dim, n_dim] (blocks along K) -> f32 [k_dim, n_dim].
         const scratch_bytes = @as(u64, k_dim) * n_dim * 4;
         if (!context.storageBindingFits(ctx, scratch_bytes)) return error.Unsupported;
-        const b_tile_bytes: u64 = @as(u64, k_dim / Q8_BLOCK_ELEMS) * n_dim * Q8_BLOCK_BYTES;
-        if (b_tile_bytes > db.len) return error.Unsupported;
+        if (@as(u64, k_dim / Q8_BLOCK_ELEMS) * n_dim * Q8_BLOCK_BYTES > db.len) return error.Unsupported;
         const scratch = try self.ensureDqScratch(ctx, scratch_bytes);
 
         const count: u32 = (k_dim / Q8_BLOCK_ELEMS) * (n_dim / 2);
@@ -429,231 +324,108 @@ pub const Matmul = struct {
         const dq_groups = @max(1, @min(context.ceilDiv(count, DEQUANT_WG), context.MAX_GROUPS_1D));
         try frame.recordCompute(dq_built, &dq_bufs, &dq_sizes, std.mem.asBytes(&dq_params), .{ dq_groups, 1, 1 });
 
-        // 2) Plain GEMM: A[m, k] @ scratch[k, n] -> C[m, n].
-        const params: MatMulParams = .{
-            .m = m_dim,
-            .n = n_dim,
-            .k = k_dim,
-            .a_row = @intCast(@divExact(da.strides_mem[rank - 2], @sizeOf(f32))),
-            .b_row = n_dim,
-            .c_row = @intCast(@divExact(dc.strides_mem[rank - 2], @sizeOf(f32))),
-            .alpha = s.alpha,
-            .beta = beta,
-        };
-        const bufs = [_]c.WGPUBuffer{
-            ctx.devmem.bufferFor(da.handle).?,
-            scratch,
-            ctx.devmem.bufferFor(dc.handle).?,
-        };
+        const idx = try self.safeConfigIndex(ctx);
+        self.last_choice = idx;
+        const gen = self.generated[idx];
+        const built = try ctx.pipes.get(gen.desc, gen.entry);
+        const gy = context.ceilDiv(m_dim, gen.cfg.bm);
+        if (gy > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
+        const params: MatMulParams = .{ .m = m_dim, .n = n_dim, .k = k_dim, .a_row = k_dim, .b_row = n_dim, .c_row = n_dim, .alpha = s.alpha, .beta = s.beta };
+        const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(da.handle).?, scratch, ctx.devmem.bufferFor(dc.handle).? };
         const sizes = [_]u64{ da.len, scratch_bytes, dc.len };
-        try frame.recordCompute(
-            built,
-            &bufs,
-            &sizes,
-            std.mem.asBytes(&params),
-            .{ context.ceilDiv(n_dim, g.cfg.bn), context.ceilDiv(m_dim, g.cfg.bm), 1 },
-        );
+        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ context.ceilDiv(n_dim, gen.cfg.bn), gy, 1 });
     }
 
     /// Per-shape autotune over `configs.generated`: benchmark each eligible config
-    /// on-device once per tile shape and cache the fastest.
-    fn chooseConfig(self: *Matmul, ctx: Ctx, s: StepMatMul, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!usize {
-        // Tuning re-runs output tile (0,0) on the real C tensor; with beta != 0 that
-        // would accumulate junk into C(0,0) before the real pass reads it. beta == 0
-        // (the lowering's default) overwrites, so tuning is safe there. For beta != 0
-        // skip tuning and use config 0 (always eligible/correct).
-        if (s.beta != 0.0) {
-            self.last_choice = 0;
-            return 0;
-        }
+    /// on-device once per `(m, n, k)` and cache the fastest.
+    fn chooseConfig(self: *Matmul, ctx: Ctx, s: StepMatMul, g: Gemm) ExecuteProgramError!usize {
+        // Tuning re-runs the product on the real C; with beta != 0 that would
+        // accumulate junk into C before the real pass reads it. beta == 0 (the
+        // lowering's default) overwrites, so tuning is safe there. For beta != 0 skip
+        // tuning and use config 0 (always eligible/correct).
+        if (s.beta != 0.0) return 0;
 
-        // Row strides (bytes) of tile (0,0) drive vec4 eligibility.
-        const da0 = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
-        const a_row_bytes = da0.strides_mem[0];
-        ctx.store.releaseConst(da0.token);
-        const db0 = ctx.store.acquireTileDeviceConstLinear(s.b, 0) catch return error.ExecutionFailed;
-        const b_row_bytes = db0.strides_mem[0];
-        ctx.store.releaseConst(db0.token);
-
-        if (try forcedConfigIndex(self.generated, ctx.gpu.limits, a_row_bytes, b_row_bytes, c_meta, a_meta, b_meta)) |idx| {
-            self.last_choice = idx;
-            return idx;
-        }
+        // Row strides (bytes) drive vec4 eligibility.
+        const row_bytes: [2]isize = .{ @intCast(g.k * @sizeOf(f32)), @intCast(g.n * @sizeOf(f32)) };
+        if (try forcedConfigIndex(self.generated, ctx.gpu.limits, row_bytes, g)) |idx| return idx;
 
         const TuneCtx = struct {
             ctx: Ctx,
             s: StepMatMul,
-            c_meta: TensorMeta,
-            a_meta: TensorMeta,
-            b_meta: TensorMeta,
-            a_row_bytes: isize,
-            b_row_bytes: isize,
+            g: Gemm,
+            row_bytes: [2]isize,
             generated: []const Generated,
 
             pub fn eligible(t: @This(), idx: usize) bool {
                 const cfg = t.generated[idx].cfg;
-                return fullTileCompatible(cfg, t.c_meta, t.a_meta, t.b_meta) and eligibleConfig(cfg, t.ctx.gpu.limits, t.a_row_bytes, t.b_row_bytes);
+                return blockAligned(cfg, t.g) and eligibleConfig(cfg, t.ctx.gpu.limits, t.row_bytes[0], t.row_bytes[1]);
             }
             pub fn timeNs(t: @This(), idx: usize) ?u64 {
-                const g = t.generated[idx];
-                const built = t.ctx.pipes.get(g.desc, g.entry) catch return null;
+                const gen = t.generated[idx];
+                const built = t.ctx.pipes.get(gen.desc, gen.entry) catch return null;
                 var best: ?u64 = null;
                 var rep: usize = 0;
                 while (rep < 2) : (rep += 1) {
-                    const ns = timeConfig(t.ctx, t.s, g, built, t.c_meta, t.a_meta, t.b_meta) catch return null;
+                    const ns = timeConfig(t.ctx, t.s, gen, built, t.g) catch return null;
                     if (best == null or ns < best.?) best = ns;
                 }
                 return best;
             }
         };
-        const tctx = TuneCtx{
-            .ctx = ctx,
-            .s = s,
-            .c_meta = c_meta,
-            .a_meta = a_meta,
-            .b_meta = b_meta,
-            .a_row_bytes = a_row_bytes,
-            .b_row_bytes = b_row_bytes,
-            .generated = self.generated,
-        };
-        const key = autotune.shapeKey(c_meta.tile_shape[0], c_meta.tile_shape[1], a_meta.tile_shape[1]);
-        const idx = autotune.pickBest(&self.tune, key, self.generated.len, tctx) orelse return error.ExecutionFailed;
-        self.last_choice = idx;
-        return idx;
+        const tctx = TuneCtx{ .ctx = ctx, .s = s, .g = g, .row_bytes = row_bytes, .generated = self.generated };
+        return autotune.pickBest(&self.tune, autotune.shapeKey(g.m, g.n, g.k), self.generated.len, tctx) orelse error.ExecutionFailed;
     }
 };
 
-/// Record all k-tile dispatches that compute output C tile (ti_m, ti_n) with config
-/// `g`. Shared by the main execute loop and the autotuner's timing.
-fn recordOutputTile(
-    ctx: Ctx,
-    frame: *Frame,
-    s: StepMatMul,
-    g: Generated,
-    built: pipelines.Built,
-    ti_m: usize,
-    ti_n: usize,
-    c_meta: TensorMeta,
-    a_meta: TensorMeta,
-    b_meta: TensorMeta,
-) ExecuteProgramError!void {
-    const hs = ctx.store;
-    const k_tiles = a_meta.tile_counts[1];
-    const c_lin = tensor_store_mod.encodeTileIndex(c_meta, &[_]usize{ ti_m, ti_n }) catch return error.ExecutionFailed;
-    var ti_k: usize = 0;
-    while (ti_k < k_tiles) : (ti_k += 1) {
-        const beta: f32 = if (ti_k == 0) s.beta else 1.0;
-        const a_lin = tensor_store_mod.encodeTileIndex(a_meta, &[_]usize{ ti_m, ti_k }) catch return error.ExecutionFailed;
-        const b_lin = tensor_store_mod.encodeTileIndex(b_meta, &[_]usize{ ti_k, ti_n }) catch return error.ExecutionFailed;
-
-        const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-        const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-        const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
-        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dc.len)) {
-            hs.releaseConst(da.token);
-            hs.releaseConst(db.token);
-            hs.releaseMut(dc.token);
-            return error.Unsupported;
-        }
-
-        const m_dim: u32 = @intCast(dc.shape_mem[0]);
-        const n_dim: u32 = @intCast(dc.shape_mem[1]);
-        const k_dim: u32 = @intCast(da.shape_mem[1]);
-        const params: MatMulParams = .{
-            .m = m_dim,
-            .n = n_dim,
-            .k = k_dim,
-            .a_row = @intCast(@divExact(da.strides_mem[0], @sizeOf(f32))),
-            .b_row = @intCast(@divExact(db.strides_mem[0], @sizeOf(f32))),
-            .c_row = @intCast(@divExact(dc.strides_mem[0], @sizeOf(f32))),
-            .alpha = s.alpha,
-            .beta = beta,
-        };
-        const bufs = [_]c.WGPUBuffer{
-            ctx.devmem.bufferFor(da.handle).?,
-            ctx.devmem.bufferFor(db.handle).?,
-            ctx.devmem.bufferFor(dc.handle).?,
-        };
-        const sizes = [_]u64{ da.len, db.len, dc.len };
-        try frame.recordCompute(
-            built,
-            &bufs,
-            &sizes,
-            std.mem.asBytes(&params),
-            .{ context.ceilDiv(n_dim, g.cfg.bn), context.ceilDiv(m_dim, g.cfg.bm), 1 },
-        );
-
-        hs.releaseConst(da.token);
-        hs.releaseConst(db.token);
-        hs.releaseMut(dc.token);
-    }
+fn castU32(v: usize) ExecuteProgramError!u32 {
+    return std.math.cast(u32, v) orelse error.Unsupported;
 }
 
-/// Record the GEMM for one batched output tile (given by linear indices into the
-/// c/a/b tile grids). The matrix dims are the last two of each tile; leading dims
-/// were resolved by the caller (`execBatched`). One dispatch (single k-tile step).
-fn recordTileGemmLinear(
-    ctx: Ctx,
-    frame: *Frame,
-    s: StepMatMul,
-    g: Generated,
-    built: pipelines.Built,
-    c_lin: usize,
-    a_lin: usize,
-    b_lin: usize,
-    beta: f32,
-    rank: usize,
-) ExecuteProgramError!void {
+/// Record the one dispatch computing `g` with config `gen`. Shared by the execute
+/// path and the autotuner's timing.
+fn recordGemm(ctx: Ctx, frame: *Frame, s: StepMatMul, gen: Generated, built: pipelines.Built, g: Gemm) ExecuteProgramError!void {
     const hs = ctx.store;
-    const da = ctx.store.acquireTileDeviceConstLinear(s.a, a_lin) catch return error.ExecutionFailed;
-    const db = ctx.store.acquireTileDeviceConstLinear(s.b, b_lin) catch return error.ExecutionFailed;
-    const dc = ctx.store.acquireTileDeviceMutLinear(s.c, c_lin) catch return error.ExecutionFailed;
-    defer {
-        hs.releaseConst(da.token);
-        hs.releaseConst(db.token);
-        hs.releaseMut(dc.token);
-    }
-    if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dc.len)) {
-        return error.Unsupported;
-    }
+    const da = hs.acquireConst(s.a) catch return error.ExecutionFailed;
+    defer hs.releaseConst(da.token);
+    const db = hs.acquireConst(s.b) catch return error.ExecutionFailed;
+    defer hs.releaseConst(db.token);
+    const dc = hs.acquireMut(s.c) catch return error.ExecutionFailed;
+    defer hs.releaseMut(dc.token);
+    inline for (.{ da.len, db.len, dc.len }) |len| if (!context.storageBindingFits(ctx, len)) return error.Unsupported;
 
-    const m_dim: u32 = @intCast(dc.shape_mem[rank - 2]);
-    const n_dim: u32 = @intCast(dc.shape_mem[rank - 1]);
-    const k_dim: u32 = @intCast(da.shape_mem[rank - 1]);
-    const b_rank: usize = @intCast(db.rank);
     const params: MatMulParams = .{
-        .m = m_dim,
-        .n = n_dim,
-        .k = k_dim,
-        .a_row = @intCast(@divExact(da.strides_mem[rank - 2], @sizeOf(f32))),
-        .b_row = @intCast(@divExact(db.strides_mem[b_rank - 2], @sizeOf(f32))),
-        .c_row = @intCast(@divExact(dc.strides_mem[rank - 2], @sizeOf(f32))),
+        .m = try castU32(g.m),
+        .n = try castU32(g.n),
+        .k = try castU32(g.k),
+        .a_batch = try castU32(g.a_batch),
+        .a_row = try castU32(g.k),
+        .b_row = try castU32(g.n),
+        .c_row = try castU32(g.n),
+        .b_batch = try castU32(g.b_batch),
         .alpha = s.alpha,
-        .beta = beta,
+        .beta = s.beta,
     };
+    const gx = context.ceilDiv(params.n, gen.cfg.bn);
+    const gy = context.ceilDiv(params.m, gen.cfg.bm);
+    const gz = try castU32(g.batch);
+    if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM or gz > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
     const bufs = [_]c.WGPUBuffer{
         ctx.devmem.bufferFor(da.handle).?,
         ctx.devmem.bufferFor(db.handle).?,
         ctx.devmem.bufferFor(dc.handle).?,
     };
     const sizes = [_]u64{ da.len, db.len, dc.len };
-    try frame.recordCompute(
-        built,
-        &bufs,
-        &sizes,
-        std.mem.asBytes(&params),
-        .{ context.ceilDiv(n_dim, g.cfg.bn), context.ceilDiv(m_dim, g.cfg.bm), 1 },
-    );
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ gx, gy, gz });
 }
 
-/// Time `TUNE_ITERS` recomputations of output tile (0,0) with config `g` (own
-/// throwaway frames + a single device sync), returning total nanoseconds.
-fn timeConfig(ctx: Ctx, s: StepMatMul, g: Generated, built: pipelines.Built, c_meta: TensorMeta, a_meta: TensorMeta, b_meta: TensorMeta) ExecuteProgramError!u64 {
+/// Time `TUNE_ITERS` recomputations of `g` with config `gen` (own throwaway frames
+/// + a single device sync), returning total nanoseconds.
+fn timeConfig(ctx: Ctx, s: StepMatMul, gen: Generated, built: pipelines.Built, g: Gemm) ExecuteProgramError!u64 {
     const TUNE_ITERS = 24;
     {
         var f = try Frame.init(ctx.allocator, ctx.gpu);
         defer f.deinit();
-        try recordOutputTile(ctx, &f, s, g, built, 0, 0, c_meta, a_meta, b_meta);
+        try recordGemm(ctx, &f, s, gen, built, g);
         f.submit();
     }
     syncDevice(ctx);
@@ -662,7 +434,7 @@ fn timeConfig(ctx: Ctx, s: StepMatMul, g: Generated, built: pipelines.Built, c_m
     while (t < TUNE_ITERS) : (t += 1) {
         var f = try Frame.init(ctx.allocator, ctx.gpu);
         defer f.deinit();
-        try recordOutputTile(ctx, &f, s, g, built, 0, 0, c_meta, a_meta, b_meta);
+        try recordGemm(ctx, &f, s, gen, built, g);
         f.submit();
     }
     syncDevice(ctx);

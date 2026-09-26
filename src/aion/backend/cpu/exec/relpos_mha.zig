@@ -22,9 +22,7 @@
 //   pos_bias_u/_v : [H, D]                                   f32
 //   mask (optional) : [T_q, T_kv] additive                  f32
 //
-// Tiling: each (batch, head) slice is a single tile of shape [1, T, 1, D], which
-// the tiled storage packs contiguously as [T, D] (row stride D) — so the kernel
-// reads each slice as a contiguous [T*D] panel exactly as in the head-second case.
+// Each (batch, head) slice is T rows of D, `H * D` apart; the kernels take that stride.
 //
 // The op does not own the streaming ring buffer: the converter concatenates the
 // per-layer left-context cache onto K/V in-graph and slices the tail back out as the
@@ -40,8 +38,7 @@
 // lane width (see `attention_registry`). A panel also bounds the `pos_emb` band it
 // needs (consecutive rows shift by one), so `bd` costs `window + panel - 1` columns
 // per row instead of all `P = 2*T_kv - 1`. Slices are distributed across the thread
-// pool; lowering forces a single tile over the trailing [T, D] dims so each
-// (batch, head) slice is one contiguous tile.
+// pool.
 
 const std = @import("std");
 const backend_mod = @import("../../backend.zig");
@@ -119,7 +116,7 @@ const Scratch = struct {
 
 /// Keys visible to query row `i`. Its absolute key position is `i + (t_kv - t_q)`,
 /// since a left-context cache occupies the front of the K/V run.
-fn keyWindow(dims: Dims, s: executable.StepRelPosMHATiled, i: usize) @TypeOf(s.window.keys(0, 0)) {
+fn keyWindow(dims: Dims, s: executable.StepRelPosMHA, i: usize) @TypeOf(s.window.keys(0, 0)) {
     return s.window.keys(i + (dims.t_kv - dims.t_q), dims.t_kv);
 }
 
@@ -167,16 +164,12 @@ fn addScores(
     }
 }
 
-fn tileIndex(meta: tensor_store.TensorMeta, coords: []const usize) ExecuteProgramError!usize {
-    return tensor_store.encodeTileIndex(meta, coords[0..meta.tile_counts.len]);
-}
-
-pub fn execRelPosMHATiled(
+pub fn execRelPosMHA(
     allocator: std.mem.Allocator,
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
     kernels: attention_registry.Kernels,
-    s: executable.StepRelPosMHATiled,
+    s: executable.StepRelPosMHA,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     if (!(s.scale > 0.0) or !std.math.isFinite(s.scale)) return BackendError.InvalidArgument;
@@ -213,20 +206,10 @@ pub fn execRelPosMHATiled(
     if (P == 0 or s.relative_zero_index >= P) return BackendError.InvalidArgument;
     if (T_q > T_kv) return BackendError.InvalidArgument;
 
-    // Tiling contract: dims [T, D] (1 and 3) form a single tile per (batch, head);
-    // dims [B, H] (0 and 2) are size-1 tiles. pos_emb [H,P,D] tiles [1,P,D]; biases single-tile.
-    if (out_meta.tile_counts[0] != B or out_meta.tile_counts[2] != H) return BackendError.InvalidArgument;
-    if (out_meta.tile_counts[1] != 1 or out_meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
-    if (q_meta.tile_counts[1] != 1 or q_meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
-    if (k_meta.tile_counts[1] != 1 or k_meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
-    if (v_meta.tile_counts[1] != 1 or v_meta.tile_counts[3] != 1) return BackendError.InvalidArgument;
-    if (pe_meta.tile_counts[1] != 1 or pe_meta.tile_counts[2] != 1) return BackendError.InvalidArgument;
-
     if (s.mask) |mask_id| {
         const m_meta = try store.meta(mask_id);
         if (m_meta.rank != 2 or m_meta.dtype != .f32) return BackendError.InvalidArgument;
         if (m_meta.shape[0] != T_q or m_meta.shape[1] != T_kv) return BackendError.InvalidArgument;
-        if (m_meta.tile_counts[0] != 1 or m_meta.tile_counts[1] != 1) return BackendError.InvalidArgument;
     }
 
     if (!std.math.isFinite(s.attn_logits_soft_cap) or s.attn_logits_soft_cap < 0) return BackendError.InvalidArgument;
@@ -264,7 +247,7 @@ pub fn execRelPosMHATiled(
         if (pool) |p| {
             const Task = struct {
                 store: tensor_store.TensorStore,
-                s: executable.StepRelPosMHATiled,
+                s: executable.StepRelPosMHA,
                 kernels: attention_registry.Kernels,
                 dims: Dims,
                 mr: usize,
@@ -329,7 +312,7 @@ pub fn execRelPosMHATiled(
 
 fn computeSlice(
     store: tensor_store.TensorStore,
-    s: executable.StepRelPosMHATiled,
+    s: executable.StepRelPosMHA,
     kernels: attention_registry.Kernels,
     dims: Dims,
     b: usize,
@@ -341,39 +324,32 @@ fn computeSlice(
     const P = dims.p;
     const D = dims.d;
 
-    // Layout [B, T, H, D]: dims 1 (T) and 3 (D) are the single full tile; the slice
-    // is selected by the size-1 tiles on dim 0 (B) and dim 2 (H).
-    var coords4: [MAX_RANK]usize = @splat(0);
-    coords4[0] = b;
-    coords4[2] = h;
+    // Layout [B, T, H, D]: slice (b, h) is T rows of D, `H * D` apart.
+    const row_stride = dims.h * D;
+    const q_base = (b * T_q * dims.h + h) * D;
+    const kv_base = (b * T_kv * dims.h + h) * D;
 
-    // --- acquire input tiles (read) ---
-    const q_t = try store.acquireTileConstLinear(s.q, try tileIndex((try store.meta(s.q)), &coords4));
+    const q_t = try store.acquireConst(s.q);
     defer store.releaseConst(q_t.token);
-    const k_t = try store.acquireTileConstLinear(s.k, try tileIndex((try store.meta(s.k)), &coords4));
+    const k_t = try store.acquireConst(s.k);
     defer store.releaseConst(k_t.token);
-    const v_t = try store.acquireTileConstLinear(s.v, try tileIndex((try store.meta(s.v)), &coords4));
+    const v_t = try store.acquireConst(s.v);
     defer store.releaseConst(v_t.token);
-
-    var pe_coords: [MAX_RANK]usize = @splat(0);
-    pe_coords[0] = h;
-    const pe_t = try store.acquireTileConstLinear(s.pos_emb, try tileIndex((try store.meta(s.pos_emb)), &pe_coords));
+    const pe_t = try store.acquireConst(s.pos_emb);
     defer store.releaseConst(pe_t.token);
-
-    var bias_coords: [MAX_RANK]usize = @splat(0);
-    const bu_t = try store.acquireTileConstLinear(s.pos_bias_u, try tileIndex((try store.meta(s.pos_bias_u)), &bias_coords));
+    const bu_t = try store.acquireConst(s.pos_bias_u);
     defer store.releaseConst(bu_t.token);
-    const bv_t = try store.acquireTileConstLinear(s.pos_bias_v, try tileIndex((try store.meta(s.pos_bias_v)), &bias_coords));
+    const bv_t = try store.acquireConst(s.pos_bias_v);
     defer store.releaseConst(bv_t.token);
 
-    const qbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, q_t.bufferView().bytes);
-    const kbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, k_t.bufferView().bytes);
-    const vbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, v_t.bufferView().bytes);
-    const pebuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, pe_t.bufferView().bytes);
+    const qbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, q_t.bufferView().bytes)[q_base..];
+    const kbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, k_t.bufferView().bytes)[kv_base..];
+    const vbuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, v_t.bufferView().bytes)[kv_base..];
+    const pebuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, pe_t.bufferView().bytes)[h * P * D ..];
     const ubuf: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, bu_t.bufferView().bytes);
     const vbias: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, bv_t.bufferView().bytes);
 
-    if (qbuf.len < T_q * D or kbuf.len < T_kv * D or vbuf.len < T_kv * D) return BackendError.InvalidArgument;
+    if (qbuf.len < (T_q - 1) * row_stride + D or kbuf.len < (T_kv - 1) * row_stride + D or vbuf.len < (T_kv - 1) * row_stride + D) return BackendError.InvalidArgument;
     if (pebuf.len < P * D) return BackendError.InvalidArgument;
 
     const u_row: []align(1) const f32 = ubuf[h * D .. h * D + D];
@@ -382,7 +358,7 @@ fn computeSlice(
     // --- qu = q + u ; qv = q + v_bias ---
     var i: usize = 0;
     while (i < T_q) : (i += 1) {
-        const qr = qbuf[i * D .. i * D + D];
+        const qr = qbuf[i * row_stride ..][0..D];
         const qu_r = scratch.qu[i * D .. i * D + D];
         const qv_r = scratch.qv[i * D .. i * D + D];
         var kk: usize = 0;
@@ -397,19 +373,18 @@ fn computeSlice(
     var mask_buf: ?[]align(1) const f32 = null;
     var mask_tok: ?usize = null;
     if (s.mask) |mask_id| {
-        var m_coords: [MAX_RANK]usize = @splat(0);
-        const m_t = try store.acquireTileConstLinear(mask_id, try tileIndex((try store.meta(mask_id)), &m_coords));
+        const m_t = try store.acquireConst(mask_id);
         mask_tok = m_t.token;
         mask_buf = simd.bytesAsSliceConstUnaligned(f32, m_t.bufferView().bytes);
     }
     defer if (mask_tok) |tok| store.releaseConst(tok);
 
-    const out_t = try store.acquireTileMutLinear(s.out, try tileIndex((try store.meta(s.out)), &coords4));
+    const out_t = try store.acquireMut(s.out);
     defer store.releaseMut(out_t.token);
     const ov = out_t.bufferView();
     if (ov.dtype != .f32) return BackendError.InvalidArgument;
-    const obuf: []align(@alignOf(f32)) f32 = @alignCast(simd.bytesAsSliceMutUnaligned(f32, ov.bytes));
-    if (obuf.len < T_q * D) return BackendError.InvalidArgument;
+    const obuf: []align(@alignOf(f32)) f32 = @alignCast(simd.bytesAsSliceMutUnaligned(f32, ov.bytes)[q_base..]);
+    if (obuf.len < (T_q - 1) * row_stride + D) return BackendError.InvalidArgument;
 
     // --- row panels: rows sharing a key window, at most `panel` at a time ---
     var r0: usize = 0;
@@ -431,8 +406,7 @@ fn computeSlice(
         // --- ac = (q+u) @ K[win]^T -> [rows, n_k] ---
         const ac = scratch.ac[0 .. rows * n_k];
         @memset(ac, 0.0);
-        const k_panel = kbuf[win.lo * D ..];
-        addScores(kernels, rows, n_k, D, scratch.qu[r0 * D ..], D, k_panel, D, scratch.ktp, scratch.qtp, ac, n_k);
+        addScores(kernels, rows, n_k, D, scratch.qu[r0 * D ..], D, kbuf[win.lo * row_stride ..], row_stride, scratch.ktp, scratch.qtp, ac, n_k);
 
         // Compact relative tables are allowed: an offset outside [0,P) contributes
         // zero to the positional score. Gemma audio relies on this when a 13-row
@@ -492,8 +466,8 @@ fn computeSlice(
         }
 
         // --- out[panel] = scores @ V[win] ---
-        @memset(obuf[r0 * D .. r1 * D], 0.0);
-        kernels.accumulate_values_f32(rows, n_k, D, ac, n_k, vbuf[win.lo * D ..], D, obuf[r0 * D ..], D);
+        for (r0..r1) |r| @memset(obuf[r * row_stride ..][0..D], 0.0);
+        kernels.accumulate_values_f32(rows, n_k, D, ac, n_k, vbuf[win.lo * row_stride ..], row_stride, obuf[r0 * row_stride ..], row_stride);
 
         r0 = r1;
     }

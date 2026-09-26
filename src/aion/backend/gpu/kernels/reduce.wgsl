@@ -40,46 +40,37 @@ fn wg_reduce_sum(lidx: u32, v: f32) -> f32 {
     return r;
 }
 
-fn row_sum(wid: vec3<u32>, lidx: u32) -> f32 {
-    let xb = wid.x * p.x_row;
+fn row_sum(row: u32, lidx: u32) -> f32 {
+    let xb = row * p.x_row;
     var s = 0.0;
     for (var c = lidx; c < p.cols; c += WG) { s += x[xb + c]; }
     return wg_reduce_sum(lidx, s);
 }
 
 @compute @workgroup_size(256)
-fn reduce_sum_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum(wid, lidx);
-    if (lidx == 0u) { o[p.o_base + wid.x] = total; }
+fn reduce_sum_row(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let total = row_sum(row, lidx);
+    if (lidx == 0u) { o[p.o_base + row] = total; }
 }
 
 @compute @workgroup_size(256)
-fn reduce_mean_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum(wid, lidx);
-    if (lidx == 0u) { o[p.o_base + wid.x] = total / f32(p.cols); }
-}
-
-// Fold column-tile partials. Scratch is part-major:
-// x[part * rows + row]. For mean, `o_base` carries the full logical row width;
-// the final output tile itself always begins at element zero.
-fn parts_sum(wid: vec3<u32>, lidx: u32) -> f32 {
-    var value = 0.0;
-    for (var part = lidx; part < p.cols; part += WG) {
-        value += x[part * p.x_row + wid.x];
-    }
-    return wg_reduce_sum(lidx, value);
-}
-
-@compute @workgroup_size(256)
-fn reduce_parts_sum(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = parts_sum(wid, lidx);
-    if (lidx == 0u) { o[wid.x] = total; }
-}
-
-@compute @workgroup_size(256)
-fn reduce_parts_mean(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = parts_sum(wid, lidx);
-    if (lidx == 0u) { o[wid.x] = total / f32(p.o_base); }
+fn reduce_mean_row(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let total = row_sum(row, lidx);
+    if (lidx == 0u) { o[p.o_base + row] = total / f32(p.cols); }
 }
 
 // ---- two-stage whole-tensor reduction --------------------------------------
@@ -108,36 +99,43 @@ fn reduce_all_partial(
 // dispatched, so the stride field is otherwise unused — deliberate reuse).
 @compute @workgroup_size(256)
 fn reduce_mean_finish(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum(wid, lidx);
+    let total = row_sum(0u, lidx);
     if (lidx == 0u) { o[0] = total / f32(p.x_row); }
 }
 
 // ---- f16 reductions ---------------------------------------------------------
 
-fn row_sum_h(wid: vec3<u32>, lidx: u32) -> f32 {
-    let xb = wid.x * p.x_row;
+fn row_sum_h(row: u32, lidx: u32) -> f32 {
+    let xb = row * p.x_row;
     var s = 0.0;
     for (var c = lidx; c < p.cols; c += WG) { s += f32(xh[xb + c]); }
     return wg_reduce_sum(lidx, s);
 }
 
 @compute @workgroup_size(256)
-fn reduce_sum_row_h2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum_h(wid, lidx);
-    if (lidx == 0u) { oh[p.o_base + wid.x] = f16(total); }
+fn reduce_sum_row_h2h(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let total = row_sum_h(row, lidx);
+    if (lidx == 0u) { oh[p.o_base + row] = f16(total); }
 }
 
 @compute @workgroup_size(256)
-fn reduce_mean_row_h2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum_h(wid, lidx);
-    if (lidx == 0u) { oh[p.o_base + wid.x] = f16(total / f32(p.cols)); }
-}
-
-/// Stage 1 of a staged reduce: f16 data in, f32 partial out.
-@compute @workgroup_size(256)
-fn reduce_sum_row_h2f(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum_h(wid, lidx);
-    if (lidx == 0u) { o[p.o_base + wid.x] = total; }
+fn reduce_mean_row_h2h(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let total = row_sum_h(row, lidx);
+    if (lidx == 0u) { oh[p.o_base + row] = f16(total / f32(p.cols)); }
 }
 
 @compute @workgroup_size(256)
@@ -155,25 +153,21 @@ fn reduce_all_partial_h2f(
 
 /// Folds: f32 partials in, f16 result out.
 @compute @workgroup_size(256)
-fn reduce_sum_row_f2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum(wid, lidx);
-    if (lidx == 0u) { oh[p.o_base + wid.x] = f16(total); }
+fn reduce_sum_row_f2h(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let total = row_sum(row, lidx);
+    if (lidx == 0u) { oh[p.o_base + row] = f16(total); }
 }
 
 @compute @workgroup_size(256)
 fn reduce_mean_finish_f2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = row_sum(wid, lidx);
+    let total = row_sum(0u, lidx);
     if (lidx == 0u) { oh[0] = f16(total / f32(p.x_row)); }
 }
 
-@compute @workgroup_size(256)
-fn reduce_parts_sum_f2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = parts_sum(wid, lidx);
-    if (lidx == 0u) { oh[wid.x] = f16(total); }
-}
-
-@compute @workgroup_size(256)
-fn reduce_parts_mean_f2h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let total = parts_sum(wid, lidx);
-    if (lidx == 0u) { oh[wid.x] = f16(total / f32(p.o_base)); }
-}

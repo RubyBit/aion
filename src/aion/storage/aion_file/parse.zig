@@ -11,6 +11,7 @@ const PadMode = types.PadMode;
 const magic_bytes = types.magic_bytes;
 const current_version = types.current_version;
 const header_size = types.header_size;
+const payload_alignment = types.payload_alignment;
 const invalid_index = types.invalid_index;
 const section_slot_count = types.section_slot_count;
 const PackageError = types.PackageError;
@@ -86,7 +87,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) PackageError!Packa
             try allocator.alloc(DimExpr, 0);
         errdefer allocator.free(dim_exprs);
 
-        const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, refs[sectionSlot(.tensors)].?));
+        const tensors_ref = refs[sectionSlot(.tensors)].?;
+        if (tensors_ref.offset % payload_alignment != 0) return PackageError.InvalidFormat;
+        const initializers = try parseInitializersSection(allocator, strings, sectionBytes(bytes, tensors_ref));
         errdefer freeInitializers(allocator, initializers);
 
         const values = try parseValuesSection(allocator, sectionBytes(bytes, refs[sectionSlot(.values)].?));
@@ -344,6 +347,8 @@ fn parseInitializersSection(
         const params_len = std.math.cast(usize, try readIntCursor(bytes, &cursor, u32)) orelse return PackageError.InvalidFormat;
         const data_len = std.math.cast(usize, try readIntCursor(bytes, &cursor, u64)) orelse return PackageError.InvalidFormat;
         const params_raw = try readBytes(bytes, &cursor, params_len);
+        // The payload starts on `payload_alignment` of the section, which starts on one.
+        _ = try readBytes(bytes, &cursor, std.mem.alignForward(usize, cursor, payload_alignment) - cursor);
         const data_raw = try readBytes(bytes, &cursor, data_len);
 
         // The payload, and a quantized one's params, stay views of the file bytes.

@@ -35,8 +35,7 @@ const Interval = struct {
 const PendingSlot = struct {
     owner: TensorId,
     members: std.ArrayList(TensorId) = .empty,
-    capacities: std.ArrayList(usize) = .empty,
-    host_bytes: usize,
+    bytes: usize,
     last_end: usize,
     placement: executable.Placement,
     reusable: bool,
@@ -203,7 +202,6 @@ pub fn plan(
     defer {
         for (slots.items) |*slot| {
             slot.members.deinit(allocator);
-            slot.capacities.deinit(allocator);
         }
         slots.deinit(allocator);
     }
@@ -213,9 +211,8 @@ pub fn plan(
             mgr.releaseTensorData(interval.id) catch {};
             continue;
         }
-        const tensor = mgr.getConst(interval.id) catch return error.InvalidArgument;
         const placement = prog.placementOf(interval.id) orelse prog.target;
-        const host_bytes = mgr.tensorLogicalBackingBytes(interval.id) catch return error.InvalidArgument;
+        const bytes = mgr.tensorLogicalBackingBytes(interval.id) catch return error.InvalidArgument;
 
         var reusable_slot: ?usize = null;
         var best_growth: usize = std.math.maxInt(usize);
@@ -224,13 +221,7 @@ pub fn plan(
                 if (!slot.reusable or slot.last_end >= interval.first or !slot.placement.eql(placement)) continue;
                 if (slot.domain != interval.domain) continue;
 
-                var growth: usize = if (placement.kind == .cpu and host_bytes > slot.host_bytes) host_bytes - slot.host_bytes else 0;
-                if (placement.kind != .cpu) {
-                    for (tensor.tile_lens, 0..) |len, tile| {
-                        const old = if (tile < slot.capacities.items.len) slot.capacities.items[tile] else 0;
-                        if (len > old) growth = std.math.add(usize, growth, len - old) catch return error.InvalidArgument;
-                    }
-                }
+                const growth: usize = if (bytes > slot.bytes) bytes - slot.bytes else 0;
                 if (growth < best_growth) {
                     reusable_slot = i;
                     best_growth = growth;
@@ -241,18 +232,12 @@ pub fn plan(
         if (reusable_slot) |slot_index| {
             const slot = &slots.items[slot_index];
             slot.members.append(allocator, interval.id) catch return error.OutOfMemory;
-            if (slot.capacities.items.len < tensor.tile_lens.len) {
-                const old_len = slot.capacities.items.len;
-                slot.capacities.resize(allocator, tensor.tile_lens.len) catch return error.OutOfMemory;
-                @memset(slot.capacities.items[old_len..], 0);
-            }
-            for (tensor.tile_lens, 0..) |len, tile| slot.capacities.items[tile] = @max(slot.capacities.items[tile], len);
-            slot.host_bytes = @max(slot.host_bytes, host_bytes);
+            slot.bytes = @max(slot.bytes, bytes);
             slot.last_end = interval.last;
         } else {
             var slot: PendingSlot = .{
                 .owner = interval.id,
-                .host_bytes = host_bytes,
+                .bytes = bytes,
                 .last_end = interval.last,
                 .placement = placement,
                 .reusable = interval.reusable,
@@ -260,7 +245,6 @@ pub fn plan(
                 .domain = interval.domain,
             };
             slot.members.append(allocator, interval.id) catch return error.OutOfMemory;
-            slot.capacities.appendSlice(allocator, tensor.tile_lens) catch return error.OutOfMemory;
             slots.append(allocator, slot) catch return error.OutOfMemory;
         }
     }
@@ -284,24 +268,15 @@ pub fn plan(
                 return error.InvalidArgument;
             };
             const slot = &slots.items[slot_index];
-            const tensor = mgr.getConst(dst_id) catch return error.InvalidArgument;
             slot.members.append(allocator, dst_id) catch return error.OutOfMemory;
-            if (slot.capacities.items.len < tensor.tile_lens.len) {
-                const old_len = slot.capacities.items.len;
-                slot.capacities.resize(allocator, tensor.tile_lens.len) catch return error.OutOfMemory;
-                @memset(slot.capacities.items[old_len..], 0);
-            }
-            for (tensor.tile_lens, 0..) |len, tile| slot.capacities.items[tile] = @max(slot.capacities.items[tile], len);
+            slot.bytes = @max(slot.bytes, mgr.tensorLogicalBackingBytes(dst_id) catch return error.InvalidArgument);
         }
     }
 
     const final = allocator.alloc(executable.WorkspaceSlot, slots.items.len) catch return error.OutOfMemory;
     var built: usize = 0;
     errdefer {
-        for (final[0..built]) |slot| {
-            allocator.free(slot.members);
-            allocator.free(slot.tile_capacities);
-        }
+        for (final[0..built]) |slot| allocator.free(slot.members);
         allocator.free(final);
     }
     var workspace_bytes: usize = 0;
@@ -310,26 +285,18 @@ pub fn plan(
         // Keep one slot-sized host allocation even for a GPU program. It allows
         // CPU reference execution before placement without restoring per-value
         // allocations; GPU materialization releases it.
-        mgr.reserveHostBacking(slot.owner, slot.host_bytes) catch |e| return switch (e) {
+        mgr.reserveHostBacking(slot.owner, slot.bytes) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidArgument,
         };
-        const physical_bytes = if (slot.placement.kind == .cpu) slot.host_bytes else blk: {
-            var total: usize = 0;
-            for (slot.capacities.items) |cap| total = std.math.add(usize, total, cap) catch return error.InvalidArgument;
-            break :blk total;
-        };
-        workspace_bytes = std.math.add(usize, workspace_bytes, physical_bytes) catch return error.InvalidArgument;
+        workspace_bytes = std.math.add(usize, workspace_bytes, slot.bytes) catch return error.InvalidArgument;
 
         const members = allocator.dupe(TensorId, slot.members.items) catch return error.OutOfMemory;
         errdefer allocator.free(members);
-        const tile_capacities = allocator.dupe(usize, slot.capacities.items) catch return error.OutOfMemory;
-        errdefer allocator.free(tile_capacities);
         final[i] = .{
             .owner = slot.owner,
             .members = members,
-            .tile_capacities = tile_capacities,
-            .host_bytes = slot.host_bytes,
+            .bytes = slot.bytes,
             .placement = slot.placement,
             .preserve_contents = slot.preserve_contents,
         };
@@ -361,8 +328,7 @@ pub fn materializePlacements(
             slot.owner,
             slot_target,
             if (slot_target.kind == .cpu) null else dev,
-            slot.tile_capacities,
-            slot.host_bytes,
+            slot.bytes,
             slot.preserve_contents,
         );
     }
@@ -375,10 +341,7 @@ pub fn materializePlacements(
         if (tensor.backing_owner != null) continue;
         if (!try mgr.tensorHasBacking(entry.id)) return error.InvalidArgument;
 
-        var tile_shape: [8]usize = undefined;
-        const rank: usize = @intCast(tensor.rank);
-        @memcpy(tile_shape[0..rank], tensor.tile_shape);
-        try mgr.moveTensor(entry.id, target, dev, tile_shape[0..rank], tensor.tile_alignment);
+        try mgr.moveTensor(entry.id, target, dev);
     }
 }
 
@@ -408,19 +371,19 @@ test "workspace planner grows capacity for disjoint lifetimes in one domain" {
     var mgr = StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const input = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const a = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const c = try mgr.createTiledTensor(.f32, &.{100}, &.{100}, .{});
-    const b = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const out = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
+    const input = try mgr.createTensor(.f32, &.{4}, .{});
+    const a = try mgr.createTensor(.f32, &.{4}, .{});
+    const c = try mgr.createTensor(.f32, &.{100}, .{});
+    const b = try mgr.createTensor(.f32, &.{4}, .{});
+    const out = try mgr.createTensor(.f32, &.{4}, .{});
     const owned = [_]TensorId{ a, c, b, out };
     for (owned) |id| try mgr.releaseTensorData(id);
 
     var steps = [_]PlacedStep{
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = a, .a = input } } },
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = c, .a = a } } },
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = b, .a = input } } },
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = out, .a = b } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = a, .a = input } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = c, .a = a } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = b, .a = input } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = out, .a = b } } },
     };
     var outputs = [_]TensorId{out};
     var placements = [_]executable.TensorPlacement{
@@ -439,7 +402,6 @@ test "workspace planner grows capacity for disjoint lifetimes in one domain" {
     defer {
         for (prog.workspace_slots) |slot| {
             allocator.free(slot.members);
-            allocator.free(slot.tile_capacities);
         }
         allocator.free(prog.workspace_slots);
     }
@@ -458,22 +420,22 @@ test "workspace planner isolates loop-body reuse from the enclosing schedule" {
     var mgr = StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const input = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const outer_tmp = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const body_a = try mgr.createTiledTensor(.f32, &.{4}, &.{4}, .{});
-    const body_b = try mgr.createTiledTensor(.f32, &.{100}, &.{100}, .{});
-    const body_c = try mgr.createTiledTensor(.f32, &.{8}, &.{8}, .{});
+    const input = try mgr.createTensor(.f32, &.{4}, .{});
+    const outer_tmp = try mgr.createTensor(.f32, &.{4}, .{});
+    const body_a = try mgr.createTensor(.f32, &.{4}, .{});
+    const body_b = try mgr.createTensor(.f32, &.{100}, .{});
+    const body_c = try mgr.createTensor(.f32, &.{8}, .{});
     const owned = [_]TensorId{ outer_tmp, body_a, body_b, body_c };
     for (owned) |id| try mgr.releaseTensorData(id);
 
     var body_steps = [_]PlacedStep{
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = body_a, .a = input } } },
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = body_b, .a = body_a } } },
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = body_c, .a = input } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = body_a, .a = input } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = body_b, .a = body_a } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = body_c, .a = input } } },
     };
     var blocks = [_]executable.Block{.{ .steps = &body_steps }};
     var steps = [_]PlacedStep{
-        .{ .op = .{ .UnaryTiled = .{ .op = .relu, .out = outer_tmp, .a = input } } },
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = outer_tmp, .a = input } } },
         .{ .op = .{ .Loop = .{
             .trip_count = null,
             .static_max_trip_count = 2,
@@ -502,7 +464,6 @@ test "workspace planner isolates loop-body reuse from the enclosing schedule" {
     defer {
         for (prog.workspace_slots) |slot| {
             allocator.free(slot.members);
-            allocator.free(slot.tile_capacities);
         }
         allocator.free(prog.workspace_slots);
     }

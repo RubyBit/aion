@@ -8,7 +8,7 @@
 const std = @import("std");
 
 const backend_mod = @import("../backend/backend.zig");
-const plan_mod = @import("../graph/plan.zig");
+const types = @import("../backend/types.zig");
 const opt_mod = @import("../graph/opt.zig");
 const target_mod = @import("../graph/target.zig");
 const storage_mod = @import("../storage/storage.zig");
@@ -34,19 +34,20 @@ pub const GpuOptions = struct {
     adapter_index: ?usize = null,
 };
 
-/// A resolved, transient device handle: the backend to execute on, the tile
-/// policy to compile/tile for, and (for non-cpu) the device memory for migration.
+/// A resolved, transient device handle: the backend to execute on, the weight
+/// layout its kernels read, and (for non-cpu) the device memory for migration.
 /// Computed on demand from a `Context` — never stored long-term.
 pub const Device = struct {
     ref: DeviceRef,
     backend: backend_mod.Backend,
-    policy: plan_mod.TilePolicy,
+    /// How this device's NT kernel wants q8 weight rows grouped.
+    quant_block_order: types.QuantBlockOrder,
     device_memory: ?dm.DeviceMemory,
 
     /// The compile target this device implies. `passes` overrides the device's default
     /// pass set — bisecting a pass on a real model is the only reason to.
     pub fn target(self: Device, passes: ?opt_mod.Policy) target_mod.Target {
-        const t: target_mod.Target = .init(self.ref, self.policy);
+        const t: target_mod.Target = .init(self.ref, self.quant_block_order);
         return if (passes) |p| t.withPasses(p) else t;
     }
 };

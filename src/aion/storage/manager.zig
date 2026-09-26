@@ -5,15 +5,15 @@ const storage_mod = @import("storage.zig");
 const cache_mod = @import("cache.zig");
 const types = @import("../backend/types.zig");
 const tensor_store = @import("../runtime/tensor_store.zig");
+const layout = @import("layout.zig");
 const dm = @import("../runtime/device_memory.zig");
-const plan = @import("../graph/plan.zig");
 const derived_mod = @import("derived.zig");
 const store_view = @import("manager/store_view.zig");
 const fold = @import("manager/fold.zig");
 const grow = @import("manager/grow.zig");
 
 pub const StorageError = storage_mod.StorageError;
-pub const TiledTensor = storage_mod.TiledTensor;
+pub const Tensor = storage_mod.Tensor;
 pub const DeviceRef = storage_mod.DeviceRef;
 pub const DType = types.DType;
 pub const Cache = cache_mod.Cache;
@@ -30,10 +30,10 @@ pub const TensorId = u32;
 
 /// RAM-only storage manager.
 ///
-/// This owns all `TiledTensor` allocations for a context.
+/// This owns all `Tensor` allocations for a context.
 pub const StorageManager = struct {
     allocator: std.mem.Allocator,
-    tensors: std.ArrayList(*TiledTensor) = .empty,
+    tensors: std.ArrayList(*Tensor) = .empty,
     cache: ?Cache = null,
 
     /// Weights an optimization pass derived from other weights (see `derived.zig`).
@@ -43,13 +43,16 @@ pub const StorageManager = struct {
 
     /// Device registry for tensor migration (`moveTensor` / `Tensor.to`). Set by the
     /// owning `Context` via `setDeviceRegistry`. `device_registry[i]` is gpu[i]; the
-    /// slice is borrowed (Context owns the backing). `cpu_policy` retiles on `.to(.cpu)`.
+    /// slice is borrowed (Context owns the backing).
     device_registry: []const DeviceEntry = &[_]DeviceEntry{},
-    cpu_policy: plan.TilePolicy = .{},
 
-    /// One registered non-cpu device: how to (de)allocate/transfer its buffers, plus
-    /// the tile policy used when a tensor is migrated onto it.
-    pub const DeviceEntry = struct { mem: dm.DeviceMemory, policy: plan.TilePolicy };
+    /// Threads bulk weight work on this store may use (the one-time relayout of a
+    /// derived weight). A count, not a pool: the owner of the store sets it from its
+    /// own thread budget, and the work spins a pool up only when there is any.
+    bulk_threads: usize = 1,
+
+    /// One registered non-cpu device: how to (de)allocate and transfer its buffers.
+    pub const DeviceEntry = struct { mem: dm.DeviceMemory };
 
     const Self = @This();
 
@@ -92,31 +95,16 @@ pub const StorageManager = struct {
         self.* = undefined;
     }
 
-    /// A derived weight already built for these sources, at this tiling, on this device.
-    pub fn derivedFind(
-        self: *const Self,
-        kind: derived_mod.Kind,
-        tiles: []const usize,
-        device: DeviceRef,
-        sources: []const TensorId,
-    ) ?TensorId {
-        return self.derived.find(kind, tiles, device, sources);
+    /// A weight already derived from `source` in `order` on `device`.
+    pub fn derivedFind(self: *const Self, order: types.QuantBlockOrder, device: DeviceRef, source: TensorId) ?TensorId {
+        return self.derived.find(order, device, source);
     }
 
-    /// Record `result` as derived from `sources`. A source no program reads gives its
+    /// Record `result` as derived from `source`. A source no program reads gives its
     /// bytes up now rather than at the next lease, so deriving never holds a weight twice.
-    pub fn derivedRecord(
-        self: *Self,
-        kind: derived_mod.Kind,
-        tiles: []const usize,
-        device: DeviceRef,
-        result: TensorId,
-        sources: []const derived_mod.Source,
-    ) StorageError!void {
-        try self.derived.record(self.allocator, kind, tiles, device, result, sources);
-        for (sources) |s| {
-            if (self.tensorProgramRefs(s.tid) == 0) self.releaseTensorData(s.tid) catch {};
-        }
+    pub fn derivedRecord(self: *Self, device: DeviceRef, result: TensorId, source: TensorId, view: derived_mod.View) StorageError!void {
+        try self.derived.record(self.allocator, device, result, source, view);
+        if (self.tensorProgramRefs(source) == 0) self.releaseTensorData(source) catch {};
     }
 
     /// Where `id`'s bytes live, if a pass folded it into a derived weight.
@@ -143,11 +131,10 @@ pub const StorageManager = struct {
         return fold.collectDerived(self);
     }
 
-    /// Give `id` its physical backing on `target`, preserving its tile geometry.
+    /// Give `id` its physical backing on `target`.
     ///
     /// The one way anything says "this tensor belongs on that device": placement,
-    /// weight retargeting and the fusion passes all want exactly this, and each
-    /// reimplementing the tile-shape/alignment plumbing is how they drift apart.
+    /// weight retargeting and the fusion passes all want exactly this.
     /// No-op for a cpu target or a tensor already there. Unified-memory devices keep
     /// the host allocation and alias it inside the device-memory implementation.
     pub fn placeTensor(self: *Self, id: TensorId, target: DeviceRef) StorageError!void {
@@ -155,10 +142,7 @@ pub const StorageManager = struct {
         const t = try self.getConst(id);
         if (t.device.eql(target)) return;
         const dev = self.deviceMemoryFor(target) orelse return StorageError.InvalidArgument;
-        var tile_shape: [tensor_store.INLINE_RANK]usize = undefined;
-        const rank: usize = @intCast(t.rank);
-        @memcpy(tile_shape[0..rank], t.tile_shape);
-        return self.moveTensor(id, target, dev, tile_shape[0..rank], self.policyFor(target).tile_alignment);
+        return self.moveTensor(id, target, dev);
     }
 
     /// Count one live compiled program as naming `id`.
@@ -263,17 +247,12 @@ pub const StorageManager = struct {
         return .{};
     }
 
-    pub fn createTiledTensor(
-        self: *Self,
-        dtype: DType,
-        shape: []const usize,
-        tile_shape: []const usize,
-        opts: TiledTensor.InitOptions,
-    ) StorageError!TensorId {
-        var t: *TiledTensor = self.allocator.create(TiledTensor) catch return StorageError.OutOfMemory;
+    /// A host tensor: one flat, row-major buffer of `shape`.
+    pub fn createTensor(self: *Self, dtype: DType, shape: []const usize, opts: Tensor.InitOptions) StorageError!TensorId {
+        var t: *Tensor = self.allocator.create(Tensor) catch return StorageError.OutOfMemory;
         errdefer self.allocator.destroy(t);
 
-        try t.init(self.allocator, dtype, shape, tile_shape, opts);
+        try t.init(self.allocator, dtype, shape, opts);
         errdefer t.deinit();
 
         const idx_usize: usize = self.tensors.items.len;
@@ -281,44 +260,52 @@ pub const StorageManager = struct {
         return @intCast(idx_usize);
     }
 
-    /// Create only a tensor's logical tiled geometry. Compiler workspace values
-    /// do not need physical bytes until liveness has assigned them to a slot.
-    pub fn createTiledTensorMetadata(
-        self: *Self,
-        dtype: DType,
-        shape: []const usize,
-        tile_shape: []const usize,
-        opts: TiledTensor.InitOptions,
-    ) StorageError!TensorId {
-        var no_bytes = opts;
-        no_bytes.host_data = false;
-        return self.createTiledTensor(dtype, shape, tile_shape, no_bytes);
+    /// A host tensor whose bytes are `bytes` of `mapping`, used in place (see
+    /// `storage.Mapping`). The tensor holds a reference to the mapping until its bytes
+    /// are released or copied.
+    pub fn createMappedTensor(self: *Self, dtype: DType, shape: []const usize, bytes: []const u8, mapping: *storage_mod.Mapping, opts: Tensor.InitOptions) StorageError!TensorId {
+        var t: *Tensor = self.allocator.create(Tensor) catch return StorageError.OutOfMemory;
+        errdefer self.allocator.destroy(t);
+        try t.initMapped(self.allocator, dtype, shape, bytes, mapping, opts);
+        errdefer t.deinit();
+        const idx: usize = self.tensors.items.len;
+        self.tensors.append(self.allocator, t) catch return StorageError.OutOfMemory;
+        return @intCast(idx);
     }
 
-    /// A tensor whose tiles live on `target` from the start: no host bytes are ever
+    /// Create only a tensor's geometry. Compiler workspace values do not need
+    /// physical bytes until liveness has assigned them to a slot.
+    pub fn createTensorMetadata(self: *Self, dtype: DType, shape: []const usize, opts: Tensor.InitOptions) StorageError!TensorId {
+        var no_bytes = opts;
+        no_bytes.host_data = false;
+        return self.createTensor(dtype, shape, no_bytes);
+    }
+
+    /// A tensor whose bytes live on `target` from the start: no host bytes are ever
     /// allocated for it. Its contents are undefined until written.
     pub fn createDeviceTensor(
         self: *Self,
         dtype: DType,
         shape: []const usize,
-        tile_shape: []const usize,
-        opts: TiledTensor.InitOptions,
+        opts: Tensor.InitOptions,
         target: DeviceRef,
     ) StorageError!TensorId {
         const d = self.deviceMemoryFor(target) orelse return StorageError.InvalidArgument;
-        const id = try self.createTiledTensorMetadata(dtype, shape, tile_shape, opts);
-        const t = try self.getMut(id);
-        try allocateDeviceTiles(self.allocator, t, target, d, t.tile_lens);
+        var device_opts = opts;
+        device_opts.host_data = false;
+        device_opts.chunk_rows = layout.chunkRows(dtype, shape, opts.quant_axis, d.maxBindingBytes());
+        const id = try self.createTensor(dtype, shape, device_opts);
+        try allocateDeviceChunks(self.allocator, try self.getMut(id), target, d, null);
         return id;
     }
 
-    pub fn getConst(self: *const Self, id: TensorId) StorageError!*const TiledTensor {
+    pub fn getConst(self: *const Self, id: TensorId) StorageError!*const Tensor {
         const idx: usize = @intCast(id);
         if (idx >= self.tensors.items.len) return StorageError.InvalidArgument;
         return self.tensors.items[idx];
     }
 
-    pub fn getMut(self: *Self, id: TensorId) StorageError!*TiledTensor {
+    pub fn getMut(self: *Self, id: TensorId) StorageError!*Tensor {
         const idx: usize = @intCast(id);
         if (idx >= self.tensors.items.len) return StorageError.InvalidArgument;
         return self.tensors.items[idx];
@@ -347,12 +334,12 @@ pub const StorageManager = struct {
     }
 
     /// The tensor holding `id`'s bytes: itself, or the workspace slot it aliases.
-    /// Public for `manager/store_view.zig`, which resolves every tile through it.
-    pub fn backingConst(self: *const Self, id: TensorId) StorageError!*const TiledTensor {
+    /// Public for `manager/store_view.zig`, which resolves every tensor through it.
+    pub fn backingConst(self: *const Self, id: TensorId) StorageError!*const Tensor {
         return self.getConst(try self.backingId(id));
     }
 
-    pub fn backingMut(self: *Self, id: TensorId) StorageError!*TiledTensor {
+    pub fn backingMut(self: *Self, id: TensorId) StorageError!*Tensor {
         return self.getMut(try self.backingId(id));
     }
 
@@ -389,80 +376,67 @@ pub const StorageManager = struct {
     /// pass has derived away. The id stays valid for shape/dtype validation;
     /// executing against the tensor afterward is a bug. Idempotent.
     pub fn releaseTensorData(self: *Self, id: TensorId) StorageError!void {
-        const t: *TiledTensor = try self.getMut(id);
+        const t: *Tensor = try self.getMut(id);
         t.releaseData();
     }
 
     /// Bytes in the tensor's physical backing. This is the resource used for
-    /// specialization-cache budgeting; it intentionally measures tiled storage,
-    /// not logical packed size.
+    /// specialization-cache budgeting.
     pub fn tensorBackingBytes(self: *const Self, id: TensorId) StorageError!usize {
         const t = try self.getConst(id);
         if (t.backing_owner != null) return 0;
         return t.backing_bytes;
     }
 
-    /// Bytes required by this tensor's own logical tiled layout, independent of
-    /// whether it currently owns or aliases a physical backing.
+    /// Bytes of this tensor's packed layout, independent of whether it currently
+    /// owns or aliases a physical backing.
     pub fn tensorLogicalBackingBytes(self: *const Self, id: TensorId) StorageError!usize {
-        const t = try self.getConst(id);
-        var bytes: usize = 0;
-        for (t.tile_offsets, t.tile_lens) |offset, len| {
-            bytes = @max(bytes, std.math.add(usize, offset, len) catch return StorageError.InvalidArgument);
-        }
-        return bytes;
+        return (try self.getConst(id)).byteLen();
     }
 
     pub fn tensorHasBacking(self: *const Self, id: TensorId) StorageError!bool {
         const t = try self.backingConst(id);
-        return if (t.device.kind == .cpu) t.data.len != 0 else t.tile_handles.len != 0;
+        return if (t.device.kind == .cpu) t.data.len != 0 else t.chunk_handles.len != 0;
     }
 
     pub fn writeFromPackedScalar(self: *Self, id: TensorId, packed_bytes: []const u8) StorageError!void {
         if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
-        var t: *TiledTensor = try self.getMut(id);
+        var t: *Tensor = try self.getMut(id);
         return t.writeFromPackedScalar(packed_bytes);
     }
 
     pub fn readToPackedScalar(self: *const Self, id: TensorId, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
+        const t: *const Tensor = try self.getConst(id);
         return t.readToPackedScalar(out);
     }
 
     pub fn writeFromPackedQuant(self: *Self, id: TensorId, packed_bytes: []const u8) StorageError!void {
         if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
-        var t: *TiledTensor = try self.getMut(id);
+        var t: *Tensor = try self.getMut(id);
         return t.writeFromPackedQuant(packed_bytes);
     }
 
-    /// Write a range of packed quant blocks into `id` (see `TiledTensor.writeQuantBlocks`).
-    pub fn writeQuantBlocks(self: *Self, id: TensorId, first_block: usize, packed_bytes: []const u8) StorageError!void {
-        if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
-        const t: *TiledTensor = try self.getMut(id);
-        return t.writeQuantBlocks(first_block, packed_bytes);
-    }
-
-    /// Read a range of `id`'s packed quant blocks (see `TiledTensor.readQuantBlocks`).
+    /// Read a range of `id`'s packed quant blocks (see `Tensor.readQuantBlocks`).
     pub fn readQuantBlocks(self: *const Self, id: TensorId, first_block: usize, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
+        const t: *const Tensor = try self.getConst(id);
         return t.readQuantBlocks(first_block, out);
     }
 
-    /// Write a range of `id`'s row-major elements (see `TiledTensor.writeScalarRange`).
+    /// Write a range of `id`'s row-major elements (see `Tensor.writeScalarRange`).
     pub fn writeScalarRange(self: *Self, id: TensorId, first_elem: usize, packed_bytes: []const u8) StorageError!void {
         if (!(try self.tensorHasBacking(id))) try self.reserveHostBacking(id, try self.tensorLogicalBackingBytes(id));
-        const t: *TiledTensor = try self.getMut(id);
+        const t: *Tensor = try self.getMut(id);
         return t.writeScalarRange(first_elem, packed_bytes);
     }
 
-    /// Read a range of `id`'s row-major elements (see `TiledTensor.readScalarRange`).
+    /// Read a range of `id`'s row-major elements (see `Tensor.readScalarRange`).
     pub fn readScalarRange(self: *const Self, id: TensorId, first_elem: usize, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
+        const t: *const Tensor = try self.getConst(id);
         return t.readScalarRange(first_elem, out);
     }
 
     pub fn readToPackedQuant(self: *const Self, id: TensorId, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
+        const t: *const Tensor = try self.getConst(id);
         return t.readToPackedQuant(out);
     }
 
@@ -478,61 +452,79 @@ pub const StorageManager = struct {
     /// The write direction is deliberately NOT symmetric — a write has to reach every
     /// copy, which is `writeDerivedSource`, not one buffer.
     pub fn readPackedAtPlacement(self: *Self, id: TensorId, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
         if (!try self.tensorHasBacking(id)) {
             if (self.derivedLocate(id)) |at| return fold.readDerivedPacked(self, at, out);
         }
-        return self.gatherPacked(t, out);
+        const t: *const Tensor = try self.getConst(id);
+        return self.readBytesAtPlacement(t, 0, out[0..try t.byteLen()]);
     }
 
     /// Write device-independent packed bytes into `id` at its actual placement,
     /// staging H2D when it is device-resident. See `readPackedAtPlacement`.
     pub fn writePackedAtPlacement(self: *Self, id: TensorId, packed_bytes: []const u8) StorageError!void {
-        const t: *TiledTensor = try self.getMut(id);
-        return self.scatterPackedResident(t, packed_bytes);
+        const t: *Tensor = try self.getMut(id);
+        const len = try t.byteLen();
+        if (packed_bytes.len < len) return StorageError.InvalidArgument;
+        return writeBytesAtPlacement(t, 0, packed_bytes[0..len]);
     }
 
-    /// Read packed quant blocks `[first_block, ..)` of `id` into `out`, wherever it
-    /// lives. A device tensor must tile in packed runs, so the range is byte spans of
-    /// its tiles, read back in one batch.
+    /// Read packed quant blocks `[first_block, ..)` of `id` into `out`, wherever it lives.
     pub fn readQuantBlocksAtPlacement(self: *Self, id: TensorId, first_block: usize, out: []u8) StorageError!void {
-        const t: *const TiledTensor = try self.getConst(id);
-        if (t.device.kind == .cpu) return t.readQuantBlocks(first_block, out);
-        const d = t.dev orelse return StorageError.InvalidArgument;
-        if (!t.tilesArePackedRuns()) return StorageError.InvalidArgument;
-        const start = first_block * t.dtype.info().block_bytes;
-        var regions: std.ArrayList(dm.D2HRegion) = .empty;
-        defer regions.deinit(self.allocator);
-        var tile_start: usize = 0;
-        for (t.tile_handles, t.tile_lens) |h, len| {
-            const lo = @max(start, tile_start);
-            const hi = @min(start + out.len, tile_start + len);
-            if (lo < hi) regions.append(self.allocator, .{ .dst = out[lo - start .. hi - start], .handle = h, .src_offset = lo - tile_start }) catch return StorageError.OutOfMemory;
-            tile_start += len;
-        }
-        if (start + out.len > tile_start) return StorageError.InvalidArgument;
-        d.copyD2HMany(regions.items) catch return StorageError.InvalidArgument;
+        const t: *const Tensor = try self.getConst(id);
+        return self.readBytesAtPlacement(t, first_block * t.dtype.info().block_bytes, out);
     }
 
-    /// Write `bytes` at `offset` into tile `index` of `id`, wherever the tile lives:
-    /// a copy into the host buffer, or an upload into its device buffer.
-    pub fn writeTileAtPlacement(self: *Self, id: TensorId, index: usize, offset: usize, bytes: []const u8) StorageError!void {
-        const t: *TiledTensor = try self.getMut(id);
-        if (index >= t.tile_lens.len or offset + bytes.len > t.tile_lens[index]) return StorageError.InvalidArgument;
+    /// Write `bytes` at byte `offset` of `id`'s packed layout, wherever it lives: a
+    /// copy into the host buffer, or an upload into the device chunks it spans.
+    pub fn writeAtPlacement(self: *Self, id: TensorId, offset: usize, bytes: []const u8) StorageError!void {
+        return writeBytesAtPlacement(try self.getMut(id), offset, bytes);
+    }
+
+    /// Bytes `[offset, offset + out.len)` of `t`'s packed layout. On a device each
+    /// spanned chunk is one region of a single batched readback.
+    fn readBytesAtPlacement(self: *Self, t: *const Tensor, offset: usize, out: []u8) StorageError!void {
+        const total = try t.byteLen();
+        if (offset + out.len > total) return StorageError.InvalidArgument;
         if (t.device.kind == .cpu) {
-            @memcpy(t.data[t.tile_offsets[index] + offset ..][0..bytes.len], bytes);
+            if (t.data.len < total) return StorageError.InvalidArgument;
+            @memcpy(out, t.data[offset..][0..out.len]);
             return;
         }
         const d = t.dev orelse return StorageError.InvalidArgument;
-        d.copyH2D(t.tile_handles[index], offset, bytes) catch return StorageError.InvalidArgument;
+        var regions: std.ArrayList(dm.D2HRegion) = .empty;
+        defer regions.deinit(self.allocator);
+        for (t.chunk_handles, 0..) |h, i| {
+            const c = t.chunk(i);
+            const lo = @max(offset, c.offset);
+            const hi = @min(offset + out.len, c.offset + c.len);
+            if (lo < hi) regions.append(self.allocator, .{ .dst = out[lo - offset .. hi - offset], .handle = h, .src_offset = lo - c.offset }) catch return StorageError.OutOfMemory;
+        }
+        d.copyD2HMany(regions.items) catch return StorageError.InvalidArgument;
+    }
+
+    fn writeBytesAtPlacement(t: *Tensor, offset: usize, bytes: []const u8) StorageError!void {
+        const total = try t.byteLen();
+        if (offset + bytes.len > total) return StorageError.InvalidArgument;
+        if (t.device.kind == .cpu) {
+            try t.ensureWritable();
+            if (t.data.len < total) return StorageError.InvalidArgument;
+            @memcpy(t.data[offset..][0..bytes.len], bytes);
+            return;
+        }
+        const d = t.dev orelse return StorageError.InvalidArgument;
+        for (t.chunk_handles, 0..) |h, i| {
+            const c = t.chunk(i);
+            const lo = @max(offset, c.offset);
+            const hi = @min(offset + bytes.len, c.offset + c.len);
+            if (lo < hi) d.copyH2D(h, lo - c.offset, bytes[lo - offset .. hi - offset]) catch return StorageError.InvalidArgument;
+        }
     }
 
     // --- Device registry + migration (move semantics) ---
 
     /// Install the device registry used by `moveTensor` / `Tensor.to`. `gpu_entries`
     /// is borrowed (the caller — a `Context` — owns the backing for its lifetime).
-    pub fn setDeviceRegistry(self: *Self, cpu_policy: plan.TilePolicy, gpu_entries: []const DeviceEntry) void {
-        self.cpu_policy = cpu_policy;
+    pub fn setDeviceRegistry(self: *Self, gpu_entries: []const DeviceEntry) void {
         self.device_registry = gpu_entries;
     }
 
@@ -543,278 +535,163 @@ pub const StorageManager = struct {
         return self.device_registry[ref.index].mem;
     }
 
-    /// The tile policy for `ref` (cpu policy for cpu / unknown index).
-    pub fn policyFor(self: *const Self, ref: DeviceRef) plan.TilePolicy {
-        if (ref.kind == .cpu) return self.cpu_policy;
-        if (ref.index >= self.device_registry.len) return self.cpu_policy;
-        return self.device_registry[ref.index].policy;
-    }
-
     /// Which device a tensor's bytes currently live on.
     pub fn tensorDevice(self: *const Self, id: TensorId) StorageError!DeviceRef {
-        const t: *const TiledTensor = try self.backingConst(id);
+        const t: *const Tensor = try self.backingConst(id);
         return t.device;
     }
 
-    /// Gather a tensor's bytes into a packed (device-independent) buffer, regardless
-    /// of where it currently lives. A gpu-resident tensor reads straight into `out`
-    /// when its tiles are packed runs, else rebuilds its tiling host-side via D2H.
-    fn gatherPacked(self: *Self, t: *const TiledTensor, out: []u8) StorageError!void {
-        if (t.device.kind == .cpu) {
-            return if (t.dtype.info().is_quantized) t.readToPackedQuant(out) else t.readToPackedScalar(out);
-        }
-        const d = t.dev orelse return StorageError.InvalidArgument;
-        const regions = self.allocator.alloc(dm.D2HRegion, t.tile_handles.len) catch return StorageError.OutOfMemory;
-        defer self.allocator.free(regions);
-        if (t.tilesArePackedRuns()) {
-            // Each tile is the next run of the packed bytes: read it straight there.
-            var at: usize = 0;
-            for (t.tile_handles, t.tile_lens, regions) |h, len, *region| {
-                if (at + len > out.len) return StorageError.InvalidArgument;
-                region.* = .{ .dst = out[at..][0..len], .handle = h };
-                at += len;
-            }
-            return d.copyD2HMany(regions) catch StorageError.InvalidArgument;
-        }
-        var tmp: TiledTensor = undefined;
-        try tmp.init(self.allocator, t.dtype, t.shape, t.tile_shape, .{ .tile_alignment = t.tile_alignment, .quant_axis = t.quant_axis });
-        defer tmp.deinit();
-        // `tmp` has geometry identical to `t` (same params) → matching tile offsets/lens.
-        // Issued as one batch: a per-tile loop would wait on the device once per tile.
-        for (t.tile_handles, regions, 0..) |h, *region, i| {
-            const off = tmp.tile_offsets[i];
-            region.* = .{ .dst = tmp.data[off .. off + tmp.tile_lens[i]], .handle = h };
-        }
-        d.copyD2HMany(regions) catch return StorageError.InvalidArgument;
-        return if (t.dtype.info().is_quantized) tmp.readToPackedQuant(out) else tmp.readToPackedScalar(out);
-    }
-
-    fn scatterPacked(t: *TiledTensor, packed_bytes: []const u8) StorageError!void {
-        return if (t.dtype.info().is_quantized) t.writeFromPackedQuant(packed_bytes) else t.writeFromPackedScalar(packed_bytes);
-    }
-
-    /// Scatter device-independent packed bytes into `t`, honoring residency: a
-    /// host tensor writes directly; a device-resident tensor stages into a host
-    /// buffer in `t`'s tiling and uploads each tile (H2D). The device-writing
-    /// counterpart of `gatherPacked` (same identical-geometry `tmp` trick).
-    fn scatterPackedResident(self: *Self, t: *TiledTensor, packed_bytes: []const u8) StorageError!void {
-        if (t.device.kind == .cpu) return scatterPacked(t, packed_bytes);
-        const d = t.dev orelse return StorageError.InvalidArgument;
-        if (t.tilesArePackedRuns()) {
-            // Each tile is already the next run of the packed bytes: upload it from
-            // there, without staging a host copy of the tensor.
-            var at: usize = 0;
-            for (t.tile_handles, t.tile_lens) |h, len| {
-                if (at + len > packed_bytes.len) return StorageError.InvalidArgument;
-                d.copyH2D(h, 0, packed_bytes[at..][0..len]) catch return StorageError.InvalidArgument;
-                at += len;
-            }
-            return;
-        }
-        var tmp: TiledTensor = undefined;
-        try tmp.init(self.allocator, t.dtype, t.shape, t.tile_shape, .{ .tile_alignment = t.tile_alignment, .quant_axis = t.quant_axis });
-        defer tmp.deinit();
-        try scatterPacked(&tmp, packed_bytes);
-        for (t.tile_handles, 0..) |h, i| {
-            const off = tmp.tile_offsets[i];
-            const len = tmp.tile_lens[i];
-            d.copyH2D(h, 0, tmp.data[off .. off + len]) catch return StorageError.InvalidArgument;
-        }
-    }
-
     /// Copy `src_id`'s logical contents into `dst_id`, honoring each tensor's
-    /// residency (any host/device combination). Gathers the source into the
-    /// device-independent packed layout (D2H when the source is on a device),
-    /// then scatters it into the destination (H2D when the destination is). dtype
-    /// and logical shape must match. Used to seed a device-resident recurrent
-    /// state slot from a caller's host tensor, and to mirror device state back to
-    /// a host tensor for reads.
+    /// residency (any host/device combination): the source's packed bytes are read
+    /// (D2H when it is on a device) and written into the destination (H2D when it
+    /// is). dtype and logical shape must match. Used to seed a device-resident
+    /// recurrent state slot from a caller's host tensor, and to mirror device state
+    /// back to a host tensor for reads.
     pub fn copyTensorData(self: *Self, dst_id: TensorId, src_id: TensorId) StorageError!void {
-        const src: *const TiledTensor = try self.getConst(src_id);
-        const dst: *TiledTensor = try self.getMut(dst_id);
-        if (src.dtype != dst.dtype or src.rank != dst.rank) return StorageError.InvalidArgument;
-        for (src.shape, dst.shape) |a, b| if (a != b) return StorageError.InvalidArgument;
+        const src: *const Tensor = try self.getConst(src_id);
+        const dst: *Tensor = try self.getMut(dst_id);
+        if (src.dtype != dst.dtype or !std.mem.eql(usize, src.shape, dst.shape)) return StorageError.InvalidArgument;
 
-        const plen: usize = try src.packedByteLen();
-        const buf: []u8 = self.allocator.alloc(u8, plen) catch return StorageError.OutOfMemory;
+        const len: usize = try src.byteLen();
+        if (src.device.kind == .cpu) return writeBytesAtPlacement(dst, 0, src.data[0..len]);
+        const buf: []u8 = self.allocator.alloc(u8, len) catch return StorageError.OutOfMemory;
         defer self.allocator.free(buf);
-        try self.gatherPacked(src, buf);
-        try self.scatterPackedResident(dst, buf);
+        try self.readBytesAtPlacement(src, 0, buf);
+        try writeBytesAtPlacement(dst, 0, buf);
     }
 
     /// Zero a tensor's contents at its current placement: host bytes are cleared
-    /// directly; a device tensor gets zero bytes uploaded into each tile buffer.
+    /// directly; a device tensor gets zero bytes uploaded into each chunk buffer.
     /// Used by `Model.resetState` so recurrent state clears correctly whether it
     /// lives on the host or exclusively on a device.
     pub fn zeroTensorData(self: *Self, id: TensorId) StorageError!void {
-        const t: *TiledTensor = try self.getMut(id);
+        const t: *Tensor = try self.getMut(id);
         if (t.device.kind == .cpu) {
+            try t.ensureWritable();
             @memset(t.data, 0);
             return;
         }
         const d = t.dev orelse return StorageError.InvalidArgument;
-        for (t.tile_handles, 0..) |h, i| try grow.zeroDeviceRange(self, d, h, 0, t.tile_lens[i]);
+        for (t.chunk_handles, 0..) |h, i| try grow.zeroDeviceRange(self, d, h, 0, t.chunk(i).len);
     }
 
     /// Materialize one compiler-planned workspace slot directly at its final
-    /// placement. Compile-time contents are uploaded only for synthetic values
-    /// that actually own initialized host bytes.
+    /// placement: one buffer of `bytes`, which every member aliases. Compile-time
+    /// contents are uploaded only for synthetic values that actually own initialized
+    /// host bytes.
     pub fn materializeWorkspaceSlot(
         self: *Self,
         owner_id: TensorId,
         target: DeviceRef,
         dev: ?dm.DeviceMemory,
-        tile_capacities: []const usize,
-        host_bytes: usize,
+        bytes: usize,
         preserve_contents: bool,
     ) StorageError!void {
         const owner = try self.getMut(owner_id);
         if (owner.backing_owner != null) return StorageError.InvalidArgument;
         if (target.kind == .cpu) {
-            try self.reserveHostBacking(owner_id, host_bytes);
+            try self.reserveHostBacking(owner_id, bytes);
             return;
         }
-        if (owner.device.eql(target) and owner.tile_handles.len == tile_capacities.len) return;
+        if (owner.device.eql(target) and owner.chunk_handles.len == 1) return;
         if (preserve_contents) {
-            return self.moveTensor(owner_id, target, dev, owner.tile_shape, owner.tile_alignment);
+            return self.moveTensor(owner_id, target, dev);
         }
 
         owner.releaseData();
         const d = dev orelse return StorageError.InvalidArgument;
-        return allocateDeviceTiles(self.allocator, owner, target, d, tile_capacities);
+        return allocateDeviceChunks(self.allocator, owner, target, d, &.{bytes});
     }
 
-    /// Give `t`, which holds no bytes, fresh tiles of `tile_capacities` on `target`.
-    fn allocateDeviceTiles(allocator: std.mem.Allocator, t: *TiledTensor, target: DeviceRef, d: dm.DeviceMemory, tile_capacities: []const usize) StorageError!void {
-        const handles = allocator.alloc(dm.DeviceHandle, tile_capacities.len) catch return StorageError.OutOfMemory;
+    /// Give `t`, which holds no bytes, fresh device buffers on `target`: one per chunk,
+    /// of `capacities` bytes each (null: exactly each chunk's length).
+    fn allocateDeviceChunks(allocator: std.mem.Allocator, t: *Tensor, target: DeviceRef, d: dm.DeviceMemory, capacities: ?[]const usize) StorageError!void {
+        const n = t.chunkCount();
+        if (capacities) |caps| if (caps.len != n) return StorageError.InvalidArgument;
+        const handles = allocator.alloc(dm.DeviceHandle, n) catch return StorageError.OutOfMemory;
         var allocated: usize = 0;
         errdefer {
             for (handles[0..allocated]) |h| d.free(h);
             allocator.free(handles);
         }
         var total: usize = 0;
-        while (allocated < tile_capacities.len) : (allocated += 1) {
-            const cap = tile_capacities[allocated];
+        while (allocated < n) : (allocated += 1) {
+            const cap = if (capacities) |caps| caps[allocated] else t.chunk(allocated).len;
             handles[allocated] = d.alloc(cap, 64) catch return StorageError.OutOfMemory;
             total = std.math.add(usize, total, cap) catch return StorageError.InvalidArgument;
         }
         t.device = target;
-        t.tile_handles = handles;
+        t.chunk_handles = handles;
         t.dev = d;
         t.owns_data = false;
         t.backing_bytes = total;
     }
 
     /// Migrate a tensor to `target` (move semantics: the source-device copy is freed),
-    /// re-tiling to `target_tile_shape`. `dev` must be the target device's `DeviceMemory`
-    /// when `target.kind != .cpu`. The tensor id and logical shape are preserved.
-    pub fn moveTensor(
-        self: *Self,
-        id: TensorId,
-        target: DeviceRef,
-        dev: ?dm.DeviceMemory,
-        target_tile_shape: []const usize,
-        tile_alignment: usize,
-    ) StorageError!void {
-        const t: *TiledTensor = try self.getMut(id);
+    /// split the way that device takes it (`storage/layout.zig`). `dev` must be the
+    /// target device's `DeviceMemory` when `target.kind != .cpu`. The tensor id,
+    /// logical shape and bookkeeping are preserved. Every chunk is a run of the packed
+    /// layout, so a move is one copy per chunk with no re-arrangement.
+    pub fn moveTensor(self: *Self, id: TensorId, target: DeviceRef, dev: ?dm.DeviceMemory) StorageError!void {
+        const t: *Tensor = try self.getMut(id);
         if (t.device.eql(target)) return; // idempotent
+        const len: usize = try t.byteLen();
 
-        // Fast path: host -> device with the tiling unchanged (what placement does
-        // for every weight — it re-requests the tensor's own tile shape). The
-        // general path below gathers into a packed buffer and scatters into a
-        // re-tiled staging tensor, two full copies of the tensor plus two transient
-        // allocations, before uploading a byte-identical result. Each tile is
-        // already contiguous at `data[off..off+len]`, so upload straight from there.
-        // `tile_alignment` only spaces tiles inside the host buffer and every device
-        // tile is its own buffer sized `tile_lens[i]`, so it cannot change the result.
-        if (target.kind != .cpu and t.device.kind == .cpu and t.backing_owner == null and
-            t.owns_data and t.data.len != 0 and std.mem.eql(usize, t.tile_shape, target_tile_shape))
-        {
-            const d = dev orelse return StorageError.InvalidArgument;
-            const n: usize = t.tile_offsets.len;
-            const handles: []dm.DeviceHandle = self.allocator.alloc(dm.DeviceHandle, n) catch return StorageError.OutOfMemory;
-            var uploaded: usize = 0;
-            errdefer {
-                var j: usize = 0;
-                while (j < uploaded) : (j += 1) d.free(handles[j]);
-                self.allocator.free(handles);
-            }
-            var device_bytes: usize = 0;
-            while (uploaded < n) : (uploaded += 1) {
-                const off = t.tile_offsets[uploaded];
-                const len = t.tile_lens[uploaded];
-                const h = d.alloc(len, 64) catch return StorageError.OutOfMemory;
-                handles[uploaded] = h;
-                d.copyH2D(h, 0, t.data[off .. off + len]) catch {
-                    d.free(h);
-                    return StorageError.InvalidArgument;
-                };
-                device_bytes = std.math.add(usize, device_bytes, len) catch return StorageError.InvalidArgument;
-            }
-            t.releaseData(); // host bytes are now on the device
-            t.device = target;
-            t.tile_handles = handles;
-            t.dev = d;
-            t.owns_data = false;
-            t.backing_bytes = device_bytes;
+        // The packed bytes on the host: `t`'s own buffer, or a D2H of its chunks.
+        var staged: ?[]align(64) u8 = null;
+        errdefer if (staged) |b| self.allocator.free(b);
+        const host: []const u8 = if (t.device.kind == .cpu) blk: {
+            const b = self.backingConst(id) catch return StorageError.InvalidArgument;
+            if (b.data.len < len) return StorageError.InvalidArgument;
+            break :blk b.data[0..len];
+        } else blk: {
+            const b = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), len) catch return StorageError.OutOfMemory;
+            staged = b;
+            try self.readBytesAtPlacement(t, 0, b);
+            break :blk b;
+        };
+
+        if (target.kind == .cpu) {
+            // Device -> host: the staged buffer becomes the tensor's bytes.
+            t.releaseData();
+            t.data = staged.?;
+            staged = null;
+            t.owns_data = true;
+            t.backing_bytes = len;
+            t.chunk_rows = t.shape[0];
             return;
         }
 
-        // 1. Gather current bytes into the device-independent packed layout.
-        const plen: usize = try t.packedByteLen();
-        const packed_buf: []u8 = self.allocator.alloc(u8, plen) catch return StorageError.OutOfMemory;
-        defer self.allocator.free(packed_buf);
-        try self.gatherPacked(t, packed_buf);
-
-        // 2. Build staging tensor in the TARGET tiling (host-backed, zeroed) and scatter.
-        var staging: TiledTensor = undefined;
-        try staging.init(self.allocator, t.dtype, t.shape, target_tile_shape, .{
-            .tile_alignment = tile_alignment,
-            .quant_axis = t.quant_axis,
-        });
-        errdefer staging.deinit();
-        try scatterPacked(&staging, packed_buf);
-
-        // 3. If migrating to a device, upload each tile and hand ownership of the device
-        //    buffers to `staging`, freeing its host staging buffer.
-        if (target.kind != .cpu) {
-            const d = dev orelse return StorageError.InvalidArgument;
-            const n: usize = staging.tile_offsets.len;
-            const handles: []dm.DeviceHandle = self.allocator.alloc(dm.DeviceHandle, n) catch return StorageError.OutOfMemory;
-            var uploaded: usize = 0;
-            errdefer {
-                var j: usize = 0;
-                while (j < uploaded) : (j += 1) d.free(handles[j]);
-                self.allocator.free(handles);
-            }
-            while (uploaded < n) : (uploaded += 1) {
-                const off = staging.tile_offsets[uploaded];
-                const len = staging.tile_lens[uploaded];
-                handles[uploaded] = d.alloc(len, 64) catch return StorageError.OutOfMemory;
-                d.copyH2D(handles[uploaded], 0, staging.data[off .. off + len]) catch return StorageError.InvalidArgument;
-            }
-            staging.releaseData(); // host staging bytes are now on the device
-            staging.device = target;
-            staging.tile_handles = handles;
-            staging.dev = d;
-            staging.owns_data = false;
-            var device_bytes: usize = 0;
-            for (staging.tile_lens) |len| device_bytes += len;
-            staging.backing_bytes = device_bytes;
+        const d = dev orelse return StorageError.InvalidArgument;
+        var moved = t.*;
+        moved.chunk_rows = layout.chunkRows(t.dtype, t.shape, t.quant_axis, d.maxBindingBytes());
+        moved.chunk_handles = &.{};
+        moved.dev = null;
+        moved.data = &.{};
+        try allocateDeviceChunks(self.allocator, &moved, target, d, null);
+        errdefer {
+            for (moved.chunk_handles) |h| d.free(h);
+            self.allocator.free(moved.chunk_handles);
         }
-
-        // 4. Replace in place: free the old backing (host or device), move staging in,
-        //    and rebind the metadata slices to the moved-in instance's own storage.
-        t.deinit();
-        t.* = staging;
-        t.shape = t.shape_storage.constSlice();
-        t.tile_shape = t.tile_shape_storage.constSlice();
-        t.tile_counts = t.tile_counts_storage.constSlice();
-        t.tile_strides = t.tile_strides_storage.constSlice();
+        for (moved.chunk_handles, 0..) |h, i| {
+            const c = moved.chunk(i);
+            d.copyH2D(h, 0, host[c.offset..][0..c.len]) catch return StorageError.InvalidArgument;
+        }
+        // The old placement (host bytes or another device's chunks) is freed only now
+        // that every byte has landed.
+        if (staged) |b| self.allocator.free(b);
+        staged = null;
+        t.releaseData();
+        t.chunk_rows = moved.chunk_rows;
+        t.device = moved.device;
+        t.chunk_handles = moved.chunk_handles;
+        t.dev = moved.dev;
+        t.owns_data = false;
+        t.backing_bytes = moved.backing_bytes;
     }
 
     /// The store as the runtime's `TensorStore` interface — how an executor reaches
-    /// tiles without depending on this layer (see `manager/store_view.zig`).
+    /// tensors without depending on this layer (see `manager/store_view.zig`).
     pub fn tensorStore(self: *Self) tensor_store.TensorStore {
         return store_view.of(self);
     }

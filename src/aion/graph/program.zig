@@ -8,7 +8,7 @@
 const compiler = @import("program/compiler.zig");
 
 pub const StorageError = compiler.StorageError;
-pub const TiledTensor = compiler.TiledTensor;
+pub const Tensor = compiler.Tensor;
 pub const StorageManager = compiler.StorageManager;
 pub const TensorId = compiler.TensorId;
 pub const Step = compiler.Step;

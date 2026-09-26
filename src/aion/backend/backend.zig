@@ -26,7 +26,7 @@ pub const Session = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Execute a validated tiled program against this session's store.
+        /// Execute a validated program against this session's store.
         ///
         /// Contract:
         /// - `prog` has been validated end-to-end by the compiler (Graph -> ExecutableProgram).

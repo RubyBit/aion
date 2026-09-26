@@ -12,37 +12,21 @@ const executable = @import("../../../runtime/executable.zig");
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
-fn execElemwiseBinaryTile(
-    store: tensor_store.TensorStore,
-    out_meta: tensor_store.TensorMeta,
-    a_meta: tensor_store.TensorMeta,
-    b_meta: tensor_store.TensorMeta,
-    s: executable.StepElemwiseBinaryTiled,
-    tile_index: usize,
+/// The binary op on views of the output and both operands: the row ranges
+/// `execElemwiseBinary` hands each thread.
+fn binaryViews(
+    s: executable.StepElemwiseBinary,
+    out_view: types.BufferViewMut,
+    a_view: types.BufferViewConst,
+    b_view: types.BufferViewConst,
 ) !void {
-    var coords_buf: [tensor_store.INLINE_RANK]usize = @splat(0);
-    const coords = coords_buf[0..@as(usize, out_meta.rank)];
-    try tensor_store.decodeTileCoords(out_meta, tile_index, coords);
-    const a_index = try tensor_store.projectTileIndex(a_meta, coords, &.{}, s.broadcast.a_broadcast_axes);
-    const b_index = try tensor_store.projectTileIndex(b_meta, coords, &.{}, s.broadcast.b_broadcast_axes);
-
-    const out_tile = try store.acquireTileMutLinear(s.out, tile_index);
-    defer store.releaseMut(out_tile.token);
-    const a_tile = try store.acquireTileConstLinear(s.a, a_index);
-    defer store.releaseConst(a_tile.token);
-    const b_tile = try store.acquireTileConstLinear(s.b, b_index);
-    defer store.releaseConst(b_tile.token);
-
-    const out_view = out_tile.bufferView();
-    const a_view = a_tile.bufferView();
-    const b_view = b_tile.bufferView();
-    const n = exec_utils.elemCountFromTileView(out_view);
+    const n = exec_utils.elemCountFromView(out_view);
 
     // A gate is the activation folded into the multiply: apply `act` into `out`, then
     // multiply in place by `b`. Same order of operations as the unfused
-    // `UnaryTiled(act)` + `ElemwiseBinaryTiled(mul)` pair, so the result is
+    // `Unary(act)` + `ElemwiseBinary(mul)` pair, so the result is
     // bit-identical to it — which is what lets the GPU fused kernel be tested against
-    // this. Threading, tiling and broadcast validation all come from the surrounding
+    // this. Threading and broadcast validation all come from the surrounding
     // elementwise machinery instead of a second copy of it.
     if (s.op == .gate) {
         if (s.broadcast.kind != .identical) return BackendError.InvalidArgument;
@@ -61,7 +45,7 @@ fn execElemwiseBinaryTile(
     }
 
     if (s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b) {
-        const cols = exec_utils.elemCountFromTileView(b_view);
+        const cols = exec_utils.elemCountFromView(b_view);
         return switch (out_view.dtype) {
             .f32 => switch (s.op) {
                 .add => elemwise.contiguousSuffixBinaryF32Packed(.add, out_view.bytes, a_view.bytes, b_view.bytes, n, cols),
@@ -111,215 +95,127 @@ fn execElemwiseBinaryTile(
     };
 }
 
-pub fn execElemwiseBinaryTiled(
+/// The output split into contiguous row ranges across the pool.
+///
+/// Same-shape and suffix-broadcast operands split by element or by whole `b` rows.
+/// A general broadcast splits along the outermost axis longer than one -- the only
+/// split that keeps each output range contiguous -- and each operand follows along
+/// that axis unless it broadcasts over it.
+pub fn execElemwiseBinary(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepElemwiseBinaryTiled,
+    s: executable.StepElemwiseBinary,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
-    const out_meta = try store.meta(s.out);
-    const a_meta = try store.meta(s.a);
-    const b_meta = try store.meta(s.b);
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < @as(usize, out_meta.rank)) : (d += 1) {
-        tile_total *= out_meta.tile_counts[d];
+    const out_lease = try store.acquireMut(s.out);
+    defer store.releaseMut(out_lease.token);
+    const a_lease = try store.acquireConst(s.a);
+    defer store.releaseConst(a_lease.token);
+    const b_lease = try store.acquireConst(s.b);
+    defer store.releaseConst(b_lease.token);
+    const out = out_lease.bufferView();
+    const a = a_lease.bufferView();
+    const b = b_lease.bufferView();
+    const n = exec_utils.elemCountFromView(out);
+    const eb = out.dtype.info().block_bytes;
+
+    const flat = s.op == .gate or s.broadcast.kind == .identical;
+    const suffix = s.broadcast.kind == .scalar_b or s.broadcast.kind == .contiguous_suffix_b;
+    if (flat or suffix) {
+        // Rows of `b`'s length (one element when nothing broadcasts), as rank-1 views.
+        const row: usize = if (flat) 1 else exec_utils.elemCountFromView(b);
+        if (row == 0 or n % row != 0) return BackendError.InvalidArgument;
+        const Ctx = struct {
+            s: executable.StepElemwiseBinary,
+            out: types.BufferViewMut,
+            a: types.BufferViewConst,
+            b: types.BufferViewConst,
+            row: usize,
+            flat: bool,
+
+            fn run(c: @This(), lo: usize, hi: usize, _: usize) anyerror!void {
+                const eb2 = c.out.dtype.info().block_bytes;
+                const first = lo * c.row * eb2;
+                const len = (hi - lo) * c.row * eb2;
+                var shape: [1]usize = .{(hi - lo) * c.row};
+                const strides: [1]isize = .{@intCast(eb2)};
+                const layout: types.Layout = .{ .rank = 1, .shape = &shape, .strides_bytes = &strides };
+                const out_v: types.BufferViewMut = .{ .bytes = c.out.bytes[first..][0..len], .dtype = c.out.dtype, .layout = layout };
+                const a_v: types.BufferViewConst = .{ .bytes = c.a.bytes[first..][0..len], .dtype = c.a.dtype, .layout = layout };
+                const b_v: types.BufferViewConst = if (c.flat) .{ .bytes = c.b.bytes[first..][0..len], .dtype = c.b.dtype, .layout = layout } else c.b;
+                return binaryViews(c.s, out_v, a_v, b_v);
+            }
+        };
+        const ctx: Ctx = .{ .s = s, .out = out, .a = a, .b = b, .row = row, .flat = flat };
+        return exec_utils.parallelRange(anyerror, pool, thread_count, n / row, row * eb, ctx, Ctx.run) catch |e| @errorCast(e);
     }
-    const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
-    const min_total_bytes: usize = 256 * 1024; // aim for at least 256KiB of work
 
-    if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                out_meta: tensor_store.TensorMeta,
-                a_meta: tensor_store.TensorMeta,
-                b_meta: tensor_store.TensorMeta,
-                op: types.ElemwiseBinaryOp,
-                out: tensor_store.TensorId,
-                a: tensor_store.TensorId,
-                b: tensor_store.TensorId,
-                broadcast: executable.ElementwiseBroadcastPlan,
+    // General broadcast: split the outermost axis longer than one.
+    const rank: usize = out.layout.rank;
+    var ax: usize = 0;
+    while (ax < rank and out.layout.shape[ax] <= 1) ax += 1;
+    if (ax == rank) return binaryViews(s, out, a, b);
+    const Ctx = struct {
+        s: executable.StepElemwiseBinary,
+        out: types.BufferViewMut,
+        a: types.BufferViewConst,
+        b: types.BufferViewConst,
+        ax: usize,
 
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-
-                    if (t.stop.load(.acquire)) return;
-
-                    var i: usize = start;
-                    while (i < end) : (i += 1) {
-                        if (t.stop.load(.acquire)) return;
-                        const step: executable.StepElemwiseBinaryTiled = .{
-                            .op = t.op,
-                            .out = t.out,
-                            .a = t.a,
-                            .b = t.b,
-                            .broadcast = t.broadcast,
-                        };
-                        execElemwiseBinaryTile(t.store, t.out_meta, t.a_meta, t.b_meta, step, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                    }
-                }
-            };
-
-            var task: Task = .{
-                .store = store,
-                .out_meta = out_meta,
-                .a_meta = a_meta,
-                .b_meta = b_meta,
-                .op = s.op,
-                .out = s.out,
-                .a = s.a,
-                .b = s.b,
-                .broadcast = s.broadcast,
-            };
-            // Grain based on bytes-per-tile: target ~256KiB per chunk.
-            var grain: usize = if (tile_bytes == 0) 32 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
-            if (grain > tile_total) grain = tile_total;
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
+        /// `v` restricted to `[lo, hi)` along output axis `ax`, unless it broadcasts there.
+        fn follow(v: types.BufferViewConst, out_rank: usize, axis: usize, mask: u8, lo: usize, hi: usize, shape: *[8]usize) types.BufferViewConst {
+            const r: usize = v.layout.rank;
+            const off = out_rank - r;
+            if (axis < off or (mask & (@as(u8, 1) << @intCast(axis))) != 0 or v.layout.shape[axis - off] == 1) return v;
+            const in_ax = axis - off;
+            @memcpy(shape[0..r], v.layout.shape);
+            shape[in_ax] = hi - lo;
+            const start: usize = lo * @as(usize, @intCast(v.layout.strides_bytes[in_ax]));
+            var sub = v;
+            sub.bytes = v.bytes[start..];
+            sub.layout.shape = shape[0..r];
+            return sub;
         }
-    }
 
-    // Sequential fallback.
-    var tile_index: usize = 0;
-    while (tile_index < tile_total) : (tile_index += 1) {
-        try execElemwiseBinaryTile(store, out_meta, a_meta, b_meta, s, tile_index);
-    }
-}
-
-pub fn execCopyTiled(
-    pool: ?*thread_pool.ThreadPool,
-    thread_count: usize,
-    s: executable.StepCopyTiled,
-    store: tensor_store.TensorStore,
-) ExecuteProgramError!void {
-    const dst_meta = try store.meta(s.dst);
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < @as(usize, dst_meta.rank)) : (d += 1) {
-        tile_total *= dst_meta.tile_counts[d];
-    }
-    const tile_bytes: usize = exec_utils.tileByteSize(dst_meta);
-    const min_total_bytes: usize = 256 * 1024;
-
-    const bytesForTileView = struct {
-        // Every dim, not just the leading two: a tile is contiguous, so its byte
-        // length is the product of its whole extent.
-        fn calc(dtype: types.DType, view: anytype) usize {
-            var elems: usize = 1;
-            for (view.layout.shape[0..view.layout.rank]) |dim| elems *= dim;
-            return switch (dtype) {
-                .f32 => elems * 4,
-                .f16 => elems * 2,
-                .i8 => elems,
-                .i32 => elems * 4,
-                .q4_0, .q8_0 => blk: {
-                    const info = dtype.info();
-                    const blocks = std.math.divCeil(usize, elems, info.block_elems) catch return 0;
-                    break :blk blocks * info.block_bytes;
-                },
-            };
+        fn run(c: @This(), lo: usize, hi: usize, _: usize) anyerror!void {
+            const r: usize = c.out.layout.rank;
+            var out_shape: [8]usize = undefined;
+            @memcpy(out_shape[0..r], c.out.layout.shape);
+            out_shape[c.ax] = hi - lo;
+            const stride: usize = @intCast(c.out.layout.strides_bytes[c.ax]);
+            var out_v = c.out;
+            out_v.bytes = c.out.bytes[lo * stride .. hi * stride];
+            out_v.layout.shape = out_shape[0..r];
+            var a_shape: [8]usize = undefined;
+            var b_shape: [8]usize = undefined;
+            const a_v = follow(c.a, r, c.ax, c.s.broadcast.a_broadcast_axes, lo, hi, &a_shape);
+            const b_v = follow(c.b, r, c.ax, c.s.broadcast.b_broadcast_axes, lo, hi, &b_shape);
+            return binaryViews(c.s, out_v, a_v, b_v);
         }
     };
+    const rows = out.layout.shape[ax];
+    const ctx: Ctx = .{ .s = s, .out = out, .a = a, .b = b, .ax = ax };
+    return exec_utils.parallelRange(anyerror, pool, thread_count, rows, (n / rows) * eb, ctx, Ctx.run) catch |e| @errorCast(e);
+}
 
-    if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
-            const Task = struct {
-                store: tensor_store.TensorStore,
-                dst_meta: tensor_store.TensorMeta,
-                dst: tensor_store.TensorId,
-                src: tensor_store.TensorId,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (t.stop.load(.acquire)) return;
-
-                    var i: usize = start;
-                    while (i < end) : (i += 1) {
-                        if (t.stop.load(.acquire)) return;
-                        if (i + 1 < end) {
-                            t.store.prefetchLinear(t.src, i + 1);
-                        }
-
-                        var dst_tile = t.store.acquireTileMutLinear(t.dst, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseMut(dst_tile.token);
-                        const src_tile = t.store.acquireTileConstLinear(t.src, i) catch |e| {
-                            t.fail(e);
-                            return;
-                        };
-                        defer t.store.releaseConst(src_tile.token);
-
-                        const dst_view = dst_tile.bufferView();
-                        const src_view = src_tile.bufferView();
-                        if (dst_view.dtype != src_view.dtype) {
-                            t.fail(BackendError.InvalidArgument);
-                            return;
-                        }
-                        const need: usize = bytesForTileView.calc(dst_view.dtype, dst_view);
-                        if (need == 0 or dst_view.bytes.len < need or src_view.bytes.len < need) {
-                            t.fail(BackendError.InvalidArgument);
-                            return;
-                        }
-                        @memcpy(dst_view.bytes[0..need], src_view.bytes[0..need]);
-                    }
-                }
-            };
-
-            var task: Task = .{ .store = store, .dst_meta = dst_meta, .dst = s.dst, .src = s.src };
-            var grain: usize = if (tile_bytes == 0) 32 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
-            if (grain > tile_total) grain = tile_total;
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
+/// A same-shape copy: one memcpy, split across the pool.
+pub fn execCopy(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    s: executable.StepCopy,
+    store: tensor_store.TensorStore,
+) ExecuteProgramError!void {
+    const dst = try store.acquireMut(s.dst);
+    defer store.releaseMut(dst.token);
+    const src = try store.acquireConst(s.src);
+    defer store.releaseConst(src.token);
+    if (dst.dtype != src.dtype or dst.bytes.len != src.bytes.len) return BackendError.InvalidArgument;
+    const Ctx = struct {
+        dst: []u8,
+        src: []const u8,
+        fn run(c: @This(), lo: usize, hi: usize, _: usize) BackendError!void {
+            @memcpy(c.dst[lo..hi], c.src[lo..hi]);
         }
-    }
-
-    // Sequential fallback.
-    var tile_index: usize = 0;
-    while (tile_index < tile_total) : (tile_index += 1) {
-        var dst_tile = try store.acquireTileMutLinear(s.dst, tile_index);
-        defer store.releaseMut(dst_tile.token);
-        const src_tile = try store.acquireTileConstLinear(s.src, tile_index);
-        defer store.releaseConst(src_tile.token);
-
-        const dst_view = dst_tile.bufferView();
-        const src_view = src_tile.bufferView();
-        if (dst_view.dtype != src_view.dtype) return BackendError.InvalidArgument;
-        const need: usize = bytesForTileView.calc(dst_view.dtype, dst_view);
-        if (need == 0 or dst_view.bytes.len < need or src_view.bytes.len < need) return BackendError.InvalidArgument;
-        @memcpy(dst_view.bytes[0..need], src_view.bytes[0..need]);
-    }
+    };
+    return exec_utils.parallelRange(BackendError, pool, thread_count, dst.bytes.len, 1, Ctx{ .dst = dst.bytes, .src = src.bytes }, Ctx.run);
 }

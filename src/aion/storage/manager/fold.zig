@@ -11,40 +11,23 @@ const storage_mod = @import("../storage.zig");
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
 const StorageError = storage_mod.StorageError;
-const TiledTensor = storage_mod.TiledTensor;
+const Tensor = storage_mod.Tensor;
 
 const RegionDir = enum { into_derived, out_of_derived };
 
-/// Copy one source region between a derived weight's packed bytes and its own.
+/// Copy one source's blocks between a derived weight's packed bytes and its own, one
+/// block at a time: neither side keeps a column contiguous in the other's order, and
+/// the derived side may split a block's bytes.
 fn copyRegion(whole: []u8, part: []u8, view: derived_mod.View, dir: RegionDir) void {
     const bb = view.block_bytes;
-    switch (view.mapping) {
-        .relayout => |lay| {
-            // One block at a time: neither side keeps a column contiguous in the
-            // other's order, and the derived side may split a block's bytes.
-            for (0..view.len) |c| {
-                const at = lay.tileOf(view.rows, c);
-                const tile = whole[at.base..];
-                for (0..view.rows) |kb| {
-                    const block = part[lay.sourceAt(view.rows, view.len, c, kb) * bb ..][0..bb];
-                    switch (dir) {
-                        .into_derived => lay.order.storeBlock(tile, view.rows, at.row, kb, block),
-                        .out_of_derived => lay.order.loadBlock(tile, view.rows, at.row, kb, block),
-                    }
-                }
+    for (0..view.cols) |c| {
+        for (0..view.blocks) |kb| {
+            const block = part[view.sourceAt(c, kb) * bb ..][0..bb];
+            switch (dir) {
+                .into_derived => view.order.storeBlock(whole, view.blocks, c, kb, block),
+                .out_of_derived => view.order.loadBlock(whole, view.blocks, c, kb, block),
             }
-        },
-        .stripe => {
-            const n = view.len * bb;
-            for (0..view.rows) |r| {
-                const at_whole = (r * view.row_stride + view.offset) * bb;
-                const at_part = r * n;
-                switch (dir) {
-                    .into_derived => @memcpy(whole[at_whole..][0..n], part[at_part..][0..n]),
-                    .out_of_derived => @memcpy(part[at_part..][0..n], whole[at_whole..][0..n]),
-                }
-            }
-        },
+        }
     }
 }
 
@@ -56,9 +39,9 @@ pub fn writeDerivedSource(mgr: *StorageManager, id: TensorId, src: TensorId) Sto
     while (it.next()) |at| {
         try requireSourceLayout(mgr, at, src);
 
-        const whole = mgr.allocator.alloc(u8, at.view.derivedBytes()) catch return StorageError.OutOfMemory;
+        const whole = mgr.allocator.alloc(u8, at.view.bytes()) catch return StorageError.OutOfMemory;
         defer mgr.allocator.free(whole);
-        const part = mgr.allocator.alloc(u8, at.view.sourceBytes()) catch return StorageError.OutOfMemory;
+        const part = mgr.allocator.alloc(u8, at.view.bytes()) catch return StorageError.OutOfMemory;
         defer mgr.allocator.free(part);
 
         try mgr.readPackedAtPlacement(at.result, whole);
@@ -75,18 +58,18 @@ pub fn readDerivedSource(mgr: *StorageManager, id: TensorId, dst: TensorId) Stor
     const at = mgr.derivedLocate(id) orelse return StorageError.InvalidArgument;
     try requireSourceLayout(mgr, at, dst);
 
-    const part = mgr.allocator.alloc(u8, at.view.sourceBytes()) catch return StorageError.OutOfMemory;
+    const part = mgr.allocator.alloc(u8, at.view.bytes()) catch return StorageError.OutOfMemory;
     defer mgr.allocator.free(part);
 
     try readDerivedPacked(mgr, at, part);
     try mgr.writePackedAtPlacement(dst, part);
 }
 
-/// One source's stripe of a derived weight, packed. The derived weight is never
+/// A source's bytes out of its derived weight, packed. The derived weight is never
 /// itself derived (`Table.record` refuses stacking), so this recurses no further.
 pub fn readDerivedPacked(mgr: *StorageManager, at: derived_mod.Located, out: []u8) StorageError!void {
-    if (out.len != at.view.sourceBytes()) return StorageError.InvalidArgument;
-    const whole = mgr.allocator.alloc(u8, at.view.derivedBytes()) catch return StorageError.OutOfMemory;
+    if (out.len != at.view.bytes()) return StorageError.InvalidArgument;
+    const whole = mgr.allocator.alloc(u8, at.view.bytes()) catch return StorageError.OutOfMemory;
     defer mgr.allocator.free(whole);
     try mgr.readPackedAtPlacement(at.result, whole);
     copyRegion(whole, out, at.view, .out_of_derived);
@@ -102,38 +85,22 @@ pub fn unfoldTensor(mgr: *StorageManager, id: TensorId) StorageError!void {
 }
 
 /// Collect storage after program reference counts change.
-/// First remove an unreferenced derived weight when every source is whole, or when
-/// nothing holds or reads its sources any more; otherwise reclaim unreferenced source
-/// copies because the derived weight is canonical.
+/// First remove an unreferenced derived weight when its source is whole, or when
+/// nothing holds or reads its source any more; otherwise reclaim an unreferenced
+/// source copy because the derived weight is canonical.
 pub fn collectDerived(mgr: *StorageManager) void {
     var i: usize = 0;
     while (i < mgr.derived.entries.items.len) {
         const e = mgr.derived.entries.items[i];
-        if (mgr.tensorProgramRefs(e.result) == 0 and (sourcesAreWhole(mgr, e) or sourcesAreUnreferenced(mgr, e))) {
+        const source_whole = mgr.tensorHasBacking(e.source) catch false;
+        if (mgr.tensorProgramRefs(e.result) == 0 and (source_whole or mgr.tensorUnreferenced(e.source))) {
             mgr.releaseTensorData(e.result) catch {};
-            mgr.derived.remove(mgr.allocator, i);
+            mgr.derived.remove(i);
             continue;
         }
-        for (e.sources) |s| {
-            if (mgr.tensorProgramRefs(s.tid) == 0) mgr.releaseTensorData(s.tid) catch {};
-        }
+        if (mgr.tensorProgramRefs(e.source) == 0) mgr.releaseTensorData(e.source) catch {};
         i += 1;
     }
-}
-
-/// Every source of `e` holds its own bytes, so the derived weight is not the only
-/// copy of anything.
-/// No source is held or read any more, so neither is anything derived from them.
-fn sourcesAreUnreferenced(mgr: *const StorageManager, e: derived_mod.Entry) bool {
-    for (e.sources) |s| if (!mgr.tensorUnreferenced(s.tid)) return false;
-    return true;
-}
-
-fn sourcesAreWhole(mgr: *const StorageManager, e: derived_mod.Entry) bool {
-    for (e.sources) |s| {
-        if (!(mgr.tensorHasBacking(s.tid) catch return false)) return false;
-    }
-    return true;
 }
 
 /// The tensor standing in for a folded-away weight must match it byte for byte:
@@ -142,5 +109,5 @@ fn requireSourceLayout(mgr: *const StorageManager, at: derived_mod.Located, othe
     const result = try mgr.getConst(at.result);
     const t = try mgr.getConst(other);
     if (t.dtype != result.dtype) return StorageError.InvalidArgument;
-    if (try t.packedByteLen() != at.view.sourceBytes()) return StorageError.InvalidArgument;
+    if (try t.byteLen() != at.view.bytes()) return StorageError.InvalidArgument;
 }

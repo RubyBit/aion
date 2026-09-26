@@ -6,7 +6,7 @@
 // in `[0..bins)`, imaginary in `[bins..2*bins)`, `bins = n_fft/2+1`). All
 // leading dimensions are treated as an independent batch of frames. Frames are
 // processed in groups of `kernels.lanes` so the kernel can vectorize across
-// them.
+// them, and groups split across the pool.
 
 const std = @import("std");
 const backend_mod = @import("../../backend.zig");
@@ -32,11 +32,6 @@ pub fn execRFFT(
     s: executable.StepRFFT,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
-    // v1: sequential over frame-groups; the kernel vectorizes across the lanes
-    // within each group. Frame-group threading is a future optimization.
-    _ = pool;
-    _ = thread_count;
-
     const out_meta = try store.meta(s.out);
     const x_meta = try store.meta(s.x);
 
@@ -51,79 +46,54 @@ pub fn execRFFT(
     const bins: usize = n_fft / 2 + 1;
     if (out_meta.shape[rank - 1] != 2 * bins) return BackendError.InvalidArgument;
 
-    const leading_rank: usize = rank - 1;
     var frames: usize = 1;
-    var d: usize = 0;
-    while (d < leading_rank) : (d += 1) {
+    for (0..rank - 1) |d| {
         if (out_meta.shape[d] != x_meta.shape[d]) return BackendError.InvalidArgument;
         frames *= x_meta.shape[d];
     }
-    if (frames == 0) return; // nothing to do (empty leading dim)
+    if (frames == 0) return;
     if (plan.n_fft != n_fft) return BackendError.InvalidArgument;
 
-    const lanes: usize = kernels.lanes;
-    const in_buf = allocator.alloc(f32, lanes * n_fft) catch return BackendError.ExecutionFailed;
-    defer allocator.free(in_buf);
-    const out_buf = allocator.alloc(f32, lanes * 2 * bins) catch return BackendError.ExecutionFailed;
-    defer allocator.free(out_buf);
-    const scratch = allocator.alignedAlloc(u8, .@"64", fft.scratchBytes(plan, lanes)) catch return BackendError.ExecutionFailed;
-    defer allocator.free(scratch);
+    const x = try store.acquireConst(s.x);
+    defer store.releaseConst(x.token);
+    const out = try store.acquireMut(s.out);
+    defer store.releaseMut(out.token);
 
-    // Packed strides over the leading (frame) dims for linear<->coord decoding.
-    var lead_strides: [MAX_RANK]usize = @splat(0);
-    if (leading_rank > 0) {
-        var stride: usize = 1;
-        var dd: usize = leading_rank;
-        while (dd > 0) : (dd -= 1) {
-            lead_strides[dd - 1] = stride;
-            stride *= x_meta.shape[dd - 1];
-        }
-    }
+    // Frames are consecutive rows of both tensors, so a group of them is one run
+    // the kernel reads and writes in place.
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        kernels: fft_registry.FftKernels,
+        plan: *const fft.Plan,
+        frames: usize,
+        n_fft: usize,
+        out_row: usize,
+        x: []align(1) const f32,
+        out: []align(1) f32,
 
-    var x_cache: exec_utils.TileCacheConstND = .{};
-    defer x_cache.deinit(store);
-    var out_cache: exec_utils.TileCacheMutND = .{};
-    defer out_cache.deinit(store);
-
-    var coords: [MAX_RANK]usize = @splat(0);
-
-    var group_start: usize = 0;
-    while (group_start < frames) : (group_start += lanes) {
-        const count: usize = @min(lanes, frames - group_start);
-
-        // Gather: windowed (here just raw) frames into the contiguous in_buf.
-        var l: usize = 0;
-        while (l < count) : (l += 1) {
-            const f: usize = group_start + l;
-            decodeLeading(f, lead_strides[0..leading_rank], coords[0..leading_rank]);
-            var p: usize = 0;
-            while (p < n_fft) : (p += 1) {
-                coords[leading_rank] = p;
-                in_buf[l * n_fft + p] = try exec_utils.readScalarF32At(store, x_meta, s.x, coords[0..rank], &x_cache);
+        fn run(c: @This(), lo: usize, hi: usize, _: usize) BackendError!void {
+            const lanes = c.kernels.lanes;
+            const scratch = c.allocator.alignedAlloc(u8, .@"64", fft.scratchBytes(c.plan, lanes)) catch return BackendError.ExecutionFailed;
+            defer c.allocator.free(scratch);
+            for (lo..hi) |group| {
+                const f0 = group * lanes;
+                const count = @min(lanes, c.frames - f0);
+                const in: []const f32 = @alignCast(c.x[f0 * c.n_fft ..][0 .. count * c.n_fft]);
+                const dst: []f32 = @alignCast(c.out[f0 * c.out_row ..][0 .. count * c.out_row]);
+                c.kernels.process_group(c.plan, in, dst, count, scratch) catch return BackendError.ExecutionFailed;
             }
         }
-
-        kernels.process_group(plan, in_buf, out_buf, count, scratch) catch return BackendError.ExecutionFailed;
-
-        // Scatter packed complex bins to the output.
-        l = 0;
-        while (l < count) : (l += 1) {
-            const f: usize = group_start + l;
-            decodeLeading(f, lead_strides[0..leading_rank], coords[0..leading_rank]);
-            var k: usize = 0;
-            while (k < 2 * bins) : (k += 1) {
-                coords[leading_rank] = k;
-                try exec_utils.writeScalarFromF32At(store, out_meta, s.out, coords[0..rank], out_buf[l * 2 * bins + k], &out_cache);
-            }
-        }
-    }
-}
-
-fn decodeLeading(linear: usize, strides: []const usize, out: []usize) void {
-    var rem: usize = linear;
-    for (strides, 0..) |stride, i| {
-        const v: usize = rem / stride;
-        out[i] = v;
-        rem -= v * stride;
-    }
+    };
+    const ctx: Ctx = .{
+        .allocator = allocator,
+        .kernels = kernels,
+        .plan = plan,
+        .frames = frames,
+        .n_fft = n_fft,
+        .out_row = 2 * bins,
+        .x = std.mem.bytesAsSlice(f32, x.bytes),
+        .out = std.mem.bytesAsSlice(f32, out.bytes),
+    };
+    const groups = std.math.divCeil(usize, frames, kernels.lanes) catch unreachable;
+    return exec_utils.parallelRange(BackendError, pool, thread_count, groups, kernels.lanes * n_fft * 4 * @sizeOf(f32), ctx, Ctx.run);
 }

@@ -35,46 +35,13 @@ fn loadRowAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, 
 }
 
 fn loadRowT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
-    const elem: usize = @sizeOf(T);
     if (meta.rank != 2) return BackendError.InvalidArgument;
     if (row >= meta.shape[0]) return BackendError.InvalidArgument;
     if (out.len != meta.shape[1]) return BackendError.InvalidArgument;
-
-    const ti0: usize = row / meta.tile_shape[0];
-    const in0: usize = row - ti0 * meta.tile_shape[0];
-
-    var col_off: usize = 0;
-    var ti1: usize = 0;
-    while (ti1 < meta.tile_counts[1]) : (ti1 += 1) {
-        const tile = try store.acquireTileConst(id, ti0, ti1);
-        defer store.releaseConst(tile.token);
-
-        const view = tile.bufferView();
-        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
-        if (view.layout.rank != 2) return BackendError.InvalidArgument;
-
-        const m_tile: usize = view.layout.shape[0];
-        const n_tile: usize = view.layout.shape[1];
-        if (in0 >= m_tile) return BackendError.InvalidArgument;
-        if (col_off + n_tile > out.len) return BackendError.InvalidArgument;
-
-        const stride0_bytes_i: isize = view.layout.strides_bytes[0];
-        const stride1_bytes_i: isize = view.layout.strides_bytes[1];
-        if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-        if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
-        const stride0_bytes: usize = @intCast(stride0_bytes_i);
-
-        const row_bytes: usize = n_tile * elem;
-        const src_off: usize = in0 * stride0_bytes;
-        if (src_off + row_bytes > view.bytes.len) return BackendError.InvalidArgument;
-
-        const src: [*]align(1) const T = @ptrCast(view.bytes.ptr + src_off);
-        var j: usize = 0;
-        while (j < n_tile) : (j += 1) out[col_off + j] = @floatCast(src[j]);
-        col_off += n_tile;
-    }
-
-    if (col_off != out.len) return BackendError.InvalidArgument;
+    const t = try store.acquireConst(id);
+    defer store.releaseConst(t.token);
+    const src = std.mem.bytesAsSlice(T, t.bytes)[row * out.len ..][0..out.len];
+    for (out, src) |*d, v| d.* = @floatCast(v);
 }
 
 fn loadVecAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
@@ -82,34 +49,12 @@ fn loadVecAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, 
 }
 
 fn loadVecT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
-    const elem: usize = @sizeOf(T);
     if (meta.rank != 1) return BackendError.InvalidArgument;
     if (out.len != meta.shape[0]) return BackendError.InvalidArgument;
-
-    var off: usize = 0;
-    var ti0: usize = 0;
-    while (ti0 < meta.tile_counts[0]) : (ti0 += 1) {
-        const tile = try store.acquireTileConst(id, ti0, 0);
-        defer store.releaseConst(tile.token);
-
-        const view = tile.bufferView();
-        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
-        if (view.layout.rank != 1) return BackendError.InvalidArgument;
-        const stride0_bytes_i: isize = view.layout.strides_bytes[0];
-        if (stride0_bytes_i != elem) return BackendError.InvalidArgument;
-        const n_tile: usize = view.layout.shape[0];
-        if (off + n_tile > out.len) return BackendError.InvalidArgument;
-
-        const bytes: usize = n_tile * elem;
-        if (bytes > view.bytes.len) return BackendError.InvalidArgument;
-
-        const src: [*]align(1) const T = @ptrCast(view.bytes.ptr);
-        var j: usize = 0;
-        while (j < n_tile) : (j += 1) out[off + j] = @floatCast(src[j]);
-        off += n_tile;
-    }
-
-    if (off != out.len) return BackendError.InvalidArgument;
+    const t = try store.acquireConst(id);
+    defer store.releaseConst(t.token);
+    const src = std.mem.bytesAsSlice(T, t.bytes)[0..out.len];
+    for (out, src) |*d, v| d.* = @floatCast(v);
 }
 
 fn storeRowState(
@@ -123,6 +68,7 @@ fn storeRowState(
     return floatDispatch("storeRowStateT", meta.dtype, .{ store, meta, id, row, h, c });
 }
 
+/// Row `row` of the `[B, 2*H]` state is `h` followed by `c`.
 fn storeRowStateT(
     comptime T: type,
     store: tensor_store.TensorStore,
@@ -132,63 +78,28 @@ fn storeRowStateT(
     h: []const f32,
     c: []const f32,
 ) ExecuteProgramError!void {
-    const elem: usize = @sizeOf(T);
     if (meta.rank != 2) return BackendError.InvalidArgument;
     if (row >= meta.shape[0]) return BackendError.InvalidArgument;
     if (meta.shape[1] != h.len + c.len) return BackendError.InvalidArgument;
-
-    const ti0: usize = row / meta.tile_shape[0];
-    const in0: usize = row - ti0 * meta.tile_shape[0];
-
-    var col_off: usize = 0;
-    var ti1: usize = 0;
-    while (ti1 < meta.tile_counts[1]) : (ti1 += 1) {
-        var tile = try store.acquireTileMut(id, ti0, ti1);
-        defer store.releaseMut(tile.token);
-
-        const view = tile.bufferView();
-        if (view.dtype != meta.dtype) return BackendError.InvalidArgument;
-        if (view.layout.rank != 2) return BackendError.InvalidArgument;
-
-        const m_tile: usize = view.layout.shape[0];
-        const n_tile: usize = view.layout.shape[1];
-        if (in0 >= m_tile) return BackendError.InvalidArgument;
-
-        const stride0_bytes_i: isize = view.layout.strides_bytes[0];
-        const stride1_bytes_i: isize = view.layout.strides_bytes[1];
-        if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-        if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
-        const stride0_bytes: usize = @intCast(stride0_bytes_i);
-
-        const row_bytes: usize = n_tile * elem;
-        const dst_off: usize = in0 * stride0_bytes;
-        if (dst_off + row_bytes > view.bytes.len) return BackendError.InvalidArgument;
-        if (n_tile > MAX_HIDDEN * 2) return BackendError.InvalidArgument;
-
-        // Fill the output row segment from either h or c depending on position.
-        const dst: [*]align(1) T = @ptrCast(view.bytes.ptr + dst_off);
-        var j: usize = 0;
-        while (j < n_tile) : (j += 1) {
-            const g: usize = col_off + j;
-            dst[j] = @floatCast(if (g < h.len) h[g] else c[g - h.len]);
-        }
-        col_off += n_tile;
-    }
-
-    if (col_off != meta.shape[1]) return BackendError.InvalidArgument;
+    const t = try store.acquireMut(id);
+    defer store.releaseMut(t.token);
+    const dst = std.mem.bytesAsSlice(T, t.bytes)[row * meta.shape[1] ..][0..meta.shape[1]];
+    for (dst[0..h.len], h) |*d, v| d.* = @floatCast(v);
+    for (dst[h.len..], c) |*d, v| d.* = @floatCast(v);
 }
 
-fn accumMatVecTiled(
+/// `out += x @ W` for `W [rows, cols]`.
+fn accumMatVec(
     store: tensor_store.TensorStore,
     w_meta: tensor_store.TensorMeta,
     w_id: tensor_store.TensorId,
     x: []const f32,
     out: []f32,
 ) ExecuteProgramError!void {
-    return floatDispatch("accumMatVecTiledT", w_meta.dtype, .{ store, w_meta, w_id, x, out });
+    return floatDispatch("accumMatVecT", w_meta.dtype, .{ store, w_meta, w_id, x, out });
 }
 
-fn accumMatVecTiledT(
+fn accumMatVecT(
     comptime T: type,
     store: tensor_store.TensorStore,
     w_meta: tensor_store.TensorMeta,
@@ -196,55 +107,16 @@ fn accumMatVecTiledT(
     x: []const f32,
     out: []f32,
 ) ExecuteProgramError!void {
-    const elem: usize = @sizeOf(T);
     if (w_meta.rank != 2) return BackendError.InvalidArgument;
     if (x.len != w_meta.shape[0]) return BackendError.InvalidArgument;
     if (out.len != w_meta.shape[1]) return BackendError.InvalidArgument;
-
-    var ti0: usize = 0;
-    while (ti0 < w_meta.tile_counts[0]) : (ti0 += 1) {
-        var ti1: usize = 0;
-        while (ti1 < w_meta.tile_counts[1]) : (ti1 += 1) {
-            const tile = try store.acquireTileConst(w_id, ti0, ti1);
-            defer store.releaseConst(tile.token);
-
-            const view = tile.bufferView();
-            if (view.dtype != w_meta.dtype) return BackendError.InvalidArgument;
-            if (view.layout.rank != 2) return BackendError.InvalidArgument;
-
-            const stride0_bytes_i: isize = view.layout.strides_bytes[0];
-            const stride1_bytes_i: isize = view.layout.strides_bytes[1];
-            if (stride0_bytes_i <= 0) return BackendError.InvalidArgument;
-            if (stride1_bytes_i != elem) return BackendError.InvalidArgument;
-            const stride0_bytes: usize = @intCast(stride0_bytes_i);
-            const stride1_bytes: usize = @intCast(stride1_bytes_i);
-
-            const base_r: usize = ti0 * w_meta.tile_shape[0];
-            const base_c: usize = ti1 * w_meta.tile_shape[1];
-
-            const m_tile: usize = view.layout.shape[0];
-            const n_tile: usize = view.layout.shape[1];
-            if (base_c + n_tile > out.len) return BackendError.InvalidArgument;
-
-            const needed_bytes: usize = (m_tile - 1) * stride0_bytes + (n_tile - 1) * stride1_bytes + elem;
-            if (needed_bytes > view.bytes.len) return BackendError.InvalidArgument;
-
-            var lr: usize = 0;
-            while (lr < m_tile) : (lr += 1) {
-                const gr: usize = base_r + lr;
-                if (gr >= x.len) break;
-                const xv: f32 = x[gr];
-                if (xv == 0.0) continue;
-
-                const row_base_off: usize = lr * stride0_bytes;
-                var lc: usize = 0;
-                while (lc < n_tile) : (lc += 1) {
-                    const off_bytes: usize = row_base_off + lc * stride1_bytes;
-                    const p: *align(1) const T = @ptrCast(view.bytes.ptr + off_bytes);
-                    out[base_c + lc] += xv * @as(f32, @floatCast(p.*));
-                }
-            }
-        }
+    const t = try store.acquireConst(w_id);
+    defer store.releaseConst(t.token);
+    const w = std.mem.bytesAsSlice(T, t.bytes);
+    for (x, 0..) |xv, r| {
+        if (xv == 0.0) continue;
+        const w_row = w[r * out.len ..][0..out.len];
+        for (out, w_row) |*o, wv| o.* += xv * @as(f32, @floatCast(wv));
     }
 }
 
@@ -327,9 +199,9 @@ pub fn execLSTMCellFused(
         }
 
         // gates += x @ w_ih
-        try accumMatVecTiled(store, wih_meta, s.w_ih, x_row_buf[0..input_size], gates_buf[0..gate_dim]);
+        try accumMatVec(store, wih_meta, s.w_ih, x_row_buf[0..input_size], gates_buf[0..gate_dim]);
         // gates += h_prev @ w_hh
-        try accumMatVecTiled(store, whh_meta, s.w_hh, h_row_buf[0..hidden], gates_buf[0..gate_dim]);
+        try accumMatVec(store, whh_meta, s.w_hh, h_row_buf[0..hidden], gates_buf[0..gate_dim]);
 
         // Compute new state.
         const h_off0: usize = 0;

@@ -4,7 +4,7 @@
 //! thread per (batch, hidden) element computes all four gates and writes the
 //! [h_t | c_t] state row. f32 or f16 storage — the gates, the activations and
 //! the cell update are f32 either way, so the dtype only picks an entry point.
-//! Every operand must be a single packed tile and share the cell's dtype.
+//! Every operand must be one buffer and share the cell's dtype.
 //!
 //! Numerics note: the CPU exec uses sigmoid/tanh fast approximations; the GPU
 //! uses exact builtins — CPU-vs-GPU comparisons need a ~1e-3 tolerance.
@@ -45,19 +45,19 @@ const LstmParams = extern struct {
     _p2: u32 = 0,
 };
 
-/// Acquire tensor `id`'s single packed tile of `dtype` (Unsupported otherwise).
-/// Caller releases via `hs.releaseConst(tile.token)`.
-fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize, dtype: types.DType) ExecuteProgramError!device_store.TileRef {
+/// Acquire tensor `id`'s one buffer, of `dtype` and at least `min_elems` elements
+/// (Unsupported otherwise). Caller releases via `hs.releaseConst(t.token)`.
+fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize, dtype: types.DType) ExecuteProgramError!device_store.Chunk {
     const hs = ctx.store;
     const meta = hs.meta(id) catch return error.ExecutionFailed;
     // Every operand shares the cell's dtype — `infer` requires it, so a mismatch
     // here is a compiler bug rather than input.
-    if (meta.dtype != dtype or context.totalTiles(meta) != 1) return error.Unsupported;
-    const t = ctx.store.acquireTileDeviceConstLinear(id, 0) catch return error.ExecutionFailed;
-    errdefer hs.releaseConst(t.token);
-    const rank: usize = @as(usize, t.rank);
-    const n = context.packedElemsSized(t.rank, t.shape_mem[0..rank], t.strides_mem[0..rank], elemBytes(dtype)) orelse return error.Unsupported;
+    if (meta.dtype != dtype or meta.chunks != 1) return error.Unsupported;
+    var n: usize = 1;
+    for (meta.shape) |d| n *= d;
     if (n < min_elems) return error.Unsupported;
+    const t = ctx.store.acquireConst(id) catch return error.ExecutionFailed;
+    errdefer hs.releaseConst(t.token);
     if (!context.storageBindingFits(ctx, t.len)) return error.Unsupported;
     return t;
 }
@@ -71,7 +71,7 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     // f32 and f16 both run the cell in f32 and differ only in storage (lstm.wgsl).
     const dt = out_meta.dtype;
     if ((dt != .f32 and dt != .f16) or out_meta.rank != 2 or x_meta.rank != 2 or h_meta.rank != 2) return error.Unsupported;
-    if (context.totalTiles(out_meta) != 1) return error.Unsupported;
+    if (out_meta.chunks != 1) return error.Unsupported;
 
     const batch = x_meta.shape[0];
     const input_size = x_meta.shape[1];
@@ -93,8 +93,8 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     const dwhh = try acquirePackedConst(ctx, s.w_hh, hidden * gate_dim, dt);
     defer hs.releaseConst(dwhh.token);
 
-    var dbih: ?device_store.TileRef = null;
-    var dbhh: ?device_store.TileRef = null;
+    var dbih: ?device_store.Chunk = null;
+    var dbhh: ?device_store.Chunk = null;
     defer {
         if (dbih) |t| hs.releaseConst(t.token);
         if (dbhh) |t| hs.releaseConst(t.token);
@@ -104,10 +104,9 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         dbhh = try acquirePackedConst(ctx, s.b_hh.?, gate_dim, dt);
     }
 
-    const dout = ctx.store.acquireTileDeviceMutLinear(s.out_state, 0) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireMut(s.out_state) catch return error.ExecutionFailed;
     defer hs.releaseMut(dout.token);
-    const out_n = context.packedElemsSized(dout.rank, dout.shape_mem[0..2], dout.strides_mem[0..2], elemBytes(dt)) orelse return error.Unsupported;
-    if (out_n < batch * hidden * 2) return error.Unsupported;
+    if (out_meta.shape[0] * out_meta.shape[1] < batch * hidden * 2) return error.Unsupported;
 
     const total = std.math.cast(u32, batch * hidden) orelse return error.Unsupported;
     const params: LstmParams = .{

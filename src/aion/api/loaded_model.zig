@@ -30,7 +30,6 @@ pub const TensorId = types_mod.TensorId;
 pub const DeviceRef = types_mod.DeviceRef;
 pub const SequenceCachePolicy = types_mod.SequenceCachePolicy;
 pub const DType = types_mod.DType;
-pub const TilePolicy = types_mod.TilePolicy;
 pub const Target = types_mod.Target;
 pub const Params = params_mod.Params;
 pub const no_param = params_mod.invalid;
@@ -120,7 +119,7 @@ pub const Model = struct {
     /// (device residency on GPU) for this model's lifetime, so weights stay
     /// device-resident across `run` calls. Released in `deinit`.
     session: backend_mod.Session,
-    /// Compilation and execution device, tiling, and optimization policy.
+    /// Compilation and execution device, weight layout, and optimization policy.
     /// Discrete GPUs may also keep recurrent-state slots device-exclusive.
     target: Target,
     /// The model's graph before its free dims are known, and whatever owns its records.
@@ -191,7 +190,6 @@ pub const Model = struct {
     cache_build_count: u64 = 0,
     cache_eviction_count: u64 = 0,
     last_run_cache_index: ?usize = null,
-    package_hash: u64,
     trace_runs: bool = false,
 
     const Self = @This();
@@ -206,7 +204,7 @@ pub const Model = struct {
 
     fn debugDumpBoundInputs(self: *const Self, trace: bool) void {
         if (!trace) return;
-        std.debug.print("[aion][run] bound inputs (name -> dtype/shape/tile):\n", .{});
+        std.debug.print("[aion][run] bound inputs (name -> dtype/shape):\n", .{});
         for (self.input_signatures, 0..) |sig, idx| {
             const t_opt: ?Tensor = self.bound_inputs[idx];
             if (t_opt == null) {
@@ -222,8 +220,8 @@ pub const Model = struct {
                 continue;
             };
             std.debug.print(
-                "  - {s}: id={d} dtype={s} rank={d} shape={any} tile_shape={any} tile_counts={any} quant_axis={d} aliased_input={any}\n",
-                .{ sig.name, id, @tagName(meta.dtype), meta.rank, meta.shape, meta.tile_shape, meta.tile_counts, meta.quant_axis, (self.inputAliasOutputIndex(idx) != null) },
+                "  - {s}: id={d} dtype={s} rank={d} shape={any} quant_axis={d} aliased_input={any}\n",
+                .{ sig.name, id, @tagName(meta.dtype), meta.rank, meta.shape, meta.quant_axis, (self.inputAliasOutputIndex(idx) != null) },
             );
         }
     }
@@ -313,7 +311,7 @@ pub const Model = struct {
     }
 
     /// Copy compatible bytes over an initializer without changing tensor IDs or
-    /// retargeting compiled programs. Different tilings use pack/unpack.
+    /// retargeting compiled programs.
     pub fn overwriteInitializerByValue(self: *Self, value_index: u32, src: Tensor) api_errors.ApiError!void {
         if (src.store != self.store) return api_errors.ApiError.InvalidArgument;
         const tid: TensorId = try self.paramTid(value_index);
@@ -356,8 +354,7 @@ pub const Model = struct {
     }
 
     /// Retarget an initializer in future entries and existing cached programs.
-    /// `new_tensor` must use the same context and have a compatible dtype, shape, and
-    /// tile layout.
+    /// `new_tensor` must use the same context and have a compatible dtype and shape.
     pub fn retargetInitializerByValue(self: *Self, value_index: u32, new_tensor: Tensor) api_errors.ApiError!void {
         if (new_tensor.store != self.store) return api_errors.ApiError.InvalidArgument;
         const old_tid: TensorId = try self.paramTid(value_index);
@@ -930,7 +927,7 @@ pub const Model = struct {
             break :blk m.dtype != src_meta.dtype or !signatures.sameUsize(m.shape, src_meta.shape);
         };
         if (need_new) {
-            const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, src_meta.dtype, src_meta.shape);
+            const tid = try self.store.createTensor(src_meta.dtype, src_meta.shape, .{});
             self.store.trackHolders(tid);
             const old = self.output_host_mirror_tids[output_index];
             if (old != types_mod.invalid_tensor_id) self.store.releaseHold(old);
@@ -1002,7 +999,6 @@ pub const Model = struct {
         target: Target,
         owner: TemplateOwner,
         params: Params,
-        package_hash: u64,
         opts: LoadModelOptions,
     ) api_errors.LoadError!Self {
         const input_signatures = try signatures.buildSignatures(allocator, owner.values(), owner.namedInputs());
@@ -1249,7 +1245,6 @@ pub const Model = struct {
             .run_input_shapes = run_input_shapes,
             .run_direct_input_ids = run_direct_input_ids,
             .cache_workspace_budget_bytes = opts.plan_cache_budget_bytes,
-            .package_hash = package_hash,
             .trace_runs = traceEnabled(),
         };
     }
@@ -1352,7 +1347,7 @@ pub const Model = struct {
             break :blk !signatures.sameUsize(meta.shape, shape);
         };
         if (need_new) {
-            tid = initializers.createTensorForShape(self.store, self.target.tiles, .i32, shape) catch return error.OutOfMemory;
+            tid = self.store.createTensor(.i32, shape, .{}) catch return error.OutOfMemory;
             self.role_input_tids[index] = tid;
         }
         const meta = self.store.getConst(tid) catch return error.InvalidArgument;
@@ -1477,9 +1472,9 @@ pub const Model = struct {
 
             if (need_new) {
                 const tid = if (is_aliased)
-                    try initializers.createTensorSingleTile(self.store, self.target.tiles, sig.dtype, shape)
+                    try self.store.createTensor(sig.dtype, shape, .{})
                 else
-                    try initializers.createTensorForShape(self.store, self.target.tiles, sig.dtype, shape);
+                    try self.store.createTensor(sig.dtype, shape, .{});
                 // Freshly created store tensors are zero-initialized.
                 self.auto_input_tids[i] = tid;
                 if (trace) std.debug.print(
@@ -1697,14 +1692,13 @@ pub const Model = struct {
         for (self.input_signatures, 0..) |_, sig_idx| {
             const concrete_shape = buildConcreteShapeFromFlat(input_shapes, self.input_signatures, sig_idx, &input_shape_cursor);
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
-                // Share recurrent state across cache entries and keep it single-tile
-                // because SequenceAppend requires a contiguous last axis.
+                // Share recurrent state across cache entries.
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
             else if (self.target.device.kind != .cpu and !inputIsHostOnly(graph, in_ids[sig_idx])) blk: {
                 // A GPU program binds a stable device slot, never the caller's
                 // host tensor. `run()` performs the explicit H2D copy into this
                 // slot, so execution has one backing and no staged-input cache.
-                const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, self.input_signatures[sig_idx].dtype, concrete_shape);
+                const tid = try self.store.createTensor(self.input_signatures[sig_idx].dtype, concrete_shape, .{});
                 owned_input_slots.append(self.allocator, tid) catch {
                     self.store.releaseTensorData(tid) catch {};
                     return error.OutOfMemory;
@@ -1778,7 +1772,7 @@ pub const Model = struct {
         return seen_use;
     }
 
-    /// Return or lazily allocate the shared single-tile slot for an io-aliased input.
+    /// Return or lazily allocate the shared slot for an io-aliased input.
     /// Replacing it after a capacity change resets the seeded bind version.
     fn ensureAliasedStateSlot(self: *Self, input_index: usize, shape: []const usize) api_errors.ExecuteError!TensorId {
         const sig = self.input_signatures[input_index];
@@ -1792,7 +1786,7 @@ pub const Model = struct {
             // Capacity truly changed: re-seed into the new slot on the next run.
             self.aliased_state_synced_versions[input_index] = 0;
         }
-        const tid = try initializers.createTensorSingleTile(self.store, self.target.tiles, sig.dtype, shape);
+        const tid = try self.store.createTensor(sig.dtype, shape, .{});
         if (self.state_input_policies[input_index]) |pol| {
             self.store.registerSequenceCachePolicy(tid, pol) catch return error.InvalidArgument;
         }
@@ -1829,15 +1823,13 @@ pub const Model = struct {
         const mem = self.store.deviceMemoryFor(self.target.device) orelse return;
 
         const info = dtype.info();
-        if (info.is_quantized) return; // createTensorSingleTile already rejects these
+        if (info.is_quantized) return;
         var elems: u64 = 1;
         for (shape) |d| elems *= @as(u64, @intCast(d));
         const bytes: u64 = elems * @as(u64, @intCast(info.block_bytes));
         if (bytes > mem.maxBindingBytes()) return; // over the device's per-buffer ceiling
 
-        const policy = self.store.policyFor(self.target.device);
-        // Single-tile target (tile_shape == shape), matching createTensorSingleTile.
-        self.store.moveTensor(tid, self.target.device, mem, shape, policy.tile_alignment) catch return;
+        self.store.moveTensor(tid, self.target.device, mem) catch return;
     }
 
     /// Seed a recurrent slot from a caller-bound tensor using the destination's current

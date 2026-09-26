@@ -41,10 +41,12 @@ pub fn Kernel(comptime t: Tuning) type {
             return .{ .pb = @alignCast(full[0..pb_elems]), .pa = @alignCast(full[pb_elems .. pb_elems + pa_elems]) };
         }
 
-        pub fn packBTileF32(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
+        /// Pack a `k x n` block of B whose rows are `ldb` elements apart (0 = n).
+        pub fn packBTileF32(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
             const b: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, b_bytes);
-            if (b.len < k * n) return BackendError.InvalidArgument;
+            if (k > 0 and b.len < (k - 1) * ld + n) return BackendError.InvalidArgument;
 
             const s = try splitScratch(scratch_bytes);
             const packed_b: []align(32) f32 = s.pb;
@@ -55,7 +57,7 @@ pub fn Kernel(comptime t: Tuning) type {
                 const panel_idx: usize = jr / NR;
                 const offset: usize = panel_idx * (KC * NR);
                 const dest: *[KC * NR]f32 = @ptrCast(packed_b[offset..][0 .. KC * NR]);
-                packPanelB(k, nr, b, n, 0, jr, dest);
+                packPanelB(k, nr, b, ld, 0, jr, dest);
             }
         }
 
@@ -78,10 +80,11 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
 
-        pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
+        pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
             const b: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, b_bytes);
-            if (b.len < k * n) return BackendError.InvalidArgument;
+            if (k > 0 and b.len < (k - 1) * ld + n) return BackendError.InvalidArgument;
 
             const panel_elems: usize = KC * NR;
             const panel_count: usize = (n + NR - 1) / NR;
@@ -102,7 +105,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var kk: usize = 0;
                 while (kk < k) : (kk += 1) {
-                    const src_row: usize = kk * n + j;
+                    const src_row: usize = kk * ld + j;
                     const dst_row: usize = base + kk * NR;
 
                     var c: usize = 0;
@@ -169,6 +172,7 @@ pub fn Kernel(comptime t: Tuning) type {
             const alpha: f32 = params.alpha;
             const beta: f32 = params.beta;
             const c_stride: usize = if (params.ldc != 0) params.ldc else n;
+            const a_stride: usize = if (params.lda != 0) params.lda else k;
 
             if (k > KC or n > NC) return BackendError.InvalidArgument;
             // Packed-B is `ceil(n/NR)` panels of `KC*NR` each; the panel stride is
@@ -183,7 +187,7 @@ pub fn Kernel(comptime t: Tuning) type {
             const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
             const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
             if (m == 0 or n == 0) return BackendError.InvalidArgument;
-            if (c.len < (m - 1) * c_stride + n or a.len < m * k) return BackendError.InvalidArgument;
+            if (c.len < (m - 1) * c_stride + n or a.len < (m - 1) * a_stride + k) return BackendError.InvalidArgument;
 
             const s = try splitScratch(scratch_bytes);
             const packed_a: []align(32) f32 = s.pa;
@@ -199,7 +203,7 @@ pub fn Kernel(comptime t: Tuning) type {
                     const panel_idx: usize = ir / MR;
                     const offset: usize = panel_idx * (MR * KC);
                     const dest: *[MR * KC]f32 = @ptrCast(packed_a[offset..][0 .. MR * KC]);
-                    packPanelA(k, mr, a, k, ic + ir, 0, dest);
+                    packPanelA(k, mr, a, a_stride, ic + ir, 0, dest);
                 }
 
                 var jr_ex: usize = 0;
@@ -757,7 +761,7 @@ fn runLaneWidthCase(comptime lanes: usize, m: usize, n: usize, k: usize, alpha: 
 
     const scratch = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
     defer allocator.free(scratch);
-    try K.packBTileF32(scratch, k, n, std.mem.sliceAsBytes(b));
+    try K.packBTileF32(scratch, k, n, 0, std.mem.sliceAsBytes(b));
     const pb_bytes: usize = K.KC * K.NC * @sizeOf(f32);
     const packed_b_view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
 

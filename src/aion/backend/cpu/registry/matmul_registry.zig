@@ -44,9 +44,9 @@ pub const F32Kernels = struct {
     scratch_bytes: usize,
     scratch_alignment: usize,
 
-    pack_b_tile: *const fn (scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void,
+    pack_b_tile: *const fn (scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void,
     pack_a_tile: *const fn (k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) types.BackendError!void,
-    pack_b_tile_f16_to_packed_f32: *const fn (packed_b: []align(32) f32, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void,
+    pack_b_tile_f16_to_packed_f32: *const fn (packed_b: []align(32) f32, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void,
     pack_a_tile_f16_to_packed_f32: *const fn (packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_b: *const fn (scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void,
     matmul_packed_ab: *const fn (packed_a: []align(32) const f32, packed_b_view: []align(32) const f32, params: types.MatMulParams, c_bytes: []u8) types.BackendError!void,

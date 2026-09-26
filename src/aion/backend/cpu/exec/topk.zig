@@ -155,7 +155,7 @@ fn runRows(
 
     // A row is already a full scan of `n`, so rows are the only unit worth splitting.
     if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, outer, n * @sizeOf(T), 256 * 1024)) {
+        if (thread_count > 1 and outer >= 2 and outer * n * @sizeOf(T) >= exec_utils.parallel_min_bytes) {
             const grain: usize = @max(1, (64 * 1024) / @max(n, 1));
             p.parallelForAny(@ptrCast(&task), outer, grain, Task.run);
             if (task.err_any) |e| return @errorCast(e);
@@ -194,21 +194,18 @@ pub fn execTopK(
     for (0..rank) |d| {
         const want: usize = if (d == rank - 1) k else in_meta.shape[d];
         if (val_meta.shape[d] != want or idx_meta.shape[d] != want) return BackendError.InvalidArgument;
-        if (in_meta.tile_counts[d] != 1 or val_meta.tile_counts[d] != 1 or idx_meta.tile_counts[d] != 1) {
-            return BackendError.InvalidArgument;
-        }
     }
 
-    const in_tile = try store.acquireTileConstLinear(s.a, 0);
-    defer store.releaseConst(in_tile.token);
-    const val_tile = try store.acquireTileMutLinear(s.values, 0);
-    defer store.releaseMut(val_tile.token);
-    const idx_tile = try store.acquireTileMutLinear(s.indices, 0);
-    defer store.releaseMut(idx_tile.token);
+    const in_view = try store.acquireConst(s.a);
+    defer store.releaseConst(in_view.token);
+    const val_view = try store.acquireMut(s.values);
+    defer store.releaseMut(val_view.token);
+    const idx_view = try store.acquireMut(s.indices);
+    defer store.releaseMut(idx_view.token);
 
-    const in_bytes = in_tile.bufferView().bytes;
-    const val_bytes = val_tile.bufferView().bytes;
-    const idx_bytes = idx_tile.bufferView().bytes;
+    const in_bytes = in_view.bufferView().bytes;
+    const val_bytes = val_view.bufferView().bytes;
+    const idx_bytes = idx_view.bufferView().bytes;
 
     return switch (in_meta.dtype) {
         .f32 => runRows(f32, pool, thread_count, allocator, in_bytes, val_bytes, idx_bytes, outer, n, k, s.largest),

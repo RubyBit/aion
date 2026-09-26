@@ -2,16 +2,16 @@
 //
 //! MatMulNT execution for the GPU backend:
 //!   C[m, n] = alpha * sum_k A[m, k] * B[n, k]  +  beta * C[m, n]
-//! with A f32 (single tile spanning [M, K]) and B [N, K] in q8_0 or f32,
-//! N-tiled in lockstep with C's trailing axis (compile-enforced, same contract
-//! as the CPU executor in `backend/cpu/exec/matmul_nt.zig`).
+//! with A f32 [.., K] and B [N, K] in q8_0 or f32 (same contract as the CPU
+//! executor in `backend/cpu/exec/matmul_nt.zig`). A B past the binding limit is
+//! chunked along N; each chunk writes its columns of the one C.
 //!
 //! Two regimes, split on M:
 //!   - M == 1 (decode): bandwidth-bound matvec — `kernels/matmul_nt_gemv.wgsl`
 //!     reads B exactly once (dequant-in-registers for q8_0).
 //!   - M > 1 (prefill): compute-bound — a dequant/transpose pass materializes
-//!     the B tile as f32 [K, n] in a pooled scratch buffer, then the existing
-//!     autotuned f32 GEMM pipeline runs on it. Scratch is reused across tiles;
+//!     the B chunk as f32 [K, n] in a pooled scratch buffer, then the existing
+//!     autotuned f32 GEMM pipeline runs on it. Scratch is reused across chunks;
 //!     the frame's compute-pass ordering serializes dequant(i+1) after gemm(i).
 //!
 //! q8_0 path requires K % 64 == 0 (whole word-aligned block pairs per row —
@@ -53,17 +53,17 @@ const LANES_WIDE_BELOW_GROUPS: u32 = 64;
 /// device reports so its weights are laid out for it.
 pub const block_order: types.QuantBlockOrder = .lanes32;
 
-/// How a B tile's bytes are laid out, which picks the kernels that read it.
+/// How B's bytes are laid out, which picks the kernels that read it.
 const BForm = enum { q8_pairs, q8_lanes32, f32 };
 const DEQUANT_WG: u32 = 64;
 
 /// Field order matches `struct Params` in matmul_nt_gemv.wgsl.
-const GemvParams = extern struct { k: u32, n: u32, b_wpr: u32, _pad: u32 = 0, alpha: f32, beta: f32 };
+const GemvParams = extern struct { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32 };
 /// Field order matches `struct Params` in dequant.wgsl.
 const DequantParams = extern struct { n: u32, k: u32, src_wpr: u32, dst_row: u32, count: u32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 
 pub const MatmulNt = struct {
-    /// Pooled f32 scratch holding one dequantized/transposed B tile [K, n_tile]
+    /// Pooled f32 scratch holding one dequantized/transposed B chunk [K, n]
     /// for the GEMM path. Grows monotonically, freed in `deinit`.
     scratch: ?c.WGPUBuffer = null,
     scratch_cap: u64 = 0,
@@ -88,7 +88,7 @@ pub const MatmulNt = struct {
         return buf;
     }
 
-    pub fn exec(self: *MatmulNt, ctx: Ctx, frame: *Frame, s: executable.StepMatMulNTTiled, generated: []const Generated) ExecuteProgramError!void {
+    pub fn exec(self: *MatmulNt, ctx: Ctx, frame: *Frame, s: executable.StepMatMulNT, generated: []const Generated) ExecuteProgramError!void {
         const hs = ctx.store;
         const c_meta = hs.meta(s.c) catch return error.ExecutionFailed;
         const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
@@ -105,34 +105,36 @@ pub const MatmulNt = struct {
         // Row-major q8 rows are walked in word-aligned block pairs; `lanes32`
         // segments are word-aligned whatever K is.
         if (b_meta.dtype == .q8_0 and k % (if (lanes) Q8_BLOCK_ELEMS else 64) != 0) return error.Unsupported;
-        // Compile guarantees B tiles span full K and B's N tiling matches C's
-        // trailing-axis tiling; A is one tile spanning [M, K].
-        if (b_meta.tile_shape[1] != b_meta.shape[1]) return error.Unsupported;
-        if (context.totalTiles(a_meta) != 1) return error.Unsupported;
-        const n_tiles = b_meta.tile_counts[0];
-        if (n_tiles != c_meta.tile_counts[@as(usize, c_meta.rank) - 1]) return error.Unsupported;
+        if (a_meta.chunks != 1 or c_meta.chunks != 1) return error.Unsupported;
+        const a_rank: usize = a_meta.rank;
+        const c_rank: usize = c_meta.rank;
+        if (a_rank == 0 or c_rank == 0 or a_meta.shape[a_rank - 1] != k) return error.Unsupported;
+        var m_rows: usize = 1;
+        for (a_meta.shape[0 .. a_rank - 1]) |d| m_rows *= d;
+        var c_rows: usize = 1;
+        for (c_meta.shape[0 .. c_rank - 1]) |d| c_rows *= d;
+        const n_total = b_meta.shape[0];
+        if (c_rows != m_rows or c_meta.shape[c_rank - 1] != n_total) return error.Unsupported;
+        const m_total = std.math.cast(u32, m_rows) orelse return error.Unsupported;
+        const c_row = std.math.cast(u32, n_total) orelse return error.Unsupported;
+        if (m_total == 0) return;
 
-        const da = ctx.store.acquireTileDeviceConstLinear(s.a, 0) catch return error.ExecutionFailed;
+        const da = ctx.store.acquireConst(s.a) catch return error.ExecutionFailed;
         defer hs.releaseConst(da.token);
-        if (!context.storageBindingFits(ctx, da.len)) return error.Unsupported;
-        const av = context.rowView(da.rank, da.shape_mem[0..@as(usize, da.rank)], da.strides_mem[0..@as(usize, da.rank)]) orelse return error.Unsupported;
-        if (av.cols != k) return error.Unsupported;
-        const m_total = av.rows;
+        const dc = ctx.store.acquireMut(s.c) catch return error.ExecutionFailed;
+        defer hs.releaseMut(dc.token);
+        if (!context.storageBindingFits(ctx, da.len) or !context.storageBindingFits(ctx, dc.len)) return error.Unsupported;
 
-        var nt: usize = 0;
-        while (nt < n_tiles) : (nt += 1) {
-            const db = ctx.store.acquireTileDeviceConstLinear(s.b, nt) catch return error.ExecutionFailed;
-            const dc = ctx.store.acquireTileDeviceMutLinear(s.c, nt) catch return error.ExecutionFailed;
-            defer {
-                hs.releaseConst(db.token);
-                hs.releaseMut(dc.token);
-            }
-            if (!context.storageBindingFits(ctx, db.len) or !context.storageBindingFits(ctx, dc.len)) return error.Unsupported;
-
-            const cv = context.rowView(dc.rank, dc.shape_mem[0..@as(usize, dc.rank)], dc.strides_mem[0..@as(usize, dc.rank)]) orelse return error.Unsupported;
-            if (cv.rows != m_total) return error.Unsupported;
-            const n_count = cv.cols;
-            if (db.shape_mem[0] < n_count) return error.Unsupported;
+        var n0: usize = 0;
+        var chunk: usize = 0;
+        const chunks = b_meta.chunks;
+        while (chunk < chunks) : (chunk += 1) {
+            const db = ctx.store.acquireChunkConst(s.b, chunk) catch return error.ExecutionFailed;
+            defer hs.releaseConst(db.token);
+            if (!context.storageBindingFits(ctx, db.len)) return error.Unsupported;
+            const n_count = std.math.cast(u32, db.rows) orelse return error.Unsupported;
+            const c_off = std.math.cast(u32, n0) orelse return error.Unsupported;
+            n0 += n_count;
 
             // B row size in u32 words (q8_0 rows are (K/32)*34 bytes; K%64==0
             // makes that word-aligned. f32 rows are K words).
@@ -143,24 +145,26 @@ pub const MatmulNt = struct {
             if (lanes and n_count % LANES_W != 0) return error.Unsupported;
             const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32 else .q8_pairs;
             if (m_total == 1) {
-                try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, form);
+                try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, c_off, form);
             } else {
-                try self.recordDequantGemm(ctx, frame, s, generated, da, db, dc, av, cv, k, n_count, b_wpr, form);
+                try self.recordDequantGemm(ctx, frame, s, generated, da, db, dc, m_total, c_row, c_off, k, n_count, b_wpr, form);
             }
         }
+        if (n0 != n_total) return error.Unsupported; // chunks did not cover B
     }
 
     fn recordGemv(
         self: *MatmulNt,
         ctx: Ctx,
         frame: *Frame,
-        s: executable.StepMatMulNTTiled,
+        s: executable.StepMatMulNT,
         da: anytype,
         db: anytype,
         dc: anytype,
         k: u32,
         n_count: u32,
         b_wpr: u32,
+        c_off: u32,
         form: BForm,
     ) ExecuteProgramError!void {
         _ = self;
@@ -181,7 +185,7 @@ pub const MatmulNt = struct {
             ctx.devmem.bufferFor(dc.handle).?,
         };
         const sizes = [_]u64{ da.len, db.len, dc.len };
-        const params: GemvParams = .{ .k = k, .n = n_count, .b_wpr = b_wpr, .alpha = s.alpha, .beta = s.beta };
+        const params: GemvParams = .{ .k = k, .n = n_count, .b_wpr = b_wpr, .c_off = c_off, .alpha = s.alpha, .beta = s.beta };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
     }
 
@@ -189,19 +193,20 @@ pub const MatmulNt = struct {
         self: *MatmulNt,
         ctx: Ctx,
         frame: *Frame,
-        s: executable.StepMatMulNTTiled,
+        s: executable.StepMatMulNT,
         generated: []const Generated,
         da: anytype,
         db: anytype,
         dc: anytype,
-        av: context.RowView,
-        cv: context.RowView,
+        m: u32,
+        c_row: u32,
+        c_off: u32,
         k: u32,
         n_count: u32,
         b_wpr: u32,
         form: BForm,
     ) ExecuteProgramError!void {
-        // 1) Dequant/transpose the B tile into scratch as f32 [K, n_count].
+        // 1) Dequant/transpose the B chunk into scratch as f32 [K, n_count].
         const scratch_bytes = @as(u64, k) * n_count * 4;
         if (!context.storageBindingFits(ctx, scratch_bytes)) return error.Unsupported;
         const scratch = try self.ensureScratch(ctx, scratch_bytes);
@@ -222,22 +227,23 @@ pub const MatmulNt = struct {
         const dq_groups = @max(1, @min(context.ceilDiv(count, DEQUANT_WG), context.MAX_GROUPS_1D));
         try frame.recordCompute(dq_built, &dq_bufs, &dq_sizes, std.mem.asBytes(&dq_params), .{ dq_groups, 1, 1 });
 
-        // 2) Run the f32 GEMM over [M, K] @ scratch[K, n_count] -> C tile.
-        const a_row_bytes: isize = @intCast(@as(u64, av.row_stride) * 4);
+        // 2) Run the f32 GEMM over [M, K] @ scratch[K, n_count] -> C[:, c_off ..].
+        const a_row_bytes: isize = @intCast(@as(u64, k) * 4);
         const scratch_row_bytes: isize = @intCast(@as(u64, n_count) * 4);
         const idx = pickGemmConfig(generated, ctx.gpu.limits, a_row_bytes, scratch_row_bytes) orelse return error.Unsupported;
         const g = generated[idx];
         const built = try ctx.pipes.get(g.desc, g.entry);
 
         const params: matmul_exec.MatMulParams = .{
-            .m = av.rows,
+            .m = m,
             .n = n_count,
             .k = k,
-            .a_row = av.row_stride,
+            .a_row = k,
             .b_row = n_count,
-            .c_row = cv.row_stride,
+            .c_row = c_row,
             .alpha = s.alpha,
             .beta = s.beta,
+            .c_off = c_off,
         };
         const bufs = [_]c.WGPUBuffer{
             ctx.devmem.bufferFor(da.handle).?,
@@ -250,12 +256,12 @@ pub const MatmulNt = struct {
             &bufs,
             &sizes,
             std.mem.asBytes(&params),
-            .{ context.ceilDiv(n_count, g.cfg.bn), context.ceilDiv(av.rows, g.cfg.bm), 1 },
+            .{ context.ceilDiv(n_count, g.cfg.bn), context.ceilDiv(m, g.cfg.bm), 1 },
         );
     }
 };
 
-/// Pick a GEMM config for the scratch-B path: bounds-checked (edge tiles are the
+/// Pick a GEMM config for the scratch-B path: bounds-checked (edge blocks are the
 /// norm here) and device-eligible, preferring the shape autotune usually settles
 /// on (128x128, bk16, vec4, double-buffered). No per-shape tuning — the dequant
 /// pass makes re-timing every shape needlessly expensive; hook into the

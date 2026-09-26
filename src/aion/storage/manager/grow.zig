@@ -12,7 +12,7 @@ const dm = @import("../../runtime/device_memory.zig");
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
 const StorageError = storage_mod.StorageError;
-const TiledTensor = storage_mod.TiledTensor;
+const Tensor = storage_mod.Tensor;
 const DeviceRef = storage_mod.DeviceRef;
 
 /// Zero `bytes` of `handle` from `offset`, in bounded chunks so zeroing a
@@ -32,18 +32,12 @@ pub fn zeroDeviceRange(mgr: *StorageManager, dev: dm.DeviceMemory, handle: dm.De
     }
 }
 
-/// Grow a single-tile, unpadded device tensor by zeroing new backing and copying
+/// Grow a device tensor held in one buffer by zeroing new backing and copying
 /// preserved runs with `copyD2D`. Returns false for layouts requiring a host fallback.
 fn growAxisOnDevice(mgr: *StorageManager, id: TensorId, axis: usize, new_size: usize, dev: dm.DeviceMemory) StorageError!bool {
-    const t: *TiledTensor = try mgr.getMut(id);
+    const t: *Tensor = try mgr.getMut(id);
     if (t.dtype.info().is_quantized) return false;
-    if (t.tile_handles.len != 1 or !std.mem.eql(usize, t.tile_shape, t.shape)) return false;
-
-    const rank: usize = @intCast(t.rank);
-    var new_shape_mem: [8]usize = undefined;
-    @memcpy(new_shape_mem[0..rank], t.shape);
-    new_shape_mem[axis] = new_size;
-    const new_shape: []const usize = new_shape_mem[0..rank];
+    if (t.chunk_handles.len != 1) return false;
 
     // Bytes spanned by one index of `axis`, and the runs on each side of it.
     var trailing: usize = t.dtype.info().block_bytes;
@@ -54,43 +48,32 @@ fn growAxisOnDevice(mgr: *StorageManager, id: TensorId, axis: usize, new_size: u
     const new_run = std.math.mul(usize, new_size, trailing) catch return StorageError.InvalidArgument;
     // Device copies move whole 4-byte words; odd runs (f16) take the host path.
     if (old_run % 4 != 0 or new_run % 4 != 0) return false;
-
-    // Built host-backed for its geometry, then immediately released: the
-    // bytes live on the device, same handoff `moveTensor` performs.
-    var staging: TiledTensor = undefined;
-    try staging.init(mgr.allocator, t.dtype, new_shape, new_shape, .{ .tile_alignment = t.tile_alignment });
-    errdefer staging.deinit();
-    const total = staging.tile_lens[0];
-    staging.releaseData();
+    const total = std.math.mul(usize, outer, new_run) catch return StorageError.InvalidArgument;
+    // The grown tensor must still fit one buffer; past that the host path re-chunks it.
+    const bound = dev.maxBindingBytes();
+    if (bound != 0 and total > bound / 4 * 3) return false;
 
     const handle = dev.alloc(total, 64) catch return StorageError.OutOfMemory;
     errdefer dev.free(handle);
     try zeroDeviceRange(mgr, dev, handle, 0, total);
     var i: usize = 0;
     while (i < outer) : (i += 1) {
-        dev.copyD2D(handle, i * new_run, t.tile_handles[0], i * old_run, old_run) catch return StorageError.InvalidArgument;
+        dev.copyD2D(handle, i * new_run, t.chunk_handles[0], i * old_run, old_run) catch return StorageError.InvalidArgument;
     }
 
-    const handles: []dm.DeviceHandle = mgr.allocator.alloc(dm.DeviceHandle, 1) catch return StorageError.OutOfMemory;
-    handles[0] = handle;
-    staging.device = t.device;
-    staging.tile_handles = handles;
-    staging.dev = dev;
-    staging.owns_data = false;
-
-    // Frees the old device buffer, which the submitted copy above keeps
-    // alive until it retires.
-    t.deinit();
-    t.* = staging;
+    // Frees the old device buffer, which the submitted copy above keeps alive until
+    // it retires.
+    dev.free(t.chunk_handles[0]);
+    t.chunk_handles[0] = handle;
+    t.backing_bytes = total;
+    t.shape_storage.slice()[axis] = new_size;
     t.shape = t.shape_storage.constSlice();
-    t.tile_shape = t.tile_shape_storage.constSlice();
-    t.tile_counts = t.tile_counts_storage.constSlice();
-    t.tile_strides = t.tile_strides_storage.constSlice();
+    t.chunk_rows = t.shape[0];
     return true;
 }
 
 pub fn ensureTensorAxisCapacity(mgr: *StorageManager, id: TensorId, axis: usize, min_size: usize) StorageError!void {
-    const t0: *const TiledTensor = try mgr.getConst(id);
+    const t0: *const Tensor = try mgr.getConst(id);
     if (axis >= @as(usize, t0.rank)) return StorageError.InvalidArgument;
     if (t0.shape[axis] >= min_size) return;
     if (t0.device.kind == .cpu) {
@@ -105,18 +88,9 @@ pub fn ensureTensorAxisCapacity(mgr: *StorageManager, id: TensorId, axis: usize,
     // Unsupported device layouts round-trip through host growth and remigration.
     // Geometric growth amortizes this to O(final size) while preserving the tensor id.
     const dev: dm.DeviceMemory = t0.dev orelse return StorageError.InvalidArgument;
-    const tile_align: usize = t0.tile_alignment;
-    const rank: usize = @as(usize, t0.rank);
-    var shape_buf: [8]usize = undefined;
-    @memcpy(shape_buf[0..rank], t0.shape);
-
-    try mgr.moveTensor(id, .{ .kind = .cpu }, null, shape_buf[0..rank], tile_align);
+    try mgr.moveTensor(id, .{ .kind = .cpu }, null);
     try (try mgr.getMut(id)).growAxisPreserveScalar(axis, min_size);
-
-    const grown: *const TiledTensor = try mgr.getConst(id);
-    var grown_shape: [8]usize = undefined;
-    @memcpy(grown_shape[0..rank], grown.shape);
-    try mgr.moveTensor(id, target, dev, grown_shape[0..rank], tile_align);
+    try mgr.moveTensor(id, target, dev);
 }
 
 /// Grow rolling storage without changing the logical sequence it represents.
@@ -135,7 +109,7 @@ pub fn ensureRollingCacheCapacity(
     const old_capacity = before.shape[1];
     if (old_capacity >= min_size) return;
 
-    const old_bytes_len = try before.packedByteLen();
+    const old_bytes_len = try before.byteLen();
     const old_bytes = mgr.allocator.alloc(u8, old_bytes_len) catch return StorageError.OutOfMemory;
     defer mgr.allocator.free(old_bytes);
     try mgr.readPackedAtPlacement(id, old_bytes);
@@ -143,7 +117,7 @@ pub fn ensureRollingCacheCapacity(
     try ensureTensorAxisCapacity(mgr, id, 1, min_size);
     const after = try mgr.getConst(id);
     const new_capacity = after.shape[1];
-    const new_bytes_len = try after.packedByteLen();
+    const new_bytes_len = try after.byteLen();
     const new_bytes = mgr.allocator.alloc(u8, new_bytes_len) catch return StorageError.OutOfMemory;
     defer mgr.allocator.free(new_bytes);
     @memset(new_bytes, 0);

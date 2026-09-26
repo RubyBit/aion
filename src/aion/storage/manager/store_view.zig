@@ -12,7 +12,7 @@ const device_store = @import("../../runtime/device_store.zig");
 const dm = @import("../../runtime/device_memory.zig");
 
 const StorageManager = manager_mod.StorageManager;
-const TiledTensor = storage_mod.TiledTensor;
+const Tensor = storage_mod.Tensor;
 const SequenceCachePolicy = cache_mod.SequenceCachePolicy;
 const StorageError = storage_mod.StorageError;
 const TensorId = manager_mod.TensorId;
@@ -22,13 +22,6 @@ const DeviceRef = storage_mod.DeviceRef;
 /// the manager is.
 pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
     const Vt = struct {
-        fn shouldLease(policy: SequenceCachePolicy) bool {
-            return switch (policy) {
-                .none => false,
-                else => true,
-            };
-        }
-
         fn toStorePolicyInfo(info: cache_mod.SequenceCachePolicyInfo) tensor_store.SequenceCachePolicyInfo {
             const kind: tensor_store.SequenceCachePolicyKind = switch (info.kind) {
                 .none => .none,
@@ -40,141 +33,57 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
 
         fn meta(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.StoreError!tensor_store.TensorMeta {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+            const t: *const Tensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             return .{
                 .dtype = t.dtype,
                 .rank = t.rank,
                 .shape = t.shape,
-                .tile_shape = t.tile_shape,
-                .tile_counts = t.tile_counts,
-                .tile_strides = t.tile_strides,
+                .chunks = t.chunkCount(),
                 .block_order = t.block_order,
             };
         }
 
-        fn acquireTileConst(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) tensor_store.StoreError!tensor_store.TileRefConst {
+        /// `t`'s bytes as `backing` holds them: `t` itself, or the workspace slot it aliases.
+        fn hostBytes(t: *const Tensor, backing: *const Tensor) tensor_store.StoreError![]u8 {
+            const len = t.byteLen() catch return tensor_store.StoreError.InvalidArgument;
+            if (backing.data.len < len) return tensor_store.StoreError.InvalidArgument;
+            return backing.data[0..len];
+        }
+
+        fn layoutOf(t: *const Tensor, shape: *[tensor_store.INLINE_RANK]usize, strides: *[tensor_store.INLINE_RANK]isize) void {
+            shape.* = @splat(0);
+            strides.* = @splat(0);
+            @memcpy(shape[0..t.rank], t.shape);
+            tensor_store.packedStrides(t.dtype, t.shape, strides[0..t.rank]);
+        }
+
+        fn acquireConst(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.StoreError!tensor_store.ViewConst {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+            const t: *const Tensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const tile = t.acquireTileConstFrom(backing.data, ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
-
-            var token: usize = 0;
-            if (sm.cache) |*cache| {
-                if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                    token = cache.acquireLease(@intCast(id), t.tileIndex(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument, false) catch |e| {
-                        return switch (e) {
-                            error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                            else => tensor_store.StoreError.InvalidArgument,
-                        };
-                    };
-                }
-            }
-
-            return .{
-                .bytes = tile.bytes,
-                .dtype = tile.dtype,
-                .rank = tile.rank,
-                .shape_mem = tile.shape_mem,
-                .strides_mem = tile.strides_mem,
-                .token = token,
-            };
+            var v: tensor_store.ViewConst = .{ .bytes = try hostBytes(t, backing), .dtype = t.dtype, .rank = t.rank, .shape_mem = undefined, .strides_mem = undefined };
+            layoutOf(t, &v.shape_mem, &v.strides_mem);
+            return v;
         }
 
-        fn acquireTileMut(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) tensor_store.StoreError!tensor_store.TileRefMut {
+        fn acquireMut(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.StoreError!tensor_store.ViewMut {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+            const t: *const Tensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             const backing = sm.backingMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const tile = t.acquireTileMutFrom(backing.data, ti0, ti1) catch return tensor_store.StoreError.InvalidArgument;
-
-            var token: usize = 0;
-            if (sm.cache) |*cache| {
-                if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                    token = cache.acquireLease(@intCast(id), t.tileIndex(ti0, ti1) catch return tensor_store.StoreError.InvalidArgument, true) catch |e| {
-                        return switch (e) {
-                            error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                            else => tensor_store.StoreError.InvalidArgument,
-                        };
-                    };
-                }
-            }
-
-            return .{
-                .bytes = tile.bytes,
-                .dtype = tile.dtype,
-                .rank = tile.rank,
-                .shape_mem = tile.shape_mem,
-                .strides_mem = tile.strides_mem,
-                .token = token,
+            // A write through a view of a read-only mapping would fault; copy first.
+            backing.ensureWritable() catch |e| return switch (e) {
+                error.OutOfMemory => tensor_store.StoreError.OutOfMemory,
+                else => tensor_store.StoreError.InvalidArgument,
             };
+            var v: tensor_store.ViewMut = .{ .bytes = try hostBytes(t, backing), .dtype = t.dtype, .rank = t.rank, .shape_mem = undefined, .strides_mem = undefined };
+            layoutOf(t, &v.shape_mem, &v.strides_mem);
+            return v;
         }
 
-        fn acquireTileConstLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefConst {
-            const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const tile = t.acquireTileConstLinearFrom(backing.data, tile_index) catch return tensor_store.StoreError.InvalidArgument;
+        // Host bytes live as long as their tensor, so a lease pins nothing.
+        fn releaseConst(_: *anyopaque, _: usize) void {}
 
-            var token: usize = 0;
-            if (sm.cache) |*cache| {
-                if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                    token = cache.acquireLease(@intCast(id), tile_index, false) catch |e| {
-                        return switch (e) {
-                            error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                            else => tensor_store.StoreError.InvalidArgument,
-                        };
-                    };
-                }
-            }
-
-            return .{
-                .bytes = tile.bytes,
-                .dtype = tile.dtype,
-                .rank = tile.rank,
-                .shape_mem = tile.shape_mem,
-                .strides_mem = tile.strides_mem,
-                .token = token,
-            };
-        }
-
-        fn acquireTileMutLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!tensor_store.TileRefMut {
-            const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *TiledTensor = sm.getMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const backing = sm.backingMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            const tile = t.acquireTileMutLinearFrom(backing.data, tile_index) catch return tensor_store.StoreError.InvalidArgument;
-
-            var token: usize = 0;
-            if (sm.cache) |*cache| {
-                if (shouldLease(cache.tensorPolicy(@intCast(id)))) {
-                    token = cache.acquireLease(@intCast(id), tile_index, true) catch |e| {
-                        return switch (e) {
-                            error.OutOfMemoryRam => tensor_store.StoreError.OutOfMemory,
-                            else => tensor_store.StoreError.InvalidArgument,
-                        };
-                    };
-                }
-            }
-
-            return .{
-                .bytes = tile.bytes,
-                .dtype = tile.dtype,
-                .rank = tile.rank,
-                .shape_mem = tile.shape_mem,
-                .strides_mem = tile.strides_mem,
-                .token = token,
-            };
-        }
-
-        fn releaseConst(ctx: *anyopaque, token: usize) void {
-            if (token == 0) return;
-            const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            if (sm.cache) |*cache| cache.releaseLease(token);
-        }
-
-        fn releaseMut(ctx: *anyopaque, token: usize) void {
-            if (token == 0) return;
-            const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            if (sm.cache) |*cache| cache.releaseLease(token);
-        }
+        fn releaseMut(_: *anyopaque, _: usize) void {}
 
         fn sequenceCachePolicyInfo(ctx: *anyopaque, id: tensor_store.TensorId) tensor_store.SequenceCachePolicyInfo {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
@@ -196,7 +105,7 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
             switch (policy) {
                 .growable => |g| {
                     // Grow along the canonical time axis (axis 1).
-                    const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
+                    const t_const: *const Tensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
                     if (t_const.rank != 4) return tensor_store.StoreError.InvalidArgument;
                     const current_cap: usize = t_const.shape[1];
 
@@ -229,7 +138,7 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
                 },
                 else => {
                     if (sm.cache) |*cache| {
-                        const t_const: *const TiledTensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
+                        const t_const: *const Tensor = sm.getConst(tid) catch return tensor_store.StoreError.InvalidArgument;
                         var cap: usize = physical_capacity_tokens;
                         if (@as(usize, t_const.rank) > 1) cap = t_const.shape[1];
                         if (cap == 0) return tensor_store.StoreError.InvalidArgument;
@@ -247,69 +156,45 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
             }
         }
 
-        fn prefetch(ctx: *anyopaque, id: tensor_store.TensorId, ti0: usize, ti1: usize) void {
+        fn prefetch(ctx: *anyopaque, id: tensor_store.TensorId) void {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
             const backing = sm.backingConst(@intCast(id)) catch return;
-            const tile = t.acquireTileConstFrom(backing.data, ti0, ti1) catch return;
-            @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
-        }
-
-        fn prefetchLinear(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) void {
-            const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return;
-            const backing = sm.backingConst(@intCast(id)) catch return;
-            const tile = t.acquireTileConstLinearFrom(backing.data, tile_index) catch return;
-            @prefetch(tile.bytes.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+            if (backing.data.len == 0) return;
+            @prefetch(backing.data.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
         }
 
         fn sameShape(a: []const usize, b: []const usize) bool {
-            if (a.len != b.len) return false;
-            for (a, 0..) |v, i| if (v != b[i]) return false;
-            return true;
+            return std.mem.eql(usize, a, b);
         }
 
-        fn deviceTile(ctx: *anyopaque, id: tensor_store.TensorId, tile_index: usize) tensor_store.StoreError!?tensor_store.DeviceTileRef {
+        fn deviceChunk(ctx: *anyopaque, id: tensor_store.TensorId, chunk: usize) tensor_store.StoreError!?tensor_store.DeviceChunkRef {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            const t: *const TiledTensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
+            const t: *const Tensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             const backing = sm.backingConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             if (backing.device.kind == .cpu) return null;
-            if (tile_index >= backing.tile_handles.len) return tensor_store.StoreError.InvalidArgument;
-            const layout = t.tileLayoutLinear(tile_index) catch return tensor_store.StoreError.InvalidArgument;
-            return .{
-                .handle = backing.tile_handles[tile_index],
-                .len = t.tile_lens[tile_index],
-                .dtype = layout.dtype,
-                .rank = layout.rank,
-                .shape_mem = layout.shape_mem,
-                .strides_mem = layout.strides_mem,
-            };
+            if (chunk >= t.chunkCount() or chunk >= backing.chunk_handles.len) return tensor_store.StoreError.InvalidArgument;
+            const c = t.chunk(chunk);
+            return .{ .handle = backing.chunk_handles[chunk], .len = c.len, .rows = c.rows };
         }
 
         fn swapTensors(ctx: *anyopaque, a_id: tensor_store.TensorId, b_id: tensor_store.TensorId) tensor_store.StoreError!void {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
-            var a: *TiledTensor = sm.getMut(@intCast(a_id)) catch return tensor_store.StoreError.InvalidArgument;
-            var b: *TiledTensor = sm.getMut(@intCast(b_id)) catch return tensor_store.StoreError.InvalidArgument;
+            var a: *Tensor = sm.getMut(@intCast(a_id)) catch return tensor_store.StoreError.InvalidArgument;
+            var b: *Tensor = sm.getMut(@intCast(b_id)) catch return tensor_store.StoreError.InvalidArgument;
 
             if (a.dtype != b.dtype) return tensor_store.StoreError.InvalidArgument;
             if (a.rank != b.rank) return tensor_store.StoreError.InvalidArgument;
             if (a.quant_axis != b.quant_axis) return tensor_store.StoreError.InvalidArgument;
             if (!sameShape(a.shape, b.shape)) return tensor_store.StoreError.InvalidArgument;
-            if (!sameShape(a.tile_shape, b.tile_shape)) return tensor_store.StoreError.InvalidArgument;
-            if (!sameShape(a.tile_counts, b.tile_counts)) return tensor_store.StoreError.InvalidArgument;
-            if (!sameShape(a.tile_strides, b.tile_strides)) return tensor_store.StoreError.InvalidArgument;
-            if (a.tile_offsets.len != b.tile_offsets.len or a.tile_lens.len != b.tile_lens.len) return tensor_store.StoreError.InvalidArgument;
-            if (a.tile_alignment != b.tile_alignment) return tensor_store.StoreError.InvalidArgument;
+            if (a.chunk_rows != b.chunk_rows) return tensor_store.StoreError.InvalidArgument;
             // Zero-copy carried-variable swap for CPU loop execution. Move
             // the complete backing record between the logical tensor ids.
             std.mem.swap([]align(64) u8, &a.data, &b.data);
             std.mem.swap(bool, &a.owns_data, &b.owns_data);
+            std.mem.swap(?*storage_mod.Mapping, &a.mapping, &b.mapping);
             std.mem.swap(DeviceRef, &a.device, &b.device);
-            std.mem.swap([]dm.DeviceHandle, &a.tile_handles, &b.tile_handles);
+            std.mem.swap([]dm.DeviceHandle, &a.chunk_handles, &b.chunk_handles);
             std.mem.swap(?dm.DeviceMemory, &a.dev, &b.dev);
-            // The host-write counter travels with the bytes so a residency
-            // layer's per-tile `uploaded_seq` (which the resident store swaps
-            // alongside) stays consistent and avoids a spurious re-upload.
         }
     };
 
@@ -317,18 +202,15 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
         .ctx = @ptrCast(mgr),
         .vtable = &.{
             .meta = Vt.meta,
-            .acquireTileConst = Vt.acquireTileConst,
-            .acquireTileMut = Vt.acquireTileMut,
-            .acquireTileConstLinear = Vt.acquireTileConstLinear,
-            .acquireTileMutLinear = Vt.acquireTileMutLinear,
+            .acquireConst = Vt.acquireConst,
+            .acquireMut = Vt.acquireMut,
             .releaseConst = Vt.releaseConst,
             .releaseMut = Vt.releaseMut,
             .sequenceCachePolicyInfo = Vt.sequenceCachePolicyInfo,
             .mapSequenceStep = Vt.mapSequenceStep,
             .prefetch = Vt.prefetch,
-            .prefetchLinear = Vt.prefetchLinear,
             .swapTensors = Vt.swapTensors,
-            .deviceTile = Vt.deviceTile,
+            .deviceChunk = Vt.deviceChunk,
         },
     };
 }

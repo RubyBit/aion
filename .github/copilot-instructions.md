@@ -13,9 +13,9 @@ Also, a critical feature: out-of-core tensors. The library must operate correctl
 
 Tiered storage management (VRAM → RAM → SSD/NVMe), with configurable cache sizes, async prefetching, and eviction policies (LRU or similar).
 
-Chunked tensor storage format: contiguous, mmap-friendly files, with aligned, fixed-size tiles and metadata for dtype, shape, strides, and quantization.
+Tensor storage format: contiguous, mmap-friendly files; every tensor is one row-major buffer (quantized: row-major over block space) with metadata for dtype, shape, and quantization. The in-memory layout is the file layout. Do not reintroduce storage-level tiling: a GPU tensor past the binding limit is split into dim-0 chunks by `storage/layout.zig`, and nothing else.
 
-Tiled operators: rewrite core kernels (GEMM, convolution, attention, elementwise ops) to process tiles without requiring the full tensor in memory at once.
+Operators partition their own work (row ranges, cache blocking inside kernels) over whole tensors; out-of-core residency is handled at the tensor/chunk lease level, not by tiling storage.
 
 Deterministic error handling: expose meaningful Zig error unions when I/O stalls, disk bandwidth is insufficient, or cache limits are exceeded.
 

@@ -5,8 +5,7 @@
 // affine apply. Matches the CPU kernels:
 //   layernorm: (x - mean) / sqrt(max(0, E[x^2] - mean^2) + eps) * gamma + beta
 //   rmsnorm:    x         / sqrt(E[x^2] + eps)                 * gamma + beta
-// The backend guarantees the whole normalized axis lives in this tile and that
-// gamma/beta are single-tile vectors of `cols` elements.
+// The backend guarantees gamma/beta are vectors of at least `cols` elements.
 
 enable f16;
 

@@ -44,18 +44,13 @@ pub const SequenceCachePolicy = union(CachePolicy) {
 };
 
 pub const CacheConfig = struct {
-    /// Soft upper bound for RAM used by cached tiles.
+    /// Soft upper bound for RAM used by cached tensors.
     ///
     /// v1 notes:
     /// - we do not yet implement out-of-core eviction,
     /// - this is validated to be non-zero and is reserved for future cache
     ///   accounting policy.
     ram_budget_bytes: usize,
-
-    /// Optional hard cap on simultaneously outstanding tile leases.
-    ///
-    /// `0` means unlimited.
-    max_live_leases: usize = 0,
 };
 
 pub const SequenceCachePolicyKind = enum(u8) {
@@ -74,8 +69,6 @@ pub const Cache = struct {
     cfg: CacheConfig,
 
     tensor_policies: std.ArrayListUnmanaged(TensorPolicyRecord) = .empty,
-    live_leases: std.AutoHashMapUnmanaged(usize, LeaseRecord) = .empty,
-    next_lease_token: usize = 1,
 
     const Self = @This();
 
@@ -93,12 +86,6 @@ pub const Cache = struct {
     const TensorPolicyRecord = struct {
         policy: SequenceCachePolicy = .{ .none = {} },
         state: PolicyState = .{ .none = {} },
-    };
-
-    const LeaseRecord = struct {
-        tensor_id: u32,
-        tile_index: usize,
-        is_mut: bool,
     };
 
     fn makePolicyRecord(policy: SequenceCachePolicy) CacheError!TensorPolicyRecord {
@@ -221,39 +208,7 @@ pub const Cache = struct {
         }
     }
 
-    pub fn acquireLease(self: *Self, tensor_id: u32, tile_index: usize, is_mut: bool) CacheError!usize {
-        if (self.cfg.max_live_leases != 0 and self.live_leases.count() >= self.cfg.max_live_leases) {
-            return CacheError.CacheLimitExceeded;
-        }
-
-        if (self.next_lease_token == 0) return CacheError.CacheLimitExceeded;
-        const token: usize = self.next_lease_token;
-        self.next_lease_token = std.math.add(usize, self.next_lease_token, 1) catch return CacheError.CacheLimitExceeded;
-
-        self.live_leases.put(self.allocator, token, .{
-            .tensor_id = tensor_id,
-            .tile_index = tile_index,
-            .is_mut = is_mut,
-        }) catch return CacheError.OutOfMemoryRam;
-
-        return token;
-    }
-
-    pub fn releaseLease(self: *Self, token: usize) void {
-        if (token == 0) return;
-        _ = self.live_leases.remove(token);
-    }
-
-    pub fn liveLeaseCount(self: *const Self) usize {
-        return self.live_leases.count();
-    }
-
-    pub fn hasLiveLease(self: *const Self, token: usize) bool {
-        return self.live_leases.contains(token);
-    }
-
     pub fn deinit(self: *Cache) void {
-        self.live_leases.deinit(self.allocator);
         self.tensor_policies.deinit(self.allocator);
         self.* = undefined;
     }

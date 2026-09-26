@@ -35,7 +35,6 @@ pub const Tuning = struct {
 
 pub const MatvecFn = *const fn (params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) types.BackendError!void;
 pub const QuantMatvecFn = *const fn (params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) types.BackendError!void;
-pub const QuantMatvecAccumulateFn = *const fn (params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8, acc_bytes: []align(32) u8, prepared_a: []align(32) u8, prepare_a: bool, first_k_tile: bool, last_k_tile: bool) types.BackendError!void;
 pub const MatvecRangeFn = *const fn (
     params: types.MatMulParams,
     col_start: usize,
@@ -53,9 +52,8 @@ pub const Kernels = struct {
     matvec_f16: MatvecFn,
     matvec_f16_range: MatvecRangeFn,
 
-    /// Direct q8_0 matvec for K-major/block-major B layout used to avoid pack-B on large M=1 tiles.
+    /// Direct q8_0 matvec for K-major/block-major B layout, used to avoid pack-B at small M.
     matvec_q8_0_kmajor: QuantMatvecFn,
-    matvec_q8_0_kmajor_accumulate: QuantMatvecAccumulateFn,
 };
 
 pub const VariantId = cpu_target.SimdWidth;
@@ -77,7 +75,6 @@ fn kernelsFor(comptime t: Tuning, comptime dot_enc: cpu_target.DotEnc) Kernels {
         .matvec_f16 = K.matvecF16,
         .matvec_f16_range = K.matvecF16Range,
         .matvec_q8_0_kmajor = Q8_0.matvecQ8_0KMajor,
-        .matvec_q8_0_kmajor_accumulate = Q8_0.matvecQ8_0KMajorAccumulate,
     };
 }
 

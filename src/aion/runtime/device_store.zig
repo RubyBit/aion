@@ -5,21 +5,19 @@
 
 const std = @import("std");
 const tensor_store = @import("tensor_store.zig");
-const types = @import("../backend/types.zig");
 
 pub const TensorId = tensor_store.TensorId;
 pub const StoreError = tensor_store.StoreError;
 pub const TensorMeta = tensor_store.TensorMeta;
 pub const SequenceCachePolicyInfo = tensor_store.SequenceCachePolicyInfo;
 
-pub const TileRef = struct {
+/// One device buffer of a tensor: the whole tensor, or one of its dim-0 chunks.
+pub const Chunk = struct {
     handle: u64,
     offset: usize,
     len: usize,
-    dtype: types.DType,
-    rank: u8,
-    shape_mem: [tensor_store.INLINE_RANK]usize,
-    strides_mem: [tensor_store.INLINE_RANK]isize,
+    /// Rows of dim 0 this chunk holds.
+    rows: usize,
     token: usize = 0,
 };
 
@@ -29,8 +27,8 @@ pub const DeviceStore = struct {
 
     pub const VTable = struct {
         meta: *const fn (*anyopaque, TensorId) StoreError!TensorMeta,
-        acquireConst: *const fn (*anyopaque, TensorId, usize) StoreError!TileRef,
-        acquireMut: *const fn (*anyopaque, TensorId, usize) StoreError!TileRef,
+        acquireConst: *const fn (*anyopaque, TensorId, usize) StoreError!Chunk,
+        acquireMut: *const fn (*anyopaque, TensorId, usize) StoreError!Chunk,
         releaseConst: *const fn (*anyopaque, usize) void,
         releaseMut: *const fn (*anyopaque, usize) void,
         sequenceCachePolicyInfo: *const fn (*anyopaque, TensorId) SequenceCachePolicyInfo,
@@ -41,12 +39,24 @@ pub const DeviceStore = struct {
         return self.vtable.meta(self.ctx, id);
     }
 
-    pub fn acquireTileDeviceConstLinear(self: DeviceStore, id: TensorId, tile: usize) StoreError!TileRef {
-        return self.vtable.acquireConst(self.ctx, id, tile);
+    /// The tensor's one buffer. Fails for a chunked tensor: use `acquireChunkConst`.
+    pub fn acquireConst(self: DeviceStore, id: TensorId) StoreError!Chunk {
+        if ((try self.meta(id)).chunks != 1) return StoreError.InvalidArgument;
+        return self.vtable.acquireConst(self.ctx, id, 0);
     }
 
-    pub fn acquireTileDeviceMutLinear(self: DeviceStore, id: TensorId, tile: usize) StoreError!TileRef {
-        return self.vtable.acquireMut(self.ctx, id, tile);
+    pub fn acquireMut(self: DeviceStore, id: TensorId) StoreError!Chunk {
+        if ((try self.meta(id)).chunks != 1) return StoreError.InvalidArgument;
+        return self.vtable.acquireMut(self.ctx, id, 0);
+    }
+
+    /// Dim-0 chunk `chunk` of the tensor (`meta.chunks` of them).
+    pub fn acquireChunkConst(self: DeviceStore, id: TensorId, chunk: usize) StoreError!Chunk {
+        return self.vtable.acquireConst(self.ctx, id, chunk);
+    }
+
+    pub fn acquireChunkMut(self: DeviceStore, id: TensorId, chunk: usize) StoreError!Chunk {
+        return self.vtable.acquireMut(self.ctx, id, chunk);
     }
 
     pub fn releaseConst(self: DeviceStore, token: usize) void {
@@ -87,9 +97,9 @@ fn exposesHostBytes(comptime T: type) bool {
 // computing. Asserted over the vtable itself rather than over method names, so
 // adding a host-byte accessor fails here instead of quietly reopening the hole.
 test "no device store method can return host bytes" {
-    // The host tile ref is what must never appear here, and proves the detector
+    // The host view is what must never appear here, and proves the detector
     // detects rather than passing vacuously.
-    try std.testing.expect(exposesHostBytes(tensor_store.StoreError!tensor_store.TileRefConst));
+    try std.testing.expect(exposesHostBytes(tensor_store.StoreError!tensor_store.ViewConst));
 
     inline for (@typeInfo(DeviceStore.VTable).@"struct".field_types) |field| {
         const signature = @typeInfo(@typeInfo(field).pointer.child).@"fn";

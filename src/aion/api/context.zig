@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const tensor_store_max_rank = @import("../runtime/tensor_store.zig").max_rank;
 
 const backend_mod = @import("../backend/backend.zig");
 const cpu_backend_mod = @import("../backend/cpu/cpu_backend.zig");
@@ -8,7 +9,6 @@ const package_file = @import("../storage/aion_file.zig");
 const cache_mod = @import("../storage/cache.zig");
 const manager_mod = @import("../storage/manager.zig");
 const quantize_mod = @import("../storage/quantize.zig");
-const plan_mod = @import("../graph/plan.zig");
 const graph_mod = @import("../graph/graph.zig");
 const program_mod = @import("../graph/program.zig");
 const infer_mod = @import("../graph/infer.zig");
@@ -17,9 +17,10 @@ const api_builder = @import("builder.zig");
 const api_loaded_model = @import("loaded_model.zig");
 const api_weights = @import("weights.zig");
 const api_initializers = @import("loaded_model/initializers.zig");
+const params_mod = @import("loaded_model/params.zig");
+const storage_mod = @import("../storage/storage.zig");
 const api_package_export = @import("package_export.zig");
 const api_tensor = @import("tensor.zig");
-const api_tiling = @import("tiling.zig");
 const api_errors = @import("errors.zig");
 const device_mod = @import("device.zig");
 const build_options = @import("build_options");
@@ -28,7 +29,6 @@ const build_options = @import("build_options");
 const gpu_device_mod = if (build_options.enable_gpu) @import("gpu_device.zig") else struct {};
 
 pub const DType = types.DType;
-pub const TilePolicy = plan_mod.TilePolicy;
 pub const Model = api_loaded_model.Model;
 pub const LoadedModel = api_loaded_model.LoadedModel;
 pub const Weights = api_weights.Weights;
@@ -82,7 +82,6 @@ pub const Context = struct {
     cpu: cpu_backend_mod.CpuBackend,
 
     store: manager_mod.StorageManager,
-    policy: plan_mod.TilePolicy,
 
     /// Registered GPU devices (heap-pinned bundles), index-aligned with the
     /// `.gpu = i` selector. Empty when none requested; `void` on a CPU-only build.
@@ -97,15 +96,9 @@ pub const Context = struct {
         /// Total threads including the calling thread.
         thread_count: usize = 1,
 
-        /// Optional tiling policy override.
-        ///
-        /// If null, a default policy is used and users don't need to think about tiling.
-        /// Power users can provide this to tune performance.
-        tile_policy_override: ?plan_mod.TilePolicy = null,
-
         /// Optional runtime cache manager configuration.
         ///
-        /// If null, storage behaves as plain RAM-backed tiled tensors.
+        /// If null, storage behaves as plain RAM-backed tensors.
         cache_config: ?cache_mod.CacheConfig = null,
 
         /// GPU devices to create, one per entry (index = the `.gpu = i` selector).
@@ -121,14 +114,12 @@ pub const Context = struct {
         errdefer cpu.deinit();
         var sm = try makeStore(allocator, opts);
         errdefer sm.deinit();
+        sm.bulk_threads = cpu.thread_count;
 
         var self: Self = .{
             .allocator = allocator,
             .cpu = cpu,
             .store = sm,
-            // Scalar tensors are re-tileable either way, so a CPU model on a GPU
-            // context costs a copy, not a failure (see `cpuPolicy`).
-            .policy = opts.tile_policy_override orelse cpuPolicy(&cpu, opts),
             .gpu_devices = if (build_options.enable_gpu) &.{} else {},
             .device_entries = &.{},
         };
@@ -160,22 +151,22 @@ pub const Context = struct {
                     error.BackendUnavailable => api_errors.InitError.BackendUnavailable,
                 };
                 bundles[created] = bundle;
-                entries[created] = .{ .mem = bundle.deviceMemory(), .policy = bundle.policy };
+                entries[created] = .{ .mem = bundle.deviceMemory() };
             }
 
             self.gpu_devices = bundles;
             self.device_entries = entries;
-            self.store.setDeviceRegistry(self.policy, entries);
+            self.store.setDeviceRegistry(entries);
         } else {
             return api_errors.InitError.BackendUnavailable;
         }
     }
 
-    /// Resolve a device selector to a concrete backend + tile policy (+ device
+    /// Resolve a device selector to a concrete backend + weight layout (+ device
     /// memory for GPU). Computed on demand — never cached on the Context.
     fn resolveDevice(self: *Self, sel: device_mod.DeviceSelector) error{InvalidArgument}!device_mod.Device {
         switch (sel) {
-            .cpu => return .{ .ref = .{ .kind = .cpu }, .backend = self.backend(), .policy = self.policy, .device_memory = null },
+            .cpu => return .{ .ref = .{ .kind = .cpu }, .backend = self.backend(), .quant_block_order = self.cpu.quantBlockOrder(), .device_memory = null },
             .gpu => |idx| {
                 if (build_options.enable_gpu) {
                     if (idx >= self.gpu_devices.len or idx > 255) return error.InvalidArgument;
@@ -183,23 +174,12 @@ pub const Context = struct {
                     return .{
                         .ref = .{ .kind = .gpu, .index = @intCast(idx) },
                         .backend = b.backend.backend(),
-                        .policy = b.policy,
+                        .quant_block_order = gpu_device_mod.GpuDevice.quant_block_order,
                         .device_memory = b.deviceMemory(),
                     };
                 } else return error.InvalidArgument;
             },
         }
-    }
-
-    /// A quantized weight is tiled once, where it is created, and can never be
-    /// re-tiled — so on a context that registers a GPU, author for the GPU: that
-    /// is what the weight is there to run on. Otherwise lay weights out the way
-    /// this CPU's kernels read them.
-    fn cpuPolicy(cpu: *const cpu_backend_mod.CpuBackend, opts: Options) plan_mod.TilePolicy {
-        if (opts.gpus.len != 0) return plan_mod.tilePolicyForTarget(.webgpu);
-        var p = plan_mod.tilePolicyForTarget(.cpu);
-        p.quant_block_order = cpu.quantBlockOrder();
-        return p;
     }
 
     /// `init` alias kept for callers/tests that name the CPU path explicitly.
@@ -249,10 +229,6 @@ pub const Context = struct {
     pub fn setTensorSequenceCachePolicy(self: *Self, t: api_tensor.Tensor, policy: cache_mod.SequenceCachePolicy) api_errors.ApiError!void {
         if (t.store != &self.store) return api_errors.ApiError.InvalidArgument;
         try self.store.registerSequenceCachePolicy(t.id, policy);
-    }
-
-    pub fn tilePolicy(self: *const Self) plan_mod.TilePolicy {
-        return self.policy;
     }
 
     /// Return a backend handle bound to this context's CPU backend.
@@ -309,21 +285,34 @@ pub const Context = struct {
         return self.exportModel(file, bld, outputs, opts);
     }
 
+    /// Import `mapped`'s weights onto `device`. Host weights stay views of the file
+    /// mapping, which the store's tensors then keep alive; device weights are uploaded
+    /// from it. Either way `mapped` is left without it, its payload views dropped.
+    fn importMapped(self: *Self, mapped: *package_file.MappedPackage, device: manager_mod.DeviceRef) api_errors.LoadError!params_mod.Params {
+        defer mapped.unmap();
+        const map = mapped.takeMap() orelse return api_errors.LoadError.InvalidArgument;
+        const mapping = storage_mod.Mapping.adopt(self.allocator, map) catch |e| {
+            var owned = map;
+            var io_backend: std.Io.Threaded = .init_single_threaded;
+            io_backend.allocator = self.allocator;
+            owned.destroy(io_backend.io());
+            return e;
+        };
+        // The tensors that borrow from it hold their own references; this one only
+        // spans the import, so a GPU load unmaps the file as soon as it is uploaded.
+        defer mapping.release();
+        return api_initializers.importParams(self.allocator, &self.store, &mapped.package, device, if (device.kind == .cpu) mapping else null);
+    }
+
     pub fn loadModel(self: *Self, file: std.Io.File, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
-        // Resolve the target device: its backend runs the model and its tile policy
+        // Resolve the target device: its backend runs the model and its weight layout
         // shapes both the imported weights and the per-shape JIT compiles.
         const dev = try self.resolveDevice(opts.device);
         var mapped = try package_file.MappedPackage.open(self.allocator, file);
         errdefer mapped.package.deinit();
-        const hash, var params = import: {
-            // The weights are copied from the mapping into the store, which is all the
-            // mapping is for: it goes when they are in.
-            defer mapped.unmap();
-            const hash = std.hash.Wyhash.hash(0, mapped.bytes());
-            break :import .{ hash, try api_initializers.importParams(self.allocator, &self.store, dev.policy, &mapped.package, dev.ref) };
-        };
+        var params = try self.importMapped(&mapped, dev.ref);
         errdefer params.deinit(self.allocator);
-        return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = mapped.package }, params, hash, opts);
+        return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = mapped.package }, params, opts);
     }
 
     /// Load an AION package as a weights-only container.
@@ -333,13 +322,9 @@ pub const Context = struct {
     pub fn loadWeights(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!Weights {
         var mapped = try package_file.MappedPackage.open(self.allocator, file);
         errdefer mapped.package.deinit();
-        const hash, var params = import: {
-            defer mapped.unmap();
-            const hash = std.hash.Wyhash.hash(0, mapped.bytes());
-            break :import .{ hash, try api_initializers.importParams(self.allocator, &self.store, self.policy, &mapped.package, .{}) };
-        };
+        var params = try self.importMapped(&mapped, .{});
         errdefer params.deinit(self.allocator);
-        return api_weights.Weights.initLoaded(self.allocator, &self.store, self.policy, mapped.package, params, hash);
+        return api_weights.Weights.initLoaded(self.allocator, &self.store, mapped.package, params);
     }
 
     pub fn loadModelPath(self: *Self, path: []const u8, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
@@ -374,15 +359,10 @@ pub const Context = struct {
         return self.loadWeights(file, opts);
     }
 
-    /// Create a new owned tensor with a default tile shape.
+    /// Create a new owned tensor.
     pub fn tensor(self: *Self, dtype: DType, shape: []const usize) api_errors.ApiError!api_tensor.Tensor {
-        if (shape.len == 0 or shape.len > api_tiling.MAX_RANK) return api_errors.ApiError.InvalidArgument;
-
-        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
-        const tile_slice: []usize = tile_mem[0..shape.len];
-        try api_tiling.fillDefaultTileShape(self.policy, dtype, shape, tile_slice);
-
-        const tid: manager_mod.TensorId = try self.store.createTiledTensor(dtype, shape, tile_slice, .{ .tile_alignment = self.policy.tile_alignment });
+        if (shape.len == 0 or shape.len > tensor_store_max_rank) return api_errors.ApiError.InvalidArgument;
+        const tid: manager_mod.TensorId = try self.store.createTensor(dtype, shape, .{});
         self.store.trackHolders(tid);
         const t = try self.store.getConst(tid);
         return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
@@ -397,14 +377,6 @@ pub const Context = struct {
         return t;
     }
 
-    /// Create a new tensor with an explicit tile shape.
-    pub fn tensorTiled(self: *Self, dtype: DType, shape: []const usize, tile_shape: []const usize) api_errors.ApiError!api_tensor.Tensor {
-        const tid: manager_mod.TensorId = try self.store.createTiledTensor(dtype, shape, tile_shape, .{ .tile_alignment = self.policy.tile_alignment });
-        self.store.trackHolders(tid);
-        const t = try self.store.getConst(tid);
-        return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
-    }
-
     /// Convenience: allocate and initialize from packed scalar bytes.
     pub fn fromPackedScalar(self: *Self, dtype: DType, shape: []const usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
         var t: api_tensor.Tensor = try self.tensor(dtype, shape);
@@ -414,33 +386,22 @@ pub const Context = struct {
 
     /// Convenience: allocate and initialize from packed quant bytes, blocking
     /// along `quant_axis`.
-    ///
-    /// Tiling comes from the shared chooser, so an authored weight lands on the same
-    /// tiling the loader gives the identical weight. It cannot be left to the
-    /// compiler: quantized tensors are the one thing `ensureTilingMaybeRetile`
-    /// refuses to re-tile, so a wrong tiling here is a compile error at first use.
     pub fn fromPackedQuant(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, packed_bytes: []const u8) api_errors.ApiError!api_tensor.Tensor {
         var t = try self.quantTensor(dtype, shape, quant_axis);
         try t.writePackedQuant(packed_bytes);
         return t;
     }
 
-    /// An empty block-quantized tensor, tiled by the shared chooser.
+    /// An empty block-quantized tensor.
     fn quantTensor(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize) api_errors.ApiError!api_tensor.Tensor {
         if (!dtype.info().is_quantized) return api_errors.ApiError.InvalidArgument;
         if (quant_axis >= shape.len) return api_errors.ApiError.InvalidArgument;
-        if (shape.len > api_tiling.MAX_RANK) return api_errors.ApiError.InvalidArgument;
+        if (shape.len > tensor_store_max_rank) return api_errors.ApiError.InvalidArgument;
 
-        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
-        const tile_shape = tile_mem[0..shape.len];
-        api_tiling.chooseTileShapeForTensor(self.policy, dtype, shape, @intCast(quant_axis), tile_shape) catch
-            return api_errors.ApiError.InvalidArgument;
-
-        const tid: manager_mod.TensorId = try self.store.createTiledTensor(
+        const tid: manager_mod.TensorId = try self.store.createTensor(
             dtype,
             shape,
-            tile_shape,
-            .{ .tile_alignment = self.policy.tile_alignment, .quant_axis = @intCast(quant_axis) },
+            .{ .quant_axis = @intCast(quant_axis) },
         );
         self.store.trackHolders(tid);
         const ct = try self.store.getConst(tid);
@@ -456,7 +417,7 @@ pub const Context = struct {
     }
 
     /// Quantize a weight's f32 `source` into a new tensor of `dtype`, blocking along
-    /// `quant_axis`, a bounded chunk of rows at a time and straight into its tiles:
+    /// `quant_axis`, a bounded chunk of rows at a time and straight into its bytes:
     /// neither the whole f32 weight nor its packed bytes are ever held a second time.
     pub fn quantize(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, source: WeightSource) api_errors.ApiError!api_tensor.Tensor {
         var total: usize = 1;
@@ -483,8 +444,9 @@ pub const Context = struct {
 
         const staged: []f32 = self.allocator.alloc(f32, chunk_elems) catch return api_errors.ApiError.OutOfMemory;
         defer self.allocator.free(staged);
-        const packed_chunk = self.allocator.alloc(u8, chunk_elems / di.block_elems * di.block_bytes) catch return api_errors.ApiError.OutOfMemory;
-        defer self.allocator.free(packed_chunk);
+        // A new host tensor's bytes ARE its packed layout, so each chunk's blocks are
+        // quantized straight into their place.
+        const dst: []u8 = (try self.store.getMut(t.id)).data;
 
         var row0: usize = 0;
         while (row0 < rows) : (row0 += chunk_rows) {
@@ -495,13 +457,12 @@ pub const Context = struct {
                 .tensor => |src| src.store.readScalarRange(src.id, first, std.mem.sliceAsBytes(values)) catch return api_errors.ApiError.InvalidArgument,
                 .view => |v| v.readF32(first, values) catch return api_errors.ApiError.InvalidArgument,
             }
-            const out = packed_chunk[0 .. n / di.block_elems * di.block_bytes];
+            const out = dst[first / di.block_elems * di.block_bytes ..][0 .. n / di.block_elems * di.block_bytes];
             quantize_mod.quantizeBlocks(dtype, shape, quant_axis, values, first, first / di.block_elems, out) catch |e| return switch (e) {
                 error.OutOfMemory => api_errors.ApiError.OutOfMemory,
                 error.Unsupported => api_errors.ApiError.UnsupportedFeature,
                 error.InvalidArgument => api_errors.ApiError.InvalidArgument,
             };
-            try self.store.writeQuantBlocks(t.id, first / di.block_elems, out);
         }
         return t;
     }
@@ -610,13 +571,13 @@ pub const Context = struct {
         }
 
         const ShapeInfo = comptime blk: {
-            var dims: [api_tiling.MAX_RANK]usize = @splat(0);
+            var dims: [tensor_store_max_rank]usize = @splat(0);
             var rank: usize = 0;
             var cur: type = base_arr_t;
             while (true) {
                 switch (@typeInfo(cur)) {
                     .array => |a| {
-                        if (rank >= api_tiling.MAX_RANK) break;
+                        if (rank >= tensor_store_max_rank) break;
                         dims[rank] = @as(usize, @intCast(a.len));
                         rank += 1;
                         cur = a.child;
@@ -625,15 +586,15 @@ pub const Context = struct {
                 }
             }
             const dt_opt: ?DType = api_tensor.Tensor.dtypeOf(cur);
-            const dims_out: [api_tiling.MAX_RANK]usize = dims;
+            const dims_out: [tensor_store_max_rank]usize = dims;
             break :blk .{ .rank = rank, .dims = dims_out, .dt_opt = dt_opt };
         };
 
-        if (ShapeInfo.rank == 0 or ShapeInfo.rank > api_tiling.MAX_RANK) return api_errors.ApiError.InvalidArgument;
+        if (ShapeInfo.rank == 0 or ShapeInfo.rank > tensor_store_max_rank) return api_errors.ApiError.InvalidArgument;
         if (ShapeInfo.dt_opt == null) return api_errors.ApiError.InvalidArgument;
         const dt: DType = ShapeInfo.dt_opt.?;
 
-        var shape_mem: [api_tiling.MAX_RANK]usize = undefined;
+        var shape_mem: [tensor_store_max_rank]usize = undefined;
         var i: usize = 0;
         while (i < ShapeInfo.rank) : (i += 1) {
             shape_mem[i] = ShapeInfo.dims[i];
@@ -673,8 +634,8 @@ pub const Context = struct {
     }
 
     /// Like `compile`, but targets `dev_sel` (e.g. `.{ .gpu = 0 }`). The model's
-    /// backend + tile policy follow the device; auto-allocated inputs/outputs and
-    /// the per-shape JIT are tiled for it.
+    /// backend + weight layout follow the device; auto-allocated inputs/outputs and
+    /// the per-shape JIT are placed for it.
     pub fn compileOn(
         self: *Self,
         dev_sel: device_mod.DeviceSelector,
@@ -751,7 +712,6 @@ pub const Context = struct {
             dev.target(opts.passes),
             .{ .parts = parts },
             try paramsFromTemplate(self.allocator, parts),
-            0,
             .{},
         );
     }

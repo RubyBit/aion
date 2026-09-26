@@ -3,7 +3,7 @@
 //! RFFT / STFT execution for the GPU backend (kernels/fft.wgsl, stft.wgsl):
 //! naive per-bin DFT kernels, one thread per output bin. Output packing matches
 //! the CPU executors (one-sided spectrum, real halves then imaginary). v1: f32,
-//! single packed tiles. Numerics: the CPU uses an O(n log n) FFT plan, the GPU
+//! single buffers. Numerics: the CPU uses an O(n log n) FFT plan, the GPU
 //! a direct DFT — same math, different rounding order, so CPU-vs-GPU
 //! comparisons need a tolerance scaled to the spectrum magnitude.
 
@@ -64,27 +64,28 @@ pub fn execRFFT(ctx: Ctx, frame: *Frame, s: executable.StepRFFT) ExecuteProgramE
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
 
     if (out_meta.dtype != .f32 or x_meta.dtype != .f32) return error.Unsupported;
-    if (context.totalTiles(x_meta) != 1 or context.totalTiles(out_meta) != 1) return error.Unsupported;
+    if (x_meta.chunks != 1 or out_meta.chunks != 1) return error.Unsupported;
 
     const n_fft = s.n_fft;
     if (n_fft < 4 or (n_fft & (n_fft - 1)) != 0) return error.Unsupported;
     const bins = n_fft / 2 + 1;
 
-    const dx = ctx.store.acquireTileDeviceConstLinear(s.x, 0) catch return error.ExecutionFailed;
-    const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+    const dx = ctx.store.acquireConst(s.x) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireMut(s.out) catch return error.ExecutionFailed;
     defer {
         hs.releaseConst(dx.token);
         hs.releaseMut(dout.token);
     }
     if (!context.storageBindingFits(ctx, dx.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
-    const x_rank: usize = @as(usize, dx.rank);
-    const x_n = context.packedElems(dx.rank, dx.shape_mem[0..x_rank], dx.strides_mem[0..x_rank]) orelse return error.Unsupported;
-    const out_rank: usize = @as(usize, dout.rank);
-    const out_n = context.packedElems(dout.rank, dout.shape_mem[0..out_rank], dout.strides_mem[0..out_rank]) orelse return error.Unsupported;
-    if (dx.shape_mem[x_rank - 1] != n_fft) return error.Unsupported;
-    const rows = x_n / @as(u32, @intCast(n_fft));
-    if (out_n < rows * 2 * @as(u32, @intCast(bins))) return error.Unsupported;
+    const x_rank: usize = x_meta.rank;
+    if (x_rank == 0 or x_meta.shape[x_rank - 1] != n_fft) return error.Unsupported;
+    var x_n: usize = 1;
+    for (x_meta.shape) |d| x_n *= d;
+    var out_n: usize = 1;
+    for (out_meta.shape) |d| out_n *= d;
+    const rows = std.math.cast(u32, x_n / n_fft) orelse return error.Unsupported;
+    if (out_n < @as(usize, rows) * 2 * bins) return error.Unsupported;
 
     const total = std.math.cast(u32, @as(usize, rows) * bins) orelse return error.Unsupported;
     const params: RfftParams = .{
@@ -116,7 +117,7 @@ pub fn execSTFT(ctx: Ctx, frame: *Frame, s: executable.StepSTFT) ExecuteProgramE
 
     if (out_meta.dtype != .f32 or sig_meta.dtype != .f32 or win_meta.dtype != .f32) return error.Unsupported;
     if (sig_meta.rank != 2 or win_meta.rank != 1 or out_meta.rank != 3) return error.Unsupported;
-    if (context.totalTiles(sig_meta) != 1 or context.totalTiles(win_meta) != 1 or context.totalTiles(out_meta) != 1) return error.Unsupported;
+    if (sig_meta.chunks != 1 or win_meta.chunks != 1 or out_meta.chunks != 1) return error.Unsupported;
 
     const n_fft = s.n_fft;
     if (n_fft < 4 or (n_fft & (n_fft - 1)) != 0 or s.hop_length == 0) return error.Unsupported;
@@ -127,9 +128,9 @@ pub fn execSTFT(ctx: Ctx, frame: *Frame, s: executable.StepSTFT) ExecuteProgramE
     if (batch == 0 or frames == 0) return;
     if (win_meta.shape[0] != n_fft) return error.Unsupported;
 
-    const dsig = ctx.store.acquireTileDeviceConstLinear(s.signal, 0) catch return error.ExecutionFailed;
-    const dwin = ctx.store.acquireTileDeviceConstLinear(s.window, 0) catch return error.ExecutionFailed;
-    const dout = ctx.store.acquireTileDeviceMutLinear(s.out, 0) catch return error.ExecutionFailed;
+    const dsig = ctx.store.acquireConst(s.signal) catch return error.ExecutionFailed;
+    const dwin = ctx.store.acquireConst(s.window) catch return error.ExecutionFailed;
+    const dout = ctx.store.acquireMut(s.out) catch return error.ExecutionFailed;
     defer {
         hs.releaseConst(dsig.token);
         hs.releaseConst(dwin.token);
@@ -137,11 +138,7 @@ pub fn execSTFT(ctx: Ctx, frame: *Frame, s: executable.StepSTFT) ExecuteProgramE
     }
     if (!context.storageBindingFits(ctx, dsig.len) or !context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
 
-    const sig_n = context.packedElems(dsig.rank, dsig.shape_mem[0..2], dsig.strides_mem[0..2]) orelse return error.Unsupported;
-    const out_n = context.packedElems(dout.rank, dout.shape_mem[0..3], dout.strides_mem[0..3]) orelse return error.Unsupported;
-    if (context.packedElems(dwin.rank, dwin.shape_mem[0..1], dwin.strides_mem[0..1]) == null) return error.Unsupported;
-    if (sig_n < batch * samples) return error.Unsupported;
-    if (out_n < batch * frames * 2 * bins) return error.Unsupported;
+    if (out_meta.shape[0] * out_meta.shape[1] * out_meta.shape[2] < batch * frames * 2 * bins) return error.Unsupported;
 
     const total = std.math.cast(u32, batch * frames * bins) orelse return error.Unsupported;
     const params: StftParams = .{

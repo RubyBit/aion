@@ -32,7 +32,7 @@ pub const Tuning = struct {
 
 pub const PackedBView = []align(32) const u8;
 
-pub const PackBFn = *const fn (scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) types.BackendError!void;
+pub const PackBFn = *const fn (scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void;
 pub const MatMulPackedBFn = *const fn (scratch_bytes: []u8, packed_b_view: PackedBView, params: types.MatMulParams, c_bytes: []u8, a_bytes: []const u8) types.BackendError!void;
 
 pub const QuantKernels = struct {

@@ -19,7 +19,7 @@
 //
 // Every K and V row is read once per block instead of once per 4 rows, and the
 // products run out of registers — the decode kernel's per-row key scan is what
-// capped prefill there. The host routes here for f32 q over a single k/v tile.
+// capped prefill there. The host routes here for f32 q.
 
 enable f16;
 
@@ -33,33 +33,26 @@ enable f16;
 
 // Identical to attention.wgsl `Params` (the host fills one struct for both).
 struct Params {
-    base_b: u32,
-    base_h: u32,
-    tl: u32,
-    th: u32,
+    tl: u32, // q/out L count
+    th: u32, // q/out head count
     dk: u32,
     dv: u32,
-    t_cap: u32,
+    t_cap: u32, // physical T of the caches
     h_kv: u32,
-    gqa: u32,
+    gqa: u32, // query heads per kv head
     win_left: u32,
     win_right: u32,
     win_chunk: u32,
-    ring: u32,
+    ring: u32, // 0 = identity time map, 1 = ring
     ring_modulus: u32,
     kv_f16: u32,
     scale: f32,
-    soft_cap: f32,
-    segs: u32,
-    base_l: u32,
+    soft_cap: f32, // 0 = disabled
+    segs: u32, // split-K segment count (1 for attn_row)
     has_pos: u32,
     has_lengths: u32,
-    rl: u32,
-    rh: u32,
-    kv_t0: u32,
-    kv_tile_t: u32,
-    seg_base: u32,
-    segs_local: u32,
+    rl: u32, // rows per block along L
+    rh: u32, // heads per block (within one GQA group)
 };
 
 const R: u32 = 32u;
@@ -139,10 +132,10 @@ fn attn_block(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     let slices = (p.dv + DVS - 1u) / DVS;
     let vs = (wid.x % slices) * DVS;
     let b_local = wid.z;
-    let b = p.base_b + b_local;
+    let b = b_local;
     let blk_h = (wid.x / slices) * p.rh;
     let blk_l = wid.y * p.rl;
-    let hkv = (p.base_h + blk_h) / p.gqa;
+    let hkv = blk_h / p.gqa;
     let rows = p.rl * p.rh;
 
     var valid_end = p.t_cap;
@@ -155,7 +148,7 @@ fn attn_block(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
         let l_local = blk_l + tid / p.rh;
         let h_local = blk_h + tid % p.rh;
         if (tid < rows && l_local < p.tl && h_local < p.th) {
-            var q_pos = p.base_l + l_local;
+            var q_pos = l_local;
             if (p.has_pos != 0u) { q_pos = u32(pos[b_local * p.tl + l_local]); }
             let w = window_keys(p.win_left, p.win_right, p.win_chunk, q_pos, valid_end);
             lo = w.x;

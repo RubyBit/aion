@@ -26,7 +26,7 @@ const MIN_CHUNK_BYTES: usize = 64 * 1024;
 pub const MatMulNtExecCtx = struct {
     matmul_nt: matmul_nt_registry.Kernels,
     /// One shared staging buffer for the quantized activation. Shared, not
-    /// per-thread: every N tile reads the same rows and none of them writes.
+    /// per-thread: every run of B reads the same rows and none of them writes.
     scratch: []align(32) u8 = &[_]u8{},
     /// The detected L2, which sizes the activation panel; 0 when unknown.
     l2_bytes: usize = 0,
@@ -82,17 +82,13 @@ fn panelRows(l2_bytes: usize, room_bytes: usize, row_bytes: usize) usize {
 /// - B: q8_0 `[N, K]` (quant_axis == 1, one row = K/32 contiguous q8_0 blocks) or f32 `[N, K]`.
 /// - C: f32, trailing axis N.
 ///
-/// Actual compute is delegated to the NT matmul registry:
-/// - Q8_0 → `matmul_nt_q.Kernel(...).matmulNtQ8_0` via `matmul_nt_registry.Kernels.matmul_q8_0`
-/// - F32  → `matmul_nt.Kernel(...).matmulNtF32` via `matmul_nt_registry.Kernels.matmul_f32`
-///
-/// Parallelism here is over N tiles (B's axis-0 tiling must match C's last-axis tiling,
-/// enforced at compile time). Each worker handles a contiguous range of N tiles.
-pub fn execMatMulNTTiled(
+/// B's rows are C's columns, so work splits into runs of them: a run needs no more
+/// of B than a slice, and C keeps its full width as its row stride.
+pub fn execMatMulNT(
     ctx: *const MatMulNtExecCtx,
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepMatMulNTTiled,
+    s: executable.StepMatMulNT,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const c_meta = try store.meta(s.c);
@@ -105,218 +101,59 @@ pub fn execMatMulNTTiled(
     if (b_meta.dtype != .q8_0 and b_meta.dtype != .f32) return BackendError.InvalidArgument;
 
     const k: usize = b_meta.shape[1];
-    const n_total: usize = b_meta.shape[0];
+    const n: usize = b_meta.shape[0];
     if (a_meta.shape[a_meta.rank - 1] != k) return BackendError.InvalidArgument;
-    if (c_meta.shape[c_meta.rank - 1] != n_total) return BackendError.InvalidArgument;
+    if (c_meta.shape[c_meta.rank - 1] != n) return BackendError.InvalidArgument;
     if (b_meta.dtype == .q8_0 and (k % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
 
-    // `m_total` is the flattened product of leading C/A axes.
     var m_total: usize = 1;
-    var d: usize = 0;
-    while (d + 1 < @as(usize, c_meta.rank)) : (d += 1) {
+    for (0..c_meta.rank - 1) |d| {
         if (a_meta.shape[d] != c_meta.shape[d]) return BackendError.InvalidArgument;
         m_total = std.math.mul(usize, m_total, c_meta.shape[d]) catch return BackendError.InvalidArgument;
     }
 
-    // A is held in a single tile spanning all (batch,seq) rows × K. Acquire once.
-    var a_tile = try store.acquireTileConstLinear(s.a, 0);
-    defer store.releaseConst(a_tile.token);
-    const a_view = a_tile.bufferView();
+    const a_view = try store.acquireConst(s.a);
+    defer store.releaseConst(a_view.token);
+    const b_view = try store.acquireConst(s.b);
+    defer store.releaseConst(b_view.token);
+    const c_view = try store.acquireMut(s.c);
+    defer store.releaseMut(c_view.token);
+    if (a_view.bytes.len < m_total * k * @sizeOf(f32) or c_view.bytes.len < m_total * n * @sizeOf(f32)) return BackendError.InvalidArgument;
 
-    // A must occupy a single tile containing all M×K f32 elements (the compile step
-    // retiles to `[...leading_full, K]` which is a single tile).
-    const expected_a_bytes: usize = m_total * k * @sizeOf(f32);
-    if (a_view.bytes.len < expected_a_bytes) return BackendError.InvalidArgument;
-
-    // C's last-axis tile size is aligned to B's axis-0 tile size by the compile step,
-    // so B-tile `nt` covers C's N range [nt*tile_size .. min((nt+1)*tile_size, N)].
-    if (b_meta.tile_counts[0] != c_meta.tile_counts[c_meta.rank - 1]) return BackendError.InvalidArgument;
-    if (b_meta.tile_shape[0] != c_meta.tile_shape[c_meta.rank - 1]) return BackendError.InvalidArgument;
-
-    const tile_total: usize = c_meta.tile_counts[c_meta.rank - 1];
-    const n_tile_size: usize = c_meta.tile_shape[c_meta.rank - 1];
-
-    const Runner = struct {
-        const Self = @This();
-
-        store: tensor_store.TensorStore,
-        c: tensor_store.TensorId,
-        b: tensor_store.TensorId,
-        n_total: usize,
-        n_tile_size: usize,
-        chunks_per_tile: usize,
-        b_row_bytes: usize,
-        block_order: types.QuantBlockOrder,
-        k: usize,
-        alpha: f32,
-        beta: f32,
-        /// The panel this pass computes: C rows `[row0, row0 + rows)`.
-        row0: usize = 0,
-        rows: usize = 0,
-        /// Rows a kernel call takes at once (see `blockRows`).
-        block_rows: usize = std.math.maxInt(usize),
-        a: union(enum) {
-            /// f32 rows of A, starting at `row0`.
-            f32: []const u8,
-            /// The same rows prepared for the q8 kernel (`matmul_nt_q.prepareActivation`),
-            /// for the kernel of B's block order.
-            q8_0: struct { rows: []const u8, row_bytes: usize, kernel: matmul_nt_registry.MatMulNtQ8_0Fn },
-        } = undefined,
-        matmul_nt_f32: matmul_nt_registry.MatMulNtF32Fn,
-
-        /// `[start, end)` indexes column chunks, `chunks_per_tile` to a tile. B's
-        /// rows are its output columns, so a chunk is a contiguous run of them and
-        /// needs no more than a slice; C keeps the tile's width as its row stride.
-        fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
-            var idx: usize = start;
-            while (idx < end) : (idx += 1) {
-                const nt: usize = idx / self.chunks_per_tile;
-                const chunk: usize = idx % self.chunks_per_tile;
-
-                const n_start: usize = nt * self.n_tile_size;
-                const n_count: usize = @min(self.n_tile_size, self.n_total - n_start);
-                // Chunks start on a group boundary: a grouped tile shares a
-                // block's bytes across its rows, so a split inside a group would
-                // address the wrong ones.
-                const group: usize = self.block_order.groupRows();
-                const raw = std.math.divCeil(usize, n_count, self.chunks_per_tile) catch return BackendError.InvalidArgument;
-                const per_chunk: usize = (std.math.divCeil(usize, raw, group) catch return BackendError.InvalidArgument) * group;
-                const col_lo: usize = chunk * per_chunk;
-                if (col_lo >= n_count) continue;
-                const cols: usize = @min(per_chunk, n_count - col_lo);
-
-                var c_tile = try self.store.acquireTileMutLinear(self.c, nt);
-                defer self.store.releaseMut(c_tile.token);
-                const c_view = c_tile.bufferView();
-                if ((c_view.bytes.len % @sizeOf(f32)) != 0) return BackendError.InvalidArgument;
-
-                var b_tile = try self.store.acquireTileConstLinear(self.b, nt);
-                defer self.store.releaseConst(b_tile.token);
-                const b_view = b_tile.bufferView();
-
-                const b_off: usize = col_lo * self.b_row_bytes;
-                if (b_off > b_view.bytes.len) return BackendError.InvalidArgument;
-                const c_off: usize = (self.row0 * n_count + col_lo) * @sizeOf(f32);
-                if (c_off > c_view.bytes.len) return BackendError.InvalidArgument;
-
-                // The kernels take the chunk, not the whole matrix: `params.n` is its
-                // column count and `ldc` keeps C addressed at the tile's full width.
-                // They range-check the slices against these dims themselves.
-                //
-                // Rows go in blocks that fit L1: a kernel sweeps every column for
-                // each row it holds, so a block re-reads this chunk of B from L2
-                // once, where all the rows at once would re-read A per column group.
-                var r0: usize = 0;
-                while (r0 < self.rows) : (r0 += self.block_rows) {
-                    const params: types.MatMulParams = .{
-                        .m = @min(self.block_rows, self.rows - r0),
-                        .n = cols,
-                        .k = self.k,
-                        .ldc = n_count,
-                        .alpha = self.alpha,
-                        .beta = self.beta,
-                    };
-                    const c_block = c_view.bytes[c_off + r0 * n_count * @sizeOf(f32) ..];
-                    switch (self.a) {
-                        .q8_0 => |q| try q.kernel(params, c_block, q.rows[r0 * q.row_bytes ..], b_view.bytes[b_off..]),
-                        .f32 => |a_rows| try self.matmul_nt_f32(params, c_block, a_rows[r0 * self.k * @sizeOf(f32) ..], b_view.bytes[b_off..]),
-                    }
-                }
-            }
-        }
-
-        fn run(self: *@This(), workers: ?*thread_pool.ThreadPool, threads: usize, work_total: usize, tile_bytes: usize) ExecuteProgramError!void {
-            if (workers) |p| {
-                // A tile costs the B panel it streams, not the C row it writes. At
-                // decode C is one f32 per column against half a megabyte of weights,
-                // so sizing the split by C alone swept every tile into one grain and
-                // left the whole matmul on a single worker.
-                const min_total_bytes: usize = 256 * 1024;
-                if (exec_utils.shouldParallelTiles(threads, work_total, tile_bytes, min_total_bytes)) {
-                    const Task = struct {
-                        runner: *Self,
-                        stop: std.atomic.Value(bool) = .init(false),
-                        err_mutex: std.Io.Mutex = .init,
-                        err_any: ?anyerror = null,
-
-                        fn fail(t: *@This(), err: anyerror) void {
-                            if (t.stop.swap(true, .acq_rel)) return;
-                            std.Io.Threaded.mutexLock(&t.err_mutex);
-                            defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                            if (t.err_any == null) t.err_any = err;
-                        }
-
-                        fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                            _ = tid;
-                            const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                            if (start >= end) return;
-                            if (t.stop.load(.acquire)) return;
-                            t.runner.runRange(start, end) catch |e| {
-                                t.fail(e);
-                                return;
-                            };
-                        }
-                    };
-
-                    var task: Task = .{ .runner = self };
-                    // Uniform cost per chunk, non-uniform cores: let them claim on
-                    // demand, one chunk at a time. A chunk is hundreds of kilobytes of
-                    // weights, so the atomic that hands it out costs nothing beside it.
-                    p.parallelForDynamic(@ptrCast(&task), work_total, 1, Task.runTiles);
-                    if (task.err_any) |e| return @errorCast(e);
-                    return;
-                }
-            }
-            try self.runRange(0, work_total);
-        }
-    };
-
-    // One tile per worker leaves most of them idle on the narrow projections: a
-    // 2048-wide one is eight tiles against six threads, and a 256-wide KV
-    // projection is a single tile. Splitting a tile's columns costs nothing —
-    // they are separate rows of B — and only kicks in where tiles are too few.
     const b_row_bytes: usize = switch (b_meta.dtype) {
         .q8_0 => (k / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES,
         .f32 => k * @sizeOf(f32),
         else => return BackendError.Unsupported,
     };
-    // Units per thread, for claiming to even out cores of unequal speed. At
-    // decode a unit is its stream of B and a few suffice; with rows to sweep it
-    // is heavy, and the last wave idles the rest: prefill gained up to 16.
+    // Runs per thread, for claiming to even out cores of unequal speed. At decode a
+    // run is its stream of B and a few suffice; with rows to sweep it is heavy, and
+    // the last wave idles the rest: prefill gained up to 16. Never a run so short its
+    // stream of B is not worth handing out.
     const per_thread: usize = if (m_total > 1) 16 else 4;
-    const chunks_per_tile: usize = blk: {
-        if (thread_count <= 1 or tile_total >= thread_count * per_thread) break :blk 1;
-        const want = std.math.divCeil(usize, thread_count * per_thread, tile_total) catch 1;
-        const by_width = @max(@as(usize, 1), (n_tile_size * b_row_bytes) / MIN_CHUNK_BYTES);
-        break :blk @max(@as(usize, 1), @min(want, by_width));
-    };
-    const work_total: usize = tile_total * chunks_per_tile;
-    const tile_bytes: usize = (exec_utils.tileByteSize(b_meta) + exec_utils.tileByteSize(c_meta)) / chunks_per_tile;
+    const by_width = @max(@as(usize, 1), (n * b_row_bytes) / MIN_CHUNK_BYTES);
+    const chunks: usize = if (thread_count <= 1) 1 else @max(@as(usize, 1), @min(thread_count * per_thread, by_width));
 
     var runner: Runner = .{
-        .store = store,
-        .c = s.c,
-        .b = s.b,
-        .n_total = n_total,
-        .n_tile_size = n_tile_size,
-        .chunks_per_tile = chunks_per_tile,
+        .n = n,
+        .chunks = chunks,
         .b_row_bytes = b_row_bytes,
         .block_order = b_meta.block_order,
         .k = k,
         .alpha = s.alpha,
         .beta = s.beta,
+        .b = b_view.bytes,
+        .c = c_view.bytes,
         .matmul_nt_f32 = ctx.matmul_nt.matmul_f32,
     };
 
     if (b_meta.dtype == .f32) {
         runner.rows = m_total;
         runner.a = .{ .f32 = a_view.bytes };
-        return runner.run(pool, thread_count, work_total, tile_bytes);
+        return runner.run(pool, thread_count);
     }
 
-    // A panel at a time, each quantized once for every N tile of it to share — a
-    // decode step has hundreds of tiles per matmul and they all read the same
-    // activation. Decode is a single panel.
+    // A panel at a time, each quantized once for every run of B to share — they all
+    // read the same activation. Decode is a single panel.
     const kernel = ctx.matmul_nt.matmul_q8_0.get(b_meta.block_order);
     const a_row_bytes: usize = matmul_nt_q.preparedBytes(1, k);
     if (ctx.scratch.len < a_row_bytes) return BackendError.Unsupported;
@@ -332,9 +169,94 @@ pub fn execMatMulNTTiled(
         runner.row0 = row0;
         runner.rows = rows;
         runner.a = .{ .q8_0 = .{ .rows = panel, .row_bytes = a_row_bytes, .kernel = kernel } };
-        try runner.run(pool, thread_count, work_total, tile_bytes);
+        try runner.run(pool, thread_count);
     }
 }
+
+const Runner = struct {
+    n: usize,
+    chunks: usize,
+    b_row_bytes: usize,
+    block_order: types.QuantBlockOrder,
+    k: usize,
+    alpha: f32,
+    beta: f32,
+    b: []const u8,
+    c: []u8,
+    /// The panel this pass computes: C rows `[row0, row0 + rows)`.
+    row0: usize = 0,
+    rows: usize = 0,
+    /// Rows a kernel call takes at once (see `blockRows`).
+    block_rows: usize = std.math.maxInt(usize),
+    a: union(enum) {
+        /// f32 rows of A, starting at `row0`.
+        f32: []const u8,
+        /// The same rows prepared for the q8 kernel (`matmul_nt_q.prepareActivation`),
+        /// for the kernel of B's block order.
+        q8_0: struct { rows: []const u8, row_bytes: usize, kernel: matmul_nt_registry.MatMulNtQ8_0Fn },
+    } = undefined,
+    matmul_nt_f32: matmul_nt_registry.MatMulNtF32Fn,
+
+    /// Column runs `[start, end)`. A run starts on a group boundary: a grouped B
+    /// shares a block's bytes across its rows, so a split inside a group would
+    /// address the wrong ones.
+    fn runRange(self: *const Runner, start: usize, end: usize) ExecuteProgramError!void {
+        const group: usize = self.block_order.groupRows();
+        const raw = std.math.divCeil(usize, self.n, self.chunks) catch return BackendError.InvalidArgument;
+        const per_chunk: usize = (std.math.divCeil(usize, raw, group) catch return BackendError.InvalidArgument) * group;
+        for (start..end) |chunk| {
+            const col_lo: usize = chunk * per_chunk;
+            if (col_lo >= self.n) continue;
+            const cols: usize = @min(per_chunk, self.n - col_lo);
+            const b_run = self.b[col_lo * self.b_row_bytes ..];
+            const c_off: usize = (self.row0 * self.n + col_lo) * @sizeOf(f32);
+
+            // Rows go in blocks that fit L1: a kernel sweeps every column for each
+            // row it holds, so a block re-reads this run of B from L2 once, where
+            // all the rows at once would re-read A per column group.
+            var r0: usize = 0;
+            while (r0 < self.rows) : (r0 += self.block_rows) {
+                const params: types.MatMulParams = .{
+                    .m = @min(self.block_rows, self.rows - r0),
+                    .n = cols,
+                    .k = self.k,
+                    .ldc = self.n,
+                    .alpha = self.alpha,
+                    .beta = self.beta,
+                };
+                const c_block = self.c[c_off + r0 * self.n * @sizeOf(f32) ..];
+                switch (self.a) {
+                    .q8_0 => |q| try q.kernel(params, c_block, q.rows[r0 * q.row_bytes ..], b_run),
+                    .f32 => |a_rows| try self.matmul_nt_f32(params, c_block, a_rows[r0 * self.k * @sizeOf(f32) ..], b_run),
+                }
+            }
+        }
+    }
+
+    fn run(self: *const Runner, pool: ?*thread_pool.ThreadPool, thread_count: usize) ExecuteProgramError!void {
+        const p = pool orelse return self.runRange(0, self.chunks);
+        if (thread_count <= 1 or self.chunks < 2) return self.runRange(0, self.chunks);
+        const Task = struct {
+            runner: *const Runner,
+            failure: std.atomic.Value(u16) = .init(0),
+
+            fn claim(ctx_any: *anyopaque, start: usize, end: usize, _: usize) void {
+                const t: *@This() = @ptrCast(@alignCast(ctx_any));
+                if (t.failure.load(.monotonic) != 0) return;
+                t.runner.runRange(start, end) catch |e| {
+                    _ = t.failure.cmpxchgStrong(0, @intFromError(e), .release, .monotonic);
+                };
+            }
+        };
+        // Uniform cost per run, non-uniform cores: let them claim on demand, one run
+        // at a time. A run is hundreds of kilobytes of weights, so the atomic that
+        // hands it out costs nothing beside it.
+        var task: Task = .{ .runner = self };
+        p.parallelForDynamic(@ptrCast(&task), self.chunks, 1, Task.claim);
+        const failure = task.failure.load(.acquire);
+        if (failure != 0) return @errorCast(@errorFromInt(failure));
+    }
+};
 
 // Rows are independent — each is quantized and swept on its own — so how many
 // share a panel may change speed but never a result.
@@ -351,7 +273,7 @@ test "matmul_nt: results do not depend on how A is split into panels" {
 
     var a_vals: [m * k]f32 = undefined;
     for (&a_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) * 0.03;
-    const a = try sm.createTiledTensor(.f32, &.{ m, k }, &.{ m, k }, .{ .tile_alignment = 64 });
+    const a = try sm.createTensor(.f32, &.{ m, k }, .{});
     try sm.writeFromPackedScalar(a, std.mem.sliceAsBytes(&a_vals));
 
     var b_bytes: [n * (k / 32) * 34]u8 = undefined;
@@ -359,7 +281,7 @@ test "matmul_nt: results do not depend on how A is split into panels" {
         std.mem.writeInt(u16, b_bytes[bi * 34 ..][0..2], @bitCast(@as(f16, 0.01)), .little);
         for (b_bytes[bi * 34 + 2 ..][0..32], 0..) |*q, i| q.* = @truncate(bi *% 13 +% i *% 7);
     }
-    const b = try sm.createTiledTensor(.q8_0, &.{ n, k }, &.{ n, k }, .{ .tile_alignment = 64, .quant_axis = 1 });
+    const b = try sm.createTensor(.q8_0, &.{ n, k }, .{ .quant_axis = 1 });
     try sm.writeFromPackedQuant(b, &b_bytes);
 
     const kernels = comptime matmul_nt_registry.selectForTarget(cpu_target.compiled).kernels;
@@ -367,9 +289,9 @@ test "matmul_nt: results do not depend on how A is split into panels" {
     var out: [2][m * n]f32 = undefined;
     // All seven rows in one panel, then a scratch that holds only two at a time.
     for ([_]usize{ scratch.len, 2 * matmul_nt_q.preparedBytes(1, k) }, 0..) |room, i| {
-        const c = try sm.createTiledTensor(.f32, &.{ m, n }, &.{ m, n }, .{ .tile_alignment = 64 });
+        const c = try sm.createTensor(.f32, &.{ m, n }, .{});
         const ctx: MatMulNtExecCtx = .{ .matmul_nt = kernels, .scratch = scratch[0..room] };
-        try execMatMulNTTiled(&ctx, null, 1, .{ .c = c, .a = a, .b = b, .alpha = 1.0, .beta = 0.0 }, sm.tensorStore());
+        try execMatMulNT(&ctx, null, 1, .{ .c = c, .a = a, .b = b, .alpha = 1.0, .beta = 0.0 }, sm.tensorStore());
         try sm.readToPackedScalar(c, std.mem.sliceAsBytes(&out[i]));
     }
     try testing.expectEqualSlices(f32, &out[0], &out[1]);

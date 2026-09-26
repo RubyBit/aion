@@ -24,7 +24,6 @@ const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 const matmul_nt_registry = @import("../registry/matmul_nt_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
 const attention_registry = @import("../registry/attention_registry.zig");
-const conv1d_registry = @import("../registry/conv1d_registry.zig");
 const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
 const tier_kinds = @import("tier_kinds.zig");
@@ -76,7 +75,6 @@ const table: dt.DispatchTable = .{
 
     .attention = attention_registry.selectForTarget(tier_target).kernels,
     .relpos_mha = attention_registry.selectForTarget(tier_target).kernels,
-    .conv1d = conv1d_registry.selectForTarget(tier_target).kernels,
     .conv2d = conv2d_registry.selectForTarget(tier_target).kernels,
     .fft = fft_registry.selectForTarget(tier_target).kernels,
 };

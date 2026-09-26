@@ -29,7 +29,7 @@ const Rotation = struct {
     }
 };
 
-pub fn runTileF32(
+pub fn runF32(
     out_view: types.BufferViewMut,
     x_view: types.BufferViewConst,
     pos_view: types.BufferViewConst,
@@ -96,7 +96,7 @@ pub fn runTileF32(
     }
 }
 
-pub fn runTileF16(
+pub fn runF16(
     out_view: types.BufferViewMut,
     x_view: types.BufferViewConst,
     pos_view: types.BufferViewConst,

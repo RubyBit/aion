@@ -7,8 +7,7 @@ const aion = @import("aion");
 const api = aion.api;
 
 /// Build a small model `out = mean(relu(a @ b))` on `ctx` targeting `dev`, run it,
-/// and return the scalar output. Small single-tile operands so CPU and GPU tilings
-/// coincide (no cross-device retile needed at this foundation stage).
+/// and return the scalar output.
 fn runSmallModel(
     ctx: *api.Context,
     dev: api.DeviceSelector,

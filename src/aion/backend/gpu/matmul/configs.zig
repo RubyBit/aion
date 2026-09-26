@@ -12,7 +12,7 @@ const MatmulConfig = codegen.MatmulConfig;
 /// measured competitive on this hardware). Always keep a scalar (non-vec4) config
 /// so every shape has an eligible fallback when vec4 stride alignment fails.
 /// `_db` = double-buffered. `_nb` (`bounds_check = false`) variants are admitted
-/// only when the executor proves all storage tiles are full and block-aligned.
+/// only when the executor proves every dim is a whole number of blocks.
 pub const configs = [_]MatmulConfig{
     // Baseline square blocks.
     .{ .bm = 128, .bn = 128, .bk = 8, .tm = 8, .tn = 8, .vec4_load = false },

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 // Layout/dtype conversion passes that feed the f32 GEMM: they materialize a
-// B tile into a transient f32 scratch buffer so the autotuned f32 kernel can
+// B into a transient f32 scratch buffer so the autotuned f32 kernel can
 // consume weights stored in other dtypes/orientations (the M>1 MatMulNT path).
 // One extra bandwidth pass over B — cheap next to the GEMM it unblocks; the
-// frame's pass ordering serializes scratch reuse across tiles.
+// frame's pass ordering serializes scratch reuse across chunks.
 //
 //   q8_nt_to_f32t : B q8_0 [N, K] (NT)  -> scratch f32 [K, N]  (dequant + transpose)
 //   q8_lanes32_to_f32t : B q8_0 [N, K] in `lanes32` order -> scratch f32 [K, N]
@@ -22,13 +22,13 @@ enable f16;
 
 // Native f16 views of the same two bindings. `shader-f16` is a required device
 // feature, so a cast addresses ELEMENTS and no longer has to pack pairs into u32
-// words — which is what forced the old even-element-count restriction on the
-// tile. An odd tile now casts as-is.
+// words — which is what forced the old even-element-count restriction. An odd
+// element count now casts as-is.
 @group(0) @binding(0) var<storage, read>       src_h: array<f16>;
 @group(0) @binding(1) var<storage, read_write> dst_h: array<f16>;
 @group(0) @binding(2) var<uniform>             p: Params;
 
-// n/k: B tile rows/cols. src_wpr = u32 words per source row. dst_row = f32
+// n/k: B rows/cols. src_wpr = u32 words per source row. dst_row = f32
 // elements per dst row ( == n for the transposed layouts). count = total work
 // items (pairs for q8, elements for the others).
 struct Params { n: u32, k: u32, src_wpr: u32, dst_row: u32, count: u32 };
@@ -154,7 +154,7 @@ fn q8_row_to_f32(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
-// q8_0 tile [K, N] quantized along K (the MatMul-B convention): blocks tile a
+// q8_0 B [K, N] quantized along K (the MatMul-B convention): blocks tile a
 // [K/32, N] grid, row-major, so consecutive blocks run along N. -> f32 [K, N]
 // (same logical layout) for a normal [K,N] GEMM B operand. One work item = one
 // block PAIR (two adjacent N columns, same 32-K range) so the 68-byte pair is

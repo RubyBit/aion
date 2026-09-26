@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Whole-model benchmark graphs with distinct, real-sized, per-tile-filled weights.
+//! Whole-model benchmark graphs with distinct, real-sized, pattern-filled weights.
 //! They use the production compiler without requiring full-size host staging buffers.
 
 const std = @import("std");
@@ -10,8 +10,6 @@ pub const StorageManager = aion.storage_manager.StorageManager;
 pub const TensorId = aion.storage_manager.TensorId;
 pub const ValueId = aion.graph.ValueId;
 pub const DeviceRef = aion.storage_manager.DeviceRef;
-pub const plan = aion.plan;
-pub const tiling = aion.tiling;
 
 // ---------------------------------------------------------------------------
 // Gemma-4 E2B (text) architecture
@@ -101,7 +99,7 @@ pub const DecodeOptions = struct {
     head: bool = true,
     /// Rows in the per-layer embedding table. The real 262144 costs 2.5 GB of VRAM
     /// but contributes one gathered row per token, so shrinking it is the one cheap
-    /// way to fit a big run -- at the cost of that gather's tile count.
+    /// way to fit a big run -- at the cost of that gather's chunk count on a GPU.
     pli_vocab: usize = G4.vocab_size,
     /// Query length. 1 is decode; >1 walks the same graph as prefill.
     seq: usize = 1,
@@ -164,7 +162,7 @@ fn q8Bytes(elems: usize) u64 {
     return @as(u64, elems / info.block_elems) * info.block_bytes;
 }
 
-/// Fill each tile directly with finite, valid q8_0 blocks.
+/// Fill a host tensor's bytes directly with finite, valid q8_0 blocks.
 /// Direct writes avoid allocating a tensor-sized packed staging buffer.
 fn fillQuantPattern(mgr: *StorageManager, id: TensorId, seed: usize) !void {
     const t = try mgr.getMut(id);
@@ -174,24 +172,20 @@ fn fillQuantPattern(mgr: *StorageManager, id: TensorId, seed: usize) !void {
         const q: i32 = @intCast((i * 7 + seed * 13) % 127);
         b.* = @bitCast(@as(i8, @intCast(q - 63)));
     }
-    for (t.tile_offsets, t.tile_lens) |off, len| {
-        var w: usize = 0;
-        while (w < len) : (w += block.len) {
-            const n = @min(block.len, len - w);
-            @memcpy(t.data[off + w ..][0..n], block[0..n]);
-        }
+    var w: usize = 0;
+    while (w < t.data.len) : (w += block.len) {
+        const n = @min(block.len, t.data.len - w);
+        @memcpy(t.data[w..][0..n], block[0..n]);
     }
 }
 
-/// Fill an f32 tensor in place with a bounded pattern (norm gammas, scalars).
+/// Fill an f32 host tensor in place with a bounded pattern (norm gammas, scalars).
 fn fillF32Pattern(mgr: *StorageManager, id: TensorId, seed: usize) !void {
     const t = try mgr.getMut(id);
-    for (t.tile_offsets, t.tile_lens) |off, len| {
-        const words: []align(1) f32 = @alignCast(std.mem.bytesAsSlice(f32, t.data[off..][0..len]));
-        for (words, 0..) |*v, i| {
-            const k: usize = (i * 2654435761 + seed * 97) % 1000;
-            v.* = 0.5 + (@as(f32, @floatFromInt(k)) - 500.0) * 0.0004;
-        }
+    const words = std.mem.bytesAsSlice(f32, t.data);
+    for (words, 0..) |*v, i| {
+        const k: usize = (i * 2654435761 + seed * 97) % 1000;
+        v.* = 0.5 + (@as(f32, @floatFromInt(k)) - 500.0) * 0.0004;
     }
 }
 
@@ -202,7 +196,6 @@ const Ctx = struct {
     alloc: std.mem.Allocator,
     mgr: *StorageManager,
     g: *Graph,
-    policy: plan.TilePolicy,
     target: DeviceRef,
     dev: ?aion.device_memory.DeviceMemory,
     stats: *DecodeStats,
@@ -220,22 +213,12 @@ const Ctx = struct {
     fn place(self: *Ctx, id: TensorId) !void {
         const dev = self.dev orelse return;
         if (self.target.kind == .cpu) return;
-        const tile_shape = blk: {
-            const t = try self.mgr.getConst(id);
-            break :blk try self.alloc.dupe(usize, t.tile_shape);
-        };
-        defer self.alloc.free(tile_shape);
-        try self.mgr.moveTensor(id, self.target, dev, tile_shape, self.policy.tile_alignment);
+        try self.mgr.moveTensor(id, self.target, dev);
     }
 
-    /// A q8_0 matmul-B weight `[k, n]`, blocked along K, tiled the way the model
-    /// loader tiles one (`chooseQuantMatMulBTiles`), given its OWN storage.
+    /// A q8_0 matmul-B weight `[k, n]`, blocked along K, given its OWN storage.
     fn weight(self: *Ctx, k: usize, n: usize) !ValueId {
-        const tile = tiling.chooseQuantMatMulBTiles(self.policy, k, n, .q8_0);
-        const id = try self.mgr.createTiledTensor(.q8_0, &.{ k, n }, &tile, .{
-            .tile_alignment = self.policy.tile_alignment,
-            .quant_axis = 0,
-        });
+        const id = try self.mgr.createTensor(.q8_0, &.{ k, n }, .{ .quant_axis = 0 });
         try fillQuantPattern(self.mgr, id, self.nextSeed());
         const v = try self.g.addInput(.q8_0, &.{ k, n });
         try self.g.bindExternal(v, id);
@@ -250,11 +233,7 @@ const Ctx = struct {
     /// whether its bytes belong in the roofline: the token table does (it is the
     /// tied logits head), the per-layer table does not (one gathered row per token).
     fn table(self: *Ctx, v_rows: usize, d: usize, streamed: bool) !ValueId {
-        const tile = tiling.chooseQuantRowTiles(self.policy, .q8_0, v_rows, d);
-        const id = try self.mgr.createTiledTensor(.q8_0, &.{ v_rows, d }, &tile, .{
-            .tile_alignment = self.policy.tile_alignment,
-            .quant_axis = 1,
-        });
+        const id = try self.mgr.createTensor(.q8_0, &.{ v_rows, d }, .{ .quant_axis = 1 });
         try fillQuantPattern(self.mgr, id, self.nextSeed());
         const val = try self.g.addInput(.q8_0, &.{ v_rows, d });
         try self.g.bindExternal(val, id);
@@ -267,8 +246,7 @@ const Ctx = struct {
 
     /// An f32 vector input (norm gamma / beta).
     fn vec(self: *Ctx, n: usize) !ValueId {
-        const t1 = plan.chooseTileShape1D(self.policy, n);
-        const id = try self.mgr.createTiledTensor(.f32, &.{n}, &t1, .{ .tile_alignment = self.policy.tile_alignment });
+        const id = try self.mgr.createTensor(.f32, &.{n}, .{});
         try fillF32Pattern(self.mgr, id, self.nextSeed());
         const v = try self.g.addInput(.f32, &.{n});
         try self.g.bindExternal(v, id);
@@ -280,10 +258,10 @@ const Ctx = struct {
     /// A one-element f32 parameter used as a broadcast scalar. Aion has no
     /// scalar-typed operand; the converter relies on this same size-1 trick.
     fn scalar(self: *Ctx, value: f32) !ValueId {
-        const id = try self.mgr.createTiledTensor(.f32, &.{1}, &.{1}, .{ .tile_alignment = self.policy.tile_alignment });
+        const id = try self.mgr.createTensor(.f32, &.{1}, .{});
         {
             const t = try self.mgr.getMut(id);
-            std.mem.writeInt(u32, t.data[t.tile_offsets[0]..][0..4], @bitCast(value), .little);
+            std.mem.writeInt(u32, t.data[0..4], @bitCast(value), .little);
         }
         const v = try self.g.addInput(.f32, &.{1});
         try self.g.bindExternal(v, id);
@@ -306,7 +284,7 @@ const Ctx = struct {
     }
 
     fn i32In(self: *Ctx, shape: []const usize, vals: []const i32) !ValueId {
-        const id = try self.mgr.createTiledTensor(.i32, shape, shape, .{ .tile_alignment = self.policy.tile_alignment });
+        const id = try self.mgr.createTensor(.i32, shape, .{});
         try self.mgr.writeFromPackedScalar(id, std.mem.sliceAsBytes(vals));
         const v = try self.g.addInput(.i32, shape);
         try self.g.bindExternal(v, id);
@@ -314,11 +292,18 @@ const Ctx = struct {
         return v;
     }
 
-    /// A zeroed f16 KV cache `[1, t_len, kv_heads, head_dim]` (time is dim 1).
-    fn cache(self: *Ctx, t_len: usize, head_dim: usize) !ValueId {
+    /// A zeroed f16 KV cache `[1, t_len, kv_heads, head_dim]` (time is dim 1). A
+    /// sliding-window layer's cache is a ring of `t_len` slots, as the model loads it:
+    /// positions past the window wrap instead of running off the end.
+    fn cache(self: *Ctx, t_len: usize, head_dim: usize, ring: bool) !ValueId {
         const shape = [_]usize{ 1, t_len, G4.num_kv_heads, head_dim };
-        const id = try self.mgr.createTiledTensor(.f16, &shape, &shape, .{ .tile_alignment = self.policy.tile_alignment });
+        const id = try self.mgr.createTensor(.f16, &shape, .{});
         try self.mgr.zeroTensorData(id);
+        if (ring) {
+            // The RAM budget is reserved, not enforced; the policy is what matters.
+            if (!self.mgr.hasCache()) try self.mgr.configureCache(.{ .ram_budget_bytes = std.math.maxInt(usize) });
+            try self.mgr.registerSequenceCachePolicy(id, .{ .rolling = .{ .history_tokens = t_len - 1 } });
+        }
         const v = try self.g.addInput(.f16, &shape);
         try self.g.bindExternal(v, id);
         self.stats.resident_bytes += @as(u64, t_len * G4.num_kv_heads * head_dim) * 2;
@@ -376,9 +361,8 @@ pub fn selectLayers(buf: []usize, want: usize) []usize {
 pub fn gemma4E2BDecode(
     alloc: std.mem.Allocator,
     mgr: *StorageManager,
-    policy: plan.TilePolicy,
     opts: DecodeOptions,
-    target: DeviceRef,
+    target: aion.program.Target,
     dev: ?aion.device_memory.DeviceMemory,
 ) !Built {
     var g = Graph.init(alloc);
@@ -389,8 +373,7 @@ pub fn gemma4E2BDecode(
         .alloc = alloc,
         .mgr = mgr,
         .g = &g,
-        .policy = policy,
-        .target = target,
+        .target = target.device,
         .dev = dev,
         .stats = &stats,
         .ablate = opts.ablate,
@@ -454,8 +437,8 @@ pub fn gemma4E2BDecode(
         if (k_cache[src] != null) continue;
         const hd = G4.headDim(src);
         const t_len = if (G4.isGlobal(src)) opts.ctx else G4.local_sliding_window;
-        k_cache[src] = try ctx.cache(t_len, hd);
-        v_cache[src] = try ctx.cache(t_len, hd);
+        k_cache[src] = try ctx.cache(t_len, hd, !G4.isGlobal(src));
+        v_cache[src] = try ctx.cache(t_len, hd, !G4.isGlobal(src));
     }
 
     // ---- transformer blocks ----
@@ -547,7 +530,7 @@ pub fn gemma4E2BDecode(
     }
     try g.setOutputs(&.{out_v});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(target, policy));
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0], .stats = stats };
 }
 
@@ -566,11 +549,10 @@ pub const AttnKind = enum { local, global };
 pub fn gemma4Attention(
     alloc: std.mem.Allocator,
     mgr: *StorageManager,
-    policy: plan.TilePolicy,
     kind: AttnKind,
     ctx_len: usize,
     repeat: usize,
-    target: DeviceRef,
+    target: aion.program.Target,
     dev: ?aion.device_memory.DeviceMemory,
 ) !Built {
     var g = Graph.init(alloc);
@@ -581,8 +563,7 @@ pub fn gemma4Attention(
         .alloc = alloc,
         .mgr = mgr,
         .g = &g,
-        .policy = policy,
-        .target = target,
+        .target = target.device,
         .dev = dev,
         .stats = &stats,
     };
@@ -592,7 +573,7 @@ pub fn gemma4Attention(
     const win: aion.graph.AttentionWindow = if (kind == .global) .causal else .sliding(G4.local_sliding_window - 1, 0);
 
     const q_shape = [_]usize{ 1, 1, G4.num_heads, head_dim };
-    const q_id = try mgr.createTiledTensor(.f32, &q_shape, &q_shape, .{ .tile_alignment = policy.tile_alignment });
+    const q_id = try mgr.createTensor(.f32, &q_shape, .{});
     try fillF32Pattern(mgr, q_id, 1);
     const q = try g.addInput(.f32, &q_shape);
     try g.bindExternal(q, q_id);
@@ -608,8 +589,8 @@ pub fn gemma4Attention(
     for (0..n_rep) |_| {
         // A fresh cache pair per copy: sharing one would let the L2 serve every
         // repeat after the first and turn this into a cache benchmark.
-        const k = try ctx.cache(t_len, head_dim);
-        const v = try ctx.cache(t_len, head_dim);
+        const k = try ctx.cache(t_len, head_dim, kind == .local);
+        const v = try ctx.cache(t_len, head_dim, kind == .local);
         cur = try g.addAttention(cur, k, v, positions, kv_len, 1.0, win, 0.0);
     }
     try g.setOutputs(&.{cur});
@@ -618,7 +599,7 @@ pub fn gemma4Attention(
     const visible: usize = if (kind == .global) t_len else @min(t_len, G4.local_sliding_window);
     stats.stream_bytes = @as(u64, 2 * visible * G4.num_kv_heads * head_dim) * 2 * n_rep;
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, .cpu(policy));
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0], .stats = stats };
 }
 
@@ -647,17 +628,13 @@ pub fn stepHistogram(prog: *const aion.program.Program, counts: *std.StringHashM
 }
 
 /// Print the lowered steps in execution order. Counts say what is expensive; the
-/// ORDER says why it exists -- a retile only makes sense next to the ops whose tiling
-/// disagreed. Run with `--layers 1` to get one readable layer.
+/// ORDER says why it exists. Run with `--layers 1` to get one readable layer.
 pub fn printStepSequence(mgr: *StorageManager, prog: *const aion.program.Program, limit: usize) void {
     std.debug.print("  step sequence (first {d} of {d}):\n", .{ @min(limit, prog.steps.len), prog.steps.len });
     for (prog.steps[0..@min(limit, prog.steps.len)], 0..) |step, i| {
         std.debug.print("    {d:>4}  {s:<22}", .{ i, @tagName(step.op) });
-        // For the view family, the shapes and TILINGS are the whole story: a retile
-        // exists only because two neighbours disagreed about tiling, and the printout
-        // is how you see which pair.
+        // For the view family the shapes are the whole story.
         switch (step.op) {
-            .ReTileCopyScalar => |s| printPair(mgr, s.src, s.dst),
             .ReshapeScalar => |s| printPair(mgr, s.src, s.dst),
             .SliceNDScalar => |s| printPair(mgr, s.src, s.dst),
             else => {},
@@ -679,8 +656,6 @@ fn printOne(mgr: *StorageManager, label: []const u8, id: TensorId) void {
     };
     std.debug.print("{s} shape[", .{label});
     for (t.shape, 0..) |d, i| std.debug.print("{s}{d}", .{ if (i == 0) "" else ",", d });
-    std.debug.print("] tile[", .{});
-    for (t.tile_shape, 0..) |d, i| std.debug.print("{s}{d}", .{ if (i == 0) "" else ",", d });
     std.debug.print("]", .{});
 }
 
@@ -692,7 +667,6 @@ pub fn countNoopViews(mgr: *StorageManager, prog: *const aion.program.Program) s
     for (prog.steps) |step| {
         const pair: ?[2]TensorId = switch (step.op) {
             .ReshapeScalar => |s| .{ s.src, s.dst },
-            .ReTileCopyScalar => |s| .{ s.src, s.dst },
             else => null,
         };
         const p = pair orelse continue;

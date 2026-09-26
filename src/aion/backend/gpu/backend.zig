@@ -13,21 +13,21 @@
 //!   - Every tensor has one physical placement. Model preparation migrates GPU
 //!     values before execution; the executor has no host-staging fallback.
 //!   - Transfers are explicit executable steps. Host control reads can only see
-//!     CPU mirrors produced by those steps, while kernels only see device tiles.
+//!     CPU mirrors produced by those steps, while kernels only see device buffers.
 //!   - Each `executeProgram` records dispatches into a `Frame` and submits once
 //!     except where an explicit control transfer requires synchronization.
 //!   - WGSL kernels are cached via `Pipelines` (module per kernel, pipeline +
 //!     bind-group layout per entry point -- reflected once, not per dispatch).
 //!
-//! Kernel coverage (f32, multi-tile): ElemwiseBinaryTiled, UnaryTiled,
-//! broadcast-aware elementwise binary, CopyTiled (buffer-to-buffer, dtype-agnostic),
-//! MatMulTiled (rank-2, autotuned register-blocked GEMM), MatMulNTTiled
-//! (q8_0/f32 weights: GEMV for M==1, dequant + f32 GEMM for M>1), SoftmaxTiled /
-//! RMSNormTiled / LayerNormTiled / ReduceAll / ReduceAxis (row-wise, last axis
-//! intra-tile), GatherRows / RoPE1D / SequenceAppend / Cast (decode data
-//! movement), AttentionTiled (GQA over f32/f16 k/v, positions/end read
-//! on-device when present), Conv1DTiled /
-//! Conv2DTiled (direct kernel). Everything else returns `error.Unsupported`.
+//! Kernel coverage: ElemwiseBinary, Unary,
+//! broadcast-aware elementwise binary, Copy (buffer-to-buffer, dtype-agnostic),
+//! MatMul (rank-2, autotuned register-blocked GEMM), MatMulNT
+//! (q8_0/f32 weights: GEMV for M==1, dequant + f32 GEMM for M>1), Softmax /
+//! RMSNorm / LayerNorm / ReduceAll / ReduceAxis (row-wise, last axis),
+//! GatherRows / RoPE1D / SequenceAppend / Cast (decode data
+//! movement), Attention (GQA over f32/f16 k/v, positions/end read
+//! on-device when present), Conv1D /
+//! Conv2D (direct kernel). Everything else returns `error.Unsupported`.
 
 const std = @import("std");
 
@@ -164,7 +164,7 @@ pub const GpuBackend = struct {
     }
 
     /// Build a session over an already-placed store. GPU operation code receives
-    /// only opaque device tiles; host values are reachable solely through
+    /// only opaque device buffers; host values are reachable solely through
     /// explicit transfer/control paths.
     pub fn createSession(self: *Self, store: TensorStore) tensor_store_mod.StoreError!Session {
         // Wire the D2H memcpy pool now that `self` is at its final address (the
@@ -198,18 +198,10 @@ pub const GpuBackend = struct {
             return s.host.meta(id);
         }
 
-        fn deviceAcquire(ctx: *anyopaque, id: TensorId, tile_index: usize) tensor_store_mod.StoreError!device_store_mod.TileRef {
+        fn deviceAcquire(ctx: *anyopaque, id: TensorId, chunk: usize) tensor_store_mod.StoreError!device_store_mod.Chunk {
             const s: *GpuSession = @ptrCast(@alignCast(ctx));
-            const tile = (try s.host.deviceTile(id, tile_index)) orelse return error.InvalidArgument;
-            return .{
-                .handle = tile.handle,
-                .offset = 0,
-                .len = tile.len,
-                .dtype = tile.dtype,
-                .rank = tile.rank,
-                .shape_mem = tile.shape_mem,
-                .strides_mem = tile.strides_mem,
-            };
+            const ref = (try s.host.deviceChunk(id, chunk)) orelse return error.InvalidArgument;
+            return .{ .handle = ref.handle, .offset = 0, .len = ref.len, .rows = ref.rows };
         }
 
         fn deviceRelease(_: *anyopaque, _: usize) void {}
@@ -256,12 +248,6 @@ pub const GpuBackend = struct {
         };
     };
 
-    fn totalTiles(meta: TensorMeta) usize {
-        var total: usize = 1;
-        for (meta.tile_counts) |cnt| total *= cnt;
-        return total;
-    }
-
     // ---- vtable ----
 
     /// Per-`executeProgram` execution state. Most steps just record into the
@@ -292,7 +278,7 @@ pub const GpuBackend = struct {
             r.frame.flushInPlace() catch return error.ExecutionFailed;
         }
 
-        /// Host-read an i32 control value (element 0 of tile 0). `id` is always
+        /// Host-read an i32 control value (element 0). `id` is always
         /// CPU-placed — the compiler transferred it if the device wrote it — so
         /// this is a plain read with no submit and no device poll.
         fn readI32Scalar(r: *Runner, id: TensorId) ExecuteProgramError!i32 {
@@ -302,8 +288,8 @@ pub const GpuBackend = struct {
             return lease.vals[0];
         }
 
-        /// Device-side equivalent of the CPU's `copyTensorLists`: same-layout
-        /// tensors, tile-for-tile buffer copies (stays in-frame, no sync).
+        /// Device-side equivalent of the CPU's `copyTensorLists`: same-shape
+        /// tensors, chunk-for-chunk buffer copies (stays in-frame, no sync).
         fn copyLists(r: *Runner, dst: []const TensorId, src: []const TensorId) ExecuteProgramError!void {
             const hs = r.op_ctx.store;
             for (dst, src) |dst_id, src_id| {
@@ -312,14 +298,13 @@ pub const GpuBackend = struct {
                 const src_meta = hs.meta(src_id) catch return error.ExecutionFailed;
                 if (dst_meta.dtype != src_meta.dtype or dst_meta.rank != src_meta.rank) return error.ExecutionFailed;
                 for (dst_meta.shape, src_meta.shape) |a, b| if (a != b) return error.ExecutionFailed;
-                for (dst_meta.tile_shape, src_meta.tile_shape) |a, b| if (a != b) return error.ExecutionFailed;
-                for (dst_meta.tile_counts, src_meta.tile_counts) |a, b| if (a != b) return error.ExecutionFailed;
 
-                const total = totalTiles(dst_meta);
+                const total = dst_meta.chunks;
+                if (src_meta.chunks != total) return error.ExecutionFailed;
                 var ti: usize = 0;
                 while (ti < total) : (ti += 1) {
-                    const st = r.op_ctx.store.acquireTileDeviceConstLinear(src_id, ti) catch return error.ExecutionFailed;
-                    const dt = r.op_ctx.store.acquireTileDeviceMutLinear(dst_id, ti) catch return error.ExecutionFailed;
+                    const st = r.op_ctx.store.acquireChunkConst(src_id, ti) catch return error.ExecutionFailed;
+                    const dt = r.op_ctx.store.acquireChunkMut(dst_id, ti) catch return error.ExecutionFailed;
                     defer {
                         hs.releaseConst(st.token);
                         hs.releaseMut(dt.token);
@@ -360,28 +345,28 @@ pub const GpuBackend = struct {
                             const input = r.op_ctx.store.meta(s.a) catch null;
                             const output = r.op_ctx.store.meta(s.out) catch null;
                             if (input) |m| std.debug.print(
-                                "[gpu]   input id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
-                                .{ s.a, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                                "[gpu]   input id={} dtype={s} shape={any}\n",
+                                .{ s.a, @tagName(m.dtype), m.shape },
                             );
                             if (output) |m| std.debug.print(
-                                "[gpu]   output id={} dtype={s} shape={any} tile_shape={any} tile_counts={any} axis={} op={s}\n",
-                                .{ s.out, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts, s.axis, @tagName(s.op) },
+                                "[gpu]   output id={} dtype={s} shape={any} axis={} op={s}\n",
+                                .{ s.out, @tagName(m.dtype), m.shape, s.axis, @tagName(s.op) },
                             );
                         },
-                        .LayerNormTiled => |s| {
+                        .LayerNorm => |s| {
                             const x = r.op_ctx.store.meta(s.x) catch null;
                             const gamma = r.op_ctx.store.meta(s.gamma) catch null;
                             const beta = r.op_ctx.store.meta(s.beta) catch null;
                             const output = r.op_ctx.store.meta(s.out) catch null;
                             if (x) |m| std.debug.print(
-                                "[gpu]   x id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
-                                .{ s.x, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                                "[gpu]   x id={} dtype={s} shape={any}\n",
+                                .{ s.x, @tagName(m.dtype), m.shape },
                             );
                             if (gamma) |m| std.debug.print("[gpu]   gamma id={} dtype={s} shape={any}\n", .{ s.gamma, @tagName(m.dtype), m.shape });
                             if (beta) |m| std.debug.print("[gpu]   beta id={} dtype={s} shape={any}\n", .{ s.beta, @tagName(m.dtype), m.shape });
                             if (output) |m| std.debug.print(
-                                "[gpu]   output id={} dtype={s} shape={any} tile_shape={any} tile_counts={any}\n",
-                                .{ s.out, @tagName(m.dtype), m.shape, m.tile_shape, m.tile_counts },
+                                "[gpu]   output id={} dtype={s} shape={any}\n",
+                                .{ s.out, @tagName(m.dtype), m.shape },
                             );
                         },
                         else => {},
@@ -401,27 +386,39 @@ pub const GpuBackend = struct {
             const hs = r.op_ctx.control.host;
             const src_meta = hs.meta(transfer.src) catch return error.ExecutionFailed;
             const dst_meta = hs.meta(transfer.dst) catch return error.ExecutionFailed;
-            if (src_meta.dtype != dst_meta.dtype or totalTiles(src_meta) != totalTiles(dst_meta)) return error.ExecutionFailed;
-            const count = totalTiles(src_meta);
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
-                if (transfer.source.kind == .webgpu and transfer.destination.kind == .cpu) {
-                    const src = r.op_ctx.store.acquireTileDeviceConstLinear(transfer.src, i) catch return error.ExecutionFailed;
-                    defer r.op_ctx.store.releaseConst(src.token);
-                    const dst = hs.acquireTileMutLinear(transfer.dst, i) catch return error.ExecutionFailed;
-                    defer hs.releaseMut(dst.token);
-                    if (src.len != dst.bytes.len) return error.ExecutionFailed;
-                    r.op_ctx.devmem.device().copyD2H(dst.bytes, src.handle, src.offset) catch return error.ExecutionFailed;
-                } else if (transfer.source.kind == .cpu and transfer.destination.kind == .webgpu) {
-                    const src = hs.acquireTileConstLinear(transfer.src, i) catch return error.ExecutionFailed;
-                    defer hs.releaseConst(src.token);
-                    const dst = r.op_ctx.store.acquireTileDeviceMutLinear(transfer.dst, i) catch return error.ExecutionFailed;
-                    defer r.op_ctx.store.releaseMut(dst.token);
-                    if (src.bytes.len != dst.len) return error.ExecutionFailed;
-                    r.op_ctx.devmem.device().copyH2D(dst.handle, dst.offset, src.bytes) catch return error.ExecutionFailed;
-                } else {
-                    return error.Unsupported;
+            if (src_meta.dtype != dst_meta.dtype) return error.ExecutionFailed;
+            // The host side is one buffer; the device side may be chunked along
+            // dim 0, so each chunk moves its own byte range of the host buffer.
+            const to_host = transfer.source.kind == .webgpu and transfer.destination.kind == .cpu;
+            const to_device = transfer.source.kind == .cpu and transfer.destination.kind == .webgpu;
+            if (!to_host and !to_device) return error.Unsupported;
+            const dev_id = if (to_host) transfer.src else transfer.dst;
+            const host_id = if (to_host) transfer.dst else transfer.src;
+            const chunks = (if (to_host) src_meta else dst_meta).chunks;
+            const device = r.op_ctx.devmem.device();
+            var at: usize = 0;
+            if (to_host) {
+                const host = hs.acquireMut(host_id) catch return error.ExecutionFailed;
+                defer hs.releaseMut(host.token);
+                for (0..chunks) |ci| {
+                    const chunk = r.op_ctx.store.acquireChunkConst(dev_id, ci) catch return error.ExecutionFailed;
+                    defer r.op_ctx.store.releaseConst(chunk.token);
+                    if (at + chunk.len > host.bytes.len) return error.ExecutionFailed;
+                    device.copyD2H(host.bytes[at..][0..chunk.len], chunk.handle, chunk.offset) catch return error.ExecutionFailed;
+                    at += chunk.len;
                 }
+                if (at != host.bytes.len) return error.ExecutionFailed;
+            } else {
+                const host = hs.acquireConst(host_id) catch return error.ExecutionFailed;
+                defer hs.releaseConst(host.token);
+                for (0..chunks) |ci| {
+                    const chunk = r.op_ctx.store.acquireChunkMut(dev_id, ci) catch return error.ExecutionFailed;
+                    defer r.op_ctx.store.releaseMut(chunk.token);
+                    if (at + chunk.len > host.bytes.len) return error.ExecutionFailed;
+                    device.copyH2D(chunk.handle, chunk.offset, host.bytes[at..][0..chunk.len]) catch return error.ExecutionFailed;
+                    at += chunk.len;
+                }
+                if (at != host.bytes.len) return error.ExecutionFailed;
             }
         }
 
@@ -429,32 +426,32 @@ pub const GpuBackend = struct {
             const op_ctx = r.op_ctx;
             const frame = &r.frame;
             switch (step) {
-                .ElemwiseBinaryTiled => |s| try simple_ops.execElemwiseBinary(op_ctx, frame, s),
-                .UnaryTiled => |s| try simple_ops.execUnary(op_ctx, frame, s),
-                .CopyTiled => |s| try simple_ops.execCopy(op_ctx, frame, s),
-                .CastTiled => |s| try simple_ops.execCast(op_ctx, frame, s),
-                .MatMulTiled => |s| try r.gb.matmul.exec(op_ctx, frame, s),
-                .MatMulNTTiled => |s| try r.gb.nt.exec(op_ctx, frame, s, r.gb.matmul.generated),
-                .SoftmaxTiled => |s| try rowwise.execSoftmax(op_ctx, frame, s),
+                .ElemwiseBinary => |s| try simple_ops.execElemwiseBinary(op_ctx, frame, s),
+                .Unary => |s| try simple_ops.execUnary(op_ctx, frame, s),
+                .Copy => |s| try simple_ops.execCopy(op_ctx, frame, s),
+                .Cast => |s| try simple_ops.execCast(op_ctx, frame, s),
+                .MatMul => |s| try r.gb.matmul.exec(op_ctx, frame, s),
+                .MatMulNT => |s| try r.gb.nt.exec(op_ctx, frame, s, r.gb.matmul.generated),
+                .Softmax => |s| try rowwise.execSoftmax(op_ctx, frame, s),
                 // The residual is a configuration of the norm, so the kernel choice is
                 // made here rather than by a step tag: `add_norm.wgsl` when one is
-                // present, the plain rowwise/cross-tile paths otherwise.
-                .RMSNormTiled => |s| if (s.residual != null)
+                // present, the plain rowwise path otherwise.
+                .RMSNorm => |s| if (s.residual != null)
                     try rowwise.execAddNorm(op_ctx, frame, s)
                 else
                     try rowwise.execNorm(op_ctx, frame, .rmsnorm, s),
-                .LayerNormTiled => |s| try rowwise.execNorm(op_ctx, frame, .layernorm, s),
+                .LayerNorm => |s| try rowwise.execNorm(op_ctx, frame, .layernorm, s),
                 .ReduceAll => |s| try rowwise.execReduceAll(op_ctx, frame, s),
                 .ReduceAxis => |s| try rowwise.execReduceAxis(op_ctx, frame, s),
-                .GatherRowsTiled => |s| try decode_ops.execGatherRows(op_ctx, frame, s),
+                .GatherRows => |s| try decode_ops.execGatherRows(op_ctx, frame, s),
                 .GatherND => |s| try decode_ops.execGatherND(op_ctx, frame, s),
-                .GatherTiled => |s| try decode_ops.execGather(op_ctx, frame, s),
-                .RoPE1DTiled => |s| try decode_ops.execRoPE(op_ctx, frame, s),
-                .SequenceAppendTiled => |s| try decode_ops.execSequenceAppend(op_ctx, frame, s),
-                .AttentionTiled => |s| try attention_exec.execAttention(op_ctx, frame, s),
-                .RelPosMHATiled => |s| try attention_exec.execRelPosMHA(op_ctx, frame, s),
-                .Conv1DTiled => |s| try conv_exec.execConv1D(op_ctx, frame, s),
-                .Conv2DTiled => |s| try conv_exec.execConv2D(op_ctx, frame, s, r.gb.matmul.generated_conv),
+                .Gather => |s| try decode_ops.execGather(op_ctx, frame, s),
+                .RoPE1D => |s| try decode_ops.execRoPE(op_ctx, frame, s),
+                .SequenceAppend => |s| try decode_ops.execSequenceAppend(op_ctx, frame, s),
+                .Attention => |s| try attention_exec.execAttention(op_ctx, frame, s),
+                .RelPosMHA => |s| try attention_exec.execRelPosMHA(op_ctx, frame, s),
+                .Conv1D => |s| try conv_exec.execConv1D(op_ctx, frame, s),
+                .Conv2D => |s| try conv_exec.execConv2D(op_ctx, frame, s, r.gb.matmul.generated_conv),
                 .MaxPool2D => |s| try @import("exec/pool.zig").exec(op_ctx, frame, s),
                 .LSTMCellFused => |s| try lstm_exec.execLSTMCell(op_ctx, frame, s),
                 .RFFT => |s| try fft_ops.execRFFT(op_ctx, frame, s),
@@ -464,7 +461,6 @@ pub const GpuBackend = struct {
                 .ScatterRow => |s| try decode_ops.execScatterRow(op_ctx, frame, s),
                 .ConcatScalar => |s| try view_ops.execConcat(op_ctx, frame, s),
                 .ReshapeScalar => |s| try view_ops.execPackedCopy(op_ctx, frame, s.dst, s.src),
-                .ReTileCopyScalar => |s| try view_ops.execPackedCopy(op_ctx, frame, s.dst, s.src),
                 .Transpose2DScalar => |s| try view_ops.execTranspose2D(op_ctx, frame, s),
                 .SliceNDScalar => |s| try view_ops.execSliceND(op_ctx, frame, s),
                 .Transfer => |s| try r.runTransfer(s),

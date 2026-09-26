@@ -6,10 +6,9 @@
 //!
 //! v1 contract (Unsupported otherwise):
 //!   - rank 3 (conv1d [B, L, C]) / rank 4 (conv2d [B, H, W, C]), f32;
-//!   - out tiles carry one batch each (tile_shape[0] == 1);
-//!   - x is one tile per batch group (spatial/channel dims untiled);
-//!   - w and bias are single packed tiles;
+//!   - every operand one device buffer;
 //!   - pad_mode zero or reflect (reflect needs input extent >= 2).
+//! One dispatch covers every batch.
 //!
 //! A rank-4, single-group, zero-padded conv instead lowers onto the generated
 //! implicit-GEMM kernels (`matmul/codegen.zig`, `kind = .conv`): same register
@@ -56,7 +55,7 @@ const ConvGemmParams = extern struct {
     c_in: u32,
     kh: u32,
     kw: u32,
-    x_base: u32,
+    x_batch: u32,
     pad_top: u32,
     pad_left: u32,
     stride_h: u32,
@@ -64,8 +63,8 @@ const ConvGemmParams = extern struct {
     dil_h: u32,
     dil_w: u32,
     has_bias: u32,
-    base_h: u32,
-    base_w: u32,
+    ohw: u32,
+    _pad: u32 = 0,
 };
 
 /// Widest block whose `bn` still fits the output-channel count, so a 64-channel
@@ -106,7 +105,7 @@ fn depthwiseOk(geo: Geometry, c_in_g: usize, c_out: usize, rank: usize) bool {
 
 /// Field order matches `struct Params` in conv.wgsl.
 const ConvParams = extern struct {
-    x_base: u32,
+    x_batch: u32,
     h_in: u32,
     w_in: u32,
     c_in: u32,
@@ -121,9 +120,9 @@ const ConvParams = extern struct {
     dil_w: u32,
     pad_top: u32,
     pad_left: u32,
-    base_h: u32,
-    base_w: u32,
-    base_c: u32,
+    batch: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
     oh_cnt: u32,
     ow_cnt: u32,
     c_cnt: u32,
@@ -159,72 +158,7 @@ fn prodU(xs: []const usize) usize {
     return p;
 }
 
-/// Whether x has any spatial/channel dim (dims 1..) split into multiple tiles.
-fn xSpatiallyTiled(x_meta: TensorMetaT, rank: usize) bool {
-    var d: usize = 1;
-    while (d < rank) : (d += 1) if (x_meta.tile_counts[d] != 1) return true;
-    return false;
-}
-
-const TensorMetaT = tensor_store_mod.TensorMeta;
-
-/// A conv input materialized into one contiguous scratch tile.
-const MaterializedX = struct { buf: c.WGPUBuffer, len: u64 };
-
-/// Materialize a spatially-tiled x into one contiguous `[batch,H,W,C]` scratch
-/// buffer (the conv kernel needs the whole spatial extent addressable from one
-/// binding). Handles x tiled along a SINGLE dim with the others whole — e.g. a
-/// mel/subsampling input tiled per time-frame. Each tile is a contiguous run in
-/// packed order, so this is `n_tiles * outer` buffer copies. Returns the scratch
-/// buffer + its byte length.
-fn materializeX(ctx: Ctx, frame: *Frame, x_id: executable.TensorId, x_meta: TensorMetaT, rank: usize) ExecuteProgramError!MaterializedX {
-    const hs = ctx.store;
-    const elem: usize = 4;
-
-    // Find the single split dim.
-    var sp: ?usize = null;
-    var d: usize = 0;
-    while (d < rank) : (d += 1) {
-        if (x_meta.tile_counts[d] != 1) {
-            if (sp != null) return error.Unsupported; // more than one split dim
-            sp = d;
-        }
-    }
-    const split = sp orelse return error.Unsupported;
-
-    const total_elems = prodU(x_meta.shape[0..rank]);
-    const total_bytes: u64 = @as(u64, total_elems) * elem;
-    if (!context.storageBindingFits(ctx, total_bytes)) return error.Unsupported;
-    const scratch = try ctx.scratch.ensure(ctx.gpu, total_bytes);
-
-    const outer = prodU(x_meta.shape[0..split]);
-    const inner = prodU(x_meta.shape[split + 1 .. rank]);
-    const dim = x_meta.shape[split];
-    const ts = x_meta.tile_shape[split];
-    const n_tiles = x_meta.tile_counts[split];
-    if (ts == 0) return error.Unsupported;
-
-    var t: usize = 0;
-    while (t < n_tiles) : (t += 1) {
-        const lo = t * ts;
-        const this_ts = @min(ts, dim - lo);
-        const xt = ctx.store.acquireTileDeviceConstLinear(x_id, t) catch return error.ExecutionFailed;
-        defer hs.releaseConst(xt.token);
-        if (!context.storageBindingFits(ctx, xt.len)) return error.Unsupported;
-        const xt_buf = ctx.devmem.bufferFor(xt.handle).?;
-        const run_bytes: u64 = @as(u64, this_ts) * inner * elem;
-        var o: usize = 0;
-        while (o < outer) : (o += 1) {
-            const src_off: u64 = @as(u64, o * this_ts) * inner * elem;
-            const dst_off: u64 = @as(u64, o * dim + lo) * inner * elem;
-            if (src_off + run_bytes > xt.len) return error.ExecutionFailed;
-            frame.recordCopy(xt_buf, src_off, scratch, dst_off, run_bytes);
-        }
-    }
-    return .{ .buf = scratch, .len = total_bytes };
-}
-
-pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) ExecuteProgramError!void {
+pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1D) ExecuteProgramError!void {
     const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 3) return error.Unsupported;
@@ -246,7 +180,7 @@ pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1DTiled) Execut
     return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, &.{});
 }
 
-pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2DTiled, generated: []const Generated) ExecuteProgramError!void {
+pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2D, generated: []const Generated) ExecuteProgramError!void {
     const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 4) return error.Unsupported;
@@ -305,202 +239,118 @@ fn execConv(
         },
     }
 
-    // x: the kernel needs the whole spatial/channel extent from one binding. If
-    // the compiler split a spatial/channel dim (e.g. a mel input tiled per
-    // time-frame), materialize x into one contiguous scratch tile first.
-    const x_materialized: ?MaterializedX = if (xSpatiallyTiled(x_meta, rank))
-        try materializeX(ctx, frame, x_id, x_meta, rank)
-    else
-        null;
-    // w / bias: single packed tiles.
-    if (context.totalTiles(w_meta) != 1) return error.Unsupported;
-    var bias_tile: ?device_store.TileRef = null;
-    defer if (bias_tile) |bt| hs.releaseConst(bt.token);
+    // Every operand is one device buffer (a tensor past the binding limit would be
+    // chunked, which this kernel does not address).
+    inline for (.{ out_meta, x_meta, w_meta }) |m| if (m.chunks != 1) return error.Unsupported;
+    var dbias: ?device_store.Chunk = null;
+    defer if (dbias) |bt| hs.releaseConst(bt.token);
     if (bias_id) |bid| {
         const b_meta = hs.meta(bid) catch return error.ExecutionFailed;
         if (b_meta.rank != 1 or b_meta.dtype != .f32) return error.Unsupported;
-        if (b_meta.shape[0] < c_out or context.totalTiles(b_meta) != 1) return error.Unsupported;
-        const bt = ctx.store.acquireTileDeviceConstLinear(bid, 0) catch return error.ExecutionFailed;
-        bias_tile = bt;
-        if (context.packedElems(bt.rank, bt.shape_mem[0..1], bt.strides_mem[0..1]) == null) return error.Unsupported;
+        if (b_meta.shape[0] < c_out or b_meta.chunks != 1) return error.Unsupported;
+        dbias = ctx.store.acquireConst(bid) catch return error.ExecutionFailed;
     }
-
-    const dw = ctx.store.acquireTileDeviceConstLinear(w_id, 0) catch return error.ExecutionFailed;
+    const dw = ctx.store.acquireConst(w_id) catch return error.ExecutionFailed;
     defer hs.releaseConst(dw.token);
-    if (!context.storageBindingFits(ctx, dw.len)) return error.Unsupported;
-    if (context.packedElems(dw.rank, dw.shape_mem[0..rank], dw.strides_mem[0..rank]) == null) return error.Unsupported;
+    const dx = ctx.store.acquireConst(x_id) catch return error.ExecutionFailed;
+    defer hs.releaseConst(dx.token);
+    const dout = ctx.store.acquireMut(out_id) catch return error.ExecutionFailed;
+    defer hs.releaseMut(dout.token);
+    inline for (.{ dw.len, dx.len, dout.len }) |len| if (!context.storageBindingFits(ctx, len)) return error.Unsupported;
+
+    const batch = out_meta.shape[0];
+    const oh_cnt = out_meta.shape[1];
+    const ow_cnt = if (rank == 4) out_meta.shape[2] else 1;
+    const x_batch = geo.h_in * geo.w_in * geo.c_in;
+    const out_total = batch * oh_cnt * ow_cnt * c_out;
+    if (out_total == 0) return;
+
+    const bias_buf = if (dbias) |bt| ctx.devmem.bufferFor(bt.handle).? else ctx.devmem.bufferFor(dw.handle).?;
+    const bias_len = if (dbias) |bt| bt.len else dw.len;
+    const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(dx.handle).?, ctx.devmem.bufferFor(dw.handle).?, bias_buf, ctx.devmem.bufferFor(dout.handle).? };
+    const sizes = [_]u64{ dx.len, dw.len, bias_len, dout.len };
 
     // Implicit GEMM needs a plain 2-D convolution: a group splits A by output
     // column, and reflect padding is not a zero-fill, so neither fits the kernel.
+    // M runs over every batch's pixels, so C is the output buffer exactly.
     const gemm_idx: ?usize = if (rank == 4 and geo.groups == 1 and geo.pad_mode == .zero and generated.len != 0)
         chooseConvConfig(generated, ctx, c_out, @intCast(c_out * @sizeOf(f32)))
     else
         null;
-    const gemm_built: ?pipelines.Built = if (gemm_idx) |gi|
-        (ctx.pipes.get(generated[gi].desc, generated[gi].entry) catch null)
-    else
-        null;
+    if (gemm_idx) |gi| gemm: {
+        const gb = ctx.pipes.get(generated[gi].desc, generated[gi].entry) catch break :gemm;
+        const m_dim = std.math.cast(u32, batch * oh_cnt * ow_cnt) orelse break :gemm;
+        const n_dim = std.math.cast(u32, c_out) orelse break :gemm;
+        const k_dim = std.math.cast(u32, geo.kh * geo.kw * geo.c_in) orelse break :gemm;
+        const gp: ConvGemmParams = .{
+            .m = m_dim,
+            .n = n_dim,
+            .k = k_dim,
+            .b_row = n_dim,
+            .c_row = n_dim,
+            .ow_out = @intCast(ow_cnt),
+            .h_in = @intCast(geo.h_in),
+            .w_in = @intCast(geo.w_in),
+            .c_in = @intCast(geo.c_in),
+            .kh = @intCast(geo.kh),
+            .kw = @intCast(geo.kw),
+            .x_batch = std.math.cast(u32, x_batch) orelse break :gemm,
+            .pad_top = @intCast(geo.pad_top),
+            .pad_left = @intCast(geo.pad_left),
+            .stride_h = @intCast(geo.stride_h),
+            .stride_w = @intCast(geo.stride_w),
+            .dil_h = @intCast(geo.dil_h),
+            .dil_w = @intCast(geo.dil_w),
+            .has_bias = @intFromBool(dbias != null),
+            .ohw = @intCast(oh_cnt * ow_cnt),
+        };
+        const cfg = generated[gi].cfg;
+        const gx = context.ceilDiv(n_dim, cfg.bn);
+        const gy = context.ceilDiv(m_dim, cfg.bm);
+        if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) break :gemm;
+        return frame.recordCompute(gb, &bufs, &sizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
+    }
 
     const use_dw = depthwiseOk(geo, c_in_g, c_out, rank) and
         ctx.gpu.limits.max_shared_bytes >= DW_SHARED_BYTES;
     // vec4 channel contraction: any pad mode, needs the group channel count % 4.
     const use_vec4c = !use_dw and c_in_g % 4 == 0;
     const entry = if (use_dw) "conv_dw_f32" else if (use_vec4c) "conv_f32_vec4c" else "conv_f32";
-    const built = try ctx.pipes.get(conv_kernel, entry);
-    const built_generic = if (use_dw) try ctx.pipes.get(conv_kernel, "conv_f32") else built;
-    const x_batch_elems = geo.h_in * geo.w_in * geo.c_in;
+    const params: ConvParams = .{
+        .x_batch = std.math.cast(u32, x_batch) orelse return error.Unsupported,
+        .h_in = @intCast(geo.h_in),
+        .w_in = @intCast(geo.w_in),
+        .c_in = @intCast(geo.c_in),
+        .kh = @intCast(geo.kh),
+        .kw = @intCast(geo.kw),
+        .c_in_g = @intCast(c_in_g),
+        .c_out_g = @intCast(c_out / geo.groups),
+        .c_out = @intCast(c_out),
+        .stride_h = @intCast(geo.stride_h),
+        .stride_w = @intCast(geo.stride_w),
+        .dil_h = @intCast(geo.dil_h),
+        .dil_w = @intCast(geo.dil_w),
+        .pad_top = @intCast(geo.pad_top),
+        .pad_left = @intCast(geo.pad_left),
+        .batch = @intCast(batch),
+        .oh_cnt = @intCast(oh_cnt),
+        .ow_cnt = @intCast(ow_cnt),
+        .c_cnt = @intCast(c_out),
+        .total = std.math.cast(u32, out_total) orelse return error.Unsupported,
+        .reflect = @intFromBool(geo.pad_mode == .reflect),
+        .has_bias = @intFromBool(dbias != null),
+    };
 
-    // Cached x device tile (out tiles for the same batch group reuse it).
-    var x_cached: ?usize = null;
-    var x_tile: device_store.TileRef = undefined;
-    defer if (x_cached != null) hs.releaseConst(x_tile.token);
-
-    const total = context.totalTiles(out_meta);
-    var ti: usize = 0;
-    while (ti < total) : (ti += 1) {
-        var coords: [tensor_store_mod.INLINE_RANK]usize = @splat(0);
-        tensor_store_mod.decodeTileCoords(out_meta, ti, coords[0..rank]) catch return error.ExecutionFailed;
-        if (out_meta.tile_shape[0] != 1) return error.Unsupported; // one batch per out tile
-        const b = coords[0];
-
-        var x_buf: c.WGPUBuffer = undefined;
-        var x_len: u64 = undefined;
-        var x_base: usize = undefined;
-        if (x_materialized) |xm| {
-            // Whole [batch,H,W,C] contiguous in scratch — index by batch directly.
-            x_buf = xm.buf;
-            x_len = xm.len;
-            x_base = b * x_batch_elems;
-        } else {
-            const x_lin = b / x_meta.tile_shape[0];
-            if (x_cached == null or x_cached.? != x_lin) {
-                if (x_cached != null) hs.releaseConst(x_tile.token);
-                x_cached = null;
-                x_tile = ctx.store.acquireTileDeviceConstLinear(x_id, x_lin) catch return error.ExecutionFailed;
-                x_cached = x_lin;
-                if (!context.storageBindingFits(ctx, x_tile.len)) return error.Unsupported;
-                if (context.packedElems(x_tile.rank, x_tile.shape_mem[0..rank], x_tile.strides_mem[0..rank]) == null) return error.Unsupported;
-                var xd: usize = 1;
-                while (xd < rank) : (xd += 1) {
-                    if (x_tile.shape_mem[xd] != x_meta.shape[xd]) return error.Unsupported;
-                }
-            }
-            x_buf = ctx.devmem.bufferFor(x_tile.handle).?;
-            x_len = x_tile.len;
-            x_base = (b % x_meta.tile_shape[0]) * x_batch_elems;
+    // Depthwise: a 3D grid (channel-groups x length-blocks x batch); fall back to
+    // the grid-strided generic kernel if any grid dim exceeds the per-dim cap.
+    if (use_dw) {
+        const cg = context.ceilDiv(@intCast(c_out), DW_NCG * 4);
+        const lg = context.ceilDiv(@intCast(oh_cnt), DW_LT);
+        if (cg <= context.MAX_GROUPS_PER_DIM and lg <= context.MAX_GROUPS_PER_DIM and batch <= context.MAX_GROUPS_PER_DIM) {
+            const built = try ctx.pipes.get(conv_kernel, entry);
+            return frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ cg, lg, @intCast(batch) });
         }
-
-        const dout = ctx.store.acquireTileDeviceMutLinear(out_id, ti) catch return error.ExecutionFailed;
-        defer hs.releaseMut(dout.token);
-        if (!context.storageBindingFits(ctx, dout.len)) return error.Unsupported;
-        if (context.packedElems(dout.rank, dout.shape_mem[0..rank], dout.strides_mem[0..rank]) == null) return error.Unsupported;
-
-        const oh_cnt = dout.shape_mem[1];
-        const ow_cnt = if (rank == 4) dout.shape_mem[2] else 1;
-        const c_cnt = dout.shape_mem[rank - 1];
-        const out_total = oh_cnt * ow_cnt * c_cnt;
-        if (out_total == 0) continue;
-
-        // Implicit GEMM writes C[pixel, channel] straight into the tile, so it
-        // needs the tile to hold every output channel; a channel-split tile has
-        // no column origin to offset the weight by.
-        if (gemm_built) |gb| {
-            const base_c = coords[rank - 1] * out_meta.tile_shape[rank - 1];
-            if (base_c == 0 and c_cnt == c_out) {
-                const m_dim = std.math.cast(u32, oh_cnt * ow_cnt) orelse return error.Unsupported;
-                const n_dim = std.math.cast(u32, c_out) orelse return error.Unsupported;
-                const k_dim = std.math.cast(u32, geo.kh * geo.kw * geo.c_in) orelse return error.Unsupported;
-                const gp: ConvGemmParams = .{
-                    .m = m_dim,
-                    .n = n_dim,
-                    .k = k_dim,
-                    .b_row = n_dim,
-                    .c_row = @intCast(c_cnt),
-                    .ow_out = @intCast(ow_cnt),
-                    .h_in = @intCast(geo.h_in),
-                    .w_in = @intCast(geo.w_in),
-                    .c_in = @intCast(geo.c_in),
-                    .kh = @intCast(geo.kh),
-                    .kw = @intCast(geo.kw),
-                    .x_base = std.math.cast(u32, x_base) orelse return error.Unsupported,
-                    .pad_top = @intCast(geo.pad_top),
-                    .pad_left = @intCast(geo.pad_left),
-                    .stride_h = @intCast(geo.stride_h),
-                    .stride_w = @intCast(geo.stride_w),
-                    .dil_h = @intCast(geo.dil_h),
-                    .dil_w = @intCast(geo.dil_w),
-                    .has_bias = @intFromBool(bias_tile != null),
-                    .base_h = @intCast(coords[1] * out_meta.tile_shape[1]),
-                    .base_w = @intCast(coords[2] * out_meta.tile_shape[2]),
-                };
-                const cfg = generated[gemm_idx.?].cfg;
-                const gx = context.ceilDiv(n_dim, cfg.bn);
-                const gy = context.ceilDiv(m_dim, cfg.bm);
-                if (gx <= context.MAX_GROUPS_PER_DIM and gy <= context.MAX_GROUPS_PER_DIM) {
-                    const gbias = if (bias_tile) |bt| ctx.devmem.bufferFor(bt.handle).? else ctx.devmem.bufferFor(dw.handle).?;
-                    const gbias_len = if (bias_tile) |bt| bt.len else dw.len;
-                    const gbufs = [_]c.WGPUBuffer{
-                        x_buf,
-                        ctx.devmem.bufferFor(dw.handle).?,
-                        gbias,
-                        ctx.devmem.bufferFor(dout.handle).?,
-                    };
-                    const gsizes = [_]u64{ x_len, dw.len, gbias_len, dout.len };
-                    try frame.recordCompute(gb, &gbufs, &gsizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
-                    continue;
-                }
-            }
-        }
-
-        const params: ConvParams = .{
-            .x_base = std.math.cast(u32, x_base) orelse return error.Unsupported,
-            .h_in = @intCast(geo.h_in),
-            .w_in = @intCast(geo.w_in),
-            .c_in = @intCast(geo.c_in),
-            .kh = @intCast(geo.kh),
-            .kw = @intCast(geo.kw),
-            .c_in_g = @intCast(c_in_g),
-            .c_out_g = @intCast(c_out / geo.groups),
-            .c_out = @intCast(c_out),
-            .stride_h = @intCast(geo.stride_h),
-            .stride_w = @intCast(geo.stride_w),
-            .dil_h = @intCast(geo.dil_h),
-            .dil_w = @intCast(geo.dil_w),
-            .pad_top = @intCast(geo.pad_top),
-            .pad_left = @intCast(geo.pad_left),
-            .base_h = @intCast(coords[1] * out_meta.tile_shape[1]),
-            .base_w = if (rank == 4) @intCast(coords[2] * out_meta.tile_shape[2]) else 0,
-            .base_c = @intCast(coords[rank - 1] * out_meta.tile_shape[rank - 1]),
-            .oh_cnt = @intCast(oh_cnt),
-            .ow_cnt = @intCast(ow_cnt),
-            .c_cnt = @intCast(c_cnt),
-            .total = std.math.cast(u32, out_total) orelse return error.Unsupported,
-            .reflect = @intFromBool(geo.pad_mode == .reflect),
-            .has_bias = @intFromBool(bias_tile != null),
-        };
-        const bias_buf = if (bias_tile) |bt| ctx.devmem.bufferFor(bt.handle).? else ctx.devmem.bufferFor(dw.handle).?;
-        const bias_len = if (bias_tile) |bt| bt.len else dw.len;
-        const bufs = [_]c.WGPUBuffer{
-            x_buf,
-            ctx.devmem.bufferFor(dw.handle).?,
-            bias_buf,
-            ctx.devmem.bufferFor(dout.handle).?,
-        };
-        const sizes = [_]u64{ x_len, dw.len, bias_len, dout.len };
-
-        // Depthwise: 2D grid (channel-groups x length-blocks); fall back to the
-        // grid-strided generic kernel if either grid dim exceeds the per-dim cap.
-        var tile_built = built;
-        var groups: [3]u32 = .{ groups1D(params.total), 1, 1 };
-        if (use_dw) {
-            const cg = context.ceilDiv(@intCast(c_cnt), DW_NCG * 4);
-            const lg = context.ceilDiv(@intCast(oh_cnt), DW_LT);
-            if (cg <= context.MAX_GROUPS_PER_DIM and lg <= context.MAX_GROUPS_PER_DIM) {
-                groups = .{ cg, lg, 1 };
-            } else {
-                tile_built = built_generic;
-            }
-        }
-        try frame.recordCompute(tile_built, &bufs, &sizes, std.mem.asBytes(&params), groups);
     }
+    const built = try ctx.pipes.get(conv_kernel, if (use_dw) "conv_f32" else entry);
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups1D(params.total), 1, 1 });
 }

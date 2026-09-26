@@ -2,13 +2,12 @@
 //
 // Elementwise binary ops over f32 storage buffers. One entry point per op; the
 // backend selects the entry point from `ElemwiseBinaryOp`. f32 only; the backend
-// dispatches once per tile (each tile is its own pair of input buffers + output
-// buffer). The element count comes from a uniform (binding 3) rather than
-// `arrayLength`, so a tile's logical length is explicit and not tied to the
-// device buffer's allocated size.
+// dispatches once per tensor. The element count comes from a uniform (binding 3)
+// rather than `arrayLength`, so the logical length is explicit and not tied to
+// the device buffer's allocated size.
 //
-// Grid-stride: WebGPU caps workgroups per dimension at 65535, and GPU-policy
-// tiles reach 16M+ elements (262144 groups of 64). Each thread therefore loops
+// Grid-stride: WebGPU caps workgroups per dimension at 65535, and tensors reach
+// 16M+ elements (262144 groups of 64). Each thread therefore loops
 // with stride = total threads; the backend dispatches at most MAX_GROUPS_1D.
 
 // The f16 entry points alias `array<f16>` onto the same bindings the f32 ones

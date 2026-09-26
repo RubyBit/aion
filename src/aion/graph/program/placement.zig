@@ -7,7 +7,7 @@
 const std = @import("std");
 const executable = @import("../../runtime/executable.zig");
 const manager_mod = @import("../../storage/manager.zig");
-const plan_mod = @import("../plan.zig");
+const types = @import("../../backend/types.zig");
 
 const StorageManager = manager_mod.StorageManager;
 const TensorId = manager_mod.TensorId;
@@ -26,9 +26,9 @@ pub fn place(
     mgr: *StorageManager,
     prog: *Program,
     owned: *std.ArrayList(TensorId),
-    policy: plan_mod.TilePolicy,
+    kind: types.BackendKind,
 ) Error!void {
-    const target: executable.Placement = .{ .kind = policy.target_kind };
+    const target: executable.Placement = .{ .kind = kind };
     prog.target = target;
     for (prog.steps) |*placed| placed.placement = target;
     for (prog.blocks) |block| {
@@ -159,8 +159,7 @@ const HoistCtx = struct {
     fn transferToHost(self: *HoistCtx, out: *std.ArrayList(PlacedStep), source: TensorId) Error!TensorId {
         const dst = self.mirrors.get(source) orelse blk: {
             const src = self.mgr.getConst(source) catch return error.InvalidArgument;
-            const mirror = self.mgr.createTiledTensor(src.dtype, src.shape, src.tile_shape, .{
-                .tile_alignment = src.tile_alignment,
+            const mirror = self.mgr.createTensor(src.dtype, src.shape, .{
                 .quant_axis = src.quant_axis,
             }) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,

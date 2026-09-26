@@ -110,29 +110,29 @@ const swiz = [4][]const u8{ "x", "y", "z", "w" };
 fn aVec4(cfg: MatmulConfig) []const u8 {
     if (cfg.kind == .conv) return "im2col_vec4(gr, gk)";
     return if (cfg.vec4_load)
-        "a[(gr * a_row + gk) / 4u]"
+        "a[(a_base + gr * a_row + gk) / 4u]"
     else
-        "vec4<f32>(a[gr * a_row + gk], a[gr * a_row + gk + 1u], a[gr * a_row + gk + 2u], a[gr * a_row + gk + 3u])";
+        "vec4<f32>(a[a_base + gr * a_row + gk], a[a_base + gr * a_row + gk + 1u], a[a_base + gr * a_row + gk + 2u], a[a_base + gr * a_row + gk + 3u])";
 }
 fn bVec4(cfg: MatmulConfig) []const u8 {
     return if (cfg.vec4_load)
-        "b[(gk * b_row + gc) / 4u]"
+        "b[(b_base + gk * b_row + gc) / 4u]"
     else
-        "vec4<f32>(b[gk * b_row + gc], b[gk * b_row + gc + 1u], b[gk * b_row + gc + 2u], b[gk * b_row + gc + 3u])";
+        "vec4<f32>(b[b_base + gk * b_row + gc], b[b_base + gk * b_row + gc + 1u], b[b_base + gk * b_row + gc + 2u], b[b_base + gk * b_row + gc + 3u])";
 }
 /// WGSL for a single A scalar at column offset `off` (per-lane edge fallback).
 fn aScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
     if (cfg.kind == .conv) return w.fmt("im2col_at(gr, gk + {d}u)", .{off});
     return if (cfg.vec4_load)
-        w.fmt("a[(gr * a_row + gk + {d}u) / 4u][(gr * a_row + gk + {d}u) % 4u]", .{ off, off })
+        w.fmt("a[(a_base + gr * a_row + gk + {d}u) / 4u][(a_base + gr * a_row + gk + {d}u) % 4u]", .{ off, off })
     else
-        w.fmt("a[gr * a_row + gk + {d}u]", .{off});
+        w.fmt("a[a_base + gr * a_row + gk + {d}u]", .{off});
 }
 fn bScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
     return if (cfg.vec4_load)
-        w.fmt("b[(gk * b_row + gc + {d}u) / 4u][(gk * b_row + gc + {d}u) % 4u]", .{ off, off })
+        w.fmt("b[(b_base + gk * b_row + gc + {d}u) / 4u][(b_base + gk * b_row + gc + {d}u) % 4u]", .{ off, off })
     else
-        w.fmt("b[gk * b_row + gc + {d}u]", .{off});
+        w.fmt("b[b_base + gk * b_row + gc + {d}u]", .{off});
 }
 
 // ---- module scaffolding ----------------------------------------------------
@@ -144,9 +144,9 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
         // so the bindings match the direct kernel's (x, w, bias, out, params).
         w.lit("struct Params { dims: vec4<u32>, strides: vec4<u32>, ab: vec4<f32>,");
         w.lit("                ow_out: u32, h_in: u32, w_in: u32, c_in: u32,");
-        w.lit("                kh: u32, kw: u32, x_base: u32, pad_top: u32,");
+        w.lit("                kh: u32, kw: u32, x_batch: u32, pad_top: u32,");
         w.lit("                pad_left: u32, stride_h: u32, stride_w: u32, dil_h: u32,");
-        w.lit("                dil_w: u32, has_bias: u32, base_h: u32, base_w: u32 };");
+        w.lit("                dil_w: u32, has_bias: u32, ohw: u32, _pad: u32 };");
         // A is gathered one activation at a time, so it is always scalar-addressed;
         // B is the weight matrix and still takes the 128-bit path when aligned.
         w.lit("@group(0) @binding(0) var<storage, read> a: array<f32>;");
@@ -164,6 +164,10 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
     // Different invocations stage adjacent rows. Scalar storage gives each
     // writer a separate memory location; vector-component stores can lower to
     // a read/modify/write of the whole vector (notably on Metal).
+    // Batch bases (workgroup z): A, B and C of batch `z` start at `z * dims.w`,
+    // `z * strides.w` and `c_off + z * M * c_row` (`c_off` rides in `ab.z` as
+    // bits). A zero stride broadcasts that operand.
+    w.lit("var<private> a_base: u32; var<private> b_base: u32; var<private> c_base: u32;");
     w.line("var<workgroup> As: array<f32, {d}>;", .{cfg.bm * cfg.bk});
     w.line("var<workgroup> Bs: array<vec4<f32>, {d}>;", .{cfg.bVecs()});
     if (cfg.kind == .conv) im2colFns(w);
@@ -171,18 +175,21 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
 }
 
 /// The two im2col readers — the whole difference between this and the GEMM.
-/// A[m, k] is the activation at `(m -> oh, ow)` offset by `(k -> kh, kw, c_in)`,
-/// or zero where the window falls outside the image.
+/// A[m, k] is the activation at `(m -> batch, oh, ow)` offset by `(k -> kh, kw,
+/// c_in)`, or zero where the window falls outside the image. M runs over every
+/// batch, so one dispatch covers the whole output.
 fn im2colFns(w: *Wgsl) void {
     w.blank();
     w.open("fn im2col_at(m: u32, k: u32) -> f32", .{});
     w.lit("let kwc = p.kw * p.c_in;");
-    w.lit("let ih = i32((p.base_h + m / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
-    w.lit("let iw = i32((p.base_w + m % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
+    w.lit("let mb = m / p.ohw;");
+    w.lit("let mr = m % p.ohw;");
+    w.lit("let ih = i32((mr / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
+    w.lit("let iw = i32((mr % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
     w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
     w.lit("return 0.0;");
     w.close();
-    w.lit("return a[p.x_base + (u32(ih) * p.w_in + u32(iw)) * p.c_in + (k % p.c_in)];");
+    w.lit("return a[mb * p.x_batch + (u32(ih) * p.w_in + u32(iw)) * p.c_in + (k % p.c_in)];");
     w.close();
     w.blank();
     // Four consecutive k stay within one (kh, kw) tap unless the channel run
@@ -191,12 +198,14 @@ fn im2colFns(w: *Wgsl) void {
     w.lit("let ci = k % p.c_in;");
     w.open("if (ci + 3u < p.c_in)", .{});
     w.lit("let kwc = p.kw * p.c_in;");
-    w.lit("let ih = i32((p.base_h + m / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
-    w.lit("let iw = i32((p.base_w + m % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
+    w.lit("let mb = m / p.ohw;");
+    w.lit("let mr = m % p.ohw;");
+    w.lit("let ih = i32((mr / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
+    w.lit("let iw = i32((mr % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
     w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
     w.lit("return vec4<f32>(0.0);");
     w.close();
-    w.lit("let base = p.x_base + (u32(ih) * p.w_in + u32(iw)) * p.c_in + ci;");
+    w.lit("let base = mb * p.x_batch + (u32(ih) * p.w_in + u32(iw)) * p.c_in + ci;");
     w.lit("return vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);");
     w.close();
     w.lit("return vec4<f32>(im2col_at(m, k), im2col_at(m, k + 1u), im2col_at(m, k + 2u), im2col_at(m, k + 3u));");
@@ -208,7 +217,12 @@ fn im2colFns(w: *Wgsl) void {
 fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
     const cols = cfg.bn / cfg.tn;
     w.lit("let M = p.dims.x; let N = p.dims.y; let K = p.dims.z;");
-    if (cfg.kind == .conv) w.lit("let b_row = p.strides.y;") else w.lit("let a_row = p.strides.x; let b_row = p.strides.y;");
+    if (cfg.kind == .conv) {
+        w.lit("let b_row = p.strides.y;");
+    } else {
+        w.lit("let a_row = p.strides.x; let b_row = p.strides.y;");
+        w.lit("a_base = wid.z * p.dims.w; b_base = wid.z * p.strides.w; c_base = bitcast<u32>(p.ab.z) + wid.z * M * p.strides.z;");
+    }
     w.line("let block_row = wid.y * {d}u;", .{cfg.bm});
     w.line("let block_col = wid.x * {d}u;", .{cfg.bn});
     w.line("let thread_col = lidx % {d}u;", .{cols});
@@ -472,7 +486,7 @@ fn writeOneFn(w: *Wgsl, cfg: MatmulConfig) void {
         w.lit("v = v + bias[c];");
         w.close();
     }
-    w.lit("let idx = r * p.strides.z + c;");
+    w.lit("let idx = c_base + r * p.strides.z + c;");
     w.open("if (p.ab.y == 0.0)", .{});
     w.lit("cmat[idx] = p.ab.x * v;");
     w.otherwise();

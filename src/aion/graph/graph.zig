@@ -631,7 +631,7 @@ pub const Graph = struct {
 
     const Self = @This();
 
-    /// Maximum tensor rank the graph (and the tiling/exec layers) support.
+    /// Maximum tensor rank the graph (and the storage/exec layers) support.
     pub const MAX_RANK: usize = 8;
 
     pub fn init(allocator: std.mem.Allocator) Self {

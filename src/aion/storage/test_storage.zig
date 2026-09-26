@@ -16,74 +16,6 @@ fn createTestFile(dir: std.Io.Dir, sub_path: []const u8, flags: std.Io.Dir.Creat
     return try dir.createFile(std.testing.io, sub_path, flags);
 }
 
-test "storage: scalar f32 roundtrip pack<->tiles" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    // A small odd shape to exercise boundary tiles.
-    const rows: usize = 5;
-    const cols: usize = 7;
-
-    var tt: storage.TiledTensor = undefined;
-    try tt.init(
-        allocator,
-        .f32,
-        &[_]usize{ rows, cols },
-        &[_]usize{ 2, 3 },
-        .{ .tile_alignment = 64 },
-    );
-    defer tt.deinit();
-
-    const total_elems: usize = rows * cols;
-    const packed_vals: []f32 = try allocator.alloc(f32, total_elems);
-    defer allocator.free(packed_vals);
-
-    // Fill with a deterministic pattern.
-    for (0..rows) |i| {
-        for (0..cols) |j| {
-            packed_vals[i * cols + j] = @as(f32, @floatFromInt(i * 1000 + j));
-        }
-    }
-
-    const packed_bytes: []const u8 = std.mem.sliceAsBytes(packed_vals);
-    try tt.writeFromPackedScalar(packed_bytes);
-
-    // Verify each tile is a valid packed scalar view, and its contents match expectations.
-    var ti0: usize = 0;
-    while (ti0 < tt.tile_counts[0]) : (ti0 += 1) {
-        var ti1: usize = 0;
-        while (ti1 < tt.tile_counts[1]) : (ti1 += 1) {
-            const tv = try tt.acquireTileConst(ti0, ti1);
-            const v = tv.bufferView();
-            try backend_utils.requirePackedScalar(v);
-
-            const tile_rows: usize = v.layout.shape[0];
-            const tile_cols: usize = v.layout.shape[1];
-
-            const tile_vals: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, v.bytes);
-            try std.testing.expect(tile_vals.len >= tile_rows * tile_cols);
-
-            const row0: usize = ti0 * tt.tile_shape[0];
-            const col0: usize = ti1 * tt.tile_shape[1];
-
-            for (0..tile_rows) |r| {
-                for (0..tile_cols) |c| {
-                    const gi: usize = row0 + r;
-                    const gj: usize = col0 + c;
-                    try std.testing.expectEqual(packed_vals[gi * cols + gj], tile_vals[r * tile_cols + c]);
-                }
-            }
-        }
-    }
-
-    // Unpack and compare.
-    const out: []f32 = try allocator.alloc(f32, total_elems);
-    defer allocator.free(out);
-    @memset(out, 0);
-
-    try tt.readToPackedScalar(std.mem.sliceAsBytes(out));
-    try std.testing.expectEqualSlices(f32, packed_vals, out);
-}
-
 test "storage: device-aware copy/zero round-trip via mock device memory" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
@@ -96,19 +28,19 @@ test "storage: device-aware copy/zero round-trip via mock device memory" {
     const shape = [_]usize{ 2, 3 };
     const vals = [_]f32{ 1, 2, 3, 4, 5, 6 };
 
-    // Host source seeded with known values (single tile).
-    const src = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+    // Host source seeded with known values.
+    const src = try sm.createTensor(.f32, &shape, .{});
     try sm.writeFromPackedScalar(src, std.mem.sliceAsBytes(&vals));
 
     // Device-exclusive destination (migrated onto the mock device; host bytes freed).
-    const dst = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
-    try sm.moveTensor(dst, .{ .kind = .gpu, .index = 0 }, mock.device(), &shape, 64);
+    const dst = try sm.createTensor(.f32, &shape, .{});
+    try sm.moveTensor(dst, .{ .kind = .gpu, .index = 0 }, mock.device());
     try std.testing.expect((try sm.tensorDevice(dst)).kind == .gpu);
 
     // Seed device dst from host src (H2D scatter), then mirror back to a host
     // tensor (D2H gather) — the seed + host-read paths a device-exclusive KV slot uses.
     try sm.copyTensorData(dst, src);
-    const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+    const mirror = try sm.createTensor(.f32, &shape, .{});
     try sm.copyTensorData(mirror, dst);
 
     var got: [6]f32 = undefined;
@@ -123,31 +55,31 @@ test "storage: device-aware copy/zero round-trip via mock device memory" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 0, 0 }, &got);
 }
 
-// A multi-tile host tensor migrated to a device must arrive byte-identical whether
-// the target tiling matches its own (the copy-free upload placement uses) or forces
-// a re-tile (the gather/scatter path).
-test "storage: multi-tile host->device migration preserves bytes, matched and re-tiled" {
+// A host tensor migrated to a device must arrive byte-identical whether it lands in
+// one device buffer or is split into dim-0 chunks (a tensor over the binding limit).
+test "storage: host->device migration preserves bytes, whole and chunked" {
     const allocator: std.mem.Allocator = std.testing.allocator;
-    const shape = [_]usize{ 4, 6 };
-    var vals: [24]f32 = undefined;
+    const shape = [_]usize{ 64, 6 };
+    var vals: [64 * 6]f32 = undefined;
     for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
 
-    for ([_][2]usize{ .{ 2, 6 }, .{ 4, 3 } }) |target_tile| {
+    // Unbounded, then a limit whose budget holds one 32-row granule: two chunks.
+    for ([_]u64{ std.math.maxInt(u64), 1200 }, [_]usize{ 1, 2 }) |limit, chunks| {
         var mock = dm.MockDeviceMemory.init(allocator);
         defer mock.deinit();
+        mock.max_binding_bytes = limit;
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
 
-        const src_tile = [_]usize{ 2, 6 }; // 2 tiles along dim 0
-        const t = try sm.createTiledTensor(.f32, &shape, &src_tile, .{ .tile_alignment = 64 });
+        const t = try sm.createTensor(.f32, &shape, .{});
         try sm.writeFromPackedScalar(t, std.mem.sliceAsBytes(&vals));
-        try sm.moveTensor(t, .{ .kind = .gpu, .index = 0 }, mock.device(), &target_tile, 64);
+        try sm.moveTensor(t, .{ .kind = .gpu, .index = 0 }, mock.device());
         try std.testing.expect((try sm.tensorDevice(t)).kind == .gpu);
-        try std.testing.expect(mock.h2d_count > 0);
+        try std.testing.expectEqual(chunks, (try sm.getConst(t)).chunkCount());
 
-        const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{ .tile_alignment = 64 });
+        const mirror = try sm.createTensor(.f32, &shape, .{});
         try sm.copyTensorData(mirror, t);
-        var got: [24]f32 = undefined;
+        var got: [64 * 6]f32 = undefined;
         try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got));
         try std.testing.expectEqualSlices(f32, &vals, &got);
     }
@@ -164,11 +96,11 @@ test "storage: swap carries heterogeneous host and device backings without copie
     const shape = [_]usize{4};
     const host_vals = [_]f32{ 1, 2, 3, 4 };
     const device_vals = [_]f32{ 5, 6, 7, 8 };
-    const host = try sm.createTiledTensor(.f32, &shape, &shape, .{});
-    const device = try sm.createTiledTensor(.f32, &shape, &shape, .{});
+    const host = try sm.createTensor(.f32, &shape, .{});
+    const device = try sm.createTensor(.f32, &shape, .{});
     try sm.writeFromPackedScalar(host, std.mem.sliceAsBytes(&host_vals));
     try sm.writeFromPackedScalar(device, std.mem.sliceAsBytes(&device_vals));
-    try sm.moveTensor(device, .{ .kind = .gpu, .index = 0 }, mock.device(), &shape, 64);
+    try sm.moveTensor(device, .{ .kind = .gpu, .index = 0 }, mock.device());
 
     const h2d_before = mock.h2d_count;
     const d2h_before = mock.d2h_count;
@@ -182,129 +114,11 @@ test "storage: swap carries heterogeneous host and device backings without copie
     try sm.readToPackedScalar(device, std.mem.sliceAsBytes(&got_host));
     try std.testing.expectEqualSlices(f32, &host_vals, &got_host);
 
-    const mirror = try sm.createTiledTensor(.f32, &shape, &shape, .{});
+    const mirror = try sm.createTensor(.f32, &shape, .{});
     try sm.copyTensorData(mirror, host);
     var got_device: [4]f32 = undefined;
     try sm.readToPackedScalar(mirror, std.mem.sliceAsBytes(&got_device));
     try std.testing.expectEqualSlices(f32, &device_vals, &got_device);
-}
-
-test "storage: quant q8_0 roundtrip pack<->tiles (bit exact)" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    // Treat this as a [K,N] weight matrix with K multiple of 32.
-    const k: usize = 96;
-    const n: usize = 5;
-
-    var tt: storage.TiledTensor = undefined;
-    try tt.init(
-        allocator,
-        .q8_0,
-        &[_]usize{ k, n },
-        &[_]usize{ 64, 3 },
-        .{ .tile_alignment = 64 },
-    );
-    defer tt.deinit();
-
-    const total_elems: usize = k * n;
-    const total_bytes: usize = try backend_utils.requiredBytesForElems(DType.q8_0, total_elems);
-
-    const packed_bytes_q: []u8 = try allocator.alloc(u8, total_bytes);
-    defer allocator.free(packed_bytes_q);
-
-    // Fill with deterministic data (not necessarily a meaningful quant tensor, but valid size).
-    for (packed_bytes_q, 0..) |*b, i| b.* = @intCast(i % 251);
-
-    try tt.writeFromPackedQuant(packed_bytes_q);
-
-    const out: []u8 = try allocator.alloc(u8, total_bytes);
-    defer allocator.free(out);
-    @memset(out, 0);
-
-    try tt.readToPackedQuant(out);
-    try std.testing.expectEqualSlices(u8, packed_bytes_q, out);
-}
-
-test "storage: quant q8_0 roundtrip on quant_axis=1 (embedding table layout)" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    // [V, D] embedding table with per-row quantization (blocks along axis 1).
-    const v: usize = 10;
-    const d: usize = 96; // multiple of 32
-
-    var tt: storage.TiledTensor = undefined;
-    try tt.init(
-        allocator,
-        .q8_0,
-        &[_]usize{ v, d },
-        &[_]usize{ 4, 64 },
-        .{ .tile_alignment = 64, .quant_axis = 1 },
-    );
-    defer tt.deinit();
-
-    const total_elems: usize = v * d;
-    const total_bytes: usize = try backend_utils.requiredBytesForElems(DType.q8_0, total_elems);
-
-    const packed_bytes: []u8 = try allocator.alloc(u8, total_bytes);
-    defer allocator.free(packed_bytes);
-
-    // Fill with a pattern that lets us verify block-boundary correctness.
-    // Block (row v, block b) byte k => (v*7 + b*13 + k) mod 251.
-    const d_blocks: usize = d / 32; // quant axis at 1, block_elems=32
-    var row: usize = 0;
-    while (row < v) : (row += 1) {
-        var b: usize = 0;
-        while (b < d_blocks) : (b += 1) {
-            const block_off: usize = (row * d_blocks + b) * 34;
-            var kk: usize = 0;
-            while (kk < 34) : (kk += 1) {
-                packed_bytes[block_off + kk] = @intCast((row * 7 + b * 13 + kk) % 251);
-            }
-        }
-    }
-
-    try tt.writeFromPackedQuant(packed_bytes);
-
-    const out: []u8 = try allocator.alloc(u8, total_bytes);
-    defer allocator.free(out);
-    @memset(out, 0);
-
-    try tt.readToPackedQuant(out);
-    try std.testing.expectEqualSlices(u8, packed_bytes, out);
-}
-
-test "storage: scalar f32 roundtrip rank-3 pack<->tiles" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const d0: usize = 3;
-    const d1: usize = 4;
-    const d2: usize = 5;
-
-    var tt: storage.TiledTensor = undefined;
-    try tt.init(
-        allocator,
-        .f32,
-        &[_]usize{ d0, d1, d2 },
-        &[_]usize{ 2, 3, 2 },
-        .{ .tile_alignment = 64 },
-    );
-    defer tt.deinit();
-
-    const total_elems: usize = d0 * d1 * d2;
-    const packed_vals: []f32 = try allocator.alloc(f32, total_elems);
-    defer allocator.free(packed_vals);
-
-    // Deterministic pattern: linear index + offset.
-    for (packed_vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 7)) * 0.25;
-
-    try tt.writeFromPackedScalar(std.mem.sliceAsBytes(packed_vals));
-
-    const out: []f32 = try allocator.alloc(f32, total_elems);
-    defer allocator.free(out);
-    @memset(out, 0);
-
-    try tt.readToPackedScalar(std.mem.sliceAsBytes(out));
-    try std.testing.expectEqualSlices(f32, packed_vals, out);
 }
 
 test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
@@ -1022,19 +836,18 @@ test "storage file: invalid input roles are rejected" {
     try package_file.validate(&pkg);
 }
 
-test "storage cache: lease tokens and policy info" {
+test "storage cache: sequence policy info and time mapping" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    try sm.configureCache(.{ .ram_budget_bytes = 1 << 20, .max_live_leases = 2 });
+    try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const tid: manager_mod.TensorId = try sm.createTiledTensor(
+    const tid: manager_mod.TensorId = try sm.createTensor(
         .f32,
         &[_]usize{8},
-        &[_]usize{4},
-        .{ .tile_alignment = 64 },
+        .{},
     );
     try sm.registerSequenceCachePolicy(tid, .{ .rolling = .{ .history_tokens = 4 } });
 
@@ -1043,46 +856,26 @@ test "storage cache: lease tokens and policy info" {
     try std.testing.expectEqual(tensor_store.SequenceCachePolicyKind.rolling, info.kind);
     try std.testing.expectEqual(@as(usize, 4), info.rolling_history_tokens);
 
-    var t0: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
-    defer store.releaseConst(t0.token);
-    const t1: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 1);
-    defer store.releaseConst(t1.token);
-
-    try std.testing.expect(t0.token != 0);
-    try std.testing.expect(t1.token != 0);
-    try std.testing.expect(t0.token != t1.token);
-
-    try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.acquireTileConstLinear(tid, 0));
-
-    store.releaseConst(t0.token);
-    t0.token = 0;
-
-    const t2: tensor_store.TileRefConst = try store.acquireTileConstLinear(tid, 0);
-    defer store.releaseConst(t2.token);
-    try std.testing.expect(t2.token != 0);
-
     const mapped_ring: usize = try store.mapSequenceStep(tid, 5, 4);
     try std.testing.expectEqual(@as(usize, 1), mapped_ring);
 
-    const grow_tid: manager_mod.TensorId = try sm.createTiledTensor(
+    const grow_tid: manager_mod.TensorId = try sm.createTensor(
         .f32,
         &[_]usize{ 1, 1, 8, 1 },
-        &[_]usize{ 1, 1, 4, 1 },
-        .{ .tile_alignment = 64 },
+        .{},
     );
     try sm.registerSequenceCachePolicy(grow_tid, .{ .growable = .{ .initial_capacity_tokens = 2, .growth_numerator = 2, .growth_denominator = 1 } });
     const mapped_grow: usize = try store.mapSequenceStep(grow_tid, 3, 8);
     try std.testing.expectEqual(@as(usize, 3), mapped_grow);
     const mapped_grow_expand: usize = try store.mapSequenceStep(grow_tid, 8, 8);
     try std.testing.expectEqual(@as(usize, 8), mapped_grow_expand);
-    const grow_meta: *const manager_mod.TiledTensor = try sm.getConst(grow_tid);
+    const grow_meta: *const manager_mod.Tensor = try sm.getConst(grow_tid);
     try std.testing.expectEqual(@as(usize, 16), grow_meta.shape[1]);
 
-    const plain_tid: manager_mod.TensorId = try sm.createTiledTensor(
+    const plain_tid: manager_mod.TensorId = try sm.createTensor(
         .f32,
         &[_]usize{8},
-        &[_]usize{4},
-        .{ .tile_alignment = 64 },
+        .{},
     );
     try std.testing.expectError(tensor_store.StoreError.InvalidArgument, store.mapSequenceStep(plain_tid, 9, 8));
 }
@@ -1092,11 +885,10 @@ test "storage cache: rolling growth rehashes retained logical rows" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const tid = try sm.createTiledTensor(
+    const tid = try sm.createTensor(
         .f32,
         &.{ 1, 4, 1, 1 },
-        &.{ 1, 4, 1, 1 },
-        .{ .tile_alignment = 64 },
+        .{},
     );
     // At logical end 6, retained rows 3,4,5 occupy physical 3,0,1.
     try sm.writeFromPackedScalar(tid, std.mem.sliceAsBytes(&[_]f32{ 4, 5, 0, 3 }));
@@ -1107,18 +899,15 @@ test "storage cache: rolling growth rehashes retained logical rows" {
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 3, 4, 5, 0 }, &got);
 }
 
-// A tensor created on a device is written from packed bytes either straight from the
-// caller (tiles that are runs of the packed layout) or through a staged retile, and
-// must come back byte-identical when moved to the host.
+// A tensor created on a device is written from packed bytes straight into its chunks,
+// and must come back byte-identical when moved to the host.
 test "storage: device-created tensor takes packed bytes and moves back to host" {
     const allocator: std.mem.Allocator = std.testing.allocator;
-    const Case = struct { dtype: DType, shape: [2]usize, tile: [2]usize, quant_axis: u8 = 0 };
+    const Case = struct { dtype: DType, shape: [2]usize, quant_axis: u8 = 0 };
     const cases = [_]Case{
-        .{ .dtype = .f32, .shape = .{ 4, 6 }, .tile = .{ 2, 6 } },
-        .{ .dtype = .f32, .shape = .{ 4, 6 }, .tile = .{ 4, 3 } },
-        .{ .dtype = .q8_0, .shape = .{ 4, 64 }, .tile = .{ 2, 64 }, .quant_axis = 1 },
-        .{ .dtype = .q8_0, .shape = .{ 4, 64 }, .tile = .{ 4, 32 }, .quant_axis = 1 },
-        .{ .dtype = .q8_0, .shape = .{ 64, 4 }, .tile = .{ 32, 4 }, .quant_axis = 0 },
+        .{ .dtype = .f32, .shape = .{ 4, 6 } },
+        .{ .dtype = .q8_0, .shape = .{ 4, 64 }, .quant_axis = 1 },
+        .{ .dtype = .q8_0, .shape = .{ 64, 4 }, .quant_axis = 0 },
     };
     for (cases) |case| {
         var mock = dm.MockDeviceMemory.init(allocator);
@@ -1126,19 +915,19 @@ test "storage: device-created tensor takes packed bytes and moves back to host" 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
         const gpu: manager_mod.DeviceRef = .{ .kind = .gpu, .index = 0 };
-        const entries = [_]manager_mod.StorageManager.DeviceEntry{.{ .mem = mock.device(), .policy = .{} }};
-        sm.setDeviceRegistry(.{}, &entries);
+        const entries = [_]manager_mod.StorageManager.DeviceEntry{.{ .mem = mock.device() }};
+        sm.setDeviceRegistry(&entries);
 
-        const opts: storage.TiledTensor.InitOptions = .{ .quant_axis = case.quant_axis };
-        const t = try sm.createDeviceTensor(case.dtype, &case.shape, &case.tile, opts, gpu);
-        const len = try (try sm.getConst(t)).packedByteLen();
+        const opts: storage.Tensor.InitOptions = .{ .quant_axis = case.quant_axis };
+        const t = try sm.createDeviceTensor(case.dtype, &case.shape, opts, gpu);
+        const len = try (try sm.getConst(t)).byteLen();
         const bytes = try allocator.alloc(u8, len);
         defer allocator.free(bytes);
         for (bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
 
         try sm.writePackedAtPlacement(t, bytes);
         try std.testing.expectEqual(len, mock.bytes_h2d);
-        try sm.moveTensor(t, .{}, null, &case.tile, 64);
+        try sm.moveTensor(t, .{}, null);
         try std.testing.expect((try sm.tensorDevice(t)).kind == .cpu);
 
         const got = try allocator.alloc(u8, len);

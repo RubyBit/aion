@@ -225,24 +225,6 @@ def create_tensor(
     return handle
 
 
-def create_empty_tiled_tensor(
-    ctx: ContextHandle,
-    dtype: AionDType,
-    shape: Sequence[int],
-    tile_shape: Sequence[int],
-) -> TensorHandle:
-    dims = tuple(int(dim) for dim in shape)
-    tiles = tuple(int(dim) for dim in tile_shape)
-    c_shape = ffi.NULL if not dims else ffi.new("size_t[]", dims)
-    c_tiles = ffi.NULL if not tiles else ffi.new("size_t[]", tiles)
-    out = ffi.new("AionTensor**")
-    status = lib.aion_tensor_create_tiled(
-        ctx.raw, int(dtype), len(dims), c_shape, c_tiles, out
-    )
-    raise_for_status(status, ctx, what="aion_tensor_create_tiled")
-    return TensorHandle(out[0])
-
-
 def quantize_tensor(
     ctx: ContextHandle,
     dtype: AionDType,
@@ -349,7 +331,6 @@ __all__ = [
     "bind_model_input",
     "create_context",
     "create_empty_tensor",
-    "create_empty_tiled_tensor",
     "create_tensor",
     "destroy_context",
     "destroy_model",

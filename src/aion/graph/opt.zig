@@ -64,7 +64,7 @@ pub const Ctx = struct {
     gpa: std.mem.Allocator,
     mgr: *StorageManager,
     /// Where this compile is going. A pass that derives a weight keys it on the device,
-    /// because a derived weight belongs to `(sources, tiling, device)` and not to any one
+    /// because a derived weight belongs to `(source, block order, device)` and not to any one
     /// compiled program (see `opt/weight_layout.relayout`).
     target: target_mod.Target,
 };

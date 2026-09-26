@@ -225,25 +225,27 @@ pub fn Kernel(comptime t: Tuning) type {
             return .{ .pb = @alignCast(full[0..PB_ELEMS]), .pa = @alignCast(full[PB_ELEMS..]) };
         }
 
-        pub fn packBTileF32(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
+        pub fn packBTileF32(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
             const b: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, b_bytes);
-            if (b.len < k * n) return BackendError.InvalidArgument;
+            if (k > 0 and b.len < (k - 1) * ld + n) return BackendError.InvalidArgument;
             const s = try splitScratch(scratch_bytes);
-            packB(s.pb, k, n, b, n);
+            packB(s.pb, k, n, b, ld);
         }
 
-        pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
+        pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
             const b: []align(1) const f16 = simd.bytesAsSliceConstUnaligned(f16, b_bytes);
-            if (b.len < k * n) return BackendError.InvalidArgument;
+            if (k > 0 and b.len < (k - 1) * ld + n) return BackendError.InvalidArgument;
             if (packed_b.len < ((n + NR - 1) / NR) * KC * NR) return BackendError.InvalidArgument;
             for (0..(n + NR - 1) / NR) |panel| {
                 const nj = panel * NR;
                 const nr = @min(NR, n - nj);
                 const dst = packed_b[panel * (KC * NR) ..];
                 for (0..k) |kk| {
-                    for (0..nr) |j| dst[kk * NR + j] = @floatCast(b[kk * n + nj + j]);
+                    for (0..nr) |j| dst[kk * NR + j] = @floatCast(b[kk * ld + nj + j]);
                     @memset(dst[kk * NR + nr .. kk * NR + NR], 0.0);
                 }
             }
@@ -262,16 +264,21 @@ pub fn Kernel(comptime t: Tuning) type {
         }
 
         pub fn packATileF32(k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) BackendError!void {
+            return packAStrided(k, m, k, a_bytes, packed_a_out);
+        }
+
+        /// `packATileF32` for rows `lda` elements apart.
+        fn packAStrided(k: usize, m: usize, lda: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) BackendError!void {
             if (k > KC) return BackendError.InvalidArgument;
             const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
-            if (a.len < m * k) return BackendError.InvalidArgument;
+            if (m > 0 and a.len < (m - 1) * lda + k) return BackendError.InvalidArgument;
             if (packed_a_out.len < ((m + MR - 1) / MR) * MR * KC) return BackendError.InvalidArgument;
             for (0..(m + MR - 1) / MR) |panel| {
                 const mi = panel * MR;
                 const mr = @min(MR, m - mi);
                 const dst = packed_a_out[panel * (MR * KC) ..];
                 for (0..k) |kk| {
-                    for (0..mr) |r| dst[kk * MR + r] = a[(mi + r) * k + kk];
+                    for (0..mr) |r| dst[kk * MR + r] = a[(mi + r) * lda + kk];
                 }
             }
         }
@@ -405,7 +412,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
         pub fn matmulF32PackedB(scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8) BackendError!void {
             const s = try splitScratch(scratch_bytes);
-            try packATileF32(params.k, params.m, a_bytes, s.pa);
+            try packAStrided(params.k, params.m, if (params.lda != 0) params.lda else params.k, a_bytes, s.pa);
             return matmulF32PackedAB(@alignCast(s.pa), packed_b_view, params, c_bytes);
         }
     };
@@ -455,7 +462,7 @@ fn gemmCases(comptime K: type) !void {
 
         const scratch = try alloc.alignedAlloc(u8, .@"32", K.scratchBytes());
         defer alloc.free(scratch);
-        try K.packBTileF32(scratch, k, n, std.mem.sliceAsBytes(b));
+        try K.packBTileF32(scratch, k, n, 0, std.mem.sliceAsBytes(b));
         const pb: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0 .. K.KC * K.NC * @sizeOf(f32)]));
 
         // beta != 0 must accumulate onto what is already in C.
@@ -523,7 +530,7 @@ fn indirectCases(comptime K: type) !void {
 
         const scratch = try alloc.alignedAlloc(u8, .@"32", K.scratchBytes());
         defer alloc.free(scratch);
-        try K.packBTileF32(scratch, k, n, std.mem.sliceAsBytes(b));
+        try K.packBTileF32(scratch, k, n, 0, std.mem.sliceAsBytes(b));
         const pb: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0 .. K.KC * K.NC * @sizeOf(f32)]));
 
         const c_buf = try alloc.alloc(f32, m * n);

@@ -11,95 +11,50 @@ const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 const DType = types.DType;
 
-/// Per-tile elementwise cast between scalar dtypes.
-///
-/// v1 supports f16<->f32 and same-dtype (no-op memcpy). Adding more pairs is a
-/// matter of extending the dispatch below; the kernel body is always a straight
-/// per-tile loop since Cast is shape- and layout-preserving.
-pub fn execCastTiled(
+/// Elementwise cast between scalar dtypes: f16<->f32, f32<->i32, and same-dtype
+/// (a copy). Its elements split across the pool.
+pub fn execCast(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepCastTiled,
+    s: executable.StepCast,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const out_meta = try store.meta(s.out);
     const in_meta = try store.meta(s.x);
-
     if (out_meta.dtype != s.to_dtype) return BackendError.InvalidArgument;
     if (out_meta.rank != in_meta.rank) return BackendError.InvalidArgument;
+    return castWhole(pool, thread_count, s, store, in_meta.dtype);
+}
 
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < @as(usize, out_meta.rank)) : (d += 1) {
-        tile_total *= out_meta.tile_counts[d];
-    }
-
-    const Runner = struct {
-        store: tensor_store.TensorStore,
-        out: tensor_store.TensorId,
-        x: tensor_store.TensorId,
+/// A whole tensor: its elements split across the pool.
+fn castWhole(
+    pool: ?*thread_pool.ThreadPool,
+    thread_count: usize,
+    s: executable.StepCast,
+    store: tensor_store.TensorStore,
+    from: DType,
+) ExecuteProgramError!void {
+    const out_v = try store.acquireMut(s.out);
+    defer store.releaseMut(out_v.token);
+    const in_view = try store.acquireConst(s.x);
+    defer store.releaseConst(in_view.token);
+    const Ctx = struct {
         from: DType,
         to: DType,
+        out: []u8,
+        in: []const u8,
 
-        fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
-            var i: usize = start;
-            while (i < end) : (i += 1) {
-                var out_tile = try self.store.acquireTileMutLinear(self.out, i);
-                defer self.store.releaseMut(out_tile.token);
-                const in_tile = try self.store.acquireTileConstLinear(self.x, i);
-                defer self.store.releaseConst(in_tile.token);
-
-                const out_bytes: []u8 = out_tile.bufferView().bytes;
-                const in_bytes: []const u8 = in_tile.bufferView().bytes;
-
-                try castBytes(self.from, self.to, in_bytes, out_bytes);
-            }
+        fn run(c: @This(), start: usize, end: usize, _: usize) BackendError!void {
+            const ib = c.from.info().block_bytes;
+            const ob = c.to.info().block_bytes;
+            return castBytes(c.from, c.to, c.in[start * ib .. end * ib], c.out[start * ob .. end * ob]);
         }
     };
-
-    var runner: Runner = .{ .store = store, .out = s.out, .x = s.x, .from = in_meta.dtype, .to = s.to_dtype };
-
-    const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
-    const min_total_bytes: usize = 256 * 1024;
-
-    if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
-            const Task = struct {
-                runner: *Runner,
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (t.stop.load(.acquire)) return;
-                    t.runner.runRange(start, end) catch |e| {
-                        t.fail(e);
-                        return;
-                    };
-                }
-            };
-
-            var task: Task = .{ .runner = &runner };
-            var grain: usize = if (tile_bytes == 0) 16 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
-            if (grain > tile_total) grain = tile_total;
-
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
-    }
-
-    try runner.runRange(0, tile_total);
+    const out_view = out_v.bufferView();
+    const ctx: Ctx = .{ .from = from, .to = s.to_dtype, .out = out_view.bytes, .in = in_view.bufferView().bytes };
+    const n = exec_utils.elemCountFromView(out_view);
+    const unit = @max(from.info().block_bytes, s.to_dtype.info().block_bytes);
+    return exec_utils.parallelRange(BackendError, pool, thread_count, n, unit, ctx, Ctx.run);
 }
 
 fn castBytes(from: DType, to: DType, in_bytes: []const u8, out_bytes: []u8) BackendError!void {

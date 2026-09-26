@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -25,8 +26,11 @@ class build_ext(_build_ext):
     leaves the previously linked archive in place and the install silently ships
     stale bytes — indistinguishable from a working rebuild, and the kind of thing
     you only notice after debugging the wrong binary for an hour. So the archive
-    itself is the staleness input: build it first, and force a relink when it is
-    newer than the extension.
+    itself is the staleness input: build it first, and force a relink whenever it
+    is not the archive the extension was last linked against. By content, not
+    mtime: on a cache hit `zig build install` restores the cached archive with its
+    original timestamp, so switching back to an earlier configuration lands an
+    archive *older* than the extension, and an mtime check keeps the wrong one.
 
     GPU builds ship no extra runtime here: wgpu-native is loaded at runtime via
     dlopen and delivered by the separate `aion-wgpu` package (see the README).
@@ -43,42 +47,18 @@ class build_ext(_build_ext):
         # Build Aion up front. `build_aion` memoizes per prefix, so the call the
         # cffi builder makes during `super().run()` is free.
         archive = build_zig.build_aion(prefix).link_lib_path
-        if self._needs_relink(archive):
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        stamp = prefix / ".aion-linked-archive"
+        linked = stamp.read_text(encoding="utf-8") if stamp.is_file() else ""
+        if linked != digest or not all(out.is_file() for out in self._outputs()):
             self.force = True
 
         super().run()
 
-        self._verify_fresh(archive)
+        stamp.write_text(digest, encoding="utf-8")
 
     def _outputs(self) -> list[Path]:
         return [Path(self.get_ext_fullpath(ext.name)) for ext in (self.extensions or [])]
-
-    def _needs_relink(self, archive: Path) -> bool:
-        """True when any extension is missing or older than the Aion archive."""
-        if not archive.is_file():
-            return True
-        archive_mtime = archive.stat().st_mtime
-        for out in self._outputs():
-            if not out.is_file() or out.stat().st_mtime < archive_mtime:
-                return True
-        return False
-
-    def _verify_fresh(self, archive: Path) -> None:
-        """Fail loudly if an extension is still older than the archive.
-
-        Belt to the braces above: shipping a stale binary is worse than failing to
-        build, because it looks like success.
-        """
-        if not archive.is_file():
-            return
-        archive_mtime = archive.stat().st_mtime
-        for out in self._outputs():
-            if out.is_file() and out.stat().st_mtime < archive_mtime:
-                raise SystemExit(
-                    f"aion build: {out.name} is older than {archive.name} — the "
-                    "extension was not relinked against the current Aion build. "
-                    "Remove the `build/` directory and rebuild."
-                )
 
 
 # cffi will import the builder referenced below during the build.

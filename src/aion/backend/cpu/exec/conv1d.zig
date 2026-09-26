@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const conv_utils = @import("conv_utils.zig");
-const conv1d_kernels = @import("../kernels/conv1d.zig");
+const conv2d_kernels = @import("../kernels/conv2d.zig");
 const simd = @import("../kernels/simd.zig");
 const matmul_registry = @import("../registry/matmul_registry.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
@@ -11,7 +11,7 @@ const BackendError = conv_utils.BackendError;
 const MatMulParams = conv_utils.MatMulParams;
 const ExecuteProgramError = conv_utils.ExecuteProgramError;
 
-const StepConv1DTiled = executable.StepConv1DTiled;
+const StepConv1D = executable.StepConv1D;
 
 const elemCountFromShape = conv_utils.elemCountFromShape;
 
@@ -23,8 +23,6 @@ const getOrCreatePackedWeights = conv_utils.getOrCreatePackedWeights;
 const scratchForTid = conv_utils.scratchForTid;
 const fillWeightBlock = conv_utils.fillWeightBlock;
 const addBiasRowsF32 = conv_utils.addBiasRowsF32;
-const readTensorPackedF32 = conv_utils.readTensorPackedF32;
-const writeTensorPackedF32 = conv_utils.writeTensorPackedF32;
 
 fn bytesAsF32Const(bytes: []const u8) []align(1) const f32 {
     std.debug.assert((bytes.len % @sizeOf(f32)) == 0);
@@ -51,926 +49,9 @@ inline fn reflectIndex1D(idx_nom: isize, len: usize) usize {
     return @intCast(x);
 }
 
-fn tryExecConv1DDepthwiseTileNative(
-    ctx: *ConvExecCtx,
-    s: StepConv1DTiled,
-    out_meta: tensor_store.TensorMeta,
-    x_meta: tensor_store.TensorMeta,
-    w_meta: tensor_store.TensorMeta,
-    store: tensor_store.TensorStore,
-) ExecuteProgramError!bool {
-    // Setup/dispatch for the depthwise tile-native kernel.
-    // The actual compute loop lives in kernels/conv1d.zig.
-
-    const rank: usize = @as(usize, out_meta.rank);
-    if (rank != 3) return false;
-    if (out_meta.tile_counts.len != 3 or x_meta.tile_counts.len != 3 or w_meta.tile_counts.len != 3) return false;
-
-    const batch: usize = out_meta.shape[0];
-    const l_out: usize = out_meta.shape[1];
-    const c_out: usize = out_meta.shape[2];
-
-    const l_in: usize = x_meta.shape[1];
-    const c_in: usize = x_meta.shape[2];
-
-    const k: usize = w_meta.shape[0];
-    const c_in_g: usize = w_meta.shape[1];
-
-    // Depthwise check.
-    if (s.groups == 0) return BackendError.InvalidArgument;
-    if (s.groups != c_in or s.groups != c_out) return false;
-    if (c_in != c_out) return false;
-    if (c_in_g != 1) return false;
-    if (w_meta.shape[2] != c_out) return false;
-    if (l_out == 0 or c_out == 0 or l_in == 0 or k == 0) return BackendError.InvalidArgument;
-
-    // Simple indexing requirement (matches other tile-native conv paths).
-    if (x_meta.tile_shape[0] != 1 or out_meta.tile_shape[0] != 1) return false;
-
-    // X and out channel tiling must align.
-    if (x_meta.tile_counts[2] != out_meta.tile_counts[2]) return false;
-    if (x_meta.tile_shape[2] != out_meta.tile_shape[2]) return false;
-
-    // W is tiled only along K (dim0) and C_out (dim2); dim1 is size 1.
-    if (w_meta.tile_counts[1] != 1 or w_meta.tile_shape[1] != 1) return false;
-    if (w_meta.tile_counts[2] != out_meta.tile_counts[2]) return false;
-    if (w_meta.tile_shape[2] != out_meta.tile_shape[2]) return false;
-
-    // Bias (optional) is tiled along C_out to match output channel tiles.
-    var bias_present: bool = false;
-    if (s.bias) |b_id| {
-        const bias_meta: tensor_store.TensorMeta = try store.meta(b_id);
-        if (bias_meta.rank != 1 or bias_meta.shape[0] != c_out or bias_meta.tile_counts.len != 1) return false;
-        if (bias_meta.tile_counts[0] != out_meta.tile_counts[2]) return false;
-        if (bias_meta.tile_shape[0] != out_meta.tile_shape[2]) return false;
-        bias_present = true;
-    }
-
-    const x_ltc: usize = x_meta.tile_counts[1];
-    const x_ctc: usize = x_meta.tile_counts[2];
-    const out_ltc: usize = out_meta.tile_counts[1];
-    const out_ctc: usize = out_meta.tile_counts[2];
-    const w_ktc: usize = w_meta.tile_counts[0];
-
-    if (x_ltc == 0 or x_ctc == 0 or out_ltc == 0 or out_ctc == 0 or w_ktc == 0) return BackendError.InvalidArgument;
-
-    const alloc: std.mem.Allocator = ctx.allocator;
-
-    // Cache all X tiles.
-    const XTile = conv1d_kernels.XTile;
-    const x_tile_total: usize = batch * x_ltc * x_ctc;
-    const x_tiles: []XTile = try alloc.alloc(XTile, x_tile_total);
-    defer alloc.free(x_tiles);
-
-    const x_tokens: []usize = try alloc.alloc(usize, x_tile_total);
-    defer alloc.free(x_tokens);
-    var x_acquired: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < x_acquired) : (i += 1) store.releaseConst(x_tokens[i]);
-    }
-
-    var x_coords_buf: [3]usize = undefined;
-    var b: usize = 0;
-    while (b < batch) : (b += 1) {
-        var xlti: usize = 0;
-        while (xlti < x_ltc) : (xlti += 1) {
-            var xcti: usize = 0;
-            while (xcti < x_ctc) : (xcti += 1) {
-                x_coords_buf = .{ b, xlti, xcti };
-                const x_tile_index: usize = try tensor_store.encodeTileIndex(x_meta, x_coords_buf[0..3]);
-                const x_tile = try store.acquireTileConstLinear(s.x, x_tile_index);
-                x_tokens[x_acquired] = x_tile.token;
-                x_acquired += 1;
-
-                const idx: usize = (b * x_ltc + xlti) * x_ctc + xcti;
-                const xv_all: []align(1) const f32 = bytesAsF32Const(x_tile.bytes);
-                const l_mem: usize = @as(usize, x_tile.shape_mem[1]);
-                const c_mem: usize = @as(usize, x_tile.shape_mem[2]);
-                const need: usize = l_mem * c_mem;
-                if (xv_all.len < need) return BackendError.InvalidArgument;
-                x_tiles[idx] = .{ .vals = xv_all[0..need], .l_mem = l_mem, .c_mem = c_mem, .row_stride = c_mem };
-            }
-        }
-    }
-    defer {
-        var i: usize = 0;
-        while (i < x_acquired) : (i += 1) store.releaseConst(x_tokens[i]);
-    }
-
-    // Cache W tiles.
-    const WTile = conv1d_kernels.WTile;
-    const w_tile_total: usize = out_ctc * w_ktc;
-    const w_tiles: []WTile = try alloc.alloc(WTile, w_tile_total);
-    defer alloc.free(w_tiles);
-
-    const w_tokens: []usize = try alloc.alloc(usize, w_tile_total);
-    defer alloc.free(w_tokens);
-    var w_acquired: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < w_acquired) : (i += 1) store.releaseConst(w_tokens[i]);
-    }
-
-    var w_coords_buf: [3]usize = undefined;
-    var out_cti: usize = 0;
-    while (out_cti < out_ctc) : (out_cti += 1) {
-        var wkti: usize = 0;
-        while (wkti < w_ktc) : (wkti += 1) {
-            w_coords_buf = .{ wkti, 0, out_cti };
-            const w_tile_index: usize = try tensor_store.encodeTileIndex(w_meta, w_coords_buf[0..3]);
-            const w_tile = try store.acquireTileConstLinear(s.w, w_tile_index);
-            w_tokens[w_acquired] = w_tile.token;
-            w_acquired += 1;
-
-            const idx: usize = out_cti * w_ktc + wkti;
-            const wv_all: []align(1) const f32 = bytesAsF32Const(w_tile.bytes);
-            const k_mem: usize = @as(usize, w_tile.shape_mem[0]);
-            const c_mem: usize = @as(usize, w_tile.shape_mem[2]);
-            const need: usize = k_mem * c_mem;
-            if (wv_all.len < need) return BackendError.InvalidArgument;
-            w_tiles[idx] = .{ .vals = wv_all[0..need], .k_mem = k_mem, .c_mem = c_mem };
-        }
-    }
-    defer {
-        var i: usize = 0;
-        while (i < w_acquired) : (i += 1) store.releaseConst(w_tokens[i]);
-    }
-
-    // Cache bias tiles (optional).
-    const bias_slices: [][]align(1) const f32 = if (bias_present) try alloc.alloc([]align(1) const f32, out_ctc) else &[_][]align(1) const f32{};
-    defer if (bias_present) alloc.free(bias_slices);
-
-    const bias_tokens: []usize = if (bias_present) try alloc.alloc(usize, out_ctc) else &[_]usize{};
-    defer if (bias_present) alloc.free(bias_tokens);
-
-    var bias_acquired: usize = 0;
-    errdefer {
-        if (bias_present) {
-            var i: usize = 0;
-            while (i < bias_acquired) : (i += 1) store.releaseConst(bias_tokens[i]);
-        }
-    }
-
-    if (bias_present) {
-        const b_id: tensor_store.TensorId = s.bias.?;
-        out_cti = 0;
-        while (out_cti < out_ctc) : (out_cti += 1) {
-            const b_tile = try store.acquireTileConstLinear(b_id, out_cti);
-            bias_tokens[bias_acquired] = b_tile.token;
-            bias_acquired += 1;
-
-            const oc_count: usize = @as(usize, b_tile.shape_mem[0]);
-            const b_all: []align(1) const f32 = bytesAsF32Const(b_tile.bytes);
-            if (b_all.len < oc_count) return BackendError.InvalidArgument;
-            bias_slices[out_cti] = b_all[0..oc_count];
-        }
-    }
-    defer if (bias_present) {
-        var i: usize = 0;
-        while (i < bias_acquired) : (i += 1) store.releaseConst(bias_tokens[i]);
-    };
-
-    // Pre-acquire all output tiles.
-    const out_tile_total: usize = batch * out_ltc * out_ctc;
-    const out_tiles_all: [][]align(1) f32 = try alloc.alloc([]align(1) f32, out_tile_total);
-    defer alloc.free(out_tiles_all);
-
-    const out_tokens_all: []usize = try alloc.alloc(usize, out_tile_total);
-    defer alloc.free(out_tokens_all);
-    var out_acquired: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < out_acquired) : (i += 1) store.releaseMut(out_tokens_all[i]);
-    }
-
-    const out_l_mems: []usize = try alloc.alloc(usize, batch * out_ltc);
-    defer alloc.free(out_l_mems);
-
-    var out_coords_buf: [3]usize = undefined;
-    b = 0;
-    while (b < batch) : (b += 1) {
-        var out_lti: usize = 0;
-        while (out_lti < out_ltc) : (out_lti += 1) {
-            var l_mem_ref: usize = 0;
-            out_cti = 0;
-            while (out_cti < out_ctc) : (out_cti += 1) {
-                out_coords_buf = .{ b, out_lti, out_cti };
-                const out_tile_index: usize = try tensor_store.encodeTileIndex(out_meta, out_coords_buf[0..3]);
-                const out_tile = try store.acquireTileMutLinear(s.out, out_tile_index);
-                out_tokens_all[out_acquired] = out_tile.token;
-                out_acquired += 1;
-
-                const idx: usize = (b * out_ltc + out_lti) * out_ctc + out_cti;
-
-                const l_mem: usize = @as(usize, out_tile.shape_mem[1]);
-                const c_mem: usize = @as(usize, out_tile.shape_mem[2]);
-                if (out_cti == 0) {
-                    l_mem_ref = l_mem;
-                    out_l_mems[b * out_ltc + out_lti] = l_mem;
-                } else if (l_mem != l_mem_ref) {
-                    return BackendError.InvalidArgument;
-                }
-
-                const ov_all: []align(1) f32 = bytesAsF32Mut(out_tile.bytes);
-                if (ov_all.len < l_mem * c_mem) return BackendError.InvalidArgument;
-                out_tiles_all[idx] = ov_all[0 .. l_mem * c_mem];
-            }
-        }
-    }
-    defer {
-        var i: usize = 0;
-        while (i < out_acquired) : (i += 1) store.releaseMut(out_tokens_all[i]);
-    }
-
-    const out_tl: usize = out_meta.tile_shape[1];
-    const out_tc: usize = out_meta.tile_shape[2];
-    const x_tl: usize = x_meta.tile_shape[1];
-    const w_tk: usize = w_meta.tile_shape[0];
-
-    const fast_stride1_dil1: bool = (s.pad_mode != .reflect and s.stride == 1 and s.dilation == 1 and x_ltc == 1 and w_ktc == 1);
-
-    var task: conv1d_kernels.DepthwiseConv1DTask = .{
-        .p = .{ .stride = s.stride, .dilation = s.dilation, .pad_left = s.pad_left, .reflect = s.pad_mode == .reflect },
-        .batch = batch,
-        .l_in = l_in,
-        .l_out = l_out,
-        .c = c_out,
-        .k = k,
-        .out_ltc = out_ltc,
-        .out_ctc = out_ctc,
-        .out_tl = out_tl,
-        .out_tc = out_tc,
-        .out_l_mems = out_l_mems,
-        .x_ltc = x_ltc,
-        .x_ctc = x_ctc,
-        .x_tl = x_tl,
-        .x_tiles = x_tiles,
-        .w_tiles = w_tiles,
-        .w_ktc = w_ktc,
-        .w_tk = w_tk,
-        .out_tiles_all = out_tiles_all,
-        .bias_slices = if (bias_present) bias_slices else &[_][]align(1) const f32{},
-        .fast_stride1_dil1 = fast_stride1_dil1,
-    };
-
-    const work_items: usize = batch * out_ltc * out_ctc;
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and work_items >= 2) {
-            p.parallelForAny(@ptrCast(&task), work_items, 1, ctx.depthwise_conv1d.run_items);
-            return true;
-        }
-    }
-
-    ctx.depthwise_conv1d.run_item_range(&task, 0, work_items);
-    return true;
-}
-
-fn tryExecConv1DImplicitGemmTileNative(
-    ctx: *ConvExecCtx,
-    s: StepConv1DTiled,
-    out_meta: tensor_store.TensorMeta,
-    x_meta: tensor_store.TensorMeta,
-    w_meta: tensor_store.TensorMeta,
-    store: tensor_store.TensorStore,
-) ExecuteProgramError!bool {
-    // Support reflect padding inside the same tile-native packing loop.
-    // Tile-native fast path (Conv1D NLC-style channel-last).
-    // Goals:
-    // - avoid packed-scalar read/write of X/out
-    // - avoid per-call heap allocations in the hot loop
-    // Requirements (v1):
-    // - rank-3 (batch, length, channel)
-    // - groups == 1
-    // - batch tile shape is 1
-    // - X channel dim is not tiled (tile_counts[C_in] == 1)
-    // - W is tiled only along C_out, and aligns with Out's C tile
-    const rank: usize = @as(usize, out_meta.rank);
-    if (rank != 3) return false;
-    if (s.groups != 1) return false;
-
-    if (out_meta.tile_counts.len != 3 or x_meta.tile_counts.len != 3 or w_meta.tile_counts.len != 3) return false;
-    if (x_meta.tile_shape[0] != 1 or out_meta.tile_shape[0] != 1) return false;
-    if (x_meta.tile_counts[2] != 1) return false;
-    if (w_meta.tile_counts[0] != 1 or w_meta.tile_counts[1] != 1) return false;
-    if (w_meta.tile_counts[2] != out_meta.tile_counts[2]) return false;
-    if (w_meta.tile_shape[2] != out_meta.tile_shape[2]) return false;
-
-    const batch: usize = out_meta.shape[0];
-    const c_out: usize = out_meta.shape[2];
-    const l_in: usize = x_meta.shape[1];
-    const c_in: usize = x_meta.shape[2];
-
-    const k: usize = w_meta.shape[0];
-    const c_in_g: usize = w_meta.shape[1];
-    if (c_in_g != c_in) return false;
-    if (c_out != w_meta.shape[2]) return false;
-
-    const k_dim_g: usize = k * c_in_g;
-
-    const matmul_default: matmul_registry.F32Kernels = ctx.matmul_f32;
-    const kc: usize = matmul_default.tuning.kc;
-    const m_cap: usize = matmul_default.tuning.mc;
-    if (kc == 0 or m_cap == 0) return BackendError.InvalidArgument;
-
-    // Bias is tiled along C_out.
-    var bias_present: bool = false;
-    var bias_meta: tensor_store.TensorMeta = undefined;
-    if (s.bias) |b_id| {
-        bias_meta = try store.meta(b_id);
-        if (bias_meta.rank != 1 or bias_meta.shape[0] != c_out or bias_meta.tile_counts.len != 1) return false;
-        if (bias_meta.tile_counts[0] != out_meta.tile_counts[2]) return false;
-        if (bias_meta.tile_shape[0] != out_meta.tile_shape[2]) return false;
-        bias_present = true;
-    }
-
-    const XTile = struct {
-        vals: []align(1) const f32,
-        l_mem: usize,
-        c_mem: usize,
-        row_stride: usize,
-    };
-
-    const x_ltc: usize = x_meta.tile_counts[1];
-    const out_ltc: usize = out_meta.tile_counts[1];
-    if (x_ltc == 0 or out_ltc == 0) return BackendError.InvalidArgument;
-
-    const alloc: std.mem.Allocator = ctx.allocator;
-
-    // Cache all X tiles (const) for all batches.
-    const x_tile_total: usize = batch * x_ltc;
-    const x_tiles: []XTile = try alloc.alloc(XTile, x_tile_total);
-    defer alloc.free(x_tiles);
-    const x_tokens: []usize = try alloc.alloc(usize, x_tile_total);
-    defer alloc.free(x_tokens);
-
-    var x_coords_buf: [3]usize = undefined;
-    var xb: usize = 0;
-    while (xb < batch) : (xb += 1) {
-        var xlti: usize = 0;
-        while (xlti < x_ltc) : (xlti += 1) {
-            x_coords_buf = .{ xb, xlti, 0 };
-            const x_tile_index: usize = try tensor_store.encodeTileIndex(x_meta, x_coords_buf[0..3]);
-            const x_tile = try store.acquireTileConstLinear(s.x, x_tile_index);
-            const idx: usize = xb * x_ltc + xlti;
-            x_tokens[idx] = x_tile.token;
-
-            const xv_all: []align(1) const f32 = bytesAsF32Const(x_tile.bytes);
-            const l_mem: usize = @as(usize, x_tile.shape_mem[1]);
-            const c_mem: usize = @as(usize, x_tile.shape_mem[2]);
-            const need: usize = l_mem * c_mem;
-            if (xv_all.len < need) {
-                store.releaseConst(x_tile.token);
-                return BackendError.InvalidArgument;
-            }
-            x_tiles[idx] = .{ .vals = xv_all[0..need], .l_mem = l_mem, .c_mem = c_mem, .row_stride = c_mem };
-        }
-    }
-    defer {
-        var i: usize = 0;
-        while (i < x_tile_total) : (i += 1) store.releaseConst(x_tokens[i]);
-    }
-
-    // Precompute packed weights per OC tile (and keep bias tiles acquired).
-    const oc_tiles: usize = out_meta.tile_counts[2];
-    if (oc_tiles == 0) return BackendError.InvalidArgument;
-
-    // Allow per-OC-tile matmul selection (primarily narrow-N variants) while keeping
-    // KC constant, because KC drives the K-blocking loop structure below.
-    const oc_matmuls: []matmul_registry.F32Kernels = try alloc.alloc(matmul_registry.F32Kernels, oc_tiles);
-    defer alloc.free(oc_matmuls);
-    var max_nc: usize = matmul_default.tuning.nc;
-
-    const packed_ws: []PackedWeightEntry = try alloc.alloc(PackedWeightEntry, oc_tiles);
-    defer alloc.free(packed_ws);
-    const oc_counts: []usize = try alloc.alloc(usize, oc_tiles);
-    defer alloc.free(oc_counts);
-
-    const bias_slices: [][]align(1) const f32 = if (bias_present) try alloc.alloc([]align(1) const f32, oc_tiles) else &[_][]align(1) const f32{};
-    defer if (bias_present) alloc.free(bias_slices);
-    const bias_tokens: []usize = if (bias_present) try alloc.alloc(usize, oc_tiles) else &[_]usize{};
-    defer if (bias_present) alloc.free(bias_tokens);
-
-    var w_coords_buf: [3]usize = undefined;
-    var oc_ti: usize = 0;
-    while (oc_ti < oc_tiles) : (oc_ti += 1) {
-        w_coords_buf = .{ 0, 0, oc_ti };
-        const w_tile_index: usize = try tensor_store.encodeTileIndex(w_meta, w_coords_buf[0..3]);
-        const w_tile = try store.acquireTileConstLinear(s.w, w_tile_index);
-        defer store.releaseConst(w_tile.token);
-        const w_vals_all: []align(1) const f32 = bytesAsF32Const(w_tile.bytes);
-        const oc_count: usize = @as(usize, w_tile.shape_mem[2]);
-        oc_counts[oc_ti] = oc_count;
-        if (w_vals_all.len < k_dim_g * oc_count) return BackendError.InvalidArgument;
-        const w_vals: []align(1) const f32 = w_vals_all[0 .. k_dim_g * oc_count];
-
-        // Select a matmul variant for this OC tile. We only accept variants that
-        // preserve KC (and MR/NR) to keep the surrounding packing/loop structure stable.
-        var matmul_oc: matmul_registry.F32Kernels = matmul_registry.selectForConvOcTile(matmul_default, oc_count);
-        if (matmul_oc.tuning.kc != kc or matmul_oc.tuning.mr != matmul_default.tuning.mr or matmul_oc.tuning.nr != matmul_default.tuning.nr) {
-            matmul_oc = matmul_default;
-        }
-        oc_matmuls[oc_ti] = matmul_oc;
-        max_nc = @max(max_nc, matmul_oc.tuning.nc);
-
-        const oc_start: usize = oc_ti * out_meta.tile_shape[2];
-        const key: PackedWeightKey = .{
-            .w_id = s.w,
-            .oc_start = oc_start,
-            .k_dim = k_dim_g,
-            .c_out = oc_count,
-            .groups = 1,
-            .kc = kc,
-            .nc = matmul_oc.tuning.nc,
-        };
-        packed_ws[oc_ti] = try getOrCreatePackedWeights(ctx.cache, matmul_oc, key, w_vals);
-
-        if (bias_present) {
-            const b_id: tensor_store.TensorId = s.bias.?;
-            const b_tile = try store.acquireTileConstLinear(b_id, oc_ti);
-            bias_tokens[oc_ti] = b_tile.token;
-            const b_all: []align(1) const f32 = bytesAsF32Const(b_tile.bytes);
-            if (b_all.len < oc_count) return BackendError.InvalidArgument;
-            bias_slices[oc_ti] = b_all[0..oc_count];
-        }
-    }
-    defer if (bias_present) {
-        var i: usize = 0;
-        while (i < oc_tiles) : (i += 1) store.releaseConst(bias_tokens[i]);
-    };
-
-    const full_blocks: usize = k_dim_g / kc;
-    const k_tail: usize = k_dim_g - full_blocks * kc;
-
-    // Pre-acquire all output tiles once (avoids repeated acquire/release and enables global parallelism).
-    const out_tile_total: usize = batch * out_ltc * oc_tiles;
-    const out_tiles_all: [][]align(1) f32 = try alloc.alloc([]align(1) f32, out_tile_total);
-    defer alloc.free(out_tiles_all);
-    const out_tokens_all: []usize = try alloc.alloc(usize, out_tile_total);
-    defer alloc.free(out_tokens_all);
-    const out_l_mems: []usize = try alloc.alloc(usize, batch * out_ltc);
-    defer alloc.free(out_l_mems);
-
-    var out_coords_buf: [3]usize = undefined;
-    var bb: usize = 0;
-    while (bb < batch) : (bb += 1) {
-        var lti: usize = 0;
-        while (lti < out_ltc) : (lti += 1) {
-            var l_mem_ref: usize = 0;
-            var oc_ti2: usize = 0;
-            while (oc_ti2 < oc_tiles) : (oc_ti2 += 1) {
-                out_coords_buf = .{ bb, lti, oc_ti2 };
-                const out_tile_index: usize = try tensor_store.encodeTileIndex(out_meta, out_coords_buf[0..3]);
-                const out_tile = try store.acquireTileMutLinear(s.out, out_tile_index);
-
-                const idx: usize = ((bb * out_ltc + lti) * oc_tiles) + oc_ti2;
-                out_tokens_all[idx] = out_tile.token;
-
-                const l_mem: usize = @as(usize, out_tile.shape_mem[1]);
-                const c_mem: usize = @as(usize, out_tile.shape_mem[2]);
-                if (c_mem != oc_counts[oc_ti2]) return BackendError.InvalidArgument;
-                if (oc_ti2 == 0) {
-                    l_mem_ref = l_mem;
-                    out_l_mems[bb * out_ltc + lti] = l_mem;
-                } else if (l_mem != l_mem_ref) {
-                    return BackendError.InvalidArgument;
-                }
-
-                const ov_all: []align(1) f32 = bytesAsF32Mut(out_tile.bytes);
-                if (ov_all.len < l_mem * c_mem) return BackendError.InvalidArgument;
-                out_tiles_all[idx] = ov_all[0 .. l_mem * c_mem];
-            }
-        }
-    }
-    defer {
-        var i: usize = 0;
-        while (i < out_tile_total) : (i += 1) store.releaseMut(out_tokens_all[i]);
-    }
-
-    const blocks_per_tile: usize = (out_meta.tile_shape[1] + m_cap - 1) / m_cap;
-    const work_items: usize = batch * out_ltc * blocks_per_tile;
-
-    const Task = struct {
-        ctx: *ConvExecCtx,
-        s: StepConv1DTiled,
-        // Matmul kernel selection per OC tile. All entries share KC/MR/NR.
-        oc_matmuls: []const matmul_registry.F32Kernels,
-        mr: usize,
-        a_layout: matmul_registry.PackedALayout,
-        max_nc: usize,
-
-        // Shapes.
-        l_in: usize,
-        c_in: usize,
-        k: usize,
-        batch: usize,
-        out_ltc: usize,
-        blocks_per_tile: usize,
-
-        // Tiling.
-        out_tl: usize,
-        out_l_mems: []const usize,
-
-        // X tiles.
-        x_tiles: []const XTile,
-        x_ltc: usize,
-        x_tl: usize,
-
-        // Output tiles for all (b,lti,oc_ti): indexed by ((b*out_ltc + lti)*oc_tiles + oc_ti).
-        out_tiles_all: [][]align(1) f32,
-        packed_ws: []const PackedWeightEntry,
-        oc_counts: []const usize,
-        bias_slices: [][]align(1) const f32,
-
-        kc: usize,
-        m_cap: usize,
-        full_blocks: usize,
-        k_tail: usize,
-
-        inline fn reflectIndex(idx_nom: isize, len: isize) isize {
-            // len must be > 1 (validated in infer/program for reflect)
-            var x: isize = idx_nom;
-            while (x < 0 or x >= len) {
-                // Reflect padding semantics used by our reference tests.
-                // Note: this mapping reflects around the edge including index 0.
-                if (x < 0) x = -x else x = (2 * len - 2) - x;
-            }
-            return x;
-        }
-
-        fn runItemRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
-            @setRuntimeSafety(false);
-
-            const pb_elems: usize = t.kc * t.max_nc;
-            const pa_elems: usize = conv_utils.packedAElems(t.mr, t.m_cap, t.kc);
-            const scratch_f32: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch));
-            std.debug.assert(scratch_f32.len >= pb_elems + pa_elems);
-            const packed_a_buf: []align(32) f32 = @alignCast(scratch_f32[pb_elems .. pb_elems + pa_elems]);
-
-            const l_in_i: isize = @as(isize, @intCast(t.l_in));
-            const use_reflect: bool = (t.s.pad_mode == .reflect);
-            const max_l: isize = @as(isize, @intCast((t.k - 1) * t.s.dilation));
-            const max_l_u: usize = @intCast(max_l);
-            const dilation_u: usize = t.s.dilation;
-
-            const bias_present_local: bool = (t.bias_slices.len != 0);
-            const MR: usize = t.mr;
-            const KC: usize = t.kc;
-
-            var item0: usize = start;
-            while (item0 < end) : (item0 += 1) {
-                // Decode work item.
-                const items_per_batch: usize = t.out_ltc * t.blocks_per_tile;
-                const b: usize = item0 / items_per_batch;
-                const rem0: usize = item0 - b * items_per_batch;
-                const lti: usize = rem0 / t.blocks_per_tile;
-                const bi: usize = rem0 - lti * t.blocks_per_tile;
-
-                if (b >= t.batch) continue;
-                const out_l_mem: usize = t.out_l_mems[b * t.out_ltc + lti];
-                const row0: usize = bi * t.m_cap;
-                if (row0 >= out_l_mem) continue;
-                const row_end: usize = @min(out_l_mem, row0 + t.m_cap);
-                const m_rows: usize = row_end - row0;
-
-                const l_base: usize = lti * t.out_tl;
-                const b_x_off: usize = b * t.x_ltc;
-                const b_out_off: usize = (b * t.out_ltc + lti) * t.oc_counts.len;
-                const x_single_len_tile: bool = (t.x_ltc == 1);
-                const xt_only: XTile = if (x_single_len_tile) t.x_tiles[b_x_off] else undefined;
-
-                if (t.full_blocks != 0) {
-                    var bi_full: usize = 0;
-                    while (bi_full < t.full_blocks) : (bi_full += 1) {
-                        const kk0: usize = bi_full * t.kc;
-                        const k_sub: usize = t.kc;
-                        const panel_count: usize = (m_rows + MR - 1) / MR;
-
-                        // Pack A once for this K-block.
-                        var panel: usize = 0;
-                        while (panel < panel_count) : (panel += 1) {
-                            const base_pa: usize = panel * (MR * KC);
-                            var r: usize = 0;
-                            while (r < MR) : (r += 1) {
-                                const mr: usize = panel * MR + r;
-                                if (mr >= m_rows) break;
-
-                                const lo_abs: usize = l_base + (row0 + mr);
-                                const lo0: isize = @as(isize, @intCast(lo_abs)) * @as(isize, @intCast(t.s.stride)) - @as(isize, @intCast(t.s.pad_left));
-                                const all_valid: bool = (lo0 >= 0 and (lo0 + max_l) < l_in_i);
-
-                                const kmaj = t.a_layout == .k_major;
-                                const row_pa: []f32 = if (kmaj)
-                                    conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
-                                else
-                                    packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
-
-                                // Fast-path when the entire convolution window stays within a single X length-tile.
-                                var one_tile: bool = false;
-                                var li_l0: usize = 0;
-                                var xt0: XTile = undefined;
-                                if (all_valid) {
-                                    const li0_u: usize = @intCast(lo0);
-                                    if (x_single_len_tile) {
-                                        li_l0 = li0_u;
-                                        one_tile = (li_l0 + max_l_u) < t.x_tl;
-                                        if (one_tile) xt0 = xt_only;
-                                    } else {
-                                        const xlti0: usize = li0_u / t.x_tl;
-                                        li_l0 = li0_u - xlti0 * t.x_tl;
-                                        one_tile = (li_l0 + max_l_u) < t.x_tl;
-                                        if (one_tile) {
-                                            xt0 = t.x_tiles[b_x_off + xlti0];
-                                        }
-                                    }
-                                }
-
-                                var rem_k: usize = k_sub;
-                                var gk: usize = kk0;
-                                var a_off: usize = 0;
-                                while (rem_k != 0) {
-                                    const kw: usize = gk / t.c_in;
-                                    const ic0: usize = gk - kw * t.c_in;
-                                    const take: usize = @min(rem_k, t.c_in - ic0);
-                                    const dst: []f32 = row_pa[a_off .. a_off + take];
-
-                                    if (all_valid) {
-                                        if (one_tile) {
-                                            const li_l: usize = li_l0 + kw * dilation_u;
-                                            const src0: usize = li_l * xt0.row_stride + ic0;
-                                            @memcpy(dst, xt0.vals[src0 .. src0 + take]);
-                                        } else {
-                                            const li_u: usize = @intCast(lo0 + @as(isize, @intCast(kw * dilation_u)));
-                                            const xlti: usize = li_u / t.x_tl;
-                                            const li_l: usize = li_u - xlti * t.x_tl;
-                                            const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                            const src0: usize = li_l * xt.row_stride + ic0;
-                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                        }
-                                    } else {
-                                        // Edge / padding.
-                                        const li_nom: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
-                                        if (use_reflect) {
-                                            // Reflect always maps into range (given validated constraints).
-                                            const li: isize = reflectIndex(li_nom, l_in_i);
-                                            const li_u: usize = @intCast(li);
-                                            const xlti: usize = li_u / t.x_tl;
-                                            const li_l: usize = li_u - xlti * t.x_tl;
-                                            const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                            const src0: usize = li_l * xt.row_stride + ic0;
-                                            @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                        } else {
-                                            if (li_nom >= 0 and li_nom < l_in_i) {
-                                                const li_u: usize = @intCast(li_nom);
-                                                const xlti: usize = li_u / t.x_tl;
-                                                if (xlti < t.x_ltc) {
-                                                    const li_l: usize = li_u - xlti * t.x_tl;
-                                                    const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                                    if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
-                                                        const src0: usize = li_l * xt.row_stride + ic0;
-                                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                                    } else {
-                                                        @memset(dst, 0.0);
-                                                    }
-                                                } else {
-                                                    @memset(dst, 0.0);
-                                                }
-                                            } else {
-                                                @memset(dst, 0.0);
-                                            }
-                                        }
-                                    }
-
-                                    gk += take;
-                                    a_off += take;
-                                    rem_k -= take;
-                                }
-                                if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
-                                    const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
-                                    conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
-                                }
-                            }
-                        }
-
-                        // Compute all OC tiles using the same packed A.
-                        const beta_eff: f32 = if (bi_full == 0) 0.0 else 1.0;
-                        var oc_ti2: usize = 0;
-                        while (oc_ti2 < t.oc_counts.len) : (oc_ti2 += 1) {
-                            const oc_count: usize = t.oc_counts[oc_ti2];
-                            const out: []align(1) f32 = t.out_tiles_all[b_out_off + oc_ti2];
-                            const c_base: usize = row0 * oc_count;
-                            const c_len: usize = m_rows * oc_count;
-                            const c_slice: []align(1) f32 = out[c_base .. c_base + c_len];
-
-                            const pw: PackedWeightEntry = t.packed_ws[oc_ti2];
-                            const block_elems: usize = pw.block_elems;
-                            const pb0: usize = bi_full * block_elems;
-                            const packed_b_view: []align(32) const f32 = @alignCast(pw.blocks[pb0 .. pb0 + block_elems]);
-                            const pp: MatMulParams = .{ .m = m_rows, .n = oc_count, .k = k_sub, .ldc = oc_count, .alpha = 1.0, .beta = beta_eff };
-                            const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
-                            try mk.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
-                        }
-                    }
-                }
-
-                if (t.k_tail != 0) {
-                    const kk0: usize = t.full_blocks * t.kc;
-                    const k_sub: usize = t.k_tail;
-                    const panel_count: usize = (m_rows + MR - 1) / MR;
-
-                    var panel: usize = 0;
-                    while (panel < panel_count) : (panel += 1) {
-                        const base_pa: usize = panel * (MR * KC);
-                        var r: usize = 0;
-                        while (r < MR) : (r += 1) {
-                            const mr: usize = panel * MR + r;
-                            if (mr >= m_rows) break;
-
-                            const lo_abs: usize = l_base + (row0 + mr);
-                            const lo0: isize = @as(isize, @intCast(lo_abs)) * @as(isize, @intCast(t.s.stride)) - @as(isize, @intCast(t.s.pad_left));
-                            const all_valid: bool = (lo0 >= 0 and (lo0 + max_l) < l_in_i);
-
-                            const kmaj = t.a_layout == .k_major;
-                            const row_pa: []f32 = if (kmaj)
-                                conv_utils.kMajorStage(KC)[(r % conv_utils.KMAJOR_GROUP) * KC ..][0..KC]
-                            else
-                                packed_a_buf[base_pa + r * KC .. base_pa + r * KC + KC];
-
-                            var one_tile: bool = false;
-                            var li_l0: usize = 0;
-                            var xt0: XTile = undefined;
-                            if (all_valid) {
-                                const li0_u: usize = @intCast(lo0);
-                                if (x_single_len_tile) {
-                                    li_l0 = li0_u;
-                                    one_tile = (li_l0 + max_l_u) < t.x_tl;
-                                    if (one_tile) xt0 = xt_only;
-                                } else {
-                                    const xlti0: usize = li0_u / t.x_tl;
-                                    li_l0 = li0_u - xlti0 * t.x_tl;
-                                    one_tile = (li_l0 + max_l_u) < t.x_tl;
-                                    if (one_tile) {
-                                        xt0 = t.x_tiles[b_x_off + xlti0];
-                                    }
-                                }
-                            }
-
-                            var rem_k: usize = k_sub;
-                            var gk: usize = kk0;
-                            var a_off: usize = 0;
-                            while (rem_k != 0) {
-                                const kw: usize = gk / t.c_in;
-                                const ic0: usize = gk - kw * t.c_in;
-                                const take: usize = @min(rem_k, t.c_in - ic0);
-                                const dst: []f32 = row_pa[a_off .. a_off + take];
-
-                                if (all_valid) {
-                                    if (one_tile) {
-                                        const li_l: usize = li_l0 + kw * dilation_u;
-                                        const src0: usize = li_l * xt0.row_stride + ic0;
-                                        @memcpy(dst, xt0.vals[src0 .. src0 + take]);
-                                    } else {
-                                        const li_u: usize = @intCast(lo0 + @as(isize, @intCast(kw * dilation_u)));
-                                        const xlti: usize = li_u / t.x_tl;
-                                        const li_l: usize = li_u - xlti * t.x_tl;
-                                        const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                        const src0: usize = li_l * xt.row_stride + ic0;
-                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                    }
-                                } else {
-                                    const li_nom: isize = lo0 + @as(isize, @intCast(kw * t.s.dilation));
-                                    if (use_reflect) {
-                                        const li: isize = reflectIndex(li_nom, l_in_i);
-                                        const li_u: usize = @intCast(li);
-                                        const xlti: usize = li_u / t.x_tl;
-                                        const li_l: usize = li_u - xlti * t.x_tl;
-                                        const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                        const src0: usize = li_l * xt.row_stride + ic0;
-                                        @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                    } else {
-                                        if (li_nom >= 0 and li_nom < l_in_i) {
-                                            const li_u: usize = @intCast(li_nom);
-                                            const xlti: usize = li_u / t.x_tl;
-                                            if (xlti < t.x_ltc) {
-                                                const li_l: usize = li_u - xlti * t.x_tl;
-                                                const xt: XTile = t.x_tiles[b_x_off + xlti];
-                                                if (li_l < xt.l_mem and (ic0 + take) <= xt.c_mem) {
-                                                    const src0: usize = li_l * xt.row_stride + ic0;
-                                                    @memcpy(dst, xt.vals[src0 .. src0 + take]);
-                                                } else {
-                                                    @memset(dst, 0.0);
-                                                }
-                                            } else {
-                                                @memset(dst, 0.0);
-                                            }
-                                        } else {
-                                            @memset(dst, 0.0);
-                                        }
-                                    }
-                                }
-
-                                gk += take;
-                                a_off += take;
-                                rem_k -= take;
-                            }
-                            if (kmaj and ((r % conv_utils.KMAJOR_GROUP) == conv_utils.KMAJOR_GROUP - 1 or r + 1 == MR or mr + 1 == m_rows)) {
-                                const g0: usize = r - (r % conv_utils.KMAJOR_GROUP);
-                                conv_utils.cornerTurnKMajor(packed_a_buf[base_pa..], conv_utils.kMajorStage(KC), MR, g0, r - g0 + 1, k_sub, KC);
-                            }
-                        }
-                    }
-
-                    const beta_eff: f32 = if (t.full_blocks == 0) 0.0 else 1.0;
-                    var oc_ti2: usize = 0;
-                    while (oc_ti2 < t.oc_counts.len) : (oc_ti2 += 1) {
-                        const oc_count: usize = t.oc_counts[oc_ti2];
-                        const out: []align(1) f32 = t.out_tiles_all[b_out_off + oc_ti2];
-                        const c_base: usize = row0 * oc_count;
-                        const c_len: usize = m_rows * oc_count;
-                        const c_slice: []align(1) f32 = out[c_base .. c_base + c_len];
-
-                        const pw: PackedWeightEntry = t.packed_ws[oc_ti2];
-                        const block_elems: usize = pw.block_elems;
-                        const pb0: usize = t.full_blocks * block_elems;
-                        const packed_b_view: []align(32) const f32 = @alignCast(pw.blocks[pb0 .. pb0 + block_elems]);
-                        const pp: MatMulParams = .{ .m = m_rows, .n = oc_count, .k = k_sub, .ldc = oc_count, .alpha = 1.0, .beta = beta_eff };
-                        const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
-                        try mk.matmul_packed_ab(packed_a_buf, packed_b_view, pp, std.mem.sliceAsBytes(c_slice));
-                    }
-                }
-
-                if (bias_present_local) {
-                    var oc_ti2: usize = 0;
-                    while (oc_ti2 < t.oc_counts.len) : (oc_ti2 += 1) {
-                        const oc_count: usize = t.oc_counts[oc_ti2];
-                        const out: []align(1) f32 = t.out_tiles_all[b_out_off + oc_ti2];
-                        const bias: []align(1) const f32 = t.bias_slices[oc_ti2];
-                        const mk: matmul_registry.F32Kernels = t.oc_matmuls[oc_ti2];
-                        addBiasRowsF32(out, row0, m_rows, oc_count, oc_count, bias, mk.tuning.lanes);
-                    }
-                }
-            }
-        }
-
-        fn runItems(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
-            const t: *@This() = @ptrCast(@alignCast(ctx_any));
-            if (tid >= t.ctx.matmul_scratch.len) return error.InvalidArgument;
-            const scratch_bytes: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            try t.runItemRange(scratch_bytes, start, end);
-        }
-    };
-
-    var task: Task = .{
-        .ctx = ctx,
-        .s = s,
-        .oc_matmuls = oc_matmuls,
-        .mr = matmul_default.tuning.mr,
-        .a_layout = matmul_default.tuning.a_layout,
-        .max_nc = max_nc,
-        .l_in = l_in,
-        .c_in = c_in,
-        .k = k,
-        .batch = batch,
-        .out_ltc = out_ltc,
-        .blocks_per_tile = blocks_per_tile,
-        .out_tl = out_meta.tile_shape[1],
-        .out_l_mems = out_l_mems,
-        .x_tiles = x_tiles,
-        .x_ltc = x_ltc,
-        .x_tl = x_meta.tile_shape[1],
-        .out_tiles_all = out_tiles_all,
-        .packed_ws = packed_ws,
-        .oc_counts = oc_counts,
-        .bias_slices = if (bias_present) bias_slices else &[_][]align(1) const f32{},
-        .kc = kc,
-        .m_cap = m_cap,
-        .full_blocks = full_blocks,
-        .k_tail = k_tail,
-    };
-
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and work_items >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
-            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), work_items, 1, Task.runItems);
-            return true;
-        }
-    }
-
-    // Fallback single-thread.
-    const scratch0: []align(32) u8 = try scratchForTid(ctx, 0);
-    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch0);
-    try task.runItemRange(scratch0, 0, work_items);
-
-    return true;
-}
-
-/// Fast path for small convolutions (e.g. Silero VAD feature extraction).
-///
-/// Bypasses tiling infrastructure entirely: reads flat, convolves directly with
-/// SIMD broadcast-accumulate, writes flat.  Only groups=1, rank-3, f32 and
-/// small element counts.
 fn tryExecConv1DSmallDirect(
     ctx: *ConvExecCtx,
-    s: StepConv1DTiled,
+    s: StepConv1D,
     out_meta: tensor_store.TensorMeta,
     x_meta: tensor_store.TensorMeta,
     w_meta: tensor_store.TensorMeta,
@@ -990,130 +71,10 @@ fn tryExecConv1DSmallDirect(
     const c_in: usize = x_meta.shape[2];
     const k_len: usize = w_meta.shape[0];
 
-    // Helper: compute tile_total.
-    const calcTileTotal = struct {
-        fn run(meta: tensor_store.TensorMeta) usize {
-            var acc: usize = 1;
-            for (meta.tile_counts) |tc| acc *= tc;
-            return acc;
-        }
-    }.run;
-
-    // Helper: verify a single-tile, packed-contiguous f32 layout and return the usable slice.
-    const PackedTile = struct {
-        vals: []align(1) const f32,
-        token: usize,
-    };
-    const PackedTileMut = struct {
-        vals: []align(1) f32,
-        token: usize,
-    };
-    const tryAcquirePackedF32Const = struct {
-        fn run(store2: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId) ExecuteProgramError!?PackedTile {
-            if (meta.dtype != .f32) return null;
-            const rank2: usize = @as(usize, meta.rank);
-            if (rank2 == 0 or rank2 > 8) return null;
-            if (calcTileTotal(meta) != 1) return null;
-            const t = store2.acquireTileConstLinear(id, 0) catch return null;
-            const view = t.bufferView();
-            if (view.layout.rank != meta.rank) {
-                store2.releaseConst(t.token);
-                return null;
-            }
-            if (view.layout.shape.len != rank2 or meta.shape.len != rank2) {
-                store2.releaseConst(t.token);
-                return null;
-            }
-            var d: usize = 0;
-            while (d < rank2) : (d += 1) {
-                if (view.layout.shape[d] != meta.shape[d]) {
-                    store2.releaseConst(t.token);
-                    return null;
-                }
-            }
-            // Require packed-contiguous row-major in bytes.
-            var expect: isize = @intCast(@sizeOf(f32));
-            var dd: usize = rank2;
-            while (dd > 0) : (dd -= 1) {
-                const i: usize = dd - 1;
-                if (view.layout.strides_bytes[i] != expect) {
-                    store2.releaseConst(t.token);
-                    return null;
-                }
-                if (i > 0) {
-                    const mulv: isize = @intCast(view.layout.shape[i]);
-                    expect *= mulv;
-                }
-            }
-
-            const total_elems: usize = elemCountFromShape(meta.shape) catch {
-                store2.releaseConst(t.token);
-                return null;
-            };
-            const need_bytes: usize = total_elems * @sizeOf(f32);
-            if (t.bytes.len < need_bytes) {
-                store2.releaseConst(t.token);
-                return null;
-            }
-            const all_vals: []align(1) const f32 = bytesAsF32Const(t.bytes[0..need_bytes]);
-            return .{ .vals = all_vals[0..total_elems], .token = t.token };
-        }
-    }.run;
-    const tryAcquirePackedF32Mut = struct {
-        fn run(store2: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId) ExecuteProgramError!?PackedTileMut {
-            if (meta.dtype != .f32) return null;
-            const rank2: usize = @as(usize, meta.rank);
-            if (rank2 == 0 or rank2 > 8) return null;
-            if (calcTileTotal(meta) != 1) return null;
-            var t = store2.acquireTileMutLinear(id, 0) catch return null;
-            const view = t.bufferView();
-            if (view.layout.rank != meta.rank) {
-                store2.releaseMut(t.token);
-                return null;
-            }
-            if (view.layout.shape.len != rank2 or meta.shape.len != rank2) {
-                store2.releaseMut(t.token);
-                return null;
-            }
-            var d: usize = 0;
-            while (d < rank2) : (d += 1) {
-                if (view.layout.shape[d] != meta.shape[d]) {
-                    store2.releaseMut(t.token);
-                    return null;
-                }
-            }
-            var expect: isize = @intCast(@sizeOf(f32));
-            var dd: usize = rank2;
-            while (dd > 0) : (dd -= 1) {
-                const i: usize = dd - 1;
-                if (view.layout.strides_bytes[i] != expect) {
-                    store2.releaseMut(t.token);
-                    return null;
-                }
-                if (i > 0) {
-                    const mulv: isize = @intCast(view.layout.shape[i]);
-                    expect *= mulv;
-                }
-            }
-
-            const total_elems: usize = elemCountFromShape(meta.shape) catch {
-                store2.releaseMut(t.token);
-                return null;
-            };
-            const need_bytes: usize = total_elems * @sizeOf(f32);
-            if (t.bytes.len < need_bytes) {
-                store2.releaseMut(t.token);
-                return null;
-            }
-            const all_vals: []align(1) f32 = bytesAsF32Mut(t.bytes[0..need_bytes]);
-            return .{ .vals = all_vals[0..total_elems], .token = t.token };
-        }
-    }.run;
-
     // Core compute: assumes NLC packed buffers.
     const doDirect = struct {
         fn run(
-            s2: StepConv1DTiled,
+            s2: StepConv1D,
             batch2: usize,
             l_out2: usize,
             c_out2: usize,
@@ -1273,63 +234,14 @@ fn tryExecConv1DSmallDirect(
     const limit: usize = 256 * 1024;
     if (x_n > limit or w_n > limit or out_n > limit) return false;
 
-    // Fastest path: all tensors are a single packed f32 tile we can operate on directly.
-    // This avoids heap allocations and pack/unpack copies in readTensorPackedF32/writeTensorPackedF32.
-    if (try tryAcquirePackedF32Const(store, x_meta, s.x)) |x_tile| {
-        defer store.releaseConst(x_tile.token);
-        if (try tryAcquirePackedF32Const(store, w_meta, s.w)) |w_tile| {
-            defer store.releaseConst(w_tile.token);
-            if (try tryAcquirePackedF32Mut(store, out_meta, s.out)) |out_tile| {
-                defer store.releaseMut(out_tile.token);
-
-                var bias_ptr: ?[*]align(1) const f32 = null;
-                var bias_token: usize = 0;
-                if (s.bias) |b_id| {
-                    const b_meta: tensor_store.TensorMeta = store.meta(b_id) catch {
-                        return false;
-                    };
-                    if (try tryAcquirePackedF32Const(store, b_meta, b_id)) |b_tile| {
-                        bias_ptr = @ptrCast(b_tile.vals.ptr);
-                        bias_token = b_tile.token;
-                    } else {
-                        return false;
-                    }
-                }
-                defer if (bias_ptr != null) store.releaseConst(bias_token);
-
-                doDirect(
-                    s,
-                    batch,
-                    l_out,
-                    c_out,
-                    l_in,
-                    c_in,
-                    k_len,
-                    @ptrCast(x_tile.vals.ptr),
-                    @ptrCast(w_tile.vals.ptr),
-                    @ptrCast(out_tile.vals.ptr),
-                    bias_ptr,
-                );
-                return true;
-            }
-        }
-    }
-
-    // Fallback: keep existing behavior for nontrivial tilings/layouts.
-    // (Still uses the improved register-accumulating microkernel, but with packed copies.)
-    const total_f32: usize = x_n + w_n + out_n + c_out;
-    const scratch: []f32 = ctx.allocator.alloc(f32, total_f32) catch return false;
-    defer ctx.allocator.free(scratch);
-
-    try readTensorPackedF32(store, x_meta, s.x, scratch[0..x_n]);
-    try readTensorPackedF32(store, w_meta, s.w, scratch[x_n .. x_n + w_n]);
-
-    var bias_ptr2: ?[*]align(1) const f32 = null;
-    if (s.bias) |b_id| {
-        const b_meta: tensor_store.TensorMeta = try store.meta(b_id);
-        try readTensorPackedF32(store, b_meta, b_id, scratch[x_n + w_n + out_n ..][0..c_out]);
-        bias_ptr2 = @ptrCast(scratch.ptr + x_n + w_n + out_n);
-    }
+    const x = try store.acquireConst(s.x);
+    defer store.releaseConst(x.token);
+    const w = try store.acquireConst(s.w);
+    defer store.releaseConst(w.token);
+    const out = try store.acquireMut(s.out);
+    defer store.releaseMut(out.token);
+    const bias = if (s.bias) |b_id| try store.acquireConst(b_id) else null;
+    defer if (bias) |bt| store.releaseConst(bt.token);
 
     doDirect(
         s,
@@ -1339,44 +251,74 @@ fn tryExecConv1DSmallDirect(
         l_in,
         c_in,
         k_len,
-        @ptrCast(scratch.ptr),
-        @ptrCast(scratch.ptr + x_n),
-        @ptrCast(scratch.ptr + x_n + w_n),
-        bias_ptr2,
+        bytesAsF32Const(x.bytes).ptr,
+        bytesAsF32Const(w.bytes).ptr,
+        bytesAsF32Mut(out.bytes).ptr,
+        if (bias) |bt| bytesAsF32Const(bt.bytes).ptr else null,
     );
-
-    try writeTensorPackedF32(store, out_meta, s.out, scratch[x_n + w_n ..][0..out_n]);
+    _ = ctx;
     return true;
 }
 
-fn tileCount3(meta: tensor_store.TensorMeta) usize {
-    if (meta.tile_counts.len != 3) return 0;
-    return meta.tile_counts[0] * meta.tile_counts[1] * meta.tile_counts[2];
+/// Depthwise Conv1D is depthwise Conv2D over a single input row, its length the width.
+fn execDepthwise(ctx: *ConvExecCtx, s: StepConv1D, out_meta: tensor_store.TensorMeta, x_meta: tensor_store.TensorMeta, w_meta: tensor_store.TensorMeta, store: tensor_store.TensorStore) ExecuteProgramError!bool {
+    const rank: usize = out_meta.rank;
+    const c: usize = out_meta.shape[rank - 1];
+    if (s.groups != c or x_meta.shape[rank - 1] != c or w_meta.shape[1] != 1 or w_meta.shape[2] != c) return false;
+    if (w_meta.shape[0] > conv2d_kernels.MAX_TAPS) return false;
+    var batch: usize = 1;
+    for (out_meta.shape[0 .. rank - 2]) |d| batch *= d;
+
+    const x = try store.acquireConst(s.x);
+    defer store.releaseConst(x.token);
+    const w = try store.acquireConst(s.w);
+    defer store.releaseConst(w.token);
+    const out = try store.acquireMut(s.out);
+    defer store.releaseMut(out.token);
+    const bias = if (s.bias) |b_id| try store.acquireConst(b_id) else null;
+    defer if (bias) |b| store.releaseConst(b.token);
+
+    var task: conv2d_kernels.DepthwiseConv2DTask = .{
+        .p = .{
+            .stride_h = 1,
+            .stride_w = s.stride,
+            .dilation_h = 1,
+            .dilation_w = s.dilation,
+            .pad_top = 0,
+            .pad_left = s.pad_left,
+            .reflect = s.pad_mode == .reflect,
+        },
+        .batch = batch,
+        .h_in = 1,
+        .w_in = x_meta.shape[rank - 2],
+        .h_out = 1,
+        .w_out = out_meta.shape[rank - 2],
+        .c = c,
+        .k_h = 1,
+        .k_w = w_meta.shape[0],
+        .x = bytesAsF32Const(x.bytes),
+        .w = bytesAsF32Const(w.bytes),
+        .bias = if (bias) |b| bytesAsF32Const(b.bytes) else &.{},
+        .out = bytesAsF32Mut(out.bytes),
+    };
+    conv_utils.runDepthwise(ctx, &task);
+    return true;
 }
 
 fn execConv1DImplicitGemm(
     ctx: *ConvExecCtx,
-    s: StepConv1DTiled,
+    s: StepConv1D,
     out_meta: tensor_store.TensorMeta,
     x_meta: tensor_store.TensorMeta,
     w_meta: tensor_store.TensorMeta,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!bool {
-    // Fast path for small convolutions — bypasses all tiling overhead.
+    // Small convolutions: a direct loop beats packing for the GEMM.
     if (try tryExecConv1DSmallDirect(ctx, s, out_meta, x_meta, w_meta, store)) {
         return true;
     }
 
-    // Dedicated depthwise kernel (tile-native) when groups == C and W is [K,1,C].
-    if (try tryExecConv1DDepthwiseTileNative(ctx, s, out_meta, x_meta, w_meta, store)) {
-        return true;
-    }
-
-    // Prefer a tile-native path when possible (avoids large scalar pack/unpack copies
-    // and eliminates per-call heap allocations in the hot loop).
-    if (try tryExecConv1DImplicitGemmTileNative(ctx, s, out_meta, x_meta, w_meta, store)) {
-        return true;
-    }
+    if (try execDepthwise(ctx, s, out_meta, x_meta, w_meta, store)) return true;
 
     const rank: usize = @as(usize, out_meta.rank);
     const c_out: usize = out_meta.shape[rank - 1];
@@ -1402,9 +344,6 @@ fn execConv1DImplicitGemm(
     const k_dim_g: usize = k * c_in_g;
     const is_pointwise_unit: bool = (k == 1 and s.stride == 1 and s.dilation == 1 and s.pad_left == 0 and s.pad_right == 0 and l_out == l_in);
     const is_k3_same_regular: bool = (k == 3 and s.stride == 1 and s.dilation == 1 and s.pad_left == 1 and s.pad_right == 1 and l_out == l_in);
-
-    const x_count: usize = try elemCountFromShape(x_meta.shape);
-    const out_count: usize = try elemCountFromShape(out_meta.shape);
 
     const alloc: std.mem.Allocator = std.heap.page_allocator;
 
@@ -1438,21 +377,16 @@ fn execConv1DImplicitGemm(
         }
     }
 
-    const x_packed: []f32 = try alloc.alloc(f32, x_count);
-    defer alloc.free(x_packed);
-    const out_packed: []f32 = try alloc.alloc(f32, out_count);
-    defer alloc.free(out_packed);
-
-    try readTensorPackedF32(store, x_meta, s.x, x_packed);
-
-    var bias_packed: []f32 = &[_]f32{};
-    defer if (bias_packed.len != 0) alloc.free(bias_packed);
-    if (s.bias) |b_id| {
-        const b_meta: tensor_store.TensorMeta = try store.meta(b_id);
-        std.debug.assert(b_meta.dtype == .f32 and b_meta.rank == 1 and b_meta.shape[0] == c_out);
-        bias_packed = try alloc.alloc(f32, c_out);
-        try readTensorPackedF32(store, b_meta, b_id, bias_packed);
-    }
+    const x_ref = try store.acquireConst(s.x);
+    defer store.releaseConst(x_ref.token);
+    const out_ref = try store.acquireMut(s.out);
+    defer store.releaseMut(out_ref.token);
+    const bias_ref = if (s.bias) |b_id| try store.acquireConst(b_id) else null;
+    defer if (bias_ref) |b| store.releaseConst(b.token);
+    const x_packed: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, x_ref.bytes));
+    const out_packed: []f32 = @alignCast(std.mem.bytesAsSlice(f32, out_ref.bytes));
+    const bias_packed: []const f32 = if (bias_ref) |b| @alignCast(std.mem.bytesAsSlice(f32, b.bytes)) else &.{};
+    if (bias_packed.len != 0 and bias_packed.len != c_out) return BackendError.InvalidArgument;
 
     if (c_out_g == 0 or ctx.matmul_f32.tuning.nc == 0) return BackendError.InvalidArgument;
 
@@ -1463,10 +397,9 @@ fn execConv1DImplicitGemm(
     const m_cap: usize = matmul.tuning.mc;
     const oc_tile_max: usize = @min(c_out_g, matmul.tuning.nc);
 
-    const w_count: usize = try elemCountFromShape(w_meta.shape);
-    const w_packed: []f32 = try alloc.alloc(f32, w_count);
-    defer alloc.free(w_packed);
-    try readTensorPackedF32(store, w_meta, s.w, w_packed);
+    const w_ref = try store.acquireConst(s.w);
+    defer store.releaseConst(w_ref.token);
+    const w_packed: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, w_ref.bytes));
 
     const TileInfo = struct {
         oc_start: usize,
@@ -1516,7 +449,7 @@ fn execConv1DImplicitGemm(
 
     const Task = struct {
         ctx: *ConvExecCtx,
-        s: StepConv1DTiled,
+        s: StepConv1D,
         matmul: matmul_registry.F32Kernels,
         use_local_scratch: bool,
         params: struct {
@@ -1820,7 +753,6 @@ fn execConv1DImplicitGemm(
         if (ctx.thread_count > 1 and rows_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
             const grain: usize = @max(m_cap, @max(@as(usize, 1), rows_total / (ctx.thread_count * 4)));
             try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), rows_total, grain, Task.runRows);
-            try writeTensorPackedF32(store, out_meta, s.out, out_packed);
             return true;
         }
     }
@@ -1828,12 +760,10 @@ fn execConv1DImplicitGemm(
     const scratch: []align(32) u8 = try scratchForTid(ctx, 0);
     defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch);
     try task.runRowsRange(scratch, 0, rows_total);
-
-    try writeTensorPackedF32(store, out_meta, s.out, out_packed);
     return true;
 }
 
-pub fn execConv1DTiled(ctx: *ConvExecCtx, s: StepConv1DTiled, store: tensor_store.TensorStore) ExecuteProgramError!void {
+pub fn execConv1D(ctx: *ConvExecCtx, s: StepConv1D, store: tensor_store.TensorStore) ExecuteProgramError!void {
     const out_meta: tensor_store.TensorMeta = try store.meta(s.out);
     const x_meta: tensor_store.TensorMeta = try store.meta(s.x);
     const w_meta: tensor_store.TensorMeta = try store.meta(s.w);

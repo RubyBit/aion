@@ -2,9 +2,8 @@
 //
 // Row-wise softmax over the last axis: one 256-thread workgroup per row, with
 // shared-memory tree reductions for the row max and the exp-sum. Numerically
-// matches the CPU kernel (exp(x - max) / sum). The backend guarantees the whole
-// reduced axis lives in this tile (tile_counts[axis] == 1) and rows fit the
-// dispatch limit, so a single dispatch handles one tile of `rows` rows.
+// matches the CPU kernel (exp(x - max) / sum). One dispatch covers every row;
+// rows past the per-dimension group cap spill into grid y.
 //
 // Three column sweeps per row (max, exp+sum, normalize); x is read twice, o is
 // written then rescaled in place — same structure as the CPU three-pass kernel.
@@ -27,7 +26,7 @@ enable f16;
 
 @group(0) @binding(2) var<uniform>             p: Params;
 
-// Row strides are in elements (tiles may pad rows; the backend passes both).
+// Row strides are in elements.
 struct Params { rows: u32, cols: u32, x_row: u32, o_row: u32 };
 
 const WG: u32 = 256u;
@@ -74,9 +73,16 @@ fn expApprox(x_in: f32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn softmax_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+fn softmax_row(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var m = -3.4028235e38;
     for (var c = lidx; c < p.cols; c += WG) { m = max(m, x[xb + c]); }
@@ -94,9 +100,16 @@ fn softmax_row(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
 }
 
 @compute @workgroup_size(256)
-fn softmax_row_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
-    let xb = wid.x * p.x_row;
-    let ob = wid.x * p.o_row;
+fn softmax_row_f16(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    // Rows past 65535 spill into grid y; the last y row may overshoot.
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= p.rows) { return; }
+    let xb = row * p.x_row;
+    let ob = row * p.o_row;
 
     var m = -3.4028235e38;
     for (var c = lidx; c < p.cols; c += WG) { m = max(m, f32(xh[xb + c])); }

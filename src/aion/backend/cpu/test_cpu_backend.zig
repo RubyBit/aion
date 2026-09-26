@@ -14,7 +14,6 @@ const types = @import("../types.zig");
 const manager_mod = @import("../../storage/manager.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const infer_mod = @import("../../graph/infer.zig");
-const plan_mod = @import("../../graph/plan.zig");
 const program = @import("../../graph/program.zig");
 const Backend = backend_mod.Backend;
 
@@ -60,9 +59,9 @@ test "cpu backend: if selects region output" {
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const cond_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    const then_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
-    const else_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const cond_tid: manager_mod.TensorId = try mgr.createTensor(.i32, &[_]usize{1}, .{});
+    const then_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
+    const else_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
     try writeScalarI32(&mgr, cond_tid, 1);
     try writeScalarF32(&mgr, then_tid, 42.0);
     try writeScalarF32(&mgr, else_tid, 7.0);
@@ -83,7 +82,7 @@ test "cpu backend: if selects region output" {
     const out = try g.addIf(cond, then_region, else_region);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -102,8 +101,8 @@ test "cpu backend: loop carries state with tensor-id alias swap" {
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const carried_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
-    const inc_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
+    const carried_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
+    const inc_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
     try writeScalarF32(&mgr, carried_tid, 1.0);
     try writeScalarF32(&mgr, inc_tid, 2.0);
 
@@ -120,7 +119,7 @@ test "cpu backend: loop carries state with tensor-id alias swap" {
     const out = try g.addLoop(carried, body_region, 4);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -136,12 +135,12 @@ test "cpu backend: multi-carry loop with early-exit condition" {
     defer mgr.deinit();
 
     // Carries: i (i32), acc (f32), active (i32 predicate). Constants one/ten/limit.
-    const i_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    const acc_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
-    const active_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    const one_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    const ten_tid: manager_mod.TensorId = try mgr.createTiledTensor(.f32, &[_]usize{1}, &[_]usize{1}, .{});
-    const limit_tid: manager_mod.TensorId = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const i_tid: manager_mod.TensorId = try mgr.createTensor(.i32, &[_]usize{1}, .{});
+    const acc_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
+    const active_tid: manager_mod.TensorId = try mgr.createTensor(.i32, &[_]usize{1}, .{});
+    const one_tid: manager_mod.TensorId = try mgr.createTensor(.i32, &[_]usize{1}, .{});
+    const ten_tid: manager_mod.TensorId = try mgr.createTensor(.f32, &[_]usize{1}, .{});
+    const limit_tid: manager_mod.TensorId = try mgr.createTensor(.i32, &[_]usize{1}, .{});
     try writeScalarI32(&mgr, i_tid, 0);
     try writeScalarF32(&mgr, acc_tid, 0.0);
     try writeScalarI32(&mgr, active_tid, 1);
@@ -180,7 +179,7 @@ test "cpu backend: multi-carry loop with early-exit condition" {
     );
     try g.setOutputs(&[_]graph_mod.ValueId{ outs[1], outs[0] }); // acc, i
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -190,7 +189,7 @@ test "cpu backend: multi-carry loop with early-exit condition" {
     try std.testing.expectEqual(@as(i32, 3), try readScalarI32(&mgr, prog.outputs[1]));
 }
 
-test "cpu backend: rmsnorm supports row tiles >256" {
+test "cpu backend: rmsnorm supports more than 256 rows" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const batch: usize = 1;
@@ -256,15 +255,14 @@ test "cpu backend: rmsnorm supports row tiles >256" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Force a single tile over the leading dims so rows_per_tile = 1*14*35 = 490 (>256).
-    const x_tid = try sm.createTiledTensor(
+    // 1*14*35 = 490 rows (>256).
+    const x_tid = try sm.createTensor(
         .f32,
         &[_]usize{ batch, seq, groups, hidden },
-        &[_]usize{ batch, seq, groups, 128 },
-        .{ .tile_alignment = 64 },
+        .{ },
     );
-    const gamma_tid = try sm.createTiledTensor(.f32, &[_]usize{hidden}, &[_]usize{128}, .{ .tile_alignment = 64 });
-    const beta_tid = try sm.createTiledTensor(.f32, &[_]usize{hidden}, &[_]usize{128}, .{ .tile_alignment = 64 });
+    const gamma_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{ });
+    const beta_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{ });
 
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(gamma_tid, g_buf);
@@ -284,8 +282,7 @@ test "cpu backend: rmsnorm supports row tiles >256" {
     const y = try g.addRMSNorm(x_in, gamma_in, beta_in, eps, &[_]usize{hidden});
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -414,14 +411,13 @@ test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce
     for (0..m * n) |idx| sum += g_ref[idx];
     out_ref[0] = sum / @as(f32, @floatFromInt(m * n));
 
-    // Build tiled inputs and graph.
+    // Build inputs and graph.
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Intentionally use non-matmul-friendly tiling to exercise ReTileCopyScalar.
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, n }, &[_]usize{ 2, 3 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{3}, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ k, n }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -445,8 +441,7 @@ test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce
     const out = try g.addReduce(.mean, gg);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -515,11 +510,9 @@ test "cpu backend: batched matmul rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{ });
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -535,7 +528,7 @@ test "cpu backend: batched matmul rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -604,11 +597,9 @@ test "cpu backend: batched matmul broadcast B rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ 1, k, n }, .{ });
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -624,7 +615,7 @@ test "cpu backend: batched matmul broadcast B rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -693,11 +684,9 @@ test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    const tiles = plan_mod.chooseMatMulTiles(policy, m, n, k, .f32);
 
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, m, k }, &[_]usize{ 1, tiles.tm, tiles.tk }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, k, n }, &[_]usize{ 1, tiles.tk, tiles.tn }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ 1, m, k }, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{ });
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -713,7 +702,7 @@ test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -726,100 +715,6 @@ test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     var max_abs: f32 = 0.0;
     for (out_vals, c_ref) |g0, r0| max_abs = @max(max_abs, @abs(g0 - r0));
     try std.testing.expect(max_abs <= 1e-5);
-}
-
-test "cpu backend: batch retile guard accepts small, rejects large" {
-    const allocator: std.mem.Allocator = std.testing.allocator;
-
-    const batch: usize = 4;
-    const m: usize = 2;
-    const k: usize = 3;
-    const n: usize = 2;
-
-    const a_bytes_len: usize = batch * m * k * 4;
-    const b_bytes_len: usize = batch * k * n * 4;
-    const c_bytes_len: usize = batch * m * n * 4;
-
-    const a_buf: []u8 = try allocator.alloc(u8, a_bytes_len);
-    defer allocator.free(a_buf);
-    const b_buf: []u8 = try allocator.alloc(u8, b_bytes_len);
-    defer allocator.free(b_buf);
-
-    const a_vals: []align(1) f32 = asF32Slice(a_buf);
-    const b_vals: []align(1) f32 = asF32Slice(b_buf);
-    for (0..batch * m * k) |i| a_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 3)) * 0.2;
-    for (0..batch * k * n) |i| b_vals[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i % 7))) - 3)) * 0.25;
-
-    // Reference.
-    const c_ref_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(c_ref_buf);
-    const c_ref: []align(1) f32 = asF32Slice(c_ref_buf);
-    @memset(c_ref, 0.0);
-
-    var b0: usize = 0;
-    while (b0 < batch) : (b0 += 1) {
-        var i: usize = 0;
-        while (i < m) : (i += 1) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                var acc: f32 = 0.0;
-                var kk: usize = 0;
-                while (kk < k) : (kk += 1) {
-                    const a_idx: usize = ((b0 * m + i) * k) + kk;
-                    const b_idx: usize = ((b0 * k + kk) * n) + j;
-                    acc += a_vals[a_idx] * b_vals[b_idx];
-                }
-                const c_idx: usize = ((b0 * m + i) * n) + j;
-                c_ref[c_idx] = acc;
-            }
-        }
-    }
-
-    var sm = manager_mod.StorageManager.init(allocator);
-    defer sm.deinit();
-
-    const policy_ok: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64, .batch_retile_max_tiles = 2 };
-    const tiles = plan_mod.chooseMatMulTiles(policy_ok, m, n, k, .f32);
-
-    // Inputs are tiled with batch tile size 2, forcing retile to batch tile size 1.
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, m, k }, &[_]usize{ 2, tiles.tm, tiles.tk }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, k, n }, &[_]usize{ 2, tiles.tk, tiles.tn }, .{ .tile_alignment = 64 });
-
-    try sm.writeFromPackedScalar(a_tid, a_buf);
-    try sm.writeFromPackedScalar(b_tid, b_buf);
-
-    var g = graph_mod.Graph.init(allocator);
-    defer g.deinit();
-
-    const a_in = try g.addInput(.f32, &[_]usize{ batch, m, k });
-    const b_in = try g.addInput(.f32, &[_]usize{ batch, k, n });
-    try g.bindExternal(a_in, @intCast(a_tid));
-    try g.bindExternal(b_in, @intCast(b_tid));
-
-    const c = try g.addMatMul(a_in, b_in, 1.0, 0.0);
-    try g.setOutputs(&[_]graph_mod.ValueId{c});
-
-    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
-    defer cpu.deinit();
-    const backend: Backend = cpu.backend();
-
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy_ok));
-    defer prog.deinit();
-
-    try backend.executeProgram(&prog, sm.tensorStore());
-
-    const out_buf: []u8 = try allocator.alloc(u8, c_bytes_len);
-    defer allocator.free(out_buf);
-    try sm.readToPackedScalar(prog.outputs[0], out_buf[0..c_bytes_len]);
-    const out_vals: []align(1) f32 = asF32Slice(out_buf);
-
-    var max_abs: f32 = 0.0;
-    for (out_vals, c_ref) |g0, r0| max_abs = @max(max_abs, @abs(g0 - r0));
-    try std.testing.expect(max_abs <= 1e-5);
-
-    // Reject when guard is tighter than required batch tiles.
-    const policy_bad: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64, .batch_retile_max_tiles = 1 };
-    try std.testing.expectError(program.CompileError.InvalidArgument, program.compileGraph(allocator, &g, &sm, .cpu(policy_bad)));
 }
 
 test "cpu backend: unary ops match reference (f32)" {
@@ -846,10 +741,9 @@ test "cpu backend: unary ops match reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{16}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 16, .tile_alignment = 64 };
 
     inline for (.{
         .{ .op = types.UnaryOp.relu, .name = "relu" },
@@ -867,7 +761,7 @@ test "cpu backend: unary ops match reference (f32)" {
         const y = try g.addUnary(case.op, x_in);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1182,8 +1076,7 @@ test "cpu backend: softmax rank-1 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Intentionally awkward tiling to exercise tile loops.
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{17}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1194,8 +1087,7 @@ test "cpu backend: softmax rank-1 matches reference (f32)" {
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1252,8 +1144,7 @@ test "cpu backend: softmax rank-2 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Intentionally awkward tiling to exercise tile loops + possible retile.
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ 2, 5 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1264,9 +1155,7 @@ test "cpu backend: softmax rank-2 matches reference (f32)" {
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    // Force softmax tiling to span multiple tiles in both dims.
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1329,7 +1218,7 @@ test "cpu backend: softmax rank-2 axis-0 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ 2, 5 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1340,8 +1229,7 @@ test "cpu backend: softmax rank-2 axis-0 matches reference (f32)" {
     const y = try g.addSoftmax(x_in, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1401,7 +1289,7 @@ test "cpu backend: softmax rank-3 axis-last matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ b, m, n }, &[_]usize{ 1, 2, 4 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1412,8 +1300,7 @@ test "cpu backend: softmax rank-3 axis-last matches reference (f32)" {
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 3, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1486,15 +1373,13 @@ test "cpu backend: layernorm and rmsnorm rank-2 match reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Intentionally awkward tiling to exercise retile + edge tiles.
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ 2, 5 }, .{ .tile_alignment = 64 });
-    const g_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{6}, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{7}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
+    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(g_tid, g_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 8, .tile_alignment = 64 };
 
     // Run both ops.
     inline for (.{
@@ -1515,7 +1400,7 @@ test "cpu backend: layernorm and rmsnorm rank-2 match reference (f32)" {
         const y = if (case.is_rms) try g.addRMSNorm(x_in, gamma_in, beta_in, eps, norm_shape[0..]) else try g.addLayerNorm(x_in, gamma_in, beta_in, eps, norm_shape[0..]);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1589,9 +1474,9 @@ test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ b, m, n }, &[_]usize{ 1, 2, 5 }, .{ .tile_alignment = 64 });
-    const g_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{6}, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{n}, &[_]usize{7}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{ });
+    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(g_tid, g_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -1610,8 +1495,7 @@ test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     const y = try g.addLayerNorm(x_in, gamma_in, beta_in, eps, norm_shape[0..]);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1719,9 +1603,9 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
         var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
 
-        const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 2, 2, d_k }, .{ .tile_alignment = 64 });
-        const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
-        const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
+        const q_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
+        const k_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_k }, .{ });
+        const v_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_v }, .{ });
         try sm.writeFromPackedScalar(q_tid, q_buf);
         try sm.writeFromPackedScalar(k_tid, k_buf);
         try sm.writeFromPackedScalar(v_tid, v_buf);
@@ -1740,8 +1624,7 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
         const out = try g.addAttention(q_in, k_in, v_in, null, null, scale, window, 0.0);
         try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
 
         var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -1871,14 +1754,13 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
 
-    const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-    const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-    const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-    const pe_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, p_len, d }, &[_]usize{ 1, p_len, d }, .{ .tile_alignment = 64 });
-    const u_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
-    const vb_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
+    const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+    const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+    const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+    const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{ });
+    const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
+    const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
     try sm.writeFromPackedScalar(v_tid, v_buf);
@@ -1905,7 +1787,7 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     const y = try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, scale, .full, t - 1, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -1980,7 +1862,6 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
     }
 
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d)));
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -1991,7 +1872,6 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
         fn go(
             alloc: std.mem.Allocator,
             be: Backend,
-            pol: plan_mod.TilePolicy,
             sc: f32,
             use_mask: bool,
             bufs: [7][]u8,
@@ -2000,13 +1880,13 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
             var sm = manager_mod.StorageManager.init(alloc);
             defer sm.deinit();
 
-            const q_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-            const k_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-            const v_tid = try sm.createTiledTensor(.f32, &[_]usize{ batch, t, heads, d }, &[_]usize{ 1, t, 1, d }, .{ .tile_alignment = 64 });
-            const pe_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, p_len, d }, &[_]usize{ 1, p_len, d }, .{ .tile_alignment = 64 });
-            const u_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
-            const vb_tid = try sm.createTiledTensor(.f32, &[_]usize{ heads, d }, &[_]usize{ heads, d }, .{ .tile_alignment = 64 });
-            const m_tid = try sm.createTiledTensor(.f32, &[_]usize{ t, t }, &[_]usize{ t, t }, .{ .tile_alignment = 64 });
+            const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+            const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+            const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
+            const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{ });
+            const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
+            const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
+            const m_tid = try sm.createTensor(.f32, &[_]usize{ t, t }, .{ });
             try sm.writeFromPackedScalar(q_tid, bufs[0]);
             try sm.writeFromPackedScalar(k_tid, bufs[1]);
             try sm.writeFromPackedScalar(v_tid, bufs[2]);
@@ -2038,7 +1918,7 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
                 try g.addRelPosMHA(q_in, k_in, v_in, pe_in, u_in, vb_in, null, sc, .chunked(chunk, left), t - 1, 0);
             try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-            var prog = try program.compileGraph(alloc, &g, &sm, .cpu(pol));
+            var prog = try program.compileGraph(alloc, &g, &sm, .cpu());
             defer prog.deinit();
             try be.executeProgram(&prog, sm.tensorStore());
             try sm.readToPackedScalar(prog.outputs[0], out);
@@ -2051,8 +1931,8 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
     const windowed: []u8 = try allocator.alloc(u8, qkv_len * 4);
     defer allocator.free(windowed);
 
-    try run(allocator, backend, policy, scale, true, bufs, masked);
-    try run(allocator, backend, policy, scale, false, bufs, windowed);
+    try run(allocator, backend, scale, true, bufs, masked);
+    try run(allocator, backend, scale, false, bufs, windowed);
 
     var max_abs: f32 = 0.0;
     for (asF32Slice(masked), asF32Slice(windowed)) |a, b| {
@@ -2091,8 +1971,7 @@ test "cpu backend: argmax over last axis returns i32 indices" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 8, .base_1d = 5, .tile_alignment = 64 };
-    const in_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, n }, &[_]usize{ rows, n }, .{ .tile_alignment = 64 });
+    const in_tid = try sm.createTensor(.f32, &[_]usize{ rows, n }, .{ });
     try sm.writeFromPackedScalar(in_tid, in_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2102,7 +1981,7 @@ test "cpu backend: argmax over last axis returns i32 indices" {
     const y = try g.addArgMax(x, 1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -2122,8 +2001,8 @@ test "cpu backend: packed-state loop (slice/cast/i32-add/scatter/concat) — in-
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const state_tid = try mgr.createTiledTensor(.f32, &[_]usize{L}, &[_]usize{L}, .{});
-    const one_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const state_tid = try mgr.createTensor(.f32, &[_]usize{L}, .{});
+    const one_tid = try mgr.createTensor(.i32, &[_]usize{1}, .{});
     var s0: [L]f32 = @splat(0.0);
     try mgr.writeFromPackedScalar(state_tid, std.mem.sliceAsBytes(s0[0..]));
     var onev: [1]i32 = .{1};
@@ -2150,7 +2029,7 @@ test "cpu backend: packed-state loop (slice/cast/i32-add/scatter/concat) — in-
     const out = try g.addLoop(state, body_region, M);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2172,9 +2051,9 @@ test "cpu backend: scatter row writes value at dynamic index" {
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const buf_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
-    const idx_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
-    const src_tid = try mgr.createTiledTensor(.i32, &[_]usize{1}, &[_]usize{1}, .{});
+    const buf_tid = try mgr.createTensor(.i32, &[_]usize{N}, .{});
+    const idx_tid = try mgr.createTensor(.i32, &[_]usize{1}, .{});
+    const src_tid = try mgr.createTensor(.i32, &[_]usize{1}, .{});
     var bufv: [N]i32 = .{ 10, 20, 30, 40 };
     var idxv: [1]i32 = .{2};
     var srcv: [1]i32 = .{99};
@@ -2193,7 +2072,7 @@ test "cpu backend: scatter row writes value at dynamic index" {
     const out = try g.addScatterRow(buf, idx, src);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2211,8 +2090,8 @@ test "cpu backend: i32 elementwise add and eq comparison" {
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const a_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
-    const b_tid = try mgr.createTiledTensor(.i32, &[_]usize{N}, &[_]usize{N}, .{});
+    const a_tid = try mgr.createTensor(.i32, &[_]usize{N}, .{});
+    const b_tid = try mgr.createTensor(.i32, &[_]usize{N}, .{});
     var abuf: [N]i32 = .{ 4, 3, 5, 2 };
     var bbuf: [N]i32 = .{ 1, 3, 5, 9 };
     try mgr.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(abuf[0..]));
@@ -2228,7 +2107,7 @@ test "cpu backend: i32 elementwise add and eq comparison" {
     const eq = try g.addElemwiseBinary(.eq, a, b);
     try g.setOutputs(&[_]graph_mod.ValueId{ sum, eq });
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2250,8 +2129,8 @@ test "cpu backend: loop body lowers matmul + relu (region full-op lowering)" {
     var mgr = manager_mod.StorageManager.init(allocator);
     defer mgr.deinit();
 
-    const carried_tid = try mgr.createTiledTensor(.f32, &[_]usize{ 1, N }, &[_]usize{ 1, N }, .{});
-    const w_tid = try mgr.createTiledTensor(.f32, &[_]usize{ N, N }, &[_]usize{ N, N }, .{});
+    const carried_tid = try mgr.createTensor(.f32, &[_]usize{ 1, N }, .{});
+    const w_tid = try mgr.createTensor(.f32, &[_]usize{ N, N }, .{});
 
     var cbuf: [N]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
     try mgr.writeFromPackedScalar(carried_tid, std.mem.sliceAsBytes(cbuf[0..]));
@@ -2279,7 +2158,7 @@ test "cpu backend: loop body lowers matmul + relu (region full-op lowering)" {
     const out = try g.addLoop(carried, body_region, 3);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu(.{}));
+    var prog = try program.compileGraph(allocator, &g, &mgr, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2322,9 +2201,8 @@ test "cpu backend: matmul f16 allows promoted f32 output" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Intentionally choose non-matmul-friendly tiling to ensure retile logic is exercised.
-    const a_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, k }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f16, &[_]usize{ k, n }, &[_]usize{ 2, 1 }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f16, &[_]usize{ m, k }, .{ });
+    const b_tid = try sm.createTensor(.f16, &[_]usize{ k, n }, .{ });
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
 
@@ -2357,8 +2235,7 @@ test "cpu backend: matmul f16 allows promoted f32 output" {
         }
     }
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     try backend.executeProgram(&prog, sm.tensorStore());
@@ -2412,7 +2289,7 @@ test "cpu backend: view ops lower to materialization (transpose/slice/reshape)" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, cols }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2428,8 +2305,7 @@ test "cpu backend: view ops lower to materialization (transpose/slice/reshape)" 
     const out = try g.addReduce(.sum, u);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -2463,7 +2339,7 @@ test "cpu backend: reshape supports rank-3 materialization" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, cols }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2478,8 +2354,7 @@ test "cpu backend: reshape supports rank-3 materialization" {
     const out = try g.addReduce(.sum, u);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2520,7 +2395,7 @@ test "cpu backend: view slice nd materialization rank-3" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ d0, d1, d2 }, &[_]usize{ 1, 2, 2 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ d0, d1, d2 }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2534,8 +2409,7 @@ test "cpu backend: view slice nd materialization rank-3" {
     const out = try g.addReduce(.sum, r);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2572,8 +2446,8 @@ test "cpu backend: concat axis-1 materialization" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, c0 }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
-    const b_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, c1 }, &[_]usize{ 2, 1 }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ rows, c0 }, .{ });
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ rows, c1 }, .{ });
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
 
@@ -2587,8 +2461,7 @@ test "cpu backend: concat axis-1 materialization" {
     const c = try g.addConcat(&[_]graph_mod.ValueId{ a_in, b_in }, 1);
     try g.setOutputs(&[_]graph_mod.ValueId{c});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2636,9 +2509,8 @@ test "cpu backend: gather rows matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Indices are deliberately mis-tiled to exercise i32 scalar retiling.
-    const table_tid = try sm.createTiledTensor(.f32, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
-    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{ });
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
     try sm.writeFromPackedScalar(table_tid, table_buf);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2653,8 +2525,7 @@ test "cpu backend: gather rows matches reference (f32)" {
     const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2698,9 +2569,9 @@ test "cpu backend: shape index ops and batched gather derive pooling indices" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const data_tid = try sm.createTiledTensor(.f32, &.{ b, s, d }, &.{ 1, 2, d }, .{ .tile_alignment = 64 });
-    const indices_tid = try sm.createTiledTensor(.i32, &.{ b, l }, &.{ 1, 1 }, .{ .tile_alignment = 64 });
-    const tokens_tid = try sm.createTiledTensor(.i32, &.{ b, s }, &.{ 1, 2 }, .{ .tile_alignment = 64 });
+    const data_tid = try sm.createTensor(.f32, &.{ b, s, d }, .{ });
+    const indices_tid = try sm.createTensor(.i32, &.{ b, l }, .{ });
+    const tokens_tid = try sm.createTensor(.i32, &.{ b, s }, .{ });
     try sm.writeFromPackedScalar(data_tid, std.mem.sliceAsBytes(&data_vals));
     try sm.writeFromPackedScalar(indices_tid, std.mem.sliceAsBytes(&indices_vals));
     try sm.writeFromPackedScalar(tokens_tid, std.mem.sliceAsBytes(&tokens_vals));
@@ -2719,8 +2590,7 @@ test "cpu backend: shape index ops and batched gather derive pooling indices" {
     const seq_len = try g.addDim(tokens, 1);
     try g.setOutputs(&.{ gathered, positions, seq_len });
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -2778,8 +2648,8 @@ test "cpu backend: gather rows matches reference (f16)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const table_tid = try sm.createTiledTensor(.f16, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
-    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ b, l }, .{ .tile_alignment = 64 });
+    const table_tid = try sm.createTensor(.f16, &[_]usize{ v, d }, .{ });
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
     try sm.writeFromPackedScalar(table_tid, table_buf);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2794,8 +2664,7 @@ test "cpu backend: gather rows matches reference (f16)" {
     const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2887,15 +2756,13 @@ test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // tile_shape[1] must equal shape[1] for q8_0 embedding tables (one row = one contiguous
-    // block run). tile_shape[0] is a small batch of rows; `2` forces more than one tile.
-    const table_tid = try sm.createTiledTensor(
+    // A q8_0 embedding table: one row is one contiguous block run.
+    const table_tid = try sm.createTensor(
         .q8_0,
         &[_]usize{ v, d },
-        &[_]usize{ 2, d },
-        .{ .tile_alignment = 64, .quant_axis = 1 },
+        .{ .quant_axis = 1 },
     );
-    const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 2 }, .{ .tile_alignment = 64 });
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
     try sm.writeFromPackedQuant(table_tid, packed_table);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2910,8 +2777,7 @@ test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
     const out = try g.addGather(table_in, idx_in, 0, 0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2944,7 +2810,7 @@ test "cpu backend: cast f32 -> f16 roundtrip matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const in_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, n }, &[_]usize{ m, n }, .{ .tile_alignment = 64 });
+    const in_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
     const in_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f32));
     defer allocator.free(in_buf);
     const in_vals: []align(1) f32 = asF32Slice(in_buf);
@@ -2958,8 +2824,7 @@ test "cpu backend: cast f32 -> f16 roundtrip matches reference" {
     const y = try g.addCast(x, .f16);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -2985,7 +2850,7 @@ test "cpu backend: cast f16 -> f32 matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const in_tid = try sm.createTiledTensor(.f16, &[_]usize{ 1, n }, &[_]usize{ 1, n }, .{ .tile_alignment = 64 });
+    const in_tid = try sm.createTensor(.f16, &[_]usize{ 1, n }, .{ });
     const in_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f16));
     defer allocator.free(in_buf);
     const in_vals: []align(1) f16 = asF16Slice(in_buf);
@@ -3000,8 +2865,7 @@ test "cpu backend: cast f16 -> f32 matches reference" {
     const y = try g.addCast(x, .f32);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3037,7 +2901,7 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
         }
     }
 
-    // Pack B into q8_0 per-row blocks (mirrors the layout Aion's tiled storage expects).
+    // Pack B into q8_0 per-row blocks (the layout Aion's storage expects).
     const block_bytes: usize = 34;
     const blocks_per_row: usize = k / 32;
     const packed_b: []u8 = try allocator.alloc(u8, n * blocks_per_row * block_bytes);
@@ -3115,14 +2979,13 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTiledTensor(.f32, &[_]usize{ m, k }, &[_]usize{ m, k }, .{ .tile_alignment = 64 });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{ });
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a_buf));
 
-    const b_tid = try sm.createTiledTensor(
+    const b_tid = try sm.createTensor(
         .q8_0,
         &[_]usize{ n, k },
-        &[_]usize{ n, k },
-        .{ .tile_alignment = 64, .quant_axis = 1 },
+        .{ .quant_axis = 1 },
     );
     try sm.writeFromPackedQuant(b_tid, packed_b);
 
@@ -3135,8 +2998,7 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     const c_out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c_out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3186,8 +3048,8 @@ test "cpu backend: gather index rules follow ONNX (negative wraps, out of range 
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const table_tid = try sm.createTiledTensor(.f32, &[_]usize{ v, d }, &[_]usize{ 4, d }, .{ .tile_alignment = 64 });
-        const idx_tid = try sm.createTiledTensor(.i32, &[_]usize{ 1, l }, &[_]usize{ 1, l }, .{ .tile_alignment = 64 });
+        const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{ });
+        const idx_tid = try sm.createTensor(.i32, &[_]usize{ 1, l }, .{ });
         try sm.writeFromPackedScalar(table_tid, table_buf);
         try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -3200,8 +3062,7 @@ test "cpu backend: gather index rules follow ONNX (negative wraps, out of range 
         const out = try g.addGather(table_in, idx_in, 0, 0);
         try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         var cpu = cpu_backend_mod.CpuBackend.init(allocator);
         defer cpu.deinit();
@@ -3293,8 +3154,8 @@ test "cpu backend: rope1d matches chunked-halves reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ b, l, n, h }, &[_]usize{ 1, 2, 1, h }, .{ .tile_alignment = 64 });
-    const pos_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, l, n, h }, .{ });
+    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(pos_tid, pos_buf);
 
@@ -3309,8 +3170,7 @@ test "cpu backend: rope1d matches chunked-halves reference (f32)" {
     const out = try g.addRoPE1D(x_in, pos_in, base_frequency, scale_factor, rope_proportion);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3397,8 +3257,8 @@ test "cpu backend: rope1d matches chunked-halves reference (f16)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ b, l, n, h }, &[_]usize{ 1, 2, 1, h }, .{ .tile_alignment = 64 });
-    const pos_tid = try sm.createTiledTensor(.i32, &[_]usize{ b, l }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ b, l, n, h }, .{ });
+    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(pos_tid, pos_buf);
 
@@ -3413,8 +3273,7 @@ test "cpu backend: rope1d matches chunked-halves reference (f16)" {
     const out = try g.addRoPE1D(x_in, pos_in, base_frequency, scale_factor, rope_proportion);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3507,9 +3366,9 @@ test "cpu backend: conv1d depthwise (NLC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_in, c_in }, &[_]usize{ 1, 3, 2 }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, c_in_g, c_out }, &[_]usize{ 2, 1, 2 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{2}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in_g, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3527,8 +3386,7 @@ test "cpu backend: conv1d depthwise (NLC) matches reference" {
     const y = try g.addConv1D(x_in, w_in, bias_in, stride, dilation, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3619,9 +3477,9 @@ test "cpu backend: conv1d depthwise reflect padding matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_in, c_in }, &[_]usize{ 1, 4, 2 }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, 1, c_out }, &[_]usize{ 2, 1, 2 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{2}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, 1, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3639,8 +3497,7 @@ test "cpu backend: conv1d depthwise reflect padding matches reference" {
     const y = try g.addConv1DWithPadMode(x_in, w_in, bias_in, stride, dilation, pad_left, pad_right, .reflect, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3728,8 +3585,8 @@ test "cpu backend: conv1d reflect padding matches reference" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_in, c_in }, &[_]usize{ 1, 3, 2 }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, c_in, c_out }, &[_]usize{ 2, c_in, 2 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -3742,8 +3599,7 @@ test "cpu backend: conv1d reflect padding matches reference" {
     const y = try g.addConv1DWithPadMode(x_in, w_in, null, stride, dilation, pad_left, pad_right, .reflect, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3845,8 +3701,8 @@ test "cpu backend: conv2d reflect padding matches reference" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, &[_]usize{ 1, 2, 2, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, &[_]usize{ k_h, k_w, c_in, 3 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -3859,8 +3715,7 @@ test "cpu backend: conv2d reflect padding matches reference" {
     const y = try g.addConv2DWithPadMode(x_input, w_input, null, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, .reflect, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3938,10 +3793,9 @@ test "cpu backend: conv1d pointwise (NLC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Length-tiling is allowed for pointwise conv1d; channels must be full tiles.
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_in, c_in }, &[_]usize{ 1, 4, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, c_in, c_out }, &[_]usize{ 1, c_in, c_out }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{c_out}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3959,8 +3813,7 @@ test "cpu backend: conv1d pointwise (NLC) matches reference" {
     const y = try g.addConv1D(x_in, w_in, bias_in, stride, dilation, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -3997,7 +3850,7 @@ test "cpu backend: reduce axis sum/mean matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ rows, cols }, &[_]usize{ 2, 2 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -4010,8 +3863,7 @@ test "cpu backend: reduce axis sum/mean matches reference" {
     const mean_axis_neg1 = try g.addReduceAxis(.mean, x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{ sum_axis0, mean_axis_neg1 });
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4103,9 +3955,9 @@ test "cpu backend: conv1d general (NLC) supports large c_out" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_in, c_in }, &[_]usize{ 1, 3, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k, c_in, c_out }, &[_]usize{ k, c_in, 128 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{128}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4123,8 +3975,7 @@ test "cpu backend: conv1d general (NLC) supports large c_out" {
     const y = try g.addConv1D(x_in, w_in, bias_in, stride, dilation, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4213,9 +4064,9 @@ test "cpu backend: conv2d pointwise (NHWC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, &[_]usize{ 1, 2, 3, 4 }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, &[_]usize{ 1, 1, 3, 4 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{4}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4233,8 +4084,7 @@ test "cpu backend: conv2d pointwise (NHWC) matches reference" {
     const y = try g.addConv2D(x_in, w_val, bias_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4333,9 +4183,9 @@ test "cpu backend: conv2d depthwise (NHWC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, &[_]usize{ 1, h_in, w_in, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, &[_]usize{ k_h, k_w, 1, c_out }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{c_out}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4353,8 +4203,7 @@ test "cpu backend: conv2d depthwise (NHWC) matches reference" {
     const y = try g.addConv2D(x_in, w_val, bias_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4461,9 +4310,9 @@ test "cpu backend: conv2d depthwise reflect padding matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, &[_]usize{ 1, 2, 2, 2 }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, &[_]usize{ 2, 2, 1, 2 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{2}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4481,8 +4330,7 @@ test "cpu backend: conv2d depthwise reflect padding matches reference" {
     const y = try g.addConv2DWithPadMode(x_in, w_val, bias_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, .reflect, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4584,9 +4432,9 @@ test "cpu backend: conv2d general (NHWC) supports large c_out" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, &[_]usize{ 1, 2, 2, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, &[_]usize{ k_h, k_w, c_in, 128 }, .{ .tile_alignment = 64 });
-    const bias_tid = try sm.createTiledTensor(.f32, &[_]usize{c_out}, &[_]usize{128}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4604,8 +4452,7 @@ test "cpu backend: conv2d general (NHWC) supports large c_out" {
     const y = try g.addConv2D(x_in, w_val, bias_in, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right, groups);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4704,10 +4551,9 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // v1 constraints: single tile over batch+heads, full head-dim tile.
-    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 3, heads, d_head }, .{ .tile_alignment = 64 });
-    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
-    const end_tid = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
+    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
+    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4725,8 +4571,7 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     const out = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     // In-place alias contract: output tensor id is cache tensor id.
@@ -4777,9 +4622,9 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cache_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
-    const new_tid = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
-    const end_tid = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
+    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
+    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4797,8 +4642,7 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     const out = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4838,9 +4682,9 @@ test "cpu backend: kv cache append rolling policy wraps time index" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
-    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
+    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4859,8 +4703,7 @@ test "cpu backend: kv cache append rolling policy wraps time index" {
     const out: graph_mod.ValueId = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -4910,9 +4753,9 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, &[_]usize{ bsz, 2, heads, d_head }, .{ .tile_alignment = 64 });
-    const new_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, &[_]usize{ bsz, 1, heads, d_head }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
+    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4931,15 +4774,14 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     const out: graph_mod.ValueId = try g.addSequenceAppend(cache_in, new_in, end_in);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 2, .base_1d = 2, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
     try cpu.backend().executeProgram(&prog, sm.tensorStore());
 
-    const grown_meta: *const manager_mod.TiledTensor = try sm.getConst(cache_tid);
+    const grown_meta: *const manager_mod.Tensor = try sm.getConst(cache_tid);
     try std.testing.expectEqual(@as(usize, 8), grown_meta.shape[1]);
 
     const out_buf: []u8 = try allocator.alloc(u8, bsz * heads * 8 * d_head * @sizeOf(f32));
@@ -5134,11 +4976,11 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
-    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
+    const k_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{ });
+    const v_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{ });
+    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{ });
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
 
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
@@ -5173,8 +5015,7 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     );
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -5274,11 +5115,11 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const q_tid: manager_mod.TensorId = try sm.createTiledTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, &[_]usize{ 1, 1, 2, d_k }, .{ .tile_alignment = 64 });
-    const k_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k }, &[_]usize{ 1, 2, 1, d_k }, .{ .tile_alignment = 64 });
-    const v_tid: manager_mod.TensorId = try sm.createTiledTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v }, &[_]usize{ 1, 2, 1, d_v }, .{ .tile_alignment = 64 });
-    const pos_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{ bsz, l_q }, &[_]usize{ 1, 1 }, .{ .tile_alignment = 64 });
-    const end_tid: manager_mod.TensorId = try sm.createTiledTensor(.i32, &[_]usize{bsz}, &[_]usize{bsz}, .{ .tile_alignment = 64 });
+    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
+    const k_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{ });
+    const v_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{ });
+    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{ });
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
 
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
@@ -5313,11 +5154,10 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     );
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
 
-    const out_meta: *const manager_mod.TiledTensor = try sm.getConst(prog.outputs[0]);
+    const out_meta: *const manager_mod.Tensor = try sm.getConst(prog.outputs[0]);
     try std.testing.expectEqual(types.DType.f32, out_meta.dtype);
 
     var cpu: cpu_backend_mod.CpuBackend = cpu_backend_mod.CpuBackend.init(allocator);
@@ -5382,8 +5222,7 @@ test "cpu backend: softmax rank-1 (f16) normalizes without an f16 intermediate" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    // Awkward tiling so the multi-tile max/sum/normalize passes all run.
-    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{n}, &[_]usize{17}, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{n}, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5394,8 +5233,7 @@ test "cpu backend: softmax rank-1 (f16) normalizes without an f16 intermediate" 
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5455,7 +5293,7 @@ test "cpu backend: softmax rank-2 (f16) matches reference per row" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ m, n }, &[_]usize{ 2, 4 }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ m, n }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5465,8 +5303,7 @@ test "cpu backend: softmax rank-2 (f16) matches reference per row" {
     const y = try g.addSoftmax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 8, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5517,7 +5354,7 @@ test "cpu backend: argmax (f16) picks the same index as f32" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTiledTensor(.f16, &[_]usize{ rows, n }, &[_]usize{ rows, n }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ rows, n }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5527,8 +5364,7 @@ test "cpu backend: argmax (f16) picks the same index as f32" {
     const y = try g.addArgMax(x_in, -1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try backend.executeProgram(&prog, sm.tensorStore());
 
@@ -5595,7 +5431,7 @@ fn runLSTMCellAsF32(
         const buf: []u8 = try allocator.alloc(u8, n * elem);
         defer allocator.free(buf);
         Fill.go(dt, buf, spec.seed);
-        tids[si] = try sm.createTiledTensor(dt, spec.shape, spec.shape, .{ .tile_alignment = 64 });
+        tids[si] = try sm.createTensor(dt, spec.shape, .{ });
         try sm.writeFromPackedScalar(tids[si], buf);
     }
 
@@ -5614,8 +5450,7 @@ fn runLSTMCellAsF32(
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 32, .base_1d = 128, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try cpu.backend().executeProgram(&prog, sm.tensorStore());
 
@@ -5670,8 +5505,8 @@ test "cpu backend: lstm cell (f16) tracks the f32 cell" {
 test "cpu backend: conv2d zero padding packs lead/copy/trail runs correctly" {
     const allocator: std.mem.Allocator = std.testing.allocator;
     const Case = struct { h: usize, w: usize, c_in: usize, c_out: usize, k_h: usize, k_w: usize, sh: usize, sw: usize, dh: usize, dw: usize, pt: usize, pb: usize, pl: usize, pr: usize };
-    // Single-tile inputs take the coalesced packing path; the last two cases
-    // keep a dilated/strided window and a fully-padded column in scope.
+    // The last two cases keep a dilated/strided window and a fully-padded column in
+    // scope.
     const cases = [_]Case{
         .{ .h = 7, .w = 7, .c_in = 1, .c_out = 8, .k_h = 5, .k_w = 5, .sh = 1, .sw = 1, .dh = 1, .dw = 1, .pt = 2, .pb = 2, .pl = 2, .pr = 2 },
         .{ .h = 6, .w = 5, .c_in = 3, .c_out = 4, .k_h = 3, .k_w = 5, .sh = 1, .sw = 1, .dh = 1, .dw = 1, .pt = 2, .pb = 1, .pl = 4, .pr = 0 },
@@ -5719,8 +5554,8 @@ test "cpu backend: conv2d zero padding packs lead/copy/trail runs correctly" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, c.h, c.w, c.c_in }, &[_]usize{ 1, c.h, c.w, c.c_in }, .{ .tile_alignment = 64 });
-        const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ c.k_h, c.k_w, c.c_in, c.c_out }, &[_]usize{ c.k_h, c.k_w, c.c_in, c.c_out }, .{ .tile_alignment = 64 });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, c.h, c.w, c.c_in }, .{ });
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c.c_in, c.c_out }, .{ });
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5733,8 +5568,7 @@ test "cpu backend: conv2d zero padding packs lead/copy/trail runs correctly" {
         const y = try g.addConv2D(x_in, w_val, null, c.sh, c.sw, c.dh, c.dw, c.pt, c.pb, c.pl, c.pr, 1);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         var cpu = cpu_backend_mod.CpuBackend.init(allocator);
         defer cpu.deinit();
@@ -5747,15 +5581,14 @@ test "cpu backend: conv2d zero padding packs lead/copy/trail runs correctly" {
     }
 }
 
-test "cpu backend: conv2d grouped and channel-tiled inputs match reference" {
+test "cpu backend: conv2d grouped inputs match reference" {
     const allocator: std.mem.Allocator = std.testing.allocator;
-    const Case = struct { c_in: usize, c_out: usize, groups: usize, x_tile_c: usize };
-    // Grouped convolutions and channel-tiled inputs both bypass the single-tile
-    // packing path, so they exercise the general im2col walk.
+    const Case = struct { c_in: usize, c_out: usize, groups: usize };
+    // Grouped convolutions exercise the general im2col walk.
     const cases = [_]Case{
-        .{ .c_in = 4, .c_out = 6, .groups = 2, .x_tile_c = 4 },
-        .{ .c_in = 8, .c_out = 4, .groups = 1, .x_tile_c = 4 },
-        .{ .c_in = 6, .c_out = 9, .groups = 3, .x_tile_c = 2 },
+        .{ .c_in = 4, .c_out = 6, .groups = 2 },
+        .{ .c_in = 8, .c_out = 4, .groups = 1 },
+        .{ .c_in = 6, .c_out = 9, .groups = 3 },
     };
     const h_in: usize = 6;
     const w_in: usize = 7;
@@ -5807,8 +5640,8 @@ test "cpu backend: conv2d grouped and channel-tiled inputs match reference" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h_in, w_in, c.c_in }, &[_]usize{ 1, h_in, w_in, c.x_tile_c }, .{ .tile_alignment = 64 });
-        const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c.c_out }, &[_]usize{ k_h, k_w, c_in_g, c.c_out }, .{ .tile_alignment = 64 });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c.c_in }, .{ });
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c.c_out }, .{ });
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5821,8 +5654,7 @@ test "cpu backend: conv2d grouped and channel-tiled inputs match reference" {
         const y = try g.addConv2D(x_in, w_val, null, 1, 1, 1, 1, pad, pad, pad, pad, c.groups);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         var cpu = cpu_backend_mod.CpuBackend.init(allocator);
         defer cpu.deinit();
@@ -5839,8 +5671,7 @@ test "cpu backend: conv2d flat-input packing handles padding geometry and reflec
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const Case = struct { k_h: usize, k_w: usize, sh: usize, sw: usize, dh: usize, dw: usize, pt: usize, pb: usize, pl: usize, pr: usize, reflect: bool };
-    // A channel-tiled input forces the flat-buffer packing path rather than the
-    // single-tile one, so these cover its zero-pad runs and its reflect walk.
+    // These cover the packing path's zero-pad runs and its reflect walk.
     const cases = [_]Case{
         .{ .k_h = 3, .k_w = 3, .sh = 1, .sw = 1, .dh = 1, .dw = 1, .pt = 1, .pb = 1, .pl = 1, .pr = 1, .reflect = false },
         .{ .k_h = 5, .k_w = 5, .sh = 1, .sw = 1, .dh = 1, .dw = 1, .pt = 2, .pb = 2, .pl = 4, .pr = 0, .reflect = false },
@@ -5899,9 +5730,8 @@ test "cpu backend: conv2d flat-input packing handles padding geometry and reflec
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        // Channel-tiled x: the single-tile packer declines this.
-        const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h_in, w_in, c_in }, &[_]usize{ 1, h_in, w_in, 4 }, .{ .tile_alignment = 64 });
-        const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ c.k_h, c.k_w, c_in, c_out }, &[_]usize{ c.k_h, c.k_w, c_in, c_out }, .{ .tile_alignment = 64 });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c_in }, .{ });
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c_in, c_out }, .{ });
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5914,8 +5744,7 @@ test "cpu backend: conv2d flat-input packing handles padding geometry and reflec
         const y = try g.addConv2DWithPadMode(x_in, w_val, null, c.sh, c.sw, c.dh, c.dw, c.pt, c.pb, c.pl, c.pr, if (c.reflect) .reflect else .zero, 1);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         var cpu = cpu_backend_mod.CpuBackend.init(allocator);
         defer cpu.deinit();
@@ -5980,8 +5809,8 @@ test "cpu backend: general gather matches a coordinate-wise reference" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const d_tid = try sm.createTiledTensor(.f32, c.d, c.d, .{ .tile_alignment = 64 });
-        const i_tid = try sm.createTiledTensor(.i32, c.i, c.i, .{ .tile_alignment = 64 });
+        const d_tid = try sm.createTensor(.f32, c.d, .{ });
+        const i_tid = try sm.createTensor(.i32, c.i, .{ });
         try sm.writeFromPackedScalar(d_tid, d_buf);
         try sm.writeFromPackedScalar(i_tid, i_buf);
 
@@ -5994,7 +5823,7 @@ test "cpu backend: general gather matches a coordinate-wise reference" {
         const y = try g.addGather(d_in, i_in, @intCast(c.axis), c.bd);
         try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-        var prog = try program.compileGraph(allocator, &g, &sm, .cpu(.{ .tile_alignment = 64 }));
+        var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
         defer prog.deinit();
         var cpu = cpu_backend_mod.CpuBackend.init(allocator);
         defer cpu.deinit();
@@ -6065,8 +5894,8 @@ fn convOnFreshStore(allocator: std.mem.Allocator, cpu: *cpu_backend_mod.CpuBacke
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h, w, c_in }, &[_]usize{ 1, h, w, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, &[_]usize{ 3, 3, c_in, c_out }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -6079,8 +5908,7 @@ fn convOnFreshStore(allocator: std.mem.Allocator, cpu: *cpu_backend_mod.CpuBacke
     const y = try g.addConv2D(x_in, w_in, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    const policy: plan_mod.TilePolicy = .{ .base_square_2d = 4, .base_1d = 4, .tile_alignment = 64 };
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(policy));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     try cpu.backend().executeProgram(&prog, sm.tensorStore());
 
@@ -6103,9 +5931,8 @@ test "cpu backend: packed conv weights are not shared between stores" {
     try std.testing.expect(try convOnFreshStore(allocator, &cpu, -0.07) <= 1e-5);
 }
 
-/// Conv2D at `shape`, 3x3 stride 1 pad 1, against a direct reference. Uses the
-/// real CPU tile policy so the output splits into channel tiles the way a model's
-/// would. Returns max |out - reference|.
+/// Conv2D at `shape`, 3x3 stride 1 pad 1, against a direct reference. Returns
+/// max |out - reference|.
 fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, c_out: usize) !f32 {
     const x_len = h * w * c_in;
     const w_len = 3 * 3 * c_in * c_out;
@@ -6137,8 +5964,8 @@ fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, 
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTiledTensor(.f32, &[_]usize{ 1, h, w, c_in }, &[_]usize{ 1, h, w, c_in }, .{ .tile_alignment = 64 });
-    const w_tid = try sm.createTiledTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, &[_]usize{ 3, 3, c_in, c_out }, .{ .tile_alignment = 64 });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{ });
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{ });
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -6151,7 +5978,7 @@ fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, 
     const y = try g.addConv2D(x_in, w_in, null, 1, 1, 1, 1, 1, 1, 1, 1, 1);
     try g.setOutputs(&[_]graph_mod.ValueId{y});
 
-    var prog = try program.compileGraph(allocator, &g, &sm, .cpu(plan_mod.tilePolicyForTarget(.cpu)));
+    var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
     defer prog.deinit();
     var cpu = cpu_backend_mod.CpuBackend.init(allocator);
     defer cpu.deinit();
@@ -6165,10 +5992,10 @@ fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, 
     return max_abs;
 }
 
-test "cpu backend: conv2d matches reference across channel-tiled output shapes" {
-    // The tile policy caps an output channel tile at 64, so c_out > 64 splits the
-    // output into several channel tiles — a case the fixed-shape conv tests above
-    // never reach, and one the packed-GEMM path has to get the weight offset right for.
+test "cpu backend: conv2d matches reference across output channel counts" {
+    // c_out past the packed GEMM's column block splits the weight into several
+    // panels — a case the fixed-shape conv tests above never reach, and one the
+    // packed-GEMM path has to get the weight offset right for.
     const allocator: std.mem.Allocator = std.testing.allocator;
     const cases = [_][4]usize{
         .{ 9, 7, 64, 64 },

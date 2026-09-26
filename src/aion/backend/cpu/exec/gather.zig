@@ -53,14 +53,14 @@ fn copyRowVectorized(dst: []u8, src: []const u8) void {
     }
 }
 
-/// Dequantize row `r` of a q8_0 table tile, `d` elements, into `dst` scalar bytes.
-/// Each block is read through the tile's block order, so a row-major and a
+/// Dequantize row `r` of a q8_0 table, `d` elements, into `dst` scalar bytes.
+/// Each block is read through the table's block order, so a row-major and a
 /// grouped table read the same way. `dst` holds `.f16` or `.f32`.
-fn dequantQ8_0Row(dst: []u8, tile: []const u8, order: QuantBlockOrder, r: usize, d: usize, out_dtype: DType) BackendError!void {
+fn dequantQ8_0Row(dst: []u8, table: []const u8, order: QuantBlockOrder, r: usize, d: usize, out_dtype: DType) BackendError!void {
     if ((d % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
     const blocks: usize = d / Q8_0_BLOCK_ELEMS;
     const g = order.groupRows();
-    if (tile.len < (r / g + 1) * g * blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
+    if (table.len < (r / g + 1) * g * blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
     const elem_bytes: usize = switch (out_dtype) {
         .f16 => 2,
         .f32 => 4,
@@ -70,7 +70,7 @@ fn dequantQ8_0Row(dst: []u8, tile: []const u8, order: QuantBlockOrder, r: usize,
 
     var block: [Q8_0_BLOCK_BYTES]u8 = undefined;
     for (0..blocks) |b| {
-        order.loadBlock(tile, blocks, r, b, &block);
+        order.loadBlock(table, blocks, r, b, &block);
         const scale: f32 = @as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little)));
         const q: *const [Q8_0_BLOCK_ELEMS]i8 = @ptrCast(block[2..]);
         for (q, 0..) |v, i| {
@@ -85,10 +85,10 @@ fn dequantQ8_0Row(dst: []u8, tile: []const u8, order: QuantBlockOrder, r: usize,
     }
 }
 
-pub fn execGatherRowsTiled(
+pub fn execGatherRows(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepGatherRowsTiled,
+    s: executable.StepGatherRows,
     store: tensor_store.TensorStore,
 ) ExecuteProgramError!void {
     const out_meta: tensor_store.TensorMeta = try store.meta(s.out);
@@ -106,9 +106,6 @@ pub fn execGatherRowsTiled(
     if (table_is_quant) {
         if (!(out_meta.dtype == .f16 or out_meta.dtype == .f32)) return BackendError.InvalidArgument;
         if ((table_meta.shape[1] % Q8_0_BLOCK_ELEMS) != 0) return BackendError.InvalidArgument;
-        // Our tiling helper guarantees `tile_shape[1] == shape[1]` for q8_0 embedding tables,
-        // so every row of a tile is one contiguous block run. Enforce the invariant here.
-        if (table_meta.tile_shape[1] != table_meta.shape[1]) return BackendError.InvalidArgument;
     } else {
         if (out_meta.dtype != table_meta.dtype) return BackendError.InvalidArgument;
         if (!(table_meta.dtype == .f16 or table_meta.dtype == .f32)) return BackendError.InvalidArgument;
@@ -130,10 +127,9 @@ pub fn execGatherRowsTiled(
     const l_total: usize = indices_meta.shape[1];
     const v_total: usize = table_meta.shape[0];
 
-    // Acquire indices once (expected to be single-tile in v0).
-    var idx_tile: tensor_store.TileRefConst = try store.acquireTileConst(s.indices, 0, 0);
-    defer store.releaseConst(idx_tile.token);
-    const idx_view = idx_tile.bufferView();
+    var idx_v: tensor_store.ViewConst = try store.acquireConst(s.indices);
+    defer store.releaseConst(idx_v.token);
+    const idx_view = idx_v.bufferView();
     if (idx_view.layout.rank != 2) return BackendError.InvalidArgument;
 
     if ((idx_view.bytes.len % @sizeOf(i32)) != 0) return BackendError.InvalidArgument;
@@ -141,315 +137,82 @@ pub fn execGatherRowsTiled(
     const idx_vals: []align(1) const i32 = idx_ptr[0 .. idx_view.bytes.len / @sizeOf(i32)];
     if (idx_vals.len < b_total * l_total) return BackendError.InvalidArgument;
 
-    // Total output tiles (linear iteration).
-    const rank: usize = 3;
-    var tile_total: usize = 1;
-    var d: usize = 0;
-    while (d < rank) : (d += 1) {
-        tile_total = std.math.mul(usize, tile_total, out_meta.tile_counts[d]) catch return BackendError.InvalidArgument;
-    }
-
-    const Runner = struct {
-        store: tensor_store.TensorStore,
-        out_meta: tensor_store.TensorMeta,
-        table_meta: tensor_store.TensorMeta,
-        out: tensor_store.TensorId,
-        table: tensor_store.TensorId,
-        b_total: usize,
-        l_total: usize,
-        v_total: usize,
-        out_elem_bytes: usize,
-        table_row_bytes: usize,
-        table_is_quant: bool,
-        idx_vals: []align(1) const i32,
-
-        fn runRange(self: *@This(), start: usize, end: usize) ExecuteProgramError!void {
-            var out_tile_coords: [8]usize = @splat(0);
-
-            var table_cached: bool = false;
-            var table_cached_ti0: usize = 0;
-            var table_tile: tensor_store.TileRefConst = undefined;
-            defer if (table_cached) self.store.releaseConst(table_tile.token);
-
-            var tile_index: usize = start;
-            while (tile_index < end) : (tile_index += 1) {
-                var out_tile: tensor_store.TileRefMut = try self.store.acquireTileMutLinear(self.out, tile_index);
-                defer self.store.releaseMut(out_tile.token);
-                const out_view = out_tile.bufferView();
-                if (out_view.layout.rank != 3) return BackendError.InvalidArgument;
-
-                try tensor_store.decodeTileCoords(self.out_meta, tile_index, out_tile_coords[0..rank]);
-
-                const base_b: usize = out_tile_coords[0] * self.out_meta.tile_shape[0];
-                const base_l: usize = out_tile_coords[1] * self.out_meta.tile_shape[1];
-
-                const tb: usize = out_view.layout.shape[0];
-                const tl: usize = out_view.layout.shape[1];
-                const td: usize = out_view.layout.shape[2];
-                if (td == 0) return BackendError.InvalidArgument;
-                if (self.out_meta.shape[2] != td) return BackendError.InvalidArgument;
-
-                const out_bytes_per_row: usize = std.math.mul(usize, td, self.out_elem_bytes) catch return BackendError.InvalidArgument;
-                const need_bytes: usize = std.math.mul(usize, std.math.mul(usize, tb, tl) catch return BackendError.InvalidArgument, out_bytes_per_row) catch return BackendError.InvalidArgument;
-                if (need_bytes > out_view.bytes.len) return BackendError.InvalidArgument;
-
-                var lb: usize = 0;
-                while (lb < tb) : (lb += 1) {
-                    const b: usize = base_b + lb;
-                    if (b >= self.b_total) return BackendError.InvalidArgument;
-
-                    var ll: usize = 0;
-                    while (ll < tl) : (ll += 1) {
-                        const l: usize = base_l + ll;
-                        if (l >= self.l_total) return BackendError.InvalidArgument;
-
-                        const row = resolveIndex(self.idx_vals[b * self.l_total + l], self.v_total) orelse
-                            return BackendError.InvalidArgument;
-
-                        // Prefetch the next row's tile while copying the current row.
-                        // This helps hide cache / storage latency for random-token gathers.
-                        var next_row_opt: ?usize = null;
-                        if (ll + 1 < tl) {
-                            const nb: usize = b;
-                            const nl: usize = l + 1;
-                            if (nl < self.l_total) {
-                                const next_i32: i32 = self.idx_vals[nb * self.l_total + nl];
-                                if (next_i32 >= 0) {
-                                    const next_row: usize = @intCast(next_i32);
-                                    if (next_row < self.v_total) {
-                                        next_row_opt = next_row;
-                                        self.store.prefetch(self.table, next_row / self.table_meta.tile_shape[0], 0);
-                                    }
-                                }
-                            }
-                        } else if (lb + 1 < tb) {
-                            const nb: usize = b + 1;
-                            const nl: usize = base_l;
-                            if (nb < self.b_total and nl < self.l_total) {
-                                const next_i32: i32 = self.idx_vals[nb * self.l_total + nl];
-                                if (next_i32 >= 0) {
-                                    const next_row: usize = @intCast(next_i32);
-                                    if (next_row < self.v_total) {
-                                        next_row_opt = next_row;
-                                        self.store.prefetch(self.table, next_row / self.table_meta.tile_shape[0], 0);
-                                    }
-                                }
-                            }
-                        }
-
-                        const ti0: usize = row / self.table_meta.tile_shape[0];
-                        const local_r: usize = row - ti0 * self.table_meta.tile_shape[0];
-
-                        if (!table_cached or table_cached_ti0 != ti0) {
-                            if (table_cached) self.store.releaseConst(table_tile.token);
-                            table_tile = try self.store.acquireTileConst(self.table, ti0, 0);
-                            table_cached = true;
-                            table_cached_ti0 = ti0;
-                        }
-
-                        const table_view = table_tile.bufferView();
-                        if (table_view.layout.rank != 2) return BackendError.InvalidArgument;
-                        const rows_in_tile: usize = table_view.layout.shape[0];
-                        const d_in_tile: usize = table_view.layout.shape[1];
-                        if (local_r >= rows_in_tile) return BackendError.InvalidArgument;
-                        if (d_in_tile != td) return BackendError.InvalidArgument;
-
-                        if (next_row_opt) |next_row| {
-                            const next_ti0: usize = next_row / self.table_meta.tile_shape[0];
-                            if (next_ti0 == table_cached_ti0) {
-                                const next_local_r: usize = next_row - next_ti0 * self.table_meta.tile_shape[0];
-                                if (next_local_r < rows_in_tile) {
-                                    const pf_off: usize = if (self.table_is_quant)
-                                        self.table_meta.block_order.scaleAt(td / Q8_0_BLOCK_ELEMS, next_local_r, 0)
-                                    else
-                                        next_local_r * self.table_row_bytes;
-                                    if (pf_off < table_view.bytes.len) {
-                                        @prefetch(table_view.bytes[pf_off..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
-                                    }
-                                }
-                            }
-                        }
-
-                        const src_off: usize = local_r * self.table_row_bytes;
-                        const dst_off: usize = ((lb * tl + ll) * td) * self.out_elem_bytes;
-
-                        if (self.table_is_quant) {
-                            try dequantQ8_0Row(
-                                out_view.bytes[dst_off .. dst_off + out_bytes_per_row],
-                                table_view.bytes,
-                                self.table_meta.block_order,
-                                local_r,
-                                td,
-                                self.out_meta.dtype,
-                            );
-                        } else {
-                            copyRowVectorized(
-                                out_view.bytes[dst_off .. dst_off + out_bytes_per_row],
-                                table_view.bytes[src_off .. src_off + out_bytes_per_row],
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    var runner: Runner = .{
-        .store = store,
-        .out_meta = out_meta,
-        .table_meta = table_meta,
-        .out = s.out,
-        .table = s.table,
-        .b_total = b_total,
-        .l_total = l_total,
-        .v_total = v_total,
-        .out_elem_bytes = out_elem_bytes,
-        .table_row_bytes = table_row_bytes,
-        .table_is_quant = table_is_quant,
-        .idx_vals = idx_vals,
-    };
-
-    const tile_bytes: usize = exec_utils.tileByteSize(out_meta);
-    const min_total_bytes: usize = 256 * 1024;
-
-    if (pool) |p| {
-        if (exec_utils.shouldParallelTiles(thread_count, tile_total, tile_bytes, min_total_bytes)) {
-            const Task = struct {
-                runner: *Runner,
-
-                stop: std.atomic.Value(bool) = .init(false),
-                err_mutex: std.Io.Mutex = .init,
-                err_any: ?anyerror = null,
-
-                fn fail(t: *@This(), err: anyerror) void {
-                    if (t.stop.swap(true, .acq_rel)) return;
-                    std.Io.Threaded.mutexLock(&t.err_mutex);
-                    defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
-                    if (t.err_any == null) t.err_any = err;
-                }
-
-                fn runTiles(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void {
-                    _ = tid;
-                    const t: *@This() = @ptrCast(@alignCast(ctx_any));
-                    if (start >= end) return;
-                    if (t.stop.load(.acquire)) return;
-                    t.runner.runRange(start, end) catch |e| {
-                        t.fail(e);
-                        return;
-                    };
-                }
-            };
-
-            var task: Task = .{ .runner = &runner };
-            var grain: usize = if (tile_bytes == 0) 16 else @max(@as(usize, 1), min_total_bytes / tile_bytes);
-            if (grain > tile_total) grain = tile_total;
-
-            p.parallelForAny(@ptrCast(&task), tile_total, grain, Task.runTiles);
-            if (task.err_any) |e| return @errorCast(e);
-            return;
-        }
-    }
-
-    // Sequential fallback.
-    try runner.runRange(0, tile_total);
+    return gatherRowsWhole(pool, thread_count, s, store, idx_vals, l_total, v_total, table_row_bytes, table_is_quant, table_meta.block_order);
 }
 
-/// Batched sequence-row gather:
-///   data    [B,S,D]
-///   indices [B,L]
-///   out     [B,L,D]
-/// with `axis=1, batch_dims=1`.
-pub fn execGatherTiled(
+/// Whole tensors: the output's `B*L` rows split across the pool, each copied (or
+/// dequantized) straight from its table row.
+fn gatherRowsWhole(
     pool: ?*thread_pool.ThreadPool,
     thread_count: usize,
-    s: executable.StepGatherTiled,
+    s: executable.StepGatherRows,
     store: tensor_store.TensorStore,
+    idx_vals: []align(1) const i32,
+    l_total: usize,
+    v_total: usize,
+    table_row_bytes: usize,
+    table_is_quant: bool,
+    block_order: types.QuantBlockOrder,
 ) ExecuteProgramError!void {
-    _ = pool;
-    _ = thread_count;
-    if (s.axis != 1 or s.batch_dims != 1) return BackendError.InvalidArgument;
+    const out_view = try store.acquireMut(s.out);
+    defer store.releaseMut(out_view.token);
+    const table_view = try store.acquireConst(s.table);
+    defer store.releaseConst(table_view.token);
+    const out = out_view.bufferView();
+    const td: usize = out.layout.shape[2];
+    const Ctx = struct {
+        out: []u8,
+        out_dtype: types.DType,
+        table: []const u8,
+        idx: []align(1) const i32,
+        v_total: usize,
+        td: usize,
+        out_row_bytes: usize,
+        table_row_bytes: usize,
+        table_is_quant: bool,
+        block_order: types.QuantBlockOrder,
 
-    const out_meta = try store.meta(s.out);
-    const data_meta = try store.meta(s.data);
-    const idx_meta = try store.meta(s.indices);
-    if (out_meta.rank != 3 or data_meta.rank != 3 or idx_meta.rank != 2) return BackendError.InvalidArgument;
-    if (idx_meta.dtype != .i32 or out_meta.dtype != data_meta.dtype) return BackendError.InvalidArgument;
-    const elem_bytes: usize = switch (out_meta.dtype) {
-        .f16 => 2,
-        .f32 => 4,
-        else => return BackendError.InvalidArgument,
-    };
-
-    const batch = data_meta.shape[0];
-    const seq = data_meta.shape[1];
-    const width = data_meta.shape[2];
-    const picks = idx_meta.shape[1];
-    if (idx_meta.shape[0] != batch or out_meta.shape[0] != batch or
-        out_meta.shape[1] != picks or out_meta.shape[2] != width) return BackendError.InvalidArgument;
-    if (data_meta.tile_counts[2] != 1 or out_meta.tile_counts[2] != 1) return BackendError.InvalidArgument;
-
-    const idx_tile = try store.acquireTileConstLinear(s.indices, 0);
-    defer store.releaseConst(idx_tile.token);
-    const idx_view = idx_tile.bufferView();
-    const idx_ptr: [*]align(1) const i32 = @ptrCast(idx_view.bytes.ptr);
-    const idx_vals = idx_ptr[0 .. idx_view.bytes.len / @sizeOf(i32)];
-    if (idx_vals.len < batch * picks) return BackendError.InvalidArgument;
-
-    var out_linear: usize = 0;
-    var out_coords: [8]usize = @splat(0);
-    var out_total: usize = 1;
-    for (out_meta.tile_counts[0..3]) |n| out_total *= n;
-    while (out_linear < out_total) : (out_linear += 1) {
-        try tensor_store.decodeTileCoords(out_meta, out_linear, out_coords[0..3]);
-        const out_tile = try store.acquireTileMutLinear(s.out, out_linear);
-        defer store.releaseMut(out_tile.token);
-        const out_view = out_tile.bufferView();
-
-        const base_b = out_coords[0] * out_meta.tile_shape[0];
-        const base_l = out_coords[1] * out_meta.tile_shape[1];
-        const tb = out_view.layout.shape[0];
-        const tl = out_view.layout.shape[1];
-        const td = out_view.layout.shape[2];
-        if (td != width) return BackendError.InvalidArgument;
-
-        for (0..tb) |lb| {
-            const b = base_b + lb;
-            for (0..tl) |ll| {
-                const l = base_l + ll;
-                if (b >= batch or l >= picks) return BackendError.InvalidArgument;
-                const row = resolveIndex(idx_vals[b * picks + l], seq) orelse return BackendError.InvalidArgument;
-
-                const data_linear =
-                    (b / data_meta.tile_shape[0]) * data_meta.tile_counts[1] +
-                    (row / data_meta.tile_shape[1]);
-                const data_tile = try store.acquireTileConstLinear(s.data, data_linear);
-                defer store.releaseConst(data_tile.token);
-                const data_view = data_tile.bufferView();
-                const local_b = b % data_meta.tile_shape[0];
-                const local_s = row % data_meta.tile_shape[1];
-                if (local_b >= data_view.layout.shape[0] or local_s >= data_view.layout.shape[1]) return BackendError.InvalidArgument;
-
-                const row_bytes = width * elem_bytes;
-                const src_off = (local_b * data_view.layout.shape[1] + local_s) * row_bytes;
-                const dst_off = (lb * tl + ll) * row_bytes;
-                if (src_off + row_bytes > data_view.bytes.len or dst_off + row_bytes > out_view.bytes.len) return BackendError.InvalidArgument;
-                copyRowVectorized(
-                    out_view.bytes[dst_off .. dst_off + row_bytes],
-                    data_view.bytes[src_off .. src_off + row_bytes],
-                );
+        fn run(c: @This(), lo: usize, hi: usize, _: usize) BackendError!void {
+            for (lo..hi) |r| {
+                const row = resolveIndex(c.idx[r], c.v_total) orelse return BackendError.InvalidArgument;
+                if (r + 1 < hi) {
+                    if (resolveIndex(c.idx[r + 1], c.v_total)) |next| {
+                        const pf = if (c.table_is_quant) c.block_order.scaleAt(c.td / Q8_0_BLOCK_ELEMS, next, 0) else next * c.table_row_bytes;
+                        if (pf < c.table.len) @prefetch(c.table[pf..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+                    }
+                }
+                const dst = c.out[r * c.out_row_bytes ..][0..c.out_row_bytes];
+                if (c.table_is_quant) {
+                    try dequantQ8_0Row(dst, c.table, c.block_order, row, c.td, c.out_dtype);
+                } else {
+                    copyRowVectorized(dst, c.table[row * c.table_row_bytes ..][0..c.out_row_bytes]);
+                }
             }
         }
-    }
+    };
+    const out_row_bytes = td * out.dtype.info().block_bytes;
+    const ctx: Ctx = .{
+        .out = out.bytes,
+        .out_dtype = out.dtype,
+        .table = table_view.bufferView().bytes,
+        .idx = idx_vals,
+        .v_total = v_total,
+        .td = td,
+        .out_row_bytes = out_row_bytes,
+        .table_row_bytes = table_row_bytes,
+        .table_is_quant = table_is_quant,
+        .block_order = block_order,
+    };
+    const rows = out.layout.shape[0] * l_total;
+    return exec_utils.parallelRange(BackendError, pool, thread_count, rows, out_row_bytes, ctx, Ctx.run);
 }
 
-fn tileCount(meta: tensor_store.TensorMeta) usize {
-    var n: usize = 1;
-    for (meta.tile_counts[0..meta.rank]) |c| n *= c;
-    return n;
+/// Batched row gather (`axis == 1`, `batch_dims == 1`): the general gather covers it.
+pub fn execGather(s: executable.StepGather, store: tensor_store.TensorStore) ExecuteProgramError!void {
+    return execGatherND(.{ .out = s.out, .data = s.data, .indices = s.indices, .axis = s.axis, .batch_dims = s.batch_dims }, store);
 }
 
-/// General gather for single-tile operands: every axis/batch_dims/rank the
-/// specialized row and batched-row steps do not take.
+/// General gather: any axis / batch_dims / rank.
 ///
 /// Flattening `data` around `axis` makes the whole family one loop: `lead` walks
 /// `data[:axis]`, `pick` walks the index tail, and each pair copies `inner`
@@ -474,7 +237,6 @@ pub fn execGatherND(
     const dr: usize = data_meta.rank;
     const ir: usize = idx_meta.rank;
     if (axis >= dr or bd > axis or bd > ir) return BackendError.InvalidArgument;
-    if (tileCount(out_meta) != 1 or tileCount(data_meta) != 1 or tileCount(idx_meta) != 1) return BackendError.Unsupported;
 
     var batch: usize = 1;
     for (data_meta.shape[0..bd]) |d| batch *= d;
@@ -488,19 +250,19 @@ pub fn execGatherND(
     if (batch == 0 or lead_total == 0 or axis_len == 0) return BackendError.InvalidArgument;
     const mid: usize = lead_total / batch;
 
-    const idx_tile = try store.acquireTileConstLinear(s.indices, 0);
-    defer store.releaseConst(idx_tile.token);
-    const idx_bytes = idx_tile.bufferView().bytes;
+    const idx_v = try store.acquireConst(s.indices);
+    defer store.releaseConst(idx_v.token);
+    const idx_bytes = idx_v.bufferView().bytes;
     const idx_ptr: [*]align(1) const i32 = @ptrCast(idx_bytes.ptr);
     const idx_vals = idx_ptr[0 .. idx_bytes.len / @sizeOf(i32)];
     if (idx_vals.len < batch * picked) return BackendError.InvalidArgument;
 
-    const data_tile = try store.acquireTileConstLinear(s.data, 0);
-    defer store.releaseConst(data_tile.token);
-    const src_bytes = data_tile.bufferView().bytes;
-    const out_tile = try store.acquireTileMutLinear(s.out, 0);
-    defer store.releaseMut(out_tile.token);
-    const dst_bytes = out_tile.bufferView().bytes;
+    const data_view = try store.acquireConst(s.data);
+    defer store.releaseConst(data_view.token);
+    const src_bytes = data_view.bufferView().bytes;
+    const out_view = try store.acquireMut(s.out);
+    defer store.releaseMut(out_view.token);
+    const dst_bytes = out_view.bufferView().bytes;
 
     const run: usize = inner * elem;
     if (src_bytes.len < lead_total * axis_len * run or dst_bytes.len < lead_total * picked * run) {

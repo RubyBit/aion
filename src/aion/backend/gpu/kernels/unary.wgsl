@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 // Elementwise unary activations over f32 or f16 storage buffers. One entry point
-// per (op, dtype); the backend selects from `UnaryOp` plus the tile dtype.
-// Dispatched once per tile. The element count comes from a uniform (binding 2)
+// per (op, dtype); the backend selects from `UnaryOp` plus the tensor dtype.
+// One dispatch per tensor. The element count comes from a uniform (binding 2)
 // rather than `arrayLength`, so it counts ELEMENTS for both dtypes. Grid-stride
 // loops (see elementwise.wgsl) keep dispatches under the 65535
-// workgroups-per-dimension limit on large GPU-policy tiles.
+// workgroups-per-dimension limit on large tensors.
 //
 // The f16 entry points alias `array<f16>` onto the same bindings the f32 ones
 // declare as `array<f32>`. A resource interface is per entry point, not per

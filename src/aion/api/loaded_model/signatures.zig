@@ -102,7 +102,5 @@ pub fn tensorsHaveCompatibleLayout(
     const new_meta = try store.getConst(new_tid);
     return old_meta.dtype == new_meta.dtype and
         old_meta.rank == new_meta.rank and
-        sameUsize(old_meta.shape, new_meta.shape) and
-        sameUsize(old_meta.tile_shape, new_meta.tile_shape) and
-        sameUsize(old_meta.tile_counts, new_meta.tile_counts);
+        sameUsize(old_meta.shape, new_meta.shape);
 }

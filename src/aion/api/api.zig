@@ -12,7 +12,6 @@ pub const HostView = @import("host_view.zig").HostView;
 pub const HostViewMut = @import("host_view.zig").HostViewMut;
 pub const HostElem = @import("host_view.zig").Elem;
 pub const host_view_max_rank = @import("host_view.zig").max_rank;
-pub const TilePolicy = @import("context.zig").TilePolicy;
 pub const LoadedModel = @import("context.zig").LoadedModel;
 pub const Weights = @import("context.zig").Weights;
 pub const Tensor = @import("tensor.zig").Tensor;

@@ -20,7 +20,6 @@ from ._ffi.dlpack import HostView, view_of, view_of_buffer
 from ._ffi.handles import TensorHandle
 from ._ffi.runtime import (
     create_empty_tensor,
-    create_empty_tiled_tensor,
     create_tensor,
     destroy_tensor,
     move_tensor,
@@ -475,32 +474,6 @@ class Tensor:
         if device is not None:
             t.to(device)
         return t
-
-    @classmethod
-    def empty_tiled(
-        cls,
-        ctx: "Context",
-        shape: Sequence[int],
-        tile_shape: Sequence[int],
-        *,
-        dtype: DTypeLike = float32,
-    ) -> "Tensor":
-        """Create an empty tensor with an explicit per-axis tile shape.
-
-        Use this when you want to pin a specific tile layout — e.g. to skip the
-        one-time retile copy the compiler would otherwise insert when an op needs
-        a different tiling. For most cases `Tensor.empty` is sufficient: the graph
-        compiler retiles inputs as needed (e.g. KV caches consumed by
-        `SequenceAppend` are coerced to head-dim-contiguous on first run).
-        """
-        shp = _as_shape(shape)
-        tshp = _as_shape(tile_shape)
-        if len(tshp) != len(shp):
-            raise ValueError(f"tile_shape rank {len(tshp)} != shape rank {len(shp)}")
-        dtype = normalize_dtype(dtype)
-
-        handle = create_empty_tiled_tensor(ctx.ptr, dtype, shp, tshp)
-        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
 
     @classmethod
     def quantize(

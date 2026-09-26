@@ -282,6 +282,7 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
             scratch_bytes: []u8,
             k: usize,
             n: usize,
+            ldb: usize,
             b_bytes: []const u8,
         ) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
@@ -291,7 +292,8 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
 
             const k_blocks: usize = k / blk_elems;
             const panels: usize = (n + NR - 1) / NR;
-            if (b_bytes.len < k_blocks * n * blk_bytes) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
+            if (k_blocks > 0 and b_bytes.len < ((k_blocks - 1) * ld + n) * blk_bytes) return BackendError.InvalidArgument;
             if (scratch_bytes.len < PB_TOTAL_BYTES) return BackendError.InvalidArgument;
 
             var p: usize = 0;
@@ -314,7 +316,7 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
                             while (t < Q8_0_BLOCK_ELEMS) : (t += 1) q[(t >> 2) * (NR * 4) + jj * 4 + (t & 3)] = 0;
                             continue;
                         }
-                        const blk_off = (kb * n + col) * blk_bytes;
+                        const blk_off = (kb * ld + col) * blk_bytes;
                         const sb: u16 = @as(*align(1) const u16, @ptrCast(b_bytes.ptr + blk_off)).*;
                         @as(*align(1) f32, @ptrCast(scales + jj * 4)).* = scaleF16BitsToF32(sb);
 
@@ -338,12 +340,12 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
             }
         }
 
-        pub fn packBTileQ8_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
-            return packGeneric(.q8_0, scratch_bytes, k, n, b_bytes);
+        pub fn packBTileQ8_0(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            return packGeneric(.q8_0, scratch_bytes, k, n, ldb, b_bytes);
         }
 
-        pub fn packBTileQ4_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
-            return packGeneric(.q4_0, scratch_bytes, k, n, b_bytes);
+        pub fn packBTileQ4_0(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            return packGeneric(.q4_0, scratch_bytes, k, n, ldb, b_bytes);
         }
 
         pub fn matmulPackedB(
@@ -369,7 +371,8 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
 
             const c: []align(1) f32 = std.mem.bytesAsSlice(f32, c_bytes);
             const a: []align(1) const f32 = std.mem.bytesAsSlice(f32, a_bytes);
-            if (a.len < m * k) return BackendError.InvalidArgument;
+            const lda = if (params.lda == 0) k else params.lda;
+            if (m > 0 and a.len < (m - 1) * lda + k) return BackendError.InvalidArgument;
 
             // Carve activation-quant scratch out of the tail of scratch_bytes.
             const aq_off = pbPadded();
@@ -387,7 +390,7 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
                     var kb: usize = 0;
                     while (kb < k_blocks) : (kb += 1) {
                         aq_scale[r * k_blocks + kb] = quantizeABlock(
-                            a.ptr + (i_base + r) * k + kb * Q8_0_BLOCK_ELEMS,
+                            a.ptr + (i_base + r) * lda + kb * Q8_0_BLOCK_ELEMS,
                             aq_i8 + r * KC + kb * Q8_0_BLOCK_ELEMS,
                         );
                     }
@@ -584,6 +587,7 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
             scratch_bytes: []u8,
             k: usize,
             n: usize,
+            ldb: usize,
             b_bytes: []const u8,
         ) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
@@ -593,7 +597,8 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
 
             const k_blocks: usize = k / blk_elems;
             const panels: usize = (n + MM_NR - 1) / MM_NR;
-            if (b_bytes.len < k_blocks * n * blk_bytes) return BackendError.InvalidArgument;
+            const ld: usize = if (ldb != 0) ldb else n;
+            if (k_blocks > 0 and b_bytes.len < ((k_blocks - 1) * ld + n) * blk_bytes) return BackendError.InvalidArgument;
             if (scratch_bytes.len < PB_TOTAL_BYTES) return BackendError.InvalidArgument;
 
             var p: usize = 0;
@@ -614,7 +619,7 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
                             writeColBlockMM(q, jj, &vals);
                             continue;
                         }
-                        const blk_off = (kb * n + col) * blk_bytes;
+                        const blk_off = (kb * ld + col) * blk_bytes;
                         const sb: u16 = @as(*align(1) const u16, @ptrCast(b_bytes.ptr + blk_off)).*;
                         @as(*align(1) f32, @ptrCast(scales + jj * 4)).* = scaleF16BitsToF32(sb);
 
@@ -638,12 +643,12 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
             }
         }
 
-        pub fn packBTileQ8_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
-            return packGenericMM(.q8_0, scratch_bytes, k, n, b_bytes);
+        pub fn packBTileQ8_0(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            return packGenericMM(.q8_0, scratch_bytes, k, n, ldb, b_bytes);
         }
 
-        pub fn packBTileQ4_0(scratch_bytes: []u8, k: usize, n: usize, b_bytes: []const u8) BackendError!void {
-            return packGenericMM(.q4_0, scratch_bytes, k, n, b_bytes);
+        pub fn packBTileQ4_0(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            return packGenericMM(.q4_0, scratch_bytes, k, n, ldb, b_bytes);
         }
 
         pub fn matmulPackedB(
@@ -669,7 +674,8 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
 
             const c: []align(1) f32 = std.mem.bytesAsSlice(f32, c_bytes);
             const a: []align(1) const f32 = std.mem.bytesAsSlice(f32, a_bytes);
-            if (a.len < m * k) return BackendError.InvalidArgument;
+            const lda = if (params.lda == 0) k else params.lda;
+            if (m > 0 and a.len < (m - 1) * lda + k) return BackendError.InvalidArgument;
 
             const aq_off = pbPadded();
             if (scratch_bytes.len < aq_off + AQ_ACT_BYTES + AQ_SCALE_BYTES) return BackendError.InvalidArgument;
@@ -686,7 +692,7 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
                     var kb: usize = 0;
                     while (kb < k_blocks) : (kb += 1) {
                         aq_scale[r * k_blocks + kb] = quantizeABlock(
-                            a.ptr + (i_base + r) * k + kb * Q8_0_BLOCK_ELEMS,
+                            a.ptr + (i_base + r) * lda + kb * Q8_0_BLOCK_ELEMS,
                             aq_i8 + r * KC + kb * Q8_0_BLOCK_ELEMS,
                         );
                     }
@@ -912,7 +918,7 @@ fn runKernelTest(comptime enc: DotEnc, m: usize, n: usize, k: usize) !void {
 
     const scratch = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
     defer allocator.free(scratch);
-    try K.packBTileQ8_0(scratch, k, n, b_q8);
+    try K.packBTileQ8_0(scratch, k, n, 0, b_q8);
     const packed_view: []align(32) const u8 = @alignCast(scratch[0..K.packedBBytes()]);
 
     const c = try allocator.alloc(f32, m * n);
@@ -1002,14 +1008,14 @@ fn runMMKernelTest(comptime enc: MmEnc, m: usize, n: usize, k: usize) !void {
     {
         const scratch = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), MM.scratchBytes());
         defer allocator.free(scratch);
-        try MM.packBTileQ8_0(scratch, k, n, b_q8);
+        try MM.packBTileQ8_0(scratch, k, n, 0, b_q8);
         const pv: []align(32) const u8 = @alignCast(scratch[0..MM.packedBBytes()]);
         try MM.matmulPackedB(scratch, pv, params, std.mem.sliceAsBytes(c_mm), std.mem.sliceAsBytes(a));
     }
     {
         const scratch = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), REF.scratchBytes());
         defer allocator.free(scratch);
-        try REF.packBTileQ8_0(scratch, k, n, b_q8);
+        try REF.packBTileQ8_0(scratch, k, n, 0, b_q8);
         const pv: []align(32) const u8 = @alignCast(scratch[0..REF.packedBBytes()]);
         try REF.matmulPackedB(scratch, pv, params, std.mem.sliceAsBytes(c_ref), std.mem.sliceAsBytes(a));
     }

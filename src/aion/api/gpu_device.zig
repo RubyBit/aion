@@ -7,7 +7,6 @@
 const std = @import("std");
 
 const gpu_backend = @import("../backend/gpu/backend.zig");
-const plan_mod = @import("../graph/plan.zig");
 const device = @import("device.zig");
 const dm = @import("../runtime/device_memory.zig");
 
@@ -21,7 +20,9 @@ pub const GpuCreateError = error{ OutOfMemory, BackendUnavailable };
 pub const GpuDevice = struct {
     gpu: wgpu.Gpu,
     backend: gpu_backend.GpuBackend,
-    policy: plan_mod.TilePolicy,
+
+    /// How the GPU's NT kernel wants q8 weight rows grouped.
+    pub const quant_block_order = gpu_backend.GpuBackend.quant_block_order;
 
     /// The device-memory interface used to migrate tensors onto this GPU. Its
     /// `ctx` points into this (pinned) bundle.
@@ -59,11 +60,6 @@ pub fn create(allocator: std.mem.Allocator, opts: device.GpuOptions) GpuCreateEr
     errdefer bundle.gpu.deinit();
 
     bundle.backend = gpu_backend.GpuBackend.init(allocator, &bundle.gpu);
-    bundle.policy = plan_mod.tilePolicyForTarget(.webgpu);
-    bundle.policy.quant_block_order = gpu_backend.GpuBackend.quant_block_order;
-    // Cap tile sizes to what this device can actually bind (e.g. a multi-GB
-    // quantized embedding table must be split along its row axis).
-    bundle.policy.max_binding_bytes = bundle.gpu.limits.max_storage_binding_bytes;
     return bundle;
 }
 

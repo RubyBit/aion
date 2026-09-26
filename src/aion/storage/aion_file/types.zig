@@ -14,8 +14,13 @@ pub const AttentionWindow = graph_mod.AttentionWindow;
 
 pub const magic_bytes: [4]u8 = .{ 'A', 'I', 'O', 'N' };
 /// v14: node operation tags occupy u16, followed by a zero u16 reserved field.
+/// v15: the tensors section and every payload in it start on a `payload_alignment`
+/// boundary, so a mapped file's payload is usable as a tensor's bytes in place.
 /// Only this version is accepted.
-pub const current_version: u32 = 14;
+pub const current_version: u32 = 15;
+/// File offset every tensor payload starts at a multiple of (zero padding before it).
+/// A tensor's host bytes are 64-byte aligned, and a mapping starts on a page.
+pub const payload_alignment: usize = 64;
 pub const header_size: usize = 72;
 pub const section_desc_size: usize = 24;
 pub const invalid_index: u32 = std.math.maxInt(u32);

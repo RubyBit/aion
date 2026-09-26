@@ -12,7 +12,7 @@ const types_mod = @import("types.zig");
 /// - `LoadedModel` caches compiled programs keyed mostly by *shapes* and
 ///   *symbol values*.
 /// - If the user later binds a *different* tensor id with the same layout
-///   (dtype/shape/tiling), we can avoid recompilation by rewriting those ids
+///   (dtype/shape), we can avoid recompilation by rewriting those ids
 ///   in-place.
 ///
 /// This is an optimization / flexibility feature. Correctness does NOT depend

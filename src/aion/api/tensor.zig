@@ -4,7 +4,6 @@ const std = @import("std");
 const types = @import("../backend/types.zig");
 const backend_utils = @import("../backend/utils.zig");
 const manager_mod = @import("../storage/manager.zig");
-const api_tiling = @import("tiling.zig");
 const device_mod = @import("device.zig");
 const host_view = @import("host_view.zig");
 
@@ -23,12 +22,12 @@ pub const DeviceSelector = device_mod.DeviceSelector;
 
 /// User-visible owned tensor handle.
 ///
-/// In v0 this is always backed by a `StorageManager`-owned `TiledTensor`.
+/// In v0 this is always backed by a `StorageManager`-owned `Tensor`.
 pub const Tensor = struct {
     store: *StorageManager,
     id: TensorId,
 
-    /// Cached metadata (borrowed from the underlying `TiledTensor`).
+    /// Cached metadata (borrowed from the underlying `Tensor`).
     dtype: DType,
     shape: []const usize,
 
@@ -59,7 +58,7 @@ pub const Tensor = struct {
     }
 
     /// Migrate this tensor to `sel` (move semantics: the source-device copy is
-    /// freed), re-tiling to the target device's geometry. `.gpu = i` requires that
+    /// freed), in the layout the target device takes. `.gpu = i` requires that
     /// GPU to be registered on the owning `Context`. Idempotent when already there.
     /// After the move, host `read`/`write` require migrating back with `.to(.cpu)`.
     pub fn to(self: *Self, sel: DeviceSelector) StorageError!void {
@@ -73,19 +72,12 @@ pub const Tensor = struct {
 
         const t = try self.store.getConst(self.id);
         if (t.device.eql(target)) return;
-        if (@as(usize, t.rank) > api_tiling.MAX_RANK) return StorageError.InvalidArgument;
-
-        const policy = self.store.policyFor(target);
         const dev = self.store.deviceMemoryFor(target);
         if (target.kind != .cpu and dev == null) return StorageError.InvalidArgument; // GPU not registered
 
-        var tile_mem: [api_tiling.MAX_RANK]usize = undefined;
-        const tile_shape = tile_mem[0..@as(usize, t.rank)];
-        api_tiling.chooseTileShapeForTensor(policy, t.dtype, t.shape, t.quant_axis, tile_shape) catch return StorageError.InvalidArgument;
+        try self.store.moveTensor(self.id, target, dev);
 
-        try self.store.moveTensor(self.id, target, dev, tile_shape, policy.tile_alignment);
-
-        // The metadata slice may have been reallocated by the re-tile; refresh caches.
+        // The metadata slice may have been reallocated by the move; refresh caches.
         const nt = try self.store.getConst(self.id);
         self.dtype = nt.dtype;
         self.shape = nt.shape;
@@ -207,7 +199,8 @@ pub const Tensor = struct {
 
         const dst_tensor = try self.store.getMut(self.id);
         const src_tensor = try src.store.getConst(src.id);
-        if (canRawCopyTiled(dst_tensor, src_tensor)) {
+        if (canRawCopy(dst_tensor, src_tensor)) {
+            try dst_tensor.ensureWritable();
             @memcpy(dst_tensor.data, src_tensor.data);
             return;
         }
@@ -241,16 +234,8 @@ pub const Tensor = struct {
         }
     }
 
-    fn canRawCopyTiled(dst: *const manager_mod.TiledTensor, src: *const manager_mod.TiledTensor) bool {
-        if (dst.dtype != src.dtype) return false;
-        if (dst.rank != src.rank) return false;
-        if (!std.mem.eql(usize, dst.shape, src.shape)) return false;
-        if (!std.mem.eql(usize, dst.tile_shape, src.tile_shape)) return false;
-        if (!std.mem.eql(usize, dst.tile_counts, src.tile_counts)) return false;
-        if (!std.mem.eql(usize, dst.tile_offsets, src.tile_offsets)) return false;
-        if (!std.mem.eql(usize, dst.tile_lens, src.tile_lens)) return false;
-        if (dst.data.len != src.data.len) return false;
-        return true;
+    fn canRawCopy(dst: *const manager_mod.Tensor, src: *const manager_mod.Tensor) bool {
+        return dst.dtype == src.dtype and std.mem.eql(usize, dst.shape, src.shape) and dst.data.len == src.data.len;
     }
 
     /// Write typed scalar tensor data (inferred from `values` element type).

@@ -785,8 +785,7 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: _Layers, towers: _
     # Generation only ever needs the *last* position's distribution, and the tied
     # head is the single widest matmul in the model (vocab 262144). Keeping every
     # prefill row would make a 272-token prompt materialize a 285 MB f32 logits
-    # tensor -- which argmax then has to see as whole rows, forcing a retile the
-    # compiler rightly refuses. Select the final row first: decode (seq == 1)
+    # tensor nobody reads. Select the final row first: decode (seq == 1)
     # gathers row 0 and is unchanged, prefill drops S-1 rows of head work.
     x = b.gather(x, _last_index(b, tokens, x), axis=1, batch_dims=1)
 

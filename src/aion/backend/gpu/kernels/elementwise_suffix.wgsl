@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 // Broadcast-last-dim binary ops: o[i] = a[i] OP b[i % cols], where `b` is the
-// rank-1 vector broadcast across each row of `a`. Tiles are packed row-major
-// (the backend verifies), so the flat index decomposes with one modulo. One
+// rank-1 vector broadcast across each row of `a`. Tensors are packed row-major,
+// so the flat index decomposes with one modulo. One
 // entry point per op; f32 only; grid-stride (see elementwise.wgsl).
 
 // The f16 entry points alias `array<f16>` onto the same bindings the f32 ones

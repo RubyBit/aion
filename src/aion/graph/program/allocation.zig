@@ -10,7 +10,6 @@
 const std = @import("std");
 const types = @import("../../backend/types.zig");
 const manager_mod = @import("../../storage/manager.zig");
-const plan = @import("../plan.zig");
 
 pub const TensorId = manager_mod.TensorId;
 
@@ -19,7 +18,6 @@ pub const Error = error{ InvalidArgument, OutOfMemory } || manager_mod.StorageEr
 pub const Context = struct {
     allocator: std.mem.Allocator,
     mgr: *manager_mod.StorageManager,
-    policy: plan.TilePolicy,
     /// The device this program targets, part of a derived weight's identity.
     device: manager_mod.DeviceRef,
     value_tensor: []TensorId,
@@ -29,8 +27,8 @@ pub const Context = struct {
     value_is_param: []const bool,
     owned_tensors: *std.ArrayList(TensorId),
 
-    pub fn allocTensor(self: *Context, dtype: types.DType, shape: []const usize, tile_shape: []const usize) Error!TensorId {
-        const tid = try self.mgr.createTiledTensorMetadata(dtype, shape, tile_shape, .{ .tile_alignment = self.policy.tile_alignment });
+    pub fn allocTensor(self: *Context, dtype: types.DType, shape: []const usize) Error!TensorId {
+        const tid = try self.mgr.createTensorMetadata(dtype, shape, .{});
         self.owned_tensors.append(self.allocator, tid) catch {
             self.mgr.releaseTensorData(tid) catch {};
             return error.OutOfMemory;
@@ -38,11 +36,11 @@ pub const Context = struct {
         return tid;
     }
 
-    pub fn ensureValueTensor(self: *Context, value_index: usize, dtype: types.DType, shape: []const usize, tile_shape: []const usize) Error!TensorId {
+    pub fn ensureValueTensor(self: *Context, value_index: usize, dtype: types.DType, shape: []const usize) Error!TensorId {
         if (value_index >= self.value_tensor.len or value_index >= self.value_has_tensor.len) return error.InvalidArgument;
         if (self.value_has_tensor[value_index]) return self.value_tensor[value_index];
 
-        const tid = try self.allocTensor(dtype, shape, tile_shape);
+        const tid = try self.allocTensor(dtype, shape);
         self.value_tensor[value_index] = tid;
         self.value_has_tensor[value_index] = true;
         return tid;

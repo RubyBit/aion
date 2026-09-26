@@ -24,7 +24,6 @@ const matmul_q_registry = @import("../registry/matmul_q_registry.zig");
 const matmul_nt_registry = @import("../registry/matmul_nt_registry.zig");
 const matvec_registry = @import("../registry/matvec_registry.zig");
 const attention_registry = @import("../registry/attention_registry.zig");
-const conv1d_registry = @import("../registry/conv1d_registry.zig");
 const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const fft_registry = @import("../registry/fft_registry.zig");
 const cpu_target = @import("../registry/cpu_target.zig");
@@ -74,7 +73,6 @@ pub const DispatchTable = struct {
 
     attention: attention_registry.Kernels,
     relpos_mha: attention_registry.Kernels,
-    conv1d: conv1d_registry.Kernels,
     conv2d: conv2d_registry.Kernels,
     fft: fft_registry.FftKernels,
 };

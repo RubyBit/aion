@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
 // Fused matvec for the PLAIN MatMul (K-major B), M == 1 — the Gemma decode hot
-// path. Computes one B tile's contribution:
+// path. Computes:
 //   C[n] = alpha * sum_k A[k] * B[k, n]  +  beta * C[n]
 // with B in q8_0 quantized ALONG K (the MatMul-B convention): blocks tile a
 // [K/32, N] grid, row-major, so consecutive blocks run along N. This is the
@@ -39,7 +39,7 @@
 @group(0) @binding(2) var<storage, read_write> cmat: array<f32>;
 @group(0) @binding(3) var<uniform>             p: Params;
 
-// k/n: this B tile's K rows / N cols. K % 32 == 0 and N % 2 == 0 (checked host-side).
+// k/n: B's K rows / N cols. K % 32 == 0 and N % 2 == 0 (checked host-side).
 struct Params { k: u32, n: u32, _p0: u32, _p1: u32, alpha: f32, beta: f32 };
 
 const COLS: u32 = 32u;   // column-pairs per workgroup (== warp width → coalesced)

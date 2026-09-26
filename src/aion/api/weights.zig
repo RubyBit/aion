@@ -12,7 +12,6 @@ pub const Tensor = types_mod.Tensor;
 pub const StorageManager = types_mod.StorageManager;
 pub const TensorId = types_mod.TensorId;
 pub const DType = types_mod.DType;
-pub const TilePolicy = types_mod.TilePolicy;
 pub const Package = types_mod.Package;
 pub const Params = params_mod.Params;
 
@@ -27,10 +26,8 @@ pub const Params = params_mod.Params;
 pub const Weights = struct {
     allocator: std.mem.Allocator,
     store: *StorageManager,
-    policy: TilePolicy,
     package: Package,
     params: Params,
-    package_hash: u64,
 
     const Self = @This();
 
@@ -65,18 +62,14 @@ pub const Weights = struct {
     pub fn initLoaded(
         allocator: std.mem.Allocator,
         store: *StorageManager,
-        policy: TilePolicy,
         package: Package,
         params: Params,
-        package_hash: u64,
     ) Self {
         return .{
             .allocator = allocator,
             .store = store,
-            .policy = policy,
             .package = package,
             .params = params,
-            .package_hash = package_hash,
         };
     }
 };

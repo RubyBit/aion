@@ -6,5 +6,5 @@ const conv2d = @import("conv2d.zig");
 pub const ConvExecCtx = conv_utils.ConvExecCtx;
 pub const ConvCache = conv_utils.ConvCache;
 
-pub const execConv1DTiled = conv1d.execConv1DTiled;
-pub const execConv2DTiled = conv2d.execConv2DTiled;
+pub const execConv1D = conv1d.execConv1D;
+pub const execConv2D = conv2d.execConv2D;

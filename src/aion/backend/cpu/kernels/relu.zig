@@ -23,9 +23,9 @@ pub fn reluF32(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
+        const av: Vec = simd.load(Vec, a.ptr + i);
         const rv: Vec = @max(av, zero);
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
+        simd.store(Vec, out.ptr + i, rv);
     }
 
     while (i < elem_count) : (i += 1) {
@@ -54,11 +54,11 @@ pub fn reluF16(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const ah: VecH = @as(*align(1) const VecH, @ptrCast(a.ptr + i)).*;
+        const ah: VecH = simd.load(VecH, a.ptr + i);
         const af: VecF = @floatCast(ah);
         const rf: VecF = @max(af, zero);
         const rh: VecH = @floatCast(rf);
-        @as(*align(1) VecH, @ptrCast(out.ptr + i)).* = rh;
+        simd.store(VecH, out.ptr + i, rh);
     }
 
     while (i < elem_count) : (i += 1) {

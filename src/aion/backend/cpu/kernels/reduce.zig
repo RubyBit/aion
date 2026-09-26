@@ -20,7 +20,7 @@ pub fn sumF32Range(bytes: []const u8, start: usize, end: usize) BackendError!f32
     const vec_end: usize = start + (count - (count % lanes));
 
     while (i < vec_end) : (i += lanes) {
-        const v: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
+        const v: Vec = simd.load(Vec, a.ptr + i);
         acc_v += v;
     }
 
@@ -49,7 +49,7 @@ pub fn sumF16RangeToF32(bytes: []const u8, start: usize, end: usize) BackendErro
     const vec_end: usize = start + (count - (count % lanes));
 
     while (i < vec_end) : (i += lanes) {
-        const vh: VecH = @as(*align(1) const VecH, @ptrCast(a.ptr + i)).*;
+        const vh: VecH = simd.load(VecH, a.ptr + i);
         const vf: VecF = @floatCast(vh);
         acc_v += vf;
     }

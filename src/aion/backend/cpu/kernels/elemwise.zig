@@ -39,8 +39,8 @@ pub fn contiguousSuffixBinaryF32(
         var c: usize = 0;
         const vec_end: usize = col_count - (col_count % lanes);
         while (c < vec_end) : (c += lanes) {
-            const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + base + c)).*;
-            const bv: Vec = @as(*align(1) const Vec, @ptrCast(b.ptr + c)).*;
+            const av: Vec = simd.load(Vec, a.ptr + base + c);
+            const bv: Vec = simd.load(Vec, b.ptr + c);
             const rv: Vec = switch (op) {
                 .add => av + bv,
                 .sub => av - bv,
@@ -48,7 +48,7 @@ pub fn contiguousSuffixBinaryF32(
                 .div => av / bv,
                 else => unreachable,
             };
-            @as(*align(1) Vec, @ptrCast(out.ptr + base + c)).* = rv;
+            simd.store(Vec, out.ptr + base + c, rv);
         }
         while (c < col_count) : (c += 1) {
             const av: f32 = a[base + c];
@@ -107,8 +107,8 @@ pub fn contiguousSuffixBinaryF16(
         var c: usize = 0;
         const vec_end: usize = col_count - (col_count % lanes);
         while (c < vec_end) : (c += lanes) {
-            const ah: VecH = @as(*align(1) const VecH, @ptrCast(a.ptr + base + c)).*;
-            const bh: VecH = @as(*align(1) const VecH, @ptrCast(b.ptr + c)).*;
+            const ah: VecH = simd.load(VecH, a.ptr + base + c);
+            const bh: VecH = simd.load(VecH, b.ptr + c);
             const af: VecF = @floatCast(ah);
             const bf: VecF = @floatCast(bh);
             const rf: VecF = switch (op) {
@@ -119,7 +119,7 @@ pub fn contiguousSuffixBinaryF16(
                 else => unreachable,
             };
             const rh: VecH = @floatCast(rf);
-            @as(*align(1) VecH, @ptrCast(out.ptr + base + c)).* = rh;
+            simd.store(VecH, out.ptr + base + c, rh);
         }
         while (c < col_count) : (c += 1) {
             const av: f32 = @as(f32, a[base + c]);
@@ -192,8 +192,8 @@ fn contiguousSuffixBinaryI32Comptime(
         if (op != .div) {
             const vec_end = col_count - (col_count % lanes);
             while (col < vec_end) : (col += lanes) {
-                const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + base + col)).*;
-                const bv: Vec = @as(*align(1) const Vec, @ptrCast(b.ptr + col)).*;
+                const av: Vec = simd.load(Vec, a.ptr + base + col);
+                const bv: Vec = simd.load(Vec, b.ptr + col);
                 const rv: Vec = switch (op) {
                     .add => av + bv,
                     .sub => av - bv,
@@ -207,7 +207,7 @@ fn contiguousSuffixBinaryI32Comptime(
                     .div => unreachable,
                     .gate => unreachable, // f32 only; excluded by the caller
                 };
-                @as(*align(1) Vec, @ptrCast(out.ptr + base + col)).* = rv;
+                simd.store(Vec, out.ptr + base + col, rv);
             }
         }
         while (col < col_count) : (col += 1) {
@@ -370,8 +370,8 @@ pub fn elemwiseBinaryF32(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
-        const bv: Vec = @as(*align(1) const Vec, @ptrCast(b.ptr + i)).*;
+        const av: Vec = simd.load(Vec, a.ptr + i);
+        const bv: Vec = simd.load(Vec, b.ptr + i);
 
         const rv: Vec = switch (op) {
             .add => av + bv,
@@ -381,7 +381,7 @@ pub fn elemwiseBinaryF32(
             else => unreachable, // comparisons produce i32 and route to elemwiseBinaryI32
         };
 
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
+        simd.store(Vec, out.ptr + i, rv);
     }
 
     switch (op) {
@@ -437,8 +437,8 @@ fn elemwiseBinaryI32Comptime(
     if (op != .div) {
         const vec_end = elem_count - (elem_count % lanes);
         while (i < vec_end) : (i += lanes) {
-            const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
-            const bv: Vec = @as(*align(1) const Vec, @ptrCast(b.ptr + i)).*;
+            const av: Vec = simd.load(Vec, a.ptr + i);
+            const bv: Vec = simd.load(Vec, b.ptr + i);
             const rv: Vec = switch (op) {
                 .add => av + bv,
                 .sub => av - bv,
@@ -452,7 +452,7 @@ fn elemwiseBinaryI32Comptime(
                 .div => unreachable,
                 .gate => unreachable, // f32 only; excluded by the caller
             };
-            @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
+            simd.store(Vec, out.ptr + i, rv);
         }
     }
     while (i < elem_count) : (i += 1) out[i] = scalarBinaryI32(op, a[i], b[i]);
@@ -482,8 +482,8 @@ pub fn elemwiseBinaryF16(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const ah: VecH = @as(*align(1) const VecH, @ptrCast(a.ptr + i)).*;
-        const bh: VecH = @as(*align(1) const VecH, @ptrCast(b.ptr + i)).*;
+        const ah: VecH = simd.load(VecH, a.ptr + i);
+        const bh: VecH = simd.load(VecH, b.ptr + i);
         const af: VecF = @floatCast(ah);
         const bf: VecF = @floatCast(bh);
 
@@ -495,7 +495,7 @@ pub fn elemwiseBinaryF16(
             else => unreachable,
         };
         const rh: VecH = @floatCast(rf);
-        @as(*align(1) VecH, @ptrCast(out.ptr + i)).* = rh;
+        simd.store(VecH, out.ptr + i, rh);
     }
 
     switch (op) {

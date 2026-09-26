@@ -24,7 +24,7 @@ pub fn accumulateStats(sum: []f32, sumsq: []f32, xv: types.BufferViewConst) void
             const xs: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, xv.bytes);
             const off: usize = r * cols;
             while (c < vec_end) : (c += lanes) {
-                const v: VecF = @as(*align(1) const VecF, @ptrCast(xs.ptr + off + c)).*;
+                const v: VecF = simd.load(VecF, xs.ptr + off + c);
                 acc_sum_v += v;
                 acc_sq_v += v * v;
             }
@@ -42,7 +42,7 @@ pub fn accumulateStats(sum: []f32, sumsq: []f32, xv: types.BufferViewConst) void
             const VecH = @Vector(lanes, f16);
             const off: usize = r * cols;
             while (c < vec_end) : (c += lanes) {
-                const vh: VecH = @as(*align(1) const VecH, @ptrCast(xs.ptr + off + c)).*;
+                const vh: VecH = simd.load(VecH, xs.ptr + off + c);
                 const v: VecF = @floatCast(vh);
                 acc_sum_v += v;
                 acc_sq_v += v * v;
@@ -93,11 +93,11 @@ pub fn applyNorm(
             var c: usize = 0;
             const vec_end: usize = cols - (cols % lanes);
             while (c < vec_end) : (c += lanes) {
-                const xv0: VecF = @as(*align(1) const VecF, @ptrCast(x_s.ptr + off + c)).*;
-                const gv0: VecF = @as(*align(1) const VecF, @ptrCast(g_s.ptr + c)).*;
-                const bv0: VecF = @as(*align(1) const VecF, @ptrCast(b_s.ptr + c)).*;
+                const xv0: VecF = simd.load(VecF, x_s.ptr + off + c);
+                const gv0: VecF = simd.load(VecF, g_s.ptr + c);
+                const bv0: VecF = simd.load(VecF, b_s.ptr + c);
                 const norm: VecF = if (mode == .layernorm) (xv0 - mu_v) * inv_v else xv0 * inv_v;
-                @as(*align(1) VecF, @ptrCast(out_s.ptr + off + c)).* = (norm * gv0) + bv0;
+                simd.store(VecF, out_s.ptr + off + c, (norm * gv0) + bv0);
             }
             while (c < cols) : (c += 1) {
                 const x0: f32 = x_s[off + c];
@@ -124,9 +124,9 @@ pub fn applyNorm(
             var c: usize = 0;
             const vec_end: usize = cols - (cols % lanes);
             while (c < vec_end) : (c += lanes) {
-                const xh: VecH = @as(*align(1) const VecH, @ptrCast(x_s.ptr + off + c)).*;
-                const gh: VecH = @as(*align(1) const VecH, @ptrCast(g_s.ptr + c)).*;
-                const bh: VecH = @as(*align(1) const VecH, @ptrCast(b_s.ptr + c)).*;
+                const xh: VecH = simd.load(VecH, x_s.ptr + off + c);
+                const gh: VecH = simd.load(VecH, g_s.ptr + c);
+                const bh: VecH = simd.load(VecH, b_s.ptr + c);
 
                 const xv0: VecF = @floatCast(xh);
                 const gv0: VecF = @floatCast(gh);
@@ -134,7 +134,7 @@ pub fn applyNorm(
 
                 const norm: VecF = if (mode == .layernorm) (xv0 - mu_v) * inv_v else xv0 * inv_v;
                 const y: VecF = (norm * gv0) + bv0;
-                @as(*align(1) VecH, @ptrCast(out_s.ptr + off + c)).* = @floatCast(y);
+                simd.store(VecH, out_s.ptr + off + c, @floatCast(y));
             }
             while (c < cols) : (c += 1) {
                 const x0: f32 = @floatCast(x_s[off + c]);

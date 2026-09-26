@@ -32,7 +32,7 @@ const ABlock = struct { q: VQ, scale: f32, correction: VI };
 
 inline fn loadA(comptime enc: DotEnc, p: [*]const u8) ABlock {
     return .{
-        .q = @as(*align(1) const VQ, @ptrCast(p)).*,
+        .q = simd.load(VQ, p),
         .scale = @as(*align(1) const f32, @ptrCast(p + Q8_0_BLOCK_ELEMS)).*,
         .correction = matmul_q_i8.prepBiasNarrow(enc, p),
     };
@@ -42,7 +42,7 @@ inline fn loadA(comptime enc: DotEnc, p: [*]const u8) ABlock {
 inline fn blockDot(comptime enc: DotEnc, a: ABlock, bp: [*]const u8) VF {
     const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
     const b_scale: f32 = @as(f16, @bitCast(bits));
-    const bq: VQ = @as(*align(1) const VQ, @ptrCast(bp + 2)).*;
+    const bq: VQ = simd.load(VQ, bp + 2);
     const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), bq, a.q) - a.correction;
     return @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a.scale * b_scale));
 }
@@ -178,7 +178,7 @@ inline fn sweepLanes(
     var kb: usize = 0;
     while (kb < blocks) : (kb += 1) {
         const seg = group + kb * segment_bytes;
-        const b_scale: VF_W = @floatCast(@as(*align(1) const @Vector(W, f16), @ptrCast(seg)).*);
+        const b_scale: VF_W = @floatCast(simd.load(@Vector(W, f16), seg));
         const quants = seg + 2 * W;
         const CH = comptime chainsFor(rows);
         var sums: [rows][CH]VI_W = @splat(@splat(@splat(0)));
@@ -186,10 +186,10 @@ inline fn sweepLanes(
         var a: [rows][2]@Vector(16, i8) = undefined;
         inline for (0..rows) |r| {
             const slot = a_rows + r * a_stride + kb * PREP_BLOCK_BYTES;
-            inline for (0..2) |h| a[r][h] = @as(*align(1) const @Vector(16, i8), @ptrCast(slot + h * 16)).*;
+            inline for (0..2) |h| a[r][h] = simd.load(@Vector(16, i8), slot + h * 16);
         }
         inline for (0..Q8_0_BLOCK_ELEMS / 4) |j| {
-            const b: VB = @as(*align(1) const VB, @ptrCast(quants + j * chunk_bytes)).*;
+            const b: VB = simd.load(VB, quants + j * chunk_bytes);
             bias += laneBias(enc, W, b);
             inline for (0..rows) |r| sums[r][j % CH] = laneDot(enc, W, sums[r][j % CH], b, a[r][j / 4], j % 4);
         }

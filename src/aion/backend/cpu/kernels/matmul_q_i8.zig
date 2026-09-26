@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const types = @import("../../types.zig");
+const simd = @import("simd.zig");
 
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
@@ -413,7 +414,7 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
                         inline for (0..MR) |rr| acc[rr] = @splat(0);
 
                         inline for (0..8) |g| {
-                            const b_grp: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(q_ptr + g * (NR * 4))).*;
+                            const b_grp: @Vector(32, i8) = simd.load(@Vector(32, i8), q_ptr + g * (NR * 4));
                             inline for (0..MR) |rr| {
                                 if (rr < mr) {
                                     const a_dword: u32 = @as(*align(1) const u32, @ptrCast(aq_i8 + rr * KC + kb * Q8_0_BLOCK_ELEMS + g * 4)).*;
@@ -423,8 +424,8 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
                             }
                         }
 
-                        const sumb: @Vector(8, i32) = @as(*align(1) const @Vector(8, i32), @ptrCast(sumb_ptr)).*;
-                        const bscale: @Vector(8, f32) = @as(*align(1) const @Vector(8, f32), @ptrCast(scales_ptr)).*;
+                        const sumb: @Vector(8, i32) = simd.load(@Vector(8, i32), sumb_ptr);
+                        const bscale: @Vector(8, f32) = simd.load(@Vector(8, f32), scales_ptr);
                         const c128: @Vector(8, i32) = @splat(128);
                         inline for (0..MR) |rr| {
                             if (rr < mr) {
@@ -444,10 +445,10 @@ pub fn Kernel(comptime opts: struct { kc: usize, nc: usize, enc: DotEnc }) type 
                             const c_off = (i_base + rr) * ldc + p * NR;
                             if (rem == NR) {
                                 if (beta == 0.0) {
-                                    @as(*align(1) @Vector(8, f32), @ptrCast(c.ptr + c_off)).* = out_v;
+                                    simd.store(@Vector(8, f32), c.ptr + c_off, out_v);
                                 } else {
-                                    const c_old: @Vector(8, f32) = @as(*align(1) const @Vector(8, f32), @ptrCast(c.ptr + c_off)).*;
-                                    @as(*align(1) @Vector(8, f32), @ptrCast(c.ptr + c_off)).* = out_v + @as(@Vector(8, f32), @splat(beta)) * c_old;
+                                    const c_old: @Vector(8, f32) = simd.load(@Vector(8, f32), c.ptr + c_off);
+                                    simd.store(@Vector(8, f32), c.ptr + c_off, out_v + @as(@Vector(8, f32), @splat(beta)) * c_old);
                                 }
                             } else {
                                 const arr: [8]f32 = out_v;
@@ -720,7 +721,7 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
                         inline for (0..KSUBS) |sg| {
                             var bvec: [MM_NR / 2]@Vector(16, i8) = undefined;
                             inline for (0..MM_NR / 2) |cp| {
-                                bvec[cp] = @as(*align(1) const @Vector(16, i8), @ptrCast(q_ptr + (cp * KSUBS + sg) * 16)).*;
+                                bvec[cp] = simd.load(@Vector(16, i8), q_ptr + (cp * KSUBS + sg) * 16);
                             }
                             inline for (0..MM_MR / 2) |rp| {
                                 const r0 = rp * 2;

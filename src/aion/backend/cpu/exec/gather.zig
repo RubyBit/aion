@@ -6,6 +6,7 @@ const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
 const exec_utils = @import("utils.zig");
+const simd = @import("../kernels/simd.zig");
 
 const BackendError = types.BackendError;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
@@ -37,16 +38,16 @@ fn copyRowVectorized(dst: []u8, src: []const u8) void {
     var i: usize = 0;
 
     while (i + 64 <= n) : (i += 64) {
-        const v: Vec64 = @as(*align(1) const Vec64, @ptrCast(src.ptr + i)).*;
-        @as(*align(1) Vec64, @ptrCast(dst.ptr + i)).* = v;
+        const v: Vec64 = simd.load(Vec64, src.ptr + i);
+        simd.store(Vec64, dst.ptr + i, v);
     }
     while (i + 32 <= n) : (i += 32) {
-        const v: Vec32 = @as(*align(1) const Vec32, @ptrCast(src.ptr + i)).*;
-        @as(*align(1) Vec32, @ptrCast(dst.ptr + i)).* = v;
+        const v: Vec32 = simd.load(Vec32, src.ptr + i);
+        simd.store(Vec32, dst.ptr + i, v);
     }
     while (i + 16 <= n) : (i += 16) {
-        const v: Vec16 = @as(*align(1) const Vec16, @ptrCast(src.ptr + i)).*;
-        @as(*align(1) Vec16, @ptrCast(dst.ptr + i)).* = v;
+        const v: Vec16 = simd.load(Vec16, src.ptr + i);
+        simd.store(Vec16, dst.ptr + i, v);
     }
     while (i < n) : (i += 1) {
         dst[i] = src[i];

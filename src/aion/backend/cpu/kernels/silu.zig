@@ -20,9 +20,9 @@ pub fn siluF32(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const xv: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
+        const xv: Vec = simd.load(Vec, a.ptr + i);
         const sv: Vec = fast.sigmoidApproxVecF32(lanes, xv);
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = xv * sv;
+        simd.store(Vec, out.ptr + i, xv * sv);
     }
     while (i < elem_count) : (i += 1) {
         const x: f32 = a[i];

@@ -111,10 +111,10 @@ pub fn Kernel(comptime t: Tuning) type {
                     var c: usize = 0;
                     while (c + lanes <= nr) : (c += lanes) {
                         const src_ptr: [*]align(1) const f16 = @ptrCast(b.ptr + src_row + c);
-                        const hv: VF16 = @as(*align(1) const VF16, @ptrCast(src_ptr)).*;
+                        const hv: VF16 = simd.load(VF16, src_ptr);
                         const fv: VF32 = @floatCast(hv);
                         const dst_ptr: [*]align(1) f32 = @ptrCast(packed_b.ptr + dst_row + c);
-                        @as(*align(1) VF32, @ptrCast(dst_ptr)).* = fv;
+                        simd.store(VF32, dst_ptr, fv);
                     }
                     while (c < nr) : (c += 1) {
                         packed_b[dst_row + c] = @as(f32, @floatCast(b[src_row + c]));
@@ -153,10 +153,10 @@ pub fn Kernel(comptime t: Tuning) type {
                     var kk: usize = 0;
                     while (kk + lanes <= k) : (kk += lanes) {
                         const src_ptr: [*]align(1) const f16 = @ptrCast(a.ptr + src_row + kk);
-                        const hv: VF16 = @as(*align(1) const VF16, @ptrCast(src_ptr)).*;
+                        const hv: VF16 = simd.load(VF16, src_ptr);
                         const fv: VF32 = @floatCast(hv);
                         const dst_ptr: [*]align(1) f32 = @ptrCast(packed_a_out.ptr + dst_row + kk);
-                        @as(*align(1) VF32, @ptrCast(dst_ptr)).* = fv;
+                        simd.store(VF32, dst_ptr, fv);
                     }
                     while (kk < k) : (kk += 1) {
                         packed_a_out[dst_row + kk] = @as(f32, @floatCast(a[src_row + kk]));
@@ -328,8 +328,8 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b_off: usize = (kk + uk) * NR;
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                    const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                    const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -344,8 +344,8 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b_off: usize = kk * NR;
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -370,22 +370,22 @@ pub fn Kernel(comptime t: Tuning) type {
                     const c_ptr_loc = c_row_ptr;
                     const scaled: Vec = if (alpha_is_1) acc[r][0] else (alpha_v * acc[r][0]);
                     if (beta_is_0) {
-                        @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = scaled;
+                        simd.store(Vec, c_ptr_loc, scaled);
                     } else {
-                        const c_old: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr_loc)).*;
+                        const c_old: Vec = simd.load(Vec, c_ptr_loc);
                         const res: Vec = if (beta_is_1) (scaled + c_old) else @mulAdd(Vec, beta_v, c_old, scaled);
-                        @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = res;
+                        simd.store(Vec, c_ptr_loc, res);
                     }
                 }
                 {
                     const c_ptr_loc = c_row_ptr + lanes;
                     const scaled: Vec = if (alpha_is_1) acc[r][1] else (alpha_v * acc[r][1]);
                     if (beta_is_0) {
-                        @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = scaled;
+                        simd.store(Vec, c_ptr_loc, scaled);
                     } else {
-                        const c_old: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr_loc)).*;
+                        const c_old: Vec = simd.load(Vec, c_ptr_loc);
                         const res: Vec = if (beta_is_1) (scaled + c_old) else @mulAdd(Vec, beta_v, c_old, scaled);
-                        @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = res;
+                        simd.store(Vec, c_ptr_loc, res);
                     }
                 }
             }
@@ -429,8 +429,8 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b_off: usize = kk * NR;
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                 inline for (0..MR) |r| {
                     if (r < mr) {
@@ -457,11 +457,11 @@ pub fn Kernel(comptime t: Tuning) type {
                         if (nr >= lanes) {
                             const scaled: Vec = if (alpha_is_1) acc[r][0] else (alpha_v * acc[r][0]);
                             if (beta_is_0) {
-                                @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = scaled;
+                                simd.store(Vec, c_ptr_loc, scaled);
                             } else {
-                                const c_old: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr_loc)).*;
+                                const c_old: Vec = simd.load(Vec, c_ptr_loc);
                                 const res: Vec = if (beta_is_1) (scaled + c_old) else @mulAdd(Vec, beta_v, c_old, scaled);
-                                @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = res;
+                                simd.store(Vec, c_ptr_loc, res);
                             }
                         } else {
                             const res_arr: [lanes]f32 = acc[r][0];
@@ -482,11 +482,11 @@ pub fn Kernel(comptime t: Tuning) type {
                         if (rem >= lanes) {
                             const scaled: Vec = if (alpha_is_1) acc[r][1] else (alpha_v * acc[r][1]);
                             if (beta_is_0) {
-                                @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = scaled;
+                                simd.store(Vec, c_ptr_loc, scaled);
                             } else {
-                                const c_old: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr_loc)).*;
+                                const c_old: Vec = simd.load(Vec, c_ptr_loc);
                                 const res: Vec = if (beta_is_1) (scaled + c_old) else @mulAdd(Vec, beta_v, c_old, scaled);
-                                @as(*align(1) Vec, @ptrCast(c_ptr_loc)).* = res;
+                                simd.store(Vec, c_ptr_loc, res);
                             }
                         } else {
                             const res_arr: [lanes]f32 = acc[r][1];
@@ -542,8 +542,8 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b_off: usize = (kk + uk) * NR;
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                    const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                    const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -557,8 +557,8 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b_off: usize = kk * NR;
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -572,15 +572,15 @@ pub fn Kernel(comptime t: Tuning) type {
                 inline for (0..MR) |r| {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
-                    @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr))).* = acc[r][0];
-                    @as(*align(half_align) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1];
+                    simd.storeAligned(Vec, c_row_ptr, 32, acc[r][0]);
+                    simd.storeAligned(Vec, c_row_ptr + lanes, half_align, acc[r][1]);
                 }
             } else {
                 inline for (0..MR) |r| {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
-                    @as(*align(1) Vec, @ptrCast(c_row_ptr)).* = acc[r][0];
-                    @as(*align(1) Vec, @ptrCast(c_row_ptr + lanes)).* = acc[r][1];
+                    simd.store(Vec, c_row_ptr, acc[r][0]);
+                    simd.store(Vec, c_row_ptr + lanes, acc[r][1]);
                 }
             }
         }
@@ -624,8 +624,8 @@ pub fn Kernel(comptime t: Tuning) type {
                     const b_off: usize = (kk + uk) * NR;
                     const b0_bytes: usize = b_off * @sizeOf(f32);
                     const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                    const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                    const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                    const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                    const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                     inline for (0..MR) |r| {
                         const a_val: f32 = a_ptr_base[r * KC + (kk + uk)];
@@ -639,8 +639,8 @@ pub fn Kernel(comptime t: Tuning) type {
                 const b_off: usize = kk * NR;
                 const b0_bytes: usize = b_off * @sizeOf(f32);
                 const b1_bytes: usize = (b_off + lanes) * @sizeOf(f32);
-                const b_vec0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(b_ptr_base + b0_bytes))).*;
-                const b_vec1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(b_ptr_base + b1_bytes))).*;
+                const b_vec0: Vec = simd.loadAligned(Vec, b_ptr_base + b0_bytes, 32);
+                const b_vec1: Vec = simd.loadAligned(Vec, b_ptr_base + b1_bytes, half_align);
 
                 inline for (0..MR) |r| {
                     const a_val: f32 = a_ptr_base[r * KC + kk];
@@ -654,19 +654,19 @@ pub fn Kernel(comptime t: Tuning) type {
                 inline for (0..MR) |r| {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
-                    const c_old0: Vec = @as(*align(32) const Vec, @ptrCast(@alignCast(c_row_ptr))).*;
-                    const c_old1: Vec = @as(*align(half_align) const Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).*;
-                    @as(*align(32) Vec, @ptrCast(@alignCast(c_row_ptr))).* = acc[r][0] + c_old0;
-                    @as(*align(half_align) Vec, @ptrCast(@alignCast(c_row_ptr + lanes))).* = acc[r][1] + c_old1;
+                    const c_old0: Vec = simd.loadAligned(Vec, c_row_ptr, 32);
+                    const c_old1: Vec = simd.loadAligned(Vec, c_row_ptr + lanes, half_align);
+                    simd.storeAligned(Vec, c_row_ptr, 32, acc[r][0] + c_old0);
+                    simd.storeAligned(Vec, c_row_ptr + lanes, half_align, acc[r][1] + c_old1);
                 }
             } else {
                 inline for (0..MR) |r| {
                     const row_off = (idx_m + r) * c_stride + idx_n;
                     const c_row_ptr = c.ptr + row_off;
-                    const c_old0: Vec = @as(*align(1) const Vec, @ptrCast(c_row_ptr)).*;
-                    const c_old1: Vec = @as(*align(1) const Vec, @ptrCast(c_row_ptr + lanes)).*;
-                    @as(*align(1) Vec, @ptrCast(c_row_ptr)).* = acc[r][0] + c_old0;
-                    @as(*align(1) Vec, @ptrCast(c_row_ptr + lanes)).* = acc[r][1] + c_old1;
+                    const c_old0: Vec = simd.load(Vec, c_row_ptr);
+                    const c_old1: Vec = simd.load(Vec, c_row_ptr + lanes);
+                    simd.store(Vec, c_row_ptr, acc[r][0] + c_old0);
+                    simd.store(Vec, c_row_ptr + lanes, acc[r][1] + c_old1);
                 }
             }
         }

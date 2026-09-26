@@ -4,6 +4,7 @@ const ts = @import("../../../runtime/tensor_store.zig");
 const exe = @import("../../../runtime/executable.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const Error = @import("../../backend.zig").ExecuteProgramError;
+const simd = @import("../kernels/simd.zig");
 
 pub fn exec(
     allocator: std.mem.Allocator,
@@ -32,7 +33,7 @@ inline fn maxInto(comptime T: type, dst: []align(1) T, src: []align(1) const T) 
     var i: usize = 0;
     while (i + lanes <= dst.len) : (i += lanes) {
         const d: *align(1) V = @ptrCast(dst.ptr + i);
-        const b: V = @as(*align(1) const V, @ptrCast(src.ptr + i)).*;
+        const b: V = simd.load(V, src.ptr + i);
         const a: V = d.*;
         d.* = @select(T, (b != b) | (b > a), b, a);
     }

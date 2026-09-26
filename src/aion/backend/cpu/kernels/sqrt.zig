@@ -22,9 +22,9 @@ pub fn sqrtF32(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const av: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
+        const av: Vec = simd.load(Vec, a.ptr + i);
         const rv: Vec = @sqrt(av);
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = rv;
+        simd.store(Vec, out.ptr + i, rv);
     }
 
     while (i < elem_count) : (i += 1) {

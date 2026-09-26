@@ -28,7 +28,7 @@ pub fn geluF32(
     var i: usize = 0;
     const vec_end: usize = elem_count - (elem_count % lanes);
     while (i < vec_end) : (i += lanes) {
-        const xv: Vec = @as(*align(1) const Vec, @ptrCast(a.ptr + i)).*;
+        const xv: Vec = simd.load(Vec, a.ptr + i);
         // t = k*(x + c*x^3)
         const c: Vec = @splat(@as(f32, 0.044715));
         const k: Vec = @splat(@as(f32, 0.7978845608028654));
@@ -36,7 +36,7 @@ pub fn geluF32(
         const tv: Vec = fast.tanhApproxVecF32(lanes, t);
         const half: Vec = @splat(@as(f32, 0.5));
         const one: Vec = @splat(@as(f32, 1.0));
-        @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = half * xv * (one + tv);
+        simd.store(Vec, out.ptr + i, half * xv * (one + tv));
     }
     while (i < elem_count) : (i += 1) {
         out[i] = geluApproxF32Scalar(a[i]);

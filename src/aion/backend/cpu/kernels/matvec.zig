@@ -64,7 +64,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                 var j: usize = 0;
                 while (j + LANES <= nc) : (j += LANES) {
-                    const b_v: VecF = @as(*align(1) const VecF, @ptrCast(b_ptr + j)).*;
+                    const b_v: VecF = simd.load(VecF, b_ptr + j);
                     acc[j..][0..LANES].* = @mulAdd(VecF, a_v, b_v, acc[j..][0..LANES].*);
                 }
                 while (j < nc) : (j += 1) acc[j] = @mulAdd(f32, a_all[kk], b_ptr[j], acc[j]);
@@ -118,9 +118,9 @@ pub fn Kernel(comptime t: Tuning) type {
                 var j: usize = 0;
                 while (j + LANES <= nc) : (j += LANES) {
                     const a_acc: VecF = acc[j..][0..LANES].*;
-                    const old: VecF = @as(*align(1) const VecF, @ptrCast(c_ptr + j)).*;
+                    const old: VecF = simd.load(VecF, c_ptr + j);
                     const res: VecF = if (beta == 0.0) (alpha_v * a_acc) else @mulAdd(VecF, alpha_v, a_acc, beta_v * old);
-                    @as(*align(1) VecF, @ptrCast(c_ptr + j)).* = res;
+                    simd.store(VecF, c_ptr + j, res);
                 }
                 while (j < nc) : (j += 1) {
                     const old: f32 = c_ptr[j];
@@ -181,7 +181,7 @@ pub fn Kernel(comptime t: Tuning) type {
 
                     var j: usize = 0;
                     while (j + LANES <= nc) : (j += LANES) {
-                        const b_h: VecH = @as(*align(1) const VecH, @ptrCast(b_ptr + j)).*;
+                        const b_h: VecH = simd.load(VecH, b_ptr + j);
                         const b_v: VecF = @floatCast(b_h);
                         const cur: VecF = acc[j..][0..LANES].*;
                         acc[j..][0..LANES].* = @mulAdd(VecF, a_v, b_v, cur);
@@ -194,10 +194,10 @@ pub fn Kernel(comptime t: Tuning) type {
                 var j: usize = 0;
                 while (j + LANES <= nc) : (j += LANES) {
                     const a_acc: VecF = acc[j..][0..LANES].*;
-                    const old_h: VecH = @as(*align(1) const VecH, @ptrCast(c_ptr + j)).*;
+                    const old_h: VecH = simd.load(VecH, c_ptr + j);
                     const old: VecF = @floatCast(old_h);
                     const res: VecF = if (beta == 0.0) (alpha_v * a_acc) else @mulAdd(VecF, alpha_v, a_acc, beta_v * old);
-                    @as(*align(1) VecH, @ptrCast(c_ptr + j)).* = @floatCast(res);
+                    simd.store(VecH, c_ptr + j, @floatCast(res));
                 }
                 while (j < nc) : (j += 1) {
                     const old: f32 = @floatCast(c_ptr[j]);

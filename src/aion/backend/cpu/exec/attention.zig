@@ -215,14 +215,14 @@ inline fn dotRowsTyped(
     while (i + step <= n) : (i += step) {
         inline for (0..DOT_CHAINS) |c| {
             const off = i + c * simd_lanes;
-            const av: Vec = @floatCast(@as(*align(1) const VA, @ptrCast(a + off)).*);
-            const bv: Vec = @floatCast(@as(*align(1) const VB, @ptrCast(b + off)).*);
+            const av: Vec = @floatCast(simd.load(VA, a + off));
+            const bv: Vec = @floatCast(simd.load(VB, b + off));
             acc[c] = @mulAdd(Vec, av, bv, acc[c]);
         }
     }
     while (i + simd_lanes <= n) : (i += simd_lanes) {
-        const av: Vec = @floatCast(@as(*align(1) const VA, @ptrCast(a + i)).*);
-        const bv: Vec = @floatCast(@as(*align(1) const VB, @ptrCast(b + i)).*);
+        const av: Vec = @floatCast(simd.load(VA, a + i));
+        const bv: Vec = @floatCast(simd.load(VB, b + i));
         acc[0] = @mulAdd(Vec, av, bv, acc[0]);
     }
 
@@ -324,7 +324,7 @@ inline fn fusedRescaleAccumulateRowF16(
     const vec_end: usize = d_v - (d_v % simd_lanes);
     while (i < vec_end) : (i += simd_lanes) {
         const vo: VF = vecLoad(out_row[i..].ptr);
-        const vh: VH = @as(*align(1) const VH, @ptrCast(v_row[i..].ptr)).*;
+        const vh: VH = simd.load(VH, v_row[i..].ptr);
         const vv: VF = @floatCast(vh);
         vecStore(out_row[i..].ptr, vo * v_rescale + vv * v_pnew);
     }
@@ -347,7 +347,7 @@ inline fn accumulateRowScaledF16(
     const vec_end: usize = d_v - (d_v % simd_lanes);
     while (i < vec_end) : (i += simd_lanes) {
         const vo: VF = vecLoad(out_row[i..].ptr);
-        const vh: VH = @as(*align(1) const VH, @ptrCast(v_row[i..].ptr)).*;
+        const vh: VH = simd.load(VH, v_row[i..].ptr);
         const vv: VF = @floatCast(vh);
         vecStore(out_row[i..].ptr, @mulAdd(VF, vv, v_alpha, vo));
     }

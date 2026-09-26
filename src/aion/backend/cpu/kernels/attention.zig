@@ -469,7 +469,7 @@ fn RangedOps(comptime lanes: usize) type {
                 if (c1 - c0 >= lanes) {
                     var vmx: VecT = @splat(mx);
                     while (c + lanes <= c1) : (c += lanes) {
-                        vmx = @max(vmx, @as(*align(1) const VecT, @ptrCast(base + c)).*);
+                        vmx = @max(vmx, simd.load(VecT, base + c));
                     }
                     mx = @reduce(.Max, vmx);
                 }
@@ -510,9 +510,9 @@ fn RangedOps(comptime lanes: usize) type {
                 var c: usize = c0;
                 while (c + lanes <= c1) : (c += lanes) {
                     const ptr: [*]f32 = base + c;
-                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+                    const v_s: VecT = simd.load(VecT, ptr);
                     const v_p: VecT = fast_math.expApproxVecF32(lanes, fast_math.clampVecF32(lanes, v_s - v_m, -80.0, 0.0));
-                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
+                    simd.store(VecT, ptr, v_p);
                     v_sum += v_p;
                 }
                 ssum += @reduce(.Add, v_sum);
@@ -551,8 +551,8 @@ fn RangedOps(comptime lanes: usize) type {
                 var c: usize = c0;
                 while (c + lanes <= c1) : (c += lanes) {
                     const ptr: [*]f32 = base + c;
-                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
-                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_cap * fast_math.tanhApproxVecF32(lanes, v_s * v_inv);
+                    const v_s: VecT = simd.load(VecT, ptr);
+                    simd.store(VecT, ptr, v_cap * fast_math.tanhApproxVecF32(lanes, v_s * v_inv));
                 }
                 while (c < c1) : (c += 1) base[c] = cap * fast_math.tanhApproxF32(base[c] * inv_cap);
             }
@@ -572,7 +572,7 @@ fn RangedOps(comptime lanes: usize) type {
                 var j: usize = 0;
                 while (j + lanes <= dv) : (j += lanes) {
                     const ptr: [*]f32 = base + j;
-                    @as(*align(1) VecT, @ptrCast(ptr)).* = @as(*align(1) const VecT, @ptrCast(ptr)).* * vf;
+                    simd.store(VecT, ptr, simd.load(VecT, ptr) * vf);
                 }
                 while (j < dv) : (j += 1) base[j] *= f;
             }
@@ -588,7 +588,7 @@ fn RangedOps(comptime lanes: usize) type {
                 if (tn >= lanes) {
                     var vmx: VecT = @splat(-std.math.inf(f32));
                     while (c + lanes <= tn) : (c += lanes) {
-                        const v: VecT = @as(*align(1) const VecT, @ptrCast(scores.ptr + r * tn + c)).*;
+                        const v: VecT = simd.load(VecT, scores.ptr + r * tn + c);
                         vmx = @max(vmx, v);
                     }
                     mx = @reduce(.Max, vmx);
@@ -619,10 +619,10 @@ fn RangedOps(comptime lanes: usize) type {
                 var v_ssum: VecT = @splat(0.0);
                 while (c + lanes <= tn) : (c += lanes) {
                     const ptr: [*]f32 = scores.ptr + r * tn + c;
-                    const v_s: VecT = @as(*align(1) const VecT, @ptrCast(ptr)).*;
+                    const v_s: VecT = simd.load(VecT, ptr);
                     const v_diff: VecT = fast_math.clampVecF32(lanes, v_s - v_mn, -80.0, 0.0);
                     const v_p: VecT = fast_math.expApproxVecF32(lanes, v_diff);
-                    @as(*align(1) VecT, @ptrCast(ptr)).* = v_p;
+                    simd.store(VecT, ptr, v_p);
                     v_ssum += v_p;
                 }
                 ssum += @reduce(.Add, v_ssum);

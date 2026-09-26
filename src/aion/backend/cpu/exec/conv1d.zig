@@ -115,10 +115,10 @@ fn tryExecConv1DSmallDirect(
                         var acc2: Vec = @splat(@as(f32, 0.0));
                         var acc3: Vec = @splat(@as(f32, 0.0));
                         if (bias_flat2) |bp| {
-                            const b0: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0)).*;
-                            const b1: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + lanes2)).*;
-                            const b2v: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + 2 * lanes2)).*;
-                            const b3: Vec = @as(*align(1) const Vec, @ptrCast(bp + co0 + 3 * lanes2)).*;
+                            const b0: Vec = simd.load(Vec, bp + co0);
+                            const b1: Vec = simd.load(Vec, bp + co0 + lanes2);
+                            const b2v: Vec = simd.load(Vec, bp + co0 + 2 * lanes2);
+                            const b3: Vec = simd.load(Vec, bp + co0 + 3 * lanes2);
                             acc0 = b0;
                             acc1 = b1;
                             acc2 = b2v;
@@ -141,10 +141,10 @@ fn tryExecConv1DSmallDirect(
                                 const x_val2: f32 = x_flat2[x_row2 + ic2];
                                 const xv2: Vec = @splat(x_val2);
                                 const w_ic2: usize = w_kw2 + ic2 * c_out2 + co0;
-                                const w0: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2)).*;
-                                const w1: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + lanes2)).*;
-                                const w2: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + 2 * lanes2)).*;
-                                const w3: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2 + 3 * lanes2)).*;
+                                const w0: Vec = simd.load(Vec, w_flat2 + w_ic2);
+                                const w1: Vec = simd.load(Vec, w_flat2 + w_ic2 + lanes2);
+                                const w2: Vec = simd.load(Vec, w_flat2 + w_ic2 + 2 * lanes2);
+                                const w3: Vec = simd.load(Vec, w_flat2 + w_ic2 + 3 * lanes2);
                                 acc0 = @mulAdd(Vec, xv2, w0, acc0);
                                 acc1 = @mulAdd(Vec, xv2, w1, acc1);
                                 acc2 = @mulAdd(Vec, xv2, w2, acc2);
@@ -153,10 +153,10 @@ fn tryExecConv1DSmallDirect(
                         }
 
                         const outp: [*]align(1) f32 = out_flat2 + out_off2 + co0;
-                        @as(*align(1) Vec, @ptrCast(outp)).* = acc0;
-                        @as(*align(1) Vec, @ptrCast(outp + lanes2)).* = acc1;
-                        @as(*align(1) Vec, @ptrCast(outp + 2 * lanes2)).* = acc2;
-                        @as(*align(1) Vec, @ptrCast(outp + 3 * lanes2)).* = acc3;
+                        simd.store(Vec, outp, acc0);
+                        simd.store(Vec, outp + lanes2, acc1);
+                        simd.store(Vec, outp + 2 * lanes2, acc2);
+                        simd.store(Vec, outp + 3 * lanes2, acc3);
                     }
 
                     // Remaining full vectors.
@@ -164,7 +164,7 @@ fn tryExecConv1DSmallDirect(
                     while (co2 + lanes2 <= c_out2) : (co2 += lanes2) {
                         var accv: Vec = @splat(@as(f32, 0.0));
                         if (bias_flat2) |bp| {
-                            accv = @as(*align(1) const Vec, @ptrCast(bp + co2)).*;
+                            accv = simd.load(Vec, bp + co2);
                         }
 
                         var kw2: usize = 0;
@@ -181,11 +181,11 @@ fn tryExecConv1DSmallDirect(
                                 const x_val2: f32 = x_flat2[x_row2 + ic2];
                                 const xv2: Vec = @splat(x_val2);
                                 const w_ic2: usize = w_kw2 + ic2 * c_out2 + co2;
-                                const wv: Vec = @as(*align(1) const Vec, @ptrCast(w_flat2 + w_ic2)).*;
+                                const wv: Vec = simd.load(Vec, w_flat2 + w_ic2);
                                 accv = @mulAdd(Vec, xv2, wv, accv);
                             }
                         }
-                        @as(*align(1) Vec, @ptrCast(out_flat2 + out_off2 + co2)).* = accv;
+                        simd.store(Vec, out_flat2 + out_off2 + co2, accv);
                     }
 
                     // Scalar tail.

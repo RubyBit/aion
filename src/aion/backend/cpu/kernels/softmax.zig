@@ -50,9 +50,9 @@ pub fn expSumStoreF32(sum_buf: []f32, out_view: types.BufferViewMut, in_view: ty
         var i: usize = 0;
         const vec_end: usize = in.len - (in.len % lanes);
         while (i < vec_end) : (i += lanes) {
-            const xv: Vec = @as(*align(1) const Vec, @ptrCast(in.ptr + i)).*;
+            const xv: Vec = simd.load(Vec, in.ptr + i);
             const ev: Vec = expFastVec(lanes, xv - @as(Vec, @splat(m)));
-            @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = ev;
+            simd.store(Vec, out.ptr + i, ev);
             acc_v += ev;
         }
         var acc: f32 = @reduce(.Add, acc_v);
@@ -76,9 +76,9 @@ pub fn expSumStoreF32(sum_buf: []f32, out_view: types.BufferViewMut, in_view: ty
         var c: usize = 0;
         const vec_end: usize = cols - (cols % lanes);
         while (c < vec_end) : (c += lanes) {
-            const xv: Vec = @as(*align(1) const Vec, @ptrCast(in.ptr + off + c)).*;
+            const xv: Vec = simd.load(Vec, in.ptr + off + c);
             const ev: Vec = expFastVec(lanes, xv - @as(Vec, @splat(m)));
-            @as(*align(1) Vec, @ptrCast(out.ptr + off + c)).* = ev;
+            simd.store(Vec, out.ptr + off + c, ev);
             acc_v += ev;
         }
         var acc: f32 = @reduce(.Add, acc_v);
@@ -102,8 +102,8 @@ pub fn normalizeF32(out_view: types.BufferViewMut, sum_buf: []const f32, rank: u
         var i: usize = 0;
         const vec_end: usize = out.len - (out.len % lanes);
         while (i < vec_end) : (i += lanes) {
-            const v: Vec = @as(*align(1) const Vec, @ptrCast(out.ptr + i)).*;
-            @as(*align(1) Vec, @ptrCast(out.ptr + i)).* = v * inv_v;
+            const v: Vec = simd.load(Vec, out.ptr + i);
+            simd.store(Vec, out.ptr + i, v * inv_v);
         }
         while (i < out.len) : (i += 1) out[i] *= inv;
         return;
@@ -119,8 +119,8 @@ pub fn normalizeF32(out_view: types.BufferViewMut, sum_buf: []const f32, rank: u
         var c: usize = 0;
         const vec_end: usize = cols - (cols % lanes);
         while (c < vec_end) : (c += lanes) {
-            const v: Vec = @as(*align(1) const Vec, @ptrCast(out.ptr + off + c)).*;
-            @as(*align(1) Vec, @ptrCast(out.ptr + off + c)).* = v * inv_v;
+            const v: Vec = simd.load(Vec, out.ptr + off + c);
+            simd.store(Vec, out.ptr + off + c, v * inv_v);
         }
         while (c < cols) : (c += 1) out[off + c] *= inv;
     }

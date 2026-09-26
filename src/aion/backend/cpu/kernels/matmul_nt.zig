@@ -74,15 +74,15 @@ fn matmulNtF32Impl(
 
             var kk: usize = 0;
             while (kk < k_vec) : (kk += 4 * LANES) {
-                const a0: VF = @as(*align(1) const VF, @ptrCast(a_row + kk + 0 * LANES)).*;
-                const a1: VF = @as(*align(1) const VF, @ptrCast(a_row + kk + 1 * LANES)).*;
-                const a2: VF = @as(*align(1) const VF, @ptrCast(a_row + kk + 2 * LANES)).*;
-                const a3: VF = @as(*align(1) const VF, @ptrCast(a_row + kk + 3 * LANES)).*;
+                const a0: VF = simd.load(VF, a_row + kk + 0 * LANES);
+                const a1: VF = simd.load(VF, a_row + kk + 1 * LANES);
+                const a2: VF = simd.load(VF, a_row + kk + 2 * LANES);
+                const a3: VF = simd.load(VF, a_row + kk + 3 * LANES);
 
-                const b0: VF = @as(*align(1) const VF, @ptrCast(b_row + kk + 0 * LANES)).*;
-                const b1: VF = @as(*align(1) const VF, @ptrCast(b_row + kk + 1 * LANES)).*;
-                const b2: VF = @as(*align(1) const VF, @ptrCast(b_row + kk + 2 * LANES)).*;
-                const b3: VF = @as(*align(1) const VF, @ptrCast(b_row + kk + 3 * LANES)).*;
+                const b0: VF = simd.load(VF, b_row + kk + 0 * LANES);
+                const b1: VF = simd.load(VF, b_row + kk + 1 * LANES);
+                const b2: VF = simd.load(VF, b_row + kk + 2 * LANES);
+                const b3: VF = simd.load(VF, b_row + kk + 3 * LANES);
 
                 vacc0 = @mulAdd(VF, a0, b0, vacc0);
                 vacc1 = @mulAdd(VF, a1, b1, vacc1);

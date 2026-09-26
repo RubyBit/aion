@@ -127,14 +127,14 @@ fn dotColumns(
         var kb: usize = 0;
         while (kb < nb) : (kb += 1) {
             const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
-            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const aqv: @Vector(32, i8) = simd.load(@Vector(32, i8), slot.ptr);
             const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
             const correction = matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
             const row = b + (kb * ldb + jt) * Q8_0_BLOCK_BYTES;
             inline for (0..NT) |jj| {
                 const bp = row + jj * Q8_0_BLOCK_BYTES;
                 const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
-                const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+                const qv: @Vector(32, i8) = simd.load(@Vector(32, i8), bp + 2);
                 const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - correction;
                 acc[jj] += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
             }
@@ -147,11 +147,11 @@ fn dotColumns(
         var kb: usize = 0;
         while (kb < nb) : (kb += 1) {
             const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
-            const aqv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(slot.ptr)).*;
+            const aqv: @Vector(32, i8) = simd.load(@Vector(32, i8), slot.ptr);
             const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
             const bp = b + (kb * ldb + jt) * Q8_0_BLOCK_BYTES;
             const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
-            const qv: @Vector(32, i8) = @as(*align(1) const @Vector(32, i8), @ptrCast(bp + 2)).*;
+            const qv: @Vector(32, i8) = simd.load(@Vector(32, i8), bp + 2);
             const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
             acc += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
         }

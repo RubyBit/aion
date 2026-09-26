@@ -103,7 +103,7 @@ pub fn Kernel(comptime tuning: DepthwiseConv2DTuning) type {
                     while (ch + lanes <= c) : (ch += lanes) {
                         var acc: Vec = if (t.bias.len != 0) load(t.bias, ch) else @splat(0.0);
                         for (x_off[0..n], w_off[0..n]) |xo, wo| acc += load(t.x, xo + ch) * load(t.w, wo + ch);
-                        @as(*align(1) Vec, @ptrCast(out.ptr + ch)).* = acc;
+                        simd.store(Vec, out.ptr + ch, acc);
                     }
                     while (ch < c) : (ch += 1) {
                         var acc: f32 = if (t.bias.len != 0) t.bias[ch] else 0.0;
@@ -120,7 +120,7 @@ pub fn Kernel(comptime tuning: DepthwiseConv2DTuning) type {
         }
 
         inline fn load(s: []align(1) const f32, i: usize) Vec {
-            return @as(*align(1) const Vec, @ptrCast(s.ptr + i)).*;
+            return simd.load(Vec, s.ptr + i);
         }
     };
 }

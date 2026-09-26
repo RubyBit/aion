@@ -7,6 +7,7 @@ const conv2d_registry = @import("../registry/conv2d_registry.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const exec_utils = @import("utils.zig");
+const simd = @import("../kernels/simd.zig");
 
 pub const BackendError = types.BackendError;
 pub const MatMulParams = types.MatMulParams;
@@ -74,10 +75,10 @@ fn addBiasRowsF32Vector(
         const row_base: usize = (row_start + mr) * row_stride;
         var oc: usize = 0;
         while (oc + lanes <= channel_count) : (oc += lanes) {
-            const bias_v: Vec = @as(*align(1) const Vec, @ptrCast(bias.ptr + oc)).*;
+            const bias_v: Vec = simd.load(Vec, bias.ptr + oc);
             const c_ptr = out.ptr + row_base + oc;
-            const c_v: Vec = @as(*align(1) const Vec, @ptrCast(c_ptr)).*;
-            @as(*align(1) Vec, @ptrCast(c_ptr)).* = c_v + bias_v;
+            const c_v: Vec = simd.load(Vec, c_ptr);
+            simd.store(Vec, c_ptr, c_v + bias_v);
         }
         while (oc < channel_count) : (oc += 1) out[row_base + oc] += bias[oc];
     }

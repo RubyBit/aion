@@ -238,8 +238,19 @@ pub const DLManagedTensorVersioned = extern struct {
     dl_tensor: DLTensor,
 };
 
-/// The DLPack major version whose layout these mirror; a consumer must refuse others.
+// The layouts dlpack.h fixes for a 64-bit target: a drifted mirror fails the build.
+comptime {
+    if (@sizeOf(usize) == 8) {
+        std.debug.assert(@sizeOf(DLDevice) == 8 and @sizeOf(DLDataType) == 4);
+        std.debug.assert(@sizeOf(DLTensor) == 48 and @offsetOf(DLTensor, "ndim") == 16 and @offsetOf(DLTensor, "dtype") == 20 and @offsetOf(DLTensor, "byte_offset") == 40);
+        std.debug.assert(@sizeOf(DLManagedTensorVersioned) == 80 and @offsetOf(DLManagedTensorVersioned, "flags") == 24 and @offsetOf(DLManagedTensorVersioned, "dl_tensor") == 32);
+    }
+}
+
+/// The DLPack version these mirror; a consumer must refuse another major.
 const dlpack_major: u32 = 1;
+const dlpack_minor: u32 = 3;
+const dlpack_flag_read_only: u64 = 1 << 0;
 
 fn releaseManaged(ctx: *anyopaque) void {
     const m: *DLManagedTensorVersioned = @ptrCast(@alignCast(ctx));
@@ -255,12 +266,14 @@ fn elemFromDL(t: DLDataType) ?api.HostElem {
     if (t.lanes != 1) return null;
     return switch (t.code) {
         kDLFloat => switch (t.bits) {
+            64 => .f64,
             32 => .f32,
             16 => .f16,
             else => null,
         },
         kDLBfloat => if (t.bits == 16) .bf16 else null,
         kDLInt => switch (t.bits) {
+            64 => .i64,
             32 => .i32,
             8 => .i8,
             else => null,
@@ -268,6 +281,32 @@ fn elemFromDL(t: DLDataType) ?api.HostElem {
         else => null,
     };
 }
+
+/// The DLPack type a scalar tensor dtype exports as; null for a quantized one.
+fn dlTypeOf(dtype: types.DType) ?DLDataType {
+    return switch (dtype) {
+        .f32 => .{ .code = kDLFloat, .bits = 32, .lanes = 1 },
+        .f16 => .{ .code = kDLFloat, .bits = 16, .lanes = 1 },
+        .i32 => .{ .code = kDLInt, .bits = 32, .lanes = 1 },
+        .i8 => .{ .code = kDLInt, .bits = 8, .lanes = 1 },
+        .q4_0, .q8_0 => null,
+    };
+}
+
+/// A DLPack export: the managed tensor handed out, the shared reference that keeps
+/// its bytes valid, and the shape it points at, freed together by the deleter.
+const Export = struct {
+    managed: DLManagedTensorVersioned,
+    bytes: api.Tensor.Shared,
+    shape: [api.host_view_max_rank]i64,
+
+    fn delete(m_opt: ?*DLManagedTensorVersioned) callconv(.c) void {
+        const m = m_opt orelse return;
+        const self: *Export = @fieldParentPtr("managed", m);
+        self.bytes.release();
+        library_allocator.destroy(self);
+    }
+};
 
 /// Where a view's shape and strides live: a stack buffer for a view used during
 /// the call, or an arena for one that outlives it.
@@ -525,7 +564,7 @@ pub export fn aion_tensor_shape(t_opt: ?*const AionTensor, out_dims: [*c]usize, 
 }
 
 /// Copy host memory in: `src`'s shape must equal the tensor's, and its elements
-/// convert to the tensor's dtype (floats among floats, integers to their own width).
+/// convert to the tensor's dtype (floats among floats, integers among integers when they fit).
 pub export fn aion_tensor_write(t_opt: ?*AionTensor, src: ?*const DLTensor) callconv(.c) AionStatus {
     const t: *AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
     const ctx: *AionContext = t.owner;
@@ -549,6 +588,108 @@ pub export fn aion_tensor_read(t_opt: ?*const AionTensor, dst: ?*const DLTensor)
     const view = viewFromDL(api.HostViewMut, dst, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
     t.tensor.readView(library_allocator, view) catch |e| {
         ctx.setLastError("tensor_read", e);
+        return mapError(e);
+    };
+    return .AION_OK;
+}
+
+/// Export a host tensor as DLPack, without copying: the export shares the tensor's
+/// bytes and keeps them valid and unchanged until its deleter runs (see aion.h).
+pub export fn aion_tensor_to_dlpack(t_opt: ?*const AionTensor, out: ?*?*DLManagedTensorVersioned) callconv(.c) AionStatus {
+    const t: *const AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = t.owner;
+    ctx.clearLastError();
+    const dst = out orelse return .AION_INVALID_ARGUMENT;
+    dst.* = null;
+    const dl_type = dlTypeOf(t.tensor.dtype) orelse return .AION_UNSUPPORTED;
+    const shape = t.tensor.shape;
+    if (shape.len > api.host_view_max_rank) return .AION_UNSUPPORTED;
+    const bytes = t.tensor.share() catch |e| {
+        ctx.setLastError("tensor_to_dlpack", e);
+        return mapError(e);
+    };
+    const ex = library_allocator.create(Export) catch {
+        bytes.release();
+        return .AION_OUT_OF_MEMORY;
+    };
+    ex.bytes = bytes;
+    for (shape, 0..) |d, i| ex.shape[i] = @intCast(d);
+    ex.managed = .{
+        .version = .{ .major = dlpack_major, .minor = dlpack_minor },
+        .manager_ctx = null,
+        .deleter = Export.delete,
+        .flags = dlpack_flag_read_only,
+        .dl_tensor = .{
+            .data = @constCast(bytes.bytes.ptr),
+            .device = .{ .device_type = kDLCPU, .device_id = 0 },
+            .ndim = @intCast(shape.len),
+            .dtype = dl_type,
+            .shape = &ex.shape,
+            .strides = null,
+            .byte_offset = 0,
+        },
+    };
+    dst.* = &ex.managed;
+    return .AION_OK;
+}
+
+/// Import a DLPack tensor, owning `src` on success: borrowed without a copy when
+/// it already is what the tensor needs, else copied once (see aion.h).
+pub export fn aion_tensor_from_dlpack(
+    ctx_opt: ?*AionContext,
+    src: ?*DLManagedTensorVersioned,
+    dtype_c: ?*const AionDType,
+    out_tensor: ?*?*AionTensor,
+) callconv(.c) AionStatus {
+    const ctx: *AionContext = ctx_opt orelse return .AION_INVALID_ARGUMENT;
+    ctx.clearLastError();
+    const out = out_tensor orelse return .AION_INVALID_ARGUMENT;
+    out.* = null;
+    const managed = src orelse return .AION_INVALID_ARGUMENT;
+    if (managed.version.major != dlpack_major) return .AION_UNSUPPORTED;
+    var buf: ViewBuf = .{};
+    var view = viewFromDL(api.HostView, &managed.dl_tensor, buf.dims()) orelse return .AION_INVALID_ARGUMENT;
+    const dtype: types.DType = if (dtype_c) |d| dtypeFromC(d.*) orelse return .AION_INVALID_ARGUMENT else viewDType(view.elem);
+    if (dtype.info().is_quantized) return .AION_INVALID_ARGUMENT; // quantize instead
+    // The runtime represents a scalar as shape [1]: the same one element.
+    if (view.shape.len == 0) {
+        buf.shape[0] = 1;
+        view.shape = buf.shape[0..1];
+        view.strides = null;
+    }
+    const elem = api.HostElem.of(dtype).?;
+    // Borrowed only when the bytes already are the tensor's: its dtype, row-major,
+    // aligned to its element. Anything else takes the one converting copy.
+    const borrowable = view.elem == elem and view.isContiguous() and std.mem.isAligned(@intFromPtr(view.data), elem.bytes());
+    const t: api.Tensor = if (borrowable)
+        ctx.ctx.borrow(dtype, view.shape, view.data[0 .. view.count() * elem.bytes()], managed, releaseManaged) catch |e| {
+            ctx.setLastError("tensor_from_dlpack", e);
+            return mapError(e);
+        }
+    else blk: {
+        const copy = ctx.ctx.fromView(dtype, view) catch |e| {
+            ctx.setLastError("tensor_from_dlpack", e);
+            return mapError(e);
+        };
+        releaseManaged(managed); // read once, handed straight back
+        break :blk copy;
+    };
+    const handle: *AionTensor = library_allocator.create(AionTensor) catch {
+        t.release();
+        return .AION_OUT_OF_MEMORY;
+    };
+    handle.* = .{ .owner = ctx, .tensor = t };
+    out.* = handle;
+    return .AION_OK;
+}
+
+/// Set every element of the tensor to zero, wherever it lives.
+pub export fn aion_tensor_zero(t_opt: ?*AionTensor) callconv(.c) AionStatus {
+    const t: *AionTensor = t_opt orelse return .AION_INVALID_ARGUMENT;
+    const ctx: *AionContext = t.owner;
+    ctx.clearLastError();
+    t.tensor.zero() catch |e| {
+        ctx.setLastError("tensor_zero", e);
         return mapError(e);
     };
     return .AION_OK;
@@ -1215,12 +1356,13 @@ pub const AionWeight = extern struct {
     view: ?*DLManagedTensorVersioned = null,
 };
 
-/// The dtype a view binds as when it is not quantized: its own, bf16 widened to f32.
+/// The dtype a view binds as when it is not quantized: its own, where the core has
+/// it; bf16 and float64 as f32, int64 as i32.
 fn viewDType(elem: api.HostElem) types.DType {
     return switch (elem) {
-        .f32, .bf16 => .f32,
+        .f64, .f32, .bf16 => .f32,
         .f16 => .f16,
-        .i32 => .i32,
+        .i64, .i32 => .i32,
         .i8 => .i8,
     };
 }

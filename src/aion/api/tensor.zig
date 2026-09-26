@@ -150,7 +150,8 @@ pub const Tensor = struct {
     }
 
     /// Copy a host view of the same shape in, converting its elements to this
-    /// tensor's dtype (floats among floats; integers to their own width).
+    /// tensor's dtype (floats among floats; integers among integers, narrowing only
+    /// values that fit).
     pub fn writeView(self: Self, allocator: std.mem.Allocator, view: HostView) StorageError!void {
         const elem = host_view.Elem.of(self.dtype) orelse return StorageError.InvalidArgument;
         if (!std.mem.eql(usize, self.shape, view.shape) or !view.elem.convertsTo(elem)) return StorageError.InvalidArgument;
@@ -187,6 +188,33 @@ pub const Tensor = struct {
             view.write(self.dtype, first, chunk[0 .. n * elem.bytes()]) catch return StorageError.InvalidArgument;
             first += n;
         }
+    }
+
+    /// This host tensor's bytes, and a reference that keeps them valid and unchanged
+    /// until `Shared.release`, whatever happens to the tensor meanwhile: it takes
+    /// them back, or copies them, before its next write (`storage.SharedBytes`).
+    /// This is what an export to another library (DLPack) hands out, without a copy.
+    pub fn share(self: Self) StorageError!Shared {
+        const s = try self.store.shareHostBytes(self.id);
+        return .{ .bytes = s.bytes, .ref = s.shared };
+    }
+
+    pub const Shared = struct {
+        bytes: []const u8,
+        ref: *manager_mod.SharedBytes,
+
+        pub fn release(self: Shared) void {
+            self.ref.release();
+        }
+    };
+
+    /// Set every element to zero, wherever the tensor lives.
+    pub fn zero(self: Self) StorageError!void {
+        if (!(try self.store.tensorHasBacking(self.id))) {
+            // A fresh host backing is zero-filled already.
+            return self.store.reserveHostBacking(self.id, try self.store.tensorLogicalBackingBytes(self.id));
+        }
+        return self.store.zeroTensorData(self.id);
     }
 
     pub fn copyFrom(self: Self, allocator: std.mem.Allocator, src: Self) StorageError!void {

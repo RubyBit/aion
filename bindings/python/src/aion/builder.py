@@ -93,8 +93,8 @@ from .enums import (
     AionReduceOp,
     AionUnaryOp,
 )
-from ._ffi.dlpack import HostView
-from .tensor import Tensor, _float_view
+from ._ffi.dlpack import HostView, data_shape, host_view
+from .tensor import Tensor
 from .types import ArrayLike, AttentionWindow, DTypeLike, NDArray, Shape
 
 if TYPE_CHECKING:
@@ -313,7 +313,7 @@ class Builder:
         # Keep param tensors alive for the builder's lifetime.
         self._params: list[Tensor] = []
         # Host memory the core reads when an op fixes a quantized weight's axis, for
-        # the sources whose owner cannot be told when it is done (see `HostView.owned`).
+        # the sources whose owner cannot be told when it is done (see `HostView.transfer`).
         self._views: list[HostView] = []
         self._symbol_counter = 0
         # value id -> evaluated result. Safe to memoize: the graph is append-only,
@@ -439,7 +439,7 @@ class Builder:
         dt = _as_dtype(dtype)
         if dt in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
             if shape is None:
-                shape = _infer_shape(data)
+                shape = data_shape(data)
             return Tensor.quantize(self._ctx_owner, shape, data, dtype=dt, quant_axis=quant_axis)
         return Tensor(data, ctx=self._ctx_owner, dtype=dt)
 
@@ -458,12 +458,12 @@ class Builder:
     ) -> TensorRef:
         """Bind a weight under a semantic, scope-qualified name (`.../weight`).
 
-        A quantized `dtype` with no `quant_axis` is quantized by the core once the
-        ops reading the weight fix the axis its blocks must run along. Until then
-        the core reads `data` where it lives -- anything exporting ``__dlpack__``
-        (a numpy array or memmap, a PyTorch tensor, bfloat16 included) is viewed in
-        place, strided, never copied whole to f32 -- so do not modify it before the
-        builder is compiled or exported.
+        Anything exporting ``__dlpack__`` (a numpy array or memmap, a PyTorch
+        tensor, bfloat16 included) is used where it lives, never copied whole: a
+        quantized `dtype` with no `quant_axis` is quantized by the core once the ops
+        reading the weight fix the axis its blocks run along, and an unquantized one
+        already in its dtype is borrowed as the weight (see `Tensor`). So do not
+        modify `data` before the builder is compiled or exported.
 
         The name persists into the package as a `debug_name`, which is the key the
         load- and swap-by-name paths use. Prefer this over `param`, whose generated
@@ -471,14 +471,16 @@ class Builder:
         """
         dt = _as_dtype(dtype)
         if not isinstance(data, Tensor) and quant_axis is None and dt in _QUANTIZED:
-            view = _float_view(data, shape if shape is not None else _infer_shape(data))
-            value, keep = builder_param_named(self._ctx_owner.ptr, self.ptr, name, view=view, quantize_to=int(dt))
-            if keep:
+            view = host_view(data, AionDType.AION_DTYPE_F32)
+            if shape is not None:
+                view = view.fit(shape, reshape=True)
+            value = builder_param_named(self._ctx_owner.ptr, self.ptr, name, view=view, quantize_to=int(dt))
+            if view.needs_keepalive:
                 self._views.append(view)
             return TensorRef(self, value)
         t = self._as_param_tensor(data, dtype=dtype, shape=shape, quant_axis=quant_axis)
         self._params.append(t)
-        value, _ = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr)
+        value = builder_param_named(self._ctx_owner.ptr, self.ptr, name, tensor=t.ptr)
         return TensorRef(self, value)
 
     # --- scopes ------------------------------------------------------------
@@ -1075,18 +1077,3 @@ def _resolve_dynamic(dynamic: DynamicAxes, rank: int, b: "Builder") -> list[tupl
             raise ValueError(f"dynamic axis {axis} out of range for rank {rank}")
         out.append((axis, name))
     return out
-
-
-def _infer_shape(data: WeightData) -> tuple[int, ...]:
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
-    if np is not None and isinstance(data, np.ndarray):
-        return tuple(int(x) for x in data.shape)
-    if hasattr(data, "__dlpack__") and hasattr(data, "shape"):
-        return tuple(int(x) for x in data.shape)  # type: ignore[union-attr]
-    from .tensor import _flatten_nested
-
-    shape, _ = _flatten_nested(data)
-    return shape

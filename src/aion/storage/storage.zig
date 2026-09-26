@@ -37,37 +37,93 @@ pub const DeviceRef = packed struct(u16) {
     }
 };
 
-/// A file mapping tensors borrow their bytes from, alive while any of them does.
+/// Read-only bytes several holders share, freed when the last lets go: a file
+/// mapping, a heap buffer a tensor handed over, or another library's memory (a
+/// DLPack import), handed back through its own release.
 ///
 /// A loaded model's weights are its mapped `.aion` payloads, used in place: the
 /// in-memory layout is the file layout, so a weight needs no allocation and no
-/// copy, and its pages are the page cache's to drop and fault back. The mapping is
-/// read-only; a tensor about to be written takes a private copy first
-/// (`Tensor.ensureWritable`), and the last tensor to let go unmaps the file.
-pub const Mapping = struct {
+/// copy, and its pages are the page cache's to drop and fault back. A tensor
+/// exported to another library (DLPack) shares its buffer the same way, so the
+/// export stays valid whatever later happens to the tensor. Shared bytes are never
+/// written: a tensor about to be written takes them back if it is the only holder
+/// of a heap buffer, and a private copy otherwise (`Tensor.ensureWritable`).
+pub const SharedBytes = struct {
     gpa: std.mem.Allocator,
-    map: std.Io.File.MemoryMap,
+    source: union(enum) {
+        map: std.Io.File.MemoryMap,
+        heap: []align(64) u8,
+        /// Memory someone else owns; `release(ctx)` hands it back.
+        external: struct { ctx: *anyopaque, release: *const fn (ctx: *anyopaque) void },
+    },
     refs: std.atomic.Value(usize),
 
     /// Take `map` over, holding one reference for the caller.
-    pub fn adopt(gpa: std.mem.Allocator, map: std.Io.File.MemoryMap) StorageError!*Mapping {
-        const self = gpa.create(Mapping) catch return StorageError.OutOfMemory;
-        self.* = .{ .gpa = gpa, .map = map, .refs = .init(1) };
+    pub fn adoptMap(gpa: std.mem.Allocator, map: std.Io.File.MemoryMap) StorageError!*SharedBytes {
+        return create(gpa, .{ .map = map });
+    }
+
+    /// Take `heap` (allocated by `gpa`) over, holding one reference for the caller.
+    pub fn adoptHeap(gpa: std.mem.Allocator, heap: []align(64) u8) StorageError!*SharedBytes {
+        return create(gpa, .{ .heap = heap });
+    }
+
+    /// Take memory someone else owns over, holding one reference for the caller:
+    /// `release(ctx)` runs once the last holder lets go.
+    pub fn adoptExternal(gpa: std.mem.Allocator, ctx: *anyopaque, release_fn: *const fn (ctx: *anyopaque) void) StorageError!*SharedBytes {
+        return create(gpa, .{ .external = .{ .ctx = ctx, .release = release_fn } });
+    }
+
+    /// Free a wrapper nothing else holds without releasing what it wraps: for a
+    /// caller whose ownership of the source did not, in the end, transfer.
+    pub fn abandon(self: *SharedBytes) void {
+        std.debug.assert(self.refs.load(.acquire) == 1);
+        self.gpa.destroy(self);
+    }
+
+    fn create(gpa: std.mem.Allocator, source: @FieldType(SharedBytes, "source")) StorageError!*SharedBytes {
+        const self = gpa.create(SharedBytes) catch return StorageError.OutOfMemory;
+        self.* = .{ .gpa = gpa, .source = source, .refs = .init(1) };
         return self;
     }
 
-    pub fn retain(self: *Mapping) void {
+    pub fn retain(self: *SharedBytes) void {
         _ = self.refs.fetchAdd(1, .monotonic);
     }
 
-    pub fn release(self: *Mapping) void {
+    pub fn release(self: *SharedBytes) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        var io_backend: std.Io.Threaded = .init_single_threaded;
-        io_backend.allocator = self.gpa;
-        self.map.destroy(io_backend.io());
+        switch (self.source) {
+            .map => |*map| {
+                var io_backend: std.Io.Threaded = .init_single_threaded;
+                io_backend.allocator = self.gpa;
+                map.destroy(io_backend.io());
+            },
+            .heap => |heap| self.gpa.free(heap),
+            .external => |e| e.release(e.ctx),
+        }
         self.gpa.destroy(self);
     }
+
+    /// The heap buffer back, when the caller holds the only reference to it; this
+    /// is then gone. Null for a mapping or a buffer someone else still holds.
+    fn reclaim(self: *SharedBytes) ?[]align(64) u8 {
+        const heap = switch (self.source) {
+            .heap => |h| h,
+            .map, .external => return null,
+        };
+        if (self.refs.load(.acquire) != 1) return null;
+        self.gpa.destroy(self);
+        return heap;
+    }
 };
+
+/// The alignment shared bytes of `dtype` need: an element's (all a kernel relies
+/// on), and 64 bytes for quantized blocks, which only a file lays out.
+fn sharedAlignment(dtype: DType) usize {
+    const info = dtype.info();
+    return if (info.is_quantized) 64 else info.block_bytes;
+}
 
 /// Byte range of one dim-0 chunk inside the packed layout.
 pub const Chunk = struct { offset: usize, len: usize, rows: usize };
@@ -102,12 +158,14 @@ pub const Tensor = struct {
     /// which is every host tensor.
     chunk_rows: usize,
 
-    /// Host bytes (packed layout). Empty on a device or when released.
-    data: []align(64) u8,
+    /// Host bytes (packed layout). Empty on a device or when released. Owned bytes
+    /// are a 64-byte-aligned allocation (`ownedBytes`); shared ones are aligned to
+    /// their element, which is all a kernel relies on.
+    data: []u8,
     owns_data: bool = true,
-    /// The file mapping `data` is a view of, for a tensor borrowing its bytes from
-    /// one; `data` is then read-only (see `ensureWritable`).
-    mapping: ?*Mapping = null,
+    /// The shared bytes `data` is a view of, for a tensor borrowing its bytes; `data`
+    /// is then read-only (see `ensureWritable`).
+    shared: ?*SharedBytes = null,
 
     // --- Device residency (move semantics) ---
     // A tensor lives on exactly one device. On `.cpu`, bytes are in `data` and
@@ -190,35 +248,63 @@ pub const Tensor = struct {
         self.backing_bytes = data.len;
     }
 
-    /// A host tensor whose bytes are `bytes` of `mapping`, used in place. `bytes`
-    /// must be the tensor's exact packed length and 64-byte aligned.
-    pub fn initMapped(self: *Self, allocator: std.mem.Allocator, dtype: DType, shape_in: []const usize, bytes: []const u8, mapping: *Mapping, opts: InitOptions) StorageError!void {
+    /// A host tensor whose bytes are `bytes` of `shared`, used in place. `bytes`
+    /// must be the tensor's exact packed length, aligned to its element (a
+    /// quantized dtype's blocks: 64 bytes, as a file lays them out).
+    pub fn initShared(self: *Self, allocator: std.mem.Allocator, dtype: DType, shape_in: []const usize, bytes: []const u8, shared: *SharedBytes, opts: InitOptions) StorageError!void {
         var no_bytes = opts;
         no_bytes.host_data = false;
         no_bytes.chunk_rows = null;
         try self.init(allocator, dtype, shape_in, no_bytes);
         errdefer self.deinit();
-        if (bytes.len != try self.byteLen() or !std.mem.isAligned(@intFromPtr(bytes.ptr), 64)) return StorageError.InvalidArgument;
-        self.data = @alignCast(@constCast(bytes));
+        if (bytes.len != try self.byteLen() or !std.mem.isAligned(@intFromPtr(bytes.ptr), sharedAlignment(dtype))) return StorageError.InvalidArgument;
+        self.data = @constCast(bytes);
         self.owns_data = false;
         self.backing_bytes = bytes.len;
-        self.mapping = mapping;
-        mapping.retain();
+        self.shared = shared;
+        shared.retain();
     }
 
-    /// Let go of the host bytes: free them if owned, drop the mapping if borrowed.
-    fn dropHostBytes(self: *Self) void {
-        if (self.data.len != 0 and self.owns_data) self.allocator.free(self.data);
-        if (self.mapping) |m| m.release();
-        self.mapping = null;
+    /// The owned host allocation, at the alignment it was allocated with.
+    fn ownedBytes(self: *const Self) []align(64) u8 {
+        std.debug.assert(self.owns_data);
+        return @alignCast(self.data);
+    }
+
+    /// Let go of the host bytes: free them if owned, release them if shared.
+    pub fn dropHostBytes(self: *Self) void {
+        if (self.data.len != 0 and self.owns_data) self.allocator.free(self.ownedBytes());
+        if (self.shared) |s| s.release();
+        self.shared = null;
         self.data = &[_]u8{};
         self.owns_data = true;
     }
 
-    /// Make the host bytes safe to write: a view of a read-only mapping becomes a
-    /// private copy. A no-op for owned bytes.
+    /// Make the host bytes safe to write: shared bytes are taken back when nothing
+    /// else holds them, else copied. A no-op for owned bytes.
     pub fn ensureWritable(self: *Self) StorageError!void {
-        if (self.mapping != null) _ = try self.promoteToOwned();
+        const s = self.shared orelse return;
+        if (s.reclaim()) |heap| {
+            self.data = heap;
+            self.owns_data = true;
+            self.shared = null;
+            return;
+        }
+        _ = try self.promoteToOwned();
+    }
+
+    /// A reference to this host tensor's bytes that stays valid whatever later
+    /// happens to the tensor: owned bytes become shared (the tensor keeps its own
+    /// reference), and the caller gets one more. The caller releases it.
+    pub fn shareBytes(self: *Self) StorageError!*SharedBytes {
+        if (self.onDevice() or self.data.len == 0) return StorageError.InvalidArgument;
+        if (self.shared == null) {
+            if (!self.owns_data) return StorageError.InvalidArgument;
+            self.shared = try SharedBytes.adoptHeap(self.allocator, self.ownedBytes());
+            self.owns_data = false;
+        }
+        self.shared.?.retain();
+        return self.shared.?;
     }
 
     /// Free this tensor's bytes, keeping metadata so the id stays valid for

@@ -17,8 +17,8 @@ from .device import DeviceLike, GpuOptions, _gpu_adapter_from_device
 from .dtype import float16, float32, int8, int32, normalize_dtype, q4_0, q8_0
 from .errors import AionError
 from .model import LoadedModel, TensorSpec
-from .tensor import Tensor
-from .types import ArrayLike, AttentionWindow, DTypeLike
+from .tensor import Tensor, from_dlpack
+from .types import ArrayLike, AttentionWindow, DTypeLike, SupportsDLPack
 from ._trace import InputSpec, compile, export, spec
 from .enums import AionDeviceKind, AionDType, AionGpuBackend, AionGpuPower, AionStatus
 
@@ -36,11 +36,13 @@ __all__ = [
     "InputSpec",
     "LoadedModel",
     "TensorSpec",
+    "SupportsDLPack",
     "Tensor",
     "TensorRef",
     "compile",
     "export",
     "float16",
+    "from_dlpack",
     "float32",
     "int8",
     "int32",
@@ -70,8 +72,9 @@ def tensor(
 ) -> Tensor:
     """Create a tensor — the Tensor-first front door.
 
-    A **concrete** tensor from a numpy array, nested list, or scalar. The dtype is
-    inferred (integer data → i32, else f32) unless you pass ``dtype=``.
+    A **concrete** tensor from any DLPack exporter (numpy, PyTorch, JAX, ...),
+    read in place, or a nested list or scalar. The dtype follows the data (see
+    `Tensor`) unless you pass ``dtype=``.
     ``device=`` migrates it after creation.
 
     Graph inputs are not tensors: use ``Builder.input(...)``, which returns the

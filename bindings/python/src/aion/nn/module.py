@@ -81,9 +81,9 @@ class Parameter:
 
     @property
     def shape(self) -> tuple[int, ...]:
-        from ..builder import _infer_shape
+        from .._ffi.dlpack import data_shape
 
-        return _infer_shape(self.data)
+        return data_shape(self.data)
 
     def value(self, b: Builder, name: str) -> TensorRef:
         """Bind under `<current scope>/<name>`, or return the existing binding."""

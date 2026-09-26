@@ -8,17 +8,32 @@ the package imports without numpy installed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Sequence, TypeAlias
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Protocol, Sequence, TypeAlias, runtime_checkable
 
 from .enums import AionDType
+
+if TYPE_CHECKING:
+    from typing_extensions import CapsuleType
+
+
+@runtime_checkable
+class SupportsDLPack(Protocol):
+    """An array exporting the DLPack protocol: numpy, PyTorch, JAX, CuPy, an
+    `aion.Tensor`, ... Aion reads such data in place, in its own dtype and strides.
+    """
+
+    def __dlpack__(self, *, stream: Any = None) -> CapsuleType: ...
+
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+
 
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-    # Anything numpy can turn into an array: ndarray, nested sequences, scalars.
-    ArrayLike: TypeAlias = npt.ArrayLike
-    F32ArrayLike: TypeAlias = npt.ArrayLike
+    # Host data Aion accepts: any DLPack exporter (read in place), or anything
+    # numpy can turn into an array (nested sequences, scalars, buffers).
+    ArrayLike: TypeAlias = SupportsDLPack | npt.ArrayLike
     # Concrete array results.
     NDArray: TypeAlias = "npt.NDArray[Any]"
     NDArrayF32: TypeAlias = "npt.NDArray[np.float32]"
@@ -27,7 +42,6 @@ if TYPE_CHECKING:
     DTypeLike: TypeAlias = AionDType | np.dtype[Any] | type[np.generic]
 else:  # runtime: no hard numpy dependency
     ArrayLike = Any
-    F32ArrayLike = Any
     NDArray = Any
     NDArrayF32 = Any
     DTypeLike: TypeAlias = AionDType
@@ -72,7 +86,7 @@ __all__ = [
     "ArrayLike",
     "AttentionWindow",
     "DTypeLike",
-    "F32ArrayLike",
+    "SupportsDLPack",
     "F32Scalar",
     "F32Values",
     "NDArray",

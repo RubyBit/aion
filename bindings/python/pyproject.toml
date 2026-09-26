@@ -30,7 +30,7 @@ Homepage = "https://github.com/RubyBit/aion"
 Repository = "https://github.com/RubyBit/aion"
 
 [project.optional-dependencies]
-numpy = ["numpy>=1.26"]
+numpy = ["numpy>=2.1"]
 # GPU support: the published `aion-engine` wheels already contain the GPU backend
 # (the seam is compiled in), but link NO wgpu — it is loaded at runtime via dlopen.
 # `pip install aion-engine[gpu]` pulls the `aion-wgpu` companion, which ships just
@@ -44,7 +44,7 @@ gpu = ["aion-wgpu>=29.0.4,<30"]
 # test deps, or `--no-default-groups` for a runtime-only environment.
 [dependency-groups]
 # numpy: the test fixtures build synthetic .aion packages via the C-ABI Builder.
-test = ["pytest>=9", "numpy>=1.26"]
+test = ["pytest>=9", "numpy>=2.1"]
 # Type-check only: PEP 696 TypeVar defaults are not in 3.12's `typing`.
 typing = ["typing-extensions>=4.12"]
 dev = [
@@ -53,8 +53,8 @@ dev = [
   "typing-extensions>=4.12",  # PEP 696 TypeVar defaults, for type-checking only
   "tokenizers>=0.23.1",
   "pytest>=9",
-  "numpy>=1.26",
-  "torch>=2.2",
+  "numpy>=2.1",  # DLPack 1.x (versioned capsules)
+  "torch>=2.13",
   "safetensors>=0.4",  # gemma/silero converters read safetensors checkpoints
   "sentencepiece>=0.2",
   "pyyaml>=6",
@@ -131,7 +131,7 @@ exclude = [
   "build",
   ".venv",
 ]
-extraPaths = ["src"]
+extraPaths = ["src", "tools"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 strict = ["src/aion/_ffi", "type_tests"]

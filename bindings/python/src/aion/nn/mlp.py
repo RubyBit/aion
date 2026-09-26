@@ -107,9 +107,9 @@ class GLU(Module):
 
 
 def _last_dim(data: WeightData) -> int:
-    from ..builder import _infer_shape
+    from .._ffi.dlpack import data_shape
 
-    shape = _infer_shape(data)
+    shape = data_shape(data)
     if not shape:
         raise ValueError("weight must have at least one axis")
     return int(shape[-1])

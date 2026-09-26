@@ -2,7 +2,7 @@
 """Tensor construction, host conversion, and in-place helpers."""
 from __future__ import annotations
 
-import importlib
+import sys
 
 import pytest
 
@@ -89,8 +89,7 @@ def test_copy_from_scalar_broadcasts(dtype, value, expected):
 def test_copy_from_scalar_broadcasts_without_numpy(
     monkeypatch, dtype, value, expected
 ):
-    tensor_module = importlib.import_module("aion.tensor")
-    monkeypatch.setattr(tensor_module, "_try_numpy", lambda: None)
+    monkeypatch.setitem(sys.modules, "numpy", None)  # `import numpy` now fails
 
     with aion.Context(thread_count=1) as ctx:
         with aion.Tensor.empty(ctx, (2,), dtype=dtype) as tensor:
@@ -107,8 +106,7 @@ def test_copy_from_non_scalar_requires_exact_shape():
 
 @pytest.mark.parametrize("dtype", [aion.float16, aion.int8])
 def test_non_numpy_constructor_supports_all_scalar_dtypes(monkeypatch, dtype):
-    tensor_module = importlib.import_module("aion.tensor")
-    monkeypatch.setattr(tensor_module, "_try_numpy", lambda: None)
+    monkeypatch.setitem(sys.modules, "numpy", None)  # `import numpy` now fails
 
     with aion.Tensor([1, 2], dtype=dtype) as tensor:
         assert tensor.tolist() == [1, 2]

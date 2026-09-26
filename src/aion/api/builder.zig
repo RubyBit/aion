@@ -513,9 +513,12 @@ pub const Builder = struct {
 
     fn pendingParam(self: *Self, dtype: types.DType, shape: []const usize, param_name: []const u8, pending: QuantizedParam.Pending) Error!TensorRef {
         const v: ValueId = try self.graph.addInput(dtype, shape);
-        self.quantized.put(self.allocator, v, .{ .dtype = dtype, .state = .{ .pending = pending } }) catch return Error.OutOfMemory;
         self.params.put(self.allocator, v, .user) catch return Error.OutOfMemory;
         try self.nameParam(v, param_name);
+        // Last: once stored, the builder owns `pending.release` and calls it at the
+        // latest when it goes, so a failure after this would release it twice (the
+        // caller keeps ownership of what a failed call did not take).
+        self.quantized.put(self.allocator, v, .{ .dtype = dtype, .state = .{ .pending = pending } }) catch return Error.OutOfMemory;
         return .{ .value = v };
     }
 

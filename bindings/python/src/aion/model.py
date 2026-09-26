@@ -327,12 +327,15 @@ class LoadedModel:
         from .tensor import Tensor
 
         temps: list[Tensor] = []
+        # Host data becomes each input's declared dtype (float64 arrays as float32,
+        # int64 token ids as int32, ...), not whatever the data's own dtype maps to.
+        dtypes = {spec.name: spec.dtype for spec in self.input_specs()}
         try:
             for name, v in inputs.items():
                 if isinstance(v, Tensor):
                     t = v
                 else:
-                    t = Tensor(v, ctx=self._ctx_owner)
+                    t = Tensor(v, ctx=self._ctx_owner, dtype=dtypes.get(name))
                     temps.append(t)
                 self.bind_input(name, t)
 

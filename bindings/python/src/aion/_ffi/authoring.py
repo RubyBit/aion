@@ -142,7 +142,7 @@ class SliceAttrs:
     lens: ViewDims
 
 
-def _set_window(member, w: AttentionWindow) -> None:
+def _set_window(member: Any, w: AttentionWindow) -> None:
     member.left = int(w.left)
     member.right = int(w.right)
     member.chunk = int(w.chunk)
@@ -330,24 +330,28 @@ def builder_param_named(
     tensor: TensorHandle | None = None,
     view: HostView | None = None,
     quantize_to: int = 0,
-) -> tuple[ValueId, bool]:
+) -> ValueId:
     """Bind `tensor`, or host memory `view`, whose ownership the core takes on
     success (it releases it once read: at once unquantized, else when an op fixes
-    the axis). Returns the value and whether `view` must still be kept alive."""
-    weight = ffi.new("AionWeight*")
-    keep = False
-    if tensor is not None:
-        weight.tensor = tensor.raw
-    if view is not None:
-        weight.view, keep = view.owned()
+    the axis; see `HostView.transfer` for what the caller still keeps alive)."""
     opts = ffi.new("AionParamOptions*")
     opts.quantize_to = int(quantize_to)
     out = ffi.new("AionValueId*")
-    status = lib.aion_builder_param_named(builder.raw, weight, _string(name), opts, out)
-    raise_for_status(status, ctx, what="aion_builder_param_named")
-    if view is not None:
-        view.handed_over()
-    return ValueId(int(out[0])), keep
+    weight = ffi.new("AionWeight*")
+
+    def bind() -> None:
+        status = lib.aion_builder_param_named(builder.raw, weight, _string(name), opts, out)
+        raise_for_status(status, ctx, what="aion_builder_param_named")
+
+    if view is None:
+        if tensor is not None:
+            weight.tensor = tensor.raw
+        bind()
+    else:
+        with view.transfer() as managed:
+            weight.view = managed
+            bind()
+    return ValueId(int(out[0]))
 
 
 def _read_str(fn: Callable[..., int], *args: Any) -> str:

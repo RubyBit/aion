@@ -2,8 +2,7 @@
 """One dtype vocabulary for the whole package.
 
 `Tensor`, `Builder`, `nn`, and tracing all route dtype handling through
-`normalize_dtype`, and read/write buffers are sized from the single metadata
-table below. Friendly aliases (`aion.float32`, ...) are the `AionDType` enum
+`normalize_dtype` and the single metadata table below. Friendly aliases (`aion.float32`, ...) are the `AionDType` enum
 members re-exported under short names, so they work anywhere an `AionDType` does.
 """
 from __future__ import annotations
@@ -20,29 +19,21 @@ from .types import DTypeLike
 
 @dataclass(frozen=True)
 class DTypeInfo:
-    """Everything the Python layer needs to move a dtype across the C ABI.
-
-    `np_name`/`c_elem` are None for quantized dtypes (no host scalar form):
-    those have no numpy array representation and no per-element read/write path.
-    """
+    """What the Python layer knows about a dtype. `np_name` is None for a quantized
+    dtype, which has no host element form (no numpy array, no DLPack export)."""
 
     enum: AionDType
     np_name: Optional[str]   # numpy dtype name, or None for quantized
-    c_elem: Optional[str]    # cffi element type for ffi.new / ffi.from_buffer
-    itemsize: int            # bytes per logical element (0 for quantized)
     is_quantized: bool
 
 
-# cffi has no half type, so f16's buffer element is uint16_t: the C ABI's
-# read/write take a void* + element *count*, and 2 bytes/elem over n elems is a
-# byte-exact reinterpret of an np.float16 array (same trick Tensor.zero uses).
 _TABLE: dict[AionDType, DTypeInfo] = {
-    AionDType.AION_DTYPE_F32:  DTypeInfo(AionDType.AION_DTYPE_F32,  "float32", "float",    4, False),
-    AionDType.AION_DTYPE_F16:  DTypeInfo(AionDType.AION_DTYPE_F16,  "float16", "uint16_t", 2, False),
-    AionDType.AION_DTYPE_I8:   DTypeInfo(AionDType.AION_DTYPE_I8,   "int8",    "int8_t",   1, False),
-    AionDType.AION_DTYPE_I32:  DTypeInfo(AionDType.AION_DTYPE_I32,  "int32",   "int32_t",  4, False),
-    AionDType.AION_DTYPE_Q8_0: DTypeInfo(AionDType.AION_DTYPE_Q8_0, None,      None,       0, True),
-    AionDType.AION_DTYPE_Q4_0: DTypeInfo(AionDType.AION_DTYPE_Q4_0, None,      None,       0, True),
+    AionDType.AION_DTYPE_F32:  DTypeInfo(AionDType.AION_DTYPE_F32,  "float32", False),
+    AionDType.AION_DTYPE_F16:  DTypeInfo(AionDType.AION_DTYPE_F16,  "float16", False),
+    AionDType.AION_DTYPE_I8:   DTypeInfo(AionDType.AION_DTYPE_I8,   "int8",    False),
+    AionDType.AION_DTYPE_I32:  DTypeInfo(AionDType.AION_DTYPE_I32,  "int32",   False),
+    AionDType.AION_DTYPE_Q8_0: DTypeInfo(AionDType.AION_DTYPE_Q8_0, None,      True),
+    AionDType.AION_DTYPE_Q4_0: DTypeInfo(AionDType.AION_DTYPE_Q4_0, None,      True),
 }
 
 _DISPLAY_NAMES: dict[AionDType, str] = {
@@ -120,16 +111,6 @@ def numpy_dtype(dtype: DTypeLike) -> "np.dtype[Any]":
     return np.dtype(di.np_name)
 
 
-def c_elem(dtype: DTypeLike) -> str:
-    """cffi element type name for a scalar Aion dtype; raises for quantized."""
-    di = info(dtype)
-    if di.c_elem is None:
-        raise NotImplementedError(
-            f"{dtype_name(di.enum)} has no per-element host buffer type"
-        )
-    return di.c_elem
-
-
 def is_quantized(dtype: DTypeLike) -> bool:
     return info(dtype).is_quantized
 
@@ -148,7 +129,6 @@ __all__ = [
     "normalize_dtype",
     "info",
     "numpy_dtype",
-    "c_elem",
     "is_quantized",
     "float32",
     "float16",

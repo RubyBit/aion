@@ -2,15 +2,13 @@
 """Typed façade for context, model, and tensor C ABI operations."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-import struct
-from typing import Literal
+from collections.abc import Sequence
+from typing import Any, Literal
 
 from ..device import GpuOptions, normalize_gpu_backend, normalize_gpu_power
-from ..dtype import c_elem
 from ..enums import AionDType
 from ._raw import ffi, lib
-from .dlpack import HostView, view_of_buffer
+from .dlpack import HostView
 from .handles import ContextHandle, ModelHandle, TensorHandle
 from .status import raise_for_status
 
@@ -209,22 +207,6 @@ def create_empty_tensor(
     return TensorHandle(out[0])
 
 
-def create_tensor(
-    ctx: ContextHandle,
-    dtype: AionDType,
-    shape: Sequence[int],
-    values: Iterable[int | float],
-) -> TensorHandle:
-    """A new tensor holding plain Python `values` (row-major)."""
-    handle = create_empty_tensor(ctx, dtype, shape)
-    try:
-        write_tensor(ctx, handle, values, shape=shape)
-    except BaseException:
-        destroy_tensor(handle)
-        raise
-    return handle
-
-
 def quantize_tensor(
     ctx: ContextHandle,
     dtype: AionDType,
@@ -272,7 +254,7 @@ def tensor_shape(ctx: ContextHandle, tensor: TensorHandle) -> tuple[int, ...]:
 
 
 def write_view(ctx: ContextHandle, tensor: TensorHandle, source: HostView) -> None:
-    """Copy host memory into `tensor` (same shape; floats convert among themselves)."""
+    """Copy host memory into `tensor` (same shape; the core converts within a kind)."""
     status = lib.aion_tensor_write(tensor.raw, source.ptr)
     raise_for_status(status, ctx, what="aion_tensor_write")
 
@@ -285,53 +267,35 @@ def read_view(ctx: ContextHandle, tensor: TensorHandle, target: HostView) -> Non
     raise_for_status(status, ctx, what="aion_tensor_read")
 
 
-def read_tensor(
-    ctx: ContextHandle,
-    tensor: TensorHandle,
-    element_count: int,
-) -> list[int | float]:
-    dtype = tensor_dtype(tensor)
-    buf = ffi.new(f"{c_elem(dtype)}[]", int(element_count))
-    read_view(ctx, tensor, view_of_buffer(buf, dtype, tensor_shape(ctx, tensor)))
-    if dtype == AionDType.AION_DTYPE_F32:
-        return [float(buf[i]) for i in range(element_count)]
-    if dtype == AionDType.AION_DTYPE_F16:
-        return [
-            struct.unpack("=e", struct.pack("=H", int(buf[i])))[0]
-            for i in range(element_count)
-        ]
-    return [int(buf[i]) for i in range(element_count)]
+def tensor_from_dlpack(ctx: ContextHandle, managed: Any, dtype: AionDType | None) -> TensorHandle:
+    """A tensor of `managed`'s data (a `DLManagedTensorVersioned*` the core owns on
+    success): its memory borrowed when it already is what the tensor needs, else
+    converted in one copy. `dtype` None keeps the data's own."""
+    c_dtype = ffi.NULL if dtype is None else ffi.new("AionDType*", int(dtype))
+    out = ffi.new("AionTensor**")
+    status = lib.aion_tensor_from_dlpack(ctx.raw, managed, c_dtype, out)
+    raise_for_status(status, ctx, what="aion_tensor_from_dlpack")
+    return TensorHandle(out[0])
 
 
-def write_tensor(
-    ctx: ContextHandle,
-    tensor: TensorHandle,
-    values: Iterable[int | float],
-    *,
-    shape: Sequence[int] | None = None,
-) -> None:
-    """Write plain Python `values` (row-major) into `tensor`."""
-    dtype = tensor_dtype(tensor)
-    buf = ffi.new(f"{c_elem(dtype)}[]", list(values))
-    dims = tensor_shape(ctx, tensor) if shape is None else tuple(shape)
-    write_view(ctx, tensor, view_of_buffer(buf, dtype, dims))
+def zero_tensor(ctx: ContextHandle, tensor: TensorHandle) -> None:
+    status = lib.aion_tensor_zero(tensor.raw)
+    raise_for_status(status, ctx, what="aion_tensor_zero")
 
 
-def zero_tensor(
-    ctx: ContextHandle,
-    tensor: TensorHandle,
-    element_count: int,
-) -> None:
-    dtype = tensor_dtype(tensor)
-    buf = ffi.new(f"{c_elem(dtype)}[]", int(element_count))  # zero-initialized
-    write_view(ctx, tensor, view_of_buffer(buf, dtype, tensor_shape(ctx, tensor)))
+def tensor_to_dlpack(ctx: ContextHandle, tensor: TensorHandle) -> Any:
+    """The tensor's bytes as a read-only `DLManagedTensorVersioned*`, shared, not
+    copied; whoever ends up owning it calls its deleter once."""
+    out = ffi.new("DLManagedTensorVersioned**")
+    status = lib.aion_tensor_to_dlpack(tensor.raw, out)
+    raise_for_status(status, ctx, what="aion_tensor_to_dlpack")
+    return out[0]
 
 
 __all__ = [
     "bind_model_input",
     "create_context",
     "create_empty_tensor",
-    "create_tensor",
     "destroy_context",
     "destroy_model",
     "destroy_tensor",
@@ -345,7 +309,6 @@ __all__ = [
     "model_rank",
     "move_tensor",
     "quantize_tensor",
-    "read_tensor",
     "read_view",
     "reset_model_state",
     "run_model",
@@ -353,8 +316,9 @@ __all__ = [
     "set_state_input_policy",
     "tensor_device",
     "tensor_dtype",
+    "tensor_from_dlpack",
     "tensor_shape",
-    "write_tensor",
+    "tensor_to_dlpack",
     "write_view",
     "zero_tensor",
 ]

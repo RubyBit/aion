@@ -4,9 +4,11 @@
 //!
 //! `elem` is what the bytes ARE, independent of the dtype a tensor stores, so a
 //! bf16 checkpoint reads straight into an f32 or f16 tensor, or into a quantizer,
-//! with no bf16 dtype in the core. Floats convert among themselves (rounding to the
-//! nearest even when narrowing); integers only copy to their own width. Elements
-//! are in native byte order, as DLPack defines them.
+//! and a float64 or int64 array (numpy's defaults) straight into an f32 or i32
+//! one, with no such dtypes in the core. Floats convert among themselves (rounding
+//! to the nearest even when narrowing); integers convert among themselves, and a
+//! value that does not fit the narrower type is an error, never wrapped. Kinds
+//! never mix. Elements are in native byte order, as DLPack defines them.
 //!
 //! A view owns nothing. `HostView` is read-only; only a `HostViewMut` -- a
 //! destination the caller hands over for writing -- can be written through.
@@ -21,14 +23,17 @@ pub const Error = error{InvalidArgument};
 
 /// What a view's bytes are, element by element.
 pub const Elem = enum {
+    f64,
     f32,
     f16,
     bf16,
+    i64,
     i32,
     i8,
 
     pub fn bytes(self: Elem) usize {
         return switch (self) {
+            .f64, .i64 => 8,
             .f32, .i32 => 4,
             .f16, .bf16 => 2,
             .i8 => 1,
@@ -37,8 +42,8 @@ pub const Elem = enum {
 
     fn isFloat(self: Elem) bool {
         return switch (self) {
-            .f32, .f16, .bf16 => true,
-            .i32, .i8 => false,
+            .f64, .f32, .f16, .bf16 => true,
+            .i64, .i32, .i8 => false,
         };
     }
 
@@ -53,10 +58,10 @@ pub const Elem = enum {
         };
     }
 
-    /// Whether values convert between `self` and `other` without changing kind.
+    /// Whether values convert between `self` and `other`: the same kind, float or
+    /// integer (an integer narrowing can still fail on a value that does not fit).
     pub fn convertsTo(self: Elem, other: Elem) bool {
-        if (self.isFloat()) return other.isFloat();
-        return self == other;
+        return self.isFloat() == other.isFloat();
     }
 };
 
@@ -121,14 +126,13 @@ pub fn View(comptime mutable: bool) type {
                 return;
             }
             if (self.transposedRows(first, n)) |rows| {
-                readTransposed(self.elem, to, self.data, self.shape[1], self.strides.?[1], rows.first, rows.count, out.ptr);
-                return;
+                return readTransposed(self.elem, to, self.data, self.shape[1], self.strides.?[1], rows.first, rows.count, out.ptr);
             }
             var cur = Cursor.init(self.shape, self.strides, first);
             var copied: usize = 0;
             while (copied < n) {
                 const run = cur.run(n - copied);
-                convertRun(self.elem, self.data, cur.offset, cur.step(), to, out.ptr + copied * to.bytes(), 1, run);
+                try convertRun(self.elem, self.data, cur.offset, cur.step(), to, out.ptr + copied * to.bytes(), 1, run);
                 copied += run;
                 cur.advance(run);
             }
@@ -154,7 +158,7 @@ pub fn View(comptime mutable: bool) type {
             var copied: usize = 0;
             while (copied < n) {
                 const run = cur.run(n - copied);
-                convertRun(from, src.ptr + copied * from.bytes(), 0, 1, self.elem, at(self.data, cur.offset, self.elem), cur.step(), run);
+                try convertRun(from, src.ptr + copied * from.bytes(), 0, 1, self.elem, at(self.data, cur.offset, self.elem), cur.step(), run);
                 copied += run;
                 cur.advance(run);
             }
@@ -246,14 +250,14 @@ fn at(base: anytype, elems: isize, elem: Elem) @TypeOf(base) {
 
 /// Convert `n` elements from `src` (element offset `src_off`, stepping `src_step`)
 /// to `dst` (stepping `dst_step`). Kinds were checked by the caller.
-fn convertRun(from: Elem, src: [*]const u8, src_off: isize, src_step: isize, to: Elem, dst: [*]u8, dst_step: isize, n: usize) void {
+fn convertRun(from: Elem, src: [*]const u8, src_off: isize, src_step: isize, to: Elem, dst: [*]u8, dst_step: isize, n: usize) Error!void {
     switch (from) {
         inline else => |f| switch (to) {
             inline else => |t| if (comptime f.convertsTo(t)) {
                 var s: isize = src_off;
                 var d: isize = 0;
                 for (0..n) |_| {
-                    convertOne(f, t, at(src, s, f), at(dst, d, t));
+                    try convertOne(f, t, at(src, s, f), at(dst, d, t));
                     s += src_step;
                     d += dst_step;
                 }
@@ -262,11 +266,27 @@ fn convertRun(from: Elem, src: [*]const u8, src_off: isize, src_step: isize, to:
     }
 }
 
-inline fn convertOne(comptime from: Elem, comptime to: Elem, sp: [*]const u8, dp: [*]u8) void {
-    if (comptime from.isFloat()) {
-        storeFloat(to, dp, loadFloat(from, sp));
-    } else {
+/// One element: floats through f32 (f64 when either side is f64), integers
+/// through i64, failing when the value does not fit `to`.
+inline fn convertOne(comptime from: Elem, comptime to: Elem, sp: [*]const u8, dp: [*]u8) Error!void {
+    if (comptime from == to) {
         @memcpy(dp[0..from.bytes()], sp[0..from.bytes()]);
+    } else if (comptime from.isFloat()) {
+        const Wide = if (from == .f64 or to == .f64) f64 else f32;
+        storeFloat(to, dp, loadFloat(from, Wide, sp));
+    } else {
+        const v: i64 = switch (from) {
+            .i64 => @as(*align(1) const i64, @ptrCast(sp)).*,
+            .i32 => @as(*align(1) const i32, @ptrCast(sp)).*,
+            .i8 => @as(*align(1) const i8, @ptrCast(sp)).*,
+            else => comptime unreachable,
+        };
+        switch (to) {
+            .i64 => @as(*align(1) i64, @ptrCast(dp)).* = v,
+            .i32 => @as(*align(1) i32, @ptrCast(dp)).* = std.math.cast(i32, v) orelse return error.InvalidArgument,
+            .i8 => @as(*align(1) i8, @ptrCast(dp)).* = std.math.cast(i8, v) orelse return error.InvalidArgument,
+            else => comptime unreachable,
+        }
     }
 }
 
@@ -274,7 +294,7 @@ inline fn convertOne(comptime from: Elem, comptime to: Elem, sp: [*]const u8, dp
 /// elements between columns) into row-major `out`, in square tiles: each tile reads
 /// the source down its unit-stride axis and stays in cache while its transpose is
 /// written.
-fn readTransposed(from: Elem, to: Elem, data: [*]const u8, cols: usize, col_step: isize, row0: usize, rows: usize, out: [*]u8) void {
+fn readTransposed(from: Elem, to: Elem, data: [*]const u8, cols: usize, col_step: isize, row0: usize, rows: usize, out: [*]u8) Error!void {
     switch (from) {
         inline else => |f| switch (to) {
             inline else => |t| if (comptime f.convertsTo(t)) {
@@ -289,7 +309,7 @@ fn readTransposed(from: Elem, to: Elem, data: [*]const u8, cols: usize, col_step
                             // Column `c` of the logical view is contiguous in the source.
                             const base: isize = @as(isize, @intCast(row0)) + @as(isize, @intCast(c)) * col_step;
                             for (r0..r1) |r| {
-                                convertOne(f, t, at(data, base + @as(isize, @intCast(r)), f), out + (r * cols + c) * t.bytes());
+                                try convertOne(f, t, at(data, base + @as(isize, @intCast(r)), f), out + (r * cols + c) * t.bytes());
                             }
                         }
                     }
@@ -299,21 +319,24 @@ fn readTransposed(from: Elem, to: Elem, data: [*]const u8, cols: usize, col_step
     }
 }
 
-fn loadFloat(comptime elem: Elem, p: [*]const u8) f32 {
+fn loadFloat(comptime elem: Elem, comptime T: type, p: [*]const u8) T {
     return switch (elem) {
+        .f64 => @floatCast(@as(*align(1) const f64, @ptrCast(p)).*),
         .f32 => @as(*align(1) const f32, @ptrCast(p)).*,
         .f16 => @as(*align(1) const f16, @ptrCast(p)).*,
-        .bf16 => @bitCast(@as(u32, @as(*align(1) const u16, @ptrCast(p)).*) << 16),
-        .i32, .i8 => comptime unreachable,
+        .bf16 => bf16ToF32(@as(*align(1) const u16, @ptrCast(p)).*),
+        .i64, .i32, .i8 => comptime unreachable,
     };
 }
 
-fn storeFloat(comptime elem: Elem, p: [*]u8, v: f32) void {
+fn storeFloat(comptime elem: Elem, p: [*]u8, v: anytype) void {
     switch (elem) {
-        .f32 => @as(*align(1) f32, @ptrCast(p)).* = v,
+        .f64 => @as(*align(1) f64, @ptrCast(p)).* = v,
+        .f32 => @as(*align(1) f32, @ptrCast(p)).* = @floatCast(v),
         .f16 => @as(*align(1) f16, @ptrCast(p)).* = @floatCast(v),
-        .bf16 => @as(*align(1) u16, @ptrCast(p)).* = bf16FromF32(v),
-        .i32, .i8 => comptime unreachable,
+        // Through f32 first: bf16 keeps f32's exponent, so only its mantissa rounds.
+        .bf16 => @as(*align(1) u16, @ptrCast(p)).* = bf16FromF32(@floatCast(v)),
+        .i64, .i32, .i8 => comptime unreachable,
     }
 }
 
@@ -380,7 +403,7 @@ test "host view: negative strides, f16 targets, and writes through a mutable vie
     for (dst, [_]f32{ 1, 3, 2, 4 }) |d, want| try std.testing.expectEqual(want, bf16ToF32(d));
 }
 
-test "host view: integers only copy to their own width; kinds never mix" {
+test "host view: integers narrow only when they fit; kinds never mix" {
     var ints = [_]i32{ 7, -8 };
     const view = HostView.contiguous(.i32, &.{2}, std.mem.sliceAsBytes(&ints));
     var out: [2]i32 = undefined;
@@ -388,7 +411,33 @@ test "host view: integers only copy to their own width; kinds never mix" {
     try std.testing.expectEqualSlices(i32, &ints, &out);
     var floats: [2]f32 = undefined;
     try std.testing.expectError(error.InvalidArgument, view.readF32(0, &floats));
-    try std.testing.expectError(error.InvalidArgument, view.read(.i8, 0, std.mem.sliceAsBytes(out[0..0])));
+
+    // int64 (numpy's default) narrows to i32 and i8 while every value fits.
+    var wide = [_]i64{ 3, -120, 1 << 20 };
+    const wide_view = HostView.contiguous(.i64, &.{3}, std.mem.sliceAsBytes(&wide));
+    var narrow: [3]i32 = undefined;
+    try wide_view.read(.i32, 0, std.mem.sliceAsBytes(&narrow));
+    try std.testing.expectEqualSlices(i32, &.{ 3, -120, 1 << 20 }, &narrow);
+    var bytes: [2]i8 = undefined;
+    try wide_view.read(.i8, 0, std.mem.sliceAsBytes(&bytes));
+    try std.testing.expectEqualSlices(i8, &.{ 3, -120 }, &bytes);
+    var all_bytes: [3]i8 = undefined;
+    try std.testing.expectError(error.InvalidArgument, wide_view.read(.i8, 0, std.mem.sliceAsBytes(&all_bytes)));
+    wide[0] = 1 << 40;
+    try std.testing.expectError(error.InvalidArgument, wide_view.read(.i32, 0, std.mem.sliceAsBytes(&narrow)));
+}
+
+test "host view: float64 rounds once to each narrower float" {
+    // 1 + 2^-11 + 2^-40: nearer 1 + 2^-10 than 1 in f16, but an f32 stop on the way
+    // would drop the 2^-40 and leave an exact tie that rounds down to 1.
+    var src = [_]f64{ 1.0 + 0x1p-11 + 0x1p-40, -2.5 };
+    const view = HostView.contiguous(.f64, &.{2}, std.mem.sliceAsBytes(&src));
+    var halves: [2]f16 = undefined;
+    try view.read(.f16, 0, std.mem.sliceAsBytes(&halves));
+    try std.testing.expectEqualSlices(f16, &.{ 1.0 + 0x1p-10, -2.5 }, &halves);
+    var singles: [2]f32 = undefined;
+    try view.readF32(0, &singles);
+    try std.testing.expectEqualSlices(f32, &.{ @floatCast(src[0]), -2.5 }, &singles);
 }
 
 test "host view: bf16 rounding is to nearest even" {

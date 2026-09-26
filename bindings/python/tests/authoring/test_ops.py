@@ -213,6 +213,7 @@ def test_validation_diagnostic_survives_builder_destruction(ctx):
             x = b.input((3, 3)).rename("x")
             b.max_pool2d(x, 2, 2)
     error = raised.value
+    assert error.diagnostic is not None
     assert error.diagnostic.phase == "validation"
     assert error.diagnostic.operation == "MaxPool2D"
     assert error.diagnostic.code == "RankMismatch"

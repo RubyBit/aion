@@ -14,6 +14,7 @@ const grow = @import("manager/grow.zig");
 
 pub const StorageError = storage_mod.StorageError;
 pub const Tensor = storage_mod.Tensor;
+pub const SharedBytes = storage_mod.SharedBytes;
 pub const DeviceRef = storage_mod.DeviceRef;
 pub const DType = types.DType;
 pub const Cache = cache_mod.Cache;
@@ -260,13 +261,13 @@ pub const StorageManager = struct {
         return @intCast(idx_usize);
     }
 
-    /// A host tensor whose bytes are `bytes` of `mapping`, used in place (see
-    /// `storage.Mapping`). The tensor holds a reference to the mapping until its bytes
-    /// are released or copied.
-    pub fn createMappedTensor(self: *Self, dtype: DType, shape: []const usize, bytes: []const u8, mapping: *storage_mod.Mapping, opts: Tensor.InitOptions) StorageError!TensorId {
+    /// A host tensor whose bytes are `bytes` of `shared`, used in place (see
+    /// `storage.SharedBytes`). The tensor holds a reference until its bytes are
+    /// released or copied.
+    pub fn createSharedTensor(self: *Self, dtype: DType, shape: []const usize, bytes: []const u8, shared: *storage_mod.SharedBytes, opts: Tensor.InitOptions) StorageError!TensorId {
         var t: *Tensor = self.allocator.create(Tensor) catch return StorageError.OutOfMemory;
         errdefer self.allocator.destroy(t);
-        try t.initMapped(self.allocator, dtype, shape, bytes, mapping, opts);
+        try t.initShared(self.allocator, dtype, shape, bytes, shared, opts);
         errdefer t.deinit();
         const idx: usize = self.tensors.items.len;
         self.tensors.append(self.allocator, t) catch return StorageError.OutOfMemory;
@@ -343,6 +344,20 @@ pub const StorageManager = struct {
         return self.getMut(try self.backingId(id));
     }
 
+    /// The host bytes `id` reads (its backing's, for a workspace alias) and a
+    /// reference that keeps them valid whatever later happens to the tensor, which
+    /// the caller releases. See `Tensor.shareBytes`.
+    pub fn shareHostBytes(self: *Self, id: TensorId) StorageError!struct { shared: *storage_mod.SharedBytes, bytes: []const u8 } {
+        const len = try (try self.getConst(id)).byteLen();
+        const t = try self.backingMut(id);
+        const shared = try t.shareBytes();
+        if (t.data.len < len) {
+            shared.release();
+            return StorageError.InvalidArgument;
+        }
+        return .{ .shared = shared, .bytes = t.data[0..len] };
+    }
+
     /// Make `id` a logical view of `owner`'s physical workspace allocation.
     /// Aliases are deliberately one level deep and never own backing bytes.
     pub fn aliasTensorBacking(self: *Self, id: TensorId, owner: TensorId) StorageError!void {
@@ -364,7 +379,7 @@ pub const StorageManager = struct {
             t.backing_bytes = t.data.len;
             return;
         }
-        if (t.data.len != 0 and t.owns_data) self.allocator.free(t.data);
+        t.dropHostBytes();
         t.data = self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(64), bytes) catch return StorageError.OutOfMemory;
         @memset(t.data, 0);
         t.owns_data = true;

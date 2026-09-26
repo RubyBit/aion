@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import math
-import struct
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Optional, Sequence, cast
 
 from .device import DeviceLike, _device_to_str, _normalize_device
 from .dtype import (
@@ -12,194 +11,44 @@ from .dtype import (
     float32,
     is_quantized as _is_quant,
     normalize_dtype,
+    numpy_dtype,
     q8_0,
 )
 from .context import Context
-from ._ffi._raw import ffi
-from ._ffi.dlpack import HostView, view_of, view_of_buffer
+from ._ffi.dlpack import dtype_kind, empty_view, export_capsule, host_view
 from ._ffi.handles import TensorHandle
 from ._ffi.runtime import (
     create_empty_tensor,
-    create_tensor,
     destroy_tensor,
     move_tensor,
     quantize_tensor,
-    read_tensor,
+    read_view,
     tensor_device,
     tensor_dtype,
+    tensor_from_dlpack,
     tensor_shape,
-    write_tensor,
+    tensor_to_dlpack,
+    write_view,
     zero_tensor,
 )
-from .enums import AionDType
+from .enums import AionDeviceKind, AionDType
 from .types import ArrayLike, DTypeLike, NDArray
 
 type TensorData = int | float | list[TensorData]
 
 if TYPE_CHECKING:
-    from .builder import Builder, TensorRef
-    from .model import LoadedModel
+    from typing_extensions import CapsuleType
 
-def _as_shape(shape: Sequence[int]) -> list[int]:
-    if isinstance(shape, (list, tuple)):
-        shp = [int(x) for x in shape]
-    else:
-        shp = [int(x) for x in shape]
+    from .builder import Builder, TensorRef
+
+_KDL_CPU = 1
+
+
+def _as_shape(shape: Sequence[int]) -> tuple[int, ...]:
+    shp = tuple(int(x) for x in shape)
     if any(d < 0 for d in shp):
         raise ValueError("shape dims must be >= 0")
     return shp
-
-
-def _elem_count(shape: Sequence[int]) -> int:
-    if len(shape) == 0:
-        return 1
-    return int(math.prod(int(x) for x in shape))
-
-
-def _float_view(values: object, shape: Sequence[int]) -> HostView:
-    """Float `values` of `shape` as a host view the core reads in place: anything
-    exporting ``__dlpack__`` as it is (any float dtype, strided, bf16 included),
-    else a numpy array or nested list copied to float32."""
-    shp = tuple(int(d) for d in shape)
-    if hasattr(values, "__dlpack__"):
-        view = view_of(values)
-        if view.shape != shp:
-            try:
-                view = view_of(values.reshape(shp))  # type: ignore[attr-defined]
-            except Exception:
-                raise ValueError(f"expected shape {shp}, got {view.shape}") from None
-        return view
-    _, flat = _flatten_nested(values)
-    n = _elem_count(list(shp))
-    if len(flat) != n:
-        raise ValueError(f"expected {n} values for shape {shp}, got {len(flat)}")
-    return view_of_buffer(ffi.new("float[]", [float(v) for v in flat]), AionDType.AION_DTYPE_F32, shp)
-
-
-def _flatten_nested(data) -> tuple[tuple[int, ...], list[float]]:
-    """Infer shape and flatten nested Python sequences to f32 values."""
-
-    if isinstance(data, (int, float)):
-        return (), [float(data)]
-
-    if isinstance(data, (list, tuple)):
-        if len(data) == 0:
-            return (0,), []
-
-        child_shape, child_vals = _flatten_nested(data[0])
-        out_vals: list[float] = list(child_vals)
-        for item in data[1:]:
-            shp, vals = _flatten_nested(item)
-            if shp != child_shape:
-                raise ValueError(f"ragged nested sequence is not supported: {shp} != {child_shape}")
-            out_vals.extend(vals)
-
-        return (len(data),) + child_shape, out_vals
-
-    # Treat other iterables (e.g. range) as 1D.
-    try:
-        seq = list(data)
-    except TypeError as e:
-        raise TypeError("Tensor data must be a scalar or nested sequence") from e
-    return _flatten_nested(seq)
-
-
-def _flatten_nested_i32(data) -> tuple[tuple[int, ...], list[int]]:
-    """Infer shape and flatten nested Python sequences to i32 values."""
-
-    if isinstance(data, bool):
-        return (), [int(data)]
-    if isinstance(data, (int, float)):
-        return (), [int(data)]
-
-    if isinstance(data, (list, tuple)):
-        if len(data) == 0:
-            return (0,), []
-
-        child_shape, child_vals = _flatten_nested_i32(data[0])
-        out_vals: list[int] = list(child_vals)
-        for item in data[1:]:
-            shp, vals = _flatten_nested_i32(item)
-            if shp != child_shape:
-                raise ValueError(f"ragged nested sequence is not supported: {shp} != {child_shape}")
-            out_vals.extend(vals)
-
-        return (len(data),) + child_shape, out_vals
-
-    # Treat other iterables (e.g. range) as 1D.
-    try:
-        seq = list(data)
-    except TypeError as e:
-        raise TypeError("Tensor data must be a scalar or nested sequence") from e
-    return _flatten_nested_i32(seq)
-
-
-def _try_numpy():
-    try:
-        import numpy as np
-
-        return np
-    except ImportError:
-        return None
-
-
-def _native_values(
-    dtype: AionDType, values: Iterable[int | float]
-) -> list[int | float]:
-    """Convert Python numbers to the host buffer representation for ``dtype``."""
-    if dtype == AionDType.AION_DTYPE_F32:
-        return [float(value) for value in values]
-    if dtype == AionDType.AION_DTYPE_F16:
-        return [
-            struct.unpack("=H", struct.pack("=e", float(value)))[0]
-            for value in values
-        ]
-    if dtype in (AionDType.AION_DTYPE_I8, AionDType.AION_DTYPE_I32):
-        return [int(value) for value in values]
-    raise NotImplementedError(
-        f"{dtype_name(dtype)} has no per-element host write path"
-    )
-
-
-def _flatten_for_dtype(
-    data: ArrayLike, dtype: AionDType
-) -> tuple[tuple[int, ...], list[int | float]]:
-    if dtype in (AionDType.AION_DTYPE_F32, AionDType.AION_DTYPE_F16):
-        return _flatten_nested(data)
-    if dtype in (AionDType.AION_DTYPE_I8, AionDType.AION_DTYPE_I32):
-        shape, values = _flatten_nested_i32(data)
-        return shape, cast(list[int | float], values)
-    raise NotImplementedError(
-        f"{dtype_name(dtype)} has no per-element host write path"
-    )
-
-
-def _infer_construct_dtype(data) -> AionDType:
-    """Preserve supported NumPy dtypes; default other numbers to I32/F32."""
-    np = _try_numpy()
-    if np is not None:
-        try:
-            array_dtype = np.asarray(data).dtype
-        except (TypeError, ValueError):
-            pass
-        else:
-            if isinstance(data, (np.ndarray, np.generic)) and array_dtype in (
-                np.dtype("float16"), np.dtype("float32"), np.dtype("int8"), np.dtype("int32")
-            ):
-                return normalize_dtype(array_dtype)
-            if np.issubdtype(array_dtype, np.integer):
-                return AionDType.AION_DTYPE_I32
-    if isinstance(data, int) and not isinstance(data, bool):
-        return AionDType.AION_DTYPE_I32
-    if isinstance(data, (list, tuple)) and data:
-        if all(_infer_construct_dtype(item) == AionDType.AION_DTYPE_I32 for item in data):
-            return AionDType.AION_DTYPE_I32
-    return AionDType.AION_DTYPE_F32
-
-
-def _is_ndarray(x) -> bool:
-    np = _try_numpy()
-    return np is not None and isinstance(x, np.ndarray)
 
 
 class Tensor:
@@ -210,6 +59,12 @@ class Tensor:
     are built from `TensorRef`s on a `Builder`, which is the single graph
     representation (and the same split the Zig API makes between `api.Tensor` and
     `TensorRef`).
+
+    Data comes in from anything exporting ``__dlpack__`` (numpy, PyTorch, JAX, ...)
+    or from Python numbers and nested sequences, and goes out, without copying, to
+    any DLPack consumer: ``np.from_dlpack(t)`` / ``torch.from_dlpack(t)`` give a
+    read-only view of the tensor's bytes as they are now. `numpy` and `tolist`
+    copy.
     """
 
     # Instance attributes (assigned in `_init_from_handle`; declared here so type
@@ -229,63 +84,40 @@ class Tensor:
         dtype: DTypeLike | None = None,
         device: DeviceLike = None,
     ) -> None:
-        """Create a tensor from Python data.
+        """Create a tensor from host data.
 
         Examples:
-            Tensor([1, 2, 3])
+            Tensor(np_f32_array)                     # borrowed: no copy
+            Tensor(torch_bf16_weight)                # converted once -> float32
+            Tensor([1, 2, 3])                        # int32
             Tensor([[1, 2], [3, 4]], dtype=aion.float32)
-            Tensor([1, 2, 3], device="gpu")   # built on CPU, then migrated
+            Tensor([1, 2, 3], device="gpu")          # built on CPU, then migrated
 
-        `device` migrates the tensor after it is built and written on the CPU
-        (move semantics: the host copy is freed). Host conversion and mutation
-        then fail until you migrate back with ``.to("cpu")``.
+        The dtype follows the data unless `dtype` is given: float16 and int8 stay,
+        other floats become float32 and other integers int32.
+
+        A DLPack exporter's memory is BORROWED when it already is the tensor's (its
+        dtype, row-major): nothing is copied, and the exporter's later writes show
+        through. Aion never writes it; a write to the tensor (or a model run into
+        it) goes to a private copy first. Anything else is converted in one copy.
+
+        `device` migrates the tensor after it is built on the CPU (move semantics:
+        the host bytes are let go). Host conversion and mutation then fail until
+        you migrate back with ``.to("cpu")``.
         """
-
         from .context import get_default_context
 
         if ctx is None:
             ctx = get_default_context()
-        if dtype is None:
-            dtype = _infer_construct_dtype(data)
-        else:
-            dtype = normalize_dtype(dtype)
-        if dtype in (AionDType.AION_DTYPE_Q4_0, AionDType.AION_DTYPE_Q8_0):
-            raise NotImplementedError("quantized tensor construction is not supported by the current C ABI")
-
-        np = _try_numpy()
-        if np is not None and isinstance(data, np.ndarray):
-            from .numpy import _tensor_from_numpy
-
-            self._take(_tensor_from_numpy(ctx, data, dtype=dtype))
-            if device is not None:
-                self.to(device)
-            return
-        if np is not None and dtype not in (
-            AionDType.AION_DTYPE_F32,
-            AionDType.AION_DTYPE_I32,
-        ):
-            from .numpy import _tensor_from_numpy
-
-            self._take(_tensor_from_numpy(ctx, data, dtype=dtype))
-            if device is not None:
-                self.to(device)
-            return
-
-        shape, vals = _flatten_for_dtype(data, dtype)
-
-        shp = _as_shape(shape)
-        n = _elem_count(shp)
-        if len(vals) != n:
-            raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
-
-        # The native runtime currently represents a scalar as shape (1,).
-        if len(shp) == 0:
-            shp = [1]
-        native_values = _native_values(dtype, vals)
-
-        handle = create_tensor(ctx.ptr, dtype, shp, native_values)
-        self._init_from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
-
+        want = normalize_dtype(dtype) if dtype is not None else None
+        if want is not None and _is_quant(want):
+            raise NotImplementedError("use Tensor.quantize for quantized tensors")
+        view = host_view(data, want)
+        # The core borrows or converts; one of our own packed buffers (float64 or
+        # int64, never a tensor dtype) is always converted, so it is never kept.
+        with view.transfer() as managed:
+            handle = tensor_from_dlpack(ctx.ptr, managed, want)
+        self._init_from_handle(ctx, handle)
         if device is not None:
             self.to(device)
 
@@ -308,20 +140,6 @@ class Tensor:
         if not hasattr(self, "_name"):
             self._name = None
 
-    def _take(self, other: "Tensor") -> None:
-        """Adopt `other`'s handle, leaving it closed. Used by the numpy paths,
-        which build a finished tensor that `__init__` must become."""
-        handle = other._require_handle()
-        self._init_from_handle(
-            other._ctx_owner,
-            handle,
-            dtype=other._dtype_cache,
-            shape=other._shape_cache,
-        )
-        other._t = None
-        other._closed = True
-
-
     @classmethod
     def _from_handle(
         cls,
@@ -334,7 +152,6 @@ class Tensor:
         self = cls.__new__(cls)
         self._init_from_handle(ctx, ptr, dtype=dtype, shape=shape)
         return self
-
 
     @property
     def ptr(self) -> TensorHandle:
@@ -366,27 +183,6 @@ class Tensor:
             raise RuntimeError("Tensor has no concrete native handle")
         return self._t
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def rename(self, name: str) -> "Tensor":
         """Set the name this tensor carries into a graph.
 
@@ -400,29 +196,26 @@ class Tensor:
     def ndim(self) -> int:
         return len(self.shape)
 
-    # --- materialization ---------------------------------------------------
-
+    # --- placement ---------------------------------------------------------
 
     def to(self, device: DeviceLike) -> "Tensor":
         """Migrate this tensor to `device` (move semantics; returns self).
 
-        The source-device copy is freed. Migrating off the CPU makes host
-        `read_*`/`write_*` fail until you migrate back with ``.to("cpu")``.
-        Idempotent when already on the target device. Accepts ``"cpu"``,
-        ``"gpu"``, ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind``.
-            """
-
+        The source-device copy is freed. Migrating off the CPU makes host reads
+        and writes fail until you migrate back with ``.to("cpu")``. Idempotent
+        when already on the target device. Accepts ``"cpu"``, ``"gpu"``,
+        ``"gpu:N"``, ``(kind, index)``, or an `AionDeviceKind`.
+        """
         kind, index = _normalize_device(device)
-        move_tensor(
-            self._ctx_owner.ptr, self._require_handle(), int(kind), int(index)
-        )
+        move_tensor(self._ctx_owner.ptr, self._require_handle(), int(kind), int(index))
         return self
 
     def device(self) -> str:
         """The device this tensor is resident on: ``"cpu"`` or ``"gpu:N"``."""
-
         kind, index = tensor_device(self._ctx_owner.ptr, self._require_handle())
         return _device_to_str(kind, index)
+
+    # --- lifetime ----------------------------------------------------------
 
     def close(self) -> None:
         if self._closed:
@@ -457,6 +250,8 @@ class Tensor:
         except Exception:
             pass
 
+    # --- construction ------------------------------------------------------
+
     @classmethod
     def empty(
         cls,
@@ -467,10 +262,8 @@ class Tensor:
         device: DeviceLike = None,
     ) -> "Tensor":
         shp = _as_shape(shape)
-        dtype = normalize_dtype(dtype)
-
-        handle = create_empty_tensor(ctx.ptr, dtype, shp)
-        t = cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
+        dt = normalize_dtype(dtype)
+        t = cls._from_handle(ctx, create_empty_tensor(ctx.ptr, dt, shp), dtype=dt, shape=shp)
         if device is not None:
             t.to(device)
         return t
@@ -485,29 +278,25 @@ class Tensor:
         dtype: DTypeLike = q8_0,
         quant_axis: int | None = None,
     ) -> "Tensor":
-        """Quantize row-major f32 `values` into a packed-quant tensor.
+        """Quantize float `values` of `shape` into a packed-quant tensor.
 
-        The core does the packing (q8_0 today), blocking along `quant_axis`.
-        `quant_axis` defaults to the matmul-B reduction axis (rank-2, i.e. the
-        `K` of a `[…, K, N]` weight); pass the last axis for an embedding table
-        blocked along its feature dim. `values` may be a numpy array or a
-        (possibly nested) Python sequence.
+        The core does the packing, blocking along `quant_axis`, which defaults to
+        the matmul-B reduction axis (rank-2, i.e. the `K` of a `[…, K, N]` weight);
+        pass the last axis for an embedding table blocked along its feature dim.
+        `values` is read in place when it exports ``__dlpack__`` (any float dtype,
+        bfloat16 included, strided), else packed from Python numbers.
         """
-        dtype = normalize_dtype(dtype)
-        if dtype not in (AionDType.AION_DTYPE_Q8_0, AionDType.AION_DTYPE_Q4_0):
-            raise ValueError(
-                f"quantize expects a quantized dtype, got {dtype_name(dtype)}"
-            )
-
+        dt = normalize_dtype(dtype)
+        if not _is_quant(dt):
+            raise ValueError(f"quantize expects a quantized dtype, got {dtype_name(dt)}")
         shp = _as_shape(shape)
         if quant_axis is None:
             quant_axis = len(shp) - 2 if len(shp) >= 2 else 0
         if not (0 <= quant_axis < len(shp)):
             raise ValueError(f"quant_axis {quant_axis} out of range for rank {len(shp)}")
-        n = _elem_count(shp)
-
-        handle = quantize_tensor(ctx.ptr, dtype, quant_axis, _float_view(values, shp))
-        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
+        view = host_view(values, AionDType.AION_DTYPE_F32).fit(shp, reshape=True)
+        handle = quantize_tensor(ctx.ptr, dt, quant_axis, view)
+        return cls._from_handle(ctx, handle, dtype=dt, shape=shp)
 
     @classmethod
     def zeros(
@@ -520,10 +309,9 @@ class Tensor:
     ) -> "Tensor":
         """Create a zero-initialized tensor.
 
-        If `ctx` is omitted, the process-wide default context is used. When
-        `device` is set, the tensor is zeroed on the CPU and then migrated.
+        If `ctx` is omitted, the process-wide default context is used. With
+        `device`, the tensor is zeroed on the CPU and then migrated.
         """
-
         from .context import get_default_context
 
         if ctx is None:
@@ -534,26 +322,10 @@ class Tensor:
             t.to(device)
         return t
 
-    @classmethod
-    def _from_flat(
-        cls,
-        ctx: "Context",
-        shape: Sequence[int],
-        values: Iterable[int | float],
-        dtype: AionDType,
-    ) -> "Tensor":
-        shp = _as_shape(shape)
-        n = _elem_count(shp)
-        vals = list(values)
-        if len(vals) != n:
-            raise ValueError(f"expected {n} values for shape {shp}, got {len(vals)}")
-        if len(shp) == 0:
-            shp = [1]
-        handle = create_tensor(ctx.ptr, dtype, shp, _native_values(dtype, vals))
-        return cls._from_handle(ctx, handle, dtype=dtype, shape=tuple(shp))
+    # --- metadata ----------------------------------------------------------
 
     def numel(self) -> int:
-        return _elem_count(self.shape)
+        return math.prod(self.shape)
 
     def __repr__(self) -> str:
         if getattr(self, "_closed", True):
@@ -569,25 +341,22 @@ class Tensor:
             self._dtype_cache = tensor_dtype(self._require_handle())
         return self._dtype_cache
 
-
     @property
     def shape(self) -> tuple[int, ...]:
-        if self._shape_cache is not None:
-            return self._shape_cache
-
-        self._shape_cache = tensor_shape(
-            self._ctx_owner.ptr, self._require_handle()
-        )
+        if self._shape_cache is None:
+            self._shape_cache = tensor_shape(self._ctx_owner.ptr, self._require_handle())
         return self._shape_cache
 
-    # --- host conversion and mutation ------------------------------------
+    # --- host reads and writes ----------------------------------------------
+
     def _flat_values(self) -> list[int | float]:
         if _is_quant(self.dtype):
             raise NotImplementedError(
                 f"{dtype_name(self.dtype)}: quantized tensors cannot be converted to Python values"
             )
-        n = _elem_count(self.shape)
-        return read_tensor(self._ctx_owner.ptr, self._require_handle(), n)
+        buf, view = empty_view(self.shape, dtype_kind(self.dtype))
+        read_view(self._ctx_owner.ptr, self._require_handle(), view)
+        return list(buf[0 : self.numel()])
 
     def tolist(self) -> TensorData:
         """Return the tensor as nested Python lists."""
@@ -612,33 +381,19 @@ class Tensor:
         return self._flat_values()[0]
 
     def copy_from(self, values: ArrayLike) -> "Tensor":
-        """Copy data into this tensor, broadcasting a scalar, and return ``self``.
+        """Copy host data into this tensor and return ``self``.
 
-        Non-scalar inputs must match the tensor's exact shape.
+        `values` has the tensor's shape, or is a single element broadcast to it.
+        It converts to the tensor's dtype as `Tensor(...)` data does.
         """
         dt = self.dtype
         if _is_quant(dt):
-            raise NotImplementedError(
-                f"{dtype_name(dt)}: quantized tensors cannot be mutated"
-            )
-
-        np = _try_numpy()
-        if np is not None:
-            from .numpy import _copy_numpy_into_tensor
-
-            _copy_numpy_into_tensor(self, values)
-            return self
-
-        shape, vals = _flatten_for_dtype(values, dt)
-        if shape == ():
-            vals *= self.numel()
-        elif shape != self.shape:
-            raise ValueError(f"shape mismatch: tensor {self.shape} vs data {shape}")
-        write_tensor(
-            self._ctx_owner.ptr,
-            self._require_handle(),
-            _native_values(dt, vals),
-        )
+            raise NotImplementedError(f"{dtype_name(dt)}: quantized tensors cannot be written")
+        try:
+            view = host_view(values, dt).fit(self.shape)
+        except ValueError as e:
+            raise ValueError(f"shape mismatch: tensor {self.shape}: {e}") from None
+        write_view(self._ctx_owner.ptr, self._require_handle(), view)
         return self
 
     def fill(self, value: int | float) -> "Tensor":
@@ -646,20 +401,79 @@ class Tensor:
         return self.copy_from(value)
 
     def zero(self) -> "Tensor":
-        """In-place zero fill (scalar dtypes). Returns self."""
-        dt = self.dtype
-        if _is_quant(dt):
-            raise NotImplementedError(
-                f"zero() not implemented for dtype={dtype_name(dt)}"
-            )
-        n = self.numel()
-        # The native façade zero-initializes the temporary C buffer; for f16,
-        # uint16 zero is IEEE-754 +0.0.
-        zero_tensor(self._ctx_owner.ptr, self._require_handle(), n)
+        """In-place zero fill, wherever the tensor lives. Returns self."""
+        zero_tensor(self._ctx_owner.ptr, self._require_handle())
         return self
 
-    # numpy interop (requires numpy; scalar dtypes only).
     def numpy(self) -> NDArray:
-        from .numpy import _tensor_to_numpy
+        """A copy of the tensor as a new numpy array (scalar dtypes only).
 
-        return _tensor_to_numpy(self)
+        For a view of the tensor's bytes without the copy, use
+        ``np.from_dlpack(tensor)`` (read-only).
+        """
+        try:
+            import numpy as np
+        except ImportError as e:  # pragma: no cover
+            raise ImportError("NumPy is required; install aion-engine[numpy]") from e
+        if _is_quant(self.dtype):
+            raise NotImplementedError(f"{dtype_name(self.dtype)}: quantized tensors have no numpy representation")
+        out = np.empty(self.shape, dtype=numpy_dtype(self.dtype))
+        read_view(self._ctx_owner.ptr, self._require_handle(), host_view(out))
+        return out
+
+    # --- DLPack export -------------------------------------------------------
+
+    def __dlpack__(
+        self,
+        *,
+        stream: Any = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> CapsuleType:
+        """Export the tensor's bytes to a DLPack consumer, without copying.
+
+        The export is read-only and stays valid, showing the values as they are
+        now, whatever later happens to the tensor: a later write (or a model run
+        that produces it) goes to a fresh copy, and the tensor may be closed first.
+        Host tensors of scalar dtypes only; ``copy=True`` exports a private copy.
+        """
+        if stream is not None:
+            raise BufferError("an Aion host tensor takes no stream")
+        if max_version is None or max_version[0] < 1:
+            raise BufferError("Aion exports DLPack 1.x (versioned) capsules only")
+        if dl_device is not None and tuple(dl_device) != (_KDL_CPU, 0):
+            raise BufferError(f"cannot export to device {dl_device}; migrate the tensor instead")
+        src = self
+        if copy:
+            src = Tensor.empty(self._ctx_owner, self.shape, dtype=self.dtype)
+            try:
+                src.copy_from(self)
+            except BaseException:
+                src.close()
+                raise
+        try:
+            managed = tensor_to_dlpack(self._ctx_owner.ptr, src._require_handle())
+        finally:
+            if src is not self:
+                src.close()  # the export shares its bytes and outlives it
+        return export_capsule(managed)
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        kind, index = tensor_device(self._ctx_owner.ptr, self._require_handle())
+        # A GPU tensor reports where it is (WebGPU) and refuses to export.
+        return (_KDL_CPU, 0) if kind == int(AionDeviceKind.AION_DEVICE_CPU) else (15, index)
+
+
+def from_dlpack(
+    data: ArrayLike,
+    *,
+    ctx: "Context | None" = None,
+    dtype: DTypeLike | None = None,
+    device: DeviceLike = None,
+) -> Tensor:
+    """A tensor of a DLPack exporter's data (numpy, PyTorch, ...): its memory
+    borrowed, not copied, when it already is the tensor's (see `Tensor`)."""
+    if not hasattr(data, "__dlpack__"):
+        raise TypeError(f"{type(data).__name__} does not export __dlpack__")
+    return Tensor(data, ctx=ctx, dtype=dtype, device=device)

@@ -400,6 +400,6 @@ class Activation(Module):
 
 
 def _shape_of(data: WeightData) -> tuple[int, ...]:
-    from ..builder import _infer_shape
+    from .._ffi.dlpack import data_shape
 
-    return _infer_shape(data)
+    return data_shape(data)

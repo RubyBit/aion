@@ -20,7 +20,7 @@ pub fn importParams(
     store: *types_mod.StorageManager,
     package: *const types_mod.Package,
     device: manager_mod.DeviceRef,
-    mapping: ?*storage_mod.Mapping,
+    mapping: ?*storage_mod.SharedBytes,
 ) api_errors.LoadError!params_mod.Params {
     var out = try params_mod.Params.init(allocator, package.values.len);
     errdefer out.deinit(allocator);
@@ -43,7 +43,7 @@ fn createInitializerTensor(
     value: package_file.ValueRecord,
     init: package_file.Initializer,
     device: manager_mod.DeviceRef,
-    mapping: ?*storage_mod.Mapping,
+    mapping: ?*storage_mod.SharedBytes,
 ) api_errors.LoadError!types_mod.TensorId {
     const shape = try resolveConstShape(allocator, package, value);
     defer allocator.free(shape);
@@ -54,7 +54,7 @@ fn createInitializerTensor(
     const bytes = init.data.bytes;
     if (device.kind == .cpu) {
         if (mapping) |m| if (std.mem.isAligned(@intFromPtr(bytes.ptr), 64)) {
-            return store.createMappedTensor(value.dtype, shape, bytes, m, .{ .quant_axis = quant_axis });
+            return store.createSharedTensor(value.dtype, shape, bytes, m, .{ .quant_axis = quant_axis });
         };
         // Not a view of a live mapping: its own copy, written whole.
         const tid = try store.createTensor(value.dtype, shape, .{ .quant_axis = quant_axis, .zero_fill = false });

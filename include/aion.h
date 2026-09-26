@@ -169,9 +169,11 @@ AION_API void aion_context_destroy(AionContext* ctx);
 // a weight view bound with `aion_builder_param_named`, see there), must be on
 // `kDLCPU`, single-lane, and its shape must equal the tensor's. `strides` are in
 // elements and may be NULL (row-major); `byte_offset` is honoured. Element types:
-// float32, float16, bfloat16, int32, int8. Floats convert among themselves (so a
-// bfloat16 checkpoint reads straight into an f32 or f16 tensor, rounding to
-// nearest even when narrowing); integers only copy to their own width.
+// float64, float32, float16, bfloat16, int64, int32, int8. Floats convert among
+// themselves (so a bfloat16 checkpoint or a float64 array reads straight into an
+// f32 or f16 tensor, rounding to nearest even when narrowing); integers convert
+// among themselves, and a value the narrower type cannot hold is an error. The
+// kinds never mix.
 
 // Create a tensor of `shape` (contents unspecified; fill it with aion_tensor_write).
 AION_API AionStatus aion_tensor_create(
@@ -202,6 +204,31 @@ AION_API AionStatus aion_tensor_write(AionTensor* t, const DLTensor* src);
 
 // Copy the tensor out into host memory `dst` (scalar dtypes; see "Host memory").
 AION_API AionStatus aion_tensor_read(const AionTensor* t, const DLTensor* dst);
+
+// Set every element to zero, wherever the tensor lives.
+AION_API AionStatus aion_tensor_zero(AionTensor* t);
+
+// Import a DLPack tensor (on kDLCPU) as a new tensor of `*dtype`, or of its own
+// dtype when `dtype` is NULL (bfloat16 and float64 as f32, int64 as i32). On
+// success the core OWNS `src`, as a DLPack consumer, and calls its deleter once.
+// When `src` already is what the tensor needs (that dtype, row-major, aligned to
+// its element) the tensor BORROWS its memory, with no copy: the deleter runs once
+// the tensor and every export of it are done. Aion never writes borrowed memory
+// (a write to the tensor goes to a private copy first), so the producer's own
+// later writes show through until then. Otherwise the data is converted in one
+// copy and the deleter runs before the call returns. A rank-0 tensor imports as
+// shape [1]. On error the caller keeps `src`.
+AION_API AionStatus aion_tensor_from_dlpack(AionContext* ctx, DLManagedTensorVersioned* src, const AionDType* dtype, AionTensor** out_tensor);
+
+// Export a host tensor (scalar dtype, on the CPU) as DLPack without copying. The
+// export is read-only (`DLPACK_FLAG_BITMASK_READ_ONLY`) and row-major, and its
+// bytes stay valid and unchanged until its deleter runs, whatever happens to the
+// tensor meanwhile: a later write to the tensor (or a model run producing it)
+// goes to a fresh copy, and the tensor may be destroyed first. Call the deleter
+// exactly once; it may be called from any thread, but before the library is
+// unloaded. A device tensor fails with AION_INVALID_ARGUMENT (migrate it first);
+// a quantized one with AION_UNSUPPORTED.
+AION_API AionStatus aion_tensor_to_dlpack(const AionTensor* t, DLManagedTensorVersioned** out);
 
 // -----------------------------------------------------------------------------
 // Loaded model runtime (.aion packages)

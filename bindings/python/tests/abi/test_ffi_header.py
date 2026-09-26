@@ -14,6 +14,7 @@ _TOOL = Path(__file__).resolve().parents[2] / "tools" / "check_ffi_header.py"
 
 def _checker():
     spec = importlib.util.spec_from_file_location("check_ffi_header", _TOOL)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

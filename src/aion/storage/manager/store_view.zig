@@ -70,7 +70,7 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
             const sm: *StorageManager = @ptrCast(@alignCast(ctx));
             const t: *const Tensor = sm.getConst(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
             const backing = sm.backingMut(@intCast(id)) catch return tensor_store.StoreError.InvalidArgument;
-            // A write through a view of a read-only mapping would fault; copy first.
+            // Shared bytes are read-only (a mapping would fault): take them back or copy.
             backing.ensureWritable() catch |e| return switch (e) {
                 error.OutOfMemory => tensor_store.StoreError.OutOfMemory,
                 else => tensor_store.StoreError.InvalidArgument,
@@ -189,9 +189,9 @@ pub fn of(mgr: *StorageManager) tensor_store.TensorStore {
             if (a.chunk_rows != b.chunk_rows) return tensor_store.StoreError.InvalidArgument;
             // Zero-copy carried-variable swap for CPU loop execution. Move
             // the complete backing record between the logical tensor ids.
-            std.mem.swap([]align(64) u8, &a.data, &b.data);
+            std.mem.swap([]u8, &a.data, &b.data);
             std.mem.swap(bool, &a.owns_data, &b.owns_data);
-            std.mem.swap(?*storage_mod.Mapping, &a.mapping, &b.mapping);
+            std.mem.swap(?*storage_mod.SharedBytes, &a.shared, &b.shared);
             std.mem.swap(DeviceRef, &a.device, &b.device);
             std.mem.swap([]dm.DeviceHandle, &a.chunk_handles, &b.chunk_handles);
             std.mem.swap(?dm.DeviceMemory, &a.dev, &b.dev);

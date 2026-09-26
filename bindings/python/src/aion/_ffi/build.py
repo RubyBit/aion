@@ -33,6 +33,24 @@ def _load_cdef_text() -> str:
 
 ffibuilder = FFI()
 ffibuilder.cdef(_load_cdef_text())
+# Binding glue compiled into the extension, not part of the Aion C ABI.
+ffibuilder.cdef("void aionpy_dlpack_capsule_destructor(void* capsule);")
+
+# The destructor of a DLPack capsule this binding exports (`_ffi/dlpack.py`): a
+# capsule no consumer took over (still named `dltensor_versioned`) runs its
+# managed tensor's deleter. The same thing numpy and PyTorch do for theirs.
+_GLUE = r'''
+void aionpy_dlpack_capsule_destructor(void* capsule) {
+    PyObject* cap = (PyObject*)capsule;
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    if (PyCapsule_IsValid(cap, "dltensor_versioned")) {
+        DLManagedTensorVersioned* m = (DLManagedTensorVersioned*)PyCapsule_GetPointer(cap, "dltensor_versioned");
+        if (m != NULL && m->deleter != NULL) m->deleter(m);
+    }
+    PyErr_Restore(type, value, traceback);
+}
+'''
 
 # Build Aion and link the resulting library into the extension.
 _build_zig = _import_build_zig()
@@ -74,7 +92,7 @@ if os.name == "nt":
 
 ffibuilder.set_source(
     "aion._aion_cffi",
-    '#include <stdint.h>\n#include <stddef.h>\n#include "aion.h"\n',
+    '#include <stdint.h>\n#include <stddef.h>\n#include "aion.h"\n' + _GLUE,
     include_dirs=include_dirs,
     extra_objects=extra_objects,
     extra_compile_args=extra_compile_args,

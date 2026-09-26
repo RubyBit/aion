@@ -291,7 +291,7 @@ pub const Context = struct {
     fn importMapped(self: *Self, mapped: *package_file.MappedPackage, device: manager_mod.DeviceRef) api_errors.LoadError!params_mod.Params {
         defer mapped.unmap();
         const map = mapped.takeMap() orelse return api_errors.LoadError.InvalidArgument;
-        const mapping = storage_mod.Mapping.adopt(self.allocator, map) catch |e| {
+        const mapping = storage_mod.SharedBytes.adoptMap(self.allocator, map) catch |e| {
             var owned = map;
             var io_backend: std.Io.Threaded = .init_single_threaded;
             io_backend.allocator = self.allocator;
@@ -363,6 +363,25 @@ pub const Context = struct {
     pub fn tensor(self: *Self, dtype: DType, shape: []const usize) api_errors.ApiError!api_tensor.Tensor {
         if (shape.len == 0 or shape.len > tensor_store_max_rank) return api_errors.ApiError.InvalidArgument;
         const tid: manager_mod.TensorId = try self.store.createTensor(dtype, shape, .{});
+        self.store.trackHolders(tid);
+        const t = try self.store.getConst(tid);
+        return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };
+    }
+
+    /// A host tensor whose bytes ARE `bytes`, another library's memory, used in
+    /// place: `release(owner)` runs once the tensor and every export of it are done
+    /// with them. Aion never writes them; a write to the tensor goes to a private
+    /// copy (`storage.SharedBytes`), so the owner's writes show through until then.
+    /// `bytes` is the tensor's exact row-major length, aligned to its element. On
+    /// error the caller keeps ownership: `release` is not called.
+    pub fn borrow(self: *Self, dtype: DType, shape: []const usize, bytes: []const u8, owner: *anyopaque, release: *const fn (owner: *anyopaque) void) api_errors.ApiError!api_tensor.Tensor {
+        if (shape.len == 0 or shape.len > tensor_store_max_rank) return api_errors.ApiError.InvalidArgument;
+        const shared = try storage_mod.SharedBytes.adoptExternal(self.allocator, owner, release);
+        const tid = self.store.createSharedTensor(dtype, shape, bytes, shared, .{}) catch |e| {
+            shared.abandon();
+            return e;
+        };
+        shared.release(); // the tensor holds the one reference left
         self.store.trackHolders(tid);
         const t = try self.store.getConst(tid);
         return .{ .store = &self.store, .id = tid, .dtype = t.dtype, .shape = t.shape };

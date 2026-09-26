@@ -186,6 +186,9 @@ AionStatus aion_tensor_shape(const AionTensor* t, size_t* out_dims, size_t out_r
 
 AionStatus aion_tensor_read(const AionTensor* t, const DLTensor* dst);
 AionStatus aion_tensor_write(AionTensor* t, const DLTensor* src);
+AionStatus aion_tensor_zero(AionTensor* t);
+AionStatus aion_tensor_from_dlpack(AionContext* ctx, DLManagedTensorVersioned* src, const AionDType* dtype, AionTensor** out_tensor);
+AionStatus aion_tensor_to_dlpack(const AionTensor* t, DLManagedTensorVersioned** out);
 
 typedef struct AionLoadModelOptions {
     uint32_t device_kind;

@@ -3437,14 +3437,14 @@ test "api: loaded host weights are views of the mapping, copied on write" {
 
         const w = try model.initializerTensorByDebugName("w");
         const meta = try load_ctx.store.getConst(w.tensorId());
-        try std.testing.expect(meta.mapping != null);
+        try std.testing.expect(meta.shared != null);
         try std.testing.expect(!meta.owns_data);
         try std.testing.expect(std.mem.isAligned(@intFromPtr(meta.data.ptr), 64));
         try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -8.0, 2.5 }, &try run(&load_ctx, &model));
 
         try w.writeF32(&[_]f32{ 1, 0, 0, 0, 1, 0 });
         const after = try load_ctx.store.getConst(w.tensorId());
-        try std.testing.expect(after.mapping == null);
+        try std.testing.expect(after.shared == null);
         try std.testing.expect(after.owns_data);
         try std.testing.expectEqualSlices(f32, &[_]f32{ 2.0, -1.0, 0.0 }, &try run(&load_ctx, &model));
     }
@@ -3453,6 +3453,125 @@ test "api: loaded host weights are views of the mapping, copied on write" {
     var again = try load_ctx.loadModel(file, .{});
     defer again.deinit();
     try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -8.0, 2.5 }, &try run(&load_ctx, &again));
+}
+
+// What an export hands out: bytes that stay valid and unchanged while it is held,
+// whatever the tensor does; a write then goes to a copy, and once the export is
+// gone the tensor takes its buffer back without one.
+test "api: shared bytes outlive tensor writes, and come back uncopied once released" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const t: api.Tensor = try ctx.fromArray([4]f32{ 1, 2, 3, 4 });
+    defer t.release();
+    const shared = try t.share();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(shared.bytes))));
+
+    // Held: the write lands in a private copy, the shared bytes keep the old values.
+    try t.writeF32(&.{ 5, 6, 7, 8 });
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(shared.bytes))));
+    var now: [4]f32 = undefined;
+    try t.read(&now);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, &now);
+    shared.release();
+
+    // Released before the write: the tensor's own buffer comes back, not a copy.
+    const again = try t.share();
+    const ptr = again.bytes.ptr;
+    again.release();
+    try t.writeF32(&.{ 0, 0, 0, 1 });
+    const meta = try ctx.store.getConst(t.tensorId());
+    try std.testing.expect(meta.shared == null and meta.owns_data);
+    try std.testing.expectEqual(ptr, meta.data.ptr);
+
+    // Outliving the tensor: the last holder frees the bytes (the leak check sees it).
+    const orphan = try ctx.fromArray([2]f32{ 9, 10 });
+    const kept = try orphan.share();
+    orphan.release();
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10 }, std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(kept.bytes))));
+    kept.release();
+}
+
+// A borrow is the owner's memory, not a copy: its later writes show through, Aion's
+// own writes go to a private copy, and the owner hears back exactly once, after
+// the last holder (an export outliving the tensor included).
+test "api: a borrowed buffer is used in place and handed back once" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const Owner = struct {
+        // Offset by one element: aligned to f32, not to 64 bytes.
+        storage: [5]f32 align(64) = .{ 0, 1, 2, 3, 4 },
+        released: usize = 0,
+        fn release(p: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.released += 1;
+        }
+    };
+    var owner: Owner = .{};
+    const bytes = std.mem.sliceAsBytes(owner.storage[1..5]);
+
+    const t = try ctx.borrow(.f32, &.{ 2, 2 }, bytes, &owner, Owner.release);
+    var got: [4]f32 = undefined;
+    try t.read(&got);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &got);
+    try std.testing.expectEqual(@as([*]const u8, bytes.ptr), (try ctx.store.getConst(t.tensorId())).data.ptr);
+
+    // The owner's write shows through: nothing was copied.
+    owner.storage[1] = 10;
+    try t.read(&got);
+    try std.testing.expectEqual(@as(f32, 10), got[0]);
+
+    // An export shares the borrowed bytes and outlives the tensor.
+    const exported = try t.share();
+    try t.writeF32(&.{ 5, 6, 7, 8 }); // to a private copy: the owner's memory is untouched
+    try std.testing.expectEqualSlices(f32, &.{ 10, 2, 3, 4 }, owner.storage[1..5]);
+    t.release();
+    try std.testing.expectEqual(@as(usize, 0), owner.released);
+    exported.release();
+    try std.testing.expectEqual(@as(usize, 1), owner.released);
+
+    // Bytes that are not the tensor's exact length are refused, and ownership stays.
+    try std.testing.expectError(error.InvalidArgument, ctx.borrow(.f32, &.{3}, bytes, &owner, Owner.release));
+    try std.testing.expectEqual(@as(usize, 1), owner.released);
+}
+
+test "api: a shared model output is a snapshot of its run" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+
+    const x = try ctx.fromArray([3]f32{ 1, 2, 3 });
+    var bld = api.Builder.init(&ctx);
+    defer bld.deinit();
+    const X = try bld.param(x);
+    var model = try ctx.compile(&bld, &[_]api.TensorRef{try bld.add(X, X)}, .{});
+    defer model.deinit();
+
+    try model.run();
+    const first = try (try model.outputTensorAt(0)).share();
+    defer first.release();
+
+    try x.writeF32(&.{ 10, 20, 30 });
+    try model.run();
+    var second: [3]f32 = undefined;
+    try (try model.outputTensorAt(0)).read(&second);
+    try std.testing.expectEqualSlices(f32, &.{ 20, 40, 60 }, &second);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6 }, std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(first.bytes))));
+}
+
+test "api: zero clears a tensor, with or without host bytes yet" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    const t: api.Tensor = try ctx.fromArray([3]i32{ 4, -5, 6 });
+    defer t.release();
+    try t.zero();
+    var out: [3]i32 = undefined;
+    try t.read(&out);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0 }, &out);
 }
 
 // Synthetic replacement for the old opt-in real-checkpoint (Gemma) verification:

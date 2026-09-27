@@ -422,11 +422,42 @@ pub fn fillWeightBlock(
     }
 }
 
-/// Run a depthwise task across the pool: an item is a block of one output row.
-pub fn runDepthwise(ctx: *ConvExecCtx, task: *@import("../kernels/conv2d.zig").DepthwiseConv2DTask) void {
-    const items = task.items();
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and items >= 2) return p.parallelForAny(@ptrCast(task), items, 1, ctx.depthwise_conv2d.run_items);
+/// Run a conv task's GEMM over `rows` output rows, in whole micro-kernel blocks of
+/// `m_cap` rows that each cost `row_macs` multiply-adds a row. The pool forks only
+/// when the work is worth it (see `exec_utils.parallelRange`), and only with a
+/// scratch buffer per thread; otherwise the rows run here.
+pub fn runGemmRows(ctx: *ConvExecCtx, task: anytype, rows: usize, m_cap: usize, row_macs: usize) ExecuteProgramError!void {
+    if (ctx.matmul_scratch.len < @max(ctx.thread_count, 1)) {
+        const scratch = try scratchForTid(ctx, 0);
+        defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch);
+        return task.runRowsRange(scratch, 0, rows);
     }
-    ctx.depthwise_conv2d.run_item_range(task, 0, items);
+    const Blocks = struct {
+        task: @TypeOf(task),
+        scratch: [][]align(32) u8,
+        rows: usize,
+        m_cap: usize,
+
+        fn run(b: @This(), lo: usize, hi: usize, tid: usize) ExecuteProgramError!void {
+            try b.task.runRowsRange(b.scratch[tid], lo * b.m_cap, @min(hi * b.m_cap, b.rows));
+        }
+    };
+    const blocks = std.math.divCeil(usize, rows, m_cap) catch unreachable;
+    const job: Blocks = .{ .task = task, .scratch = ctx.matmul_scratch, .rows = rows, .m_cap = m_cap };
+    return exec_utils.parallelRange(ExecuteProgramError, ctx.pool, ctx.thread_count, blocks, m_cap * row_macs, job, Blocks.run);
+}
+
+/// Run a depthwise task across the pool: an item is a block of one output row.
+pub fn runDepthwise(ctx: *ConvExecCtx, task: *@import("../kernels/conv2d.zig").DepthwiseConv2DTask) ExecuteProgramError!void {
+    const Items = struct {
+        task: *@import("../kernels/conv2d.zig").DepthwiseConv2DTask,
+        run_range: @TypeOf(ctx.depthwise_conv2d.run_item_range),
+
+        fn run(it: @This(), lo: usize, hi: usize, tid: usize) ExecuteProgramError!void {
+            _ = tid;
+            it.run_range(it.task, lo, hi);
+        }
+    };
+    const job: Items = .{ .task = task, .run_range = ctx.depthwise_conv2d.run_item_range };
+    return exec_utils.parallelRange(ExecuteProgramError, ctx.pool, ctx.thread_count, task.items(), task.itemMacs(), job, Items.run);
 }

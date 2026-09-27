@@ -13,7 +13,6 @@ pub const Tuning = conv2d_k.DepthwiseConv2DTuning;
 pub const Kernels = struct {
     tuning: Tuning,
 
-    run_items: *const fn (ctx_any: *anyopaque, start: usize, end: usize, tid: usize) void,
     run_item_range: *const fn (t: *const conv2d_k.DepthwiseConv2DTask, start: usize, end: usize) void,
 };
 
@@ -28,7 +27,6 @@ fn kernelsFor(comptime t: Tuning) Kernels {
     const K = conv2d_k.Kernel(t);
     return .{
         .tuning = t,
-        .run_items = K.runItems,
         .run_item_range = K.runItemRange,
     };
 }

@@ -142,22 +142,28 @@ pub const PadMode = enum(u8) {
 /// `row_major` is the plain contract: one row is an unbroken run of
 /// `cols / 32` 34-byte blocks. `lanes*` groups `W` rows so an integer dot's `W`
 /// output lanes are `W` rows at once: for each block index, the group holds its
-/// `W` f16 scales, then the 32 quantized values in eight 4-byte chunks, each
-/// chunk with its `W` rows side by side. One `W`-lane dot then covers `W` rows
-/// and the scaling after it is paid once per block for all of them, not once
-/// per row. `W` is whatever the target's kernel reads best — a CPU's dot lane
-/// count, a GPU's 32 threads per 128-byte load. The blocks' bytes are unchanged,
-/// only placed.
+/// `W` f16 scales, then the 32 quantized values in chunks, each chunk with its
+/// `W` rows side by side. One `W`-lane dot then covers `W` rows and the scaling
+/// after it is paid once per block for all of them, not once per row. `W` is
+/// whatever the target's kernel reads best — a CPU's dot lane count, a GPU's 32
+/// threads. A chunk is 4 bytes, what an integer dot takes per lane, except in
+/// `lanes32x16`: a GPU thread owns a row there, and streams best in 16-byte
+/// loads. The blocks' bytes are unchanged, only placed.
 pub const QuantBlockOrder = enum(u8) {
     row_major,
     lanes4,
     lanes8,
     lanes16,
     lanes32,
+    lanes32x16,
 
     pub const BLOCK_BYTES: usize = 34;
-    const CHUNK_BYTES: usize = 4;
-    const CHUNKS: usize = 32 / CHUNK_BYTES;
+    const QUANT_BYTES: usize = 32;
+
+    /// Bytes of one row's quants per chunk.
+    pub fn chunkBytes(self: QuantBlockOrder) usize {
+        return if (self == .lanes32x16) 16 else 4;
+    }
 
     /// Rows per group: one for `row_major`.
     pub fn groupRows(self: QuantBlockOrder) usize {
@@ -166,7 +172,7 @@ pub const QuantBlockOrder = enum(u8) {
             .lanes4 => 4,
             .lanes8 => 8,
             .lanes16 => 16,
-            .lanes32 => 32,
+            .lanes32, .lanes32x16 => 32,
         };
     }
 
@@ -194,22 +200,25 @@ pub const QuantBlockOrder = enum(u8) {
         return self.segment(blocks, r, kb) + (r % self.groupRows()) * 2;
     }
 
-    /// Offset of row `r`'s block `kb` values `[4 * chunk, 4 * chunk + 4)`.
+    /// Offset of row `r`'s block `kb` values in chunk `chunk`, which holds
+    /// `chunkBytes()` of them from `chunk * chunkBytes()`.
     pub fn chunkAt(self: QuantBlockOrder, blocks: usize, r: usize, kb: usize, chunk: usize) usize {
         const g = self.groupRows();
-        return self.segment(blocks, r, kb) + 2 * g + (chunk * g + r % g) * CHUNK_BYTES;
+        return self.segment(blocks, r, kb) + 2 * g + (chunk * g + r % g) * self.chunkBytes();
     }
 
     /// Write a whole 34-byte block to its place in `bytes`.
     pub fn storeBlock(self: QuantBlockOrder, bytes: []u8, blocks: usize, r: usize, kb: usize, block: []const u8) void {
+        const cb = self.chunkBytes();
         @memcpy(bytes[self.scaleAt(blocks, r, kb)..][0..2], block[0..2]);
-        for (0..CHUNKS) |c| @memcpy(bytes[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES], block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES]);
+        for (0..QUANT_BYTES / cb) |c| @memcpy(bytes[self.chunkAt(blocks, r, kb, c)..][0..cb], block[2 + c * cb ..][0..cb]);
     }
 
     /// Read a whole 34-byte block back out of `bytes`.
     pub fn loadBlock(self: QuantBlockOrder, bytes: []const u8, blocks: usize, r: usize, kb: usize, block: []u8) void {
+        const cb = self.chunkBytes();
         @memcpy(block[0..2], bytes[self.scaleAt(blocks, r, kb)..][0..2]);
-        for (0..CHUNKS) |c| @memcpy(block[2 + c * CHUNK_BYTES ..][0..CHUNK_BYTES], bytes[self.chunkAt(blocks, r, kb, c)..][0..CHUNK_BYTES]);
+        for (0..QUANT_BYTES / cb) |c| @memcpy(block[2 + c * cb ..][0..cb], bytes[self.chunkAt(blocks, r, kb, c)..][0..cb]);
     }
 };
 

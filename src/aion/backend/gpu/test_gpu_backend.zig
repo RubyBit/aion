@@ -269,6 +269,21 @@ fn checkMatmulSharedRows(entry: []const u8, m: usize, k: usize, n: usize) !void 
     }
 }
 
+// A batch-one f32 matmul (a fully connected layer at batch one) is a matvec: it
+// streams B once instead of staging it through a tiled GEMM. N is a multiple of 4
+// but of no tile, and K of nothing in particular.
+fn buildMatvecF32(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const a = try makeInput(&g, mgr, &.{ 1, 300 }, 90);
+    const b = try makeInput(&g, mgr, &.{ 300, 4100 }, 91);
+    return finishProg(alloc, &g, mgr, try g.addMatMul(a, b, 1.0, 0.0));
+}
+
+test "gpu backend: batch-one f32 matmul (matvec) matches CPU" {
+    try expectGpuMatchesCpu(buildMatvecF32, 4100, 1e-4);
+}
+
 test "gpu backend: matmul shared rows scalar staging" {
     try checkMatmulSharedRows("mm_128x128x8_8x8_s", 8, 4, 16);
     try checkMatmulSharedRows("mm_128x128x8_8x8_s", 9, 20, 12);
@@ -870,7 +885,7 @@ fn ntQ8MaxNmse(k: usize) f64 {
 }
 
 /// An NT q8 matmul compiled the way a GPU device lays weights out: the target asks
-/// for `lanes32`, so the layout pass re-lays B and the GPU reads it coalesced.
+/// for the GPU's grouped order, so the layout pass re-lays B and the GPU reads it coalesced.
 fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n: usize) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
@@ -889,9 +904,10 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
     try g.bindExternal(bv, b_id);
     try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMulNT(av, bv, 1.0, 0.0)});
 
-    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, .lanes32));
+    const order = gpu.GpuBackend.quant_block_order;
+    const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, order));
     for (prog.steps) |step| switch (step.op) {
-        .MatMulNT => |st| try std.testing.expectEqual(aion.types.QuantBlockOrder.lanes32, (try mgr.getConst(st.b)).block_order),
+        .MatMulNT => |st| try std.testing.expectEqual(order, (try mgr.getConst(st.b)).block_order),
         else => {},
     };
     return .{ .prog = prog, .out = prog.outputs[0] };
@@ -908,7 +924,7 @@ fn buildNtLanesGemvNarrow(alloc: std.mem.Allocator, mgr: *StorageManager) !Built
 fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 24, 96, 64);
 }
-test "gpu backend: matmul NT q8_0 in lanes32 order matches CPU" {
+test "gpu backend: matmul NT q8_0 in the GPU's grouped order matches CPU" {
     try expectGpuMatchesCpuNmse(buildNtLanesGemv, 2048, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemvNarrow, 64, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemm, 24 * 64, ntQ8MaxNmse(96));

@@ -42,19 +42,19 @@ const Q8_BLOCK_ELEMS: u32 = 32;
 const Q8_BLOCK_BYTES: u32 = 34;
 /// Rows per workgroup in the GEMV kernel — must match RPW in the WGSL.
 const GEMV_RPW: u32 = 8;
-/// Rows per group of a `lanes32` weight — must match L_W in the WGSL.
+/// Rows per group of a `lanes32x16` weight — must match L_W in the WGSL.
 const LANES_W: u32 = 32;
-/// Below this many workgroups, a `lanes32` GEMV splits K 32 ways instead of 8,
+/// Below this many workgroups, a `lanes32x16` GEMV splits K 32 ways instead of 8,
 /// so a narrow projection still occupies the GPU (whose core count WebGPU does
 /// not expose).
 const LANES_WIDE_BELOW_GROUPS: u32 = 64;
 
 /// The grouping these kernels read fastest (`types.QuantBlockOrder`), which the
 /// device reports so its weights are laid out for it.
-pub const block_order: types.QuantBlockOrder = .lanes32;
+pub const block_order: types.QuantBlockOrder = .lanes32x16;
 
 /// How B's bytes are laid out, which picks the kernels that read it.
-const BForm = enum { q8_pairs, q8_lanes32, f32 };
+const BForm = enum { q8_pairs, q8_lanes32x16, f32 };
 const DEQUANT_WG: u32 = 64;
 
 /// Field order matches `struct Params` in matmul_nt_gemv.wgsl.
@@ -100,10 +100,10 @@ pub const MatmulNt = struct {
 
         const k = std.math.cast(u32, b_meta.shape[1]) orelse return error.Unsupported;
         if (k % 4 != 0) return error.Unsupported; // vec4 A reads in every path
-        const lanes = b_meta.block_order == .lanes32;
+        const lanes = b_meta.block_order == block_order;
         if (b_meta.block_order != .row_major and !lanes) return error.Unsupported;
-        // Row-major q8 rows are walked in word-aligned block pairs; `lanes32`
-        // segments are word-aligned whatever K is.
+        // Row-major q8 rows are walked in word-aligned block pairs; `lanes32x16`
+        // segments are aligned whatever K is.
         if (b_meta.dtype == .q8_0 and k % (if (lanes) Q8_BLOCK_ELEMS else 64) != 0) return error.Unsupported;
         if (a_meta.chunks != 1 or c_meta.chunks != 1) return error.Unsupported;
         const a_rank: usize = a_meta.rank;
@@ -143,7 +143,7 @@ pub const MatmulNt = struct {
             if (@as(u64, b_row_bytes) * n_count > db.len) return error.Unsupported;
 
             if (lanes and n_count % LANES_W != 0) return error.Unsupported;
-            const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32 else .q8_pairs;
+            const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32x16 else .q8_pairs;
             if (m_total == 1) {
                 try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, c_off, form);
             } else {
@@ -169,13 +169,13 @@ pub const MatmulNt = struct {
     ) ExecuteProgramError!void {
         _ = self;
         const groups = switch (form) {
-            .q8_lanes32 => n_count / LANES_W,
+            .q8_lanes32x16 => n_count / LANES_W,
             else => context.ceilDiv(n_count, GEMV_RPW),
         };
         if (groups > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
         const entry: [:0]const u8 = switch (form) {
             .q8_pairs => "gemv_q8",
-            .q8_lanes32 => if (groups < LANES_WIDE_BELOW_GROUPS) "gemv_q8_lanes32_wide" else "gemv_q8_lanes32",
+            .q8_lanes32x16 => if (groups < LANES_WIDE_BELOW_GROUPS) "gemv_q8_lanes32x16_wide" else "gemv_q8_lanes32x16",
             .f32 => "gemv_f32",
         };
         const built = try ctx.pipes.get(gemv_kernel, entry);
@@ -213,12 +213,12 @@ pub const MatmulNt = struct {
 
         const count: u32 = switch (form) {
             .q8_pairs => n_count * (k / 64),
-            .q8_lanes32 => n_count * (k / Q8_BLOCK_ELEMS),
+            .q8_lanes32x16 => n_count * (k / Q8_BLOCK_ELEMS),
             .f32 => n_count * k,
         };
         const dq_built = try ctx.pipes.get(dequant_kernel, switch (form) {
             .q8_pairs => "q8_nt_to_f32t",
-            .q8_lanes32 => "q8_lanes32_to_f32t",
+            .q8_lanes32x16 => "q8_lanes32x16_to_f32t",
             .f32 => "f32_nt_t",
         });
         const dq_bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(db.handle).?, scratch };

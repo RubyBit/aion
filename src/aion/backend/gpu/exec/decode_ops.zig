@@ -22,6 +22,7 @@ const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const types = @import("../../types.zig");
 const device_store = @import("../../../runtime/device_store.zig");
 const executable = @import("../../../runtime/executable.zig");
+const matmul_nt = @import("matmul_nt.zig");
 
 const c = wgpu.c;
 const Ctx = context.Ctx;
@@ -48,8 +49,7 @@ const Q8RowParams = extern struct { n: u32 = 0, k: u32 = 0, src_wpr: u32, dst_ro
 /// Matches rope.wgsl `Params`.
 const RopeParams = extern struct { count: u32, th: u32, tn: u32, pairs_total: u32, rope_pairs: u32, freq_step: f32, scale_factor: f32, _pad: u32 = 0 };
 /// Matches gather.wgsl `Params`, shared by every entry point there.
-/// `wpr` = u32 words per q8_0 table row, or rows per group for a grouped one
-/// (unused by the copying gathers).
+/// `wpr` = u32 words per row-major q8_0 table row (unused by the other gathers).
 /// `total` = work items: output words (copying gathers), block pairs (q8
 /// gather), or words per row (scatter). See each entry point for the mapping.
 const GatherParams = extern struct {
@@ -84,10 +84,14 @@ pub fn gatherRowsOnDevice(out_meta: TensorMeta, table_meta: TensorMeta, idx_meta
 
     // The q8_0 gather dequantizes, so it interprets bits and emits f32. Every
     // other dtype is a pure word copy and needs only whole 4-byte words per row.
-    // Row-major reads 64-element block pairs; a grouped order reads single blocks.
+    // Row-major reads 64-element block pairs; the GPU's own grouping (the only one
+    // a weight is laid out in here) reads single blocks.
     if (table_meta.dtype == .q8_0) {
-        const unit: usize = if (table_meta.block_order == .row_major) 64 else 32;
-        return out_meta.dtype == .f32 and d_total % unit == 0;
+        return out_meta.dtype == .f32 and switch (table_meta.block_order) {
+            .row_major => d_total % 64 == 0,
+            matmul_nt.block_order => d_total % 32 == 0,
+            else => false,
+        };
     }
     if (out_meta.dtype != table_meta.dtype) return false;
     return rowAddressable(out_meta.dtype, d_total);
@@ -145,7 +149,7 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRows) Exe
     if (idx_meta.dtype != .i32) return error.Unsupported;
 
     const table_is_quant = table_meta.dtype == .q8_0;
-    const grouped = table_is_quant and table_meta.block_order != .row_major;
+    const grouped = table_is_quant and table_meta.block_order == matmul_nt.block_order;
     const d_total = table_meta.shape[1];
     const out_elem_bytes = out_meta.dtype.info().block_bytes;
 
@@ -163,8 +167,8 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRows) Exe
         defer hs.releaseConst(di.token);
         if (di.len < b_total * l_total * @sizeOf(i32)) return error.Unsupported;
 
-        // u32 words per row-major q8_0 row, or the rows per group of a grouped one.
-        const wpr = if (grouped) table_meta.block_order.groupRows() else (d_total / 64) * 17;
+        // u32 words per row-major q8_0 row (unused by the grouped kernel).
+        const wpr = (d_total / 64) * 17;
         // The copying kernel addresses words so it serves any non-quantized
         // dtype; the q8 kernel addresses elements because it dequantizes.
         // The q8 kernel addresses elements because it dequantizes; the copying
@@ -176,7 +180,7 @@ pub fn execGatherRows(ctx: Ctx, frame: *Frame, s: executable.StepGatherRows) Exe
         else
             rowWords(out_meta.dtype, d_total) orelse return error.Unsupported;
         const built = try ctx.pipes.get(gather_kernel, if (grouped)
-            "gather_q8g_rows_f32"
+            "gather_q8_lanes32x16_rows_f32"
         else if (table_is_quant)
             "gather_q8_rows_f32"
         else if (f16_elems)

@@ -54,6 +54,11 @@ pub const DepthwiseConv2DTask = struct {
         return t.batch * t.h_out * blocksPerRow(t);
     }
 
+    /// Multiply-adds one item costs: a block of pixels, every channel, the whole window.
+    pub fn itemMacs(t: *const DepthwiseConv2DTask) usize {
+        return PIXEL_BLOCK * t.c * t.k_h * t.k_w;
+    }
+
     fn blocksPerRow(t: *const DepthwiseConv2DTask) usize {
         return std.math.divCeil(usize, t.w_out, PIXEL_BLOCK) catch unreachable;
     }
@@ -112,11 +117,6 @@ pub fn Kernel(comptime tuning: DepthwiseConv2DTuning) type {
                     }
                 }
             }
-        }
-
-        pub fn runItems(ctx_any: *anyopaque, start: usize, end: usize, _: usize) void {
-            const t: *const DepthwiseConv2DTask = @ptrCast(@alignCast(ctx_any));
-            runItemRange(t, start, end);
         }
 
         inline fn load(s: []align(1) const f32, i: usize) Vec {

@@ -33,6 +33,7 @@ const KernelDesc = pipelines.KernelDesc;
 const codegen = @import("../matmul/codegen.zig");
 const Generated = codegen.Generated;
 const matmul_exec = @import("matmul.zig");
+const autotune = @import("../autotune.zig");
 
 /// Uniform for the implicit-GEMM conv: the GEMM's own `Params` with the conv
 /// geometry appended, matching the struct `codegen.header` emits.
@@ -67,20 +68,56 @@ const ConvGemmParams = extern struct {
     _pad: u32 = 0,
 };
 
-/// Widest block whose `bn` still fits the output-channel count, so a 64-channel
-/// layer does not pay for a 128-wide block it can only half fill.
-fn chooseConvConfig(generated: []const Generated, ctx: Ctx, c_out: usize, b_row_bytes: isize) ?usize {
-    var best: ?usize = null;
-    for (generated, 0..) |g, i| {
-        if (!matmul_exec.eligibleConfig(g.cfg, ctx.gpu.limits, 16, b_row_bytes)) continue;
-        if (g.cfg.bn > c_out) continue;
-        if (best) |bi| {
-            if (g.cfg.bn < generated[bi].cfg.bn) continue;
-            if (g.cfg.bn == generated[bi].cfg.bn and g.cfg.bm <= generated[bi].cfg.bm) continue;
+/// The implicit-GEMM operands of one conv: x, w, bias (w when absent), out.
+const ConvGemmOperands = struct { bufs: [4]c.WGPUBuffer, sizes: [4]u64 };
+
+/// Record `gen` over the whole conv, or null when its grid exceeds the device's.
+fn recordConvGemm(ctx: Ctx, frame: *Frame, gen: Generated, gp: ConvGemmParams, ops: ConvGemmOperands) ExecuteProgramError!?void {
+    const built = try ctx.pipes.get(gen.desc, gen.entry);
+    const gx = context.ceilDiv(gp.n, gen.cfg.bn);
+    const gy = context.ceilDiv(gp.m, gen.cfg.bm);
+    if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) return null;
+    try frame.recordCompute(built, &ops.bufs, &ops.sizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
+}
+
+/// The fastest implicit-GEMM block for this conv, timed on the device once per
+/// shape: how wide a block its channels fill and how many blocks keep the GPU
+/// busy are both properties of the device, which WebGPU does not describe.
+fn chooseConvConfig(mm: *matmul_exec.Matmul, ctx: Ctx, gp: ConvGemmParams, ops: ConvGemmOperands) ?usize {
+    const Tune = struct {
+        ctx: Ctx,
+        gp: ConvGemmParams,
+        ops: ConvGemmOperands,
+        generated: []const Generated,
+
+        pub fn eligible(t: @This(), idx: usize) bool {
+            const cfg = t.generated[idx].cfg;
+            const in_grid = context.ceilDiv(t.gp.n, cfg.bn) <= context.MAX_GROUPS_PER_DIM and
+                context.ceilDiv(t.gp.m, cfg.bm) <= context.MAX_GROUPS_PER_DIM;
+            return in_grid and matmul_exec.eligibleConfig(cfg, t.ctx.gpu.limits, 16, @intCast(t.gp.n * @sizeOf(f32)));
         }
-        best = i;
-    }
-    return best;
+
+        pub fn timeNs(t: @This(), idx: usize) ?u64 {
+            const TUNE_ITERS = 8;
+            var best: ?u64 = null;
+            for (0..2) |_| {
+                matmul_exec.syncDevice(t.ctx);
+                const start = autotune.nowNs();
+                for (0..TUNE_ITERS) |_| {
+                    var f = Frame.init(t.ctx.allocator, t.ctx.gpu) catch return null;
+                    defer f.deinit();
+                    (recordConvGemm(t.ctx, &f, t.generated[idx], t.gp, t.ops) catch return null) orelse return null;
+                    f.submit();
+                }
+                matmul_exec.syncDevice(t.ctx);
+                const ns = autotune.nowNs() - start;
+                if (best == null or ns < best.?) best = ns;
+            }
+            return best;
+        }
+    };
+    const tune: Tune = .{ .ctx = ctx, .gp = gp, .ops = ops, .generated = mm.generated_conv };
+    return autotune.pickBest(&mm.conv_tune, autotune.shapeKey(gp.m, gp.n, gp.k), mm.generated_conv.len, tune);
 }
 
 const conv_kernel: KernelDesc = .{ .name = "conv", .wgsl = @embedFile("../kernels/conv.wgsl") };
@@ -177,10 +214,10 @@ pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1D) ExecuteProg
         .pad_left = 0,
         .pad_mode = s.pad_mode,
     };
-    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, &.{});
+    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, null);
 }
 
-pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2D, generated: []const Generated) ExecuteProgramError!void {
+pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2D, mm: *matmul_exec.Matmul) ExecuteProgramError!void {
     const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 4) return error.Unsupported;
@@ -199,7 +236,7 @@ pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2D, generated: 
         .pad_left = s.pad_left,
         .pad_mode = s.pad_mode,
     };
-    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 4, generated);
+    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 4, mm);
 }
 
 fn execConv(
@@ -211,7 +248,8 @@ fn execConv(
     bias_id: ?executable.TensorId,
     geo_in: Geometry,
     rank: usize,
-    generated: []const Generated,
+    /// The implicit-GEMM kernels and their tuning, for a conv2d; null for a conv1d.
+    mm: ?*matmul_exec.Matmul,
 ) ExecuteProgramError!void {
     const hs = ctx.store;
     const out_meta = hs.meta(out_id) catch return error.ExecutionFailed;
@@ -273,21 +311,13 @@ fn execConv(
     // Implicit GEMM needs a plain 2-D convolution: a group splits A by output
     // column, and reflect padding is not a zero-fill, so neither fits the kernel.
     // M runs over every batch's pixels, so C is the output buffer exactly.
-    const gemm_idx: ?usize = if (rank == 4 and geo.groups == 1 and geo.pad_mode == .zero and generated.len != 0)
-        chooseConvConfig(generated, ctx, c_out, @intCast(c_out * @sizeOf(f32)))
-    else
-        null;
-    if (gemm_idx) |gi| gemm: {
-        const gb = ctx.pipes.get(generated[gi].desc, generated[gi].entry) catch break :gemm;
-        const m_dim = std.math.cast(u32, batch * oh_cnt * ow_cnt) orelse break :gemm;
-        const n_dim = std.math.cast(u32, c_out) orelse break :gemm;
-        const k_dim = std.math.cast(u32, geo.kh * geo.kw * geo.c_in) orelse break :gemm;
+    if (mm) |tuner| if (rank == 4 and geo.groups == 1 and geo.pad_mode == .zero) gemm: {
         const gp: ConvGemmParams = .{
-            .m = m_dim,
-            .n = n_dim,
-            .k = k_dim,
-            .b_row = n_dim,
-            .c_row = n_dim,
+            .m = std.math.cast(u32, batch * oh_cnt * ow_cnt) orelse break :gemm,
+            .n = std.math.cast(u32, c_out) orelse break :gemm,
+            .k = std.math.cast(u32, geo.kh * geo.kw * geo.c_in) orelse break :gemm,
+            .b_row = std.math.cast(u32, c_out) orelse break :gemm,
+            .c_row = std.math.cast(u32, c_out) orelse break :gemm,
             .ow_out = @intCast(ow_cnt),
             .h_in = @intCast(geo.h_in),
             .w_in = @intCast(geo.w_in),
@@ -304,12 +334,10 @@ fn execConv(
             .has_bias = @intFromBool(dbias != null),
             .ohw = @intCast(oh_cnt * ow_cnt),
         };
-        const cfg = generated[gi].cfg;
-        const gx = context.ceilDiv(n_dim, cfg.bn);
-        const gy = context.ceilDiv(m_dim, cfg.bm);
-        if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) break :gemm;
-        return frame.recordCompute(gb, &bufs, &sizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
-    }
+        const ops: ConvGemmOperands = .{ .bufs = bufs, .sizes = sizes };
+        const gi = chooseConvConfig(tuner, ctx, gp, ops) orelse break :gemm;
+        if (try recordConvGemm(ctx, frame, tuner.generated_conv[gi], gp, ops)) |_| return;
+    };
 
     const use_dw = depthwiseOk(geo, c_in_g, c_out, rank) and
         ctx.gpu.limits.max_shared_bytes >= DW_SHARED_BYTES;

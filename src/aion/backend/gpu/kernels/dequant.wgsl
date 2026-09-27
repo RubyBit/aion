@@ -7,7 +7,7 @@
 // frame's pass ordering serializes scratch reuse across chunks.
 //
 //   q8_nt_to_f32t : B q8_0 [N, K] (NT)  -> scratch f32 [K, N]  (dequant + transpose)
-//   q8_lanes32_to_f32t : B q8_0 [N, K] in `lanes32` order -> scratch f32 [K, N]
+//   q8_lanes32x16_to_f32t : B q8_0 [N, K] in `lanes32x16` order -> scratch f32 [K, N]
 //   f32_nt_t      : B f32  [N, K] (NT)  -> scratch f32 [K, N]  (transpose)
 //   f16_to_f32    : same-layout f16 -> f32 widen (for f16 GEMM / cast)
 //
@@ -80,11 +80,12 @@ fn q8_nt_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
-// One work item = one (row, block) of a `lanes32` B (see matmul_nt_gemv.wgsl):
+// One work item = one (row, block) of a `lanes32x16` B (see matmul_nt_gemv.wgsl):
 // dequantize its 32 elements into the transposed scratch. The 32 items sharing a
-// (group, block) read one segment, 32 consecutive words per chunk.
+// (group, block) read one segment: quant word `j` of row `lane` is word `j % 4`
+// of that row's 16-byte slot in chunk `j / 4`.
 @compute @workgroup_size(64)
-fn q8_lanes32_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn q8_lanes32x16_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let step = nwg.x * 64u;
     let blocks = p.k / 32u;
     for (var i = g.x; i < p.count; i += step) {
@@ -96,7 +97,7 @@ fn q8_lanes32_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_
         let sw = unpack2x16float(src[seg + lane / 2u]);
         let d = select(sw.x, sw.y, (lane & 1u) == 1u);
         for (var j = 0u; j < 8u; j += 1u) {
-            let q = i8x4f(src[seg + 16u + j * 32u + lane]) * d;
+            let q = i8x4f(src[seg + 16u + ((j / 4u) * 32u + lane) * 4u + j % 4u]) * d;
             let k = kb * 32u + j * 4u;
             dst[k * p.dst_row + n] = q.x;
             dst[(k + 1u) * p.dst_row + n] = q.y;

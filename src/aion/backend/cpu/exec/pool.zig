@@ -5,6 +5,7 @@ const exe = @import("../../../runtime/executable.zig");
 const thread_pool = @import("../../../runtime/thread_pool.zig");
 const Error = @import("../../backend.zig").ExecuteProgramError;
 const simd = @import("../kernels/simd.zig");
+const exec_utils = @import("utils.zig");
 
 pub fn exec(
     allocator: std.mem.Allocator,
@@ -55,8 +56,7 @@ fn Rows(comptime T: type) type {
 
         const Self = @This();
 
-        fn call(ctx: *anyopaque, start: usize, end: usize, _: usize) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        fn call(self: *Self, start: usize, end: usize, _: usize) Error!void {
             for (start..end) |row| self.runRow(row / self.out_shape[1], row % self.out_shape[1]);
         }
 
@@ -104,12 +104,7 @@ fn run(
         .x = std.mem.bytesAsSlice(T, x.bytes),
         .y = std.mem.bytesAsSlice(T, y.bytes),
     };
-    const total: usize = out.shape[0] * out.shape[1];
-    if (pool) |p| {
-        if (thread_count > 1 and total > 1) {
-            p.parallelForAny(@ptrCast(&rows), total, 1, Rows(T).call);
-            return;
-        }
-    }
-    Rows(T).call(@ptrCast(&rows), 0, total, 0);
+    // A row reads every tap of every output pixel it folds.
+    const row_bytes = out.shape[2] * out.shape[3] * s.opts.kernel_h * s.opts.kernel_w * @sizeOf(T);
+    try exec_utils.parallelRange(Error, pool, thread_count, out.shape[0] * out.shape[1], row_bytes, &rows, Rows(T).call);
 }

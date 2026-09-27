@@ -1575,20 +1575,25 @@ pub const Model = struct {
         traceStorageTotals(self, "placed");
     }
 
-    /// `AION_TRACE_MEMORY` accounting: host bytes still held vs device bytes.
+    /// `AION_TRACE_MEMORY` accounting: host bytes the store owns, host bytes it
+    /// views in place (a mapped file's, which the OS can drop and re-read), and
+    /// device bytes.
     fn traceStorageTotals(self: *const Self, phase: []const u8) void {
         if (!env_util.flagEnabled("AION_TRACE_MEMORY")) return;
-        var cpu_bytes: usize = 0;
+        var owned: usize = 0;
+        var viewed: usize = 0;
         var gpu_bytes: usize = 0;
         for (self.store.tensors.items) |tensor| {
             if (tensor.backing_owner != null) continue;
-            if (tensor.device.kind == .cpu) {
-                cpu_bytes +|= tensor.backing_bytes;
-            } else {
+            if (tensor.device.kind != .cpu) {
                 gpu_bytes +|= tensor.backing_bytes;
+            } else if (tensor.owns_data) {
+                owned +|= tensor.backing_bytes;
+            } else {
+                viewed +|= tensor.backing_bytes;
             }
         }
-        std.debug.print("[aion][storage] {s} cpu_backing={d} gpu_backing={d}\n", .{ phase, cpu_bytes, gpu_bytes });
+        std.debug.print("[aion][storage] {s} cpu_owned={d} cpu_viewed={d} gpu_backing={d}\n", .{ phase, owned, viewed, gpu_bytes });
     }
 
     fn idIn(ids: []const TensorId, id: TensorId) bool {

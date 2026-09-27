@@ -129,35 +129,36 @@ fn gemv_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     if (in_bounds && lane == 0u) { store(n, total); }
 }
 
-// B in `lanes32` order (types.QuantBlockOrder): for each group of 32 rows and each
-// block, the group's 32 f16 scales (16 words), then 8 chunks holding the 32 rows'
-// 4 bytes side by side. One thread owns one row, so the 32 threads reading chunk j
-// read 32 consecutive words — one 128-byte line per load, where the block-pair
-// layout above spreads each load over a line per thread. Segments are 272 words,
-// so everything is word-aligned and nothing is shifted into place.
+// B in `lanes32x16` order (types.QuantBlockOrder): for each group of 32 rows and
+// each block, the group's 32 f16 scales (16 words), then 2 chunks holding the 32
+// rows' 16 quant bytes side by side. One thread owns one row and fetches its 32
+// quants with two 16-byte loads; the 32 threads of a chunk read 512 consecutive
+// bytes. Segments are 68 vec4s, so every load is aligned.
 //
 // K is split across `L_SLICES` slices of the workgroup; the slices' partials are
 // summed in shared memory. More slices for narrow N keep the GPU occupied: its
-// core count is not visible through WebGPU, so `gemv_q8_lanes32_wide` (32 slices)
-// is picked host-side when N alone yields few workgroups.
+// core count is not visible through WebGPU, so `gemv_q8_lanes32x16_wide` (32
+// slices) is picked host-side when N alone yields few workgroups.
+@group(0) @binding(1) var<storage, read> b4: array<vec4<u32>>;
+
 const L_W: u32 = 32u;
-const L_SEG: u32 = 272u; // words per (group, block) segment: 32 * 34 / 4
+const L_SEG4: u32 = 68u; // vec4s per (group, block) segment: 32 * 34 / 16
 
 var<workgroup> lpart: array<f32, 1024>;
 
 fn lanesRow(wid: u32, lane: u32, slice: u32, slices: u32) -> f32 {
     let blocks = p.k / 32u;
-    let gbase = wid * blocks * L_SEG;
+    let gbase = wid * blocks * L_SEG4;
     var acc = 0.0;
     for (var kb = slice; kb < blocks; kb += slices) {
-        let seg = gbase + kb * L_SEG;
-        let sw = unpack2x16float(b[seg + lane / 2u]);
+        let seg = gbase + kb * L_SEG4;
+        let sw = unpack2x16float(b4[seg + lane / 8u][(lane / 2u) % 4u]);
         let d = select(sw.x, sw.y, (lane & 1u) == 1u);
+        let q0 = b4[seg + 4u + lane];
+        let q1 = b4[seg + 4u + L_W + lane];
         let av = kb * 8u;
-        var s = 0.0;
-        for (var j = 0u; j < 8u; j += 1u) {
-            s += dot(i8x4f(b[seg + 16u + j * L_W + lane]), a[av + j]);
-        }
+        let s = dot(i8x4f(q0.x), a[av]) + dot(i8x4f(q0.y), a[av + 1u]) + dot(i8x4f(q0.z), a[av + 2u]) + dot(i8x4f(q0.w), a[av + 3u])
+              + dot(i8x4f(q1.x), a[av + 4u]) + dot(i8x4f(q1.y), a[av + 5u]) + dot(i8x4f(q1.z), a[av + 6u]) + dot(i8x4f(q1.w), a[av + 7u]);
         acc += d * s;
     }
     return acc;
@@ -176,7 +177,7 @@ fn lanesReduce(lidx: u32, lane: u32, slice: u32, slices: u32, acc: f32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn gemv_q8_lanes32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+fn gemv_q8_lanes32x16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let lane = lidx % L_W;
     let slice = lidx / L_W;
     let total = lanesReduce(lidx, lane, slice, 8u, lanesRow(wid.x, lane, slice, 8u));
@@ -185,7 +186,7 @@ fn gemv_q8_lanes32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocat
 }
 
 @compute @workgroup_size(1024)
-fn gemv_q8_lanes32_wide(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
+fn gemv_q8_lanes32x16_wide(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32) {
     let lane = lidx % L_W;
     let slice = lidx / L_W;
     let total = lanesReduce(lidx, lane, slice, 32u, lanesRow(wid.x, lane, slice, 32u));

@@ -275,6 +275,13 @@ class LoadedModel:
         """Overwrite the auto-tracked position (session restore / rollback)."""
         set_model_position(self._ctx_owner.ptr, self._require_handle(), tokens)
 
+    def _input_dtypes(self) -> dict[str, AionDType]:
+        """Each input's declared dtype by name; a loaded model's signature never changes."""
+        cached = getattr(self, "_input_dtype_map", None)
+        if cached is None:
+            cached = self._input_dtype_map = {spec.name: spec.dtype for spec in self.input_specs()}
+        return cached
+
     def _default_output_names(self) -> list[str]:
         """All outputs except io-aliased state carries (KV caches etc.), which the
         runtime already persists — copying them out per run is pure overhead.
@@ -329,7 +336,7 @@ class LoadedModel:
         temps: list[Tensor] = []
         # Host data becomes each input's declared dtype (float64 arrays as float32,
         # int64 token ids as int32, ...), not whatever the data's own dtype maps to.
-        dtypes = {spec.name: spec.dtype for spec in self.input_specs()}
+        dtypes = self._input_dtypes()
         try:
             for name, v in inputs.items():
                 if isinstance(v, Tensor):

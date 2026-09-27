@@ -19,6 +19,7 @@ pub const ConvExecCtx = conv_utils.ConvExecCtx;
 const PackedWeightKey = conv_utils.PackedWeightKey;
 const PackedWeightEntry = conv_utils.PackedWeightEntry;
 
+const findPackedWeights = conv_utils.findPackedWeights;
 const getOrCreatePackedWeights = conv_utils.getOrCreatePackedWeights;
 const scratchForTid = conv_utils.scratchForTid;
 const fillWeightBlock = conv_utils.fillWeightBlock;
@@ -301,7 +302,7 @@ fn execDepthwise(ctx: *ConvExecCtx, s: StepConv1D, out_meta: tensor_store.Tensor
         .bias = if (bias) |b| bytesAsF32Const(b.bytes) else &.{},
         .out = bytesAsF32Mut(out.bytes),
     };
-    conv_utils.runDepthwise(ctx, &task);
+    try conv_utils.runDepthwise(ctx, &task);
     return true;
 }
 
@@ -345,7 +346,7 @@ fn execConv1DImplicitGemm(
     const is_pointwise_unit: bool = (k == 1 and s.stride == 1 and s.dilation == 1 and s.pad_left == 0 and s.pad_right == 0 and l_out == l_in);
     const is_k3_same_regular: bool = (k == 3 and s.stride == 1 and s.dilation == 1 and s.pad_left == 1 and s.pad_right == 1 and l_out == l_in);
 
-    const alloc: std.mem.Allocator = std.heap.page_allocator;
+    const alloc: std.mem.Allocator = ctx.allocator;
 
     // Only build K→(kw,ic) maps when we actually need per-tap indexing.
     // Pointwise unit conv gathers directly from contiguous x slices.
@@ -413,8 +414,6 @@ fn execConv1DImplicitGemm(
     const tile_infos: []TileInfo = try alloc.alloc(TileInfo, total_tiles);
     defer alloc.free(tile_infos);
 
-    const w_block: []f32 = try alloc.alloc(f32, k_dim_g * oc_tile_max);
-    defer alloc.free(w_block);
 
     var ti: usize = 0;
     var g: usize = 0;
@@ -427,9 +426,6 @@ fn execConv1DImplicitGemm(
             const oc_count: usize = @min(oc_tile_max, c_out_g - oc0);
             const oc_start: usize = oc_base + oc0;
 
-            try fillWeightBlock(w_block[0 .. k_dim_g * oc_count], w_packed, k_dim_g, c_out, oc_start, oc_count);
-            const w_block_vals: []align(1) const f32 = w_block[0 .. k_dim_g * oc_count];
-
             const key_g: PackedWeightKey = .{
                     .w_id = s.w,
                 .oc_start = oc_start,
@@ -440,7 +436,14 @@ fn execConv1DImplicitGemm(
                 .nc = ctx.matmul_f32.tuning.nc,
             };
 
-            const packed_w_g: PackedWeightEntry = try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block_vals);
+            // A weight never changes, so gathering its block is worth doing only
+            // when the pack cache has nothing for it.
+            const packed_w_g: PackedWeightEntry = findPackedWeights(ctx.cache, key_g) orelse blk: {
+                const w_block = try alloc.alloc(f32, k_dim_g * oc_count);
+                defer alloc.free(w_block);
+                try fillWeightBlock(w_block, w_packed, k_dim_g, c_out, oc_start, oc_count);
+                break :blk try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block);
+            };
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
         }
@@ -480,7 +483,7 @@ fn execConv1DImplicitGemm(
         is_stride1_contig_groups1: bool,
         alloc: std.mem.Allocator,
 
-        fn runRowsRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
+        pub fn runRowsRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
             const m_cap_local: usize = t.m_cap;
             const a_panel: []f32 = try t.alloc.alloc(f32, m_cap_local * t.kc);
             defer t.alloc.free(a_panel);
@@ -715,12 +718,6 @@ fn execConv1DImplicitGemm(
                 row0 += m_rows;
             }
         }
-
-        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
-            const t: *@This() = @ptrCast(@alignCast(ctx_any));
-            const scratch: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            try t.runRowsRange(scratch, start, end);
-        }
     };
 
     var task: Task = .{
@@ -749,17 +746,7 @@ fn execConv1DImplicitGemm(
         .alloc = alloc,
     };
 
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and rows_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
-            const grain: usize = @max(m_cap, @max(@as(usize, 1), rows_total / (ctx.thread_count * 4)));
-            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), rows_total, grain, Task.runRows);
-            return true;
-        }
-    }
-
-    const scratch: []align(32) u8 = try scratchForTid(ctx, 0);
-    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch);
-    try task.runRowsRange(scratch, 0, rows_total);
+    try conv_utils.runGemmRows(ctx, &task, rows_total, m_cap, c_out * k_dim_g);
     return true;
 }
 

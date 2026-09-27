@@ -32,6 +32,8 @@ const dequant_kernel: pipelines.KernelDesc = .{ .name = "dequant", .wgsl = @embe
 /// Fused q8_0 (K-major) matvec for M==1 (decode): folds the dequant into the dot
 /// so B is read once, no f32 scratch. See kernels/matmul_gemv.wgsl.
 const gemv_kernel: pipelines.KernelDesc = .{ .name = "matmul_gemv", .wgsl = @embedFile("../kernels/matmul_gemv.wgsl") };
+/// Column quads per f32 GEMV workgroup (matches `QUADS` in matmul_gemv.wgsl).
+const GEMV_F32_QUADS: u32 = 32;
 /// Column-pairs per GEMV workgroup (matches `COLS` in matmul_gemv.wgsl).
 const GEMV_COLS: u32 = 32;
 /// Same for the narrow variant (`COLS_N`), and the group count below which it wins.
@@ -71,7 +73,7 @@ pub const MatMulParams = extern struct {
     _a3: u32 = 0,
 };
 
-fn syncDevice(ctx: Ctx) void {
+pub fn syncDevice(ctx: Ctx) void {
     _ = fns.wgpuDevicePoll(ctx.gpu.device, 1, null);
 }
 
@@ -172,6 +174,9 @@ pub const Matmul = struct {
     generated: []const Generated,
     /// The implicit-GEMM conv kernels, rendered into the same arena.
     generated_conv: []const Generated,
+    /// The fastest conv kernel per conv shape (see `conv.zig`), kept apart from
+    /// `tune` so a conv never reuses a GEMM's choice for the same dims.
+    conv_tune: autotune.Cache,
 
     /// Pooled f32 scratch holding a dequantized B [k, n] for the q8_0-B GEMM path.
     /// Grows monotonically; freed in `deinit`.
@@ -182,10 +187,11 @@ pub const Matmul = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const generated = configs.generate(arena.allocator());
         const generated_conv = configs.generateConv(arena.allocator());
-        return .{ .tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated, .generated_conv = generated_conv };
+        return .{ .tune = autotune.Cache.init(allocator), .conv_tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated, .generated_conv = generated_conv };
     }
     pub fn deinit(self: *Matmul) void {
         self.tune.deinit();
+        self.conv_tune.deinit();
         self.arena.deinit();
         if (self.dq_scratch) |s| fns.wgpuBufferRelease(s);
     }
@@ -236,6 +242,8 @@ pub const Matmul = struct {
         if (g.m == 0 or g.n == 0) return;
         if (b_meta.dtype == .q8_0) return self.execQuantB(ctx, frame, s, g);
         if (b_meta.dtype != .f32) return error.Unsupported;
+        // One row of A streams B once: a matvec, not a tiled GEMM that would stage it.
+        if (g.batch == 1 and g.m == 1 and g.n % 4 == 0 and g.k % 4 == 0) return recordGemvF32(ctx, frame, s, g);
 
         // Batched products are small in these models: one bounds-checked config
         // rather than a tune per shape.
@@ -379,6 +387,30 @@ pub const Matmul = struct {
 
 fn castU32(v: usize) ExecuteProgramError!u32 {
     return std.math.cast(u32, v) orelse error.Unsupported;
+}
+
+/// C[n] = alpha * A[k] . B[k, n] + beta * C[n] for an f32 B (see `gemv_f32_kmajor`).
+fn recordGemvF32(ctx: Ctx, frame: *Frame, s: StepMatMul, g: Gemm) ExecuteProgramError!void {
+    const hs = ctx.store;
+    const da = hs.acquireConst(s.a) catch return error.ExecutionFailed;
+    defer hs.releaseConst(da.token);
+    const db = hs.acquireConst(s.b) catch return error.ExecutionFailed;
+    defer hs.releaseConst(db.token);
+    const dc = hs.acquireMut(s.c) catch return error.ExecutionFailed;
+    defer hs.releaseMut(dc.token);
+    inline for (.{ da.len, db.len, dc.len }) |len| if (!context.storageBindingFits(ctx, len)) return error.Unsupported;
+
+    const n = try castU32(g.n);
+    const params: GemvParams = .{ .k = try castU32(g.k), .n = n, .alpha = s.alpha, .beta = s.beta };
+    const bufs = [_]c.WGPUBuffer{
+        ctx.devmem.bufferFor(da.handle).?,
+        ctx.devmem.bufferFor(db.handle).?,
+        ctx.devmem.bufferFor(dc.handle).?,
+    };
+    const sizes = [_]u64{ da.len, db.len, dc.len };
+    const built = try ctx.pipes.get(gemv_kernel, "gemv_f32_kmajor");
+    const groups = @max(1, context.ceilDiv(n / 4, GEMV_F32_QUADS));
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
 }
 
 /// Record the one dispatch computing `g` with config `gen`. Shared by the execute

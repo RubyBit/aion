@@ -276,6 +276,8 @@ inline fn sweepRows(
                 sweepColumns(enc, 1, c, params, ldc, rows, a_rows, a_stride, b + j * b_stride, b_stride, blocks, j);
             }
         },
+        // A GPU layout: CPU tiers read it through `matmulNtQ8_0Foreign`.
+        .lanes32x16 => unreachable,
         inline .lanes4, .lanes8, .lanes16, .lanes32 => |grouped| {
             const W = comptime grouped.groupRows();
             const R = comptime groupTileRows(W);

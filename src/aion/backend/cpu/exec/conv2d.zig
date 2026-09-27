@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
 const conv_utils = @import("conv_utils.zig");
+const exec_utils = @import("utils.zig");
 
 
 
@@ -46,9 +47,8 @@ const ImageBuild = struct {
     geo: conv_utils.ImageGeometry,
     plane: usize,
 
-    fn run(ctx_any: *anyopaque, first: usize, last: usize, tid: usize) ExecuteProgramError!void {
+    fn run(t: *@This(), first: usize, last: usize, tid: usize) ExecuteProgramError!void {
         _ = tid;
-        const t: *@This() = @ptrCast(@alignCast(ctx_any));
         const rows: usize = t.geo.h_in;
         var i: usize = first;
         while (i < last) {
@@ -169,7 +169,7 @@ fn execDepthwise(ctx: *ConvExecCtx, s: StepConv2D, out_meta: tensor_store.Tensor
         .bias = if (bias) |b| bytesAsF32Const(b.bytes) else &.{},
         .out = bytesAsF32Mut(out.bytes),
     };
-    conv_utils.runDepthwise(ctx, &task);
+    try conv_utils.runDepthwise(ctx, &task);
     return true;
 }
 
@@ -210,7 +210,7 @@ fn execConv2DImplicitGemm(
     const rows_total: usize = batch * h_out * w_out;
     const k_dim_g: usize = k_h * k_w * c_in_g;
 
-    const alloc: std.mem.Allocator = std.heap.page_allocator;
+    const alloc: std.mem.Allocator = ctx.allocator;
 
     const x_ref = try store.acquireConst(s.x);
     defer store.releaseConst(x_ref.token);
@@ -249,8 +249,6 @@ fn execConv2DImplicitGemm(
     const tile_infos: []TileInfo = try alloc.alloc(TileInfo, total_tiles);
     defer alloc.free(tile_infos);
 
-    const w_block: []f32 = try alloc.alloc(f32, k_dim_g * oc_tile_max);
-    defer alloc.free(w_block);
 
     var ti: usize = 0;
     var g: usize = 0;
@@ -276,8 +274,10 @@ fn execConv2DImplicitGemm(
             // A weight never changes, so gathering its block is worth doing only
             // when the pack cache has nothing for it.
             const packed_w_g: PackedWeightEntry = findPackedWeights(ctx.cache, key_g) orelse blk: {
-                try fillWeightBlock(w_block[0 .. k_dim_g * oc_count], w_packed, k_dim_g, c_out, oc_start, oc_count);
-                break :blk try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block[0 .. k_dim_g * oc_count]);
+                const w_block = try alloc.alloc(f32, k_dim_g * oc_count);
+                defer alloc.free(w_block);
+                try fillWeightBlock(w_block, w_packed, k_dim_g, c_out, oc_start, oc_count);
+                break :blk try getOrCreatePackedWeights(ctx.cache, matmul, key_g, w_block);
             };
             tile_infos[ti] = .{ .oc_start = oc_start, .oc_count = oc_count, .ic_base = ic_base, .packed_w = packed_w_g };
             ti += 1;
@@ -424,7 +424,7 @@ fn execConv2DImplicitGemm(
             }
         }
 
-        fn runRowsRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
+        pub fn runRowsRange(t: *const @This(), scratch: []align(32) u8, start: usize, end: usize) ExecuteProgramError!void {
             @setRuntimeSafety(false);
             const m_cap_local: usize = t.m_cap;
             const full_blocks: usize = t.params.k_dim_g / t.kc;
@@ -754,12 +754,6 @@ fn execConv2DImplicitGemm(
                 row0 += m_rows;
             }
         }
-
-        fn runRows(ctx_any: *anyopaque, start: usize, end: usize, tid: usize) ExecuteProgramError!void {
-            const t: *@This() = @ptrCast(@alignCast(ctx_any));
-            const scratch_bytes: []align(32) u8 = t.ctx.matmul_scratch[tid];
-            try t.runRowsRange(scratch_bytes, start, end);
-        }
     };
 
     // Rewriting the activations channel-major up front costs one pass over x and
@@ -789,16 +783,8 @@ fn execConv2DImplicitGemm(
             };
             @memset(buf, 0);
             var build: ImageBuild = .{ .dst = buf, .x = x_packed, .geo = geo, .plane = plane };
-            const img_rows: usize = batch * h_in;
-            var built_parallel = false;
-            if (ctx.pool) |pl| {
-                if (ctx.thread_count > 1 and img_rows >= 2) {
-                    const grain: usize = @max(@as(usize, 1), img_rows / (ctx.thread_count * 4));
-                    try pl.parallelForFallible(ExecuteProgramError, @ptrCast(&build), img_rows, grain, ImageBuild.run);
-                    built_parallel = true;
-                }
-            }
-            if (!built_parallel) try ImageBuild.run(@ptrCast(&build), 0, img_rows, 0);
+            const row_bytes = w_in * c_in * @sizeOf(f32);
+            try exec_utils.parallelRange(ExecuteProgramError, ctx.pool, ctx.thread_count, batch * h_in, row_bytes, &build, ImageBuild.run);
             image = .{ .data = buf, .wp = wp, .plane_elems = plane };
         }
     }
@@ -833,17 +819,7 @@ fn execConv2DImplicitGemm(
         .image = image,
     };
 
-    if (ctx.pool) |p| {
-        if (ctx.thread_count > 1 and rows_total >= 2 and ctx.matmul_scratch.len >= ctx.thread_count) {
-            const grain: usize = @max(m_cap, @max(@as(usize, 1), rows_total / (ctx.thread_count * 4)));
-            try p.parallelForFallible(ExecuteProgramError, @ptrCast(&task), rows_total, grain, Task.runRows);
-            return true;
-        }
-    }
-
-    const scratch: []align(32) u8 = try scratchForTid(ctx, 0);
-    defer if (ctx.matmul_scratch.len == 0) ctx.allocator.free(scratch);
-    try task.runRowsRange(scratch, 0, rows_total);
+    try conv_utils.runGemmRows(ctx, &task, rows_total, m_cap, c_out * k_dim_g);
     return true;
 }
 

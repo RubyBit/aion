@@ -25,6 +25,8 @@ pub const parallel_min_bytes: usize = 256 * 1024;
 /// a few-KiB decode tensor never forks at all. Work enough for every thread is cut
 /// several chunks per thread and claimed on demand, so fast cores are not left
 /// waiting on slow ones (hybrid CPUs mix both).
+/// A compute-bound caller counts one multiply-add as one byte: both come to roughly
+/// a nanosecond per few hundred on one core, which is what the threshold weighs.
 /// `body` must be safe to run on disjoint ranges concurrently; its last argument is
 /// the running thread's id, for per-thread scratch.
 pub fn parallelRange(

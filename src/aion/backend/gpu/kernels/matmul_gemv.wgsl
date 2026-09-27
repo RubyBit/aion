@@ -288,3 +288,54 @@ fn gemv_q8_kmajor_odd(
         cmat[n] = v + p.beta * cmat[n];
     }
 }
+
+// f32 twin for a plain f32 B [K, N] (a batch-one fully connected layer): no
+// dequant, so a thread owns 4 adjacent columns and reads them as one vec4 per K
+// row — a warp streams 512 contiguous bytes of each row. The same K-lane split
+// and reduction as `gemv_q8_kmajor` give the launch its occupancy. N % 4 == 0
+// (checked host-side).
+@group(0) @binding(1) var<storage, read> b4: array<vec4<f32>>;
+
+const QUADS: u32 = 32u; // column quads per workgroup
+
+var<workgroup> part4: array<vec4<f32>, WG>;
+
+@compute @workgroup_size(1024)
+fn gemv_f32_kmajor(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+) {
+    let quad_local = lidx % QUADS;
+    let klane = lidx / QUADS;
+    let quad = wid.x * QUADS + quad_local;
+    let quads = p.n / 4u;
+    let in_bounds = quad < quads;
+
+    var acc = vec4<f32>(0.0);
+    if (in_bounds) {
+        for (var k = klane; k < p.k; k += LANES) {
+            acc += a[k / 4u][k % 4u] * b4[k * quads + quad];
+        }
+    }
+
+    part4[lidx] = acc;
+    workgroupBarrier();
+    var s = LANES / 2u;
+    while (s > 0u) {
+        if (klane < s) { part4[lidx] += part4[lidx + s * QUADS]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+
+    if (in_bounds && klane == 0u) {
+        let v = p.alpha * part4[quad_local];
+        for (var j = 0u; j < 4u; j += 1u) {
+            let n = quad * 4u + j;
+            if (p.beta == 0.0) {
+                cmat[n] = v[j];
+            } else {
+                cmat[n] = v[j] + p.beta * cmat[n];
+            }
+        }
+    }
+}

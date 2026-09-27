@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
+const builtin = @import("builtin");
 
 const types = @import("../backend/types.zig");
 const utils = @import("../backend/utils.zig");
@@ -104,6 +105,32 @@ pub const SharedBytes = struct {
         }
         self.gpa.destroy(self);
     }
+
+    /// Give back the pages wholly inside `bytes` of a file mapping, which a holder is
+    /// letting go of: they leave the process's working set. They are clean file pages,
+    /// so this costs nothing and loses nothing; anything that reads them again (another
+    /// holder of the same range, an export) faults them back in from the file. Without
+    /// it a mapping keeps every page ever touched resident until the OS runs short of
+    /// memory, so a weight re-laid into a copy would stay counted twice. A no-op for
+    /// other sources: a heap buffer is freed with its last holder, and memory someone
+    /// else owns is theirs to manage.
+    fn discard(self: *const SharedBytes, bytes: []const u8) void {
+        if (self.source != .map) return;
+        const page = std.heap.pageSize();
+        const start = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
+        const end = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
+        if (end <= start) return;
+        const pages: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(start);
+        switch (builtin.os.tag) {
+            // Unlocking pages that were never locked removes them from the working set
+            // (and reports ERROR_NOT_LOCKED, which is the expected outcome here).
+            .windows => _ = VirtualUnlock(pages, end - start),
+            .linux, .macos, .ios, .freebsd, .netbsd, .openbsd => std.posix.madvise(pages, end - start, std.posix.MADV.DONTNEED) catch {},
+            else => {},
+        }
+    }
+
+    extern "kernel32" fn VirtualUnlock(address: *anyopaque, size: usize) callconv(.winapi) std.os.windows.BOOL;
 
     /// The heap buffer back, when the caller holds the only reference to it; this
     /// is then gone. Null for a mapping or a buffer someone else still holds.
@@ -271,10 +298,14 @@ pub const Tensor = struct {
         return @alignCast(self.data);
     }
 
-    /// Let go of the host bytes: free them if owned, release them if shared.
+    /// Let go of the host bytes: free them if owned, release them if shared (and give
+    /// a file mapping's pages back to the OS, see `SharedBytes.discard`).
     pub fn dropHostBytes(self: *Self) void {
         if (self.data.len != 0 and self.owns_data) self.allocator.free(self.ownedBytes());
-        if (self.shared) |s| s.release();
+        if (self.shared) |s| {
+            s.discard(self.data);
+            s.release();
+        }
         self.shared = null;
         self.data = &[_]u8{};
         self.owns_data = true;

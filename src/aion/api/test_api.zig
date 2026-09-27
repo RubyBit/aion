@@ -3455,6 +3455,58 @@ test "api: loaded host weights are views of the mapping, copied on write" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -8.0, 2.5 }, &try run(&load_ctx, &again));
 }
 
+// A tensor letting go of mapped bytes hands their pages back to the OS
+// (`SharedBytes.discard`); whatever still reads them faults them back in from the
+// file, so nothing changes but residency. Weights span several pages here, so the
+// discard really drops some.
+test "api: pages a released mapped weight gives back still read correctly" {
+    const allocator: std.mem.Allocator = std.testing.allocator;
+    const n: usize = 8192; // 32 KiB of f32 per weight
+    const vals = try allocator.alloc(f32, n);
+    defer allocator.free(vals);
+    for (vals, 0..) |*v, i| v.* = @floatFromInt(i);
+
+    var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer export_ctx.deinit();
+    var bld = api.Builder.init(&export_ctx);
+    defer bld.deinit();
+    const X = try bld.name(try bld.input(.f32, &[_]usize{n}), "x");
+    const A = try bld.name(try bld.param(try export_ctx.fromF32(&[_]usize{n}, vals)), "a");
+    const B = try bld.name(try bld.param(try export_ctx.fromF32(&[_]usize{n}, vals)), "b");
+    const Y = try bld.add(try bld.add(X, A), B);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir, "discard.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
+
+    var ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
+    defer ctx.deinit();
+    var model = try ctx.loadModel(file, .{});
+    defer model.deinit();
+
+    // An export of weight `a` shares its mapped bytes; the weight then lets go of them
+    // (a write copies it), which discards those pages while the export still reads them.
+    const a = try model.initializerTensorByDebugName("a");
+    const exported = try a.share();
+    defer exported.release();
+    try a.writeF32(vals);
+    const seen: []align(1) const f32 = std.mem.bytesAsSlice(f32, exported.bytes);
+    for (seen, vals) |got, want| try std.testing.expectEqual(want, got);
+
+    // The neighbouring weight, and the model, are untouched.
+    const x = try allocator.alloc(f32, n);
+    defer allocator.free(x);
+    @memset(x, 1);
+    try model.bindInput("x", try ctx.fromF32(&[_]usize{n}, x));
+    try model.run();
+    const y = try allocator.alloc(f32, n);
+    defer allocator.free(y);
+    try (try model.outputTensor("y")).read(y);
+    for (y, vals) |got, v| try std.testing.expectEqual(1 + 2 * v, got);
+}
+
 // What an export hands out: bytes that stay valid and unchanged while it is held,
 // whatever the tensor does; a write then goes to a copy, and once the export is
 // gone the tensor takes its buffer back without one.

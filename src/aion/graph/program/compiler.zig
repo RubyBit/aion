@@ -30,6 +30,7 @@ pub const Step = executable.Step;
 pub const PlacedStep = executable.PlacedStep;
 pub const Program = executable.ExecutableProgram;
 pub const materializePlacements = workspace.materializePlacements;
+pub const materializeOnHost = workspace.materializeOnHost;
 
 const MAX_RANK: usize = 8;
 

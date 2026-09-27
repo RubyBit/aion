@@ -147,6 +147,20 @@ fn convParity(with_bias: bool) !void {
     }
 }
 
+/// Everything `prog` places has bytes for `materializePlacements`: its own, or a
+/// workspace slot's, which the slot gets where it is placed (host bytes at compile
+/// time, a device's when materialized). A tensor a pass removed has neither.
+fn expectPlacementsBacked(sm: *StorageManager, prog: *const program.Program) !void {
+    try prog.validatePlacements();
+    for (prog.tensor_placements) |entry| {
+        if (try sm.tensorHasBacking(entry.id)) continue;
+        const in_slot = for (prog.workspace_slots) |slot| {
+            if (std.mem.indexOfScalar(TensorId, slot.members, entry.id) != null) break true;
+        } else false;
+        try std.testing.expect(in_slot);
+    }
+}
+
 test "pointwise_conv: 1x1 conv1d lowers to matmul and matches conv output" {
     try convParity(false);
 }
@@ -256,10 +270,7 @@ test "add_norm: residual + rmsnorm is one step on every target" {
 
         // The pass runs after placement, so the entry for the intermediate it killed has
         // to be gone: `materializePlacements` demands backing for everything listed.
-        try prog.validatePlacements();
-        for (prog.tensor_placements) |entry| {
-            try std.testing.expect(try sm.tensorHasBacking(entry.id));
-        }
+        try expectPlacementsBacked(&sm, &prog);
     }
 }
 
@@ -515,10 +526,7 @@ test "add_norm + gate: fuse inside a control-flow body" {
     // The gate consumed the gelu; the leading relu is nobody's producer here and stays.
     try std.testing.expectEqual(@as(usize, 1), countBlockStep(&prog, .Unary));
     try std.testing.expectEqual(@as(usize, 0), countBlockStep(&prog, .RMSNorm) - fused_norms);
-    try prog.validatePlacements();
-    for (prog.tensor_placements) |entry| {
-        try std.testing.expect(try sm.tensorHasBacking(entry.id));
-    }
+    try expectPlacementsBacked(&sm, &prog);
 }
 
 // ---------------------------------------------------------------------------

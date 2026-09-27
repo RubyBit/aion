@@ -21,3 +21,4 @@ pub const optDefaults = @import("opt.zig").defaults;
 pub const compileGraph = compiler.compileGraph;
 pub const Target = compiler.Target;
 pub const materializePlacements = compiler.materializePlacements;
+pub const materializeOnHost = compiler.materializeOnHost;

@@ -168,22 +168,31 @@ pub fn plan(
         }
     }
 
-    // An aliased destination reads bytes the source produced, and it reads them AFTER
-    // the source's own last use. So the source's slot must stay alive that long and
-    // must never be handed to another tensor -- otherwise a later reuse would
-    // overwrite the bytes the destination is about to read. Extend and pin it here,
-    // before slots are assigned.
+    // An aliased destination owns no bytes: it reads the ones its source (the root
+    // of any chain of views, `alias_views.elide` resolves it) produced, until its own
+    // last use. So the source's lifetime spans every destination's, and from then on
+    // it is an ordinary lifetime: it may take a slot that is free before it starts,
+    // and hands its slot on once the last destination is done. Extending it is what
+    // keeps a later tensor from overwriting bytes a destination is still reading.
     {
         var it = alias.iterator();
         while (it.next()) |entry| {
             const dst_i = by_id.get(entry.key_ptr.*) orelse continue;
             const src_i = by_id.get(entry.value_ptr.*) orelse continue;
-            intervals[src_i].reusable = false;
-            if (intervals[dst_i].seen) {
-                intervals[src_i].last = @max(intervals[src_i].last, intervals[dst_i].last);
-                if (!intervals[src_i].seen) {
-                    intervals[src_i].seen = true;
-                    intervals[src_i].first = intervals[dst_i].first;
+            const dst = intervals[dst_i];
+            if (dst.seen) {
+                const src = &intervals[src_i];
+                src.first = if (src.seen) @min(src.first, dst.first) else dst.first;
+                src.last = @max(src.last, dst.last);
+                src.seen = true;
+                // The source now lives wherever a destination is read: a lifetime seen
+                // in two domains (the program and a loop body) cannot be flattened
+                // onto one timeline, so it keeps a slot of its own (see `observeDomain`).
+                if (dst.domain_set) {
+                    if (!src.domain_set) {
+                        src.domain = dst.domain;
+                        src.domain_set = true;
+                    } else if (src.domain != dst.domain) src.reusable = false;
                 }
             }
             // The destination owns nothing; skip it in slot assignment below.
@@ -282,13 +291,16 @@ pub fn plan(
     var workspace_bytes: usize = 0;
     for (slots.items, 0..) |*slot, i| {
         for (slot.members.items[1..]) |id| mgr.aliasTensorBacking(id, slot.owner) catch return error.InvalidArgument;
-        // Keep one slot-sized host allocation even for a GPU program. It allows
-        // CPU reference execution before placement without restoring per-value
-        // allocations; GPU materialization releases it.
-        mgr.reserveHostBacking(slot.owner, slot.bytes) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvalidArgument,
-        };
+        // A slot the program keeps on the host gets its bytes now. One placed on a
+        // device gets them there when the program is materialized
+        // (`materializePlacements`), with no host copy made and zeroed first -- unless
+        // its current contents must survive, which materializing moves over.
+        if (slot.placement.kind == .cpu or slot.preserve_contents) {
+            mgr.reserveHostBacking(slot.owner, slot.bytes) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidArgument,
+            };
+        }
         workspace_bytes = std.math.add(usize, workspace_bytes, slot.bytes) catch return error.InvalidArgument;
 
         const members = allocator.dupe(TensorId, slot.members.items) catch return error.OutOfMemory;
@@ -312,6 +324,14 @@ pub fn plan(
         );
     }
     try validateAliases(mgr, prog);
+}
+
+/// Give every workspace slot of `prog` host bytes, so the program can run on the host
+/// whatever its target placed: a CPU reference of a device program, say. The planner
+/// only backs host-placed slots itself (a device slot gets its bytes on the device,
+/// in `materializePlacements`), so this is the host side of that same step.
+pub fn materializeOnHost(mgr: *StorageManager, prog: *const Program) manager_mod.StorageError!void {
+    for (prog.workspace_slots) |slot| try mgr.reserveHostBacking(slot.owner, slot.bytes);
 }
 
 /// Materialize a compiler-planned program at its declared placement. Workspace
@@ -413,6 +433,60 @@ test "workspace planner grows capacity for disjoint lifetimes in one domain" {
     try std.testing.expect((try mgr.physicalBackingId(b)) != b);
     try std.testing.expect((try mgr.physicalBackingId(c)) != try mgr.physicalBackingId(b));
     try std.testing.expectEqual(out, try mgr.physicalBackingId(out));
+}
+
+// A view (an elided reshape) reads its source's bytes until its own last use, so
+// the source's slot is held that long -- and no longer: a tensor that starts after
+// the view is done reuses it, while one alive during the view's reads does not.
+test "workspace planner holds an aliased source's slot exactly until its last view is read" {
+    const allocator = std.testing.allocator;
+    var mgr = StorageManager.init(allocator);
+    defer mgr.deinit();
+
+    const input = try mgr.createTensor(.f32, &.{4}, .{});
+    const src = try mgr.createTensor(.f32, &.{4}, .{});
+    const view = try mgr.createTensor(.f32, &.{4}, .{});
+    const during = try mgr.createTensor(.f32, &.{4}, .{});
+    const w = try mgr.createTensor(.f32, &.{4}, .{});
+    const z = try mgr.createTensor(.f32, &.{4}, .{});
+    const after = try mgr.createTensor(.f32, &.{4}, .{});
+    const out = try mgr.createTensor(.f32, &.{4}, .{});
+    const owned = [_]TensorId{ src, view, during, w, z, after, out };
+    for (owned) |id| try mgr.releaseTensorData(id);
+
+    var steps = [_]PlacedStep{
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = src, .a = input } } }, // 0: src written
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = during, .a = input } } }, // 1: alive across the view's read
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = w, .a = view } } }, // 2: the view's last read
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = z, .a = during } } }, // 3
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = after, .a = w } } }, // 4: starts after the view is done
+        .{ .op = .{ .Unary = .{ .op = .relu, .out = out, .a = after } } },
+    };
+    var outputs = [_]TensorId{out};
+    var placements: [owned.len + 1]executable.TensorPlacement = undefined;
+    placements[0] = .{ .id = input, .placement = .{} };
+    for (owned, 1..) |id, i| placements[i] = .{ .id = id, .placement = .{} };
+    var prog: Program = .{
+        .allocator = allocator,
+        .steps = &steps,
+        .outputs = &outputs,
+        .tensor_placements = &placements,
+    };
+    defer {
+        for (prog.workspace_slots) |slot| allocator.free(slot.members);
+        allocator.free(prog.workspace_slots);
+    }
+
+    var alias: alias_views.AliasMap = .init(allocator);
+    defer alias.deinit();
+    try alias.put(view, src);
+    try plan(allocator, &mgr, &prog, &owned, &alias);
+
+    const src_slot = try mgr.physicalBackingId(src);
+    try std.testing.expectEqual(src_slot, try mgr.physicalBackingId(view));
+    try std.testing.expect(src_slot != try mgr.physicalBackingId(during));
+    try std.testing.expect(src_slot != try mgr.physicalBackingId(w));
+    try std.testing.expectEqual(src_slot, try mgr.physicalBackingId(after));
 }
 
 test "workspace planner isolates loop-body reuse from the enclosing schedule" {

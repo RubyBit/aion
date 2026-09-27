@@ -592,6 +592,76 @@ test "api: a loaded weight read by the host as a predicate matches cpu on gpu" {
     for (cpu, gpu) |c, g| try std.testing.expectApproxEqAbs(c, g, 1e-2);
 }
 
+// A GPU load uploads nothing: weights start as views of the file, and the first
+// compile moves each one where it is read, once. A weight re-laid for the kernel is
+// re-laid straight from the file, so its original never reaches the device; the
+// re-laid copy there is its only copy.
+test "api: a gpu load uploads each weight once, as its kernel reads it" {
+    const alloc = std.testing.allocator;
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "lazy.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    const k: usize = 64;
+    const n: usize = 64;
+    var w_v: [k * n]f32 = undefined;
+    for (&w_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.04;
+    var b_v: [n]f32 = undefined;
+    for (&b_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.01;
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const x = try bld.name(try bld.input(.f32, &.{ 4, k }), "x");
+        const w = try bld.paramNamed(try ctx.fromF32(&.{ k, n }, &w_v), "w", .{ .quantize = .q8_0 });
+        const b = try bld.paramNamed(try ctx.fromF32(&.{n}, &b_v), "b", .{});
+        const y = try bld.add(try bld.matmul(x, w, 1.0, 0.0), b);
+        try ctx.exportModel(file, &bld, &.{.{ .name = "y", .tensor = y }}, .{});
+    }
+
+    var x_v: [4 * k]f32 = undefined;
+    for (&x_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) * 0.05 - 0.3;
+    var want: [4 * n]f32 = undefined;
+    {
+        var cpu_model = try ctx.loadModel(file, .{});
+        defer cpu_model.deinit();
+        try cpu_model.bindInput("x", try ctx.fromF32(&.{ 4, k }, &x_v));
+        try cpu_model.run();
+        try (try cpu_model.outputTensor("y")).read(&want);
+    }
+
+    var model = try ctx.loadModel(file, .{ .device = .{ .gpu = 0 } });
+    defer model.deinit();
+    const w_id = (try model.initializerTensorByDebugName("w")).tensorId();
+    const b_id = (try model.initializerTensorByDebugName("b")).tensorId();
+    // Loaded: both weights are views of the file on the host, nothing uploaded.
+    for ([_]@TypeOf(w_id){ w_id, b_id }) |id| {
+        try std.testing.expectEqual(.cpu, (try ctx.store.tensorDevice(id)).kind);
+        try std.testing.expect((try ctx.store.getConst(id)).shared != null);
+    }
+
+    try model.bindInput("x", try ctx.fromF32(&.{ 4, k }, &x_v));
+    try model.run();
+    var got: [4 * n]f32 = undefined;
+    try (try model.outputTensor("y")).read(&got);
+    // The cpu rounds x to int8 for a q8 matmul and the gpu keeps it f32.
+    for (want, got) |c, g| try std.testing.expectApproxEqAbs(c, g, 3e-2);
+
+    // The bias moved to the device once; the q8 weight lives only as its re-laid copy
+    // there, its own storage released (never uploaded, so nothing to free on the device).
+    try std.testing.expectEqual(.gpu, (try ctx.store.tensorDevice(b_id)).kind);
+    const laid = ctx.store.derivedLocate(w_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(.gpu, (try ctx.store.tensorDevice(laid.result)).kind);
+    try std.testing.expect(!try ctx.store.tensorHasBacking(w_id));
+    try std.testing.expectEqual(.cpu, (try ctx.store.tensorDevice(w_id)).kind);
+}
+
 /// Runs the tied-table model in `file` on `dev`: the looked-up rows, then `x @ tableᵀ`.
 fn runTiedModel(ctx: *api.Context, file: std.Io.File, dev: api.DeviceSelector, ids: []const i32, x: []const f32, rows: []f32, prod: []f32) !void {
     var model = try ctx.loadModel(file, .{ .device = dev });

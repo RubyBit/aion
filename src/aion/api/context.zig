@@ -285,10 +285,12 @@ pub const Context = struct {
         return self.exportModel(file, bld, outputs, opts);
     }
 
-    /// Import `mapped`'s weights onto `device`. Host weights stay views of the file
-    /// mapping, which the store's tensors then keep alive; device weights are uploaded
-    /// from it. Either way `mapped` is left without it, its payload views dropped.
-    fn importMapped(self: *Self, mapped: *package_file.MappedPackage, device: manager_mod.DeviceRef) api_errors.LoadError!params_mod.Params {
+    /// Import `mapped`'s weights as views of the file mapping, which the store's
+    /// tensors then keep alive; `mapped` is left without it, its payload views dropped.
+    /// Whatever the target, a weight starts here: the first compile moves each one a
+    /// device program reads to that device once, and a weight re-laid for a kernel is
+    /// re-laid straight from the file, so its original is never uploaded at all.
+    fn importMapped(self: *Self, mapped: *package_file.MappedPackage) api_errors.LoadError!params_mod.Params {
         defer mapped.unmap();
         const map = mapped.takeMap() orelse return api_errors.LoadError.InvalidArgument;
         const mapping = storage_mod.SharedBytes.adoptMap(self.allocator, map) catch |e| {
@@ -299,9 +301,9 @@ pub const Context = struct {
             return e;
         };
         // The tensors that borrow from it hold their own references; this one only
-        // spans the import, so a GPU load unmaps the file as soon as it is uploaded.
+        // spans the import, so the file is unmapped once the last weight lets go.
         defer mapping.release();
-        return api_initializers.importParams(self.allocator, &self.store, &mapped.package, device, if (device.kind == .cpu) mapping else null);
+        return api_initializers.importParams(self.allocator, &self.store, &mapped.package, mapping);
     }
 
     pub fn loadModel(self: *Self, file: std.Io.File, opts: LoadModelOptions) api_errors.LoadError!LoadedModel {
@@ -310,7 +312,7 @@ pub const Context = struct {
         const dev = try self.resolveDevice(opts.device);
         var mapped = try package_file.MappedPackage.open(self.allocator, file);
         errdefer mapped.package.deinit();
-        var params = try self.importMapped(&mapped, dev.ref);
+        var params = try self.importMapped(&mapped);
         errdefer params.deinit(self.allocator);
         return api_loaded_model.LoadedModel.init(self.allocator, dev.backend, &self.store, dev.target(opts.passes), .{ .package = mapped.package }, params, opts);
     }
@@ -322,7 +324,7 @@ pub const Context = struct {
     pub fn loadWeights(self: *Self, file: std.Io.File, _: LoadModelOptions) api_errors.LoadError!Weights {
         var mapped = try package_file.MappedPackage.open(self.allocator, file);
         errdefer mapped.package.deinit();
-        var params = try self.importMapped(&mapped, .{});
+        var params = try self.importMapped(&mapped);
         errdefer params.deinit(self.allocator);
         return api_weights.Weights.initLoaded(self.allocator, &self.store, mapped.package, params);
     }

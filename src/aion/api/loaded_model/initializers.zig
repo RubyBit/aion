@@ -12,15 +12,14 @@ const api_errors = @import("../errors.zig");
 /// parameters keyed by graph value. The `initializer_index` that names a slot in the
 /// file's weight section does not survive this call.
 ///
-/// A host weight whose payload is a view of `mapping` IS that view: no allocation and
-/// no copy (the payloads are aligned for it, see `payload_alignment`). A weight bound
-/// for a GPU is created there and uploaded from the payload directly, never staged.
+/// Every weight IS its payload's view of `mapping`: no allocation and no copy (the
+/// payloads are aligned for it, see `payload_alignment`). A device target moves the
+/// ones its programs read when it compiles them.
 pub fn importParams(
     allocator: std.mem.Allocator,
     store: *types_mod.StorageManager,
     package: *const types_mod.Package,
-    device: manager_mod.DeviceRef,
-    mapping: ?*storage_mod.SharedBytes,
+    mapping: *storage_mod.SharedBytes,
 ) api_errors.LoadError!params_mod.Params {
     var out = try params_mod.Params.init(allocator, package.values.len);
     errdefer out.deinit(allocator);
@@ -29,7 +28,7 @@ pub fn importParams(
         const init_idx: u32 = value.initializer_index orelse return error.InvalidArgument;
         if (init_idx >= package.initializers.len) return error.InvalidArgument;
         const init = package.initializers[init_idx];
-        const tid = try createInitializerTensor(allocator, store, package, value, init, device, mapping);
+        const tid = try createInitializerTensor(allocator, store, package, value, init, mapping);
         out.set(@intCast(value_idx), tid);
     }
     return out;
@@ -42,8 +41,7 @@ fn createInitializerTensor(
     package: *const types_mod.Package,
     value: package_file.ValueRecord,
     init: package_file.Initializer,
-    device: manager_mod.DeviceRef,
-    mapping: ?*storage_mod.SharedBytes,
+    mapping: *storage_mod.SharedBytes,
 ) api_errors.LoadError!types_mod.TensorId {
     const shape = try resolveConstShape(allocator, package, value);
     defer allocator.free(shape);
@@ -51,19 +49,7 @@ fn createInitializerTensor(
         .plain => 0,
         .quantized => |q| try quantAxisToU8(q.quant_axis, shape.len),
     };
-    const bytes = init.data.bytes;
-    if (device.kind == .cpu) {
-        if (mapping) |m| if (std.mem.isAligned(@intFromPtr(bytes.ptr), 64)) {
-            return store.createSharedTensor(value.dtype, shape, bytes, m, .{ .quant_axis = quant_axis });
-        };
-        // Not a view of a live mapping: its own copy, written whole.
-        const tid = try store.createTensor(value.dtype, shape, .{ .quant_axis = quant_axis, .zero_fill = false });
-        try store.writePackedAtPlacement(tid, bytes);
-        return tid;
-    }
-    const tid = try store.createDeviceTensor(value.dtype, shape, .{ .quant_axis = quant_axis }, device);
-    try store.writePackedAtPlacement(tid, bytes);
-    return tid;
+    return store.createSharedTensor(value.dtype, shape, init.data.bytes, mapping, .{ .quant_axis = quant_axis });
 }
 
 fn resolveConstShape(

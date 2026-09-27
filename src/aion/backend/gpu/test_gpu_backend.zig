@@ -110,6 +110,7 @@ test "gpu backend: silu(a+b) matches CPU reference" {
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
+        try aion.program.materializeOnHost(&mgr, &built.prog);
         try cpu.backend().executeProgram(&built.prog, mgr.tensorStore());
         try readOutput(&mgr, built.out, cpu_result[0..]);
     }
@@ -187,6 +188,7 @@ test "gpu backend: matmul matches CPU reference" {
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
+        try aion.program.materializeOnHost(&mgr, &built.prog);
         try cpu.backend().executeProgram(&built.prog, mgr.tensorStore());
         try readOutput(&mgr, built.out, cpu_result);
     }
@@ -339,6 +341,7 @@ fn runOnBothBackendsLimited(
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
+        try aion.program.materializeOnHost(&mgr, &built.prog);
         cpu.backend().executeProgram(&built.prog, mgr.tensorStore()) catch |e| {
             std.debug.print("cpu execute failed: {s}\n", .{@errorName(e)});
             return e;
@@ -445,6 +448,7 @@ fn expectGpuMatchesCpuI32(comptime buildFn: fn (std.mem.Allocator, *StorageManag
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
+        try aion.program.materializeOnHost(&mgr, &built.prog);
         try cpu.backend().executeProgram(&built.prog, mgr.tensorStore());
         try mgr.readToPackedScalar(built.out, std.mem.sliceAsBytes(cpu_result));
     }
@@ -2290,6 +2294,7 @@ test "gpu backend: placed storage persists across session.execute calls" {
         defer built.prog.deinit();
         var cpu = aion.cpu.CpuBackend.init(alloc);
         defer cpu.deinit();
+        try aion.program.materializeOnHost(&mgr, &built.prog);
         try cpu.backend().executeProgram(&built.prog, mgr.tensorStore());
         try readOutput(&mgr, built.out, cpu_result[0..]);
     }
@@ -3015,6 +3020,7 @@ test "gpu backend: max pool preserves NaNs, f32 and f16" {
             };
             var cpu = aion.cpu.CpuBackend.init(alloc);
             defer cpu.deinit();
+            try aion.program.materializeOnHost(&mgr, &prog);
             try cpu.backend().executeProgram(&prog, mgr.tensorStore());
             try mgr.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(&actual));
             for (expected, actual) |e, v| {

@@ -162,10 +162,10 @@ AION_PY_CPU = "baseline"   # conservative ISA floor for the main module
 # Linux wheels build in a manylinux container. Zig is installed on the host
 # (mlugg/setup-zig) and the host filesystem is visible at /host, so point the
 # build at the host zig rather than installing it inside the container.
-# Keep builds and import tests on the same glibc 2.17 floor as the Zig targets.
+# Keep builds and import tests on the same glibc 2.28 floor as the Zig targets.
 [tool.cibuildwheel.linux]
-manylinux-x86_64-image = "manylinux2014"
-manylinux-aarch64-image = "manylinux2014"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 environment-pass = ["HOST_ZIG"]
 
 [tool.cibuildwheel.linux.environment]
@@ -181,9 +181,9 @@ AION_ZIG_EXE = "/host$HOST_ZIG"
 [[tool.cibuildwheel.overrides]]
 select = "*-manylinux_x86_64"
 inherit.environment = "append"
-environment.AION_PY_TARGET = "x86_64-linux-gnu.2.17"
+environment.AION_PY_TARGET = "x86_64-linux-gnu.2.28"
 
 [[tool.cibuildwheel.overrides]]
 select = "*-manylinux_aarch64"
 inherit.environment = "append"
-environment.AION_PY_TARGET = "aarch64-linux-gnu.2.17"
+environment.AION_PY_TARGET = "aarch64-linux-gnu.2.28"

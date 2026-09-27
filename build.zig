@@ -333,12 +333,13 @@ pub fn build(b: *std.Build) void {
         .linkage = linkage,
     });
 
-    // When a C/FFI consumer links against the static library on Windows using
-    // MSVC's linker (e.g. Python extensions via setuptools), the final link
-    // step will not automatically pull in Zig/Clang builtins (compiler-rt).
-    // Bundle compiler-rt into the archive so consumers don't need to know
-    // about extra runtime libraries.
-    if (linkage == .static and target.result.os.tag == .windows) {
+    // When a C/FFI consumer links the static library with its own toolchain
+    // (e.g. Python extensions via setuptools: MSVC on Windows, the manylinux
+    // GCC on Linux), the final link does not pull in Zig's builtins
+    // (compiler-rt). MSVC has none of them, and old libgcc lacks some (e.g.
+    // `__truncdfhf2`, f64->f16, only in libgcc >= 12). Bundle compiler-rt into
+    // the archive so consumers don't need to know about extra runtime libraries.
+    if (linkage == .static) {
         lib.bundle_compiler_rt = true;
     }
 

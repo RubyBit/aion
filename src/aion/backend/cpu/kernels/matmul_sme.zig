@@ -21,7 +21,6 @@ const builtin = @import("builtin");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
 
-
 const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
 
@@ -234,6 +233,20 @@ pub fn Kernel(comptime t: Tuning) type {
             packB(s.pb, k, n, b, ld);
         }
 
+        /// `packBTileF32` for a B stored as rows, `[N, K]`: the tile's `n` rows are
+        /// `ldb` elements apart and each holds its `k` reduction values in a run.
+        pub fn packBTileF32Rows(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const b: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, b_bytes);
+            if (n > 0 and b.len < (n - 1) * ldb + k) return BackendError.InvalidArgument;
+            const s = try splitScratch(scratch_bytes);
+            for (0..(n + NR - 1) / NR) |panel| {
+                const nj = panel * NR;
+                const nr = @min(NR, n - nj);
+                simd.transposeRowsIntoPanel(NR, s.pb[panel * (KC * NR) ..][0 .. KC * NR], k, nr, b, ldb, nj);
+            }
+        }
+
         pub fn packBTileF16ToPackedF32(packed_b: []align(32) f32, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
             if (k > KC or n > NC) return BackendError.InvalidArgument;
             const ld: usize = if (ldb != 0) ldb else n;
@@ -410,12 +423,59 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
 
+        /// A block of `MC` rows at a time: the scratch holds one A block, so a taller
+        /// A would not fit it.
         pub fn matmulF32PackedB(scratch_bytes: []u8, packed_b_view: []align(32) const f32, params: MatMulParams, c_bytes: []u8, a_bytes: []const u8) BackendError!void {
             const s = try splitScratch(scratch_bytes);
-            try packAStrided(params.k, params.m, if (params.lda != 0) params.lda else params.k, a_bytes, s.pa);
-            return matmulF32PackedAB(@alignCast(s.pa), packed_b_view, params, c_bytes);
+            const lda: usize = if (params.lda != 0) params.lda else params.k;
+            const ldc: usize = if (params.ldc != 0) params.ldc else params.n;
+            var ic: usize = 0;
+            while (ic < params.m) : (ic += MC) {
+                var block = params;
+                block.m = @min(MC, params.m - ic);
+                block.ldc = ldc;
+                try packAStrided(params.k, block.m, lda, a_bytes[ic * lda * @sizeOf(f32) ..], s.pa);
+                try matmulF32PackedAB(@alignCast(s.pa), packed_b_view, block, c_bytes[ic * ldc * @sizeOf(f32) ..]);
+            }
         }
     };
+}
+
+/// Packing `n x k` rows (B stored `[N, K]`, rows `ldb` apart) must give the tile
+/// `packBTileF32` gives for the same B written out `[K, N]`: the GEMM that runs on
+/// it cannot tell them apart. Edge panels and short k included.
+fn packRowsMatchesColumns(comptime K: type) !void {
+    const allocator = std.testing.allocator;
+    const cases = [_][3]usize{ .{ 1, 1, 1 }, .{ 5, 3, 5 }, .{ 3, 5, 7 }, .{ 7, 6, 9 }, .{ 17, 40, 40 }, .{ K.KC, K.NC, K.KC + 3 } };
+    for (cases) |cs| {
+        const k = cs[0];
+        const n = cs[1];
+        const ldb = cs[2];
+        const rows = try allocator.alloc(f32, n * ldb);
+        defer allocator.free(rows);
+        for (rows, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+        const cols = try allocator.alloc(f32, k * n);
+        defer allocator.free(cols);
+        for (0..k) |kk| for (0..n) |j| {
+            cols[kk * n + j] = rows[j * ldb + kk];
+        };
+        const want = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
+        defer allocator.free(want);
+        const got = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
+        defer allocator.free(got);
+        @memset(want, 0xAA);
+        @memset(got, 0xAA);
+        try K.packBTileF32(want, k, n, 0, std.mem.sliceAsBytes(cols));
+        try K.packBTileF32Rows(got, k, n, ldb, std.mem.sliceAsBytes(rows));
+        const pb_bytes = K.KC * K.NC * @sizeOf(f32);
+        try std.testing.expectEqualSlices(u8, want[0..pb_bytes], got[0..pb_bytes]);
+    }
+}
+
+test "sme f32: a B packed from its rows is the tile packed from its columns" {
+    if (comptime !compiledFor()) return error.SkipZigTest;
+    try packRowsMatchesColumns(Kernel(.{ .kc = 128, .mc = 128, .nc = 128 }));
+    try packRowsMatchesColumns(Kernel(.{ .kc = 512, .mc = 288, .nc = 512 }));
 }
 
 test "sme f32 gemm matches a reference across shapes and edges" {
@@ -483,6 +543,49 @@ fn gemmCases(comptime K: type) !void {
         try K.matmulF32PackedAB(pa, pb, .{ .m = m, .n = n, .k = k, .alpha = alpha, .beta = beta, .ldc = n }, std.mem.sliceAsBytes(c_buf));
         for (c_buf, want) |got, w| try std.testing.expect(@abs(got - w) <= 1e-3 * @max(@as(f32, 1.0), @abs(w)));
     }
+}
+
+// `matmulF32PackedB` packs A itself, one `MC`-row block at a time: an A taller
+// than one block (a 512-token prefill at MC=288) must run, not overflow the scratch.
+test "sme packed-B gemm takes an A taller than one block" {
+    if (comptime !compiledFor()) return error.SkipZigTest;
+    if (!usable()) return error.SkipZigTest;
+    const K = Kernel(.{ .kc = 128, .mc = 128, .nc = 128 });
+    const alloc = std.testing.allocator;
+    const m: usize = 2 * K.MC + 37;
+    const n: usize = 70;
+    const k: usize = 96;
+    const lda: usize = k + 5;
+    const ldc: usize = n + 3;
+
+    const a = try alloc.alloc(f32, m * lda);
+    defer alloc.free(a);
+    const b = try alloc.alloc(f32, k * n);
+    defer alloc.free(b);
+    var rng = std.Random.DefaultPrng.init(7);
+    const r = rng.random();
+    for (a) |*v| v.* = r.float(f32) - 0.5;
+    for (b) |*v| v.* = r.float(f32) - 0.5;
+
+    const scratch = try alloc.alignedAlloc(u8, .@"32", K.scratchBytes());
+    defer alloc.free(scratch);
+    try K.packBTileF32(scratch, k, n, 0, std.mem.sliceAsBytes(b));
+    // B's tile is the front of the scratch; A's blocks go behind it.
+    const pb: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0 .. K.KC * K.NC * @sizeOf(f32)]));
+
+    const c_buf = try alloc.alloc(f32, m * ldc);
+    defer alloc.free(c_buf);
+    for (c_buf, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    const want = try alloc.dupe(f32, c_buf);
+    defer alloc.free(want);
+    for (0..m) |i| for (0..n) |j| {
+        var acc: f32 = 0;
+        for (0..k) |kk| acc += a[i * lda + kk] * b[kk * n + j];
+        want[i * ldc + j] = 1.5 * acc + 0.25 * c_buf[i * ldc + j];
+    };
+
+    try K.matmulF32PackedB(scratch, pb, .{ .m = m, .n = n, .k = k, .lda = lda, .ldc = ldc, .alpha = 1.5, .beta = 0.25 }, std.mem.sliceAsBytes(c_buf), std.mem.sliceAsBytes(a));
+    for (c_buf, want) |got, w| try std.testing.expect(@abs(got - w) <= 1e-3 * @max(@as(f32, 1.0), @abs(w)));
 }
 
 test "sme indirect gemm matches a reference across row panels and scattered rows" {

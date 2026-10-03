@@ -87,8 +87,9 @@ pub const GpuBackend = struct {
     /// Matmul executor owns the per-shape autotune cache.
     matmul: matmul_exec.Matmul,
 
-    /// MatMulNT executor (q8_0/f32 weights): GEMV for M==1, dequant-to-scratch +
-    /// the f32 GEMM pipelines above for M>1. Owns the pooled scratch buffer.
+    /// MatMulNT executor (q8_0/f32 weights): GEMV for M==1; for M>1 the rows-B
+    /// GEMM (f32), or dequant-to-scratch + the f32 GEMM (q8_0). Owns the pooled
+    /// scratch buffer.
     nt: matmul_nt.MatmulNt = .{},
 
     /// Shared scratch for multi-stage kernels (two-stage reduce/argmax,
@@ -431,7 +432,7 @@ pub const GpuBackend = struct {
                 .Copy => |s| try simple_ops.execCopy(op_ctx, frame, s),
                 .Cast => |s| try simple_ops.execCast(op_ctx, frame, s),
                 .MatMul => |s| try r.gb.matmul.exec(op_ctx, frame, s),
-                .MatMulNT => |s| try r.gb.nt.exec(op_ctx, frame, s, r.gb.matmul.generated),
+                .MatMulNT => |s| try r.gb.nt.exec(op_ctx, frame, s, &r.gb.matmul),
                 .Softmax => |s| try rowwise.execSoftmax(op_ctx, frame, s),
                 // The residual is a configuration of the norm, so the kernel choice is
                 // made here rather than by a step tag: `add_norm.wgsl` when one is

@@ -827,7 +827,7 @@ test "api.nn: mini resnet (conv/residual/linear/softmax)" {
     for (0..(H * W * Cout)) |i| mean_ref += y3_ref[i];
     mean_ref /= @as(f32, @floatFromInt(H * W * Cout));
 
-    // linear: logits = mean_ref @ W + b, where W is [1, classes]
+    // linear: logits = mean_ref @ Wᵀ + b, where W is [classes, 1]
     for (0..classes) |j| {
         var acc: f32 = fc_b_vals[j];
         // k==1
@@ -857,7 +857,7 @@ test "api.nn: mini resnet (conv/residual/linear/softmax)" {
     const b1_t: api.Tensor = try ctx.from(&[_]usize{Cout}, b1_vals);
     const w2_t: api.Tensor = try ctx.from(&[_]usize{ K, K, C, Cout }, w2_vals);
     const b2_t: api.Tensor = try ctx.from(&[_]usize{Cout}, b2_vals);
-    const fc_w_t: api.Tensor = try ctx.from(&[_]usize{ 1, classes }, fc_w_vals);
+    const fc_w_t: api.Tensor = try ctx.from(&[_]usize{ classes, 1 }, fc_w_vals);
     const fc_b_t: api.Tensor = try ctx.from(&[_]usize{classes}, fc_b_vals);
 
     var bld = api.Builder.init(&ctx);
@@ -2052,9 +2052,10 @@ test "api: loadModel can switch a linear head (overwrite head.w + head.b)" {
     var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer export_ctx.deinit();
 
-    const head0_w: api.Tensor = try export_ctx.fromArray([2][3]f32{
-        .{ 1.0, -2.0, 0.5 },
-        .{ 3.0, 4.0, -1.5 },
+    const head0_w: api.Tensor = try export_ctx.fromArray([3][2]f32{
+        .{ 1.0, 3.0 },
+        .{ -2.0, 4.0 },
+        .{ 0.5, -1.5 },
     });
     const head0_b: api.Tensor = try export_ctx.fromArray([3]f32{ 0.25, -0.5, 1.0 });
 
@@ -2097,15 +2098,16 @@ test "api: loadModel can switch a linear head (overwrite head.w + head.b)" {
         try y_t.read(&y_vals);
     }
 
-    // [2, -1] @ head0_w + head0_b => [-0.75, -8.5, 3.5]
+    // [2, -1] @ head0_wᵀ + head0_b => [-0.75, -8.5, 3.5]
     try std.testing.expectApproxEqAbs(@as(f32, -0.75), y_vals[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -8.5), y_vals[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.5), y_vals[2], 1e-6);
 
     // Switch to head1 by overwriting both initializers.
-    const head1_w: api.Tensor = try load_ctx.fromArray([2][3]f32{
-        .{ 0.5, 1.0, -1.0 },
-        .{ 2.0, -0.5, 0.25 },
+    const head1_w: api.Tensor = try load_ctx.fromArray([3][2]f32{
+        .{ 0.5, 2.0 },
+        .{ 1.0, -0.5 },
+        .{ -1.0, 0.25 },
     });
     const head1_b: api.Tensor = try load_ctx.fromArray([3]f32{ -1.0, 0.0, 0.5 });
 
@@ -2120,7 +2122,7 @@ test "api: loadModel can switch a linear head (overwrite head.w + head.b)" {
         try y_t.read(&y_vals);
     }
 
-    // [2, -1] @ head1_w + head1_b => [-2, 2.5, -1.75]
+    // [2, -1] @ head1_wᵀ + head1_b => [-2, 2.5, -1.75]
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), y_vals[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), y_vals[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -1.75), y_vals[2], 1e-6);
@@ -2134,9 +2136,11 @@ test "api: loadWeights lets you load a backbone and attach different heads" {
     var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer export_ctx.deinit();
 
-    const bb_w: api.Tensor = try export_ctx.fromArray([2][4]f32{
-        .{ 1.0, 0.5, -1.0, 2.0 },
-        .{ -2.0, 1.0, 0.25, -0.5 },
+    const bb_w: api.Tensor = try export_ctx.fromArray([4][2]f32{
+        .{ 1.0, -2.0 },
+        .{ 0.5, 1.0 },
+        .{ -1.0, 0.25 },
+        .{ 2.0, -0.5 },
     });
     const bb_b: api.Tensor = try export_ctx.fromArray([4]f32{ 0.1, -0.2, 0.3, 0.0 });
 
@@ -2181,11 +2185,10 @@ test "api: loadWeights lets you load a backbone and attach different heads" {
     };
 
     // 1) Attach a classification head: hidden@Wc + bc (4 -> 3)
-    const cls_w: api.Tensor = try ctx.fromArray([4][3]f32{
-        .{ 1.0, 0.0, -1.0 },
-        .{ 0.5, 2.0, 1.0 },
-        .{ -2.0, 1.0, 0.25 },
-        .{ 0.0, -1.5, 0.5 },
+    const cls_w: api.Tensor = try ctx.fromArray([3][4]f32{
+        .{ 1.0, 0.5, -2.0, 0.0 },
+        .{ 0.0, 2.0, 1.0, -1.5 },
+        .{ -1.0, 1.0, 0.25, 0.5 },
     });
     const cls_b: api.Tensor = try ctx.fromArray([3]f32{ 0.0, 0.1, -0.2 });
 
@@ -2507,9 +2510,10 @@ test "api.module: moduleDynFrom converts nn.Linear" {
     defer ctx.deinit();
 
     const x_t: api.Tensor = try ctx.fromArray([1][2]f32{.{ 2.0, -1.0 }});
-    const w_t: api.Tensor = try ctx.fromArray([2][3]f32{
-        .{ 1.0, -2.0, 0.5 },
-        .{ 3.0, 4.0, -1.5 },
+    const w_t: api.Tensor = try ctx.fromArray([3][2]f32{
+        .{ 1.0, 3.0 },
+        .{ -2.0, 4.0 },
+        .{ 0.5, -1.5 },
     });
     const b_t: api.Tensor = try ctx.fromArray([3]f32{ 0.25, -0.5, 1.0 });
 
@@ -2531,7 +2535,7 @@ test "api.module: moduleDynFrom converts nn.Linear" {
     // `Linear#0`. Without that flag this would double-nest as
     // `Linear#0/Linear#0/...`.
     try std.testing.expect(bld.valueName(Y) != null);
-    try std.testing.expectEqualStrings("Linear#0/add#1", bld.valueName(Y).?);
+    try std.testing.expectEqualStrings("Linear#0/add#2", bld.valueName(Y).?);
 
     var model = try ctx.compile(&bld, &[_]api.TensorRef{Y}, .{});
     defer model.deinit();
@@ -2552,9 +2556,10 @@ test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
     var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer export_ctx.deinit();
 
-    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
-        .{ 1.0, -2.0, 0.5 },
-        .{ 3.0, 4.0, -1.5 },
+    const w_t: api.Tensor = try export_ctx.fromArray([3][2]f32{
+        .{ 1.0, 3.0 },
+        .{ -2.0, 4.0 },
+        .{ 0.5, -1.5 },
     });
 
     var tmp = std.testing.tmpDir(.{});
@@ -2571,7 +2576,7 @@ test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
     const Y: api.TensorRef = try linear.forward(&bld, X);
 
     try std.testing.expect(bld.valueName(Y) != null);
-    try std.testing.expectEqualStrings("Linear#0/matmul#0", bld.valueName(Y).?);
+    try std.testing.expectEqualStrings("Linear#0/matmul#1", bld.valueName(Y).?);
 
     try export_ctx.exportModel(file, &bld, &[_]api.NamedTensorRef{
         .{ .name = "y", .tensor = Y },
@@ -2585,7 +2590,7 @@ test "api: module scopes auto-generate persisted debug names (nn.Linear)" {
     for (pkg.debug_names) |entry| {
         if (entry.value == Y.value) {
             found = true;
-            try std.testing.expectEqualStrings("Linear#0/matmul#0", entry.name);
+            try std.testing.expectEqualStrings("Linear#0/matmul#1", entry.name);
         }
     }
     try std.testing.expect(found);
@@ -2748,9 +2753,10 @@ test "api: an explicit builder scope nests above the nn auto module scope" {
     var export_ctx = try api.Context.initCpu(allocator, .{ .thread_count = 1 });
     defer export_ctx.deinit();
 
-    const w_t: api.Tensor = try export_ctx.fromArray([2][3]f32{
-        .{ 1.0, -2.0, 0.5 },
-        .{ 3.0, 4.0, -1.5 },
+    const w_t: api.Tensor = try export_ctx.fromArray([3][2]f32{
+        .{ 1.0, 3.0 },
+        .{ -2.0, 4.0 },
+        .{ 0.5, -1.5 },
     });
 
     var tmp = std.testing.tmpDir(.{});
@@ -2771,7 +2777,7 @@ test "api: an explicit builder scope nests above the nn auto module scope" {
 
     // Scopes nest rather than the outer one suppressing the layer's own: the
     // layer stays identifiable inside the block it was used in.
-    const want: []const u8 = "user.block/Linear#0/matmul#0";
+    const want: []const u8 = "user.block/Linear#0/matmul#1";
     try std.testing.expect(bld.valueName(Y) != null);
     try std.testing.expectEqualStrings(want, bld.valueName(Y).?);
 
@@ -4549,8 +4555,8 @@ test "api: a quantized weight blocks along the axis its reader contracts over" {
     const x = try ctx.fromF32(&[_]usize{ 2, 64 }, &x_vals);
     const idx = try ctx.fromArray([1][2]i32{.{ 5, 1 }});
 
-    const Case = enum { matmul, matmul_nt, gather };
-    for ([_]Case{ .matmul, .matmul_nt, .gather }, [_]usize{ 0, 1, 1 }) |case, axis| {
+    const Case = enum { matmul, transposed, gather };
+    for ([_]Case{ .matmul, .transposed, .gather }, [_]usize{ 0, 1, 1 }) |case, axis| {
         // matmul reads `[64, 8]`; the other two read `[8, 64]` row-wise.
         const shape: [2]usize = if (case == .matmul) .{ 64, 8 } else .{ 8, 64 };
         var out: [2][16]f32 = undefined;
@@ -4563,7 +4569,7 @@ test "api: a quantized weight blocks along the axis its reader contracts over" {
                 try bld.paramNamed(try ctx.fromF32(&shape, &w_vals), "w", .{ .quantize = .q8_0 });
             const y = switch (case) {
                 .matmul => try bld.matmul(try bld.param(x), w, 1.0, 0.0),
-                .matmul_nt => try bld.matmulNT(try bld.param(x), w, 1.0, 0.0),
+                .transposed => try bld.matmul(try bld.param(x), try bld.transpose2d(w), 1.0, 0.0),
                 .gather => try bld.sliceLastDim(try bld.gather(w, try bld.param(idx), 0, 0), 0, 8),
             };
             var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
@@ -4596,7 +4602,7 @@ test "api: a tensor's data goes when its last holder lets go" {
     const w = try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals);
     const x = try ctx.fromF32(&[_]usize{ 1, 64 }, &vals);
     var bld = api.Builder.init(&ctx);
-    const y = try bld.matmulNT(try bld.name(try bld.input(.f32, &[_]usize{ 1, 64 }), "x"), try bld.param(w), 1.0, 0.0);
+    const y = try bld.matmul(try bld.name(try bld.input(.f32, &[_]usize{ 1, 64 }), "x"), try bld.transpose2d(try bld.param(w)), 1.0, 0.0);
     w.release();
     try std.testing.expect(try ctx.store.tensorHasBacking(w.id));
     var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
@@ -4634,7 +4640,7 @@ test "api: a quantized weight's released f32 source goes once it is quantized" {
     const w = try bld.paramNamed(src, "w", .{ .quantize = .q8_0 });
     src.release();
     try std.testing.expect(try ctx.store.tensorHasBacking(src.id));
-    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    _ = try bld.matmul(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), try bld.transpose2d(w), 1.0, 0.0);
     try std.testing.expect(!try ctx.store.tensorHasBacking(src.id));
 }
 
@@ -4709,7 +4715,7 @@ test "api: an exported package reads its weights from the store as it writes the
     defer bld.deinit();
     const x = try bld.name(try bld.input(.f32, &[_]usize{ 1, 64 }), "x");
     const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
-    const y = try bld.matmulNT(x, w, 1.0, 0.0);
+    const y = try bld.matmul(x, try bld.transpose2d(w), 1.0, 0.0);
     const outputs = [_]api.NamedTensorRef{.{ .name = "y", .tensor = y }};
 
     var pkg = try package_export.buildPackage(allocator, &ctx.store, &bld, &outputs, .{});
@@ -4749,7 +4755,7 @@ test "api: a quantized weight is bound when its first reader is added" {
     defer bld.deinit();
     const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 8, 64 }, &w_vals), "w", .{ .quantize = .q8_0 });
     try std.testing.expect(bld.innerGraph().values.items[@intCast(w.value)].external == null);
-    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    _ = try bld.matmul(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), try bld.transpose2d(w), 1.0, 0.0);
     const ext = bld.innerGraph().values.items[@intCast(w.value)].external orelse return error.TestExpectedBound;
     try std.testing.expectEqual(@as(u8, 1), (try ctx.store.getConst(@intCast(ext))).quant_axis);
 }
@@ -4777,7 +4783,7 @@ test "api: a weight bound from a bf16 host view quantizes like its values" {
     const w = try bld.paramView(.q8_0, view, "w", null);
     // Nothing is read yet: no stored tensor exists until an op fixes the axis.
     try std.testing.expect(bld.innerGraph().values.items[@intCast(w.value)].external == null);
-    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    _ = try bld.matmul(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), try bld.transpose2d(w), 1.0, 0.0);
 
     const ext = bld.innerGraph().values.items[@intCast(w.value)].external.?;
     const got = try allocator.alloc(u8, 8 * 64 / 32 * 34);
@@ -4804,7 +4810,7 @@ test "api: a quantized weight read along two axes is rejected" {
     const xr = try bld.param(x);
     _ = try bld.matmul(xr, w, 1.0, 0.0);
     // The first reader fixed the axis, so the second fails where it is added.
-    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+    try std.testing.expectError(error.InvalidArgument, bld.matmul(xr, try bld.transpose2d(w), 1.0, 0.0));
 }
 
 // A compiled program holds the tensor its weight was quantized into, so a reader
@@ -4826,7 +4832,7 @@ test "api: a quantized weight read along a second axis after a compile is reject
     var first = try ctx.compile(&bld, &[_]api.TensorRef{try bld.matmul(xr, w, 1.0, 0.0)}, .{});
     defer first.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+    try std.testing.expectError(error.InvalidArgument, bld.matmul(xr, try bld.transpose2d(w), 1.0, 0.0));
 }
 
 // With no reader to decide, a weight takes the matmul-B axis; a reader that needs
@@ -4843,7 +4849,7 @@ test "api: a quantized weight keeps the axis a compile defaulted it to" {
     var first = try ctx.compile(&bld, &[_]api.TensorRef{w}, .{});
     defer first.deinit();
     const xr = try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals));
-    try std.testing.expectError(error.InvalidArgument, bld.matmulNT(xr, w, 1.0, 0.0));
+    try std.testing.expectError(error.InvalidArgument, bld.matmul(xr, try bld.transpose2d(w), 1.0, 0.0));
 }
 
 // The name is qualified where the weight is declared, as `paramNamed` does, so a
@@ -4860,7 +4866,7 @@ test "api: a quantized weight keeps the scope it was declared in" {
     const w = try bld.paramNamed(try ctx.fromF32(&[_]usize{ 4, 32 }, &w_vals), "weight", .{ .quantize = .q8_0 });
     bld.endScope(scope);
     const head = try bld.beginScope("head");
-    _ = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 32 }, w_vals[0..32])), w, 1.0, 0.0);
+    _ = try bld.matmul(try bld.param(try ctx.fromF32(&[_]usize{ 1, 32 }, w_vals[0..32])), try bld.transpose2d(w), 1.0, 0.0);
     bld.endScope(head);
     try std.testing.expectEqualStrings("embed/weight", bld.valueName(w).?);
 }
@@ -4879,7 +4885,7 @@ test "api: a quantized weight's f32 source stays the caller's" {
     var bld = api.Builder.init(&ctx);
     defer bld.deinit();
     const w = try bld.paramNamed(src, "w", .{ .quantize = .q8_0 });
-    const y = try bld.matmulNT(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), w, 1.0, 0.0);
+    const y = try bld.matmul(try bld.param(try ctx.fromF32(&[_]usize{ 1, 64 }, &x_vals)), try bld.transpose2d(w), 1.0, 0.0);
     var model = try ctx.compile(&bld, &[_]api.TensorRef{y}, .{});
     defer model.deinit();
     try model.run();

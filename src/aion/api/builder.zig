@@ -72,6 +72,9 @@ pub const Builder = struct {
     // Weights the builder quantizes itself (see `ParamOptions.quantize`), keyed by
     // the input they occupy: pending until an op reading them fixes their axis.
     quantized: std.AutoArrayHashMapUnmanaged(ValueId, QuantizedParam) = .{},
+    // Transposes of those weights, view -> weight: a reader of the view fixes the
+    // weight's axis, swapped (`x @ wᵀ` over a `[N, K]` weight blocks it along K).
+    quantized_transposes: std.AutoHashMapUnmanaged(ValueId, ValueId) = .{},
     // How many nodes of the root list and of the open region `bindReaders` has seen.
     readers_seen: struct { root: usize = 0, region: usize = 0 } = .{},
 
@@ -187,6 +190,7 @@ pub const Builder = struct {
             .bound => {},
         };
         self.quantized.deinit(self.allocator);
+        self.quantized_transposes.deinit(self.allocator);
         self.params.deinit(self.allocator);
         self.zero_vecs.deinit(self.allocator);
         self.one_vecs.deinit(self.allocator);
@@ -548,12 +552,24 @@ pub const Builder = struct {
         const nodes = self.graph.currentNodes();
         const seen = if (self.graph.active_region) &self.readers_seen.region else &self.readers_seen.root;
         for (nodes[seen.*..]) |node| {
+            if (node.op == .ViewTranspose2D and self.quantized.contains(node.inputs[0])) {
+                self.quantized_transposes.put(self.allocator, node.output, node.inputs[0]) catch return Error.OutOfMemory;
+                continue;
+            }
             for (node.inputs, 0..) |in, slot| {
-                const q = self.quantized.getPtr(in) orelse continue;
-                const axis = readAxis(node.op, slot, self.graph.values.items[@intCast(in)].shape.len) orelse continue;
+                const weight: ValueId, const transposed = if (self.quantized.contains(in))
+                    .{ in, false }
+                else if (self.quantized_transposes.get(in)) |w|
+                    .{ w, true }
+                else
+                    continue;
+                const q = self.quantized.getPtr(weight).?;
+                const read = readAxis(node.op, slot, self.graph.values.items[@intCast(in)].shape.len) orelse continue;
+                // A transpose is rank 2, so its axis `a` is the weight's `1 - a`.
+                const axis = if (transposed) 1 - read else read;
                 switch (q.state) {
                     .bound => |bound| if (bound != axis) return Error.InvalidArgument,
-                    .pending => try self.quantizeParam(in, q, axis),
+                    .pending => try self.quantizeParam(weight, q, axis),
                 }
             }
         }
@@ -577,7 +593,6 @@ pub const Builder = struct {
         if (rank == 0) return null;
         return switch (op) {
             .MatMul => if (slot == 1 and rank >= 2) rank - 2 else rank - 1,
-            .MatMulNT => rank - 1,
             // A gathered slice must hold whole blocks: the innermost axis not cut.
             .Gather => |g| blk: {
                 if (slot != 0) break :blk null;
@@ -1244,14 +1259,6 @@ pub const Builder = struct {
     pub fn elemwiseBinary(self: *Self, op: types.ElemwiseBinaryOp, a: TensorRef, b: TensorRef) Error!TensorRef {
         const out: ValueId = try self.graph.addElemwiseBinary(op, a.value, b.value);
         try self.autoNameIfUnnamed(out, @tagName(op));
-        return .{ .value = out };
-    }
-
-    /// Matmul with a transposed / per-row-quantized B: `C[m,n] = Σ A[m,k]·B[n,k]`
-    /// (B is `[N, K]`). Used for tied-embedding logits.
-    pub fn matmulNT(self: *Self, a: TensorRef, b: TensorRef, alpha: f32, beta: f32) Error!TensorRef {
-        const out: ValueId = try self.graph.addMatMulNT(a.value, b.value, alpha, beta);
-        try self.autoNameIfUnnamed(out, "matmul_nt");
         return .{ .value = out };
     }
 

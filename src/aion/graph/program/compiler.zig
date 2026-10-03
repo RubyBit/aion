@@ -10,6 +10,7 @@ const executable = @import("../../runtime/executable.zig");
 const graph_mod = @import("../graph.zig");
 const infer_mod = @import("../infer.zig");
 const opt_mod = @import("../opt.zig");
+const matmul_rows = @import("matmul_rows.zig");
 const placement = @import("placement.zig");
 const workspace = @import("workspace.zig");
 const allocation = @import("allocation.zig");
@@ -1116,10 +1117,12 @@ pub fn compileGraph(
     // Lower nodes in order, skipping any whose results nothing asked for.
     const live: []bool = try liveNodes(allocator, graph);
     defer allocator.free(live);
+    var rows = try matmul_rows.Rows.init(allocator, graph);
+    defer rows.deinit(allocator);
 
     for (graph.nodes.items, 0..) |node, idx| {
         if (!live[idx]) continue;
-        try lowerTraced(allocator, graph, node, mgr, &ctx, &steps, &blocks);
+        try lowerTraced(allocator, graph, &rows, node, mgr, &ctx, &steps, &blocks);
     }
 
     var compiled: Program = .{
@@ -1175,6 +1178,7 @@ fn ensureAnyTensor(ctx: anytype, value_index: usize) CompileError!TensorId {
 fn lowerRegionBlock(
     allocator: std.mem.Allocator,
     graph: *graph_mod.Graph,
+    rows: *const matmul_rows.Rows,
     region: graph_mod.Region,
     mgr: *StorageManager,
     ctx: anytype,
@@ -1184,7 +1188,7 @@ fn lowerRegionBlock(
     errdefer region_steps.deinit(allocator);
 
     for (region.nodes) |rnode| {
-        try lowerTraced(allocator, graph, rnode, mgr, ctx, &region_steps, blocks);
+        try lowerTraced(allocator, graph, rows, rnode, mgr, ctx, &region_steps, blocks);
     }
 
     const block_steps: []PlacedStep = try region_steps.toOwnedSlice(allocator);
@@ -1200,6 +1204,7 @@ fn lowerRegionBlock(
 fn lowerTraced(
     allocator: std.mem.Allocator,
     graph: *graph_mod.Graph,
+    rows: *const matmul_rows.Rows,
     node: graph_mod.Node,
     mgr: *StorageManager,
     ctx: anytype,
@@ -1207,7 +1212,7 @@ fn lowerTraced(
     blocks: *std.ArrayList(executable.Block),
 ) CompileError!void {
     const first_step = steps.items.len;
-    lowerNode(allocator, graph, node, mgr, ctx, steps, blocks) catch |e| {
+    lowerNode(allocator, graph, rows, node, mgr, ctx, steps, blocks) catch |e| {
         diagnostic.current().recordGraph(.lowering, graph, node, e);
         if (traceEnabled()) {
             std.debug.print(
@@ -1242,6 +1247,7 @@ fn input(ctx: anytype, node: graph_mod.Node, i: usize) CompileError!TensorId {
 fn lowerNode(
     allocator: std.mem.Allocator,
     graph: *graph_mod.Graph,
+    rows: *const matmul_rows.Rows,
     node: graph_mod.Node,
     mgr: *StorageManager,
     ctx: anytype,
@@ -1259,6 +1265,15 @@ fn lowerNode(
         .MatMul => |mm| {
             if (values[@intCast(node.inputs[0])].dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             const c = try ctx.ensureValueTensor(out_idx, out_dt, out_shape);
+            // Over a transposed B: contract against the rows of what it transposes.
+            if (rows.of(graph, node)) |b_rows| {
+                const b = try ensureAnyTensor(ctx, @intCast(b_rows));
+                // A quantized `[N, K]` B holds each row as one run of blocks.
+                const b_t = try mgr.getConst(b);
+                if (b_t.dtype.info().is_quantized and b_t.quant_axis != 1) return CompileError.InvalidArgument;
+                try appendStepChecked(allocator, mgr, steps, .{ .MatMulNT = .{ .c = c, .a = try input(ctx, node, 0), .b = b, .alpha = mm.alpha, .beta = mm.beta } });
+                return;
+            }
             try appendStepChecked(allocator, mgr, steps, .{ .MatMul = .{ .c = c, .a = try input(ctx, node, 0), .b = try input(ctx, node, 1), .alpha = mm.alpha, .beta = mm.beta } });
         },
 
@@ -1584,8 +1599,8 @@ fn lowerNode(
         },
 
         .If => |iff| {
-            const then_block = try lowerRegionBlock(allocator, graph, graph.regions.items[@intCast(iff.then_region)], mgr, ctx, blocks);
-            const else_block = try lowerRegionBlock(allocator, graph, graph.regions.items[@intCast(iff.else_region)], mgr, ctx, blocks);
+            const then_block = try lowerRegionBlock(allocator, graph, rows, graph.regions.items[@intCast(iff.then_region)], mgr, ctx, blocks);
+            const else_block = try lowerRegionBlock(allocator, graph, rows, graph.regions.items[@intCast(iff.else_region)], mgr, ctx, blocks);
             const out = try ctx.ensureValueTensor(out_idx, out_dt, out_shape);
 
             var outputs_arr: [executable.MAX_CONTROL_OUTPUTS]TensorId = @splat(0);
@@ -1614,7 +1629,7 @@ fn lowerNode(
             var carried_arr: [executable.MAX_LOOP_CARRIED]TensorId = @splat(0);
             for (0..n) |i| carried_arr[i] = try input(ctx, node, i);
 
-            const body_block = try lowerRegionBlock(allocator, graph, body_region, mgr, ctx, blocks);
+            const body_block = try lowerRegionBlock(allocator, graph, rows, body_region, mgr, ctx, blocks);
 
             var body_arr: [executable.MAX_LOOP_CARRIED]TensorId = @splat(0);
             for (0..n) |i| {
@@ -1643,16 +1658,6 @@ fn lowerNode(
             try appendStepChecked(allocator, mgr, steps, .{ .Cast = .{ .out = out, .x = try input(ctx, node, 0), .to_dtype = ct.to_dtype } });
         },
 
-        .MatMulNT => |mm| {
-            if (values[@intCast(node.inputs[1])].shape.len != 2) return CompileError.InvalidArgument;
-            const b = try input(ctx, node, 1);
-            const b_t = try mgr.getConst(b);
-            // A quantized `[N, K]` B holds each row as one run of blocks.
-            if (b_t.dtype.info().is_quantized and b_t.quant_axis != 1) return CompileError.InvalidArgument;
-            const c = try ctx.ensureValueTensor(out_idx, out_dt, out_shape);
-            try appendStepChecked(allocator, mgr, steps, .{ .MatMulNT = .{ .c = c, .a = try input(ctx, node, 0), .b = b, .alpha = mm.alpha, .beta = mm.beta } });
-        },
-
         .Copy => {
             const out = try ctx.ensureValueTensor(out_idx, out_dt, out_shape);
             try appendStepChecked(allocator, mgr, steps, .{ .Copy = .{ .dst = out, .src = try input(ctx, node, 0) } });
@@ -1662,6 +1667,9 @@ fn lowerNode(
             // A view cannot reinterpret a block-quantized layout. Reject before
             // allocating: creating the output first surfaces this as an unrelated
             // quant-axis alignment error from storage, far from the real cause.
+            // (A transposed quantized weight read as matmul B never gets here: it
+            // folds into the matmul, see `matmul_rows`.)
+            if (rows.vanishes(node)) return;
             if (values[@intCast(node.inputs[0])].dtype.?.info().is_quantized) return CompileError.InvalidArgument;
             const out = try ctx.ensureValueTensor(out_idx, out_dt, out_shape);
             const src = try input(ctx, node, 0);

@@ -1148,37 +1148,6 @@ fn inferNodeImpl(graph: *Graph, node: Node) InferError!void {
             }
         },
 
-        .MatMulNT => |mm| {
-            const a = try getValue(graph, node.inputs[0]);
-            const b = try getValue(graph, node.inputs[1]);
-            try require(a.dtype != null and b.dtype != null);
-            try require(a.shape.len >= 2 and b.shape.len == 2);
-
-            if (!std.math.isFinite(mm.alpha) or !std.math.isFinite(mm.beta)) return InferError.InvalidGraph;
-
-            // A: f32 (residual stream dtype). B: q8_0 with per-row blocks
-            // (quant_axis=1) or plain f32 [N, K].
-            if (a.dtype.? != .f32) return InferError.Unsupported;
-            if (b.dtype.? != .q8_0 and b.dtype.? != .f32) return InferError.Unsupported;
-
-            const k_a: usize = a.shape[a.shape.len - 1];
-            const k_b: usize = b.shape[1];
-            const n: usize = b.shape[0];
-            if (k_a != k_b) return InferError.ShapeMismatch;
-            if (b.dtype.? == .q8_0 and (k_a % 32) != 0) return InferError.Unsupported;
-
-            var out_shape: []usize = graph.arenaAlloc().alloc(usize, a.shape.len) catch return InferError.InvalidGraph;
-            var d: usize = 0;
-            while (d + 1 < a.shape.len) : (d += 1) {
-                out_shape[d] = a.shape[d];
-            }
-            out_shape[a.shape.len - 1] = n;
-            var sym_buf: [8]?usize = undefined;
-            try setInferred(graph, node.output, .f32, out_shape, .{
-                .mapped = .{ .of = node.inputs[0], .map = mapLeading(&sym_buf, a.shape.len, a.shape.len - 1) },
-            });
-        },
-
         .SequenceAppend => {
             const cache = try getValue(graph, node.inputs[0]);
             const new_kv = try getValue(graph, node.inputs[1]);

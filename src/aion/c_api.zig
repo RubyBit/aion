@@ -1078,38 +1078,37 @@ pub const AionInputRoleKind = enum(c_int) {
 /// member of `AionOpAttr` (ops with no attributes ignore `attr`).
 pub const AionOp = enum(c_int) {
     AION_OP_MATMUL = 0,
-    AION_OP_MATMUL_NT = 1,
-    AION_OP_ELEMWISE = 2,
-    AION_OP_UNARY = 3,
-    AION_OP_SOFTMAX = 4,
-    AION_OP_LAYERNORM = 5,
-    AION_OP_RMSNORM = 6,
-    AION_OP_ATTENTION = 7,
-    AION_OP_RELPOS_MHA = 8,
-    AION_OP_CONV1D = 9,
-    AION_OP_CONV2D = 10,
-    AION_OP_COPY = 11,
-    AION_OP_ROPE1D = 12,
-    AION_OP_SEQUENCE_APPEND = 13,
-    AION_OP_REDUCE = 14,
-    AION_OP_CONCAT = 15,
-    AION_OP_RESHAPE = 16,
-    AION_OP_SQUEEZE = 17,
-    AION_OP_UNSQUEEZE = 18,
-    AION_OP_TRANSPOSE2D = 19,
-    AION_OP_SLICE = 20,
-    AION_OP_LSTM_CELL = 21,
-    AION_OP_RFFT = 22,
-    AION_OP_STFT = 23,
-    AION_OP_CAST = 24,
-    AION_OP_ARGMAX = 25,
-    AION_OP_SCATTER_ROW = 26,
-    // 27 was AION_OP_GELU_MUL, retired: a gated activation is an AION_OP_UNARY and an
-    // AION_OP_ELEMWISE multiply, fused at compile time if a fused kernel applies.
-    AION_OP_GATHER = 28,
-    AION_OP_DIM = 29,
-    AION_OP_IOTA = 30,
-    AION_OP_MAXPOOL2D = 31,
+    AION_OP_ELEMWISE = 1,
+    AION_OP_UNARY = 2,
+    AION_OP_SOFTMAX = 3,
+    AION_OP_LAYERNORM = 4,
+    AION_OP_RMSNORM = 5,
+    AION_OP_ATTENTION = 6,
+    AION_OP_RELPOS_MHA = 7,
+    AION_OP_CONV1D = 8,
+    AION_OP_CONV2D = 9,
+    AION_OP_COPY = 10,
+    AION_OP_ROPE1D = 11,
+    AION_OP_SEQUENCE_APPEND = 12,
+    AION_OP_REDUCE = 13,
+    AION_OP_CONCAT = 14,
+    AION_OP_RESHAPE = 15,
+    AION_OP_SQUEEZE = 16,
+    AION_OP_UNSQUEEZE = 17,
+    AION_OP_TRANSPOSE2D = 18,
+    AION_OP_SLICE = 19,
+    AION_OP_LSTM_CELL = 20,
+    AION_OP_RFFT = 21,
+    AION_OP_STFT = 22,
+    AION_OP_CAST = 23,
+    AION_OP_ARGMAX = 24,
+    AION_OP_SCATTER_ROW = 25,
+    AION_OP_GATHER = 26,
+    AION_OP_DIM = 27,
+    AION_OP_IOTA = 28,
+    AION_OP_MAXPOOL2D = 29,
+    // Whatever a caller passes, read as an op rather than trusted to be one.
+    _,
 };
 
 /// Keys a query may attend to; `AION_ATTENTION_UNBOUNDED` on a side means no limit.
@@ -1672,10 +1671,6 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
             try need(n, 2, spec.inputs);
             break :blk try bld.matmul(in(spec, 0), in(spec, 1), spec.attr.matmul.alpha, spec.attr.matmul.beta);
         },
-        .AION_OP_MATMUL_NT => blk: {
-            try need(n, 2, spec.inputs);
-            break :blk try bld.matmulNT(in(spec, 0), in(spec, 1), spec.attr.matmul.alpha, spec.attr.matmul.beta);
-        },
         .AION_OP_ELEMWISE => blk: {
             try need(n, 2, spec.inputs);
             break :blk try bld.elemwiseBinary(binaryFromC(spec.attr.elemwise.op), in(spec, 0), in(spec, 1));
@@ -1888,6 +1883,7 @@ fn builderOpImpl(b: *AionBuilder, spec: *const AionOpSpec) api.Builder.Error!Aio
             try need(n, 1, spec.inputs);
             break :blk try bld.iota(in(spec, 0), spec.attr.argmax.axis);
         },
+        _ => return error.InvalidArgument,
     };
     return out.value;
 }

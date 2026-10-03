@@ -94,49 +94,37 @@ pub const OpTag = enum(u16) {
     ///
     Cast = 20,
 
-    /// Matmul with the right operand conceptually transposed: C[m,n] = sum_k A[m,k] * B[n,k].
-    ///
-    /// Unlike the standard `MatMul` (which expects B shaped `[K, N]` with axis-0 blocks
-    /// for quantized B), `MatMulNT` expects B shaped `[N, K]` with per-row blocks
-    /// (q8_0 `quant_axis == 1`). This is the layout an embedding table already has on
-    /// disk, so tied logits can reuse the token embedding without duplicating it.
-    ///
-    MatMulNT = 21,
-
     /// Single-output conditional region.
-    If = 22,
+    If = 21,
 
     /// Single-carried-value loop region.
-    Loop = 23,
+    Loop = 22,
 
     /// Real FFT over the last dimension (power-of-two length).
-    RFFT = 24,
+    RFFT = 23,
 
     /// Short-time Fourier transform (framing + window + real FFT).
-    STFT = 25,
+    STFT = 24,
 
     /// Relative-positional (Transformer-XL / Conformer) multi-head self-attention.
-    RelPosMHA = 26,
+    RelPosMHA = 25,
 
     /// Index of the maximum value along an axis (v1: last axis). Output dtype i32.
-    ArgMax = 27,
+    ArgMax = 26,
 
     /// In-place scatter of one row: buf[idx] = src. Output aliases buf.
-    ScatterRow = 28,
-    // 29 was GeluMul, retired: a gated activation is `ElemwiseBinary{ .op = .gate }`
-    // parameterized by its `UnaryOp`, which covers GEGLU/SwiGLU/GLU/ReGLU instead of
-    // one tag for one of them. Ids are stable on disk, so 29 stays unused.
+    ScatterRow = 27,
     /// General gather with TensorFlow-style `axis` / `batch_dims` semantics.
-    Gather = 30,
+    Gather = 28,
     /// One input extent reified as an i32 one-element tensor.
-    Dim = 31,
+    Dim = 29,
     /// Coordinate tensor with the input's shape, increasing along one axis.
-    Iota = 32,
+    Iota = 30,
 
     /// The `k` largest (or smallest) values along an axis, and where they came
     /// from. Two outputs: values, then i32 indices.
-    TopK = 33,
-    MaxPool2D = 34,
+    TopK = 31,
+    MaxPool2D = 32,
 };
 
 /// Which keys a query may attend to, as one interval: `[anchor - left, anchor +
@@ -407,9 +395,6 @@ pub const Op = union(OpTag) {
     /// Elementwise scalar-dtype cast.
     Cast: struct { to_dtype: DType },
 
-    /// Matmul with B conceptually transposed; see `OpTag.MatMulNT` doc.
-    MatMulNT: struct { alpha: f32 = 1.0, beta: f32 = 0.0 },
-
     /// Single-output conditional. Inputs: cond, then_value, else_value.
     If: struct { then_region: RegionId, else_region: RegionId },
 
@@ -542,7 +527,6 @@ pub fn opInputArity(op: Op) InputArity {
         .RoPE1D => .{ .exact = 2 },
         .SequenceAppend => .{ .exact = 3 },
         .Cast => .{ .exact = 1 },
-        .MatMulNT => .{ .exact = 2 },
         .If => .{ .exact = 3 },
         .Loop => .{ .at_least = 1 },
         .RFFT => .{ .exact = 1 },
@@ -1237,13 +1221,6 @@ pub const Graph = struct {
 
     pub fn addCast(self: *Self, x: ValueId, to_dtype: DType) GraphError!ValueId {
         return self.addNodeInternal(.{ .Cast = .{ .to_dtype = to_dtype } }, &[_]ValueId{x});
-    }
-
-    pub fn addMatMulNT(self: *Self, a: ValueId, b: ValueId, alpha: f32, beta: f32) GraphError!ValueId {
-        return self.addNodeInternal(
-            .{ .MatMulNT = .{ .alpha = alpha, .beta = beta } },
-            &[_]ValueId{ a, b },
-        );
     }
 
     pub fn addLSTMCell(

@@ -40,6 +40,21 @@ pub const configs = [_]MatmulConfig{
     .{ .bm = 256, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true },
 };
 
+/// The same GEMM over a B stored as rows, `[N, K]` (a `MatMulNT`'s f32 weight), so
+/// it runs without a transposed copy. The shapes that lead the GEMM menu, and a
+/// scalar config for rows that are not 16-byte aligned.
+pub const rows_configs = [_]MatmulConfig{
+    .{ .bm = 128, .bn = 128, .bk = 8, .tm = 8, .tn = 8, .vec4_load = false, .b_rows = true },
+    .{ .bm = 128, .bn = 128, .bk = 16, .tm = 8, .tn = 8, .vec4_load = true, .b_rows = true },
+    .{ .bm = 128, .bn = 128, .bk = 16, .tm = 8, .tn = 8, .vec4_load = true, .double_buffer = true, .b_rows = true },
+    .{ .bm = 128, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
+    .{ .bm = 64, .bn = 64, .bk = 16, .tm = 4, .tn = 4, .vec4_load = true, .b_rows = true },
+    .{ .bm = 64, .bn = 64, .bk = 32, .tm = 4, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
+    .{ .bm = 128, .bn = 64, .bk = 16, .tm = 8, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
+    .{ .bm = 64, .bn = 128, .bk = 16, .tm = 4, .tn = 8, .vec4_load = true, .b_rows = true },
+    .{ .bm = 256, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
+};
+
 /// Implicit-GEMM conv menu. The same register-blocked kernel, with A gathered
 /// from the activation instead of read as a matrix, so the blocks that work for
 /// a GEMM work here; `bn` is picked against the output-channel count, which for
@@ -58,6 +73,13 @@ pub const conv_configs = [_]MatmulConfig{
 pub fn generate(arena: std.mem.Allocator) []const codegen.Generated {
     var arr = arena.alloc(codegen.Generated, configs.len) catch @panic("codegen: OOM");
     inline for (configs, 0..) |cfg, i| arr[i] = codegen.gen(arena, cfg);
+    return arr;
+}
+
+/// The rows-B menu's WGSL, rendered alongside the GEMM menu at backend init.
+pub fn generateRows(arena: std.mem.Allocator) []const codegen.Generated {
+    var arr = arena.alloc(codegen.Generated, rows_configs.len) catch @panic("codegen: OOM");
+    inline for (rows_configs, 0..) |cfg, i| arr[i] = codegen.gen(arena, cfg);
     return arr;
 }
 

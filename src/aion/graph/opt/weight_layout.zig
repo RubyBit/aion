@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! Re-lay a q8 matmul weight into the order a decode matvec reads it in, and
-//! contract against its rows instead (`MatMul` -> `MatMulNT`). Only q8: that is
-//! the one dtype the CPU's NT lowering has a kernel for.
+//! Re-lay a q8 matmul weight into the order a decode matvec reads it in, as
+//! `[N, K]`, and read it through a transpose: `MatMul(a, ViewTranspose2D(laid))`,
+//! which lowering turns into a contraction against its rows
+//! (`program/matmul_rows.zig`). Only q8: that is the one dtype the CPU's NT
+//! lowering has a kernel for.
 //!
 //! Two changes, both pure byte permutations of the same blocks:
 //!
@@ -35,6 +37,7 @@ const derived = @import("../../storage/derived.zig");
 const types = @import("../../backend/types.zig");
 const rewriter_mod = @import("rewriter.zig");
 const target_mod = @import("../target.zig");
+const matmul_rows = @import("../program/matmul_rows.zig");
 const thread_pool = @import("../../runtime/thread_pool.zig");
 
 
@@ -55,15 +58,16 @@ const Cand = struct {
     dtype: types.DType,
     k: usize,
     n: usize,
-    alpha: f32,
-    beta: f32,
-    /// B is `[n, k]` already; the re-lay only has to interleave it.
+    /// B is `[n, k]` already, read through a transpose; the re-lay only has to
+    /// interleave it.
     already_nt: bool = false,
 };
 
 pub const Rule = struct {
     mgr: *StorageManager,
     target: Target,
+    /// Every transpose's source, so a matmul over `wᵀ` is seen to read `w`.
+    sources: *const matmul_rows.Sources,
 
     pub fn run(self: Rule, rw: *Rewriter) Error!void {
         var workers: Workers = .{ .threads = self.mgr.bulk_threads };
@@ -74,7 +78,7 @@ pub const Rule = struct {
         var laid_rows: std.AutoHashMapUnmanaged(TensorId, void) = .empty;
         defer laid_rows.deinit(rw.gpa);
         for (rw.input()) |node| {
-            const c = candidate(rw.g, self.mgr, self.target, node) orelse continue;
+            const c = candidate(rw.g, self.mgr, self.target, self.sources, node) orelse continue;
             if (c.already_nt) laid_rows.put(rw.gpa, c.b_tid, {}) catch return Error.OutOfMemory;
         }
 
@@ -88,7 +92,7 @@ pub const Rule = struct {
                 changed = true;
                 continue;
             };
-            const c = candidate(rw.g, self.mgr, self.target, node) orelse {
+            const c = candidate(rw.g, self.mgr, self.target, self.sources, node) orelse {
                 try rw.add(node);
                 continue;
             };
@@ -97,10 +101,13 @@ pub const Rule = struct {
                 continue;
             };
             const weight = try rw.bound(c.dtype, &.{ c.n, c.k }, @intCast(laid));
+            const read = try rw.value(c.dtype, &.{ c.k, c.n });
+            try rw.add(.{ .op = .ViewTranspose2D, .inputs = try rw.ids(&.{weight}), .output = read });
             try rw.add(.{
-                .op = .{ .MatMulNT = .{ .alpha = c.alpha, .beta = c.beta } },
-                .inputs = try rw.ids(&.{ node.inputs[0], weight }),
+                .op = node.op,
+                .inputs = try rw.ids(&.{ node.inputs[0], read }),
                 .output = node.output,
+                .extra_outputs = node.extra_outputs,
             });
             changed = true;
         }
@@ -120,17 +127,12 @@ fn lookupTable(g: *const Graph, node: Node) ?TensorId {
     return @intCast(table.external orelse return null);
 }
 
-fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: Node) ?Cand {
-    // A `MatMulNT` is already contracting against rows; it still wants its
-    // blocks interleaved, which is the other half of what this pass does.
-    const scale: struct { alpha: f32, beta: f32 } = switch (node.op) {
-        .MatMul => |m| .{ .alpha = m.alpha, .beta = m.beta },
-        .MatMulNT => |m| .{ .alpha = m.alpha, .beta = m.beta },
-        else => return null,
-    };
-    const already_nt = std.meta.activeTag(node.op) == .MatMulNT;
-    if (node.inputs.len != 2) return null;
-    const b = g.values.items[@intCast(node.inputs[1])];
+fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, sources: *const matmul_rows.Sources, node: Node) ?Cand {
+    if (node.op != .MatMul or node.inputs.len != 2) return null;
+    // A matmul over `wᵀ` already contracts against `w`'s rows; it still wants
+    // them interleaved, which is the other half of what this pass does.
+    const b_value: ValueId, const already_nt = if (sources.get(node.inputs[1])) |w| .{ w, true } else .{ node.inputs[1], false };
+    const b = g.values.items[@intCast(b_value)];
     const ext = b.external orelse return null;
     const b_tid: TensorId = @intCast(ext);
 
@@ -150,7 +152,7 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: 
         const k_nt: usize = t.shape[1];
         if (k_nt % info.block_elems != 0) return null;
         if (orderFor(target, t.shape[0]) != target.quant_block_order or target.quant_block_order == .row_major) return null;
-        return .{ .b_tid = b_tid, .dtype = t.dtype, .k = k_nt, .n = t.shape[0], .alpha = scale.alpha, .beta = scale.beta, .already_nt = true };
+        return .{ .b_tid = b_tid, .dtype = t.dtype, .k = k_nt, .n = t.shape[0], .already_nt = true };
     }
     if (t.quant_axis != 0) return null;
     const k: usize = t.shape[0];
@@ -159,14 +161,7 @@ fn candidate(g: *const Graph, mgr: *const StorageManager, target: Target, node: 
     // as it is rather than moving to a layout the target never asked for.
     if (orderFor(target, t.shape[1]) != target.quant_block_order) return null;
 
-    return .{
-        .b_tid = b_tid,
-        .dtype = t.dtype,
-        .k = k,
-        .n = t.shape[1],
-        .alpha = scale.alpha,
-        .beta = scale.beta,
-    };
+    return .{ .b_tid = b_tid, .dtype = t.dtype, .k = k, .n = t.shape[1] };
 }
 
 /// The block order an `[n, k]` weight takes on `target`: the one its kernel reads,

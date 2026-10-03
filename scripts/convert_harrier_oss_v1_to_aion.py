@@ -37,7 +37,7 @@ there is *no* local/global alternation: one rope base (`rope_theta`), no sliding
 window, and neither logit softcap is set.
 
 Weight/quant policy (mirrors convert_gemma4_e2b_to_aion.py):
-- dense matmul weights -> q8_0 stored matmul-B `[K, N]` (blocked on K).
+- dense matmul weights -> q8_0 `[out, in]` as the checkpoint stores them (blocked on in).
 - the embedding table -> q8_0 blocked along the feature dim.
 - RMSNorm gammas -> f32.
 Pass `--dtype f32` for an unquantized reference to measure q8_0 drift against.
@@ -238,19 +238,6 @@ class _WeightLoader:
 # --------------------- weight adaptation (host-side folds) --------------------
 
 
-def _mm_b(w_torch: np.ndarray) -> np.ndarray:
-    """A PyTorch linear's `[out, in]` weight in Aion's matmul-B layout `[in, out]`.
-
-    Adapting someone else's layout is a converter's job — `nn` has one canonical
-    layout and takes no `transposed=` flag. Rank 2 is all it needs: MatMul
-    broadcasts a `[K, N]` weight into a `[batch, seq, K]` activation, so the
-    weight reaches the kernel exactly as stored, which is what keeps a quantized
-    one usable at all. Quantization itself is `nn`'s to do (`dtype=aion.q8_0`),
-    blocking along K.
-    """
-    return np.ascontiguousarray(w_torch.astype(np.float32, copy=False).T)
-
-
 def _gemma_gamma(w_torch: np.ndarray) -> np.ndarray:
     """A Gemma RMSNorm weight as a plain multiplicative gamma: `1 + w`.
 
@@ -258,7 +245,7 @@ def _gemma_gamma(w_torch: np.ndarray) -> np.ndarray:
     `(1.0 + weight)` (`Gemma3RMSNorm.forward` in transformers; `&self.weight +
     1.0` in the candle reference). Aion's `rmsnorm` op multiplies by gamma
     directly, so the `+1` is folded once here on the host rather than costing an
-    op per norm — the same kind of fold as `_mm_b`'s transpose.
+    op per norm.
 
     Getting this wrong is silent: the model still runs, and still emits plausible
     embeddings, because RMSNorm's normalization hides the magnitude error.
@@ -324,15 +311,15 @@ def _load_weights(loader: _WeightLoader) -> Tuple[_SharedWeights, List[_LayerWei
                 post_ffn_ln=_gemma_gamma(
                     loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")
                 ),
-                q_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.q_proj.weight")),
-                k_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.k_proj.weight")),
-                v_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.v_proj.weight")),
-                o_proj=_mm_b(loader.get_f32(f"{pfx}.self_attn.o_proj.weight")),
+                q_proj=loader.get_f32(f"{pfx}.self_attn.q_proj.weight"),
+                k_proj=loader.get_f32(f"{pfx}.self_attn.k_proj.weight"),
+                v_proj=loader.get_f32(f"{pfx}.self_attn.v_proj.weight"),
+                o_proj=loader.get_f32(f"{pfx}.self_attn.o_proj.weight"),
                 q_norm=_gemma_gamma(loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
                 k_norm=_gemma_gamma(loader.get_f32(f"{pfx}.self_attn.k_norm.weight")),
-                gate_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.gate_proj.weight")),
-                up_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.up_proj.weight")),
-                down_proj=_mm_b(loader.get_f32(f"{pfx}.mlp.down_proj.weight")),
+                gate_proj=loader.get_f32(f"{pfx}.mlp.gate_proj.weight"),
+                up_proj=loader.get_f32(f"{pfx}.mlp.up_proj.weight"),
+                down_proj=loader.get_f32(f"{pfx}.mlp.down_proj.weight"),
             )
         )
     return shared, layers

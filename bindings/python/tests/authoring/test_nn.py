@@ -124,11 +124,11 @@ def test_embedding_lookup(b):
 
 # --- blocks ------------------------------------------------------------------
 def test_gated_mlp_multiplies_the_two_projections(b):
-    # in=1, ffn=2. Concatenating gate and up into one wide weight is a fusion the
-    # compiler performs, so this layer only ever describes the two projections.
-    gate = np.array([[1.0, 2.0]], np.float32)
-    up = np.array([[10.0, 20.0]], np.float32)
-    down = np.array([[1.0], [1.0]], np.float32)  # sums the two ffn lanes
+    # in=1, ffn=2, weights `[out, in]`. This layer only ever describes the two
+    # projections, the way checkpoints ship them.
+    gate = np.array([[1.0], [2.0]], np.float32)
+    up = np.array([[10.0], [20.0]], np.float32)
+    down = np.array([[1.0, 1.0]], np.float32)  # sums the two ffn lanes
 
     x = b.input((1, 1)).rename("x")
     y = nn.GatedMLP(gate, up, down, act="silu")(x)
@@ -144,23 +144,28 @@ def nmse(a, b):
     return float(np.sum((a - b) ** 2) / np.sum(a**2))
 
 
-def run_linear(w, x, *, nt):
+def run_q8(w, x, *, rows):
+    """`x @ w.T` over a q8 `[out, in]` weight (a `Linear`), or the same product
+    over its `[in, out]` transpose as a plain matmul."""
     with aion.Context(thread_count=1) as c, aion.Builder(ctx=c) as bb:
         xi = bb.input(x.shape).rename("x")
-        return run(bb, nn.Linear(w, dtype=aion.q8_0, nt=nt)(xi), {"x": x})
+        if rows:
+            return run(bb, nn.Linear(w, dtype=aion.q8_0)(xi), {"x": x})
+        wi = bb.param_named(np.ascontiguousarray(w.T), "w", dtype=aion.q8_0)
+        return run(bb, bb.matmul(xi, wi), {"x": x})
 
 
-def test_nt_weights_match_their_transpose():
-    # `nt` contracts against a weight's rows, so `[out, in]` with `nt` and its
-    # transpose without it describe the same layer — and the same arithmetic,
+def test_a_linear_weight_matches_its_transpose():
+    # A `Linear` contracts against its `[out, in]` weight's rows, so it and a plain
+    # matmul over the transpose are the same layer — and the same arithmetic,
     # whichever kernel each picks. Sized past one q8 block and one N panel so the
     # blocked kernels are what run.
     rng = np.random.default_rng(0)
     w = (rng.standard_normal((320, 96)) * 0.1).astype(np.float32)
     x = (rng.standard_normal((2, 5, 96)) * 0.5).astype(np.float32)
 
-    got = run_linear(w, x, nt=True)
-    ref = run_linear(np.ascontiguousarray(w.T), x, nt=False)
+    got = run_q8(w, x, rows=True)
+    ref = run_q8(w, x, rows=False)
     exact = x @ w.T
     assert got.shape == ref.shape == exact.shape
 
@@ -177,14 +182,14 @@ def test_nt_weights_match_their_transpose():
 def test_gated_mlp_rejects_mismatched_gate_and_up_widths():
     with pytest.raises(ValueError, match="same output width"):
         nn.GatedMLP(
-            np.ones((1, 3), np.float32),
-            np.ones((1, 2), np.float32),
+            np.ones((3, 1), np.float32),
+            np.ones((2, 1), np.float32),
             np.ones((1, 1), np.float32),
         )
 
 
 def test_glu_gates_one_half_with_the_other(b):
-    w = np.array([[1.0, 2.0, 0.0, 100.0]], np.float32)
+    w = np.array([[1.0], [2.0], [0.0], [100.0]], np.float32)  # [out, in]
     x = b.input((1, 1)).rename("x")
     got = run(b, nn.GLU(w)(x), {"x": np.array([[1.0]], np.float32)})
     # a = [1, 2], g = [0, 100] -> a * sigmoid(g)
@@ -459,7 +464,7 @@ def test_a_quantized_weight_blocks_the_way_its_reader_contracts(b, nt):
     def build(builder, **axis):
         xi = builder.input((3, 64)).rename("x")
         wi = builder.param_named(w, "w", dtype=aion.q8_0, **axis)
-        return run(builder, builder.matmul_nt(xi, wi) if nt else builder.matmul(xi, wi), {"x": x})
+        return run(builder, builder.matmul(xi, wi.T if nt else wi), {"x": x})
 
     got = build(b)
     with aion.Builder(ctx=b._ctx_owner) as b2:
@@ -473,7 +478,7 @@ def test_a_quantized_weight_read_along_two_axes_is_rejected(b):
     b.matmul(x, w)
     # The first reader fixed the axis, so the second fails where it is added.
     with pytest.raises(aion.AionError):
-        b.matmul_nt(x, w)
+        b.matmul(x, w.T)
 
 
 def _exact_in(dtype, shape, seed):
@@ -503,7 +508,7 @@ def test_a_quantized_weight_reads_the_same_from_any_host_layout(ctx, tmp_path):
     # A weight left for its ops to block is read where it lives: an f16 array, a
     # transposed (strided) view and a read-only memmap all give exactly what the
     # f32 values do.
-    w = _exact_in("f16", (96, 64), 3)
+    w = _exact_in("f16", (64, 96), 3)
     table = _exact_in("f16", (50, 64), 4)
     x = (np.random.default_rng(5).standard_normal((2, 96)) * 0.5).astype(np.float32)
     ids = np.array([[3, 7, 49]], dtype=np.int32)
@@ -525,14 +530,14 @@ def test_a_quantized_weight_reads_the_same_from_any_host_layout(ctx, tmp_path):
 
 def test_a_bfloat16_torch_weight_quantizes_like_its_values(ctx):
     torch = pytest.importorskip("torch")
-    w = _exact_in("bf16", (96, 64), 6)
+    w = _exact_in("bf16", (64, 96), 6)
     table = _exact_in("bf16", (50, 64), 7)
     x = (np.random.default_rng(8).standard_normal((2, 96)) * 0.5).astype(np.float32)
     ids = np.array([[1, 2, 40]], dtype=np.int32)
 
     want = _layer_outputs(ctx, w, table, x, ids)
-    # A PyTorch `[out, in]` bf16 checkpoint weight, bound as its transpose.
-    w_torch = torch.from_numpy(np.ascontiguousarray(w.T)).to(torch.bfloat16).T
+    # A PyTorch `[out, in]` bf16 checkpoint weight, bound as it is.
+    w_torch = torch.from_numpy(w).to(torch.bfloat16)
     got = _layer_outputs(ctx, w_torch, torch.from_numpy(table).to(torch.bfloat16), x, ids)
     np.testing.assert_array_equal(want["y"], got["y"])
     np.testing.assert_array_equal(want["e"], got["e"])
@@ -546,7 +551,7 @@ def test_the_core_owns_a_viewed_weight_until_it_has_read_it(ctx):
     import gc
     import weakref
 
-    w = _exact_in("f16", (64, 32), 9)
+    w = _exact_in("f16", (32, 64), 9)
     x = np.ones((1, 64), dtype=np.float32)
     with aion.Builder(ctx=ctx) as bb:
         src = w.copy()
@@ -555,7 +560,7 @@ def test_the_core_owns_a_viewed_weight_until_it_has_read_it(ctx):
         del src
         gc.collect()
         assert alive() is not None, "released before it was read"
-        y = bb.matmul(bb.input(x.shape).rename("x"), wv)
+        y = bb.matmul(bb.input(x.shape).rename("x"), wv.T)
         gc.collect()
         assert alive() is None, "still held after it was quantized"
         model = bb.compile({"y": y})

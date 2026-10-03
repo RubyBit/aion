@@ -23,8 +23,8 @@ def ctx():
 
 
 def test_mlp_compile_matches_numpy(ctx):
-    w1 = np.random.RandomState(0).randn(4, 8).astype(np.float32)
-    w2 = np.random.RandomState(1).randn(8, 3).astype(np.float32)
+    w1 = np.random.RandomState(0).randn(8, 4).astype(np.float32)  # [out, in]
+    w2 = np.random.RandomState(1).randn(3, 8).astype(np.float32)
 
     class MLP(nn.Module):
         def __init__(self, a, b):
@@ -40,7 +40,7 @@ def test_mlp_compile_matches_numpy(ctx):
     model = aion.compile(mlp, aion.spec((None, 4)), ctx=ctx)
     x = np.random.RandomState(2).randn(5, 4).astype(np.float32)
     got = model.run({"x": x})["output0"]
-    ref = np.maximum(x @ w1, 0.0) @ w2
+    ref = np.maximum(x @ w1.T, 0.0) @ w2.T
     assert np.allclose(got, ref, atol=1e-4)
 
 
@@ -91,7 +91,7 @@ def test_multi_input_and_dict_outputs(ctx):
 
 
 def test_dynamic_axis_serves_many_sizes(ctx):
-    w = np.arange(12, dtype=np.float32).reshape(4, 3)
+    w = np.arange(12, dtype=np.float32).reshape(3, 4)  # [out, in]
 
     class Net(nn.Module):
         def __init__(self):
@@ -105,7 +105,7 @@ def test_dynamic_axis_serves_many_sizes(ctx):
         xv = ((np.arange(m * 4, dtype=np.float32) % 7) - 3).reshape(m, 4)
         got = model.run({"x": xv})["output0"]
         assert got.shape == (m, 3)
-        assert np.allclose(got, xv @ w, atol=1e-4)
+        assert np.allclose(got, xv @ w.T, atol=1e-4)
 
 
 def test_recompile_same_module_rebinds(ctx):

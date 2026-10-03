@@ -284,7 +284,54 @@ fn matmul2D(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k
         return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, groups, MATVEC_COLUMN_GROUP * col_bytes, ctx2, Ctx.run);
     }
 
-    const plan = planGemm(ctx, s, m, n, k, b_dtype, ctx.thread_count);
+    return runGemm(ctx, planGemm(ctx, s, m, n, k, b_dtype, ctx.thread_count), c, a, b);
+}
+
+/// Whether a `MatMulNT` goes through the packed GEMM: an f32 `[N, K]` B with more
+/// than one row of A. Packing a tile from B's rows costs what packing it from its
+/// columns does, so this runs at `MatMul`'s speed; one row stays on the NT row-dot
+/// kernel, which streams each row of B once and is faster there.
+pub fn gemmTakesNT(store: tensor_store.TensorStore, s: executable.StepMatMulNT) ExecuteProgramError!bool {
+    const a_meta = try store.meta(s.a);
+    const b_meta = try store.meta(s.b);
+    const c_meta = try store.meta(s.c);
+    if (a_meta.dtype != .f32 or b_meta.dtype != .f32 or c_meta.dtype != .f32 or b_meta.rank != 2) return false;
+    return !matvecRoute(rowsOf(c_meta), .f32);
+}
+
+/// `C = alpha * A @ Bᵀ + beta * C` for an f32 `[N, K]` B (see `gemmTakesNT`).
+pub fn execMatMulNT(ctx: *MatMulExecCtx, s: executable.StepMatMulNT, store: tensor_store.TensorStore) ExecuteProgramError!void {
+    const c_meta = try store.meta(s.c);
+    const a_meta = try store.meta(s.a);
+    const b_meta = try store.meta(s.b);
+    const n: usize = b_meta.shape[0];
+    const k: usize = b_meta.shape[1];
+    const m = rowsOf(c_meta);
+    if (a_meta.shape[a_meta.rank - 1] != k or c_meta.shape[c_meta.rank - 1] != n) return BackendError.InvalidArgument;
+
+    const a_view = try store.acquireConst(s.a);
+    defer store.releaseConst(a_view.token);
+    const b_view = try store.acquireConst(s.b);
+    defer store.releaseConst(b_view.token);
+    const c_view = try store.acquireMut(s.c);
+    defer store.releaseMut(c_view.token);
+    if (a_view.bytes.len < m * k * @sizeOf(f32) or b_view.bytes.len < n * k * @sizeOf(f32) or c_view.bytes.len < m * n * @sizeOf(f32)) return BackendError.InvalidArgument;
+    if (m == 0 or n == 0) return;
+
+    const as_mm: executable.StepMatMul = .{ .c = s.c, .a = s.a, .b = s.b, .alpha = s.alpha, .beta = s.beta };
+    var plan = planGemm(ctx, as_mm, m, n, k, .f32, ctx.thread_count);
+    plan.b_rows = true;
+    return runGemm(ctx, plan, c_view.bytes, a_view.bytes, b_view.bytes);
+}
+
+/// Rows of C: its leading dims folded into M.
+fn rowsOf(c_meta: tensor_store.TensorMeta) usize {
+    var m: usize = 1;
+    for (c_meta.shape[0 .. c_meta.rank - 1]) |d| m *= d;
+    return m;
+}
+
+fn runGemm(ctx: *MatMulExecCtx, plan: GemmPlan, c: []u8, a: []const u8, b: []const u8) ExecuteProgramError!void {
     const Job = struct {
         plan: GemmPlan,
         scratch: [][]align(32) u8,
@@ -316,6 +363,8 @@ const GemmPlan = struct {
     rows: usize,
     row_groups: usize,
     tasks: usize,
+    /// B is f32 `[N, K]` (a `MatMulNT`'s), packed from its rows.
+    b_rows: bool = false,
 };
 
 /// Lay out `threads` tasks over C. B is packed once per row group and A once per
@@ -387,12 +436,16 @@ fn gemmTask(p: GemmPlan, task: usize, scratch: []align(32) u8, c: []u8, a: []con
             },
             .f32, .f16 => {
                 const pb_bytes = p.mk.tuning.kc * p.mk.tuning.nc * @sizeOf(f32);
-                const b_blk = b[(pc * p.n + j0) * info.block_bytes ..];
-                if (p.b_dtype == .f32) {
-                    try p.mk.pack_b_tile(scratch, kw, nw, p.n, b_blk);
+                if (p.b_rows) {
+                    try p.mk.pack_b_tile_rows(scratch, kw, nw, p.k, b[(j0 * p.k + pc) * @sizeOf(f32) ..]);
                 } else {
-                    const pb: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
-                    try p.mk.pack_b_tile_f16_to_packed_f32(pb, kw, nw, p.n, b_blk);
+                    const b_blk = b[(pc * p.n + j0) * info.block_bytes ..];
+                    if (p.b_dtype == .f32) {
+                        try p.mk.pack_b_tile(scratch, kw, nw, p.n, b_blk);
+                    } else {
+                        const pb: []align(32) f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
+                        try p.mk.pack_b_tile_f16_to_packed_f32(pb, kw, nw, p.n, b_blk);
+                    }
                 }
                 const view: []align(32) const f32 = @alignCast(std.mem.bytesAsSlice(f32, scratch[0..pb_bytes]));
                 try p.mk.matmul_packed_b(scratch, view, params, c_blk, a_blk);

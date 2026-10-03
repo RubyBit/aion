@@ -202,7 +202,7 @@ test "api.nn: Embedding lookup and a tied output head share one table" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), got[3], 1e-6);
 
     // A tied head reuses the very same parameter (no second copy of the table).
-    const head = try nn.Linear.bindShared(&fx.bld, emb.weightRef(), null, .{ .nt = true, .name = "lm_head" });
+    const head = try nn.Linear.bindShared(&fx.bld, emb.weightRef(), null, .{ .name = "lm_head" });
     try std.testing.expectEqual(emb.weightRef().value, head.w.value);
 }
 
@@ -241,16 +241,16 @@ test "api.nn: GatedMLP silu path multiplies the two projections" {
     defer fx.deinit(allocator);
 
     // in=1, ffn=2.
-    const gate = [_]f32{ 1.0, 2.0 }; // [1, 2]
-    const up = [_]f32{ 10.0, 20.0 }; // [1, 2]
-    const down = [_]f32{ 1.0, 1.0 }; // [2, 1] sums the two ffn lanes
+    const gate = [_]f32{ 1.0, 2.0 }; // [2, 1]
+    const up = [_]f32{ 10.0, 20.0 }; // [2, 1]
+    const down = [_]f32{ 1.0, 1.0 }; // [1, 2] sums the two ffn lanes
     const x_vals = [_]f32{1.0};
 
     const X = try fx.bld.param(try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &x_vals));
     const mlp = try nn.GatedMLP.bind(&fx.bld, .{
-        .gate_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 2 }, &gate) },
-        .up_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 2 }, &up) },
-        .down_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 2, 1 }, &down) },
+        .gate_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 2, 1 }, &gate) },
+        .up_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 2, 1 }, &up) },
+        .down_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 2 }, &down) },
     }, .{ .act = .silu });
     const Y = try mlp.forward(&fx.bld, X);
 
@@ -265,7 +265,7 @@ test "api.nn: GatedMLP silu path multiplies the two projections" {
 
 test "api.nn: a q8_0 GatedMLP runs against a rank-3 activation" {
     // The shape a real transformer has: a `[batch, seq, dim]` residual stream and
-    // quantized `[1, K, N]` projections, stored rank-aligned with the activation.
+    // quantized `[out, in]` projections, blocked along `in`.
     const allocator = std.testing.allocator;
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
@@ -282,9 +282,9 @@ test "api.nn: a q8_0 GatedMLP runs against a rank-3 activation" {
 
     const X = try fx.bld.name(try fx.bld.input(.f32, &[_]usize{ 1, 4, in }), "x");
     const mlp = try nn.GatedMLP.bind(&fx.bld, .{
-        .gate_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ 1, in, ffn }, 1, &gate_vals) },
-        .up_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ 1, in, ffn }, 1, &up_vals) },
-        .down_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ 1, ffn, in }, 1, &down_vals) },
+        .gate_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 1, &gate_vals) },
+        .up_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 1, &up_vals) },
+        .down_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 1, &down_vals) },
     }, .{ .act = .silu });
     const Y = try mlp.forward(&fx.bld, X);
 
@@ -333,9 +333,9 @@ test "api.nn: fusing a split GatedMLP reclaims the weights it replaced" {
 
         const X = try fx.bld.name(try fx.bld.input(.f32, &[_]usize{ 1, 4, in }), "x");
         const mlp = try nn.GatedMLP.bind(&fx.bld, .{
-            .gate_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 0, &gate_vals) },
-            .up_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 0, &up_vals) },
-            .down_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 0, &down_vals) },
+            .gate_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 1, &gate_vals) },
+            .up_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 1, &up_vals) },
+            .down_proj = .{ .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 1, &down_vals) },
         }, .{ .name = "mlp" });
         const Y = try fx.bld.name(try mlp.forward(&fx.bld, X), "y");
         try fx.ctx.exportModel(file, &fx.bld, &[_]api.NamedTensorRef{.{ .name = "y", .tensor = Y }}, .{});
@@ -355,12 +355,12 @@ test "api.nn: fusing a split GatedMLP reclaims the weights it replaced" {
 
     // The fused-away weight is still addressable by name: reading it gathers the
     // columns back out of the fused tensor, since its own buffer is gone.
-    const probe: api.Tensor = try ctx.tensor(.q8_0, &[_]usize{ in, ffn });
+    const probe: api.Tensor = try ctx.tensor(.q8_0, &[_]usize{ ffn, in });
     try model.readInitializerByDebugName("mlp/gate_proj/weight", probe);
 
     // And swapping it writes through to the fused tensor's sub-region. Zeroing the
     // gate must change the output, or the write went somewhere unread.
-    const zeros: api.Tensor = try ctx.fromF32Quantized(.q8_0, &[_]usize{ in, ffn }, 0, &@as([in * ffn]f32, @splat(0.0)));
+    const zeros: api.Tensor = try ctx.fromF32Quantized(.q8_0, &[_]usize{ ffn, in }, 1, &@as([in * ffn]f32, @splat(0.0)));
     try model.overwriteInitializerByDebugName("mlp/gate_proj/weight", zeros);
     try model.run();
 
@@ -379,7 +379,7 @@ test "api.nn: fusing a split GatedMLP reclaims the weights it replaced" {
 test "api.nn: a symbolic-shape model loads with a 2-D quantized weight" {
     // The shape a real decoder has: a free `seq` axis, so the loader instantiates a
     // concrete graph per shape from the package's shape terms rather than reusing an
-    // authored one. A quantized weight is stored at its natural `[K, N]` rank and has
+    // authored one. A quantized weight is stored at its natural `[N, K]` rank and has
     // to survive that round trip.
     const allocator = std.testing.allocator;
 
@@ -414,7 +414,7 @@ test "api.nn: a symbolic-shape model loads with a 2-D quantized weight" {
 
         // The quantized weight feeds the matmul in the layout it was stored in.
         const fc = try nn.Linear.bind(&fx.bld, .{
-            .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ k, n }, 0, &w_vals),
+            .weight = try fx.ctx.fromF32Quantized(.q8_0, &[_]usize{ n, k }, 1, &w_vals),
         }, .{ .name = "fc" });
         const Y = try fx.bld.name(try fc.forward(&fx.bld, X), "y");
 
@@ -607,11 +607,11 @@ test "api.nn: GLU gates one half of a projection with the other" {
     const fx = try Fixture.init(allocator);
     defer fx.deinit(allocator);
 
-    // in=1, out=4 -> halves of width 2.
+    // in=1, out=4 -> halves of width 2. `[4, 1]`, one weight per output.
     const w = [_]f32{ 1.0, 2.0, 0.0, 100.0 };
     const X = try fx.bld.param(try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0}));
     const glu = try nn.GLU.bind(&fx.bld, .{
-        .proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 4 }, &w) },
+        .proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 4, 1 }, &w) },
     }, .{});
     const Y = try glu.forward(&fx.bld, X);
 
@@ -630,8 +630,8 @@ test "api.nn: GatedMLP rejects gate and up projections of different widths" {
 
     // The halves are multiplied elementwise, so unequal ffn widths cannot work.
     try std.testing.expectError(error.InvalidArgument, nn.GatedMLP.bind(&fx.bld, .{
-        .gate_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 3 }, &[_]f32{ 1.0, 2.0, 3.0 }) },
-        .up_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 2 }, &[_]f32{ 1.0, 2.0 }) },
+        .gate_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 3, 1 }, &[_]f32{ 1.0, 2.0, 3.0 }) },
+        .up_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 2, 1 }, &[_]f32{ 1.0, 2.0 }) },
         .down_proj = .{ .weight = try fx.ctx.fromF32(&[_]usize{ 1, 1 }, &[_]f32{1.0}) },
     }, .{}));
 }
@@ -768,7 +768,7 @@ test "api.nn: parameter names are hierarchical and semantic" {
     // A layer's ops land under the same path as its parameters.
     const X = try fx.bld.input(.f32, &[_]usize{ 1, 2 });
     const Y = try a.forward(&fx.bld, X);
-    try std.testing.expectEqualStrings("Linear#0/matmul#0", fx.bld.valueName(Y).?);
+    try std.testing.expectEqualStrings("Linear#0/matmul#1", fx.bld.valueName(Y).?);
 }
 
 test "api.nn: a literal, a shared Named, and a Params bind identically" {
@@ -1308,12 +1308,12 @@ test "api.nn: pooling format roundtrip and strict u16 node headers" {
     var parsed = try package.parse(allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqualDeep(pool.opts, parsed.nodes[0].op.MaxPool2D);
-    try std.testing.expectEqual(@as(u32, 15), std.mem.readInt(u32, bytes[4..8], .little));
-    for ([_]u32{ 14, 16 }) |version| {
+    try std.testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, bytes[4..8], .little));
+    for ([_]u32{ 15, 17 }) |version| {
         std.mem.writeInt(u32, bytes[4..8], version, .little);
         try std.testing.expectError(error.UnsupportedVersion, package.parse(allocator, bytes));
     }
-    std.mem.writeInt(u32, bytes[4..8], 15, .little);
+    std.mem.writeInt(u32, bytes[4..8], 16, .little);
     const sections = std.mem.readInt(u32, bytes[8..12], .little);
     const directory: usize = @intCast(std.mem.readInt(u64, bytes[16..24], .little));
     var node_offset: ?usize = null;

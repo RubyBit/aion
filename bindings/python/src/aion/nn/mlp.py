@@ -60,8 +60,8 @@ class GatedMLP(Module):
         self._layer_name = name
         self.act = act
 
-        ffn = int(_last_dim(gate))
-        if int(_last_dim(up)) != ffn:
+        ffn = _out_features(gate)
+        if _out_features(up) != ffn:
             raise ValueError("gate and up must have the same output width")
 
         self.gate_proj = Linear(gate, dtype=dtype)
@@ -91,7 +91,7 @@ class GLU(Module):
         dtype: DTypeLike = float32,
     ) -> None:
         self._layer_name = name
-        total = int(_last_dim(weight))
+        total = _out_features(weight)
         if total % 2 != 0:
             raise ValueError(f"GLU projection width must be even, got {total}")
         self.half = total // 2
@@ -106,10 +106,11 @@ class GLU(Module):
             return b.mul(b.unary("sigmoid", g), a)
 
 
-def _last_dim(data: WeightData) -> int:
+def _out_features(data: WeightData) -> int:
+    """A `Linear` weight's output width: the rows of its `[out, in]`."""
     from .._ffi.dlpack import data_shape
 
     shape = data_shape(data)
-    if not shape:
-        raise ValueError("weight must have at least one axis")
-    return int(shape[-1])
+    if len(shape) != 2:
+        raise ValueError(f"a Linear weight is [out, in], got shape {tuple(shape)}")
+    return int(shape[0])

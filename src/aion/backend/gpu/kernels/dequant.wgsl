@@ -2,13 +2,12 @@
 //
 // Layout/dtype conversion passes that feed the f32 GEMM: they materialize a
 // B into a transient f32 scratch buffer so the autotuned f32 kernel can
-// consume weights stored in other dtypes/orientations (the M>1 MatMulNT path).
+// consume weights stored in other dtypes (the M>1 q8_0 MatMulNT path).
 // One extra bandwidth pass over B — cheap next to the GEMM it unblocks; the
 // frame's pass ordering serializes scratch reuse across chunks.
 //
 //   q8_nt_to_f32t : B q8_0 [N, K] (NT)  -> scratch f32 [K, N]  (dequant + transpose)
 //   q8_lanes32x16_to_f32t : B q8_0 [N, K] in `lanes32x16` order -> scratch f32 [K, N]
-//   f32_nt_t      : B f32  [N, K] (NT)  -> scratch f32 [K, N]  (transpose)
 //   f16_to_f32    : same-layout f16 -> f32 widen (for f16 GEMM / cast)
 //
 // q8_0 rows are walked in word-aligned BLOCK PAIRS (see matmul_nt_gemv.wgsl for
@@ -104,17 +103,6 @@ fn q8_lanes32x16_to_f32t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(n
             dst[(k + 2u) * p.dst_row + n] = q.z;
             dst[(k + 3u) * p.dst_row + n] = q.w;
         }
-    }
-}
-
-// One work item = one element: dst[k * dst_row + n] = B[n, k].
-@compute @workgroup_size(64)
-fn f32_nt_t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let step = nwg.x * 64u;
-    for (var i = g.x; i < p.count; i += step) {
-        let n = i / p.k;
-        let k = i % p.k;
-        dst[k * p.dst_row + n] = bitcast<f32>(src[n * p.src_wpr + k]);
     }
 }
 

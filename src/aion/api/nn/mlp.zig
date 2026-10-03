@@ -103,8 +103,8 @@ pub const GatedMLP = struct {
 
         // The two halves are multiplied elementwise, so a width mismatch is a wiring
         // error that would otherwise surface as a confusing shape failure downstream.
-        const ffn = lastDim(bld, gate.w) orelse return error.InvalidArgument;
-        if (ffn == 0 or (lastDim(bld, up.w) orelse 0) != ffn) return error.InvalidArgument;
+        const ffn = outFeatures(bld, gate.w) orelse return error.InvalidArgument;
+        if (ffn == 0 or (outFeatures(bld, up.w) orelse 0) != ffn) return error.InvalidArgument;
 
         return .{ .gate = gate, .up = up, .down = down, .act = opts.act, .id = id };
     }
@@ -150,7 +150,7 @@ pub const GLU = struct {
         defer bld.endScope(scope);
 
         const proj = try Linear.bind(bld, p.child(Weights, .proj), .{});
-        const total: usize = lastDim(bld, proj.w) orelse return error.InvalidArgument;
+        const total: usize = outFeatures(bld, proj.w) orelse return error.InvalidArgument;
         if (total == 0 or total % 2 != 0) return error.InvalidArgument;
 
         return .{ .proj = proj, .half = total / 2, .id = id };
@@ -167,9 +167,9 @@ pub const GLU = struct {
     }
 };
 
-fn lastDim(bld: *Builder, ref: TensorRef) ?usize {
-    const shape = bld.knownShape(ref) orelse return null;
-    if (shape.len == 0) return null;
-    return shape[shape.len - 1];
+/// A `Linear`'s output width: the rows of its `[out, in]` weight.
+fn outFeatures(bld: *Builder, w: TensorRef) ?usize {
+    const shape = bld.knownShape(w) orelse return null;
+    if (shape.len != 2) return null;
+    return shape[0];
 }
-

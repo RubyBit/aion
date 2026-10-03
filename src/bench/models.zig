@@ -521,7 +521,7 @@ pub fn gemma4E2BDecode(
     if (opts.head) {
         // Tied head: contract against the embedding table's rows, reusing the very
         // parameter the gather bound rather than a second copy of the table.
-        const logits = try g.addMatMulNT(x, embed_table, 1.0, 0.0);
+        const logits = try g.addMatMul(x, try g.addViewTranspose2D(embed_table), 1.0, 0.0);
         const capped = try ctx.scaled(
             try g.addUnary(.tanh, try ctx.scaled(logits, 1.0 / G4.final_logit_softcap)),
             G4.final_logit_softcap,

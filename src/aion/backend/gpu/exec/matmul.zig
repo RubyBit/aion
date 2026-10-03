@@ -177,6 +177,9 @@ pub const Matmul = struct {
     /// The fastest conv kernel per conv shape (see `conv.zig`), kept apart from
     /// `tune` so a conv never reuses a GEMM's choice for the same dims.
     conv_tune: autotune.Cache,
+    /// The GEMM over a B stored as rows (`execRowsB`), and its choice per shape.
+    generated_rows: []const Generated,
+    rows_tune: autotune.Cache,
 
     /// Pooled f32 scratch holding a dequantized B [k, n] for the q8_0-B GEMM path.
     /// Grows monotonically; freed in `deinit`.
@@ -187,11 +190,21 @@ pub const Matmul = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const generated = configs.generate(arena.allocator());
         const generated_conv = configs.generateConv(arena.allocator());
-        return .{ .tune = autotune.Cache.init(allocator), .conv_tune = autotune.Cache.init(allocator), .arena = arena, .generated = generated, .generated_conv = generated_conv };
+        const generated_rows = configs.generateRows(arena.allocator());
+        return .{
+            .tune = autotune.Cache.init(allocator),
+            .conv_tune = autotune.Cache.init(allocator),
+            .rows_tune = autotune.Cache.init(allocator),
+            .arena = arena,
+            .generated = generated,
+            .generated_conv = generated_conv,
+            .generated_rows = generated_rows,
+        };
     }
     pub fn deinit(self: *Matmul) void {
         self.tune.deinit();
         self.conv_tune.deinit();
+        self.rows_tune.deinit();
         self.arena.deinit();
         if (self.dq_scratch) |s| fns.wgpuBufferRelease(s);
     }
@@ -344,6 +357,59 @@ pub const Matmul = struct {
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ context.ceilDiv(n_dim, gen.cfg.bn), gy, 1 });
     }
 
+    /// `C[:, c_off ..] = alpha * A[m, k] @ Bᵀ + beta * C` for an f32 B held as `n`
+    /// rows of `k` (a `MatMulNT`'s weight, or one chunk of it): the GEMM staging B
+    /// transposed, autotuned per shape like `exec`'s, so no transposed copy of B
+    /// is made.
+    pub fn execRowsB(self: *Matmul, ctx: Ctx, frame: *Frame, op: RowsB) ExecuteProgramError!void {
+        const idx = try self.chooseRowsConfig(ctx, op);
+        const gen = self.generated_rows[idx];
+        try recordRowsB(frame, gen, try ctx.pipes.get(gen.desc, gen.entry), op);
+    }
+
+    fn chooseRowsConfig(self: *Matmul, ctx: Ctx, op: RowsB) ExecuteProgramError!usize {
+        const g: Gemm = .{ .m = op.m, .n = op.n, .k = op.k, .batch = 1, .a_batch = 0, .b_batch = 0 };
+        const row_bytes: isize = @intCast(@as(u64, op.k) * @sizeOf(f32));
+        const TuneCtx = struct {
+            ctx: Ctx,
+            op: RowsB,
+            g: Gemm,
+            row_bytes: isize,
+            generated: []const Generated,
+
+            pub fn eligible(t: @This(), idx: usize) bool {
+                const cfg = t.generated[idx].cfg;
+                return blockAligned(cfg, t.g) and eligibleConfig(cfg, t.ctx.gpu.limits, t.row_bytes, t.row_bytes);
+            }
+            pub fn timeNs(t: @This(), idx: usize) ?u64 {
+                const gen = t.generated[idx];
+                const built = t.ctx.pipes.get(gen.desc, gen.entry) catch return null;
+                const Rec = struct {
+                    gen: Generated,
+                    built: pipelines.Built,
+                    op: RowsB,
+                    pub fn record(r: @This(), f: *Frame) ExecuteProgramError!void {
+                        return recordRowsB(f, r.gen, r.built, r.op);
+                    }
+                };
+                var best: ?u64 = null;
+                for (0..2) |_| {
+                    const ns = timeFrames(t.ctx, Rec{ .gen = gen, .built = built, .op = t.op }) catch return null;
+                    if (best == null or ns < best.?) best = ns;
+                }
+                return best;
+            }
+        };
+        const tctx = TuneCtx{ .ctx = ctx, .op = op, .g = g, .row_bytes = row_bytes, .generated = self.generated_rows };
+        // Tuning re-runs the product on the real C (see `chooseConfig`), so an
+        // accumulating one takes the first eligible config untimed.
+        if (op.beta != 0.0) {
+            for (0..self.generated_rows.len) |i| if (tctx.eligible(i)) return i;
+            return error.Unsupported;
+        }
+        return autotune.pickBest(&self.rows_tune, autotune.shapeKey(g.m, g.n, g.k), self.generated_rows.len, tctx) orelse error.Unsupported;
+    }
+
     /// Per-shape autotune over `configs.generated`: benchmark each eligible config
     /// on-device once per `(m, n, k)` and cache the fastest.
     fn chooseConfig(self: *Matmul, ctx: Ctx, s: StepMatMul, g: Gemm) ExecuteProgramError!usize {
@@ -453,11 +519,27 @@ fn recordGemm(ctx: Ctx, frame: *Frame, s: StepMatMul, gen: Generated, built: pip
 /// Time `TUNE_ITERS` recomputations of `g` with config `gen` (own throwaway frames
 /// + a single device sync), returning total nanoseconds.
 fn timeConfig(ctx: Ctx, s: StepMatMul, gen: Generated, built: pipelines.Built, g: Gemm) ExecuteProgramError!u64 {
+    const Rec = struct {
+        ctx: Ctx,
+        s: StepMatMul,
+        gen: Generated,
+        built: pipelines.Built,
+        g: Gemm,
+        pub fn record(r: @This(), f: *Frame) ExecuteProgramError!void {
+            return recordGemm(r.ctx, f, r.s, r.gen, r.built, r.g);
+        }
+    };
+    return timeFrames(ctx, Rec{ .ctx = ctx, .s = s, .gen = gen, .built = built, .g = g });
+}
+
+/// Time `TUNE_ITERS` frames of `rec.record` after one warm-up (own throwaway
+/// frames + a single device sync), returning total nanoseconds.
+fn timeFrames(ctx: Ctx, rec: anytype) ExecuteProgramError!u64 {
     const TUNE_ITERS = 24;
     {
         var f = try Frame.init(ctx.allocator, ctx.gpu);
         defer f.deinit();
-        try recordGemm(ctx, &f, s, gen, built, g);
+        try rec.record(&f);
         f.submit();
     }
     syncDevice(ctx);
@@ -466,9 +548,38 @@ fn timeConfig(ctx: Ctx, s: StepMatMul, gen: Generated, built: pipelines.Built, g
     while (t < TUNE_ITERS) : (t += 1) {
         var f = try Frame.init(ctx.allocator, ctx.gpu);
         defer f.deinit();
-        try recordGemm(ctx, &f, s, gen, built, g);
+        try rec.record(&f);
         f.submit();
     }
     syncDevice(ctx);
     return autotune.nowNs() - start;
+}
+
+/// One `execRowsB` product: its bound buffers and dims. `n` is B's rows here (a
+/// chunk's, when B is chunked); C's rows are `c_row` apart and this chunk's
+/// columns start `c_off` in.
+pub const RowsB = struct {
+    a: c.WGPUBuffer,
+    a_len: u64,
+    b: c.WGPUBuffer,
+    b_len: u64,
+    c: c.WGPUBuffer,
+    c_len: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    c_row: u32,
+    c_off: u32,
+    alpha: f32,
+    beta: f32,
+};
+
+fn recordRowsB(frame: *Frame, gen: Generated, built: pipelines.Built, op: RowsB) ExecuteProgramError!void {
+    const params: MatMulParams = .{ .m = op.m, .n = op.n, .k = op.k, .a_row = op.k, .b_row = op.k, .c_row = op.c_row, .alpha = op.alpha, .beta = op.beta, .c_off = op.c_off };
+    const gx = context.ceilDiv(op.n, gen.cfg.bn);
+    const gy = context.ceilDiv(op.m, gen.cfg.bm);
+    if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) return error.Unsupported;
+    const bufs = [_]c.WGPUBuffer{ op.a, op.b, op.c };
+    const sizes = [_]u64{ op.a_len, op.b_len, op.c_len };
+    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ gx, gy, 1 });
 }

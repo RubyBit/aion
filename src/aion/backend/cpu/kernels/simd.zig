@@ -51,6 +51,52 @@ pub inline fn storeAligned(comptime V: type, ptr: anytype, comptime alignment: c
     elems.* = value;
 }
 
+/// Write `nr` rows of `rows` (row `first` on, each `ldb` elements apart) into a GEMM
+/// B panel `width` columns wide, as its first `kc` panel rows: element `(k, j)` lands
+/// at `panel[k * width + j]`. The transpose goes a 4x4 block at a time through
+/// registers, so each row is read, and each panel row written, a whole vector at a
+/// time. Columns `nr .. width` are zeroed, as the column packers leave them.
+pub fn transposeRowsIntoPanel(comptime width: usize, panel: []f32, kc: usize, nr: usize, rows: []align(1) const f32, ldb: usize, first: usize) void {
+    const V = @Vector(4, f32);
+    var j: usize = 0;
+    while (j + 4 <= nr) : (j += 4) {
+        const base = (first + j) * ldb;
+        var k: usize = 0;
+        while (k + 4 <= kc) : (k += 4) {
+            const cols = transpose4(.{
+                load(V, rows[base + k ..].ptr),
+                load(V, rows[base + ldb + k ..].ptr),
+                load(V, rows[base + 2 * ldb + k ..].ptr),
+                load(V, rows[base + 3 * ldb + k ..].ptr),
+            });
+            inline for (cols, 0..) |col, q| store(V, panel[(k + q) * width + j ..].ptr, col);
+        }
+        while (k < kc) : (k += 1) {
+            inline for (0..4) |l| panel[k * width + j + l] = rows[base + l * ldb + k];
+        }
+    }
+    while (j < nr) : (j += 1) {
+        for (0..kc) |k| panel[k * width + j] = rows[(first + j) * ldb + k];
+    }
+    if (nr < width) {
+        for (0..kc) |k| @memset(panel[k * width + nr .. (k + 1) * width], 0.0);
+    }
+}
+
+/// Four rows of four as four columns of four.
+inline fn transpose4(r: [4]@Vector(4, f32)) [4]@Vector(4, f32) {
+    const lo01 = @shuffle(f32, r[0], r[1], [4]i32{ 0, -1, 1, -2 });
+    const hi01 = @shuffle(f32, r[0], r[1], [4]i32{ 2, -3, 3, -4 });
+    const lo23 = @shuffle(f32, r[2], r[3], [4]i32{ 0, -1, 1, -2 });
+    const hi23 = @shuffle(f32, r[2], r[3], [4]i32{ 2, -3, 3, -4 });
+    return .{
+        @shuffle(f32, lo01, lo23, [4]i32{ 0, 1, -1, -2 }),
+        @shuffle(f32, lo01, lo23, [4]i32{ 2, 3, -3, -4 }),
+        @shuffle(f32, hi01, hi23, [4]i32{ 0, 1, -1, -2 }),
+        @shuffle(f32, hi01, hi23, [4]i32{ 2, 3, -3, -4 }),
+    };
+}
+
 /// The array a vector type's elements occupy in memory.
 fn Elems(comptime V: type) type {
     const info = @typeInfo(V).vector;

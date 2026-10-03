@@ -45,6 +45,9 @@ pub const F32Kernels = struct {
     scratch_alignment: usize,
 
     pack_b_tile: *const fn (scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void,
+    /// `pack_b_tile` for a B stored as rows (`[N, K]`, rows `ldb` apart): the same
+    /// packed tile, so a matmul against Bᵀ runs the same kernel.
+    pack_b_tile_rows: *const fn (scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void,
     pack_a_tile: *const fn (k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) types.BackendError!void,
     pack_b_tile_f16_to_packed_f32: *const fn (packed_b: []align(32) f32, k: usize, n: usize, ldb: usize, b_bytes: []const u8) types.BackendError!void,
     pack_a_tile_f16_to_packed_f32: *const fn (packed_a_out: []align(32) f32, m: usize, k: usize, a_bytes: []const u8) types.BackendError!void,
@@ -74,6 +77,7 @@ pub fn smeKernels(comptime kc: usize, comptime mc: usize, comptime nc: usize, co
         .scratch_bytes = K.scratchBytes(),
         .scratch_alignment = K.ScratchAlignment,
         .pack_b_tile = K.packBTileF32,
+        .pack_b_tile_rows = K.packBTileF32Rows,
         .pack_a_tile = K.packATileF32,
         .pack_b_tile_f16_to_packed_f32 = K.packBTileF16ToPackedF32,
         .pack_a_tile_f16_to_packed_f32 = K.packATileF16ToPackedF32,
@@ -111,6 +115,7 @@ fn kernelsFor(comptime t: Tuning) F32Kernels {
         .scratch_bytes = K.scratchBytes(),
         .scratch_alignment = K.ScratchAlignment,
         .pack_b_tile = K.packBTileF32,
+        .pack_b_tile_rows = K.packBTileF32Rows,
         .pack_a_tile = K.packATileF32,
         .pack_b_tile_f16_to_packed_f32 = K.packBTileF16ToPackedF32,
         .pack_a_tile_f16_to_packed_f32 = K.packATileF16ToPackedF32,

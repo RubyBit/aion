@@ -9,10 +9,11 @@
 //! Two regimes, split on M:
 //!   - M == 1 (decode): bandwidth-bound matvec — `kernels/matmul_nt_gemv.wgsl`
 //!     reads B exactly once (dequant-in-registers for q8_0).
-//!   - M > 1 (prefill): compute-bound — a dequant/transpose pass materializes
-//!     the B chunk as f32 [K, n] in a pooled scratch buffer, then the existing
-//!     autotuned f32 GEMM pipeline runs on it. Scratch is reused across chunks;
-//!     the frame's compute-pass ordering serializes dequant(i+1) after gemm(i).
+//!   - M > 1 (prefill): compute-bound. An f32 B runs the autotuned GEMM that
+//!     stages B from its rows (`Matmul.execRowsB`), so nothing is copied. A q8_0
+//!     B is dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM
+//!     runs on it. Scratch is reused across chunks; the frame's compute-pass
+//!     ordering serializes dequant(i+1) after gemm(i).
 //!
 //! q8_0 path requires K % 64 == 0 (whole word-aligned block pairs per row —
 //! see the kernel headers); other shapes fall back to `error.Unsupported`.
@@ -88,7 +89,7 @@ pub const MatmulNt = struct {
         return buf;
     }
 
-    pub fn exec(self: *MatmulNt, ctx: Ctx, frame: *Frame, s: executable.StepMatMulNT, generated: []const Generated) ExecuteProgramError!void {
+    pub fn exec(self: *MatmulNt, ctx: Ctx, frame: *Frame, s: executable.StepMatMulNT, mm: *matmul_exec.Matmul) ExecuteProgramError!void {
         const hs = ctx.store;
         const c_meta = hs.meta(s.c) catch return error.ExecutionFailed;
         const a_meta = hs.meta(s.a) catch return error.ExecutionFailed;
@@ -99,7 +100,6 @@ pub const MatmulNt = struct {
         if (b_meta.rank != 2) return error.Unsupported;
 
         const k = std.math.cast(u32, b_meta.shape[1]) orelse return error.Unsupported;
-        if (k % 4 != 0) return error.Unsupported; // vec4 A reads in every path
         const lanes = b_meta.block_order == block_order;
         if (b_meta.block_order != .row_major and !lanes) return error.Unsupported;
         // Row-major q8 rows are walked in word-aligned block pairs; `lanes32x16`
@@ -144,10 +144,28 @@ pub const MatmulNt = struct {
 
             if (lanes and n_count % LANES_W != 0) return error.Unsupported;
             const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32x16 else .q8_pairs;
-            if (m_total == 1) {
+            // The GEMV reads A as vec4s; an f32 B of any other K takes the GEMM,
+            // whose scalar config reads any.
+            if (m_total == 1 and k % 4 == 0) {
                 try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, c_off, form);
+            } else if (form == .f32) {
+                try mm.execRowsB(ctx, frame, .{
+                    .a = ctx.devmem.bufferFor(da.handle).?,
+                    .a_len = da.len,
+                    .b = ctx.devmem.bufferFor(db.handle).?,
+                    .b_len = db.len,
+                    .c = ctx.devmem.bufferFor(dc.handle).?,
+                    .c_len = dc.len,
+                    .m = m_total,
+                    .n = n_count,
+                    .k = k,
+                    .c_row = c_row,
+                    .c_off = c_off,
+                    .alpha = s.alpha,
+                    .beta = s.beta,
+                });
             } else {
-                try self.recordDequantGemm(ctx, frame, s, generated, da, db, dc, m_total, c_row, c_off, k, n_count, b_wpr, form);
+                try self.recordDequantGemm(ctx, frame, s, mm.generated, da, db, dc, m_total, c_row, c_off, k, n_count, b_wpr, form);
             }
         }
         if (n0 != n_total) return error.Unsupported; // chunks did not cover B
@@ -206,7 +224,7 @@ pub const MatmulNt = struct {
         b_wpr: u32,
         form: BForm,
     ) ExecuteProgramError!void {
-        // 1) Dequant/transpose the B chunk into scratch as f32 [K, n_count].
+        // 1) Dequantize the B chunk into scratch as f32 [K, n_count].
         const scratch_bytes = @as(u64, k) * n_count * 4;
         if (!context.storageBindingFits(ctx, scratch_bytes)) return error.Unsupported;
         const scratch = try self.ensureScratch(ctx, scratch_bytes);
@@ -214,12 +232,12 @@ pub const MatmulNt = struct {
         const count: u32 = switch (form) {
             .q8_pairs => n_count * (k / 64),
             .q8_lanes32x16 => n_count * (k / Q8_BLOCK_ELEMS),
-            .f32 => n_count * k,
+            .f32 => unreachable, // `Matmul.execRowsB`
         };
         const dq_built = try ctx.pipes.get(dequant_kernel, switch (form) {
             .q8_pairs => "q8_nt_to_f32t",
             .q8_lanes32x16 => "q8_lanes32x16_to_f32t",
-            .f32 => "f32_nt_t",
+            .f32 => unreachable,
         });
         const dq_bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(db.handle).?, scratch };
         const dq_sizes = [_]u64{ db.len, scratch_bytes };

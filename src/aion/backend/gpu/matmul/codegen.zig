@@ -22,6 +22,9 @@
 //! so `validate` still fires `@compileError` on a bad config.
 //!
 //! Computes C[i,j] = alpha * sum_k A[i,k]*B[k,j] + beta * C[i,j] over one tile.
+//! With `b_rows`, B is stored as its rows instead, `[N, K]` (a `MatMulNT`'s), and
+//! the staging transposes it: the tile in shared memory, and everything after it,
+//! is the same.
 
 const std = @import("std");
 const pipelines = @import("../pipelines.zig");
@@ -55,6 +58,7 @@ pub const MatmulConfig = struct {
     vec4_load: bool, // bind A/B as array<vec4<f32>> (true 128-bit loads)
     double_buffer: bool = false, // prefetch next K-slab into registers during compute
     bounds_check: bool = true, // guard edge tiles/partial K slabs
+    b_rows: bool = false, // B is [N, K]: staged 4 rows x 4 k at a time, transposed in registers
 
     pub fn threads(cfg: MatmulConfig) u32 {
         return (cfg.bm / cfg.tm) * (cfg.bn / cfg.tn);
@@ -75,7 +79,13 @@ pub const MatmulConfig = struct {
         return (cfg.aVecs() + cfg.threads() - 1) / cfg.threads();
     }
     fn bRegs(cfg: MatmulConfig) u32 {
-        return (cfg.bVecs() + cfg.threads() - 1) / cfg.threads();
+        return (cfg.bUnits() + cfg.threads() - 1) / cfg.threads();
+    }
+    /// What one thread stages of B per step: a vec4 of a row of `[K, N]`, or for
+    /// `b_rows` a 4x4 block (four rows of `[N, K]`, four k each), so shared memory
+    /// still takes whole vec4s.
+    fn bUnits(cfg: MatmulConfig) u32 {
+        return if (cfg.b_rows) cfg.bVecs() / 4 else cfg.bVecs();
     }
 };
 
@@ -92,13 +102,21 @@ fn validate(comptime cfg: MatmulConfig) void {
     if ((cfg.bm * cfg.bk) % nt != 0) @compileError("bm*bk not divisible by thread count");
     if ((cfg.bk * cfg.bn) % nt != 0) @compileError("bk*bn not divisible by thread count");
     if (sharedBytes(cfg) > MAX_SHARED_BYTES) @compileError("shared memory exceeds MAX_SHARED_BYTES");
+    if (cfg.b_rows and cfg.kind == .conv) @compileError("a conv's B is its weight, [K, N]");
 }
 
 pub fn entryName(comptime cfg: MatmulConfig) [:0]const u8 {
-    return std.fmt.comptimePrint("{s}_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}", .{
+    return std.fmt.comptimePrint("{s}_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}{s}", .{
         if (cfg.kind == .conv) "cv" else "mm",
-        cfg.bm,                          cfg.bn,                               cfg.bk,                              cfg.tm, cfg.tn,
-        if (cfg.vec4_load) "v" else "s", if (cfg.double_buffer) "_db" else "", if (cfg.bounds_check) "" else "_nb",
+        cfg.bm,
+        cfg.bn,
+        cfg.bk,
+        cfg.tm,
+        cfg.tn,
+        if (cfg.vec4_load) "v" else "s",
+        if (cfg.double_buffer) "_db" else "",
+        if (cfg.bounds_check) "" else "_nb",
+        if (cfg.b_rows) "_bt" else "",
     });
 }
 
@@ -119,6 +137,19 @@ fn bVec4(cfg: MatmulConfig) []const u8 {
         "b[(b_base + gk * b_row + gc) / 4u]"
     else
         "vec4<f32>(b[b_base + gk * b_row + gc], b[b_base + gk * b_row + gc + 1u], b[b_base + gk * b_row + gc + 2u], b[b_base + gk * b_row + gc + 3u])";
+}
+/// WGSL for the vec4 of `[N, K]` row `gc + l` at k `gk .. gk + 3` (`b_rows`).
+fn bRowVec4(w: *Wgsl, cfg: MatmulConfig, l: u32) []const u8 {
+    return if (cfg.vec4_load)
+        w.fmt("b[(b_base + (gc + {d}u) * b_row + gk) / 4u]", .{l})
+    else
+        w.fmt("vec4<f32>(b[b_base + (gc + {d}u) * b_row + gk], b[b_base + (gc + {d}u) * b_row + gk + 1u], b[b_base + (gc + {d}u) * b_row + gk + 2u], b[b_base + (gc + {d}u) * b_row + gk + 3u])", .{ l, l, l, l });
+}
+fn bRowScalar(w: *Wgsl, cfg: MatmulConfig, l: u32, off: u32) []const u8 {
+    return if (cfg.vec4_load)
+        w.fmt("b[(b_base + (gc + {d}u) * b_row + gk + {d}u) / 4u][(b_base + (gc + {d}u) * b_row + gk + {d}u) % 4u]", .{ l, off, l, off })
+    else
+        w.fmt("b[b_base + (gc + {d}u) * b_row + gk + {d}u]", .{ l, off });
 }
 /// WGSL for a single A scalar at column offset `off` (per-lane edge fallback).
 fn aScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
@@ -314,6 +345,44 @@ fn coopLoadB(w: *Wgsl, cfg: MatmulConfig) void {
     }
 }
 
+/// `coopLoadB` for `b_rows`: unit `vi` is four rows of B (`gc ..`) by four k
+/// (`gk ..`), read as one vec4 per row and stored as one vec4 per k, so no two
+/// threads write parts of one vector. Adjacent threads take adjacent k, so a
+/// row's run is read by neighbours.
+fn coopLoadBRows(w: *Wgsl, cfg: MatmulConfig) void {
+    rowsUnitIndex(w, cfg, "vi", "k0");
+    for (0..4) |l| {
+        w.line("var r{d} = vec4<f32>(0.0);", .{l});
+        loadRow(w, cfg, w.fmt("r{d}", .{l}), @intCast(l));
+    }
+    for (0..4) |j| w.line("Bs[(kq * 4u + {d}u) * {d}u + c4 / 4u] = vec4<f32>(r0.{s}, r1.{s}, r2.{s}, r3.{s});", .{ j, cfg.bn / 4, swiz[j], swiz[j], swiz[j], swiz[j] });
+}
+
+/// The block a `b_rows` unit `idx` covers, for the slab at `k_expr`: `kq`/`c4` in
+/// the tile, `gk`/`gc` in B.
+fn rowsUnitIndex(w: *Wgsl, cfg: MatmulConfig, idx: []const u8, k_expr: []const u8) void {
+    const kpv = cfg.bk / 4;
+    w.line("let kq = {s} % {d}u; let c4 = ({s} / {d}u) * 4u;", .{ idx, kpv, idx, kpv });
+    w.line("let gk = {s} + kq * 4u; let gc = block_col + c4;", .{k_expr});
+}
+
+/// Read `[N, K]` row `gc + l` at `gk .. gk + 3` into `reg`, zero past B's edges.
+fn loadRow(w: *Wgsl, cfg: MatmulConfig, reg: []const u8, l: u32) void {
+    if (!cfg.bounds_check) {
+        w.line("{s} = {s};", .{ reg, bRowVec4(w, cfg, l) });
+        return;
+    }
+    w.open("if (gc + {d}u < N && gk + 3u < K)", .{l});
+    w.line("{s} = {s};", .{ reg, bRowVec4(w, cfg, l) });
+    w.otherwise();
+    for (0..4) |off| {
+        w.open("if (gc + {d}u < N && gk + {d}u < K)", .{ l, off });
+        w.line("{s}.{s} = {s};", .{ reg, swiz[off], bRowScalar(w, cfg, l, @intCast(off)) });
+        w.close();
+    }
+    w.close();
+}
+
 /// Emit `body` so all `count` vec4s get staged by `nt` threads. Straight-line when
 /// count == nt (a 1-iteration loop is not elided by Naga and halves throughput); a
 /// single guarded pass when count < nt; else a strided loop.
@@ -353,7 +422,7 @@ fn kLoopSingle(w: *Wgsl, cfg: MatmulConfig) void {
     w.lit("break;");
     w.close();
     loadWrap(w, cfg, cfg.aVecs(), coopLoadA);
-    loadWrap(w, cfg, cfg.bVecs(), coopLoadB);
+    if (cfg.b_rows) loadWrap(w, cfg, cfg.bUnits(), coopLoadBRows) else loadWrap(w, cfg, cfg.bVecs(), coopLoadB);
     w.lit("workgroupBarrier();");
     computeBlock(w, cfg);
     w.line("workgroupBarrier(); k0 += {d}u;", .{cfg.bk});
@@ -364,7 +433,13 @@ fn kLoopSingle(w: *Wgsl, cfg: MatmulConfig) void {
 /// while computing the one already staged in shared, hiding global-load latency.
 fn kLoopDouble(w: *Wgsl, cfg: MatmulConfig) void {
     for (0..cfg.aRegs()) |j| w.line("var apre{d} = vec4<f32>(0.0);", .{j});
-    for (0..cfg.bRegs()) |j| w.line("var bpre{d} = vec4<f32>(0.0);", .{j});
+    for (0..cfg.bRegs()) |j| {
+        if (!cfg.b_rows) {
+            w.line("var bpre{d} = vec4<f32>(0.0);", .{j});
+            continue;
+        }
+        for (0..4) |l| w.line("var bpre{d}_{d} = vec4<f32>(0.0);", .{ j, l });
+    }
     // Prologue: prefetch slab 0 into registers, store to shared.
     prefetch(w, cfg, "0u");
     storeShared(w, cfg);
@@ -401,6 +476,7 @@ fn prefetch(w: *Wgsl, cfg: MatmulConfig, k_expr: []const u8) void {
         w.close();
         w.close();
     }
+    if (cfg.b_rows) return prefetchRows(w, cfg, k_expr);
     for (0..cfg.bRegs()) |j| {
         w.openBlock();
         w.line("let vj = lidx + {d}u;", .{j * nt});
@@ -410,6 +486,20 @@ fn prefetch(w: *Wgsl, cfg: MatmulConfig, k_expr: []const u8) void {
         prefetchOne(w, cfg, w.fmt("bpre{d}", .{j}), bVec4(cfg), .b);
         w.otherwise();
         w.line("bpre{d} = vec4<f32>(0.0);", .{j});
+        w.close();
+        w.close();
+    }
+}
+
+/// `prefetch`'s B half for `b_rows`: each unit's four row vec4s into `bpre{j}_{l}`.
+fn prefetchRows(w: *Wgsl, cfg: MatmulConfig, k_expr: []const u8) void {
+    for (0..cfg.bRegs()) |j| {
+        w.openBlock();
+        w.line("let vj = lidx + {d}u;", .{j * cfg.threads()});
+        for (0..4) |l| w.line("bpre{d}_{d} = vec4<f32>(0.0);", .{ j, l });
+        w.open("if (vj < {d}u)", .{cfg.bUnits()});
+        rowsUnitIndex(w, cfg, "vj", k_expr);
+        for (0..4) |l| loadRow(w, cfg, w.fmt("bpre{d}_{d}", .{ j, l }), @intCast(l));
         w.close();
         w.close();
     }
@@ -454,8 +544,13 @@ fn storeShared(w: *Wgsl, cfg: MatmulConfig) void {
     for (0..cfg.bRegs()) |j| {
         w.openBlock();
         w.line("let vj = lidx + {d}u;", .{j * nt});
-        w.open("if (vj < {d}u)", .{cfg.bVecs()});
-        w.line("Bs[vj] = bpre{d};", .{j});
+        w.open("if (vj < {d}u)", .{cfg.bUnits()});
+        if (cfg.b_rows) {
+            w.line("let kq = vj % {d}u; let c4 = (vj / {d}u) * 4u;", .{ kpv, kpv });
+            for (0..4) |q| w.line("Bs[(kq * 4u + {d}u) * {d}u + c4 / 4u] = vec4<f32>(bpre{d}_0.{s}, bpre{d}_1.{s}, bpre{d}_2.{s}, bpre{d}_3.{s});", .{ q, cfg.bn / 4, j, swiz[q], j, swiz[q], j, swiz[q], j, swiz[q] });
+        } else {
+            w.line("Bs[vj] = bpre{d};", .{j});
+        }
         w.close();
         w.close();
     }
@@ -526,4 +621,3 @@ pub fn gen(arena: std.mem.Allocator, comptime cfg: MatmulConfig) Generated {
 
 // The config MENU lives in configs.zig — tuning policy, kept separate from this
 // codegen mechanism. The backend renders each config's WGSL once at init.
-

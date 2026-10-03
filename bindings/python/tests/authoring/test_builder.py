@@ -23,7 +23,7 @@ def ctx():
 
 
 def test_linear_relu_compile_matches_numpy(ctx):
-    w = (np.arange(12, dtype=np.float32).reshape(4, 3) * 0.5) - 2.0
+    w = (np.arange(12, dtype=np.float32).reshape(3, 4) * 0.5) - 2.0  # [out, in]
 
     class Net(nn.Module):
         def __init__(self):
@@ -35,7 +35,7 @@ def test_linear_relu_compile_matches_numpy(ctx):
     model = aion.compile(Net(), aion.spec((1, 4)), ctx=ctx)
     xv = np.array([[2.0, -1.0, 0.5, 3.0]], dtype=np.float32)
     got = model.run({"x": xv})["output0"]
-    ref = np.maximum(xv @ w, 0.0)
+    ref = np.maximum(xv @ w.T, 0.0)
     assert np.allclose(got, ref, atol=1e-5)
 
 
@@ -55,7 +55,7 @@ def test_operator_overloading(ctx):
 
 def test_q8_linear_within_tolerance(ctx):
     K, N = 64, 8
-    w = ((np.arange(K * N, dtype=np.float32).reshape(K, N) % 7) - 3) * 0.05
+    w = ((np.arange(K * N, dtype=np.float32).reshape(N, K) % 7) - 3) * 0.05  # [out, in]
 
     class Net(nn.Module):
         def __init__(self):
@@ -67,7 +67,7 @@ def test_q8_linear_within_tolerance(ctx):
     model = aion.compile(Net(), aion.spec((1, K)), ctx=ctx)
     xv = ((np.arange(K, dtype=np.float32) % 5) - 2) * 0.1
     got = model.run({"x": xv.reshape(1, K)})["output0"]
-    ref = xv.reshape(1, K) @ w
+    ref = xv.reshape(1, K) @ w.T
     relerr = np.max(np.abs(got - ref)) / (np.max(np.abs(ref)) + 1e-9)
     assert relerr < 0.02  # 8-bit block quantization
 

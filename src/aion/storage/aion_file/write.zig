@@ -402,10 +402,6 @@ fn encodeNodeOp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node: Nod
         .Cast => |ct| {
             try appendInt(out, allocator, u8, @backingInt(ct.to_dtype));
         },
-        .MatMulNT => |mm| {
-            try appendInt(out, allocator, f32, mm.alpha);
-            try appendInt(out, allocator, f32, mm.beta);
-        },
         .If => |iff| {
             try appendInt(out, allocator, u32, iff.then_region);
             try appendInt(out, allocator, u32, iff.else_region);

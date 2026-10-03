@@ -121,7 +121,7 @@ test "storage: swap carries heterogeneous host and device backings without copie
     try std.testing.expectEqualSlices(f32, &device_vals, &got_device);
 }
 
-test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
+test "storage file: cast and matmul nodes roundtrip through write/parse" {
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pkg = package_file.Package{
@@ -139,7 +139,7 @@ test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
     };
     defer pkg.deinit();
 
-    // Values: x[3,4] f32, w[5,4] q8_0, cast_out[3,4] f16, mm_out[3,5] f32, dummy public-input-2 f32 for two-input signature.
+    // Values: x[3,4] f32, w[4,5] q8_0, cast_out[3,4] f16, mm_out[3,5] f32, dummy public-input-2 f32 for two-input signature.
     pkg.values[0] = .{
         .dtype = .f32,
         .rank = 2,
@@ -150,7 +150,7 @@ test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
         .dtype = .q8_0,
         .rank = 2,
         .source = .public_input,
-        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 5, 4 }),
+        .shape_terms = try package_file.makeConstantShapeTerms(allocator, &[_]usize{ 4, 5 }),
     };
     pkg.values[2] = .{
         .dtype = .f16,
@@ -179,7 +179,7 @@ test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
     pkg.nodes[1] = .{
         .inputs = try allocator.dupe(u32, &[_]u32{ 0, 1 }),
         .output = 3,
-        .op = .{ .MatMulNT = .{ .alpha = 1.25, .beta = 0.5 } },
+        .op = .{ .MatMul = .{ .alpha = 1.25, .beta = 0.5 } },
     };
     pkg.inputs[0] = .{ .name = try allocator.dupe(u8, "x"), .value = 0 };
     pkg.inputs[1] = .{ .name = try allocator.dupe(u8, "w"), .value = 1 };
@@ -208,7 +208,7 @@ test "storage file: cast and matmul_nt nodes roundtrip through write/parse" {
         else => return error.TestUnexpectedResult,
     }
     switch (parsed.nodes[1].op) {
-        .MatMulNT => |mm| {
+        .MatMul => |mm| {
             try std.testing.expectEqual(@as(f32, 1.25), mm.alpha);
             try std.testing.expectEqual(@as(f32, 0.5), mm.beta);
         },

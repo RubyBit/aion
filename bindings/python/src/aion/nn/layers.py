@@ -54,8 +54,9 @@ class Conv2DOpts(TypedDict):
 
 
 class Linear(Module):
-    """`y = x @ w (+ b)`, with `w` in matmul-B layout `[in, out]`; or, with
-    ``nt=True``, `y = x @ w.T (+ b)` with `w` as `[out, in]`.
+    """`y = x @ w.T (+ b)`, with `w` as `[out, in]`: the layout torch and GGUF
+    store, so a checkpoint's weight binds as it is. The compiler turns the
+    transposed read into a contraction against `w`'s rows; nothing is copied.
 
     Pass ``dtype=aion.q8_0`` to quantize the weight in the core (bias stays float).
     """
@@ -69,12 +70,8 @@ class Linear(Module):
         dtype: DTypeLike = float32,
         alpha: float = 1.0,
         beta: float = 0.0,
-        nt: bool = False,
     ) -> None:
         self._layer_name = name
-        # `nt` is how a tied embedding head is written: one `[vocab, dim]` table
-        # serves both the lookup and the output projection.
-        self.nt = bool(nt)
         self.weight = Parameter(weight, dtype=dtype)
         self.bias = Parameter(bias, dtype=float32) if bias is not None else None
         self.alpha = float(alpha)
@@ -84,7 +81,7 @@ class Linear(Module):
         b = builder_of(x)
         with self._scoped(b):
             w = self.weight.value(b, "weight")
-            y = b.matmul_nt(x, w, self.alpha, self.beta) if self.nt else b.matmul(x, w, self.alpha, self.beta)
+            y = b.matmul(x, w.T, self.alpha, self.beta)
             if self.bias is not None:
                 y = b.add(y, self.bias.value(b, "bias"))
             return y
@@ -93,7 +90,8 @@ class Linear(Module):
 class Embedding(Module):
     """Row lookup into a `[vocab, dim]` table.
 
-    `weight_value` hands the bound table back so a tied output head can reuse it.
+    `weight_value` hands the bound table back so a tied output head can reuse it:
+    `x @ table.T`, the table being `[vocab, dim]` like any `Linear` weight.
     """
 
     def __init__(

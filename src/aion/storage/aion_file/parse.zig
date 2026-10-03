@@ -622,10 +622,6 @@ fn parseNodeOp(allocator: std.mem.Allocator, kind: NodeOpKind, bytes: []const u8
         } },
         .SequenceAppend => .SequenceAppend,
         .Cast => .{ .Cast = .{ .to_dtype = try readEnumCursor(bytes, &cursor, DType) } },
-        .MatMulNT => .{ .MatMulNT = .{
-            .alpha = try readIntCursor(bytes, &cursor, f32),
-            .beta = try readIntCursor(bytes, &cursor, f32),
-        } },
         .ViewReshape => blk: {
             const attr = try readSymbolicAttr(allocator, bytes, &cursor);
             break :blk .{ .ViewReshape = .{ .new_shape = attr.sizes, .free_dims = attr.free_dims } };

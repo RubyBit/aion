@@ -354,7 +354,7 @@ fn buildNt(alloc: std.mem.Allocator, mgr: *StorageManager, target: aion.program.
         try g.bindExternal(bv, b_id);
     }
 
-    const cv = try g.addMatMulNT(av, bv, 1.0, 0.0);
+    const cv = try g.addMatMul(av, try g.addViewTranspose2D(bv), 1.0, 0.0);
     try g.setOutputs(&[_]aion.graph.ValueId{cv});
     const prog = try aion.program.compileGraph(alloc, &g, mgr, target);
     return .{ .prog = prog, .out = prog.outputs[0] };

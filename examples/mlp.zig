@@ -85,7 +85,7 @@ const MLP = struct {
 };
 
 // Weight tensors, laid out for `y = x @ w + b`:
-//   fcN_w: [in, out]   fcN_b: [out]
+//   fcN_w: [out, in]   fcN_b: [out]
 const Weights = struct {
     fc1_w: Tensor,
     fc1_b: Tensor,
@@ -114,11 +114,11 @@ fn buildModel(ctx: *api.Context, weights: Weights, in_dim: usize) !api.Model {
 /// exported `.aion` package (see `silero_vad.zig`).
 fn createSyntheticWeights(ctx: *api.Context, allocator: std.mem.Allocator, opts: ExampleOptions) !Weights {
     return .{
-        .fc1_w = try makeTensor(ctx, allocator, &[_]usize{ opts.in_dim, opts.hidden_dim }, 0.10, 0.20),
+        .fc1_w = try makeTensor(ctx, allocator, &[_]usize{ opts.hidden_dim, opts.in_dim }, 0.10, 0.20),
         .fc1_b = try makeTensor(ctx, allocator, &[_]usize{opts.hidden_dim}, 0.30, 0.05),
         .fc2_w = try makeTensor(ctx, allocator, &[_]usize{ opts.hidden_dim, opts.hidden_dim }, 0.40, 0.20),
         .fc2_b = try makeTensor(ctx, allocator, &[_]usize{opts.hidden_dim}, 0.50, 0.05),
-        .fc_out_w = try makeTensor(ctx, allocator, &[_]usize{ opts.hidden_dim, opts.num_classes }, 0.60, 0.20),
+        .fc_out_w = try makeTensor(ctx, allocator, &[_]usize{ opts.num_classes, opts.hidden_dim }, 0.60, 0.20),
         .fc_out_b = try makeTensor(ctx, allocator, &[_]usize{opts.num_classes}, 0.70, 0.05),
     };
 }

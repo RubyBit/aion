@@ -1712,7 +1712,7 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
     const b_in = try g.addInput(.q8_0, &[_]usize{ n, k });
     try g.bindExternal(a_in, @intCast(a_tid));
     try g.bindExternal(b_in, @intCast(b_tid));
-    const out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
+    const out = try g.addMatMul(a_in, try g.addViewTranspose2D(b_in), 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
     var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());

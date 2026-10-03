@@ -61,6 +61,21 @@ pub fn Kernel(comptime t: Tuning) type {
             }
         }
 
+        /// `packBTileF32` for a B stored as rows, `[N, K]`: the tile's `n` rows are
+        /// `ldb` elements apart and each holds its `k` reduction values in a run.
+        pub fn packBTileF32Rows(scratch_bytes: []u8, k: usize, n: usize, ldb: usize, b_bytes: []const u8) BackendError!void {
+            if (k > KC or n > NC) return BackendError.InvalidArgument;
+            const b: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, b_bytes);
+            if (n > 0 and b.len < (n - 1) * ldb + k) return BackendError.InvalidArgument;
+
+            const s = try splitScratch(scratch_bytes);
+            var jr: usize = 0;
+            while (jr < n) : (jr += NR) {
+                const nr = @min(NR, n - jr);
+                simd.transposeRowsIntoPanel(NR, s.pb[(jr / NR) * (KC * NR) ..][0 .. KC * NR], k, nr, b, ldb, jr);
+            }
+        }
+
         pub fn packATileF32(k: usize, m: usize, a_bytes: []const u8, packed_a_out: []align(32) f32) BackendError!void {
             if (k > KC) return BackendError.InvalidArgument;
             const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
@@ -795,6 +810,42 @@ fn runLaneWidthCase(comptime lanes: usize, m: usize, n: usize, k: usize, alpha: 
             try testing.expect(@abs(got - w) <= tol);
         }
     }
+}
+
+/// Packing `n x k` rows (B stored `[N, K]`, rows `ldb` apart) must give the tile
+/// `packBTileF32` gives for the same B written out `[K, N]`: the GEMM that runs on
+/// it cannot tell them apart. Edge panels and short k included.
+fn packRowsMatchesColumns(comptime K: type) !void {
+    const allocator = std.testing.allocator;
+    const cases = [_][3]usize{ .{ 1, 1, 1 }, .{ 5, 3, 5 }, .{ 3, 5, 7 }, .{ 7, 6, 9 }, .{ 17, 40, 40 }, .{ K.KC, K.NC, K.KC + 3 } };
+    for (cases) |cs| {
+        const k = cs[0];
+        const n = cs[1];
+        const ldb = cs[2];
+        const rows = try allocator.alloc(f32, n * ldb);
+        defer allocator.free(rows);
+        for (rows, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+        const cols = try allocator.alloc(f32, k * n);
+        defer allocator.free(cols);
+        for (0..k) |kk| for (0..n) |j| {
+            cols[kk * n + j] = rows[j * ldb + kk];
+        };
+        const want = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
+        defer allocator.free(want);
+        const got = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(32), K.scratchBytes());
+        defer allocator.free(got);
+        @memset(want, 0xAA);
+        @memset(got, 0xAA);
+        try K.packBTileF32(want, k, n, 0, std.mem.sliceAsBytes(cols));
+        try K.packBTileF32Rows(got, k, n, ldb, std.mem.sliceAsBytes(rows));
+        const pb_bytes = K.KC * K.NC * @sizeOf(f32);
+        try std.testing.expectEqualSlices(u8, want[0..pb_bytes], got[0..pb_bytes]);
+    }
+}
+
+test "matmul f32: a B packed from its rows is the tile packed from its columns" {
+    try packRowsMatchesColumns(Kernel(.{ .mr = 6, .nr = 8, .lanes = 4, .kc = 128, .mc = 144, .nc = 128 }));
+    try packRowsMatchesColumns(Kernel(.{ .mr = 6, .nr = 16, .lanes = 8, .kc = 256, .mc = 144, .nc = 256 }));
 }
 
 test "matmul f32: lane-width variants (4/8/16) match reference across panel/tail shapes" {

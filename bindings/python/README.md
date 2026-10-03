@@ -52,7 +52,7 @@ import aion, numpy as np
 from aion import nn
 
 ctx = aion.Context()
-w = aion.tensor(np.random.randn(4, 3).astype("f4"))   # data
+w = aion.tensor(np.random.randn(3, 4).astype("f4"))   # data, [out, in]
 
 with aion.Builder(ctx) as b:
     x = b.input((1, 4)).rename("x")                   # TensorRef

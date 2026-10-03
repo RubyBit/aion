@@ -25,6 +25,7 @@ const editor_mod = @import("opt/editor.zig");
 const fuse_steps = @import("opt/fuse_steps.zig");
 const pointwise_conv = @import("opt/pointwise_conv.zig");
 const weight_layout = @import("opt/weight_layout.zig");
+const matmul_rows = @import("program/matmul_rows.zig");
 const rewriter_mod = @import("opt/rewriter.zig");
 const step_uses = @import("opt/step_uses.zig");
 
@@ -49,7 +50,7 @@ pub const Pass = enum {
     gate,
     /// Drop view steps that copy between byte-identical layouts.
     alias_views,
-    /// q8 matmul weights -> the target's `[n, k]` block order + MatMulNT.
+    /// q8 matmul weights -> the target's `[n, k]` block order, read through a transpose.
     weight_layout,
 };
 
@@ -80,9 +81,12 @@ pub fn graphPasses(ctx: Ctx, g: *Graph) Error!void {
         try rewriter_mod.rewrite(ctx.gpa, g, pointwise_conv.Rule{});
     }
     if (ctx.target.passes.contains(.weight_layout)) {
+        var sources = try matmul_rows.transposeSources(ctx.gpa, g);
+        defer sources.deinit(ctx.gpa);
         try rewriter_mod.rewrite(ctx.gpa, g, weight_layout.Rule{
             .mgr = ctx.mgr,
             .target = ctx.target,
+            .sources = &sources,
         });
     }
 }

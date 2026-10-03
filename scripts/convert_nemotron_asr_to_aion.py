@@ -34,7 +34,8 @@ all runtime parameters (chunk, window/buffer sizes, ...) are recorded in package
 metadata — the example scripts auto-configure from it.
 
 Weight/quant policy (mirrors convert_gemma4_e2b_to_aion.py):
-- dense matmul weights (FF, q/k/v/out proj, subsampling `out`) -> q8_0 (B `[1,K,N]`).
+- dense matmul weights (FF, q/k/v/out proj, subsampling `out`, joint) -> q8_0
+  `[out, in]` as the checkpoint stores them, read as `x @ w.T`.
 - LayerNorm gamma/beta, conv weights/biases, pos_bias_u/_v, pos_emb -> f32.
 
 Authored via the C-ABI `aion.Builder`; the Zig core serializes through
@@ -139,20 +140,14 @@ class _Loader:
 
 # ----------------------- C-ABI Builder authoring helpers ----------------------
 # The converter drives the C-ABI `aion.Builder`; these small helpers cover the
-# two weight-packing idioms (q8_0 matmul-B and q8_0 embedding) and layer norm.
+# two weight-packing idioms (q8_0 linear weight and q8_0 embedding) and layer norm.
 
 
-def q8b(b: Builder, w_torch: np.ndarray) -> TensorRef:
-    """PyTorch linear `[out, in]` -> a q8_0 matmul-B param bound as `[1, in, out]`.
-
-    The encoder's weights go through `nn` (see `mm_b`), which stores them at their
-    natural `[K, N]` rank. This remains for the RNN-T decode loop, which is written
-    directly on the Builder — control flow is the low-level escape hatch — and whose
-    graph was authored against the rank-3 form.
-    """
-    w_t = np.ascontiguousarray(w_torch.T)  # [K, N]
-    k, n = int(w_t.shape[0]), int(w_t.shape[1])
-    return b.param(w_t.reshape(1, k, n), dtype=aion.q8_0, shape=(1, k, n))
+def q8_linear(b: Builder, w_torch: np.ndarray) -> TensorRef:
+    """PyTorch linear `[out, in]` -> a q8_0 param of that layout, blocked along `in`,
+    for `x @ w.T` written directly on the Builder (the RNN-T decode loop: control
+    flow is the low-level escape hatch). The encoder's go through `nn.Linear`."""
+    return b.param(np.ascontiguousarray(w_torch), dtype=aion.q8_0, quant_axis=1)
 
 
 def q8_embed(b: Builder, table: np.ndarray) -> TensorRef:
@@ -164,17 +159,6 @@ def q8_embed(b: Builder, table: np.ndarray) -> TensorRef:
         shape=(v, d),
         quant_axis=1,
     )
-
-
-def mm_b(w_torch: np.ndarray) -> np.ndarray:
-    """A PyTorch linear's `[out, in]` weight in Aion's matmul-B layout `[in, out]`.
-
-    Adapting someone else's layout is a converter's job. Rank 2 is all it needs —
-    MatMul broadcasts a `[K, N]` weight into a rank-3 `[B, S, K]` activation — and
-    `nn` does the q8_0 quantization, blocking along K. The transpose is a strided
-    view: the core reads it in place as it quantizes, so no copy is made here.
-    """
-    return w_torch.T
 
 
 def ln(loader: _Loader, base: str, name: str) -> nn.LayerNorm:
@@ -212,16 +196,16 @@ class ConformerLayer(nn.Module):
 
         self.norm_feed_forward1 = ln(loader, f"{pf}.norm_feed_forward1", "norm_feed_forward1")
         self.feed_forward1 = nn.FeedForward(
-            mm_b(get(f"{pf}.feed_forward1.linear1.weight")),
-            mm_b(get(f"{pf}.feed_forward1.linear2.weight")),
+            get(f"{pf}.feed_forward1.linear1.weight"),
+            get(f"{pf}.feed_forward1.linear2.weight"),
                 act="silu", dtype=aion.q8_0, name="feed_forward1")
 
         self.norm_self_att = ln(loader, f"{pf}.norm_self_att", "norm_self_att")
         self.self_attn = nn.RelPosSelfAttention(
-            mm_b(get(f"{pf}.self_attn.linear_q.weight")),
-            mm_b(get(f"{pf}.self_attn.linear_k.weight")),
-            mm_b(get(f"{pf}.self_attn.linear_v.weight")),
-            mm_b(get(f"{pf}.self_attn.linear_out.weight")),
+            get(f"{pf}.self_attn.linear_q.weight"),
+            get(f"{pf}.self_attn.linear_k.weight"),
+            get(f"{pf}.self_attn.linear_v.weight"),
+            get(f"{pf}.self_attn.linear_out.weight"),
             np.ascontiguousarray(pe_proj),
             get(f"{pf}.self_attn.pos_bias_u"),
             get(f"{pf}.self_attn.pos_bias_v"),
@@ -231,7 +215,7 @@ class ConformerLayer(nn.Module):
         # Pointwise convs are k=1, i.e. matmuls, so they are stored q8_0 and take the
         # fast matmul path; only the depthwise conv stays f32.
         self.norm_conv = ln(loader, f"{pf}.norm_conv", "norm_conv")
-        self.conv_glu = nn.GLU(mm_b(get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0]),
+        self.conv_glu = nn.GLU(get(f"{pf}.conv.pointwise_conv1.weight")[:, :, 0],
                 dtype=aion.q8_0, name="conv/pointwise_conv1")
         # Causal padding in the batch path; the streaming path pads with a cached
         # left context instead, so it asks for none.
@@ -240,13 +224,13 @@ class ConformerLayer(nn.Module):
             pad_left=conv_pad_left, pad_right=0, name="conv/depthwise_conv")
         # A LayerNorm occupies the batch-norm slot in this checkpoint.
         self.conv_norm = ln(loader, f"{pf}.conv.batch_norm", "conv/batch_norm")
-        self.conv_out = nn.Linear(mm_b(get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0]),
+        self.conv_out = nn.Linear(get(f"{pf}.conv.pointwise_conv2.weight")[:, :, 0],
                 dtype=aion.q8_0, name="conv/pointwise_conv2")
 
         self.norm_feed_forward2 = ln(loader, f"{pf}.norm_feed_forward2", "norm_feed_forward2")
         self.feed_forward2 = nn.FeedForward(
-            mm_b(get(f"{pf}.feed_forward2.linear1.weight")),
-            mm_b(get(f"{pf}.feed_forward2.linear2.weight")),
+            get(f"{pf}.feed_forward2.linear1.weight"),
+            get(f"{pf}.feed_forward2.linear2.weight"),
                 act="silu", dtype=aion.q8_0, name="feed_forward2")
 
         self.norm_out = ln(loader, f"{pf}.norm_out", "norm_out")
@@ -327,7 +311,7 @@ def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) ->
     w6 = conv2d_w(f"{pe}.conv.6.weight"); b6 = b.param(loader.get(f"{pe}.conv.6.bias"))
     out_w = loader.get(f"{pe}.out.weight").reshape(D_MODEL, SUB_CH, FREQ_OUT)             # [out,c,f]
     out_w = np.ascontiguousarray(out_w.transpose(0, 2, 1).reshape(D_MODEL, FREQ_OUT * SUB_CH))  # [out,f*c]
-    out_wq = b.param(mm_b(out_w), dtype=aion.q8_0)
+    out_wq = q8_linear(b, out_w)
     out_b = b.param(loader.get(f"{pe}.out.bias"))
 
     relu = lambda x: x.relu()
@@ -345,7 +329,7 @@ def build_subsample(loader: _Loader, b: Builder, feat: TensorRef, t_mel: int) ->
     x = c2(x, w5, b5, SUB_CH, True)
     x = relu(c2(x, w6, b6, 1, False))
     x = b.reshape(x, (1, t_out, FREQ_OUT * SUB_CH))  # NHWC flatten (f*256+c)
-    return b.add(x @ out_wq, out_b)  # [1, t_out, 1024]
+    return b.add(x @ out_wq.T, out_b)  # [1, t_out, 1024]
 
 
 def build_encoder(loader: _Loader, b: Builder, t_mel: int,
@@ -421,11 +405,11 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
 
     w0 = lstm_w(0)
     w1 = lstm_w(1)
-    enc_w = q8b(b, loader.get("joint.enc.weight"))
+    enc_w = q8_linear(b, loader.get("joint.enc.weight"))
     enc_b = b.param(loader.get("joint.enc.bias"))
-    pred_w = q8b(b, loader.get("joint.pred.weight"))
+    pred_w = q8_linear(b, loader.get("joint.pred.weight"))
     pred_b = b.param(loader.get("joint.pred.bias"))
-    jn_w = q8b(b, loader.get("joint.joint_net.2.weight"))
+    jn_w = q8_linear(b, loader.get("joint.joint_net.2.weight"))
     jn_b = b.param(loader.get("joint.joint_net.2.bias"))
 
     one_i = b.param(np.array([1], np.int32), dtype=aion.int32)       # [1]
@@ -464,10 +448,10 @@ def _ingraph_decode(loader: _Loader, b: Builder, enc: TensorRef, t_out: int, max
     h1o = b.slice(st1, (0, 0), (1, H))
     c1o = b.slice(st1, (0, H), (1, H))
 
-    fproj = b.add(enc_frame @ enc_w, enc_b)      # [1,1,640]
-    gproj = b.add(b.matmul(b.reshape(h1o, (1, 1, H)), pred_w), pred_b)
+    fproj = b.add(enc_frame @ enc_w.T, enc_b)    # [1,1,640]
+    gproj = b.add(b.reshape(h1o, (1, 1, H)) @ pred_w.T, pred_b)
     sj = b.unary("relu", fproj + gproj)                      # [1,1,640]
-    logits = b.add(sj @ jn_w, jn_b)             # [1,1,1025]
+    logits = b.add(sj @ jn_w.T, jn_b)           # [1,1,1025]
     k = b.reshape(b.argmax(logits, axis=2), (1,))                  # [1] i32
 
     # advance = (k==blank) or (sym>=max_symbols);  emit = 1 - advance.

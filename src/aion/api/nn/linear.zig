@@ -11,8 +11,9 @@ pub const LayerName = layer_mod.LayerName;
 pub const Params = state_mod.Params;
 pub const BindError = state_mod.BindError;
 
-/// `y = x @ w + b`, with `w` in Aion's matmul-B layout `[in, out]` (or
-/// `[.., in, out]` to match a higher-rank activation).
+/// `y = x @ wᵀ + b`, with `w` as `[out, in]`: the layout torch and GGUF store, so a
+/// checkpoint's weight binds as it is. The compiler turns the transposed read into
+/// a contraction against `w`'s rows; nothing is copied.
 pub const Linear = struct {
     w: TensorRef,
     b: ?TensorRef = null,
@@ -37,10 +38,6 @@ pub const Linear = struct {
         alpha: f32 = 1.0,
         /// Accumulator pre-scale on the matmul.
         beta: f32 = 0.0,
-        /// Contract against `w`'s *rows* instead of its columns (`matmulNT`), i.e.
-        /// `w` is `[out, in]`. This is what a tied embedding head needs: the same
-        /// `[vocab, dim]` table serves both the lookup and the output projection.
-        nt: bool = false,
     };
 
     pub fn bind(bld: *Builder, params: anytype, opts: Options) BindError!Self {
@@ -58,8 +55,8 @@ pub const Linear = struct {
         };
     }
 
-    /// Reuse an already-bound weight instead of resolving one, for weight tying.
-    /// Pair with `.nt = true` to serve an `Embedding`'s table as the output head.
+    /// Reuse an already-bound weight instead of resolving one, for weight tying: an
+    /// `Embedding`'s `[vocab, dim]` table is already a `[out, in]` output head.
     pub fn bindShared(bld: *Builder, w: TensorRef, bias: ?TensorRef, opts: Options) BindError!Self {
         const id, const scope = try LayerName.open(Self, bld, opts.name);
         defer bld.endScope(scope);
@@ -70,12 +67,9 @@ pub const Linear = struct {
         const scope = try self.id.enter(bld);
         defer bld.endScope(scope);
 
-        // `matmul` aligns operand ranks itself, so a plain `[in, out]` weight works
+        // `matmul` aligns operand ranks itself, so the `[in, out]` view works
         // against a `[batch, seq, in]` activation with no reshape here.
-        const y: TensorRef = if (self.opts.nt)
-            try bld.matmulNT(x, self.w, self.opts.alpha, self.opts.beta)
-        else
-            try bld.matmul(x, self.w, self.opts.alpha, self.opts.beta);
+        const y: TensorRef = try bld.matmul(x, try bld.transpose2d(self.w), self.opts.alpha, self.opts.beta);
 
         if (self.b) |b0| return bld.add(y, b0);
         return y;
@@ -86,7 +80,7 @@ pub const Linear = struct {
 ///
 /// The table may be quantized (a q8_0 table blocked along `dim` is the usual
 /// choice); `weightRef` hands it back so a tied output head can reuse it via
-/// `Linear.bindShared(bld, emb.weightRef(), null, .{ .nt = true })`.
+/// `Linear.bindShared(bld, emb.weightRef(), null, .{})`.
 pub const Embedding = struct {
     table: TensorRef,
     id: LayerName = .{},

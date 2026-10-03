@@ -733,6 +733,111 @@ fn q8MatmulB(allocator: std.mem.Allocator, sm: *StorageManager, k: usize, n: usi
     return tid;
 }
 
+// ---------------------------------------------------------------------------
+// matmul_rows: MatMul over a transposed weight
+// ---------------------------------------------------------------------------
+
+/// A `[n, k]` weight of `dtype`, blocked along its rows when quantized.
+fn rowsWeight(allocator: std.mem.Allocator, sm: *StorageManager, dtype: types.DType, n: usize, k: usize, seed: usize) !TensorId {
+    const vals = try allocator.alloc(f32, n * k);
+    defer allocator.free(vals);
+    for (vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + seed) % 23)) - 11)) * 0.07;
+    if (dtype == .f32) {
+        const tid = try sm.createTensor(.f32, &[_]usize{ n, k }, .{});
+        try sm.writeFromPackedScalar(tid, std.mem.sliceAsBytes(vals));
+        return tid;
+    }
+    const buf = try allocator.alloc(u8, (k / 32) * n * 34);
+    defer allocator.free(buf);
+    try @import("../../storage/quantize.zig").quantizeBlocks(dtype, &[_]usize{ n, k }, 1, vals, 0, 0, buf);
+    const tid = try sm.createTensor(dtype, &[_]usize{ n, k }, .{ .quant_axis = 1 });
+    try sm.writeFromPackedQuant(tid, buf);
+    return tid;
+}
+
+// `a @ wᵀ` is how a model says it; lowering runs it as the contraction against
+// `w`'s rows, whatever passes run, and never copies the transpose. M covers the
+// row-dot kernel (1) and the packed GEMM (37).
+test "matmul_rows: a matmul over a transposed weight contracts against its rows" {
+    const allocator = std.testing.allocator;
+    const k: usize = 96;
+    const n: usize = 45;
+
+    var cpu = cpu_backend_mod.CpuBackend.init(allocator);
+    defer cpu.deinit();
+    for ([_]types.DType{ .f32, .q8_0 }) |dtype| {
+        for ([_]usize{ 1, 37 }) |m| {
+            var sm = StorageManager.init(allocator);
+            defer sm.deinit();
+            const a_tid = try f32Tensor(&sm, &[_]usize{ m, k }, 3);
+            const w = try rowsWeight(allocator, &sm, dtype, n, k, 5);
+
+            const out = try allocator.alloc(f32, 2 * m * n);
+            defer allocator.free(out);
+            for (0..2) |i| {
+                var g = Graph.init(allocator);
+                defer g.deinit();
+                const a = try g.addInput(.f32, &[_]usize{ m, k });
+                try g.bindExternal(a, @intCast(a_tid));
+                const b = try g.addInput(dtype, &[_]usize{ n, k });
+                try g.bindExternal(b, @intCast(w));
+                try g.setOutputs(&[_]ValueId{try g.addMatMul(a, try g.addViewTranspose2D(b), 0.5, 0.0)});
+
+                var prog = try program.compileGraph(allocator, &g, &sm, if (i == 1) cpu_target else cpu_target.withPasses(.empty));
+                defer prog.deinit();
+                try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .MatMulNT));
+                try std.testing.expectEqual(@as(usize, 0), countStep(&prog, .MatMul));
+                try std.testing.expectEqual(@as(usize, 0), countStep(&prog, .Transpose2DScalar));
+                try cpu.backend().executeProgram(&prog, sm.tensorStore());
+                try sm.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(out[i * m * n ..][0 .. m * n]));
+            }
+            // The passes may pick another kernel, over the same blocks.
+            for (out[0 .. m * n], out[m * n ..]) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+
+            if (dtype != .f32) continue;
+            // And the f32 kernels agree with the arithmetic.
+            const a_vals = try allocator.alloc(f32, m * k);
+            defer allocator.free(a_vals);
+            const w_vals = try allocator.alloc(f32, n * k);
+            defer allocator.free(w_vals);
+            try sm.readToPackedScalar(a_tid, std.mem.sliceAsBytes(a_vals));
+            try sm.readToPackedScalar(w, std.mem.sliceAsBytes(w_vals));
+            for (0..m) |r| for (0..n) |c| {
+                var acc: f64 = 0;
+                for (0..k) |kk| acc += @as(f64, a_vals[r * k + kk]) * w_vals[c * k + kk];
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(0.5 * acc)), out[r * n + c], 1e-4);
+            };
+        }
+    }
+}
+
+// A transpose something other than a matmul reads is still a value of the model,
+// so it stays and lowers as before; only the matmul folds.
+test "matmul_rows: a transpose with another reader is kept" {
+    const allocator = std.testing.allocator;
+    const m: usize = 2;
+    const k: usize = 8;
+    const n: usize = 4;
+    var sm = StorageManager.init(allocator);
+    defer sm.deinit();
+    const a_tid = try f32Tensor(&sm, &[_]usize{ m, k }, 3);
+    const w = try f32Tensor(&sm, &[_]usize{ n, k }, 5);
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    const a = try g.addInput(.f32, &[_]usize{ m, k });
+    try g.bindExternal(a, @intCast(a_tid));
+    const b = try g.addInput(.f32, &[_]usize{ n, k });
+    try g.bindExternal(b, @intCast(w));
+    const t = try g.addViewTranspose2D(b);
+    try g.setOutputs(&[_]ValueId{ try g.addMatMul(a, t, 1.0, 0.0), t });
+
+    var prog = try program.compileGraph(allocator, &g, &sm, cpu_target.withPasses(.empty));
+    defer prog.deinit();
+    try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .MatMulNT));
+    try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .Transpose2DScalar));
+}
+
 test "weight_layout: a quantized matmul weight is re-laid and contracted row-wise" {
     const allocator = std.testing.allocator;
     const m: usize = 2;
@@ -756,8 +861,10 @@ test "weight_layout: a quantized matmul weight is re-laid and contracted row-wis
     var prog = try program.compileGraph(allocator, &g, &sm, cpu_target.withPasses(.initOne(.weight_layout)));
     defer prog.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), countOp(&g, .MatMul));
-    try std.testing.expectEqual(@as(usize, 1), countOp(&g, .MatMulNT));
+    // Read through a transpose of the re-laid copy, which lowers to the NT step.
+    try std.testing.expectEqual(@as(usize, 1), countOp(&g, .ViewTranspose2D));
+    try std.testing.expectEqual(@as(usize, 1), countStep(&prog, .MatMulNT));
+    try std.testing.expectEqual(@as(usize, 0), countStep(&prog, .MatMul));
 
     // The weight now lives in its re-laid copy: `[n, k]`, blocked along its rows.
     const at = sm.derivedLocate(w) orelse return error.TestExpectedFolded;
@@ -804,7 +911,7 @@ test "weight_layout: a q4_0 matmul is left alone and runs under default passes" 
 
         var prog = try program.compileGraph(allocator, &g, &sm, target);
         defer prog.deinit();
-        try std.testing.expectEqual(@as(usize, 0), countOp(&g, .MatMulNT));
+        try std.testing.expectEqual(@as(usize, 0), countStep(&prog, .MatMulNT));
         try cpu.backend().executeProgram(&prog, sm.tensorStore());
         try sm.readToPackedScalar(prog.outputs[0], std.mem.sliceAsBytes(&out[i]));
     }
@@ -971,7 +1078,7 @@ test "weight_layout: a lookup of a re-laid table reads the re-laid copy" {
             try g.bindExternal(idx, @intCast(idx_tid));
             const a = try g.addInput(.f32, &.{ m, k });
             try g.bindExternal(a, @intCast(a_tid));
-            try g.setOutputs(&.{ try g.addGather(t, idx, 0, 0), try g.addMatMulNT(a, t, 1.0, 0.0) });
+            try g.setOutputs(&.{ try g.addGather(t, idx, 0, 0), try g.addMatMul(a, try g.addViewTranspose2D(t), 1.0, 0.0) });
 
             var prog = try program.compileGraph(allocator, &g, &sm, program.Target.init(.{}, order).withPasses(policy));
             defer prog.deinit();

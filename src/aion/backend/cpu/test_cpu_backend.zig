@@ -259,10 +259,10 @@ test "cpu backend: rmsnorm supports more than 256 rows" {
     const x_tid = try sm.createTensor(
         .f32,
         &[_]usize{ batch, seq, groups, hidden },
-        .{ },
+        .{},
     );
-    const gamma_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{ });
-    const beta_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{ });
+    const gamma_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{});
+    const beta_tid = try sm.createTensor(.f32, &[_]usize{hidden}, .{});
 
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(gamma_tid, g_buf);
@@ -415,9 +415,9 @@ test "cpu backend: compile+run covers matmul/broadcast/elemwise/relu/copy/reduce
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{ k, n }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ k, n }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -510,9 +510,8 @@ test "cpu backend: batched matmul rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{});
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -597,9 +596,8 @@ test "cpu backend: batched matmul broadcast B rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{ 1, k, n }, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ batch, m, k }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ 1, k, n }, .{});
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -684,9 +682,8 @@ test "cpu backend: batched matmul broadcast A rank-3 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ 1, m, k }, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ 1, m, k }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ batch, k, n }, .{});
 
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -741,9 +738,8 @@ test "cpu backend: unary ops match reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
-
 
     inline for (.{
         .{ .op = types.UnaryOp.relu, .name = "relu" },
@@ -1076,7 +1072,7 @@ test "cpu backend: softmax rank-1 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1144,7 +1140,7 @@ test "cpu backend: softmax rank-2 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1218,7 +1214,7 @@ test "cpu backend: softmax rank-2 axis-0 matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1289,7 +1285,7 @@ test "cpu backend: softmax rank-3 axis-last matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -1373,13 +1369,12 @@ test "cpu backend: layernorm and rmsnorm rank-2 match reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
-    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
+    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(g_tid, g_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
-
 
     // Run both ops.
     inline for (.{
@@ -1474,9 +1469,9 @@ test "cpu backend: layernorm rank-3 normalized-shape matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{ });
-    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, m, n }, .{});
+    const g_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(g_tid, g_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
@@ -1603,9 +1598,9 @@ test "cpu backend: attention over a plain sequence equals the cached path with i
         var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
 
-        const q_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
-        const k_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_k }, .{ });
-        const v_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_v }, .{ });
+        const q_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{});
+        const k_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_k }, .{});
+        const v_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t, h_kv, d_v }, .{});
         try sm.writeFromPackedScalar(q_tid, q_buf);
         try sm.writeFromPackedScalar(k_tid, k_buf);
         try sm.writeFromPackedScalar(v_tid, v_buf);
@@ -1754,13 +1749,12 @@ test "cpu backend: rel-pos multi-head attention matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-
-    const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-    const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-    const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-    const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{ });
-    const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
-    const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
+    const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+    const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+    const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+    const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{});
+    const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{});
+    const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{});
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
     try sm.writeFromPackedScalar(v_tid, v_buf);
@@ -1880,13 +1874,13 @@ test "cpu backend: chunked-limited window equals the equivalent additive mask" {
             var sm = manager_mod.StorageManager.init(alloc);
             defer sm.deinit();
 
-            const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-            const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-            const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{ });
-            const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{ });
-            const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
-            const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{ });
-            const m_tid = try sm.createTensor(.f32, &[_]usize{ t, t }, .{ });
+            const q_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+            const k_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+            const v_tid = try sm.createTensor(.f32, &[_]usize{ batch, t, heads, d }, .{});
+            const pe_tid = try sm.createTensor(.f32, &[_]usize{ heads, p_len, d }, .{});
+            const u_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{});
+            const vb_tid = try sm.createTensor(.f32, &[_]usize{ heads, d }, .{});
+            const m_tid = try sm.createTensor(.f32, &[_]usize{ t, t }, .{});
             try sm.writeFromPackedScalar(q_tid, bufs[0]);
             try sm.writeFromPackedScalar(k_tid, bufs[1]);
             try sm.writeFromPackedScalar(v_tid, bufs[2]);
@@ -1971,7 +1965,7 @@ test "cpu backend: argmax over last axis returns i32 indices" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const in_tid = try sm.createTensor(.f32, &[_]usize{ rows, n }, .{ });
+    const in_tid = try sm.createTensor(.f32, &[_]usize{ rows, n }, .{});
     try sm.writeFromPackedScalar(in_tid, in_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2201,8 +2195,8 @@ test "cpu backend: matmul f16 allows promoted f32 output" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTensor(.f16, &[_]usize{ m, k }, .{ });
-    const b_tid = try sm.createTensor(.f16, &[_]usize{ k, n }, .{ });
+    const a_tid = try sm.createTensor(.f16, &[_]usize{ m, k }, .{});
+    const b_tid = try sm.createTensor(.f16, &[_]usize{ k, n }, .{});
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
 
@@ -2289,7 +2283,7 @@ test "cpu backend: view ops lower to materialization (transpose/slice/reshape)" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2339,7 +2333,7 @@ test "cpu backend: reshape supports rank-3 materialization" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2395,7 +2389,7 @@ test "cpu backend: view slice nd materialization rank-3" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ d0, d1, d2 }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ d0, d1, d2 }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -2446,8 +2440,8 @@ test "cpu backend: concat axis-1 materialization" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ rows, c0 }, .{ });
-    const b_tid = try sm.createTensor(.f32, &[_]usize{ rows, c1 }, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ rows, c0 }, .{});
+    const b_tid = try sm.createTensor(.f32, &[_]usize{ rows, c1 }, .{});
     try sm.writeFromPackedScalar(a_tid, a_buf);
     try sm.writeFromPackedScalar(b_tid, b_buf);
 
@@ -2509,8 +2503,8 @@ test "cpu backend: gather rows matches reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{ });
-    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
+    const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{});
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{});
     try sm.writeFromPackedScalar(table_tid, table_buf);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2569,9 +2563,9 @@ test "cpu backend: shape index ops and batched gather derive pooling indices" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const data_tid = try sm.createTensor(.f32, &.{ b, s, d }, .{ });
-    const indices_tid = try sm.createTensor(.i32, &.{ b, l }, .{ });
-    const tokens_tid = try sm.createTensor(.i32, &.{ b, s }, .{ });
+    const data_tid = try sm.createTensor(.f32, &.{ b, s, d }, .{});
+    const indices_tid = try sm.createTensor(.i32, &.{ b, l }, .{});
+    const tokens_tid = try sm.createTensor(.i32, &.{ b, s }, .{});
     try sm.writeFromPackedScalar(data_tid, std.mem.sliceAsBytes(&data_vals));
     try sm.writeFromPackedScalar(indices_tid, std.mem.sliceAsBytes(&indices_vals));
     try sm.writeFromPackedScalar(tokens_tid, std.mem.sliceAsBytes(&tokens_vals));
@@ -2648,8 +2642,8 @@ test "cpu backend: gather rows matches reference (f16)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const table_tid = try sm.createTensor(.f16, &[_]usize{ v, d }, .{ });
-    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
+    const table_tid = try sm.createTensor(.f16, &[_]usize{ v, d }, .{});
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{});
     try sm.writeFromPackedScalar(table_tid, table_buf);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2762,7 +2756,7 @@ test "cpu backend: gather rows matches reference (q8_0 table, f32 output)" {
         &[_]usize{ v, d },
         .{ .quant_axis = 1 },
     );
-    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
+    const idx_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{});
     try sm.writeFromPackedQuant(table_tid, packed_table);
     try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -2810,7 +2804,7 @@ test "cpu backend: cast f32 -> f16 roundtrip matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const in_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{ });
+    const in_tid = try sm.createTensor(.f32, &[_]usize{ m, n }, .{});
     const in_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f32));
     defer allocator.free(in_buf);
     const in_vals: []align(1) f32 = asF32Slice(in_buf);
@@ -2850,7 +2844,7 @@ test "cpu backend: cast f16 -> f32 matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const in_tid = try sm.createTensor(.f16, &[_]usize{ 1, n }, .{ });
+    const in_tid = try sm.createTensor(.f16, &[_]usize{ 1, n }, .{});
     const in_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f16));
     defer allocator.free(in_buf);
     const in_vals: []align(1) f16 = asF16Slice(in_buf);
@@ -2979,7 +2973,7 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{ });
+    const a_tid = try sm.createTensor(.f32, &[_]usize{ m, k }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a_buf));
 
     const b_tid = try sm.createTensor(
@@ -2995,7 +2989,7 @@ test "cpu backend: matmul NT (A f32 @ B^T q8_0 quant_axis=1) matches reference" 
     const b_in = try g.addInput(.q8_0, &[_]usize{ n, k });
     try g.bindExternal(a_in, @intCast(a_tid));
     try g.bindExternal(b_in, @intCast(b_tid));
-    const c_out = try g.addMatMulNT(a_in, b_in, 1.0, 0.0);
+    const c_out = try g.addMatMul(a_in, try g.addViewTranspose2D(b_in), 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{c_out});
 
     var prog = try program.compileGraph(allocator, &g, &sm, .cpu());
@@ -3048,8 +3042,8 @@ test "cpu backend: gather index rules follow ONNX (negative wraps, out of range 
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{ });
-        const idx_tid = try sm.createTensor(.i32, &[_]usize{ 1, l }, .{ });
+        const table_tid = try sm.createTensor(.f32, &[_]usize{ v, d }, .{});
+        const idx_tid = try sm.createTensor(.i32, &[_]usize{ 1, l }, .{});
         try sm.writeFromPackedScalar(table_tid, table_buf);
         try sm.writeFromPackedScalar(idx_tid, idx_buf);
 
@@ -3154,8 +3148,8 @@ test "cpu backend: rope1d matches chunked-halves reference (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, l, n, h }, .{ });
-    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ b, l, n, h }, .{});
+    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(pos_tid, pos_buf);
 
@@ -3257,8 +3251,8 @@ test "cpu backend: rope1d matches chunked-halves reference (f16)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f16, &[_]usize{ b, l, n, h }, .{ });
-    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{ });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ b, l, n, h }, .{});
+    const pos_tid = try sm.createTensor(.i32, &[_]usize{ b, l }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(pos_tid, pos_buf);
 
@@ -3366,9 +3360,9 @@ test "cpu backend: conv1d depthwise (NLC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in_g, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in_g, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3477,9 +3471,9 @@ test "cpu backend: conv1d depthwise reflect padding matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, 1, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, 1, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3585,8 +3579,8 @@ test "cpu backend: conv1d reflect padding matches reference" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -3701,8 +3695,8 @@ test "cpu backend: conv2d reflect padding matches reference" {
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -3793,9 +3787,9 @@ test "cpu backend: conv1d pointwise (NLC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -3850,7 +3844,7 @@ test "cpu backend: reduce axis sum/mean matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ rows, cols }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -3955,9 +3949,9 @@ test "cpu backend: conv1d general (NLC) supports large c_out" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, l_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k, c_in, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4064,9 +4058,9 @@ test "cpu backend: conv2d pointwise (NHWC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4183,9 +4177,9 @@ test "cpu backend: conv2d depthwise (NHWC) matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4310,9 +4304,9 @@ test "cpu backend: conv2d depthwise reflect padding matches reference" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, 1, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4432,9 +4426,9 @@ test "cpu backend: conv2d general (NHWC) supports large c_out" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{ });
-    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ bsz, h_in, w_in, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in, c_out }, .{});
+    const bias_tid = try sm.createTensor(.f32, &[_]usize{c_out}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
     try sm.writeFromPackedScalar(bias_tid, bias_buf);
@@ -4551,9 +4545,9 @@ test "cpu backend: kv cache append mutates cache in-place (f32)" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
-    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
-    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{});
+    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{});
+    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4622,9 +4616,9 @@ test "cpu backend: kv cache append rejects out-of-bounds end index" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
-    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
-    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const cache_tid = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{});
+    const new_tid = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{});
+    const end_tid = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4682,9 +4676,9 @@ test "cpu backend: kv cache append rolling policy wraps time index" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
-    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
-    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{});
+    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{});
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4753,9 +4747,9 @@ test "cpu backend: kv cache append growable policy expands physical capacity" {
     defer sm.deinit();
     try sm.configureCache(.{ .ram_budget_bytes = 1 << 20 });
 
-    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{ });
-    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{ });
-    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const cache_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, heads, d_head }, .{});
+    const new_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, append_len, heads, d_head }, .{});
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
     try sm.writeFromPackedScalar(cache_tid, cache_buf);
     try sm.writeFromPackedScalar(new_tid, new_buf);
     try sm.writeFromPackedScalar(end_tid, end_buf);
@@ -4976,11 +4970,11 @@ test "cpu backend: cached grouped-query attention matches reference (f32)" {
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
-    const k_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{ });
-    const v_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{ });
-    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{ });
-    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{});
+    const k_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{});
+    const v_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{});
+    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{});
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
 
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
@@ -5115,11 +5109,11 @@ test "cpu backend: cached grouped-query attention supports q=f32, kv=f16 with f3
     var sm: manager_mod.StorageManager = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{ });
-    const k_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{ });
-    const v_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{ });
-    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{ });
-    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{ });
+    const q_tid: manager_mod.TensorId = try sm.createTensor(.f32, &[_]usize{ bsz, l_q, h_q, d_k }, .{});
+    const k_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_k }, .{});
+    const v_tid: manager_mod.TensorId = try sm.createTensor(.f16, &[_]usize{ bsz, t_cap, h_kv, d_v }, .{});
+    const pos_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{ bsz, l_q }, .{});
+    const end_tid: manager_mod.TensorId = try sm.createTensor(.i32, &[_]usize{bsz}, .{});
 
     try sm.writeFromPackedScalar(q_tid, q_buf);
     try sm.writeFromPackedScalar(k_tid, k_buf);
@@ -5222,7 +5216,7 @@ test "cpu backend: softmax rank-1 (f16) normalizes without an f16 intermediate" 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f16, &[_]usize{n}, .{ });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{n}, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5293,7 +5287,7 @@ test "cpu backend: softmax rank-2 (f16) matches reference per row" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f16, &[_]usize{ m, n }, .{ });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ m, n }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5354,7 +5348,7 @@ test "cpu backend: argmax (f16) picks the same index as f32" {
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
 
-    const x_tid = try sm.createTensor(.f16, &[_]usize{ rows, n }, .{ });
+    const x_tid = try sm.createTensor(.f16, &[_]usize{ rows, n }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
 
     var g = graph_mod.Graph.init(allocator);
@@ -5431,7 +5425,7 @@ fn runLSTMCellAsF32(
         const buf: []u8 = try allocator.alloc(u8, n * elem);
         defer allocator.free(buf);
         Fill.go(dt, buf, spec.seed);
-        tids[si] = try sm.createTensor(dt, spec.shape, .{ });
+        tids[si] = try sm.createTensor(dt, spec.shape, .{});
         try sm.writeFromPackedScalar(tids[si], buf);
     }
 
@@ -5554,8 +5548,8 @@ test "cpu backend: conv2d zero padding packs lead/copy/trail runs correctly" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, c.h, c.w, c.c_in }, .{ });
-        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c.c_in, c.c_out }, .{ });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, c.h, c.w, c.c_in }, .{});
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c.c_in, c.c_out }, .{});
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5640,8 +5634,8 @@ test "cpu backend: conv2d grouped inputs match reference" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c.c_in }, .{ });
-        const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c.c_out }, .{ });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c.c_in }, .{});
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ k_h, k_w, c_in_g, c.c_out }, .{});
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5730,8 +5724,8 @@ test "cpu backend: conv2d flat-input packing handles padding geometry and reflec
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c_in }, .{ });
-        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c_in, c_out }, .{ });
+        const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h_in, w_in, c_in }, .{});
+        const w_tid = try sm.createTensor(.f32, &[_]usize{ c.k_h, c.k_w, c_in, c_out }, .{});
         try sm.writeFromPackedScalar(x_tid, x_buf);
         try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5809,8 +5803,8 @@ test "cpu backend: general gather matches a coordinate-wise reference" {
 
         var sm = manager_mod.StorageManager.init(allocator);
         defer sm.deinit();
-        const d_tid = try sm.createTensor(.f32, c.d, .{ });
-        const i_tid = try sm.createTensor(.i32, c.i, .{ });
+        const d_tid = try sm.createTensor(.f32, c.d, .{});
+        const i_tid = try sm.createTensor(.i32, c.i, .{});
         try sm.writeFromPackedScalar(d_tid, d_buf);
         try sm.writeFromPackedScalar(i_tid, i_buf);
 
@@ -5894,8 +5888,8 @@ fn convOnFreshStore(allocator: std.mem.Allocator, cpu: *cpu_backend_mod.CpuBacke
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 
@@ -5964,8 +5958,8 @@ fn conv3x3MaxErr(allocator: std.mem.Allocator, h: usize, w: usize, c_in: usize, 
 
     var sm = manager_mod.StorageManager.init(allocator);
     defer sm.deinit();
-    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{ });
-    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{ });
+    const x_tid = try sm.createTensor(.f32, &[_]usize{ 1, h, w, c_in }, .{});
+    const w_tid = try sm.createTensor(.f32, &[_]usize{ 3, 3, c_in, c_out }, .{});
     try sm.writeFromPackedScalar(x_tid, x_buf);
     try sm.writeFromPackedScalar(w_tid, w_buf);
 

@@ -139,28 +139,12 @@ class _WeightLoader:
         return self._file.get_tensor(name).float().numpy()
 
     def rows(self, name: str):
-        """`name` as it is stored, in its own dtype."""
+        """`name` as it is stored, in its own dtype. A linear's `[out, in]` weight is
+        what `nn.Linear` takes, so it binds as it is."""
         return self._file.get_tensor(name)
-
-    def rows_t(self, name: str):
-        """A PyTorch linear's `[out, in]` weight as matmul-B `[in, out]` (see `_mm_b`):
-        the stored tensor, transposed by strides alone."""
-        return self.rows(name).T
 
 
 # --------------------- C-ABI Builder authoring helpers -----------------------
-
-
-def _mm_b(w_torch: np.ndarray) -> np.ndarray:
-    """A PyTorch linear's `[out, in]` weight in Aion's matmul-B layout `[in, out]`.
-
-    Adapting someone else's layout is a converter's job — `nn` has one canonical
-    layout and takes no `transposed=` flag. Rank 2 is all it needs: MatMul broadcasts
-    a `[K, N]` weight into a `[batch, seq, K]` activation, so the weight reaches the
-    kernel exactly as stored, which is what keeps a quantized one usable at all.
-    Quantization itself is `nn`'s to do (`dtype=aion.q8_0`), blocking along K.
-    """
-    return np.ascontiguousarray(w_torch.astype(np.float32, copy=False).T)
 
 
 def _f32(arr: np.ndarray) -> np.ndarray:
@@ -265,7 +249,7 @@ class _SharedWeights:
 
     @property
     def per_layer_model_projection(self) -> ArrayLike:
-        return self._loader.rows_t(f"{self._LN}.per_layer_model_projection.weight")
+        return self._loader.rows(f"{self._LN}.per_layer_model_projection.weight")
 
     @property
     def per_layer_projection_norm(self) -> np.ndarray:
@@ -300,19 +284,19 @@ def _load_layer(loader: _WeightLoader, layer: int) -> _LayerWeights:
         post_ffn_ln=_f32(loader.get_f32(f"{pfx}.post_feedforward_layernorm.weight")),
         post_pli_ln=_f32(loader.get_f32(f"{pfx}.post_per_layer_input_norm.weight")),
         skip_scale=float(loader.get_f32(f"{pfx}.layer_scalar").reshape(-1)[0]),
-        q_proj=loader.rows_t(f"{pfx}.self_attn.q_proj.weight"),
-        o_proj=loader.rows_t(f"{pfx}.self_attn.o_proj.weight"),
+        q_proj=loader.rows(f"{pfx}.self_attn.q_proj.weight"),
+        o_proj=loader.rows(f"{pfx}.self_attn.o_proj.weight"),
         q_norm=_f32(loader.get_f32(f"{pfx}.self_attn.q_norm.weight")),
         # The FFN width is elastic per layer, and comes off the weight itself.
-        gate_proj=loader.rows_t(f"{pfx}.mlp.gate_proj.weight"),
-        up_proj=loader.rows_t(f"{pfx}.mlp.up_proj.weight"),
-        down_proj=loader.rows_t(f"{pfx}.mlp.down_proj.weight"),
-        pli_gate=loader.rows_t(f"{pfx}.per_layer_input_gate.weight"),
-        pli_proj=loader.rows_t(f"{pfx}.per_layer_projection.weight"),
+        gate_proj=loader.rows(f"{pfx}.mlp.gate_proj.weight"),
+        up_proj=loader.rows(f"{pfx}.mlp.up_proj.weight"),
+        down_proj=loader.rows(f"{pfx}.mlp.down_proj.weight"),
+        pli_gate=loader.rows(f"{pfx}.per_layer_input_gate.weight"),
+        pli_proj=loader.rows(f"{pfx}.per_layer_projection.weight"),
     )
     if layer in SOURCE_LAYERS:
-        lw.k_proj = loader.rows_t(f"{pfx}.self_attn.k_proj.weight")
-        lw.v_proj = loader.rows_t(f"{pfx}.self_attn.v_proj.weight")
+        lw.k_proj = loader.rows(f"{pfx}.self_attn.k_proj.weight")
+        lw.v_proj = loader.rows(f"{pfx}.self_attn.v_proj.weight")
         lw.k_norm = _f32(loader.get_f32(f"{pfx}.self_attn.k_norm.weight"))
     return lw
 
@@ -347,8 +331,8 @@ def _linear_weight(towers: _TowerWeights, prefix: str) -> np.ndarray:
     direct = f"{prefix}.weight"
     wrapped = f"{prefix}.linear.weight"
     if direct in towers.values:
-        return _mm_b(towers.get(direct))
-    return _mm_b(towers.get(wrapped))
+        return towers.get(direct)
+    return towers.get(wrapped)
 
 
 def _emit_vision_tower(
@@ -419,7 +403,7 @@ def _audio_q_weight(towers: _TowerWeights, prefix: str) -> np.ndarray:
     """q_proj with Gemma's per-dim query scale folded in, so attention takes one scalar."""
     per_dim = towers.get(f"{prefix}.self_attn.per_dim_scale")
     scale = (128.0 ** -0.5) / math.log(2.0) * np.logaddexp(0.0, per_dim)
-    return _linear_weight(towers, f"{prefix}.self_attn.q_proj") * np.tile(scale, 8)[None, :]
+    return _linear_weight(towers, f"{prefix}.self_attn.q_proj") * np.tile(scale, 8)[:, None]
 
 
 def _audio_position_table(towers: _TowerWeights, layer: int) -> np.ndarray:
@@ -790,9 +774,9 @@ def _emit_forward(b: Builder, shared: _SharedWeights, layers: _Layers, towers: _
     x = b.gather(x, _last_index(b, tokens, x), axis=1, batch_dims=1)
 
     x = _rms(shared.final_norm, "norm")(x)
-    # Tied head: contract against the embedding table's *rows*, reusing the very
-    # parameter `embed` bound rather than a second copy of the table.
-    logits = b.matmul_nt(x, embed_table)
+    # Tied head: the `[vocab, dim]` table is an `[out, in]` weight, so `x @ tableᵀ`
+    # reuses the very parameter `embed` bound rather than a second copy of it.
+    logits = x @ embed_table.T
     logits = b.div(logits, b.constant(FINAL_LOGIT_SOFTCAP)).tanh()
     logits = _scaled(b, logits, FINAL_LOGIT_SOFTCAP)
 

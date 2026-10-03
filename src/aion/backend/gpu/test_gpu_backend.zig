@@ -83,7 +83,6 @@ fn readPlacedOutput(mgr: *StorageManager, id: TensorId, dst: []u8) !void {
     const rank: usize = @intCast(source.rank);
     @memcpy(shape[0..rank], source.shape);
     const mirror = try mgr.createTensor(source.dtype, shape[0..rank], .{
-
         .quant_axis = source.quant_axis,
     });
     defer mgr.releaseTensorData(mirror) catch {};
@@ -141,9 +140,8 @@ const MM_N = 128;
 /// Build `C = A @ B` over [MM_M,MM_K] @ [MM_K,MM_N] f32. Returns the compiled
 /// program + the output tensor id.
 fn buildMatMulProgram(alloc: std.mem.Allocator, mgr: *StorageManager) !struct { prog: aion.program.Program, out: TensorId } {
-
-    const a_id = try mgr.createTensor(.f32, &[_]usize{ MM_M, MM_K }, .{ });
-    const b_id = try mgr.createTensor(.f32, &[_]usize{ MM_K, MM_N }, .{ });
+    const a_id = try mgr.createTensor(.f32, &[_]usize{ MM_M, MM_K }, .{});
+    const b_id = try mgr.createTensor(.f32, &[_]usize{ MM_K, MM_N }, .{});
 
     const a_data = try alloc.alloc(f32, MM_M * MM_K);
     defer alloc.free(a_data);
@@ -857,13 +855,13 @@ fn buildNt(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n
         bv = try g.addInput(.q8_0, &.{ n, k });
         try g.bindExternal(bv, b_id);
     } else {
-        const b_id = try mgr.createTensor(.f32, &.{ n, k }, .{ });
+        const b_id = try mgr.createTensor(.f32, &.{ n, k }, .{});
         try mgr.writeFromPackedScalar(b_id, std.mem.sliceAsBytes(b_vals));
         bv = try g.addInput(.f32, &.{ n, k });
         try g.bindExternal(bv, b_id);
     }
 
-    const cv = try g.addMatMulNT(av, bv, 1.0, 0.0);
+    const cv = try g.addMatMul(av, try g.addViewTranspose2D(bv), 1.0, 0.0);
     return finishProg(alloc, &g, mgr, cv);
 }
 
@@ -902,7 +900,7 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
     try mgr.writeFromPackedQuant(b_id, packed_b);
     const bv = try g.addInput(.q8_0, &.{ n, k });
     try g.bindExternal(bv, b_id);
-    try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMulNT(av, bv, 1.0, 0.0)});
+    try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMul(av, try g.addViewTranspose2D(bv), 1.0, 0.0)});
 
     const order = gpu.GpuBackend.quant_block_order;
     const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, order));
@@ -955,6 +953,23 @@ fn buildNtF32Gemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 }
 test "gpu backend: matmul NT f32 GEMM (M=16) matches CPU" {
     try expectGpuMatchesCpu(buildNtF32Gemm, 16 * 50, 1e-4);
+}
+
+// Edge tiles on both sides of C, and a K that is no whole number of vec4s, so only
+// the scalar rows-B config is eligible; at M == 1 too, which the GEMV cannot take.
+fn buildNtF32GemmEdges(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 37, 70, 45, false);
+}
+fn buildNtF32OddK(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 1, 70, 45, false);
+}
+fn buildNtF32GemmAligned(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 128, 256, 128, false);
+}
+test "gpu backend: matmul NT f32 GEMM over B's rows matches CPU at edges and aligned" {
+    try expectGpuMatchesCpu(buildNtF32GemmEdges, 37 * 45, 1e-4);
+    try expectGpuMatchesCpu(buildNtF32OddK, 45, 1e-4);
+    try expectGpuMatchesCpu(buildNtF32GemmAligned, 128 * 128, 1e-3);
 }
 
 // B [200, 64] f32 is 50 KiB. Under a 16 KiB binding limit it is placed as 32-row
@@ -1319,7 +1334,6 @@ fn buildCastRoundtrip(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg
 test "gpu backend: cast f32->f16->f32 matches CPU" {
     try expectGpuMatchesCpu(buildCastRoundtrip, 32 * 64, 1e-6);
 }
-
 
 fn buildAttentionSeq(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);

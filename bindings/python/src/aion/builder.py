@@ -177,6 +177,11 @@ class TensorRef:
     def transpose2d(self) -> "TensorRef":
         return self._b.transpose2d(self)
 
+    @property
+    def T(self) -> "TensorRef":
+        """`transpose2d`, as NumPy spells it: `x @ w.T` over a `[out, in]` weight."""
+        return self._b.transpose2d(self)
+
     def cast(self, dtype: DTypeLike) -> "TensorRef":
         return self._b.cast(self, dtype)
 
@@ -579,11 +584,6 @@ class Builder:
     def matmul(self, a: TensorRef, b: TensorRef, alpha: float = 1.0, beta: float = 0.0) -> TensorRef:
         return self._emit(
             AionOp.AION_OP_MATMUL, (a, b), MatmulAttrs(alpha, beta)
-        )
-
-    def matmul_nt(self, a: TensorRef, b: TensorRef, alpha: float = 1.0, beta: float = 0.0) -> TensorRef:
-        return self._emit(
-            AionOp.AION_OP_MATMUL_NT, (a, b), MatmulAttrs(alpha, beta)
         )
 
     def _elemwise(self, op: AionBinaryOp, a: TensorRef, b: TensorRef) -> TensorRef:

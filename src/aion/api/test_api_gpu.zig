@@ -573,7 +573,7 @@ test "api: a loaded weight read by the host as a predicate matches cpu on gpu" {
         const cond = try bld.paramNamed(try ctx.from(&.{1}, &[_]i32{1}), "cond", .{});
         const w = try bld.paramNamed(try ctx.fromF32(&.{ 64, 64 }, &w_v), "w", .{ .quantize = .q8_0 });
         try bld.beginRegion();
-        const then_r = try bld.endRegion(&.{try bld.matmulNT(x, w, 1.0, 0.0)});
+        const then_r = try bld.endRegion(&.{try bld.matmul(x, try bld.transpose2d(w), 1.0, 0.0)});
         try bld.beginRegion();
         const else_r = try bld.endRegion(&.{x});
         const out = try bld.ifThenElse(cond, then_r, else_r);
@@ -699,7 +699,7 @@ test "api: a tied q8 table looks up the same rows on gpu and cpu" {
         const x = try bld.name(try bld.input(.f32, &.{ 2, 64 }), "x");
         const table = try bld.paramNamed(try ctx.fromF32(&.{ n, 64 }, &t_v), "table", .{ .quantize = .q8_0 });
         const rows = try bld.gather(table, ids, 0, 0);
-        const prod = try bld.matmulNT(x, table, 1.0, 0.0);
+        const prod = try bld.matmul(x, try bld.transpose2d(table), 1.0, 0.0);
         try ctx.exportModel(file, &bld, &.{ .{ .name = "rows", .tensor = rows }, .{ .name = "prod", .tensor = prod } }, .{});
     }
 

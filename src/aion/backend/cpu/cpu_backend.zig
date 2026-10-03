@@ -386,19 +386,22 @@ pub const CpuBackend = struct {
         }
     }
 
+    fn matmulCtx(self: *Self) exec_matmul.MatMulExecCtx {
+        return .{
+            .allocator = self.allocator,
+            .pool = if (self.pool) |*p| p else null,
+            .thread_count = self.thread_count,
+            .matmul_f32 = self.matmul_f32,
+            .matmul_q = self.matmul_q,
+            .matvec = self.matvec,
+            .matmul_scratch = self.matmul_scratch_f32,
+        };
+    }
+
     fn execStep(self: *Self, prog: *const executable.ExecutableProgram, step: executable.Step, store: tensor_store.TensorStore, cache: *exec_conv.ConvCache) ExecuteProgramError!void {
         switch (step) {
             .MatMul => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                var mm_ctx: exec_matmul.MatMulExecCtx = .{
-                    .allocator = self.allocator,
-                    .pool = pool_ptr,
-                    .thread_count = self.thread_count,
-                    .matmul_f32 = self.matmul_f32,
-                    .matmul_q = self.matmul_q,
-                    .matvec = self.matvec,
-                    .matmul_scratch = self.matmul_scratch_f32,
-                };
+                var mm_ctx = self.matmulCtx();
                 try exec_matmul.execMatMul(&mm_ctx, s, store);
             },
 
@@ -602,6 +605,10 @@ pub const CpuBackend = struct {
             },
 
             .MatMulNT => |s| {
+                if (try exec_matmul.gemmTakesNT(store, s)) {
+                    var mm_ctx = self.matmulCtx();
+                    return exec_matmul.execMatMulNT(&mm_ctx, s, store);
+                }
                 const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
                 const nt_ctx: exec_matmul_nt.MatMulNtExecCtx = .{
                     .matmul_nt = self.matmul_nt,

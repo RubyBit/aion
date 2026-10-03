@@ -356,6 +356,10 @@ pub const ThreadPool = struct {
         }
 
         // Wait for workers to finish: each publishes the sequence it completed.
+        // `submit_sleeping` and `done_seq` are a store-then-load pair on each side
+        // (see `publishTo`), so both go `seq_cst`: with release/acquire the worker
+        // could miss the flag while this side misses the store, and sleep forever
+        // if the futex compare runs before the store is visible.
         var w2: usize = 0;
         while (w2 < workers_job) : (w2 += 1) {
             const slot = &shared.worker_slots[w2];
@@ -363,8 +367,8 @@ pub const ThreadPool = struct {
             var spin: Spin = .{ .budget_ns = SUBMIT_SPIN_NS };
             while (slot.done_seq.load(.acquire) != want) {
                 if (spin.again()) continue;
-                slot.submit_sleeping.store(true, .release);
-                const seen = slot.done_seq.load(.acquire);
+                slot.submit_sleeping.store(true, .seq_cst);
+                const seen = slot.done_seq.load(.seq_cst);
                 if (seen != want) futexIo().futexWaitUncancelable(u32, &slot.done_seq.raw, seen);
                 slot.submit_sleeping.store(false, .release);
             }
@@ -421,8 +425,8 @@ pub const ThreadPool = struct {
 
             // Notify completion on this worker's own line.
             const slot = &shared.worker_slots[idx];
-            slot.done_seq.store(last_seq, .release);
-            if (slot.submit_sleeping.load(.acquire)) {
+            slot.done_seq.store(last_seq, .seq_cst);
+            if (slot.submit_sleeping.load(.seq_cst)) {
                 futexIo().futexWake(u32, &slot.done_seq.raw, 1);
             }
         }
@@ -545,16 +549,23 @@ fn expectedTidForIndex(index: usize, n: usize, thread_count_total: usize) usize 
     unreachable;
 }
 
+/// Wait for `flag` with a deadline in time, not tries: a test's own spinning
+/// threads can hold every core of a small CI runner, so a spin count says nothing
+/// about how long the other thread had to run.
 fn waitForBool(flag: *const std.atomic.Value(bool), expected: bool) !void {
-    var tries: usize = 0;
-    while (flag.load(.acquire) != expected) : (tries += 1) {
-        if (tries >= 50_000) return error.Timeout;
-        if ((tries & 255) == 0) {
-            std.Thread.yield() catch {};
-        } else {
-            std.atomic.spinLoopHint();
-        }
+    const deadline = nowNs() + 10 * std.time.ns_per_s;
+    while (flag.load(.acquire) != expected) {
+        if (nowNs() > deadline) return error.Timeout;
+        std.Thread.yield() catch {};
     }
+}
+
+/// Give a thread that should NOT get to run time to do so anyway. A sleep, not
+/// a count of yields: while the gated job spins on every core, each yield hands a
+/// whole scheduler quantum to a spinner, so 2048 of them on a one-core runner
+/// take minutes.
+fn settle() void {
+    std.Io.sleep(futexIo(), .fromMilliseconds(20), .awake) catch {};
 }
 
 fn yieldMany(count: usize) void {
@@ -565,11 +576,6 @@ fn yieldMany(count: usize) void {
 }
 
 fn shouldSkipThreadPoolTests() bool {
-    // This test suite can occasionally stall on some Windows environments.
-    // Allow users/CI to skip it deterministically.
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .windows) return false;
-
     return env_util.flagEnabled("AION_SKIP_THREAD_POOL_TESTS");
 }
 
@@ -792,26 +798,37 @@ test "thread pool: concurrent submissions serialize" {
         .callback_count = &callback_count_b,
     };
 
-    const submitter_a = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
+    // A failed check must still open the gate and join: returning would leave
+    // threads spinning on this frame, and `pool.deinit` waiting on submitter A.
+    var submitter_a: ?std.Thread = null;
+    var submitter_b: ?std.Thread = null;
+    errdefer {
+        gate_a.store(true, .release);
+        if (submitter_a) |t| t.join();
+        if (submitter_b) |t| t.join();
+    }
+    submitter_a = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
         .pool = &pool,
         .ctx = &ctx_a,
     }});
     try waitForBool(&entered_a, true);
 
-    const submitter_b = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
+    submitter_b = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
         .pool = &pool,
         .ctx = &ctx_b,
         .submit_entered = &submit_entered_b,
     }});
     try waitForBool(&submit_entered_b, true);
 
-    yieldMany(2048);
+    settle();
     try std.testing.expectEqual(@as(u32, 0), callback_count_b.load(.acquire));
     try std.testing.expect(!entered_b.load(.acquire));
 
     gate_a.store(true, .release);
-    submitter_a.join();
-    submitter_b.join();
+    submitter_a.?.join();
+    submitter_a = null;
+    submitter_b.?.join();
+    submitter_b = null;
 
     for (buf_a) |value| try std.testing.expectEqual(@as(u32, 11), value);
     for (buf_b) |value| try std.testing.expectEqual(@as(u32, 29), value);
@@ -944,26 +961,38 @@ test "thread pool: deinit waits for an active submission" {
         .gate = &gate,
     };
 
-    const submitter = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
+    // As above: on failure, release the job and finish the pool before returning.
+    var submitter: ?std.Thread = null;
+    var deinit_thread: ?std.Thread = null;
+    var pool_released = false;
+    errdefer {
+        gate.store(true, .release);
+        if (submitter) |t| t.join();
+        if (deinit_thread) |t| t.join() else if (!pool_released) pool.deinit();
+    }
+    submitter = try std.Thread.spawn(.{}, submit_job, .{SubmitArgs{
         .pool = &pool,
         .ctx = &ctx,
     }});
     try waitForBool(&started, true);
 
-    const deinit_thread = try std.Thread.spawn(.{}, deinit_pool, .{DeinitArgs{
+    deinit_thread = try std.Thread.spawn(.{}, deinit_pool, .{DeinitArgs{
         .pool = &pool,
         .started = &deinit_started,
         .done = &deinit_done,
     }});
     try waitForBool(&deinit_started, true);
 
-    yieldMany(2048);
+    settle();
     try std.testing.expect(!deinit_done.load(.acquire));
 
     gate.store(true, .release);
 
-    submitter.join();
-    deinit_thread.join();
+    submitter.?.join();
+    submitter = null;
+    deinit_thread.?.join();
+    deinit_thread = null;
+    pool_released = true;
     try std.testing.expect(deinit_done.load(.acquire));
 }
 

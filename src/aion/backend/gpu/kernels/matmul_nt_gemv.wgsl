@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-// Matvec for MatMulNT (M == 1, the decode hot path):
+// Matvec for MatMulNT (M == 1, the decode hot path; small M runs one per row):
 //   C[n] = alpha * sum_k A[k] * B[n, k]  +  beta * C[n]
 // with B either q8_0 [N, K] (blocks of an f16 scale + 32 i8, 34 bytes) or f32.
 //
@@ -25,7 +25,9 @@
 
 // b_wpr = u32 words per B row; k in elements; n = rows in this B chunk, whose
 // outputs start at cmat[c_off] (a B past the binding limit is chunked along N).
-struct Params { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32 };
+// a_off = the vec4 where this product's row of A starts, so a small-M product
+// runs as one dispatch per row of A.
+struct Params { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32, a_off: u32, _p0: u32 };
 
 const TPR: u32 = 32u; // lanes per output row
 const RPW: u32 = 8u;  // output rows per workgroup
@@ -81,7 +83,7 @@ fn gemv_q8(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
             let w0 = b[base];
             let d0 = unpack2x16float(w0).x;
             let d1 = unpack2x16float(b[base + 8u]).y;
-            let a0 = pi * 16u; // vec4 index of k = pi*64
+            let a0 = p.a_off + pi * 16u; // vec4 index of k = pi*64
 
             var s0 = 0.0;
             var prev = w0;
@@ -121,7 +123,7 @@ fn gemv_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
                 bitcast<f32>(b[o + 2u]),
                 bitcast<f32>(b[o + 3u]),
             );
-            acc += dot(bv, a[wj]);
+            acc += dot(bv, a[p.a_off + wj]);
         }
     }
 
@@ -156,7 +158,7 @@ fn lanesRow(wid: u32, lane: u32, slice: u32, slices: u32) -> f32 {
         let d = select(sw.x, sw.y, (lane & 1u) == 1u);
         let q0 = b4[seg + 4u + lane];
         let q1 = b4[seg + 4u + L_W + lane];
-        let av = kb * 8u;
+        let av = p.a_off + kb * 8u;
         let s = dot(i8x4f(q0.x), a[av]) + dot(i8x4f(q0.y), a[av + 1u]) + dot(i8x4f(q0.z), a[av + 2u]) + dot(i8x4f(q0.w), a[av + 3u])
               + dot(i8x4f(q1.x), a[av + 4u]) + dot(i8x4f(q1.y), a[av + 5u]) + dot(i8x4f(q1.z), a[av + 6u]) + dot(i8x4f(q1.w), a[av + 7u]);
         acc += d * s;

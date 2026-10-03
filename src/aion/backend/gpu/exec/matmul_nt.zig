@@ -7,9 +7,10 @@
 //! chunked along N; each chunk writes its columns of the one C.
 //!
 //! Two regimes, split on M:
-//!   - M == 1 (decode): bandwidth-bound matvec — `kernels/matmul_nt_gemv.wgsl`
-//!     reads B exactly once (dequant-in-registers for q8_0).
-//!   - M > 1 (prefill): compute-bound. An f32 B runs the autotuned GEMM that
+//!   - small M (decode, streaming chunks; see `gemvMaxM`): bandwidth-bound matvec —
+//!     `kernels/matmul_nt_gemv.wgsl` reads B once per row of A (dequant-in-
+//!     registers for q8_0), one dispatch per row.
+//!   - larger M (prefill): compute-bound. An f32 B runs the autotuned GEMM that
 //!     stages B from its rows (`Matmul.execRowsB`), so nothing is copied. A q8_0
 //!     B is dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM
 //!     runs on it. Scratch is reused across chunks; the frame's compute-pass
@@ -49,6 +50,14 @@ const LANES_W: u32 = 32;
 /// so a narrow projection still occupies the GPU (whose core count WebGPU does
 /// not expose).
 const LANES_WIDE_BELOW_GROUPS: u32 = 64;
+/// Up to this many rows of A, a product runs as one GEMV per row: B re-read per
+/// row still beats a GEMM whose tiles would be mostly empty rows. Measured on an
+/// RTX 4080 (N=1024, K=4096): a q8_0 GEMV row costs ~9 us against ~670 us for
+/// dequant-to-scratch + GEMM at any M <= 128; an f32 one ~14 us against
+/// ~330 us for the rows-B GEMM at M = 16.
+fn gemvMaxM(form: BForm) u32 {
+    return if (form == .f32) 16 else 32;
+}
 
 /// The grouping these kernels read fastest (`types.QuantBlockOrder`), which the
 /// device reports so its weights are laid out for it.
@@ -59,7 +68,7 @@ const BForm = enum { q8_pairs, q8_lanes32x16, f32 };
 const DEQUANT_WG: u32 = 64;
 
 /// Field order matches `struct Params` in matmul_nt_gemv.wgsl.
-const GemvParams = extern struct { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32 };
+const GemvParams = extern struct { k: u32, n: u32, b_wpr: u32, c_off: u32, alpha: f32, beta: f32, a_off: u32, _p0: u32 = 0 };
 /// Field order matches `struct Params` in dequant.wgsl.
 const DequantParams = extern struct { n: u32, k: u32, src_wpr: u32, dst_row: u32, count: u32, _p0: u32 = 0, _p1: u32 = 0, _p2: u32 = 0 };
 
@@ -146,8 +155,11 @@ pub const MatmulNt = struct {
             const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32x16 else .q8_pairs;
             // The GEMV reads A as vec4s; an f32 B of any other K takes the GEMM,
             // whose scalar config reads any.
-            if (m_total == 1 and k % 4 == 0) {
-                try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, c_off, form);
+            if (m_total <= gemvMaxM(form) and k % 4 == 0) {
+                var row: u32 = 0;
+                while (row < m_total) : (row += 1) {
+                    try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, row * (k / 4), row * c_row + c_off, form);
+                }
             } else if (form == .f32) {
                 try mm.execRowsB(ctx, frame, .{
                     .a = ctx.devmem.bufferFor(da.handle).?,
@@ -182,6 +194,7 @@ pub const MatmulNt = struct {
         k: u32,
         n_count: u32,
         b_wpr: u32,
+        a_off: u32,
         c_off: u32,
         form: BForm,
     ) ExecuteProgramError!void {
@@ -203,7 +216,7 @@ pub const MatmulNt = struct {
             ctx.devmem.bufferFor(dc.handle).?,
         };
         const sizes = [_]u64{ da.len, db.len, dc.len };
-        const params: GemvParams = .{ .k = k, .n = n_count, .b_wpr = b_wpr, .c_off = c_off, .alpha = s.alpha, .beta = s.beta };
+        const params: GemvParams = .{ .k = k, .n = n_count, .b_wpr = b_wpr, .c_off = c_off, .alpha = s.alpha, .beta = s.beta, .a_off = a_off };
         try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
     }
 

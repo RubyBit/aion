@@ -912,33 +912,45 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
 }
 
 // 2048 rows are 64 groups (the 8-slice GEMV); 64 rows are 2 (the 32-slice one);
-// M = 24 dequantizes the grouped B for the GEMM.
+// M = 24 runs that GEMV once per row; M = 40 dequantizes the grouped B for the GEMM.
 fn buildNtLanesGemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 1, 96, 2048);
 }
 fn buildNtLanesGemvNarrow(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 1, 96, 64);
 }
-fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+fn buildNtLanesGemvRows(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 24, 96, 64);
+}
+fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 40, 96, 64);
 }
 test "gpu backend: matmul NT q8_0 in the GPU's grouped order matches CPU" {
     try expectGpuMatchesCpuNmse(buildNtLanesGemv, 2048, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemvNarrow, 64, ntQ8MaxNmse(96));
-    try expectGpuMatchesCpuNmse(buildNtLanesGemm, 24 * 64, ntQ8MaxNmse(96));
+    try expectGpuMatchesCpuNmse(buildNtLanesGemvRows, 24 * 64, ntQ8MaxNmse(96));
+    try expectGpuMatchesCpuNmse(buildNtLanesGemm, 40 * 64, ntQ8MaxNmse(96));
 }
 
 test "gpu backend: matmul NT q8_0 matvec (M=1) matches CPU" {
     try expectGpuMatchesCpuNmse(buildNtQ8Gemv, 100, ntQ8MaxNmse(128));
 }
 
-// M > 1 exercises the dequant-to-scratch + f32 GEMM path (single edge-sized
+// A small M > 1 runs the matvec once per row of A.
+fn buildNtQ8GemvRows(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 3, 128, 100, true);
+}
+test "gpu backend: matmul NT q8_0 matvec per row (M=3) matches CPU" {
+    try expectGpuMatchesCpuNmse(buildNtQ8GemvRows, 3 * 100, ntQ8MaxNmse(128));
+}
+
+// A larger M exercises the dequant-to-scratch + f32 GEMM path (single edge-sized
 // output block under the 128x128 bounds-checked config).
 fn buildNtQ8Gemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
-    return buildNt(alloc, mgr, 24, 128, 100, true);
+    return buildNt(alloc, mgr, 40, 128, 100, true);
 }
-test "gpu backend: matmul NT q8_0 GEMM (M=24) matches CPU" {
-    try expectGpuMatchesCpuNmse(buildNtQ8Gemm, 24 * 100, ntQ8MaxNmse(128));
+test "gpu backend: matmul NT q8_0 GEMM (M=40) matches CPU" {
+    try expectGpuMatchesCpuNmse(buildNtQ8Gemm, 40 * 100, ntQ8MaxNmse(128));
 }
 
 fn buildNtF32Gemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -948,11 +960,18 @@ test "gpu backend: matmul NT f32 matvec (M=1) matches CPU" {
     try expectGpuMatchesCpu(buildNtF32Gemv, 50, 1e-4);
 }
 
-fn buildNtF32Gemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+fn buildNtF32GemvRows(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNt(alloc, mgr, 16, 64, 50, false);
 }
-test "gpu backend: matmul NT f32 GEMM (M=16) matches CPU" {
-    try expectGpuMatchesCpu(buildNtF32Gemm, 16 * 50, 1e-4);
+test "gpu backend: matmul NT f32 matvec per row (M=16) matches CPU" {
+    try expectGpuMatchesCpu(buildNtF32GemvRows, 16 * 50, 1e-4);
+}
+
+fn buildNtF32Gemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 24, 64, 50, false);
+}
+test "gpu backend: matmul NT f32 GEMM (M=24) matches CPU" {
+    try expectGpuMatchesCpu(buildNtF32Gemm, 24 * 50, 1e-4);
 }
 
 // Edge tiles on both sides of C, and a K that is no whole number of vec4s, so only
@@ -977,12 +996,16 @@ test "gpu backend: matmul NT f32 GEMM over B's rows matches CPU at edges and ali
 fn buildNtF32ChunkedGemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNt(alloc, mgr, 1, 64, 200, false);
 }
+fn buildNtF32ChunkedGemvRows(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 5, 64, 200, false);
+}
 fn buildNtF32ChunkedGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
-    return buildNt(alloc, mgr, 16, 64, 200, false);
+    return buildNt(alloc, mgr, 20, 64, 200, false);
 }
 test "gpu backend: matmul NT over a chunked weight matches CPU" {
     try expectGpuMatchesCpuChunked(buildNtF32ChunkedGemv, 200, 1e-4, 16 << 10);
-    try expectGpuMatchesCpuChunked(buildNtF32ChunkedGemm, 16 * 200, 1e-4, 16 << 10);
+    try expectGpuMatchesCpuChunked(buildNtF32ChunkedGemvRows, 5 * 200, 1e-4, 16 << 10);
+    try expectGpuMatchesCpuChunked(buildNtF32ChunkedGemm, 20 * 200, 1e-4, 16 << 10);
 }
 
 // ---- MatMul (plain, K-major q8_0 B) — the Gemma decode GEMV -----------------

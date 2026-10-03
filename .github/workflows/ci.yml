@@ -33,7 +33,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Zig test suite (CPU-only)
-        run: zig build test-fast -Dgpu=false
+        run: zig build test -Dgpu=false
 
       - uses: astral-sh/setup-uv@v5
 

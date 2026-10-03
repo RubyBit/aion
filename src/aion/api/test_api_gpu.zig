@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
-//! API-level device-selection tests. Built as its own artifact against the `aion`
-//! module (enable_gpu=true) — see `addApiGpuTest` in build.zig. Every test skips
+//! API-level device-selection tests. Part of the GPU test artifact against the
+//! `aion` module (enable_gpu=true) — see `src/tests_gpu.zig` and `addGpuTest` in
+//! build.zig. Every test skips
 //! cleanly (`error.SkipZigTest`) when no GPU adapter is present (headless CI).
 const std = @import("std");
 const aion = @import("aion");

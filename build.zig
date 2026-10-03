@@ -372,64 +372,32 @@ pub fn build(b: *std.Build) void {
     }
 
     // Unit tests.
-    // On this Zig snapshot, running the test artifact through Build's special
-    // `--listen=-` test runner mode can stall on Windows. The direct `zig test`
-    // path is the closest stable fallback and still honors the selected
-    // target/optimize settings.
-    // These raw commands capture graph.zig_exe, and setEnvironmentVariable
-    // copies the current process environment. Neither is relocatable across
-    // CI runners when setup-zig restores the configuration cache. Regenerate
-    // the configuration each invocation; compiled artifacts remain cached.
+    // setEnvironmentVariable (the wgpu run steps below) copies the current
+    // process environment, which is not relocatable across CI runners when
+    // setup-zig restores the configuration cache. Regenerate the configuration
+    // each invocation; compiled artifacts remain cached.
     b.graph.poisonCache();
-    const skip_thread_pool_tests: bool = b.option(
-        bool,
-        "skip-thread-pool-tests",
-        "Skip thread pool tests (avoids occasional Windows stalls)",
-    ) orelse false;
 
     const test_step = b.step("test", "Run tests");
     const test_build_options = b.addOptions();
     test_build_options.addOption(bool, "multiversion", false);
     test_build_options.addOption(bool, "enable_gpu", false);
 
-    const run_lib_tests = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "test",
-        "--cache-dir",
-        ".zig-cache",
-        optimizeArg(optimize),
+    const lib_tests = b.addTest(.{
+        .name = "aion-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "build_options", .module = test_build_options.createModule() }},
+        }),
     });
-    run_lib_tests.has_side_effects = true;
-    if (!target.query.isNativeTriple()) {
-        run_lib_tests.addArgs(&.{
-            "-target",
-            target.query.zigTriple(b.allocator) catch @panic("OOM"),
-        });
-    }
-    run_lib_tests.addPassthruArgs();
-    addRawTestModules(b, run_lib_tests, test_build_options);
-    if (skip_thread_pool_tests) run_lib_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
+    // Test processes run one at a time (the GPU suite below chains after this
+    // one): this Zig snapshot's build runner, on Windows, can miss a test
+    // child's final output while another test child is still running, and then
+    // fails the finished child with "test runner failed to respond" 60 s later.
+    const run_lib_tests = b.addRunArtifact(lib_tests);
     test_step.dependOn(&run_lib_tests.step);
-
-    const test_fast_step = b.step("test-fast", "Run tests (skip thread pool suite)");
-    const run_fast_tests = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "test",
-        "--cache-dir",
-        ".zig-cache",
-        optimizeArg(optimize),
-    });
-    run_fast_tests.has_side_effects = true;
-    if (!target.query.isNativeTriple()) {
-        run_fast_tests.addArgs(&.{
-            "-target",
-            target.query.zigTriple(b.allocator) catch @panic("OOM"),
-        });
-    }
-    run_fast_tests.addPassthruArgs();
-    addRawTestModules(b, run_fast_tests, test_build_options);
-    run_fast_tests.setEnvironmentVariable("AION_SKIP_THREAD_POOL_TESTS", "1");
-    test_fast_step.dependOn(&run_fast_tests.step);
 
     // ---------------------------------------------------------------------
     // Benchmarks.
@@ -465,30 +433,21 @@ pub fn build(b: *std.Build) void {
 
     // ---------------------------------------------------------------------
     // GPU backend test (the in-tree backend already compiled into `aion_mod`):
-    //   zig build gpu-test     — build and run the CPU-vs-GPU correctness test
+    //   zig build gpu-test     — build and run the GPU tests (kernels + public API)
     //   zig build gpu-check    — type-check only (used by zls build-on-save)
-    // The test also runs as part of `zig build test` / `test-fast` (it is its own
+    // The test also runs as part of `zig build test` (it is its own
     // artifact because it links wgpu-native; `-Dgpu=false` opts out entirely).
     // ---------------------------------------------------------------------
     if (wgpu_dep) |wd| {
         const gpu_check = b.step("gpu-check", "Type-check the GPU backend (for zls)");
-        const gpu_run = addGpuTest(b, target, optimize, aion_mod, wd, gpu_check);
+        const gpu_test = addGpuTest(b, target, optimize, aion_mod, gpu_check);
 
-        const gpu_test_step = b.step("gpu-test", "Build and run the GPU backend test");
-        gpu_test_step.dependOn(&gpu_run.step);
-
-        // API-level device-selection test (Context.gpus / compileOn(.gpu) / .to()).
-        // Must live in its own artifact against `aion_mod` (enable_gpu=true); the raw
-        // `test`/`test-fast` runner compiles `test_api.zig` with enable_gpu=false, so
-        // the GPU path would be comptime-pruned there.
-        const api_gpu_run = addApiGpuTest(b, target, optimize, aion_mod, wd, gpu_check);
-        gpu_test_step.dependOn(&api_gpu_run.step);
-
-        // Fold the GPU tests into the default test suites.
-        test_step.dependOn(&gpu_run.step);
-        test_fast_step.dependOn(&gpu_run.step);
-        test_step.dependOn(&api_gpu_run.step);
-        test_fast_step.dependOn(&api_gpu_run.step);
+        const gpu_test_step = b.step("gpu-test", "Build and run the GPU tests");
+        gpu_test_step.dependOn(&addSerialRun(b, wd, gpu_test, null).step);
+        // Fold the GPU tests into the default test suite, after the CPU suite
+        // (see `run_lib_tests`); `gpu-test` keeps its own run so it does not pull
+        // in the CPU suite.
+        test_step.dependOn(&addSerialRun(b, wd, gpu_test, &run_lib_tests.step).step);
 
         // CPU-vs-GPU benchmark (separate artifact for GPU-specific workloads).
         //   zig build gpu-bench -Doptimize=ReleaseFast -- --m 1024 --n 1024 --k 1024
@@ -622,27 +581,22 @@ fn wgpuDependency(b: *std.Build, target: std.Build.ResolvedTarget) ?WgpuDep {
 
 /// Keep the raw `zig test` runner workaround, but provide the generated options
 /// module that `cpu_backend.zig` imports directly.
-fn addRawTestModules(b: *std.Build, run: *std.Build.Step.Run, options: *std.Build.Step.Options) void {
-    run.addArgs(&.{ "--dep", "build_options" });
-    run.addPrefixedFileArg("-Mroot=", b.path("src/tests.zig"));
-    run.addPrefixedFileArg("-Mbuild_options=", options.getOutput());
-}
-
-/// The CPU-vs-GPU correctness test artifact. Its module imports the `aion` module
-/// (whose in-tree gpu backend already has the `wgpu` bindings and native link
-/// inputs); the test references `aion.gpu`, so its compilation pulls the gpu code.
+/// The GPU test artifact (`src/tests_gpu.zig`): the kernel-level CPU-vs-GPU suite
+/// and the public-API device tests. Its module imports the `aion` module (whose
+/// in-tree gpu backend already has the `wgpu` bindings and native link inputs, and
+/// is built with enable_gpu=true — the `test` runner's own `aion-test` is not, so
+/// the API's GPU paths would be comptime-pruned there).
 /// `check_step` gets a compile-only dependency for zls build-on-save; the returned
-/// run step is wired into `gpu-test` and the default test suites.
+/// artifact is run by `gpu-test` and the default test suite.
 fn addGpuTest(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     aion_mod: *std.Build.Module,
-    wd: WgpuDep,
     check_step: *std.Build.Step,
-) *std.Build.Step.Run {
+) *std.Build.Step.Compile {
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/aion/backend/gpu/test_gpu_backend.zig"),
+        .root_source_file = b.path("src/tests_gpu.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -650,37 +604,16 @@ fn addGpuTest(
     test_mod.addImport("aion", aion_mod);
 
     const gpu_test = b.addTest(.{ .name = "aion-gpu-test", .root_module = test_mod });
-    const run = b.addRunArtifact(gpu_test);
-    wd.prepareRun(b, run);
-
     check_step.dependOn(&gpu_test.step); // compile-only, for zls build-on-save
-    return run;
+    return gpu_test;
 }
 
-/// The API-level GPU device-selection test artifact. Imports `aion` (enable_gpu=true)
-/// and drives the public `Context` device API (`.gpus`, `compileOn(.gpu)`, `.to()`).
-/// Skips at runtime when no adapter is present.
-fn addApiGpuTest(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    aion_mod: *std.Build.Module,
-    wd: WgpuDep,
-    check_step: *std.Build.Step,
-) *std.Build.Step.Run {
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/aion/api/test_api_gpu.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    test_mod.addImport("aion", aion_mod);
-
-    const api_gpu_test = b.addTest(.{ .name = "aion-api-gpu-test", .root_module = test_mod });
-    const run = b.addRunArtifact(api_gpu_test);
+/// Run a GPU test artifact, after `after` when given, so test processes never
+/// overlap (see `run_lib_tests` in `build`).
+fn addSerialRun(b: *std.Build, wd: WgpuDep, artifact: *std.Build.Step.Compile, after: ?*std.Build.Step) *std.Build.Step.Run {
+    const run = b.addRunArtifact(artifact);
     wd.prepareRun(b, run);
-
-    check_step.dependOn(&api_gpu_test.step); // compile-only, for zls build-on-save
+    if (after) |step| run.step.dependOn(step);
     return run;
 }
 
@@ -743,11 +676,3 @@ fn addGpuBench(
     return run;
 }
 
-fn optimizeArg(optimize: std.builtin.OptimizeMode) []const u8 {
-    return switch (optimize) {
-        .Debug => "-ODebug",
-        .ReleaseSafe => "-OReleaseSafe",
-        .ReleaseFast => "-OReleaseFast",
-        .ReleaseSmall => "-OReleaseSmall",
-    };
-}

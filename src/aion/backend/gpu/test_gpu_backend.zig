@@ -5,8 +5,8 @@
 //! and asserts the outputs match — proving the kernels + residency + dispatch
 //! are correct end-to-end on real hardware.
 //!
-//! Built as its own test artifact (it links wgpu-native), wired into
-//! `zig build test` / `test-fast` when `-Dgpu` is on. When no GPU adapter is
+//! Part of the GPU test artifact (`src/tests_gpu.zig`; it links wgpu-native),
+//! wired into `zig build test` when `-Dgpu` is on. When no GPU adapter is
 //! available (headless CI), the test skips itself rather than failing.
 //!
 //! Tests request the HIGH-POWER adapter so a discrete GPU (the primary deploy

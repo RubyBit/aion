@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 const std = @import("std");
-const env_util = @import("../env.zig");
 
 const worker_slot_cache_line_bytes: usize = 64;
 const worker_slot_padding_bytes: usize = if (@sizeOf(std.atomic.Value(u32)) < worker_slot_cache_line_bytes)
@@ -575,16 +574,7 @@ fn yieldMany(count: usize) void {
     }
 }
 
-fn shouldSkipThreadPoolTests() bool {
-    return env_util.flagEnabled("AION_SKIP_THREAD_POOL_TESTS");
-}
-
-fn skipIfRequested() !void {
-    if (shouldSkipThreadPoolTests()) return error.SkipZigTest;
-}
-
 test "thread pool: deterministic partitioning across shapes" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -651,7 +641,6 @@ test "thread pool: deterministic partitioning across shapes" {
 }
 
 test "thread pool: dynamic claiming runs every index exactly once" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -692,7 +681,6 @@ test "thread pool: dynamic claiming runs every index exactly once" {
 }
 
 test "thread pool: repeated init and deinit remains stable" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     const Ctx = struct {
@@ -728,7 +716,6 @@ test "thread pool: repeated init and deinit remains stable" {
 }
 
 test "thread pool: concurrent submissions serialize" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -835,7 +822,6 @@ test "thread pool: concurrent submissions serialize" {
 }
 
 test "thread pool: nested same-pool submission runs inline on caller tid" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });
@@ -904,7 +890,6 @@ test "thread pool: nested same-pool submission runs inline on caller tid" {
 }
 
 test "thread pool: deinit waits for an active submission" {
-    try skipIfRequested();
     const allocator: std.mem.Allocator = std.testing.allocator;
 
     var pool = try ThreadPool.init(allocator, .{ .thread_count = 4 });

@@ -56,6 +56,7 @@ pub const Error = error{
 /// exhaustive by construction. Call through it as `fns.wgpuXxx(args)`.
 /// Handrolled because std.DynLib is @compileError on win
 const Procs = struct {
+    wgpuAdapterGetCooperativeMatrixProperties: *const @TypeOf(c.wgpuAdapterGetCooperativeMatrixProperties),
     wgpuAdapterGetInfo: *const @TypeOf(c.wgpuAdapterGetInfo),
     wgpuAdapterGetLimits: *const @TypeOf(c.wgpuAdapterGetLimits),
     wgpuAdapterHasFeature: *const @TypeOf(c.wgpuAdapterHasFeature),
@@ -87,7 +88,7 @@ const Procs = struct {
     wgpuDeviceCreateCommandEncoder: *const @TypeOf(c.wgpuDeviceCreateCommandEncoder),
     wgpuDeviceCreateComputePipeline: *const @TypeOf(c.wgpuDeviceCreateComputePipeline),
     wgpuDeviceCreateQuerySet: *const @TypeOf(c.wgpuDeviceCreateQuerySet),
-    wgpuDeviceCreateShaderModule: *const @TypeOf(c.wgpuDeviceCreateShaderModule),
+    wgpuDeviceCreateShaderModuleTrusted: *const @TypeOf(c.wgpuDeviceCreateShaderModuleTrusted),
     wgpuDeviceGetLimits: *const @TypeOf(c.wgpuDeviceGetLimits),
     wgpuDeviceGetQueue: *const @TypeOf(c.wgpuDeviceGetQueue),
     wgpuDevicePoll: *const @TypeOf(c.wgpuDevicePoll),
@@ -369,6 +370,15 @@ pub const Limits = struct {
     /// `maxComputeInvocationsPerWorkgroup` — threads per workgroup.
     max_invocations: u32 = 256,
     max_workgroup_size_x: u32 = 256,
+    /// The device multiplies 8x8 f32 tiles on its matrix units (wgpu's
+    /// cooperative matrices: Apple's simdgroup matrices), the configuration the
+    /// matrix kernels are written for (`Gpu.hasMatrixF32`).
+    // TODO: NVIDIA's tensor cores take f16 tiles (16x16, f32 accumulation), which
+    // need their own kernel variants; naga 29 types that product wrongly on Metal
+    // (fixed in gfx-rs/wgpu#9629, wgpu 30). On the M5, f16 tiles run at the f32
+    // rate (2.87 vs 2.75 TFLOPS on a 2048^3 GEMM), so they would only save memory
+    // traffic there.
+    matrix_f32: bool = false,
 
     fn fromWgpu(l: c.WGPULimits) Limits {
         var out: Limits = .{};
@@ -411,17 +421,21 @@ pub const Gpu = struct {
         // shader-f16 is required, not probed: f16 tensors are bound as `array<f16>`.
         if (fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_ShaderF16) == 0) return Error.NoShaderF16;
 
-        const want_timestamps = fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0;
-        var timestamp_query = want_timestamps;
-        const lim: ?*const c.WGPULimits = if (have_adapter_limits) &adapter_limits else null;
-        const device = requestDevice(instance, adapter, lim, timestamp_query) orelse
-            requestDevice(instance, adapter, null, timestamp_query) orelse fallback: {
-            // A buggy adapter may advertise TimestampQuery but reject it at
-            // device creation. Profiling is optional; device execution is not.
-            timestamp_query = false;
-            break :fallback requestDevice(instance, adapter, lim, false) orelse
-                (requestDevice(instance, adapter, null, false) orelse return Error.NoDevice);
+        const wanted: Optional = .{
+            .timestamps = fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0,
+            .matrix = Optional.can_enable_experimental and hasMatrixF32(adapter),
         };
+        const lim: ?*const c.WGPULimits = if (have_adapter_limits) &adapter_limits else null;
+        // An adapter may advertise an optional feature and still reject it at
+        // device creation (a runtime library older than these headers refuses
+        // experimental ones). Neither is needed to execute, so they are dropped
+        // in turn: the matrix units first, then profiling.
+        const attempts = [_]Optional{ wanted, .{ .timestamps = wanted.timestamps }, .{} };
+        var optional: Optional = .{};
+        const device = for (attempts) |attempt| {
+            optional = attempt;
+            if (requestDevice(instance, adapter, lim, attempt) orelse requestDevice(instance, adapter, null, attempt)) |d| break d;
+        } else return Error.NoDevice;
         errdefer fns.wgpuDeviceRelease(device);
 
         // Re-query the GRANTED limits (may be the requested ones, or defaults).
@@ -430,18 +444,54 @@ pub const Gpu = struct {
         if (fns.wgpuDeviceGetLimits(device, &dev_limits) == c.WGPUStatus_Success) {
             granted = Limits.fromWgpu(dev_limits);
         }
+        granted.matrix_f32 = optional.matrix;
 
         const queue = fns.wgpuDeviceGetQueue(device);
-        return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted, .timestamp_query = timestamp_query };
+        return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted, .timestamp_query = optional.timestamps };
+    }
+
+    /// Features a device is opened with when the adapter has them.
+    const Optional = struct {
+        timestamps: bool = false,
+        matrix: bool = false,
+
+        /// Cooperative matrices are experimental in wgpu, which a device has to
+        /// opt into; headers without the switch cannot ask for them.
+        const can_enable_experimental = @hasField(c.WGPUDeviceExtras, "experimentalFeaturesEnabled");
+    };
+
+    /// Whether `adapter` multiplies 8x8 f32 tiles into f32, the one configuration
+    /// the matrix kernels use. The cooperative-matrix feature alone does not say:
+    /// it is set for any configuration (on Vulkan often only 16x16 f16).
+    fn hasMatrixF32(adapter: c.WGPUAdapter) bool {
+        if (fns.wgpuAdapterHasFeature(adapter, c.WGPUNativeFeature_CooperativeMatrix) == 0) return false;
+        const n = fns.wgpuAdapterGetCooperativeMatrixProperties(adapter, null);
+        const props = std.heap.page_allocator.alloc(c.WGPUCooperativeMatrixProperties, n) catch return false;
+        defer std.heap.page_allocator.free(props);
+        _ = fns.wgpuAdapterGetCooperativeMatrixProperties(adapter, props.ptr);
+        for (props) |p| {
+            if (p.mSize == 8 and p.nSize == 8 and p.kSize == 8 and
+                p.abType == c.WGPUCooperativeScalarType_F32 and p.crType == c.WGPUCooperativeScalarType_F32) return true;
+        }
+        return false;
     }
 
     /// Request a device from `adapter` with optional `required` limits. Returns null
     /// on timeout/failure (caller decides whether to retry with relaxed limits).
-    fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits, timestamps: bool) ?c.WGPUDevice {
+    fn requestDevice(instance: c.WGPUInstance, adapter: c.WGPUAdapter, required: ?*const c.WGPULimits, optional: Optional) ?c.WGPUDevice {
         var desc: c.WGPUDeviceDescriptor = std.mem.zeroes(c.WGPUDeviceDescriptor);
         desc.requiredLimits = required;
-        var required_features = [_]c.WGPUFeatureName{ c.WGPUFeatureName_ShaderF16, c.WGPUFeatureName_TimestampQuery };
-        desc.requiredFeatureCount = if (timestamps) required_features.len else 1;
+        var required_features: [3]c.WGPUFeatureName = undefined;
+        required_features[0] = c.WGPUFeatureName_ShaderF16;
+        desc.requiredFeatureCount = 1;
+        if (optional.timestamps) {
+            required_features[desc.requiredFeatureCount] = c.WGPUFeatureName_TimestampQuery;
+            desc.requiredFeatureCount += 1;
+        }
+        if (optional.matrix) {
+            required_features[desc.requiredFeatureCount] = c.WGPUNativeFeature_CooperativeMatrix;
+            desc.requiredFeatureCount += 1;
+        }
         desc.requiredFeatures = &required_features;
         // Shrink the allocator's suballocation blocks. wgpu's default hint
         // (Performance) commits 128 MiB device + 64 MiB host blocks for the
@@ -450,17 +500,18 @@ pub const Gpu = struct {
         // steps. Manual growth 4->256 MiB keeps the idle footprint ~17 MiB
         // while steady-state blocks still reach full size, and load-time (not
         // per-frame) allocation makes the extra block count free. Guarded:
-        // upstream wgpu-native doesn't expose memoryHints yet (PR pending), so
-        // this compiles to a no-op against an unpatched header.
+        // headers from before wgpu-native#619 have no memoryHints, so this
+        // compiles to a no-op against them.
         var extras: c.WGPUDeviceExtras = std.mem.zeroes(c.WGPUDeviceExtras);
+        extras.chain.sType = c.WGPUSType_DeviceExtras;
+        desc.nextInChain = &extras.chain;
         if (comptime @hasField(c.WGPUDeviceExtras, "memoryHints")) {
             const MiB = 1024 * 1024;
-            extras.chain.sType = c.WGPUSType_DeviceExtras;
             extras.memoryHints = c.WGPUMemoryHints_Manual;
             extras.suballocatedDeviceMemoryBlockSizeStart = 4 * MiB;
             extras.suballocatedDeviceMemoryBlockSizeEnd = 256 * MiB;
-            desc.nextInChain = &extras.chain;
         }
+        if (comptime Optional.can_enable_experimental) extras.experimentalFeaturesEnabled = @intFromBool(optional.matrix);
         var dreq: DeviceReq = .{};
         _ = fns.wgpuAdapterRequestDevice(adapter, &desc, .{
             .nextInChain = null,
@@ -561,6 +612,27 @@ pub const Gpu = struct {
             std.Io.sleep(io, .fromNanoseconds(MAP_SLICE_NS), .awake) catch {};
         }
         if (mreq.status != c.WGPUMapAsyncStatus_Success) return Error.MapFailed;
+    }
+
+    /// Block until everything submitted has run, returning within a slice of its
+    /// completion: the same spin-then-sleep as `mapBlocking`, for a caller timing
+    /// the work, whom a whole-millisecond wait inside wgpu would blur.
+    pub fn waitIdle(self: *Gpu) void {
+        const start = profile.nowNs();
+        var spins: usize = 0;
+        while (!self.pollIdle()) : (spins += 1) {
+            if (spins % 64 == 0 and profile.nowNs() - start > MAP_SPIN_NS) break;
+        }
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (!self.pollIdle()) {
+            if (profile.nowNs() - start > MAP_TIMEOUT_NS) return;
+            std.Io.sleep(io, .fromNanoseconds(MAP_SLICE_NS), .awake) catch {};
+        }
+    }
+
+    /// One non-blocking poll; true once the queue has nothing left to run.
+    fn pollIdle(self: *Gpu) bool {
+        return fns.wgpuDevicePoll(self.device, 0, null) != 0;
     }
 
     /// One non-blocking poll; true once the map's callback has fired.

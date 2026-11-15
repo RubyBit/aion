@@ -12,6 +12,7 @@ const pipelines = @import("pipelines.zig");
 const device_store = @import("../../runtime/device_store.zig");
 const tensor_store = @import("../../runtime/tensor_store.zig");
 const Frame = @import("frame.zig").Frame;
+const autotune = @import("autotune.zig");
 
 pub const Ctx = struct {
     gpu: *wgpu.Gpu,
@@ -27,6 +28,8 @@ pub const Ctx = struct {
     /// one frame: dispatches in a pass are ordered, and each multi-stage op
     /// consumes its partials before the next op overwrites them.
     scratch: *ScratchPool,
+    /// The kernel choices timed on this device so far (see `autotune.zig`).
+    tune: *autotune.Tuner,
 };
 
 pub const I32Lease = struct {

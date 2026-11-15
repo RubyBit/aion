@@ -1699,17 +1699,17 @@ pub const Model = struct {
             const slot_tid = if (self.inputAliasOutputIndex(sig_idx) != null)
                 // Share recurrent state across cache entries.
                 try self.ensureAliasedStateSlot(sig_idx, concrete_shape)
-            else if (self.target.device.kind != .cpu and !inputIsHostOnly(graph, in_ids[sig_idx])) blk: {
-                // A GPU program binds a stable device slot, never the caller's
-                // host tensor. `run()` performs the explicit H2D copy into this
-                // slot, so execution has one backing and no staged-input cache.
+            else if (self.target.device.kind != .cpu) blk: {
+                // A GPU program binds a stable slot of its own, never the caller's
+                // tensor; `run()` copies into it. The slot starts on the host and
+                // placement decides: it stays there when the host reads it (a control
+                // predicate, the indices of a host lookup), and materialization moves
+                // it to the device otherwise.
                 const tid = try self.store.createTensor(self.input_signatures[sig_idx].dtype, concrete_shape, .{});
                 owned_input_slots.append(self.allocator, tid) catch {
                     self.store.releaseTensorData(tid) catch {};
                     return error.OutOfMemory;
                 };
-                self.migrateStateSlotToDevice(tid, self.input_signatures[sig_idx].dtype, concrete_shape);
-                if ((self.store.tensorDevice(tid) catch DeviceRef{}).kind == .cpu) return error.InvalidArgument;
                 break :blk tid;
             } else blk: {
                 const tid = direct_input_ids[sig_idx];
@@ -1750,31 +1750,6 @@ pub const Model = struct {
             .program = program,
             .workspace_bytes = workspace_bytes,
         };
-    }
-
-    /// Whether every use of `value` is a position the executor resolves on the HOST.
-    ///
-    /// Today that is only an `If` predicate (`inputs[0]`). Such an input's slot stays
-    /// on the host for a GPU model: uploading it would only force placement to insert
-    /// a readback to get it again, and that readback is a full pipeline flush plus a
-    /// map/poll — far more than the model's whole per-step dispatch cost.
-    fn inputIsHostOnly(graph: *const graph_mod.Graph, value: graph_mod.ValueId) bool {
-        var seen_use = false;
-        for (graph.nodes.items) |node| {
-            for (node.inputs, 0..) |input, pos| {
-                if (input != value) continue;
-                seen_use = true;
-                const host_pos = node.op == .If and pos == 0;
-                if (!host_pos) return false;
-            }
-        }
-        for (graph.regions.items) |region| {
-            for (region.nodes) |node| {
-                for (node.inputs) |input| if (input == value) return false;
-            }
-        }
-        for (graph.outputs.items) |out| if (out == value) return false;
-        return seen_use;
     }
 
     /// Return or lazily allocate the shared slot for an io-aliased input.

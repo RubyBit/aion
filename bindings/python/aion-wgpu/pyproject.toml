@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
 name = "aion-wgpu"
 # Versioned after the wgpu-native release it wraps (see build.zig.zon). Keep the
 # major in sync with the `aion-engine[gpu]` extra's `aion-wgpu>=X,<X+1` constraint.
-version = "29.0.4"
+version = "29.0.4.post1"
 description = "Prebuilt wgpu-native runtime for the optional GPU backend of aion"
 readme = "README.md"
 requires-python = ">=3.8"

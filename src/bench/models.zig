@@ -129,9 +129,12 @@ pub const Ablate = struct {
     /// norm and residual. NOTE this also removes 2 weights per layer, so
     /// `stream_bytes` falls -- it sizes the PLI machinery, not just its dispatches.
     pli: bool = false,
+    /// Drop the feed-forward block (gate, up, GEGLU, down): its normed input goes
+    /// straight to the residual. Removes 3 weights per layer, like `pli` removes 2.
+    ffn: bool = false,
 
     pub fn any(self: Ablate) bool {
-        return self.attn or self.norms or self.norms_compute or self.scales or self.rope or self.kv_write or self.pli;
+        return self.attn or self.norms or self.norms_compute or self.scales or self.rope or self.kv_write or self.pli or self.ffn;
     }
 };
 
@@ -493,10 +496,12 @@ pub fn gemma4E2BDecode(
         // Match the model's separate gate/up projections and authored GEGLU gate, so
         // the passes see the production graph pattern.
         const ff_in = try ctx.rms(x, embed);
-        const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
-        const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
-        const act = try g.addElemwiseBinary(.mul, try g.addUnary(.gelu, gate), up);
-        const ff = try g.addMatMul(act, try ctx.weight(ffn, embed), 1.0, 0.0);
+        const ff = if (opts.ablate.ffn) ff_in else blk: {
+            const gate = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
+            const up = try g.addMatMul(ff_in, try ctx.weight(embed, ffn), 1.0, 0.0);
+            const act = try g.addElemwiseBinary(.mul, try g.addUnary(.gelu, gate), up);
+            break :blk try g.addMatMul(act, try ctx.weight(ffn, embed), 1.0, 0.0);
+        };
         x = try g.addElemwiseBinary(.add, x, try ctx.rms(ff, embed));
 
         // Per-layer input: gate against this layer's slice of the PLI tensor.
@@ -543,7 +548,8 @@ pub fn gemma4E2BDecode(
 /// whole cache with head_dim 512.
 pub const AttnKind = enum { local, global };
 
-/// Build repeated attention at the model's decode shapes and dtypes.
+/// Build repeated attention at the model's shapes and dtypes, for `seq` query
+/// positions ending at the last cache slot: 1 is a decode step, more a prefill.
 /// Repetition in one program amortizes fixed execution overhead so a sweep can recover
 /// per-operation cost from the slope.
 pub fn gemma4Attention(
@@ -551,6 +557,7 @@ pub fn gemma4Attention(
     mgr: *StorageManager,
     kind: AttnKind,
     ctx_len: usize,
+    seq: usize,
     repeat: usize,
     target: aion.program.Target,
     dev: ?aion.device_memory.DeviceMemory,
@@ -572,14 +579,18 @@ pub fn gemma4Attention(
     const t_len: usize = if (kind == .global) ctx_len else G4.local_sliding_window;
     const win: aion.graph.AttentionWindow = if (kind == .global) .causal else .sliding(G4.local_sliding_window - 1, 0);
 
-    const q_shape = [_]usize{ 1, 1, G4.num_heads, head_dim };
+    if (seq == 0 or seq > t_len) return error.InvalidShape;
+    const q_shape = [_]usize{ 1, seq, G4.num_heads, head_dim };
     const q_id = try mgr.createTensor(.f32, &q_shape, .{});
     try fillF32Pattern(mgr, q_id, 1);
     const q = try g.addInput(.f32, &q_shape);
     try g.bindExternal(q, q_id);
     try ctx.place(q_id);
 
-    const positions = try ctx.i32In(&.{ 1, 1 }, &.{@intCast(t_len - 1)});
+    const pos_vals = try alloc.alloc(i32, seq);
+    defer alloc.free(pos_vals);
+    for (pos_vals, t_len - seq..) |*v, t| v.* = @intCast(t);
+    const positions = try ctx.i32In(&.{ 1, seq }, pos_vals);
     const kv_len = try ctx.i32In(&.{1}, &.{@intCast(t_len)});
 
     // Chain each attention from the previous output to measure critical-path latency;

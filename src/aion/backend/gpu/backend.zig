@@ -14,6 +14,8 @@
 //!     values before execution; the executor has no host-staging fallback.
 //!   - Transfers are explicit executable steps. Host control reads can only see
 //!     CPU mirrors produced by those steps, while kernels only see device buffers.
+//!   - A lookup the compiler placed on the host runs the CPU kernel on host
+//!     values; its rows reach the device through a transfer like any other.
 //!   - Each `executeProgram` records dispatches into a `Frame` and submits once
 //!     except where an explicit control transfer requires synchronization.
 //!   - WGSL kernels are cached via `Pipelines` (module per kernel, pipeline +
@@ -47,12 +49,14 @@ const conv_exec = @import("exec/conv.zig");
 const lstm_exec = @import("exec/lstm.zig");
 const fft_ops = @import("exec/fft_ops.zig");
 const view_ops = @import("exec/view_ops.zig");
+const autotune = @import("autotune.zig");
 const matmul_exec = @import("exec/matmul.zig");
 const matmul_nt = @import("exec/matmul_nt.zig");
 const frame_mod = @import("frame.zig");
 const timestamp_profile = @import("timestamp_profile.zig");
 const TimestampProfiler = timestamp_profile.TimestampProfiler;
 const backend_mod = @import("../backend.zig");
+const host_gather = @import("../cpu/exec/gather.zig");
 const types = @import("../types.zig");
 const executable = @import("../../runtime/executable.zig");
 const tensor_store_mod = @import("../../runtime/tensor_store.zig");
@@ -84,8 +88,17 @@ pub const GpuBackend = struct {
     devmem: wgpu_dm.WgpuDeviceMemory,
     pipes: pipelines_mod.Pipelines,
 
-    /// Matmul executor owns the per-shape autotune cache.
+    /// Matmul executor: the kernel menus a GEMM or conv chooses from.
     matmul: matmul_exec.Matmul,
+
+    /// The kernel choices timed on this device so far (see `autotune.zig`).
+    tune: autotune.Tuner,
+
+    /// Steps recorded between submits. Submitting does not wait: the GPU starts
+    /// on early chunks while the CPU records later ones, overlapping the record
+    /// cost with execution. 32 was swept on device against 8/16/64/128/unbounded:
+    /// larger chunks lose the overlap and smaller ones submit too often.
+    submit_chunk: usize = 32,
 
     /// MatMulNT executor (q8_0/f32 weights): GEMV for M==1; for M>1 the rows-B
     /// GEMM (f32), or dequant-to-scratch + the f32 GEMM (q8_0). Owns the pooled
@@ -127,6 +140,7 @@ pub const GpuBackend = struct {
             .devmem = wgpu_dm.WgpuDeviceMemory.init(allocator, gpu),
             .pipes = pipelines_mod.Pipelines.init(allocator, gpu),
             .matmul = matmul_exec.Matmul.init(allocator),
+            .tune = autotune.Tuner.init(allocator),
             .uniform_pool = .{ .gpu = gpu, .allocator = allocator },
             .bind_cache = .{ .gpu = gpu, .allocator = allocator },
             .profile_config = profile_mod.Config.fromEnv(),
@@ -143,6 +157,7 @@ pub const GpuBackend = struct {
 
     pub fn deinit(self: *Self) void {
         self.matmul.deinit();
+        self.tune.deinit();
         self.nt.deinit();
         self.scratch.deinit();
         self.pipes.deinit();
@@ -337,7 +352,8 @@ pub const GpuBackend = struct {
             defer r.frame.profile_op = previous_op;
             const generic_profile = r.profiler != null and r.depth == 0;
             const t0: u64 = if (generic_profile) profile_mod.nowNs() else 0;
-            r.dispatchStep(step) catch |e| {
+            const on_host = placed.placement.kind == .cpu and step != .Transfer;
+            (if (on_host) r.runHostStep(step) else r.dispatchStep(step)) catch |e| {
                 diagnostic.current().recordStep("gpu", placed, e);
                 if (env_util.flagEnabled("AION_GPU_TRACE")) {
                     std.debug.print("[gpu] step {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(step)), @errorName(e) });
@@ -377,6 +393,20 @@ pub const GpuBackend = struct {
             };
             if (generic_profile) {
                 if (r.cpu_track) |track| r.profiler.?.recordSpan(track, .operation, @tagName(step), t0, profile_mod.nowNs());
+            }
+        }
+
+        /// A lookup the compiler placed on the host (`placement.hostLookups`): its
+        /// table and indices live there, so the CPU kernel reads them in place and
+        /// the `Transfer` that follows carries the rows over. It touches no device
+        /// state, so it is not an ordering point.
+        fn runHostStep(r: *Runner, step: executable.Step) ExecuteProgramError!void {
+            const host = r.op_ctx.control.host;
+            switch (step) {
+                .GatherRows => |s| try host_gather.execGatherRows(null, 1, s, host),
+                .Gather => |s| try host_gather.execGather(s, host),
+                .GatherND => |s| try host_gather.execGatherND(s, host),
+                else => return error.Unsupported,
             }
         }
 
@@ -562,6 +592,7 @@ pub const GpuBackend = struct {
                 .store = session.deviceStore(),
                 .control = .{ .host = session.host },
                 .scratch = &self.scratch,
+                .tune = &self.tune,
             },
             .prog = prog,
             .frame = try Frame.init(self.allocator, self.gpu),
@@ -581,22 +612,15 @@ pub const GpuBackend = struct {
 
         const t_start: u64 = if (generic_profile) profile_mod.nowNs() else 0;
 
-        // Chunked submit: flush the pending frame every SUBMIT_CHUNK steps
-        // (submit WITHOUT polling — queue ordering + wgpu's cross-submit resource
-        // tracking preserve correctness). The GPU starts executing early chunks
-        // while the CPU is still recording later ones, overlapping the ~10ms of
-        // per-dispatch record cost with the GPU execution instead of paying them
-        // back-to-back. For a program with control flow the inner submitPending
-        // calls already split frames; this just adds periodic flushes.
-        //
-        // 32 was swept on device against 8/16/64/128/unbounded: larger chunks lose the
-        // record/execute overlap and smaller ones submit too often.
-        const SUBMIT_CHUNK: usize = 32;
+        // Chunked submit (see `submit_chunk`): queue ordering and wgpu's
+        // cross-submit resource tracking preserve correctness. For a program with
+        // control flow the inner submitPending calls already split frames; this
+        // just adds periodic flushes.
         var since_submit: usize = 0;
         for (prog.steps) |placed| {
             try runner.runStep(placed);
             since_submit += 1;
-            if (since_submit >= SUBMIT_CHUNK) {
+            if (since_submit >= self.submit_chunk) {
                 const t_chunk_submit: u64 = if (generic_profile) profile_mod.nowNs() else 0;
                 runner.submitPending() catch |e| {
                     if (env_util.flagEnabled("AION_GPU_TRACE"))

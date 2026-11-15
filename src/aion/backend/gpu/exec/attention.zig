@@ -23,6 +23,8 @@ const std = @import("std");
 const wgpu = @import("../wgpu.zig");
 const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
+const autotune = @import("../autotune.zig");
+const attention_mx = @import("attention_mx.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const device_store = @import("../../../runtime/device_store.zig");
@@ -49,32 +51,35 @@ const MAX_DV: u32 = 1024;
 // ---------------------------------------------------------------------------
 // Row-block and split-K tuning.
 //
-// HEURISTICS, measured on an RTX 4080 Laptop (Vulkan) 2026-07-30 — deliberately NOT in
-// `autotune.zig`, which exists for the matmul candidate MENU where the right tiling is
-// genuinely device- and shape-dependent and worth timing on device. These are static
-// parameters feeding a shape-adaptive rule (`chooseRowBlock`). Re-tune with
-// `gpu-bench --suite kernels --op attn_seq|attn_cached|attn_window|relpos_mha|
-// relpos_chunked`, and mind the clock-ramp trap that `bench_gpu.warmUp` exists for.
+// How many workgroups fill the device is timed on it (`BLOCK_TARGETS`,
+// `chooseSplit`). The rest are HEURISTICS, measured on an RTX 4080 Laptop (Vulkan)
+// 2026-07-30: static parameters feeding a shape-adaptive rule (`planSplit`).
+// Re-tune with `gpu-bench --suite kernels --op attn_seq|attn_cached|attn_window|
+// relpos_mha|relpos_chunked`, and mind the clock-ramp trap that `bench_gpu.warmUp`
+// exists for.
 // ---------------------------------------------------------------------------
 
-/// Query rows per attention workgroup; must match `RMAX` in attention.wgsl. 8 measured
-/// SLOWER on all three attention shapes (register pressure from the per-row
-/// `dots`/`sv`/`m_new`/`resc`/`acc` arrays) even though the freed workgroup memory
-/// allows it — a measured ceiling, not an arbitrary one.
+/// Query rows per attention workgroup: attention.wgsl holds a block's rows as the
+/// lanes of a vec4.
 const MAX_ROWS: usize = 4;
 /// Query rows per RelPosMHA workgroup; must match `RMAX` in relpos_mha.wgsl.
 const MAX_RELPOS_ROWS: usize = 4;
 
-/// Floats in each kernel's workgroup q-staging array — `q_s` in attention.wgsl and
-/// `qu_s`/`qv_s` in relpos_mha.wgsl. A row block must satisfy `rows * dk <= this`, and
-/// the value is what keeps both kernels inside the 16 KiB workgroup-storage floor.
-/// WGSL array sizes must be literals, so this is a hand-kept mirror: change it here and
-/// in the kernel together (the shaders name this constant in a comment).
+/// Floats in relpos_mha.wgsl's workgroup q-staging arrays (`qu_s`/`qv_s`). A row
+/// block must satisfy `rows * d <= this`, and the value is what keeps the kernel
+/// inside the 16 KiB workgroup-storage floor. WGSL array sizes must be literals, so
+/// this is a hand-kept mirror: change it here and in the kernel together.
 const Q_STAGE_FLOATS: usize = 1024;
-/// Block-grid size below which split-K pays off; ~2x the SM count of a mid/high-end
-/// part. Raising it to 256 made the long-cache decode fall back to a narrower row block
-/// and measured 1.6x slower, so it is a two-sided choice, not a floor to raise freely.
-const MIN_BLOCKS: usize = 128;
+/// Block-grid sizes a decode can aim for, below which split-K pays off: enough
+/// workgroups to fill the device, which WebGPU does not describe, so the one used
+/// is timed on it per shape (`chooseSplit`). The first is the default.
+///
+/// Measured per local layer of Gemma-4 at a full 512-key window: a 58-SM RTX 4080
+/// Laptop is fastest at 128 (44 us, against 57 at 32, before attention.wgsl kept
+/// its rows in vec4s); a 10-core Apple M5 at 32 (48 us, against 102 at 128 and 57
+/// at 8). Past 128 the long-cache decode falls
+/// back to a narrower row block and measured 1.6x slower on the 4080.
+const BLOCK_TARGETS = [_]usize{ 128, 32, 8 };
 /// Preferred keys per split-K segment (a full 256-key chunk plus headroom); shrunk
 /// toward `MIN_SEG_KEYS` only as far as needed to fill the device.
 const SEG_KEYS: usize = 512;
@@ -110,10 +115,11 @@ const MAX_SEGS_DEFAULT: usize = 64;
 // MIN_SEG_KEYS = 64 capped a 512-key span at 8 segments -> 4 head-blocks x 8 = 32
 // workgroups on 58 SMs, measured at 63 us for a 0.5 MiB read (8.4 GB/s, ~2 % of peak).
 //
-// Also swept and rejected: forcing the head-rows per workgroup. `rh` is how many query
-// heads share one read of the single KV head, so raising it cuts traffic 8x — and
-// measured SLOWER (rh=1 1.84 ms vs rh=4 2.79 ms), because at decode it costs workgroups.
-// `chooseRowBlock` derives it, and nothing overrides that.
+// Also swept: forcing the head-rows per workgroup. `rh` is how many query heads share
+// one read of the single KV head, so raising it cuts traffic 8x — and measured SLOWER
+// on the 4080 (rh=1 1.84 ms vs rh=4 2.79 ms), because at decode it costs workgroups.
+// `chooseRowBlock` derives it from the block target, which is what a device with
+// fewer units to fill trades the other way.
 
 /// Rows and value dims per block-kernel workgroup; must match `R` and `DVS` in
 /// attention_block.wgsl.
@@ -152,10 +158,10 @@ fn liveKeys(ctx: Ctx, lengths: ?tensor_store_mod.TensorId, t_cap: usize) Execute
     return @min(longest, t_cap);
 }
 
-fn largestBlock(gqa: usize, th: usize, tl: usize, rows_cap: usize) RowBlock {
-    var rh: usize = @min(@min(gqa, th), rows_cap);
+fn largestBlock(gqa: usize, th: usize, tl: usize) RowBlock {
+    var rh: usize = @min(@min(gqa, th), MAX_ROWS);
     while (rh > 1 and ((gqa % rh) != 0 or (th % rh) != 0)) rh -= 1;
-    return .{ .rh = rh, .rl = @max(@as(usize, 1), @min(tl, rows_cap / rh)) };
+    return .{ .rh = rh, .rl = @max(@as(usize, 1), @min(tl, MAX_ROWS / rh)) };
 }
 
 /// Pick the (heads x rows) block each workgroup handles.
@@ -169,16 +175,15 @@ fn largestBlock(gqa: usize, th: usize, tl: usize, rows_cap: usize) RowBlock {
 /// When no candidate fills the device — a short sliding window over few heads, where
 /// there simply isn't enough work — hedge at two rows rather than one: half the
 /// traffic reduction for double the blocks measured best on that shape.
-fn chooseRowBlock(gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize, d_k: usize) RowBlock {
+fn chooseRowBlock(min_blocks: usize, gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize) RowBlock {
     const max_segs: usize = @min(@max(@as(usize, 1), span_hint / MIN_SEG_KEYS), MAX_SEGS_DEFAULT);
-    const rows_cap: usize = @min(MAX_ROWS, @max(@as(usize, 1), Q_STAGE_FLOATS / @max(d_k, 1)));
     // A range one workgroup scores in a single pass has no scan to parallelize:
     // more blocks would only repeat the q staging and barrier chains per block.
     // Take the largest block, sharing each K/V read across the most rows.
-    if (span_hint <= KEY_CHUNK) return largestBlock(gqa, th, tl, rows_cap);
+    if (span_hint <= KEY_CHUNK) return largestBlock(gqa, th, tl);
 
     var hedge: ?RowBlock = null;
-    var target: usize = rows_cap;
+    var target: usize = MAX_ROWS;
     while (true) {
         var rh: usize = @min(@min(gqa, th), target);
         while (rh > 1 and ((gqa % rh) != 0 or (th % rh) != 0)) rh -= 1;
@@ -186,7 +191,7 @@ fn chooseRowBlock(gqa: usize, th: usize, tl: usize, tb: usize, span_hint: usize,
         const cand: RowBlock = .{ .rh = rh, .rl = rl };
 
         const blocks: usize = tb * ceilDiv(th, rh) * ceilDiv(tl, rl);
-        if (blocks * max_segs >= MIN_BLOCKS) return cand;
+        if (blocks * max_segs >= min_blocks) return cand;
         if (rh * rl == 2) hedge = cand;
         if (target <= 1) break;
         target /= 2;
@@ -459,12 +464,15 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttention) Execu
 
     // Prefill: a block of query rows shares every K/V row it reads.
     if (!q_f16 and l_q >= BLOCK_MIN_L) {
+        const bufs = [_]c.WGPUBuffer{ q_buf, k_buf, v_buf, pos_buf, end_buf, out_buf };
+        const sizes = [_]u64{ dq.len, dk.len, dv.len, pos_len, end_len, dout.len };
+        if (attention_mx.fits(d_k, d_v, t_cap, ctx.gpu.limits)) {
+            return attention_mx.record(ctx, frame, std.mem.asBytes(&params), bufs, sizes, .{ .heads = h_q, .rows = l_q, .batch = batch, .dv = d_v, .kv_f16 = kv_f16 });
+        }
         const rh = blockHeads(gqa, h_q);
         params.rh = @intCast(rh);
         params.rl = @intCast(BLOCK_ROWS / rh);
         const built = try ctx.pipes.get(block_kernel, "attn_block");
-        const bufs = [_]c.WGPUBuffer{ q_buf, k_buf, v_buf, pos_buf, end_buf, out_buf };
-        const sizes = [_]u64{ dq.len, dk.len, dv.len, pos_len, end_len, dout.len };
         return frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{
             @intCast(ceilDiv(h_q, rh) * ceilDiv(d_v, BLOCK_DV_SLICE)),
             @intCast(ceilDiv(l_q, params.rl)),
@@ -472,58 +480,165 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttention) Execu
         });
     }
 
-    // `rh` query heads x `rl` query rows per workgroup, all sharing one K/V panel.
     // The split is sized off the range a row ACTUALLY scans — with a sliding
     // window that is the window, not the cache capacity; with host-visible
     // lengths, the keys written so far, not the slots allocated for them.
+    const op: Decode = .{
+        .params = params,
+        .q_f16 = q_f16,
+        .bufs = .{ q_buf, k_buf, v_buf, pos_buf, end_buf },
+        .sizes = .{ dq.len, dk.len, dv.len, pos_len, end_len },
+        .out = out_buf,
+        .out_len = dout.len,
+        .batch = batch,
+    };
+    const target = try chooseBlockTarget(ctx, frame, op, s.window.maxKeys(t_cap));
     const span_hint: usize = s.window.maxKeys(try liveKeys(ctx, s.kv_lengths, t_cap));
-    const rb: RowBlock = chooseRowBlock(gqa, h_q, l_q, batch, span_hint, d_k);
-    // Both are kernel invariants: `rows` indexes fixed-size arrays there, and q
-    // staging is bounded by `Q_STAGE_FLOATS`.
-    if (rb.rh * rb.rl > MAX_ROWS or rb.rh * rb.rl * d_k > Q_STAGE_FLOATS) return error.Unsupported;
-    params.rh = @intCast(rb.rh);
-    params.rl = @intCast(rb.rl);
+    return recordDecode(ctx, frame, op, planSplit(target, op, span_hint));
+}
 
-    const grid_h: usize = ceilDiv(h_q, rb.rh);
-    const grid_l: usize = ceilDiv(l_q, rb.rl);
-    const blocks: usize = batch * grid_h * grid_l;
+/// A decode attention's operands: everything but how it is cut into workgroups.
+/// `bufs` are q, k, v, positions and lengths, as the kernel binds them.
+const Decode = struct {
+    params: CachedParams,
+    q_f16: bool,
+    bufs: [5]c.WGPUBuffer,
+    sizes: [5]u64,
+    out: c.WGPUBuffer,
+    out_len: u64,
+    batch: usize,
+
+    /// The kernel's bindings: the operands, then where it writes.
+    fn bound(op: Decode, dst: c.WGPUBuffer) [6]c.WGPUBuffer {
+        return .{ op.bufs[0], op.bufs[1], op.bufs[2], op.bufs[3], op.bufs[4], dst };
+    }
+    fn boundSizes(op: Decode, dst_len: u64) [6]u64 {
+        return .{ op.sizes[0], op.sizes[1], op.sizes[2], op.sizes[3], op.sizes[4], dst_len };
+    }
+};
+
+/// `rh` query heads x `rl` query rows per workgroup, all sharing one K/V panel, and
+/// the key segments each block's range is cut into.
+const Split = struct { rb: RowBlock, segs: usize };
+
+/// The split that aims for `min_blocks` workgroups over a range of `span_hint` keys.
+fn planSplit(min_blocks: usize, op: Decode, span_hint: usize) Split {
+    const p = op.params;
+    const rb: RowBlock = chooseRowBlock(min_blocks, p.gqa, p.th, p.tl, op.batch, span_hint);
+    const blocks: usize = op.batch * ceilDiv(p.th, rb.rh) * ceilDiv(p.tl, rb.rl);
     var segs: usize = 1;
-    if (blocks < MIN_BLOCKS and span_hint > KEY_CHUNK) {
+    if (blocks < min_blocks and span_hint > KEY_CHUNK) {
         // Prefer segments that fill a whole 256-key chunk; shrink only as far as
         // needed to fill the device, since a short segment leaves threads idle in
         // the score phase.
         var seg_keys: usize = SEG_KEYS;
-        while (seg_keys > MIN_SEG_KEYS and blocks * ceilDiv(span_hint, seg_keys) < MIN_BLOCKS) {
+        while (seg_keys > MIN_SEG_KEYS and blocks * ceilDiv(span_hint, seg_keys) < min_blocks) {
             seg_keys /= 2;
         }
         segs = @min(ceilDiv(span_hint, seg_keys), MAX_SEGS_DEFAULT);
-        segs = @min(segs, @as(usize, context.MAX_GROUPS_PER_DIM) / batch);
+        segs = @min(segs, @as(usize, context.MAX_GROUPS_PER_DIM) / op.batch);
         if (segs < 2) segs = 1;
     }
-    params.segs = @intCast(segs);
+    return .{ .rb = rb, .segs = segs };
+}
 
-    if (segs == 1) {
+/// The block target that is fastest for this decode on this device, timed once
+/// per shape.
+///
+/// A trial runs as if the cache were full, over `full_span` keys: how full it is
+/// is device state the record cannot see, and a full cache is where the split
+/// matters. So the choice does not depend on when a shape is first seen.
+fn chooseBlockTarget(ctx: Ctx, frame: *Frame, op: Decode, full_span: usize) ExecuteProgramError!usize {
+    const Cand = struct {
+        ctx: Ctx,
+        op: Decode,
+        full_span: usize,
+        /// Positions and lengths that read as a full cache, made for the first trial.
+        full: ?[2]c.WGPUBuffer = null,
+
+        fn plan(t: *const @This(), idx: usize) Split {
+            return planSplit(BLOCK_TARGETS[idx], t.op, t.full_span);
+        }
+
+        pub fn eligible(t: *const @This(), idx: usize) bool {
+            const mine = t.plan(idx);
+            for (0..idx) |earlier| if (std.meta.eql(t.plan(earlier), mine)) return false;
+            return true;
+        }
+
+        pub fn record(t: *@This(), idx: usize, f: *Frame) ExecuteProgramError!void {
+            const p = t.op.params;
+            if (t.full == null) {
+                const rows: usize = t.op.batch * p.tl;
+                const values = t.ctx.allocator.alloc(i32, rows) catch return error.OutOfMemory;
+                defer t.ctx.allocator.free(values);
+                var made: [2]c.WGPUBuffer = undefined;
+                // The last position sees every key; a length is the whole cache.
+                for ([_]i32{ @intCast(p.t_cap - 1), @intCast(p.t_cap) }, &made) |value, *buf| {
+                    @memset(values, value);
+                    const bytes = std.mem.sliceAsBytes(values);
+                    buf.* = wgpu.createBuffer(t.ctx.gpu.device, bytes.len, c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopyDst) catch return error.ExecutionFailed;
+                    wgpu.fns.wgpuQueueWriteBuffer(t.ctx.gpu.queue, buf.*, 0, bytes.ptr, bytes.len);
+                }
+                t.full = made;
+            }
+            var trial = t.op;
+            const bytes: u64 = t.op.batch * p.tl * @sizeOf(i32);
+            if (p.has_pos != 0) {
+                trial.bufs[3] = t.full.?[0];
+                trial.sizes[3] = bytes;
+            }
+            if (p.has_lengths != 0) {
+                trial.bufs[4] = t.full.?[1];
+                trial.sizes[4] = bytes;
+            }
+            return recordDecode(t.ctx, f, trial, t.plan(idx));
+        }
+    };
+    var cand: Cand = .{ .ctx = ctx, .op = op, .full_span = full_span };
+    defer if (cand.full) |made| for (made) |buf| wgpu.fns.wgpuBufferRelease(buf);
+
+    const p = op.params;
+    const key: autotune.Key = .of(.attention, .{ op.batch, p.tl, p.th, p.h_kv, full_span, p.dk, p.dv, @intFromBool(op.q_f16) | (p.kv_f16 << 1) });
+    const idx = (try ctx.tune.pick(ctx, frame, key, BLOCK_TARGETS.len, &cand)) orelse 0;
+    return BLOCK_TARGETS[idx];
+}
+
+/// Record a decode attention cut as `split`: one pass that normalizes in place,
+/// or a pass per key segment and a merge.
+fn recordDecode(ctx: Ctx, frame: *Frame, op: Decode, split: Split) ExecuteProgramError!void {
+    const rb = split.rb;
+    var params = op.params;
+    // A kernel invariant: the block's rows are the lanes of a vec4 there.
+    if (rb.rh * rb.rl > MAX_ROWS) return error.Unsupported;
+    params.rh = @intCast(rb.rh);
+    params.rl = @intCast(rb.rl);
+    params.segs = @intCast(split.segs);
+    const grid_h: usize = ceilDiv(params.th, rb.rh);
+    const grid_l: usize = ceilDiv(params.tl, rb.rl);
+
+    if (split.segs == 1) {
         // No key split: the kernel normalizes in place.
-        const built = try ctx.pipes.get(attn_kernel, if (q_f16) "attn_row_qf16" else "attn_row");
-        const bufs = [_]c.WGPUBuffer{ q_buf, k_buf, v_buf, pos_buf, end_buf, out_buf };
-        const sizes = [_]u64{ dq.len, dk.len, dv.len, pos_len, end_len, dout.len };
-        return frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(grid_h), @intCast(grid_l), @intCast(batch) });
+        const built = try ctx.pipes.get(attn_kernel, if (op.q_f16) "attn_row_qf16" else "attn_row");
+        const bufs = op.bound(op.out);
+        const sizes = op.boundSizes(op.out_len);
+        return frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(grid_h), @intCast(grid_l), @intCast(op.batch) });
     }
 
     // Split-K: each segment writes an unnormalized partial, `attn_merge` combines.
-    const rows_total: usize = batch * l_q * h_q;
-    const stride: usize = d_v + 2;
-    const part_bytes: u64 = @as(u64, rows_total) * segs * stride * @sizeOf(f32);
+    const rows_total: usize = op.batch * params.tl * params.th;
+    const stride: usize = params.dv + 2;
+    const part_bytes: u64 = @as(u64, rows_total) * split.segs * stride * @sizeOf(f32);
     const scratch = ctx.scratch.ensure(ctx.gpu, part_bytes) catch return error.ExecutionFailed;
     {
-        const built = try ctx.pipes.get(attn_kernel, if (q_f16) "attn_split_qf16" else "attn_split");
-        const bufs = [_]c.WGPUBuffer{ q_buf, k_buf, v_buf, pos_buf, end_buf, scratch };
-        const sizes = [_]u64{ dq.len, dk.len, dv.len, pos_len, end_len, part_bytes };
-        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(grid_h), @intCast(grid_l), @intCast(batch * segs) });
+        const built = try ctx.pipes.get(attn_kernel, if (op.q_f16) "attn_split_qf16" else "attn_split");
+        const bufs = op.bound(scratch);
+        const sizes = op.boundSizes(part_bytes);
+        try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ @intCast(grid_h), @intCast(grid_l), @intCast(op.batch * split.segs) });
     }
     const built = try ctx.pipes.get(merge_kernel, "attn_merge");
-    const mp: MergeParams = .{ .rows = @intCast(rows_total), .segs = @intCast(segs), .dv = @intCast(d_v), .stride = @intCast(stride) };
-    const bufs = [_]c.WGPUBuffer{ scratch, out_buf };
-    const sizes = [_]u64{ part_bytes, dout.len };
+    const mp: MergeParams = .{ .rows = @intCast(rows_total), .segs = @intCast(split.segs), .dv = @intCast(params.dv), .stride = @intCast(stride) };
+    const bufs = [_]c.WGPUBuffer{ scratch, op.out };
+    const sizes = [_]u64{ part_bytes, op.out_len };
     try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&mp), .{ @intCast(rows_total), 1, 1 });
 }

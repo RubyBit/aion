@@ -12,9 +12,11 @@
 //!     registers for q8_0), one dispatch per row.
 //!   - larger M (prefill): compute-bound. An f32 B runs the autotuned GEMM that
 //!     stages B from its rows (`Matmul.execRowsB`), so nothing is copied. A q8_0
-//!     B is dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM
-//!     runs on it. Scratch is reused across chunks; the frame's compute-pass
-//!     ordering serializes dequant(i+1) after gemm(i).
+//!     B in `lanes32x16` order runs on matrix tiles, dequantized as it is staged
+//!     (`matmul_q8_mx.zig`), where the device has them. Otherwise it is
+//!     dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM runs
+//!     on it. Scratch is reused across chunks; the frame's compute-pass ordering
+//!     serializes dequant(i+1) after gemm(i).
 //!
 //! q8_0 path requires K % 64 == 0 (whole word-aligned block pairs per row —
 //! see the kernel headers); other shapes fall back to `error.Unsupported`.
@@ -26,6 +28,7 @@ const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const codegen = @import("../matmul/codegen.zig");
 const matmul_exec = @import("matmul.zig");
+const matmul_q8_mx = @import("matmul_q8_mx.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
@@ -176,6 +179,20 @@ pub const MatmulNt = struct {
                     .alpha = s.alpha,
                     .beta = s.beta,
                 });
+            } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f32 and matmul_q8_mx.fits(m_total, n_count, k)) {
+                try matmul_q8_mx.record(ctx, frame, .{
+                    ctx.devmem.bufferFor(da.handle).?,
+                    ctx.devmem.bufferFor(db.handle).?,
+                    ctx.devmem.bufferFor(dc.handle).?,
+                }, .{ da.len, db.len, dc.len }, .{
+                    .m = m_total,
+                    .n = n_count,
+                    .k = k,
+                    .c_row = c_row,
+                    .c_off = c_off,
+                    .alpha = s.alpha,
+                    .beta = s.beta,
+                });
             } else {
                 try self.recordDequantGemm(ctx, frame, s, mm.generated, da, db, dc, m_total, c_row, c_off, k, n_count, b_wpr, form);
             }
@@ -259,9 +276,7 @@ pub const MatmulNt = struct {
         try frame.recordCompute(dq_built, &dq_bufs, &dq_sizes, std.mem.asBytes(&dq_params), .{ dq_groups, 1, 1 });
 
         // 2) Run the f32 GEMM over [M, K] @ scratch[K, n_count] -> C[:, c_off ..].
-        const a_row_bytes: isize = @intCast(@as(u64, k) * 4);
-        const scratch_row_bytes: isize = @intCast(@as(u64, n_count) * 4);
-        const idx = pickGemmConfig(generated, ctx.gpu.limits, a_row_bytes, scratch_row_bytes) orelse return error.Unsupported;
+        const idx = pickGemmConfig(generated, ctx.gpu.limits, m, n_count, k) orelse return error.Unsupported;
         const g = generated[idx];
         const built = try ctx.pipes.get(g.desc, g.entry);
 
@@ -292,21 +307,26 @@ pub const MatmulNt = struct {
     }
 };
 
-/// Pick a GEMM config for the scratch-B path: bounds-checked (edge blocks are the
-/// norm here) and device-eligible, preferring the shape autotune usually settles
-/// on (128x128, bk16, vec4, double-buffered). No per-shape tuning — the dequant
-/// pass makes re-timing every shape needlessly expensive; hook into the
-/// autotune cache later if profiles say it matters.
-fn pickGemmConfig(generated: []const Generated, limits: wgpu.Limits, a_row_bytes: isize, b_row_bytes: isize) ?usize {
+/// Pick a GEMM config for the scratch-B path, `[m, k] @ [k, n]`: bounds-checked
+/// (edge blocks are the norm here) and device-eligible. Matrix tiles win where the
+/// device has them; otherwise the shape autotune usually settles on (128x128,
+/// bk16, vec4, double-buffered). No per-shape tuning — the dequant pass makes
+/// re-timing every shape needlessly expensive; hook into the autotune cache later
+/// if profiles say it matters.
+fn pickGemmConfig(generated: []const Generated, limits: wgpu.Limits, m: u32, n: u32, k: u32) ?usize {
+    const a_row_bytes: isize = @intCast(@as(u64, k) * 4);
+    const b_row_bytes: isize = @intCast(@as(u64, n) * 4);
+    var tuned: ?usize = null;
     var fallback: ?usize = null;
     for (generated, 0..) |g, i| {
         const cfg = g.cfg;
-        if (!cfg.bounds_check) continue;
+        if (!cfg.bounds_check or !codegen.fits(cfg, m, n, k)) continue;
         if (!matmul_exec.eligibleConfig(cfg, limits, a_row_bytes, b_row_bytes)) continue;
-        if (cfg.bm == 128 and cfg.bn == 128 and cfg.bk == 16 and cfg.vec4_load and cfg.double_buffer) return i;
+        if (cfg.matrix) return i;
+        if (cfg.bm == 128 and cfg.bn == 128 and cfg.bk == 16 and cfg.vec4_load and cfg.double_buffer) tuned = tuned orelse i;
         if (fallback == null) fallback = i;
     }
-    return fallback;
+    return tuned orelse fallback;
 }
 
 test "pickGemmConfig prefers the tuned 128x128 shape and falls back to scalar" {
@@ -316,7 +336,22 @@ test "pickGemmConfig prefers the tuned 128x128 shape and falls back to scalar" {
     };
     const limits: wgpu.Limits = .{ .max_shared_bytes = 48 * 1024, .max_invocations = 256 };
     // Aligned strides: the vec4 128x128 bk16 db config wins.
-    try std.testing.expectEqual(@as(?usize, 1), pickGemmConfig(&cfgs, limits, 512, 512));
+    try std.testing.expectEqual(@as(?usize, 1), pickGemmConfig(&cfgs, limits, 40, 128, 128));
     // Misaligned B stride: only the scalar config is eligible.
-    try std.testing.expectEqual(@as(?usize, 0), pickGemmConfig(&cfgs, limits, 512, 500));
+    try std.testing.expectEqual(@as(?usize, 0), pickGemmConfig(&cfgs, limits, 40, 125, 128));
+}
+
+test "pickGemmConfig takes matrix tiles where the device and the shape allow" {
+    const cfgs = [_]Generated{
+        .{ .desc = .{ .name = "b", .wgsl = "" }, .entry = "b", .cfg = .{ .bm = 128, .bn = 128, .bk = 16, .tm = 8, .tn = 8, .vec4_load = true, .double_buffer = true } },
+        .{ .desc = .{ .name = "m", .wgsl = "" }, .entry = "m", .cfg = codegen.MatmulConfig.matrixTiles(32, 32, .{}) },
+    };
+    const plain: wgpu.Limits = .{ .max_shared_bytes = 48 * 1024, .max_invocations = 256 };
+    var units = plain;
+    units.matrix_f32 = true;
+    try std.testing.expectEqual(@as(?usize, 1), pickGemmConfig(&cfgs, units, 40, 128, 128));
+    // No matrix units; fewer rows than a block; a K that is no whole tile.
+    try std.testing.expectEqual(@as(?usize, 0), pickGemmConfig(&cfgs, plain, 40, 128, 128));
+    try std.testing.expectEqual(@as(?usize, 0), pickGemmConfig(&cfgs, units, 20, 128, 128));
+    try std.testing.expectEqual(@as(?usize, 0), pickGemmConfig(&cfgs, units, 40, 128, 132));
 }

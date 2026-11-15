@@ -355,6 +355,10 @@ pub const Step = union(enum) {
 /// so a host read can never silently observe a stale device value. Kernels get
 /// no say: an operand a backend cannot consume on the device makes the op
 /// unsupported there, rather than quietly moving work to the CPU.
+///
+/// A step whose `placement` is the host inside a device program is the compiler's
+/// choice too (`placement.hostLookups`): everything it reads and writes is
+/// host-placed, and a `Transfer` carries its result across.
 pub const PlacedStep = struct {
     origin: ?@import("../diagnostic.zig").Origin = null,
     placement: Placement = .{},
@@ -688,13 +692,11 @@ pub const ExecutableProgram = struct {
                             // The value is consumed on the CPU, so it must live
                             // there — either host-owned, or transferred back.
                             if (actual.kind != .cpu) return error.PlacementMismatch;
-                        } else if (use.access != .read) {
-                            // A step writes only where it executes.
+                        } else if (use.access != .read or placed.placement.kind == .cpu) {
+                            // A step writes only where it executes, and one placed
+                            // on the host cannot see a device value at all.
                             if (!actual.eql(placed.placement)) return error.MissingTransfer;
                         }
-                        // A read-only operand may sit at the step's placement or
-                        // on the host, where it is uploaded on use: nothing else
-                        // writes it, so that read cannot go stale.
                     }
                 },
             }

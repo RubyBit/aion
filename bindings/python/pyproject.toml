@@ -37,7 +37,7 @@ numpy = ["numpy>=2.1"]
 # the wgpu-native runtime library; `aion`'s package __init__ then points the loader
 # at it. A companion wheel is published for every platform the runtime wheels
 # target. `aion-wgpu` is versioned after the wgpu-native release it wraps.
-gpu = ["aion-wgpu>=29.0.4,<30"]
+gpu = ["aion-wgpu>=29.0.4.post1,<30"]
 
 # PEP 735 dependency groups: local dev/test environments, not package extras.
 # `uv sync` installs the `dev` group by default; use `--group test` for just the
@@ -48,7 +48,7 @@ test = ["pytest>=9", "numpy>=2.1"]
 # Type-check only: PEP 696 TypeVar defaults are not in 3.12's `typing`.
 typing = ["typing-extensions>=4.12"]
 dev = [
-  "aion-wgpu>=29.0.4,<30",
+  "aion-wgpu>=29.0.4.post1,<30",
   "pyright>=1.1",
   "typing-extensions>=4.12",  # PEP 696 TypeVar defaults, for type-checking only
   "tokenizers>=0.23.1",

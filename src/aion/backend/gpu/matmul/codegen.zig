@@ -25,6 +25,10 @@
 //! With `b_rows`, B is stored as its rows instead, `[N, K]` (a `MatMulNT`'s), and
 //! the staging transposes it: the tile in shared memory, and everything after it,
 //! is the same.
+//!
+//! A `matrix` config is the same product on the device's matrix units (wgpu's
+//! cooperative matrices): whole 8x8 tiles are loaded straight from A and B and
+//! multiplied as a unit, so it has no staging and no register tile (`matrixBody`).
 
 const std = @import("std");
 const pipelines = @import("../pipelines.zig");
@@ -36,9 +40,29 @@ const Wgsl = @import("../wgsl.zig").Wgsl;
 pub const MAX_SHARED_BYTES: u32 = 49152;
 pub const MAX_THREADS: u32 = 1024;
 
-/// Shared-memory bytes a config uses: As[bm*bk] + Bs[bk*bn], f32.
+/// Rows, columns and inner depth of a matrix tile: the one size wgpu multiplies.
+pub const TILE: u32 = 8;
+/// Invocations in a matrix kernel's workgroup: one SIMD group, which is what
+/// loads, multiplies and stores a tile together.
+const MATRIX_GROUP: u32 = 32;
+const tile_a = "coop_mat8x8<f32, A>";
+const tile_b = "coop_mat8x8<f32, B>";
+const tile_c = "coop_mat8x8<f32, C>";
+
+/// Shared-memory bytes a config uses: As[bm*bk] + Bs[bk*bn], f32. A matrix config
+/// holds the finished block instead.
 pub fn sharedBytes(cfg: MatmulConfig) u32 {
+    if (cfg.matrix) return cfg.bm * cfg.bn * 4;
     return (cfg.bm * cfg.bk + cfg.bk * cfg.bn) * 4;
+}
+
+/// Whether `cfg` computes an `[m, k] @ [k, n]` product. A config without edge
+/// guards needs whole blocks; a matrix config needs whole tiles of K and one
+/// block each way, since its edge blocks slide back inside the matrices.
+pub fn fits(cfg: MatmulConfig, m: usize, n: usize, k: usize) bool {
+    if (cfg.matrix) return m >= cfg.bm and n >= cfg.bn and k % TILE == 0;
+    if (cfg.bounds_check) return true;
+    return m % cfg.bm == 0 and n % cfg.bn == 0 and k % cfg.bk == 0;
 }
 
 /// Where the kernel's A operand comes from.
@@ -59,8 +83,18 @@ pub const MatmulConfig = struct {
     double_buffer: bool = false, // prefetch next K-slab into registers during compute
     bounds_check: bool = true, // guard edge tiles/partial K slabs
     b_rows: bool = false, // B is [N, K]: staged 4 rows x 4 k at a time, transposed in registers
+    /// Accumulate 8x8 tiles on the device's matrix units instead of in per-thread
+    /// registers. The tile is then the only unit (`tm`, `tn` and `bk` are 8) and
+    /// A and B are read in place, so the load options do not apply.
+    matrix: bool = false,
+
+    /// A matrix config computing `bm x bn` of C per workgroup; `of` says what of.
+    pub fn matrixTiles(bm: u32, bn: u32, of: struct { kind: Kind = .gemm, b_rows: bool = false }) MatmulConfig {
+        return .{ .kind = of.kind, .bm = bm, .bn = bn, .bk = TILE, .tm = TILE, .tn = TILE, .vec4_load = false, .b_rows = of.b_rows, .matrix = true };
+    }
 
     pub fn threads(cfg: MatmulConfig) u32 {
+        if (cfg.matrix) return MATRIX_GROUP;
         return (cfg.bm / cfg.tm) * (cfg.bn / cfg.tn);
     }
     /// vec4 output-column groups per thread (tn is a multiple of 4).
@@ -90,6 +124,15 @@ pub const MatmulConfig = struct {
 };
 
 fn validate(comptime cfg: MatmulConfig) void {
+    if (cfg.b_rows and cfg.kind == .conv) @compileError("a conv's B is its weight, [K, N]");
+    if (cfg.matrix) {
+        if (cfg.bm % TILE != 0 or cfg.bn % TILE != 0) @compileError("a matrix block is whole tiles");
+        if (cfg.tm != TILE or cfg.tn != TILE or cfg.bk != TILE) @compileError("a matrix config's tile is 8x8x8");
+        if (cfg.vec4_load or cfg.double_buffer or !cfg.bounds_check) @compileError("a matrix config stages nothing and needs no guards");
+        if ((cfg.bm * cfg.bn) % MATRIX_GROUP != 0) @compileError("the block is written out in equal shares");
+        if (sharedBytes(cfg) > MAX_SHARED_BYTES) @compileError("shared memory exceeds MAX_SHARED_BYTES");
+        return;
+    }
     const nt = cfg.threads();
     if (cfg.bm % cfg.tm != 0) @compileError("bm % tm != 0");
     if (cfg.bn % cfg.tn != 0) @compileError("bn % tn != 0");
@@ -102,11 +145,10 @@ fn validate(comptime cfg: MatmulConfig) void {
     if ((cfg.bm * cfg.bk) % nt != 0) @compileError("bm*bk not divisible by thread count");
     if ((cfg.bk * cfg.bn) % nt != 0) @compileError("bk*bn not divisible by thread count");
     if (sharedBytes(cfg) > MAX_SHARED_BYTES) @compileError("shared memory exceeds MAX_SHARED_BYTES");
-    if (cfg.b_rows and cfg.kind == .conv) @compileError("a conv's B is its weight, [K, N]");
 }
 
 pub fn entryName(comptime cfg: MatmulConfig) [:0]const u8 {
-    return std.fmt.comptimePrint("{s}_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}{s}", .{
+    return std.fmt.comptimePrint("{s}_{d}x{d}x{d}_{d}x{d}_{s}{s}{s}{s}{s}", .{
         if (cfg.kind == .conv) "cv" else "mm",
         cfg.bm,
         cfg.bn,
@@ -117,6 +159,7 @@ pub fn entryName(comptime cfg: MatmulConfig) [:0]const u8 {
         if (cfg.double_buffer) "_db" else "",
         if (cfg.bounds_check) "" else "_nb",
         if (cfg.b_rows) "_bt" else "",
+        if (cfg.matrix) "_mx" else "",
     });
 }
 
@@ -169,6 +212,7 @@ fn bScalar(w: *Wgsl, cfg: MatmulConfig, off: u32) []const u8 {
 // ---- module scaffolding ----------------------------------------------------
 
 fn header(w: *Wgsl, cfg: MatmulConfig) void {
+    if (cfg.matrix) w.lit("enable wgpu_cooperative_matrix;");
     const ab_ty = if (cfg.vec4_load) "array<vec4<f32>>" else "array<f32>";
     if (cfg.kind == .conv) {
         // Conv geometry rides in the same uniform, and bias takes a storage slot,
@@ -199,9 +243,14 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
     // `z * strides.w` and `c_off + z * M * c_row` (`c_off` rides in `ab.z` as
     // bits). A zero stride broadcasts that operand.
     w.lit("var<private> a_base: u32; var<private> b_base: u32; var<private> c_base: u32;");
-    w.line("var<workgroup> As: array<f32, {d}>;", .{cfg.bm * cfg.bk});
-    w.line("var<workgroup> Bs: array<vec4<f32>, {d}>;", .{cfg.bVecs()});
-    if (cfg.kind == .conv) im2colFns(w);
+    if (cfg.matrix) {
+        w.line("var<workgroup> Cs: array<f32, {d}>;", .{cfg.bm * cfg.bn});
+        if (cfg.kind == .conv) convTileFn(w);
+    } else {
+        w.line("var<workgroup> As: array<f32, {d}>;", .{cfg.bm * cfg.bk});
+        w.line("var<workgroup> Bs: array<vec4<f32>, {d}>;", .{cfg.bVecs()});
+        if (cfg.kind == .conv) im2colFns(w);
+    }
     w.blank();
 }
 
@@ -243,10 +292,8 @@ fn im2colFns(w: *Wgsl) void {
     w.close();
 }
 
-/// Thread/tile index setup + zeroed accumulator registers. As is transposed
-/// scalar storage; Bs is vec4-typed, so `cn4` addresses the column group.
-fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
-    const cols = cfg.bn / cfg.tn;
+/// The product's dims and row strides, and this batch's bases.
+fn operands(w: *Wgsl, cfg: MatmulConfig) void {
     w.lit("let M = p.dims.x; let N = p.dims.y; let K = p.dims.z;");
     if (cfg.kind == .conv) {
         w.lit("let b_row = p.strides.y;");
@@ -254,6 +301,13 @@ fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
         w.lit("let a_row = p.strides.x; let b_row = p.strides.y;");
         w.lit("a_base = wid.z * p.dims.w; b_base = wid.z * p.strides.w; c_base = bitcast<u32>(p.ab.z) + wid.z * M * p.strides.z;");
     }
+}
+
+/// Thread/tile index setup + zeroed accumulator registers. As is transposed
+/// scalar storage; Bs is vec4-typed, so `cn4` addresses the column group.
+fn preamble(w: *Wgsl, cfg: MatmulConfig) void {
+    const cols = cfg.bn / cfg.tn;
+    operands(w, cfg);
     w.line("let block_row = wid.y * {d}u;", .{cfg.bm});
     w.line("let block_col = wid.x * {d}u;", .{cfg.bn});
     w.line("let thread_col = lidx % {d}u;", .{cols});
@@ -570,7 +624,7 @@ fn epilogue(w: *Wgsl, cfg: MatmulConfig) void {
 /// The scaled store helper: `C = alpha*value` (beta==0) or `alpha*value + beta*C`.
 fn writeOneFn(w: *Wgsl, cfg: MatmulConfig) void {
     w.open("fn writeOne(r: u32, c: u32, value: f32)", .{});
-    if (cfg.bounds_check) {
+    if (cfg.bounds_check and !cfg.matrix) {
         w.open("if (r >= p.dims.x || c >= p.dims.y)", .{});
         w.lit("return;");
         w.close();
@@ -590,6 +644,103 @@ fn writeOneFn(w: *Wgsl, cfg: MatmulConfig) void {
     w.close();
 }
 
+// ---- matrix tiles ----------------------------------------------------------
+
+/// One SIMD group computes a `bm x bn` block of C as 8x8 tiles: per 8 of K it
+/// loads `bm/8` tiles of A and `bn/8` of B straight from their buffers and
+/// accumulates every pair. The finished tiles land in shared memory, and each
+/// thread writes its share through `writeOne`, where scale, bias and `beta` live.
+///
+/// Nothing guards a read, so the last block each way slides back until every
+/// tile it reads exists, and then writes only what no earlier block owns.
+fn matrixBody(w: *Wgsl, cfg: MatmulConfig) void {
+    const ti = cfg.bm / TILE;
+    const tj = cfg.bn / TILE;
+    operands(w, cfg);
+    w.line("let own_col = wid.x * {d}u; let block_col = min(own_col, N - {d}u);", .{ cfg.bn, cfg.bn });
+    if (cfg.kind == .conv) {
+        for (0..ti) |i| w.line("let t{d} = conv_tile(wid.y * {d}u + {d}u);", .{ i, ti, i });
+    } else {
+        w.line("let own_row = wid.y * {d}u; let block_row = min(own_row, M - {d}u);", .{ cfg.bm, cfg.bm });
+    }
+    for (0..ti) |i| {
+        for (0..tj) |j| w.line("var acc_{d}_{d} = {s}();", .{ i, j, tile_c });
+    }
+    w.lit("var k0 = 0u;");
+    w.open("loop", .{});
+    w.open("if (k0 >= K)", .{});
+    w.lit("break;");
+    w.close();
+    if (cfg.kind == .conv) {
+        // 8 of K is 8 channels of one kernel tap, which sit side by side in the
+        // activation; the tile's 8 pixels are `stride_w` apart along a row.
+        w.lit("let tap = k0 / p.c_in;");
+        w.lit("let at = ((tap / p.kw) * p.dil_h * p.w_in + (tap % p.kw) * p.dil_w) * p.c_in + k0 % p.c_in;");
+        for (0..ti) |i| w.line("let a{d} = coopLoad<{s}>(&a[t{d}.z + at], p.stride_w * p.c_in);", .{ i, tile_a, i });
+    } else {
+        for (0..ti) |i| w.line("let a{d} = coopLoad<{s}>(&a[a_base + (block_row + {d}u) * a_row + k0], a_row);", .{ i, tile_a, i * TILE });
+    }
+    for (0..tj) |j| {
+        // B's rows are its tile's columns: the same load, transposed.
+        if (cfg.b_rows) {
+            w.line("let b{d} = coopLoadT<{s}>(&b[b_base + (block_col + {d}u) * b_row + k0], b_row);", .{ j, tile_b, j * TILE });
+        } else {
+            w.line("let b{d} = coopLoad<{s}>(&b[b_base + k0 * b_row + block_col + {d}u], b_row);", .{ j, tile_b, j * TILE });
+        }
+    }
+    for (0..ti) |i| {
+        for (0..tj) |j| w.line("acc_{d}_{d} = coopMultiplyAdd(a{d}, b{d}, acc_{d}_{d});", .{ i, j, i, j, i, j });
+    }
+    w.line("k0 += {d}u;", .{TILE});
+    w.close();
+
+    for (0..ti) |i| {
+        for (0..tj) |j| w.line("coopStore(acc_{d}_{d}, &Cs[{d}], {d}u);", .{ i, j, i * TILE * cfg.bn + j * TILE, cfg.bn });
+    }
+    w.lit("workgroupBarrier();");
+    w.lit("var e = lidx;");
+    w.open("loop", .{});
+    w.open("if (e >= {d}u)", .{cfg.bm * cfg.bn});
+    w.lit("break;");
+    w.close();
+    w.line("let row = e / {d}u; let c = block_col + e % {d}u;", .{ cfg.bn, cfg.bn });
+    if (cfg.kind == .conv) {
+        w.line("let t = conv_tile(wid.y * {d}u + row / {d}u); let px = row % {d}u;", .{ ti, TILE, TILE });
+        w.open("if (t.w == 1u && px >= t.y && c >= own_col)", .{});
+        w.lit("writeOne(t.x + px, c, Cs[e]);");
+    } else {
+        w.lit("let r = block_row + row;");
+        w.open("if (r >= own_row && c >= own_col)", .{});
+        w.lit("writeOne(r, c, Cs[e]);");
+    }
+    w.close();
+    w.line("e += {d}u;", .{MATRIX_GROUP});
+    w.close();
+}
+
+/// A conv's tiles of A run along output rows: 8 pixels of one row, under 8
+/// channels of one kernel tap, are evenly spaced in the activation, so a tile is
+/// read in place. That needs every window inside the activation — the executor
+/// pads it first where one is not — and channels that divide into tiles.
+///
+/// `conv_tile(t)` is tile `t`: its first output pixel, how many of its pixels an
+/// earlier tile owns (a row's last tile slides back to stay on the row), where
+/// its first window starts in the activation, and whether `t` exists at all.
+fn convTileFn(w: *Wgsl) void {
+    w.blank();
+    w.open("fn conv_tile(t: u32) -> vec4<u32>", .{});
+    w.line("let per_row = (p.ow_out + {d}u) / {d}u;", .{ TILE - 1, TILE });
+    w.lit("let rows = p.dims.x / p.ow_out;");
+    w.lit("let tt = min(t, rows * per_row - 1u);");
+    w.lit("let row = tt / per_row;");
+    w.line("let own = (tt % per_row) * {d}u;", .{TILE});
+    w.line("let ow = min(own, p.ow_out - {d}u);", .{TILE});
+    w.lit("let oh_count = p.ohw / p.ow_out;");
+    w.lit("let at = (row / oh_count) * p.x_batch + ((row % oh_count) * p.stride_h * p.w_in + ow * p.stride_w) * p.c_in;");
+    w.lit("return vec4<u32>(row * p.ow_out + ow, own - ow, at, u32(t < rows * per_row));");
+    w.close();
+}
+
 // ---- entry points ----------------------------------------------------------
 
 /// Render the WGSL for `cfg` into `arena`.
@@ -599,9 +750,13 @@ pub fn emit(arena: std.mem.Allocator, comptime cfg: MatmulConfig) [:0]const u8 {
     header(&w, cfg);
     w.line("@compute @workgroup_size({d})", .{cfg.threads()});
     w.open("fn {s}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lidx: u32)", .{entryName(cfg)});
-    preamble(&w, cfg);
-    if (cfg.double_buffer) kLoopDouble(&w, cfg) else kLoopSingle(&w, cfg);
-    epilogue(&w, cfg);
+    if (cfg.matrix) {
+        matrixBody(&w, cfg);
+    } else {
+        preamble(&w, cfg);
+        if (cfg.double_buffer) kLoopDouble(&w, cfg) else kLoopSingle(&w, cfg);
+        epilogue(&w, cfg);
+    }
     w.close();
     w.blank();
     writeOneFn(&w, cfg);

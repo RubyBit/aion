@@ -13,9 +13,18 @@
 //! `getBindGroupLayout(0)` alongside each pipeline so the layout is reflected
 //! exactly once (at first use) rather than on every dispatch — the per-dispatch
 //! reflection the v0 backend did.
+//!
+//! Modules are compiled without wgpu's shader runtime checks: these are the
+//! backend's own kernels, whose indices the executors bound before dispatch, not
+//! untrusted shaders. The checks wrap every buffer and shared-memory access in a
+//! bounds clamp and every loop in a termination counter, and cost ~8% of a q8
+//! prefill on an M5 (Gemma-4 E2B and Llama-1B alike; a fused GEMM ran as fast as
+//! llama.cpp's hand-written Metal one only without them). `AION_GPU_SHADER_CHECKS=1`
+//! puts them back, for chasing an out-of-bounds access.
 
 const std = @import("std");
 const wgpu = @import("wgpu.zig");
+const env = @import("../../env.zig");
 
 const c = wgpu.c;
 const fns = wgpu.fns; // runtime wgpu dispatch table (functions)
@@ -41,6 +50,8 @@ pub const Pipelines = struct {
     allocator: std.mem.Allocator,
     modules: std.StringHashMap(c.WGPUShaderModule), // key: kernel name
     entries: std.StringHashMap(Built), // key: "<kernel>\x00<entry>" (owned)
+    /// The runtime checks modules are compiled with (see the module doc).
+    checks: c.WGPUShaderRuntimeChecks,
 
     const Self = @This();
 
@@ -50,6 +61,10 @@ pub const Pipelines = struct {
             .allocator = allocator,
             .modules = std.StringHashMap(c.WGPUShaderModule).init(allocator),
             .entries = std.StringHashMap(Built).init(allocator),
+            .checks = if (env.flagEnabled("AION_GPU_SHADER_CHECKS"))
+                c.WGPUShaderRuntimeChecks_BoundsChecks | c.WGPUShaderRuntimeChecks_ForceLoopBounding
+            else
+                c.WGPUShaderRuntimeChecks_None,
         };
     }
 
@@ -74,7 +89,7 @@ pub const Pipelines = struct {
         w.code = wgpu.strv(kernel.wgsl);
         var smd: c.WGPUShaderModuleDescriptor = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
         smd.nextInChain = &w.chain;
-        const m = fns.wgpuDeviceCreateShaderModule(self.gpu.device, &smd) orelse return error.ExecutionFailed;
+        const m = fns.wgpuDeviceCreateShaderModuleTrusted(self.gpu.device, &smd, self.checks) orelse return error.ExecutionFailed;
         self.modules.put(kernel.name, m) catch return error.ExecutionFailed;
         return m;
     }

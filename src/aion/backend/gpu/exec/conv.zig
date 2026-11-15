@@ -12,8 +12,10 @@
 //!
 //! A rank-4, single-group, zero-padded conv instead lowers onto the generated
 //! implicit-GEMM kernels (`matmul/codegen.zig`, `kind = .conv`): same register
-//! blocking as the GEMM, with A gathered from the activation. The direct kernel
-//! stays as the general case — grouped, dilated-into-reflect, conv1d, depthwise.
+//! blocking as the GEMM, with A gathered from the activation, or on a device with
+//! matrix units the same tiles as the GEMM, read from the activation in place
+//! (`recordConvTiles`). The direct kernel stays as the general case — grouped,
+//! dilated-into-reflect, conv1d, depthwise.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -33,7 +35,6 @@ const KernelDesc = pipelines.KernelDesc;
 const codegen = @import("../matmul/codegen.zig");
 const Generated = codegen.Generated;
 const matmul_exec = @import("matmul.zig");
-const autotune = @import("../autotune.zig");
 
 /// Uniform for the implicit-GEMM conv: the GEMM's own `Params` with the conv
 /// geometry appended, matching the struct `codegen.header` emits.
@@ -73,6 +74,7 @@ const ConvGemmOperands = struct { bufs: [4]c.WGPUBuffer, sizes: [4]u64 };
 
 /// Record `gen` over the whole conv, or null when its grid exceeds the device's.
 fn recordConvGemm(ctx: Ctx, frame: *Frame, gen: Generated, gp: ConvGemmParams, ops: ConvGemmOperands) ExecuteProgramError!?void {
+    if (gen.cfg.matrix) return recordConvTiles(ctx, frame, gen, gp, ops);
     const built = try ctx.pipes.get(gen.desc, gen.entry);
     const gx = context.ceilDiv(gp.n, gen.cfg.bn);
     const gy = context.ceilDiv(gp.m, gen.cfg.bm);
@@ -80,11 +82,60 @@ fn recordConvGemm(ctx: Ctx, frame: *Frame, gen: Generated, gp: ConvGemmParams, o
     try frame.recordCompute(built, &ops.bufs, &ops.sizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
 }
 
+const pad_kernel: KernelDesc = .{ .name = "pad", .wgsl = @embedFile("../kernels/pad.wgsl") };
+/// Field order matches `struct Params` in pad.wgsl.
+const PadParams = extern struct { src_shape: [4]u32, dst_shape: [4]u32, at: [4]u32 };
+
+/// Whether a conv can run on matrix tiles at all: its channels divide into
+/// tiles, and an output row holds one.
+fn tilesFit(gp: ConvGemmParams) bool {
+    return gp.c_in % codegen.TILE == 0 and gp.ow_out >= codegen.TILE;
+}
+
+/// The matrix-tile conv (see `codegen.convTileFn`). Its tiles are read from the
+/// activation in place, so no window may leave it: where padding would, the
+/// activation is first copied, zero-padded, into the pooled scratch, and the
+/// kernel is pointed at that copy and told there is no padding.
+fn recordConvTiles(ctx: Ctx, frame: *Frame, gen: Generated, conv: ConvGemmParams, operands: ConvGemmOperands) ExecuteProgramError!?void {
+    var gp = conv;
+    var ops = operands;
+    const rows = gp.m / gp.ow_out; // batch * output height
+    const span_h = (gp.ohw / gp.ow_out - 1) * gp.stride_h + (gp.kh - 1) * gp.dil_h + 1;
+    const span_w = (gp.ow_out - 1) * gp.stride_w + (gp.kw - 1) * gp.dil_w + 1;
+    if (gp.pad_top != 0 or gp.pad_left != 0 or span_h > gp.h_in or span_w > gp.w_in) {
+        const batch = gp.m / gp.ohw;
+        const vec4s = @as(u64, batch) * span_h * span_w * (gp.c_in / 4);
+        const bytes = vec4s * 16;
+        const count = std.math.cast(u32, vec4s) orelse return null;
+        if (!context.storageBindingFits(ctx, bytes)) return null;
+        const padded = try ctx.scratch.ensure(ctx.gpu, bytes);
+        const pp: PadParams = .{
+            .src_shape = .{ batch, gp.h_in, gp.w_in, gp.c_in / 4 },
+            .dst_shape = .{ batch, span_h, span_w, gp.c_in / 4 },
+            .at = .{ gp.pad_top, gp.pad_left, count, 0 },
+        };
+        const built = try ctx.pipes.get(pad_kernel, "pad_f32");
+        try frame.recordCompute(built, &.{ ops.bufs[0], padded }, &.{ ops.sizes[0], bytes }, std.mem.asBytes(&pp), .{ groups1D(count), 1, 1 });
+        ops.bufs[0] = padded;
+        ops.sizes[0] = bytes;
+        gp.h_in = span_h;
+        gp.w_in = span_w;
+        gp.x_batch = span_h * span_w * gp.c_in;
+        gp.pad_top = 0;
+        gp.pad_left = 0;
+    }
+    const built = try ctx.pipes.get(gen.desc, gen.entry);
+    const gx = context.ceilDiv(gp.n, gen.cfg.bn);
+    const gy = context.ceilDiv(rows * context.ceilDiv(gp.ow_out, codegen.TILE), gen.cfg.bm / codegen.TILE);
+    if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) return null;
+    try frame.recordCompute(built, &ops.bufs, &ops.sizes, std.mem.asBytes(&gp), .{ gx, gy, 1 });
+}
+
 /// The fastest implicit-GEMM block for this conv, timed on the device once per
 /// shape: how wide a block its channels fill and how many blocks keep the GPU
 /// busy are both properties of the device, which WebGPU does not describe.
-fn chooseConvConfig(mm: *matmul_exec.Matmul, ctx: Ctx, gp: ConvGemmParams, ops: ConvGemmOperands) ?usize {
-    const Tune = struct {
+fn chooseConvConfig(mm: *const matmul_exec.Matmul, ctx: Ctx, frame: *Frame, gp: ConvGemmParams, ops: ConvGemmOperands) ExecuteProgramError!?usize {
+    const Cand = struct {
         ctx: Ctx,
         gp: ConvGemmParams,
         ops: ConvGemmOperands,
@@ -94,30 +145,16 @@ fn chooseConvConfig(mm: *matmul_exec.Matmul, ctx: Ctx, gp: ConvGemmParams, ops: 
             const cfg = t.generated[idx].cfg;
             const in_grid = context.ceilDiv(t.gp.n, cfg.bn) <= context.MAX_GROUPS_PER_DIM and
                 context.ceilDiv(t.gp.m, cfg.bm) <= context.MAX_GROUPS_PER_DIM;
-            return in_grid and matmul_exec.eligibleConfig(cfg, t.ctx.gpu.limits, 16, @intCast(t.gp.n * @sizeOf(f32)));
+            return in_grid and codegen.fits(cfg, t.gp.m, t.gp.n, t.gp.k) and (!cfg.matrix or tilesFit(t.gp)) and
+                matmul_exec.eligibleConfig(cfg, t.ctx.gpu.limits, 16, @intCast(t.gp.n * @sizeOf(f32)));
         }
 
-        pub fn timeNs(t: @This(), idx: usize) ?u64 {
-            const TUNE_ITERS = 8;
-            var best: ?u64 = null;
-            for (0..2) |_| {
-                matmul_exec.syncDevice(t.ctx);
-                const start = autotune.nowNs();
-                for (0..TUNE_ITERS) |_| {
-                    var f = Frame.init(t.ctx.allocator, t.ctx.gpu) catch return null;
-                    defer f.deinit();
-                    (recordConvGemm(t.ctx, &f, t.generated[idx], t.gp, t.ops) catch return null) orelse return null;
-                    f.submit();
-                }
-                matmul_exec.syncDevice(t.ctx);
-                const ns = autotune.nowNs() - start;
-                if (best == null or ns < best.?) best = ns;
-            }
-            return best;
+        pub fn record(t: @This(), idx: usize, f: *Frame) ExecuteProgramError!void {
+            _ = (try recordConvGemm(t.ctx, f, t.generated[idx], t.gp, t.ops)) orelse return error.Unsupported;
         }
     };
-    const tune: Tune = .{ .ctx = ctx, .gp = gp, .ops = ops, .generated = mm.generated_conv };
-    return autotune.pickBest(&mm.conv_tune, autotune.shapeKey(gp.m, gp.n, gp.k), mm.generated_conv.len, tune);
+    const cand: Cand = .{ .ctx = ctx, .gp = gp, .ops = ops, .generated = mm.generated_conv };
+    return ctx.tune.pick(ctx, frame, .of(.conv, .{ gp.m, gp.n, gp.k }), mm.generated_conv.len, cand);
 }
 
 const conv_kernel: KernelDesc = .{ .name = "conv", .wgsl = @embedFile("../kernels/conv.wgsl") };
@@ -335,7 +372,7 @@ fn execConv(
             .ohw = @intCast(oh_cnt * ow_cnt),
         };
         const ops: ConvGemmOperands = .{ .bufs = bufs, .sizes = sizes };
-        const gi = chooseConvConfig(tuner, ctx, gp, ops) orelse break :gemm;
+        const gi = (try chooseConvConfig(tuner, ctx, frame, gp, ops)) orelse break :gemm;
         if (try recordConvGemm(ctx, frame, tuner.generated_conv[gi], gp, ops)) |_| return;
     };
 

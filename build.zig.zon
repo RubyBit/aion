@@ -35,32 +35,35 @@
     // the archive matching the build target is fetched (see `wgpuDependency` in
     // build.zig). Bump the tag + re-run `zig fetch --save=<name> <url>` to update.
     .dependencies = .{
-        // Patched build (trunk + gfx-rs/wgpu-native#619: expose memory_hints) —
-        // cuts ~250 MiB of committed VRAM per device. Restore the official URLs
-        // once upstream ships a release containing the PR.
+        // Fork build: upstream trunk (which has gfx-rs/wgpu-native#619, memory_hints:
+        // ~250 MiB less committed VRAM per device) + gfx-rs/wgpu-native#642
+        // (experimentalFeaturesEnabled: lets the device request cooperative
+        // matrices) + gfx-rs/wgpu-native#643 (wgpuAdapterGetCooperativeMatrixProperties:
+        // which matrix configurations the adapter has). Restore the official URLs
+        // once upstream ships a release containing all three.
         .wgpu_windows_x86_64 = .{
-            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-windows-x86_64-msvc-release.zip",
-            .hash = "N-V-__8AADpLGAQH4Pk3SQSRDCuntIY8ivTeHTVb43RlXY-S",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-windows-x86_64-msvc-release.zip",
+            .hash = "N-V-__8AAJVEKgIp09B6nvZ0ImtxFRCRvHsWoNDXAEUoILiK",
             .lazy = true,
         },
         .wgpu_linux_x86_64 = .{
-            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-linux-x86_64-release.zip",
-            .hash = "N-V-__8AALybrgOJ6ZwQeP_99RjvuyH-ue7AGJKrjWlG8kqn",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-linux-x86_64-release.zip",
+            .hash = "N-V-__8AAFDmxgHOfEHXm10Nn3uEvHrMc3zggpHtKtchBm1M",
             .lazy = true,
         },
         .wgpu_linux_aarch64 = .{
-            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-linux-aarch64-release.zip",
-            .hash = "N-V-__8AAFzZrAPHcNG4Cq6WLAOtgeHRpTbI9-VEdeDTu7Te",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-linux-aarch64-release.zip",
+            .hash = "N-V-__8AALQ_xwFdLE2WXeRNJzUXmAjXGE0Th92TVGy-rQMf",
             .lazy = true,
         },
         .wgpu_macos_aarch64 = .{
-            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-macos-aarch64-release.zip",
-            .hash = "N-V-__8AAPgZfQL75QCbrZoUhXf7SdaHZMpJLDkpje4dJK3R",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-macos-aarch64-release.zip",
+            .hash = "N-V-__8AAIi0KwGBeNuL-f7QYx0VSMFRHL7wEVQ_5-gE5p3m",
             .lazy = true,
         },
         .wgpu_macos_x86_64 = .{
-            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-memhints.1/wgpu-macos-x86_64-release.zip",
-            .hash = "N-V-__8AAPjGeQL4zmwsMqmJE3tZwl1B0NLOIiIT33m4xlYT",
+            .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-macos-x86_64-release.zip",
+            .hash = "N-V-__8AANCrLQHYStZm53ZqbLvG9sRSR8zMRm7Lxh4y69-u",
             .lazy = true,
         },
     },

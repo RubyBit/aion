@@ -109,6 +109,7 @@ fn applyArg(a: *Args, arg: []const u8, it: anytype) void {
     if (std.mem.eql(u8, arg, "--ablate-scales")) a.model.ablate.scales = true;
     if (std.mem.eql(u8, arg, "--ablate-rope")) a.model.ablate.rope = true;
     if (std.mem.eql(u8, arg, "--ablate-kv")) a.model.ablate.kv_write = true;
+    if (std.mem.eql(u8, arg, "--ablate-ffn")) a.model.ablate.ffn = true;
     if (std.mem.eql(u8, arg, "--high")) a.opts.power = .high;
     if (std.mem.eql(u8, arg, "--low")) a.opts.power = .low;
     if (valueFor(arg, "--adapter", it)) |v| a.opts.adapter_index = std.fmt.parseInt(usize, v, 10) catch null;
@@ -680,7 +681,7 @@ fn runToken(alloc: std.mem.Allocator, a: Args) !void {
 /// kernels -- the very ones under suspicion. Here the op runs alone for `iters`
 /// iterations, so the number is the kernel's.
 fn runAttn(alloc: std.mem.Allocator, a: Args) !void {
-    out.print("attention alone at Gemma-4 decode shapes: ctx={d} iters={d}\n", .{ a.model.ctx, a.iters });
+    out.print("attention alone at Gemma-4 shapes: ctx={d} seq={d} iters={d}\n", .{ a.model.ctx, a.model.seq, a.iters });
     out.print("  sweeping --repeat to separate the ~0.7ms/execute harness floor (intercept)\n", .{});
     out.print("  from the per-op cost (slope); the model runs 28 local + 7 global per token\n", .{});
     var device = openDevice(a) catch |e| {
@@ -694,14 +695,17 @@ fn runAttn(alloc: std.mem.Allocator, a: Args) !void {
     var total_ms: f64 = 0;
     for ([_]bm.AttnKind{ .local, .global }) |kind| {
         const count = bm.attnKindCount(kind);
-        // Two points are enough for a slope, but three guards against a bad one.
-        const reps = [_]usize{ 1, 16, 64 };
+        // Two points are enough for a slope, but three guards against a bad one. A
+        // prefill attention runs for milliseconds, so it repeats less: 64 chained
+        // prefill attentions on the scalar kernel (attention_block.wgsl) have hung
+        // the M5's GPU (not understood yet; the matrix kernel has not).
+        const reps: [3]usize = if (a.model.seq > 1) .{ 1, 4, 16 } else .{ 1, 16, 64 };
         var ms: [reps.len]f64 = @splat(0);
         for (reps, 0..) |rep, ri| {
             var mgr = StorageManager.init(alloc);
             defer mgr.deinit();
             const target = gpuTarget();
-            var built = bm.gemma4Attention(alloc, &mgr, kind, a.model.ctx, rep, target, gb.devmem.device()) catch |e| {
+            var built = bm.gemma4Attention(alloc, &mgr, kind, a.model.ctx, a.model.seq, rep, target, gb.devmem.device()) catch |e| {
                 out.print("  {s:<8} rep={d} build failed: {s}\n", .{ @tagName(kind), rep, @errorName(e) });
                 continue;
             };

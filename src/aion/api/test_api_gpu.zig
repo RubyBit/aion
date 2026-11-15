@@ -370,13 +370,14 @@ fn runRollingCacheSchedule(
     ctx: *api.Context,
     file: std.Io.File,
     dev: api.DeviceSelector,
+    head_dim: usize,
     out: *std.ArrayList(f32),
 ) !void {
-    const head_dim: usize = 4;
     var model = try ctx.loadModel(file, .{ .device = dev });
     defer model.deinit();
 
-    const chunks = [_]usize{ 20, 1, 1, 1, 1, 1, 5, 1, 1 };
+    // The last chunk is a prefill that wraps the cache.
+    const chunks = [_]usize{ 20, 1, 1, 1, 1, 1, 5, 1, 1, 12 };
     var pos: usize = 0;
     for (chunks) |width| {
         const tokens = try alloc.alloc(i32, width);
@@ -404,9 +405,12 @@ fn runRollingCacheSchedule(
 }
 
 test "api: a rolling kv cache decodes identically on gpu and cpu" {
-    const alloc = std.testing.allocator;
-    const head_dim: usize = 4;
+    // 64-wide heads take the matrix prefill kernel where the device has one.
+    for ([_]usize{ 4, 64 }) |head_dim| try expectRollingCacheMatches(head_dim);
+}
 
+fn expectRollingCacheMatches(head_dim: usize) !void {
+    const alloc = std.testing.allocator;
     var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
         error.BackendUnavailable => return error.SkipZigTest,
         else => return e,
@@ -476,8 +480,8 @@ test "api: a rolling kv cache decodes identically on gpu and cpu" {
     defer cpu.deinit(alloc);
     var gpu: std.ArrayList(f32) = .empty;
     defer gpu.deinit(alloc);
-    try runRollingCacheSchedule(alloc, &ctx, file, .cpu, &cpu);
-    try runRollingCacheSchedule(alloc, &ctx, file, .{ .gpu = 0 }, &gpu);
+    try runRollingCacheSchedule(alloc, &ctx, file, .cpu, head_dim, &cpu);
+    try runRollingCacheSchedule(alloc, &ctx, file, .{ .gpu = 0 }, head_dim, &gpu);
 
     try std.testing.expectEqual(cpu.items.len, gpu.items.len);
     for (cpu.items, gpu.items) |c, g| try std.testing.expectApproxEqAbs(c, g, 1e-5);
@@ -722,4 +726,62 @@ test "api: a tied q8 table looks up the same rows on gpu and cpu" {
     // The cpu rounds x to int8 for a q8 matmul and the gpu keeps it f32; over 64
     // terms that rounding stays well under this.
     for (prod[0], prod[1]) |c, g| try std.testing.expectApproxEqAbs(c, g, 3e-2);
+}
+
+// A table that is only looked up, by indices the caller supplies, never reaches the
+// device: the lookup runs on the host and its rows are uploaded. The same ids also
+// index a table the device contracts, so both sides read them.
+test "api: a table only looked up by an input stays on the host on gpu" {
+    const alloc = std.testing.allocator;
+    var ctx = api.Context.init(alloc, .{ .gpus = &.{.{ .power = .high }} }) catch |e| switch (e) {
+        error.BackendUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "lookup.aion", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+
+    const n: usize = 128;
+    var only_v: [n * 64]f32 = undefined;
+    var tied_v: [n * 64]f32 = undefined;
+    for (&only_v, &tied_v, 0..) |*a, *b, i| {
+        a.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.03;
+        b.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) * 0.02;
+    }
+    {
+        var bld = api.Builder.init(&ctx);
+        defer bld.deinit();
+        const ids = try bld.name(try bld.input(.i32, &.{ 1, 4 }), "ids");
+        const x = try bld.name(try bld.input(.f32, &.{ 2, 64 }), "x");
+        const only = try bld.paramNamed(try ctx.fromF32(&.{ n, 64 }, &only_v), "only", .{ .quantize = .q8_0 });
+        const tied = try bld.paramNamed(try ctx.fromF32(&.{ n, 64 }, &tied_v), "tied", .{ .quantize = .q8_0 });
+        const rows = try bld.add(try bld.gather(only, ids, 0, 0), try bld.gather(tied, ids, 0, 0));
+        const prod = try bld.matmul(x, try bld.transpose2d(tied), 1.0, 0.0);
+        try ctx.exportModel(file, &bld, &.{ .{ .name = "rows", .tensor = rows }, .{ .name = "prod", .tensor = prod } }, .{});
+    }
+
+    var x_v: [2 * 64]f32 = undefined;
+    for (&x_v, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) * 0.05 - 0.3;
+    // Two runs, each binding a new tensor: the second must not see the first's ids.
+    const id_sets = [2][4]i32{ .{ 0, 33, 127, 64 }, .{ 5, 5, 90, 1 } };
+    var rows: [2][2][4 * 64]f32 = undefined;
+    for ([_]api.DeviceSelector{ .cpu, .{ .gpu = 0 } }, &rows) |dev, *dev_rows| {
+        var model = try ctx.loadModel(file, .{ .device = dev });
+        defer model.deinit();
+        try model.bindInput("x", try ctx.fromF32(&.{ 2, 64 }, &x_v));
+        for (id_sets, dev_rows) |ids, *out| {
+            try model.bindInput("ids", try ctx.from(&.{ 1, 4 }, &ids));
+            try model.run();
+            try (try model.outputTensor("rows")).read(out);
+        }
+        if (dev == .cpu) continue;
+        const only_id = (try model.initializerTensorByDebugName("only")).tensorId();
+        try std.testing.expectEqual(.cpu, (try ctx.store.tensorDevice(only_id)).kind);
+        try std.testing.expect((try ctx.store.getConst(only_id)).shared != null);
+    }
+    for (rows[0], rows[1]) |cpu, gpu| try std.testing.expectEqualSlices(f32, &cpu, &gpu);
+    try std.testing.expect(!std.mem.eql(f32, &rows[1][0], &rows[1][1]));
 }

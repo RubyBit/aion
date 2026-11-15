@@ -73,7 +73,7 @@ typing = [{ name = "typing-extensions", specifier = ">=4.12" }]
 
 [[package]]
 name = "aion-wgpu"
-version = "29.0.4"
+version = "29.0.4.post1"
 source = { directory = "aion-wgpu" }
 
 [[package]]

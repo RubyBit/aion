@@ -213,6 +213,7 @@ fn checkMatmulSharedRows(entry: []const u8, m: usize, k: usize, n: usize) !void 
     const alloc = std.testing.allocator;
     var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
     defer device.deinit();
+    if (std.mem.endsWith(u8, entry, "_mx") and !device.limits.matrix_f32) return error.SkipZigTest;
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
     for (gb.matmul.generated, 0..) |generated, i| {
@@ -298,6 +299,17 @@ test "gpu backend: matmul shared rows double-buffered staging" {
     try checkMatmulSharedRows("mm_128x128x16_8x8_v_db", 9, 20, 12);
 }
 
+// Matrix tiles read A and B in place, so a block at the far edge of C slides back
+// inside it: whole blocks, an edge each way, and the least a block can cover.
+test "gpu backend: matmul on matrix tiles" {
+    try checkMatmulSharedRows("mm_32x32x8_8x8_s_mx", 64, 16, 96);
+    try checkMatmulSharedRows("mm_32x32x8_8x8_s_mx", 45, 24, 70);
+    try checkMatmulSharedRows("mm_32x32x8_8x8_s_mx", 32, 8, 32);
+    try checkMatmulSharedRows("mm_32x64x8_8x8_s_mx", 33, 16, 100);
+    try checkMatmulSharedRows("mm_64x32x8_8x8_s_mx", 100, 16, 50);
+    try checkMatmulSharedRows("mm_8x32x8_8x8_s_mx", 9, 8, 40);
+}
+
 // ---- shared CPU-vs-GPU runner for the simple/row-wise op tests --------------
 
 const BuiltProg = struct { prog: aion.program.Program, out: TensorId };
@@ -325,24 +337,49 @@ fn runOnBothBackends(
     cpu_result: []f32,
     gpu_result: []f32,
 ) !void {
-    return runOnBothBackendsLimited(buildFn, cpu_result, gpu_result, null);
+    return runOnBothBackendsWith(buildFn, cpu_result, gpu_result, .{});
 }
 
-/// `runOnBothBackends` with the device's per-binding limit lowered to
-/// `binding_limit`, so a tensor past it is placed as dim-0 chunks.
-fn runOnBothBackendsLimited(
+const RunOpts = struct {
+    /// Lowers the device's per-binding limit, so a tensor past it is placed as
+    /// dim-0 chunks.
+    binding_limit: ?u64 = null,
+    /// Leaves the GPU backend only its matrix-tile kernels, so a product they
+    /// cannot take fails instead of running on another kernel. Skips the test on
+    /// a device without the units.
+    matrix_tiles: bool = false,
+    /// Checks the GPU backend after it ran the program.
+    inspect: ?*const fn (*const gpu.GpuBackend) anyerror!void = null,
+    /// Steps the GPU backend records between submits, to move where a program
+    /// is split.
+    submit_chunk: ?usize = null,
+};
+
+fn runOnBothBackendsWith(
     comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg,
     cpu_result: []f32,
     gpu_result: []f32,
-    binding_limit: ?u64,
+    opts: RunOpts,
 ) !void {
     const alloc = std.testing.allocator;
 
     var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
     defer device.deinit();
-    if (binding_limit) |limit| device.limits.max_storage_binding_bytes = limit;
+    if (opts.binding_limit) |limit| device.limits.max_storage_binding_bytes = limit;
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
+    if (opts.submit_chunk) |steps| gb.submit_chunk = steps;
+    if (opts.matrix_tiles) {
+        if (!device.limits.matrix_f32) return error.SkipZigTest;
+        // Each menu ends with its matrix configs.
+        inline for (.{ "generated", "generated_rows", "generated_conv" }) |menu| {
+            const all = @field(gb.matmul, menu);
+            const first = for (all, 0..) |g, i| {
+                if (g.cfg.matrix) break i;
+            } else all.len;
+            @field(gb.matmul, menu) = all[first..];
+        }
+    }
 
     {
         var mgr = StorageManager.init(alloc);
@@ -376,15 +413,25 @@ fn runOnBothBackendsLimited(
         };
         try readPlacedOutput(&mgr, built.out, std.mem.sliceAsBytes(gpu_result));
     }
+    if (opts.inspect) |inspect| try inspect(&gb);
 }
 
 fn expectGpuMatchesCpu(comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg, out_len: usize, tol: f32) !void {
+    return expectGpuMatchesCpuWith(buildFn, out_len, tol, .{});
+}
+
+fn expectGpuMatchesCpuWith(
+    comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg,
+    out_len: usize,
+    tol: f32,
+    opts: RunOpts,
+) !void {
     const alloc = std.testing.allocator;
     const cpu_result = try alloc.alloc(f32, out_len);
     defer alloc.free(cpu_result);
     const gpu_result = try alloc.alloc(f32, out_len);
     defer alloc.free(gpu_result);
-    try runOnBothBackends(buildFn, cpu_result, gpu_result);
+    try runOnBothBackendsWith(buildFn, cpu_result, gpu_result, opts);
 
     for (cpu_result, gpu_result, 0..) |cv, gv, i| {
         std.testing.expectApproxEqAbs(cv, gv, tol) catch |e| {
@@ -402,19 +449,7 @@ fn expectGpuMatchesCpuChunked(
     tol: f32,
     binding_limit: u64,
 ) !void {
-    const alloc = std.testing.allocator;
-    const cpu_result = try alloc.alloc(f32, out_len);
-    defer alloc.free(cpu_result);
-    const gpu_result = try alloc.alloc(f32, out_len);
-    defer alloc.free(gpu_result);
-    try runOnBothBackendsLimited(buildFn, cpu_result, gpu_result, binding_limit);
-
-    for (cpu_result, gpu_result, 0..) |cv, gv, i| {
-        std.testing.expectApproxEqAbs(cv, gv, tol) catch |e| {
-            std.debug.print("mismatch at [{d}]: cpu={d} gpu={d}\n", .{ i, cv, gv });
-            return e;
-        };
-    }
+    return expectGpuMatchesCpuWith(buildFn, out_len, tol, .{ .binding_limit = binding_limit });
 }
 
 /// For comparisons where the two backends quantize different operands, so what is
@@ -424,12 +459,21 @@ fn expectGpuMatchesCpuNmse(
     out_len: usize,
     max_nmse: f64,
 ) !void {
+    return expectGpuMatchesCpuNmseWith(buildFn, out_len, max_nmse, .{});
+}
+
+fn expectGpuMatchesCpuNmseWith(
+    comptime buildFn: fn (std.mem.Allocator, *StorageManager) anyerror!BuiltProg,
+    out_len: usize,
+    max_nmse: f64,
+    opts: RunOpts,
+) !void {
     const alloc = std.testing.allocator;
     const cpu_result = try alloc.alloc(f32, out_len);
     defer alloc.free(cpu_result);
     const gpu_result = try alloc.alloc(f32, out_len);
     defer alloc.free(gpu_result);
-    try runOnBothBackends(buildFn, cpu_result, gpu_result);
+    try runOnBothBackendsWith(buildFn, cpu_result, gpu_result, opts);
 
     const got = nmse(cpu_result, gpu_result);
     if (!(got <= max_nmse)) {
@@ -912,7 +956,9 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
 }
 
 // 2048 rows are 64 groups (the 8-slice GEMV); 64 rows are 2 (the 32-slice one);
-// M = 24 runs that GEMV once per row; M = 40 dequantizes the grouped B for the GEMM.
+// M = 24 runs that GEMV once per row; M = 40 dequantizes the grouped B for the GEMM;
+// M = 100 against 96 rows of B takes the matrix-tile GEMM where the device has it,
+// its last block sliding back both ways (neither is a whole number of 64-blocks).
 fn buildNtLanesGemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 1, 96, 2048);
 }
@@ -925,11 +971,15 @@ fn buildNtLanesGemvRows(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPr
 fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 40, 96, 64);
 }
+fn buildNtLanesTiles(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 100, 96, 96);
+}
 test "gpu backend: matmul NT q8_0 in the GPU's grouped order matches CPU" {
     try expectGpuMatchesCpuNmse(buildNtLanesGemv, 2048, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemvNarrow, 64, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemvRows, 24 * 64, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemm, 40 * 64, ntQ8MaxNmse(96));
+    try expectGpuMatchesCpuNmse(buildNtLanesTiles, 100 * 96, ntQ8MaxNmse(96));
 }
 
 test "gpu backend: matmul NT q8_0 matvec (M=1) matches CPU" {
@@ -989,6 +1039,23 @@ test "gpu backend: matmul NT f32 GEMM over B's rows matches CPU at edges and ali
     try expectGpuMatchesCpu(buildNtF32GemmEdges, 37 * 45, 1e-4);
     try expectGpuMatchesCpu(buildNtF32OddK, 45, 1e-4);
     try expectGpuMatchesCpu(buildNtF32GemmAligned, 128 * 128, 1e-3);
+}
+
+// The same products on matrix tiles: B's rows are read as a tile's columns, and
+// a dequantized B as the plain GEMM's. M = 24 leaves only the 8-row block.
+fn buildNtF32MatrixEdges(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 45, 64, 70, false);
+}
+fn buildNtF32MatrixShort(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNt(alloc, mgr, 24, 64, 40, false);
+}
+test "gpu backend: matmul NT on matrix tiles matches CPU" {
+    const tiles: RunOpts = .{ .matrix_tiles = true };
+    try expectGpuMatchesCpuWith(buildNtF32MatrixEdges, 45 * 70, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildNtF32MatrixShort, 24 * 40, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildNtF32GemmAligned, 128 * 128, 1e-3, tiles);
+    try expectGpuMatchesCpuNmseWith(buildNtQ8Gemm, 40 * 100, ntQ8MaxNmse(128), tiles);
+    try expectGpuMatchesCpuNmseWith(buildNtLanesGemm, 40 * 64, ntQ8MaxNmse(96), tiles);
 }
 
 // B [200, 64] f32 is 50 KiB. Under a 16 KiB binding limit it is placed as 32-row
@@ -1486,20 +1553,37 @@ test "gpu backend: prefill attention (f16 cache, sliding window, soft cap) match
     try expectGpuMatchesCpu(buildPrefillSliding, 1 * 37 * 8 * 256, 1e-4);
 }
 
-// The widest head the block kernel takes (512, a global layer's), with a group
-// of 3 heads per kv head so a block is 3 heads x 10 positions.
+// The widest head the prefill kernels take (512, a global layer's: two value
+// slices on the matrix kernel), with a group of 3 heads per kv head.
 fn buildPrefillWide(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
-    const q = try makeInput(&g, mgr, &.{ 1, 20, 6, 512 }, 83);
-    const k = try makeInputF16(&g, mgr, &.{ 1, 20, 2, 512 }, 84);
-    const v = try makeInputF16(&g, mgr, &.{ 1, 20, 2, 512 }, 85);
+    const q = try makeInput(&g, mgr, &.{ 1, 24, 6, 512 }, 83);
+    const k = try makeInputF16(&g, mgr, &.{ 1, 24, 2, 512 }, 84);
+    const v = try makeInputF16(&g, mgr, &.{ 1, 24, 2, 512 }, 85);
     const out = try g.addAttention(q, k, v, null, null, 0.044194, .causal, 0.0);
     return finishProg(alloc, &g, mgr, out);
 }
 
 test "gpu backend: prefill attention (512-wide heads, 3-head groups) matches CPU" {
-    try expectGpuMatchesCpu(buildPrefillWide, 1 * 20 * 6 * 512, 1e-4);
+    try expectGpuMatchesCpu(buildPrefillWide, 1 * 24 * 6 * 512, 1e-4);
+}
+
+// f32 caches and 64-wide heads, scored unscaled: scores spread over tens, so a
+// row's max climbs past the matrix kernel's reference several times across its
+// 32-key blocks, and every move rescales what is already accumulated.
+fn buildPrefillMovingMax(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 2, 104, 8, 64 }, 86);
+    const k = try makeInput(&g, mgr, &.{ 2, 104, 2, 64 }, 87);
+    const v = try makeInput(&g, mgr, &.{ 2, 104, 2, 64 }, 88);
+    const out = try g.addAttention(q, k, v, null, null, 1.0, .causal, 0.0);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: prefill attention (f32 caches, moving row max) matches CPU" {
+    try expectGpuMatchesCpu(buildPrefillMovingMax, 2 * 104 * 8 * 64, 1e-4);
 }
 
 // ---- conv ----
@@ -1651,6 +1735,63 @@ fn buildConv2DGemmWide(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPro
 }
 test "gpu backend: conv2d implicit GEMM over a wide output matches CPU" {
     try expectGpuMatchesCpu(buildConv2DGemmWide, 1 * 32 * 100 * 64, 1e-4);
+}
+
+// Two images, no padding, an output row of 14 (so each row's second tile slides
+// back) and 40 output channels (so does the second block of columns).
+fn buildConv2DTilesUnpadded(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 2, 12, 16, 16 }, 105);
+    const w = try makeInput(&g, mgr, &.{ 3, 3, 16, 40 }, 106);
+    const b = try makeInput(&g, mgr, &.{40}, 107);
+    const out = try g.addConv2D(x, w, b, 1, 1, 1, 1, 0, 0, 0, 0, 1);
+    return finishProg(alloc, &g, mgr, out);
+}
+fn buildConv2DTilesPointwise(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const x = try makeInput(&g, mgr, &.{ 1, 16, 16, 32 }, 108);
+    const w = try makeInput(&g, mgr, &.{ 1, 1, 32, 64 }, 109);
+    const out = try g.addConv2D(x, w, null, 1, 1, 1, 1, 0, 0, 0, 0, 1);
+    return finishProg(alloc, &g, mgr, out);
+}
+// Five convs of five shapes, so each is timed where it stands in the program.
+fn buildConvChain(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const channels = [_]usize{ 16, 24, 32, 40, 48, 56 };
+    var x = try makeInput(&g, mgr, &.{ 1, 16, 16, channels[0] }, 300);
+    for (channels[0 .. channels.len - 1], channels[1..], 0..) |c_in, c_out, i| {
+        const w = try makeInput(&g, mgr, &.{ 3, 3, c_in, c_out }, @intCast(301 + i));
+        x = try g.addRelu(try g.addConv2D(x, w, null, 1, 1, 1, 1, 1, 1, 1, 1, 1));
+    }
+    return finishProg(alloc, &g, mgr, x);
+}
+// A kernel is timed by running it on the step's real output, ahead of whatever
+// the program has recorded and not yet submitted. That output's memory may be
+// shared with an earlier tensor one of those steps still reads, so the first
+// run — the one that tunes — has to match wherever the program is split.
+test "gpu backend: the run that tunes a kernel matches CPU wherever the program is split" {
+    for ([_]usize{ 2, 3, 4, 5, 32 }) |steps| {
+        try expectGpuMatchesCpuNmseWith(buildConvChain, 16 * 16 * 56, 1e-9, .{ .submit_chunk = steps });
+    }
+}
+
+/// A conv without a GEMM config runs on the direct kernel, which would pass a
+/// matrix-tile test unseen.
+fn expectConvTuned(gb: *const gpu.GpuBackend) !void {
+    try std.testing.expectEqual(@as(usize, 1), gb.tune.count(.conv));
+}
+// Matrix tiles read the activation in place: from a zero-padded copy where a
+// window would leave it (the first three), from the tensor itself otherwise.
+test "gpu backend: conv2d on matrix tiles matches CPU" {
+    const tiles: RunOpts = .{ .matrix_tiles = true, .inspect = expectConvTuned };
+    try expectGpuMatchesCpuWith(buildConv2DGemmTall, 1 * 100 * 32 * 64, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildConv2DGemmWide, 1 * 32 * 100 * 64, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildConv2DGemmStrided, 1 * 6 * 13 * 96, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildConv2DTilesUnpadded, 2 * 10 * 14 * 40, 1e-4, tiles);
+    try expectGpuMatchesCpuWith(buildConv2DTilesPointwise, 1 * 16 * 16 * 64, 1e-4, tiles);
 }
 
 fn buildArgMax(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {

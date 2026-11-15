@@ -7,6 +7,7 @@
 const std = @import("std");
 const codegen = @import("codegen.zig");
 const MatmulConfig = codegen.MatmulConfig;
+const matrix = MatmulConfig.matrixTiles;
 
 /// Config menu — thread-tiled register-blocked GEMM only (the one kernel family
 /// measured competitive on this hardware). Always keep a scalar (non-vec4) config
@@ -38,6 +39,13 @@ pub const configs = [_]MatmulConfig{
     .{ .bm = 256, .bn = 64, .bk = 8, .tm = 8, .tn = 8, .vec4_load = true, .double_buffer = true },
     .{ .bm = 64, .bn = 256, .bk = 8, .tm = 8, .tn = 8, .vec4_load = true, .double_buffer = true },
     .{ .bm = 256, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true },
+
+    // Matrix tiles, on devices with the units. Last, so a menu's first configs
+    // stay the ones every device and shape can run.
+    matrix(32, 32, .{}),
+    matrix(32, 64, .{}),
+    matrix(64, 32, .{}),
+    matrix(8, 32, .{}),
 };
 
 /// The same GEMM over a B stored as rows, `[N, K]` (a `MatMulNT`'s f32 weight), so
@@ -53,6 +61,11 @@ pub const rows_configs = [_]MatmulConfig{
     .{ .bm = 128, .bn = 64, .bk = 16, .tm = 8, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
     .{ .bm = 64, .bn = 128, .bk = 16, .tm = 4, .tn = 8, .vec4_load = true, .b_rows = true },
     .{ .bm = 256, .bn = 128, .bk = 16, .tm = 16, .tn = 4, .vec4_load = true, .double_buffer = true, .b_rows = true },
+
+    matrix(32, 32, .{ .b_rows = true }),
+    matrix(32, 64, .{ .b_rows = true }),
+    matrix(64, 32, .{ .b_rows = true }),
+    matrix(8, 32, .{ .b_rows = true }),
 };
 
 /// Implicit-GEMM conv menu. The same register-blocked kernel, with A gathered
@@ -65,6 +78,10 @@ pub const conv_configs = [_]MatmulConfig{
     .{ .kind = .conv, .bm = 128, .bn = 64, .bk = 16, .tm = 8, .tn = 4, .vec4_load = true, .double_buffer = true },
     .{ .kind = .conv, .bm = 64, .bn = 64, .bk = 16, .tm = 4, .tn = 4, .vec4_load = true },
     .{ .kind = .conv, .bm = 64, .bn = 64, .bk = 16, .tm = 4, .tn = 4, .vec4_load = false },
+
+    matrix(32, 32, .{ .kind = .conv }),
+    matrix(32, 64, .{ .kind = .conv }),
+    matrix(64, 32, .{ .kind = .conv }),
 };
 
 /// Render every menu config's WGSL into `arena` (called once at backend init). The

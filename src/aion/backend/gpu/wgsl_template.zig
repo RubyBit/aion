@@ -9,18 +9,27 @@
 const std = @import("std");
 
 /// `tmpl` with every line `// #name` replaced by `lines`, each indented as the
-/// marker was. A marker the kernel lacks is a compile error.
+/// marker was. A marker the kernel lacks is a compile error. The marker line may
+/// end in LF or CRLF: a Windows checkout with `core.autocrlf` embeds CRLF.
+/// Should probably use LF exclusively.
 pub fn fill(comptime tmpl: []const u8, comptime name: []const u8, comptime lines: []const []const u8) []const u8 {
-    const marker = "// #" ++ name ++ "\n";
+    const marker = "// #" ++ name;
     var out: []const u8 = "";
     var rest = tmpl;
     var found = false;
     while (std.mem.indexOf(u8, rest, marker)) |at| {
+        const after = rest[at + marker.len ..];
+        const eol: usize = if (std.mem.startsWith(u8, after, "\n")) 1 else if (std.mem.startsWith(u8, after, "\r\n")) 2 else {
+            // A longer name sharing this prefix, or a mention mid-line: not ours.
+            out = out ++ rest[0 .. at + marker.len];
+            rest = after;
+            continue;
+        };
         const line_start = if (std.mem.lastIndexOfScalar(u8, rest[0..at], '\n')) |nl| nl + 1 else 0;
         const indent = rest[line_start..at];
         out = out ++ rest[0..line_start];
         for (lines) |line| out = out ++ indent ++ line ++ "\n";
-        rest = rest[at + marker.len ..];
+        rest = after[eol..];
         found = true;
     }
     if (!found) @compileError("kernel has no `// #" ++ name ++ "` line");

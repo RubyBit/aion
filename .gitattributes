@@ -1,0 +1,3 @@
+# Check out text with LF on every platform: kernels and fixtures are embedded
+# byte-for-byte (@embedFile), so the working tree must match what CI builds.
+* text=auto eol=lf

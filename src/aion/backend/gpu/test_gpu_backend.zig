@@ -753,6 +753,21 @@ test "gpu backend: general right-aligned broadcast matches CPU" {
     try expectGpuMatchesCpu(buildGeneralBroadcast, 2 * 3 * 5, 1e-6);
 }
 
+// Past 2^21 elements the dispatch is capped below one invocation per element, so
+// the kernel must loop: a per-row scale, as a model's embedding mask applies.
+fn buildLargeBroadcast(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const av = try makeInput(&g, mgr, &.{ 1, 2100, 1024 }, 212);
+    const bv = try makeInput(&g, mgr, &.{ 1, 2100, 1 }, 213);
+    const out = try g.addElemwiseBinary(.mul, av, bv);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: general broadcast past the dispatch cap matches CPU" {
+    try expectGpuMatchesCpu(buildLargeBroadcast, 2100 * 1024, 1e-6);
+}
+
 fn buildReduceAxis(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();

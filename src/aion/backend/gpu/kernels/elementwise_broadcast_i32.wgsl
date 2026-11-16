@@ -18,6 +18,9 @@ struct Params {
     b_stride1: vec4<u32>,
 };
 
+// Grid-stride, as in elementwise.wgsl: the backend dispatches at most MAX_GROUPS_1D
+// groups, fewer than one invocation per element on tensors past 2^21 elements.
+
 fn lane(lo: vec4<u32>, hi: vec4<u32>, i: u32) -> u32 {
     if (i < 4u) { return lo[i]; }
     return hi[i - 4u];
@@ -41,58 +44,64 @@ fn indices(linear: u32) -> vec2<u32> {
 }
 
 @compute @workgroup_size(64)
-fn add(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = a[ix.x] + b[ix.y];
-}
-@compute @workgroup_size(64)
-fn sub(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = a[ix.x] - b[ix.y];
-}
-@compute @workgroup_size(64)
-fn mul(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = a[ix.x] * b[ix.y];
-}
-@compute @workgroup_size(64)
-fn divide(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x);
-    let divisor = b[ix.y];
-    if (divisor == 0) {
-        o[g.x] = 0;
-    } else {
-        o[g.x] = a[ix.x] / divisor;
+fn add(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = a[ix.x] + b[ix.y];
     }
 }
 @compute @workgroup_size(64)
-fn eq(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] == b[ix.y]);
+fn sub(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = a[ix.x] - b[ix.y];
+    }
 }
 @compute @workgroup_size(64)
-fn ne(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] != b[ix.y]);
+fn mul(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = a[ix.x] * b[ix.y];
+    }
 }
 @compute @workgroup_size(64)
-fn lt(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] < b[ix.y]);
+fn divide(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i);
+        let divisor = b[ix.y];
+        o[i] = select(a[ix.x] / divisor, 0, divisor == 0);
+    }
 }
 @compute @workgroup_size(64)
-fn gt(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] > b[ix.y]);
+fn eq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] == b[ix.y]);
+    }
 }
 @compute @workgroup_size(64)
-fn le(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] <= b[ix.y]);
+fn ne(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] != b[ix.y]);
+    }
 }
 @compute @workgroup_size(64)
-fn ge(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= p.n) { return; }
-    let ix = indices(g.x); o[g.x] = select(0, 1, a[ix.x] >= b[ix.y]);
+fn lt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] < b[ix.y]);
+    }
+}
+@compute @workgroup_size(64)
+fn gt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] > b[ix.y]);
+    }
+}
+@compute @workgroup_size(64)
+fn le(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] <= b[ix.y]);
+    }
+}
+@compute @workgroup_size(64)
+fn ge(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    for (var i = g.x; i < p.n; i += nwg.x * 64u) {
+        let ix = indices(i); o[i] = select(0, 1, a[ix.x] >= b[ix.y]);
+    }
 }

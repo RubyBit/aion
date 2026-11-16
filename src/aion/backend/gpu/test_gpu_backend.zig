@@ -348,6 +348,10 @@ const RunOpts = struct {
     /// cannot take fails instead of running on another kernel. Skips the test on
     /// a device without the units.
     matrix_tiles: bool = false,
+    /// Whether the GPU backend may use f16 matrix tiles where the device has them.
+    /// Off keeps an exactly-compared test on the f32 kernels other devices run;
+    /// `require` skips the test on a device without the tiles.
+    f16_tiles: enum { allow, forbid, require } = .allow,
     /// Checks the GPU backend after it ran the program.
     inspect: ?*const fn (*const gpu.GpuBackend) anyerror!void = null,
     /// Steps the GPU backend records between submits, to move where a program
@@ -366,6 +370,11 @@ fn runOnBothBackendsWith(
     var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
     defer device.deinit();
     if (opts.binding_limit) |limit| device.limits.max_storage_binding_bytes = limit;
+    switch (opts.f16_tiles) {
+        .allow => {},
+        .forbid => device.limits.matrix_f16 = false,
+        .require => if (!device.limits.matrix_f16) return error.SkipZigTest,
+    }
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
     if (opts.submit_chunk) |steps| gb.submit_chunk = steps;
@@ -974,6 +983,24 @@ fn buildNtLanesGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 fn buildNtLanesTiles(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 100, 96, 96);
 }
+// M = 200 against 160 rows of B takes the f16 matrix-tile GEMM (128 x 128 blocks)
+// where the device has it, its last block sliding back both ways.
+fn buildNtLanesTilesF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 200, 96, 160);
+}
+test "gpu backend: matmul NT q8_0 on f16 matrix tiles matches CPU" {
+    try expectGpuMatchesCpuNmseWith(buildNtLanesTilesF16, 200 * 160, ntQ8MaxNmse(96), .{ .f16_tiles = .require, .inspect = expectMx16Ran });
+}
+
+/// The product ran on the f16 tiles, not a fallback.
+fn expectMx16Ran(gb: *const gpu.GpuBackend) !void {
+    var it = gb.pipes.modules.keyIterator();
+    while (it.next()) |name| {
+        if (std.mem.startsWith(u8, name.*, "matmul_q8_mx16_")) return;
+    }
+    return error.TestExpectedMx16;
+}
+
 test "gpu backend: matmul NT q8_0 in the GPU's grouped order matches CPU" {
     try expectGpuMatchesCpuNmse(buildNtLanesGemv, 2048, ntQ8MaxNmse(96));
     try expectGpuMatchesCpuNmse(buildNtLanesGemvNarrow, 64, ntQ8MaxNmse(96));
@@ -1550,7 +1577,7 @@ fn buildPrefillSliding(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPro
 }
 
 test "gpu backend: prefill attention (f16 cache, sliding window, soft cap) matches CPU" {
-    try expectGpuMatchesCpu(buildPrefillSliding, 1 * 37 * 8 * 256, 1e-4);
+    try expectGpuMatchesCpuWith(buildPrefillSliding, 1 * 37 * 8 * 256, 1e-4, .{ .f16_tiles = .forbid });
 }
 
 // The widest head the prefill kernels take (512, a global layer's: two value
@@ -1566,7 +1593,7 @@ fn buildPrefillWide(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 }
 
 test "gpu backend: prefill attention (512-wide heads, 3-head groups) matches CPU" {
-    try expectGpuMatchesCpu(buildPrefillWide, 1 * 24 * 6 * 512, 1e-4);
+    try expectGpuMatchesCpuWith(buildPrefillWide, 1 * 24 * 6 * 512, 1e-4, .{ .f16_tiles = .forbid });
 }
 
 // f32 caches and 64-wide heads, scored unscaled: scores spread over tens, so a
@@ -1584,6 +1611,48 @@ fn buildPrefillMovingMax(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltP
 
 test "gpu backend: prefill attention (f32 caches, moving row max) matches CPU" {
     try expectGpuMatchesCpu(buildPrefillMovingMax, 2 * 104 * 8 * 64, 1e-4);
+}
+
+// The same prefills on f16 matrix tiles (q and the probabilities rounded to f16,
+// f32 accumulation), compared as a relative error. The wide one over a cache of
+// whole tiles (32 rows of 512); the moving max over f16 caches, 64 wide (one
+// SIMD group), 112 rows.
+fn buildPrefillWideTiles(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 1, 32, 6, 512 }, 83);
+    const k = try makeInputF16(&g, mgr, &.{ 1, 32, 2, 512 }, 84);
+    const v = try makeInputF16(&g, mgr, &.{ 1, 32, 2, 512 }, 85);
+    const out = try g.addAttention(q, k, v, null, null, 0.044194, .causal, 0.0);
+    return finishProg(alloc, &g, mgr, out);
+}
+fn buildPrefillMovingMaxF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const q = try makeInput(&g, mgr, &.{ 2, 112, 8, 64 }, 86);
+    const k = try makeInputF16(&g, mgr, &.{ 2, 112, 2, 64 }, 87);
+    const v = try makeInputF16(&g, mgr, &.{ 2, 112, 2, 64 }, 88);
+    const out = try g.addAttention(q, k, v, null, null, 1.0, .causal, 0.0);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+/// What rounding q and the probabilities to f16 leaves of a relative error.
+const ATTN_F16_MAX_NMSE: f64 = 1e-5;
+
+test "gpu backend: prefill attention on f16 matrix tiles matches CPU" {
+    const tiles: RunOpts = .{ .f16_tiles = .require, .inspect = expectAttnMx16Ran };
+    try expectGpuMatchesCpuNmseWith(buildPrefillSliding, 1 * 37 * 8 * 256, ATTN_F16_MAX_NMSE, tiles);
+    try expectGpuMatchesCpuNmseWith(buildPrefillWideTiles, 1 * 32 * 6 * 512, ATTN_F16_MAX_NMSE, tiles);
+    try expectGpuMatchesCpuNmseWith(buildPrefillMovingMaxF16, 2 * 112 * 8 * 64, ATTN_F16_MAX_NMSE, tiles);
+}
+
+/// The attention ran on the f16 tiles, not a fallback.
+fn expectAttnMx16Ran(gb: *const gpu.GpuBackend) !void {
+    var it = gb.pipes.modules.keyIterator();
+    while (it.next()) |name| {
+        if (std.mem.startsWith(u8, name.*, "attention_mx16_")) return;
+    }
+    return error.TestExpectedAttnMx16;
 }
 
 // ---- conv ----

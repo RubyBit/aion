@@ -408,7 +408,7 @@ pub const Builder = struct {
         var i: usize = 0;
         var cursor: usize = 0;
         while (i < depth) : (i += 1) {
-            const next = std.mem.indexOfScalarPos(u8, self.scope_path.items, cursor, '/') orelse self.scope_path.items.len;
+            const next = std.mem.findScalarPos(u8, self.scope_path.items, cursor, '/') orelse self.scope_path.items.len;
             keep = next;
             cursor = next + 1;
         }

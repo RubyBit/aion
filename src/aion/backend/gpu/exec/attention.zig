@@ -25,6 +25,7 @@ const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const autotune = @import("../autotune.zig");
 const attention_mx = @import("attention_mx.zig");
+const attention_mx16 = @import("attention_mx16.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const device_store = @import("../../../runtime/device_store.zig");
@@ -466,6 +467,9 @@ pub fn execAttention(ctx: Ctx, frame: *Frame, s: executable.StepAttention) Execu
     if (!q_f16 and l_q >= BLOCK_MIN_L) {
         const bufs = [_]c.WGPUBuffer{ q_buf, k_buf, v_buf, pos_buf, end_buf, out_buf };
         const sizes = [_]u64{ dq.len, dk.len, dv.len, pos_len, end_len, dout.len };
+        if (attention_mx16.fits(q_f16, kv_f16, l_q, d_k, d_v, t_cap, ctx.gpu.limits)) {
+            return attention_mx16.record(ctx, frame, std.mem.asBytes(&params), bufs, sizes, .{ .heads = h_q, .rows = l_q, .batch = batch, .dv = d_v });
+        }
         if (attention_mx.fits(d_k, d_v, t_cap, ctx.gpu.limits)) {
             return attention_mx.record(ctx, frame, std.mem.asBytes(&params), bufs, sizes, .{ .heads = h_q, .rows = l_q, .batch = batch, .dv = d_v, .kv_f16 = kv_f16 });
         }

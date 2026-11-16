@@ -4,6 +4,10 @@
 //! goes (kernels/matmul_q8_mx.wgsl), for `lanes32x16` weights: what a prefill
 //! takes wherever the device has the tiles, instead of dequantizing the whole
 //! weight into scratch and multiplying that.
+//!
+//! The `coopLoad`/`coopLoadT`/`coopStore` choices below follow naga 29's inverted
+//! Metal layout and must be swapped when moving to wgpu >= 30
+//! (gfx-rs/wgpu#9451): see the note at the top of matmul_q8_mx.wgsl.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");

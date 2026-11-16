@@ -4456,8 +4456,8 @@ test "api: binding a model input names the input and the mismatch" {
     try std.testing.expectError(error.InvalidArgument, model.bindInput("nope", ok_shape));
     try std.testing.expectEqualStrings("UnknownInput", diagnostic.current().code);
     try std.testing.expectEqualStrings("bind_input", diagnostic.current().operation);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "\"nope\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "\"x\"") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.current().message(), "\"nope\"") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.current().message(), "\"x\"") != null);
 
     // Wrong rank: names the input and reports both ranks.
     diagnostic.current().clear();
@@ -4465,9 +4465,9 @@ test "api: binding a model input names the input and the mismatch" {
     try std.testing.expectError(error.InvalidArgument, model.bindInput("x", bad_rank));
     try std.testing.expectEqualStrings("InputRankMismatch", diagnostic.current().code);
     const msg = diagnostic.current().message();
-    try std.testing.expect(std.mem.indexOf(u8, msg, "input \"x\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "rank=2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "{ 1, 2, 2 }") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "input \"x\"") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "rank=2") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "{ 1, 2, 2 }") != null);
 
     // Wrong dtype: names the input and both dtypes.
     diagnostic.current().clear();
@@ -4475,7 +4475,7 @@ test "api: binding a model input names the input and the mismatch" {
     const bad_dtype = try ctx.fromPackedScalar(.i32, &[_]usize{ 1, 4 }, std.mem.sliceAsBytes(ints[0..]));
     try std.testing.expectError(error.InvalidArgument, model.bindInput("x", bad_dtype));
     try std.testing.expectEqualStrings("InputDTypeMismatch", diagnostic.current().code);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "dtype=i32") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.current().message(), "dtype=i32") != null);
 }
 
 test "api: a diagnostic names the values the author named" {
@@ -4496,8 +4496,8 @@ test "api: a diagnostic names the values the author named" {
     try std.testing.expectError(error.Unsupported, bld.gather(w, idx, 1, 2));
 
     const msg = diagnostic.current().message();
-    try std.testing.expect(std.mem.indexOf(u8, msg, "\"attn_weights\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "\"positions\"") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "\"attn_weights\"") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "\"positions\"") != null);
 
     // An unnamed value still reports its id rather than nothing.
     diagnostic.current().clear();
@@ -4505,7 +4505,7 @@ test "api: a diagnostic names the values the author named" {
     defer bld2.deinit();
     const anon = try bld2.input(.f32, &[_]usize{ 3, 3 });
     try std.testing.expectError(error.RankMismatch, bld2.maxPool2D(anon, .{ .kernel_h = 2, .kernel_w = 2 }));
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "input[0] value 0") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.current().message(), "input[0] value 0") != null);
 }
 
 test "api: a diagnostic reports any op's attributes, not a hand-picked few" {
@@ -4526,9 +4526,9 @@ test "api: a diagnostic reports any op's attributes, not a hand-picked few" {
         const kern = try bld.input(.f32, &[_]usize{ 3, 3, 9, 4 }); // c_in disagrees
         try std.testing.expectError(error.ShapeMismatch, bld.conv2d(img, kern, null, 2, 1, 1, 1, 1, 0, 0, 0, 1));
         const msg = diagnostic.current().message();
-        try std.testing.expect(std.mem.indexOf(u8, msg, "stride_h=2") != null);
-        try std.testing.expect(std.mem.indexOf(u8, msg, "pad_top=1") != null);
-        try std.testing.expect(std.mem.indexOf(u8, msg, "groups=1") != null);
+        try std.testing.expect(std.mem.find(u8, msg, "stride_h=2") != null);
+        try std.testing.expect(std.mem.find(u8, msg, "pad_top=1") != null);
+        try std.testing.expect(std.mem.find(u8, msg, "groups=1") != null);
     }
     {
         var bld = api.Builder.init(&ctx);
@@ -4536,7 +4536,7 @@ test "api: a diagnostic reports any op's attributes, not a hand-picked few" {
         diagnostic.current().clear();
         const ints = try bld.input(.i32, &[_]usize{ 2, 3 });
         try std.testing.expectError(error.Unsupported, bld.softmax(ints, -1));
-        try std.testing.expect(std.mem.indexOf(u8, diagnostic.current().message(), "axis=-1") != null);
+        try std.testing.expect(std.mem.find(u8, diagnostic.current().message(), "axis=-1") != null);
     }
 }
 

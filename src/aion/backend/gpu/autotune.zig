@@ -20,7 +20,7 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
 /// The op families that tune. Part of the key: two families' problems can share
 /// dims and still want different candidates.
-pub const Family = enum(u8) { gemm, gemm_rows, conv, attention };
+pub const Family = enum(u8) { gemm, gemm_rows, gemm_q8, conv, attention };
 
 /// The problem a choice was timed for: the family and the dims that decide it.
 pub const Key = struct {

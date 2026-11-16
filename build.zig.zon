@@ -41,6 +41,16 @@
         // matrices) + gfx-rs/wgpu-native#643 (wgpuAdapterGetCooperativeMatrixProperties:
         // which matrix configurations the adapter has). Restore the official URLs
         // once upstream ships a release containing all three.
+        //
+        // BEFORE MOVING TO wgpu >= 30: these binaries carry naga 29.0.4, whose
+        // Metal writer inverts cooperative-matrix load/store layouts (fixed in
+        // wgpu 30, gfx-rs/wgpu#9451). The Apple 8x8 f32 kernels rely on the
+        // inversion: matmul_q8_mx.wgsl, attention_mx.wgsl, codegen.zig
+        // `matrixBody` (and their exec/ generators) must swap every
+        // coopLoad <-> coopLoadT and coopStore <-> coopStoreT in the same change,
+        // verified on Apple silicon. The _mx16 (NVIDIA) kernels already follow the
+        // spec. Also check whether gfx-rs/wgpu#10901 (coopStore stride emitted
+        // late) has landed; the kernels bind strides to `let`s to work around it.
         .wgpu_windows_x86_64 = .{
             .url = "https://github.com/RubyBit/wgpu-native/releases/download/v29.0.4-experimental.2/wgpu-windows-x86_64-msvc-release.zip",
             .hash = "N-V-__8AAJVEKgIp09B6nvZ0ImtxFRCRvHsWoNDXAEUoILiK",

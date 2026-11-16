@@ -29,6 +29,10 @@
 //! `// #name` lines: the shader compiler does not unroll loops, and tiles cannot
 //! be indexed. There is one kernel per value width, since it sets how many
 //! SIMD groups and accumulator tiles there are.
+//!
+//! The `coopLoad`/`coopLoadT` choices below follow naga 29's inverted Metal
+//! layout and must be swapped when moving to wgpu >= 30 (gfx-rs/wgpu#9451): see
+//! the note at the top of attention_mx.wgsl.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");

@@ -99,6 +99,7 @@ const Procs = struct {
     wgpuInstanceRequestAdapter: *const @TypeOf(c.wgpuInstanceRequestAdapter),
     wgpuQuerySetRelease: *const @TypeOf(c.wgpuQuerySetRelease),
     wgpuQueueGetTimestampPeriod: *const @TypeOf(c.wgpuQueueGetTimestampPeriod),
+    wgpuQueueOnSubmittedWorkDone: *const @TypeOf(c.wgpuQueueOnSubmittedWorkDone),
     wgpuQueueRelease: *const @TypeOf(c.wgpuQueueRelease),
     wgpuQueueSubmit: *const @TypeOf(c.wgpuQueueSubmit),
     wgpuQueueWriteBuffer: *const @TypeOf(c.wgpuQueueWriteBuffer),
@@ -304,6 +305,14 @@ fn onMap(status: c.WGPUMapAsyncStatus, message: c.WGPUStringView, ud1: ?*anyopaq
     r.done = true;
 }
 
+fn onWorkDone(status: c.WGPUQueueWorkDoneStatus, message: c.WGPUStringView, ud1: ?*anyopaque, ud2: ?*anyopaque) callconv(.c) void {
+    _ = status; // done either way: success, or the device is gone
+    _ = message;
+    _ = ud2;
+    const done: *bool = @ptrCast(@alignCast(ud1.?));
+    done.* = true;
+}
+
 /// One enumerated GPU's identity (for selection / display).
 pub const AdapterDesc = struct {
     name: [128]u8 = undefined,
@@ -373,12 +382,14 @@ pub const Limits = struct {
     /// The device multiplies 8x8 f32 tiles on its matrix units (wgpu's
     /// cooperative matrices: Apple's simdgroup matrices), the configuration the
     /// matrix kernels are written for (`Gpu.hasMatrixF32`).
-    // TODO: NVIDIA's tensor cores take f16 tiles (16x16, f32 accumulation), which
-    // need their own kernel variants; naga 29 types that product wrongly on Metal
-    // (fixed in gfx-rs/wgpu#9629, wgpu 30). On the M5, f16 tiles run at the f32
-    // rate (2.87 vs 2.75 TFLOPS on a 2048^3 GEMM), so they would only save memory
-    // traffic there.
     matrix_f32: bool = false,
+    /// The device multiplies 16x16x16 f16 tiles into f32 (NVIDIA's tensor cores
+    /// through Vulkan), what the `_mx16` kernels are written for
+    /// (`Gpu.hasMatrixF16`). Metal does not report this shape; naga 29 also
+    /// types that mixed product wrongly there (fixed in gfx-rs/wgpu#9629, wgpu
+    /// 30). On the M5, f16 tiles run at the f32 rate (2.87 vs 2.75 TFLOPS on a
+    /// 2048^3 GEMM), so they would only save memory traffic there.
+    matrix_f16: bool = false,
 
     fn fromWgpu(l: c.WGPULimits) Limits {
         var out: Limits = .{};
@@ -421,9 +432,10 @@ pub const Gpu = struct {
         // shader-f16 is required, not probed: f16 tensors are bound as `array<f16>`.
         if (fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_ShaderF16) == 0) return Error.NoShaderF16;
 
+        const matrix_shapes = matrixShapes(adapter);
         const wanted: Optional = .{
             .timestamps = fns.wgpuAdapterHasFeature(adapter, c.WGPUFeatureName_TimestampQuery) != 0,
-            .matrix = Optional.can_enable_experimental and hasMatrixF32(adapter),
+            .matrix = Optional.can_enable_experimental and (matrix_shapes.f32 or matrix_shapes.f16),
         };
         const lim: ?*const c.WGPULimits = if (have_adapter_limits) &adapter_limits else null;
         // An adapter may advertise an optional feature and still reject it at
@@ -444,7 +456,8 @@ pub const Gpu = struct {
         if (fns.wgpuDeviceGetLimits(device, &dev_limits) == c.WGPUStatus_Success) {
             granted = Limits.fromWgpu(dev_limits);
         }
-        granted.matrix_f32 = optional.matrix;
+        granted.matrix_f32 = optional.matrix and matrix_shapes.f32;
+        granted.matrix_f16 = optional.matrix and matrix_shapes.f16;
 
         const queue = fns.wgpuDeviceGetQueue(device);
         return .{ .instance = instance, .adapter = adapter, .device = device, .queue = queue, .limits = granted, .timestamp_query = optional.timestamps };
@@ -460,20 +473,27 @@ pub const Gpu = struct {
         const can_enable_experimental = @hasField(c.WGPUDeviceExtras, "experimentalFeaturesEnabled");
     };
 
-    /// Whether `adapter` multiplies 8x8 f32 tiles into f32, the one configuration
-    /// the matrix kernels use. The cooperative-matrix feature alone does not say:
-    /// it is set for any configuration (on Vulkan often only 16x16 f16).
-    fn hasMatrixF32(adapter: c.WGPUAdapter) bool {
-        if (fns.wgpuAdapterHasFeature(adapter, c.WGPUNativeFeature_CooperativeMatrix) == 0) return false;
+    const MatrixShapes = struct { f32: bool = false, f16: bool = false };
+
+    /// Which of the two tile configurations the matrix kernels use `adapter`
+    /// multiplies: 8x8x8 f32 into f32 (Apple), 16x16x16 f16 into f32 (NVIDIA on
+    /// Vulkan). The cooperative-matrix feature alone does not say: it is set for
+    /// any configuration.
+    fn matrixShapes(adapter: c.WGPUAdapter) MatrixShapes {
+        if (fns.wgpuAdapterHasFeature(adapter, c.WGPUNativeFeature_CooperativeMatrix) == 0) return .{};
         const n = fns.wgpuAdapterGetCooperativeMatrixProperties(adapter, null);
-        const props = std.heap.page_allocator.alloc(c.WGPUCooperativeMatrixProperties, n) catch return false;
+        const props = std.heap.page_allocator.alloc(c.WGPUCooperativeMatrixProperties, n) catch return .{};
         defer std.heap.page_allocator.free(props);
         _ = fns.wgpuAdapterGetCooperativeMatrixProperties(adapter, props.ptr);
+        var out: MatrixShapes = .{};
         for (props) |p| {
-            if (p.mSize == 8 and p.nSize == 8 and p.kSize == 8 and
-                p.abType == c.WGPUCooperativeScalarType_F32 and p.crType == c.WGPUCooperativeScalarType_F32) return true;
+            const acc_f32 = p.crType == c.WGPUCooperativeScalarType_F32;
+            if (p.mSize == 8 and p.nSize == 8 and p.kSize == 8 and acc_f32 and
+                p.abType == c.WGPUCooperativeScalarType_F32) out.f32 = true;
+            if (p.mSize == 16 and p.nSize == 16 and p.kSize == 16 and acc_f32 and
+                p.abType == c.WGPUCooperativeScalarType_F16) out.f16 = true;
         }
-        return false;
+        return out;
     }
 
     /// Request a device from `adapter` with optional `required` limits. Returns null
@@ -617,22 +637,37 @@ pub const Gpu = struct {
     /// Block until everything submitted has run, returning within a slice of its
     /// completion: the same spin-then-sleep as `mapBlocking`, for a caller timing
     /// the work, whom a whole-millisecond wait inside wgpu would blur.
+    ///
+    /// Completion is the queue's work-done callback. A non-blocking
+    /// `wgpuDevicePoll` reporting an empty queue is not: on NVIDIA/Vulkan it says
+    /// so while submitted work is still running, which had the autotuner timing
+    /// how fast the CPU records, and leaving seconds of trials queued behind it.
     pub fn waitIdle(self: *Gpu) void {
+        var done = false;
+        _ = fns.wgpuQueueOnSubmittedWorkDone(self.queue, .{
+            .nextInChain = null,
+            .mode = c.WGPUCallbackMode_AllowProcessEvents,
+            .callback = onWorkDone,
+            .userdata1 = &done,
+            .userdata2 = null,
+        });
         const start = profile.nowNs();
         var spins: usize = 0;
-        while (!self.pollIdle()) : (spins += 1) {
+        while (!self.pollDone(&done)) : (spins += 1) {
             if (spins % 64 == 0 and profile.nowNs() - start > MAP_SPIN_NS) break;
         }
         const io = std.Io.Threaded.global_single_threaded.io();
-        while (!self.pollIdle()) {
+        while (!self.pollDone(&done)) {
             if (profile.nowNs() - start > MAP_TIMEOUT_NS) return;
             std.Io.sleep(io, .fromNanoseconds(MAP_SLICE_NS), .awake) catch {};
         }
     }
 
-    /// One non-blocking poll; true once the queue has nothing left to run.
-    fn pollIdle(self: *Gpu) bool {
-        return fns.wgpuDevicePoll(self.device, 0, null) != 0;
+    /// One non-blocking poll; true once `done`'s callback has fired.
+    fn pollDone(self: *Gpu, done: *const bool) bool {
+        _ = fns.wgpuDevicePoll(self.device, 0, null); // wait = false
+        fns.wgpuInstanceProcessEvents(self.instance);
+        return @as(*const volatile bool, done).*;
     }
 
     /// One non-blocking poll; true once the map's callback has fired.

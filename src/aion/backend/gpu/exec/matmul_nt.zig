@@ -13,7 +13,8 @@
 //!   - larger M (prefill): compute-bound. An f32 B runs the autotuned GEMM that
 //!     stages B from its rows (`Matmul.execRowsB`), so nothing is copied. A q8_0
 //!     B in `lanes32x16` order runs on matrix tiles, dequantized as it is staged
-//!     (`matmul_q8_mx.zig`), where the device has them. Otherwise it is
+//!     (`matmul_q8_mx16.zig` on 16x16 f16 tiles, `matmul_q8_mx.zig` on 8x8 f32
+//!     ones), where the device has them. Otherwise it is
 //!     dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM runs
 //!     on it. Scratch is reused across chunks; the frame's compute-pass ordering
 //!     serializes dequant(i+1) after gemm(i).
@@ -29,6 +30,7 @@ const context = @import("../context.zig");
 const codegen = @import("../matmul/codegen.zig");
 const matmul_exec = @import("matmul.zig");
 const matmul_q8_mx = @import("matmul_q8_mx.zig");
+const matmul_q8_mx16 = @import("matmul_q8_mx16.zig");
 const backend_mod = @import("../../backend.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
@@ -178,6 +180,20 @@ pub const MatmulNt = struct {
                     .c_off = c_off,
                     .alpha = s.alpha,
                     .beta = s.beta,
+                });
+            } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f16 and
+                matmul_q8_mx16.fits(m_total, n_count, k, c_row, c_off, s.alpha, s.beta))
+            {
+                try matmul_q8_mx16.record(ctx, frame, .{
+                    ctx.devmem.bufferFor(da.handle).?,
+                    ctx.devmem.bufferFor(db.handle).?,
+                    ctx.devmem.bufferFor(dc.handle).?,
+                }, .{ da.len, db.len, dc.len }, .{
+                    .m = m_total,
+                    .n = n_count,
+                    .k = k,
+                    .c_row = c_row,
+                    .c_off = c_off,
                 });
             } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f32 and matmul_q8_mx.fits(m_total, n_count, k)) {
                 try matmul_q8_mx.record(ctx, frame, .{

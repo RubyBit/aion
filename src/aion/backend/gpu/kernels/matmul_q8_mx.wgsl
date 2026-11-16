@@ -20,6 +20,15 @@
 // does not unroll loops, and tiles cannot be indexed). The last block each way
 // slides back to stay whole (the host guarantees M, N >= 64), and writes only the
 // elements no earlier block owns.
+//
+// TILE LAYOUT DEPENDS ON THE WGPU VERSION. This kernel relies on naga 29's Metal
+// writer inverting the load/store layout: here `coopLoad`/`coopStore` are
+// row-major and `coopLoadT` column-major. That is an upstream bug, fixed in wgpu
+// 30 (gfx-rs/wgpu#9451): from then on `coopLoad` is column-major and `coopLoadT`
+// row-major on every backend, as the spec says. Moving wgpu-native to >= 30 must
+// swap every `coopLoad` <-> `coopLoadT` and `coopStore` <-> `coopStoreT` here
+// and in exec/matmul_q8_mx.zig, checked on the M5: a wrong layout transposes
+// the square tiles silently. (matmul_q8_mx16.wgsl already follows the spec.)
 
 enable wgpu_cooperative_matrix;
 

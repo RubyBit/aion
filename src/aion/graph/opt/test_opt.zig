@@ -155,7 +155,7 @@ fn expectPlacementsBacked(sm: *StorageManager, prog: *const program.Program) !vo
     for (prog.tensor_placements) |entry| {
         if (try sm.tensorHasBacking(entry.id)) continue;
         const in_slot = for (prog.workspace_slots) |slot| {
-            if (std.mem.indexOfScalar(TensorId, slot.members, entry.id) != null) break true;
+            if (std.mem.findScalar(TensorId, slot.members, entry.id) != null) break true;
         } else false;
         try std.testing.expect(in_slot);
     }

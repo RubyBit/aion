@@ -20,7 +20,7 @@ fn baseModuleType(comptime T: type) type {
 pub fn moduleTypeName(comptime T: type) []const u8 {
     const U: type = baseModuleType(T);
     const full: []const u8 = @typeName(U);
-    const dot = std.mem.lastIndexOfScalar(u8, full, '.') orelse return full;
+    const dot = std.mem.findScalarLast(u8, full, '.') orelse return full;
     if (dot + 1 >= full.len) return full;
     return full[dot + 1 ..];
 }

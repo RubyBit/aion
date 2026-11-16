@@ -29,6 +29,14 @@
 //! A `matrix` config is the same product on the device's matrix units (wgpu's
 //! cooperative matrices): whole 8x8 tiles are loaded straight from A and B and
 //! multiplied as a unit, so it has no staging and no register tile (`matrixBody`).
+//!
+//! `matrixBody`'s tile layout depends on the wgpu version: it relies on naga 29's
+//! Metal writer inverting the load/store layout (`coopLoad`/`coopStore` row-major,
+//! `coopLoadT` column-major). That is an upstream bug, fixed in wgpu 30
+//! (gfx-rs/wgpu#9451), after which the spec meaning holds on every backend
+//! (`coopLoad` column-major, `coopLoadT` row-major). Moving wgpu-native to >= 30
+//! must swap every `coopLoad` <-> `coopLoadT` and `coopStore` <-> `coopStoreT` it
+//! emits, checked on the M5: a wrong layout transposes the square tiles silently.
 
 const std = @import("std");
 const pipelines = @import("../pipelines.zig");

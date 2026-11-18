@@ -33,6 +33,12 @@ pub const MatMulExecCtx = struct {
     matmul_scratch: [][]align(32) u8,
 };
 
+/// The `alpha` and `beta` of `C = alpha * A @ B + beta * C`.
+pub const Scale = struct {
+    alpha: f32 = 1.0,
+    beta: f32 = 0.0,
+};
+
 /// `C = alpha * A @ B + beta * C`. A rank-2 B is one weight shared by every row of
 /// A, so A's and C's leading dims fold into M; a batched B runs one 2D matmul per
 /// batch, its size-1 batch dims broadcast.
@@ -56,13 +62,14 @@ pub fn execMatMul(ctx: *MatMulExecCtx, s: executable.StepMatMul, store: tensor_s
     const c_view = try store.acquireMut(s.c);
     defer store.releaseMut(c_view.token);
 
-    if (a_meta.dtype == .f32 and c_meta.dtype == .f32) return matmulFlat(ctx, s, c_meta, a_meta, b_meta, c_view.bytes, a_view.bytes, b_view.bytes);
+    const scale: Scale = .{ .alpha = s.alpha, .beta = s.beta };
+    if (a_meta.dtype == .f32 and c_meta.dtype == .f32) return matmulFlat(ctx, scale, c_meta, a_meta, b_meta, c_view.bytes, a_view.bytes, b_view.bytes);
 
     const a32 = try widen(ctx.allocator, a_meta.dtype, @constCast(a_view.bytes));
     defer if (a32.ptr != a_view.bytes.ptr) unwiden(ctx.allocator, a32);
     const c32 = try widen(ctx.allocator, c_meta.dtype, c_view.bytes);
     defer if (c32.ptr != c_view.bytes.ptr) unwiden(ctx.allocator, c32);
-    try matmulFlat(ctx, s, c_meta, a_meta, b_meta, c32, a32, b_view.bytes);
+    try matmulFlat(ctx, scale, c_meta, a_meta, b_meta, c32, a32, b_view.bytes);
     if (c_meta.dtype == .f16) {
         const dst: []align(1) f16 = std.mem.bytesAsSlice(f16, c_view.bytes);
         const src: []align(1) const f32 = std.mem.bytesAsSlice(f32, c32);
@@ -72,7 +79,7 @@ pub fn execMatMul(ctx: *MatMulExecCtx, s: executable.StepMatMul, store: tensor_s
 
 /// f32 bytes of a float tensor: the bytes themselves when already f32, a new f32
 /// copy of an f16 one.
-fn widen(allocator: std.mem.Allocator, dtype: DType, bytes: []u8) ExecuteProgramError![]u8 {
+pub fn widen(allocator: std.mem.Allocator, dtype: DType, bytes: []u8) ExecuteProgramError![]u8 {
     return switch (dtype) {
         .f32 => bytes,
         .f16 => blk: {
@@ -86,18 +93,18 @@ fn widen(allocator: std.mem.Allocator, dtype: DType, bytes: []u8) ExecuteProgram
 }
 
 /// Free a copy `widen` made.
-fn unwiden(allocator: std.mem.Allocator, bytes: []u8) void {
+pub fn unwiden(allocator: std.mem.Allocator, bytes: []u8) void {
     allocator.free(@as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes))));
 }
 
-fn matmulFlat(ctx: *MatMulExecCtx, s: executable.StepMatMul, c_meta: tensor_store.TensorMeta, a_meta: tensor_store.TensorMeta, b_meta: tensor_store.TensorMeta, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) ExecuteProgramError!void {
+fn matmulFlat(ctx: *MatMulExecCtx, scale: Scale, c_meta: tensor_store.TensorMeta, a_meta: tensor_store.TensorMeta, b_meta: tensor_store.TensorMeta, c_bytes: []u8, a_bytes: []const u8, b_bytes: []const u8) ExecuteProgramError!void {
     const cr: usize = c_meta.rank;
     const k: usize = a_meta.shape[a_meta.rank - 1];
     const n: usize = c_meta.shape[cr - 1];
     if (b_meta.rank == 2) {
         var m: usize = 1;
         for (c_meta.shape[0 .. cr - 1]) |d| m *= d;
-        return matmul2D(ctx, s, m, n, k, c_bytes, a_bytes, b_bytes, b_meta.dtype);
+        return gemm2D(ctx, scale, m, n, k, c_bytes, a_bytes, b_bytes, b_meta.dtype);
     }
 
     const batched: Batched = .init(c_meta, a_meta, b_meta, c_bytes, a_bytes, b_bytes);
@@ -108,7 +115,7 @@ fn matmulFlat(ctx: *MatMulExecCtx, s: executable.StepMatMul, c_meta: tensor_stor
     // is about a task per thread.
     if (!matvecRoute(m, b_meta.dtype)) {
         const threads_per_batch = std.math.divCeil(usize, @max(ctx.thread_count, 1), batches) catch unreachable;
-        const plan = planGemm(ctx, s, m, n, k, b_meta.dtype, threads_per_batch);
+        const plan = planGemm(ctx, scale, m, n, k, b_meta.dtype, threads_per_batch);
         const Job = struct {
             plan: GemmPlan,
             batched: Batched,
@@ -122,14 +129,14 @@ fn matmulFlat(ctx: *MatMulExecCtx, s: executable.StepMatMul, c_meta: tensor_stor
             }
         };
         const job: Job = .{ .plan = plan, .batched = batched, .scratch = ctx.matmul_scratch };
-        return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, batches * plan.tasks, exec_utils.parallel_min_bytes, job, Job.run);
+        return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, batches * plan.tasks, plan.rows * plan.nc * plan.k, job, Job.run);
     }
 
     // Matvec-shaped batches: with a thread's worth of them, each thread takes whole
     // batches (alone, on its own scratch); otherwise the batches run in turn.
     const Job = struct {
         ctx: *MatMulExecCtx,
-        s: executable.StepMatMul,
+        scale: Scale,
         batched: Batched,
         m: usize,
         n: usize,
@@ -145,12 +152,12 @@ fn matmulFlat(ctx: *MatMulExecCtx, s: executable.StepMatMul, c_meta: tensor_stor
             }
             for (lo..hi) |bi| {
                 const off = x.batched.offsets(bi);
-                try matmul2D(&solo, x.s, x.m, x.n, x.k, x.batched.c[off.c..], x.batched.a[off.a..], x.batched.b[off.b..], x.batched.b_dtype);
+                try gemm2D(&solo, x.scale, x.m, x.n, x.k, x.batched.c[off.c..], x.batched.a[off.a..], x.batched.b[off.b..], x.batched.b_dtype);
             }
         }
     };
     const whole_batches = ctx.pool != null and batches >= ctx.thread_count;
-    const job: Job = .{ .ctx = ctx, .s = s, .batched = batched, .m = m, .n = n, .k = k, .serial = whole_batches };
+    const job: Job = .{ .ctx = ctx, .scale = scale, .batched = batched, .m = m, .n = n, .k = k, .serial = whole_batches };
     if (!whole_batches) return job.run(0, batches, 0);
     return exec_utils.parallelRange(ExecuteProgramError, ctx.pool, ctx.thread_count, batches, m * n * k * @sizeOf(f32), job, Job.run);
 }
@@ -231,8 +238,9 @@ fn matvecRoute(m: usize, b_dtype: DType) bool {
     };
 }
 
-/// `C[m, n] = alpha * A[m, k] @ B[k, n] + beta * C` on flat row-major operands.
-fn matmul2D(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k: usize, c: []u8, a: []const u8, b: []const u8, b_dtype: DType) ExecuteProgramError!void {
+/// `C[m, n] = alpha * A[m, k] @ B[k, n] + beta * C` on flat row-major operands: an
+/// f32 A and C, any B `execMatMul` takes. Threaded across the pool.
+pub fn gemm2D(ctx: *MatMulExecCtx, scale: Scale, m: usize, n: usize, k: usize, c: []u8, a: []const u8, b: []const u8, b_dtype: DType) ExecuteProgramError!void {
     if (m == 0 or n == 0) return;
     const groups = std.math.divCeil(usize, n, MATVEC_COLUMN_GROUP) catch unreachable;
 
@@ -253,7 +261,7 @@ fn matmul2D(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k
             }
         };
         const eb = b_dtype.info().block_bytes;
-        const ctx2: Ctx = .{ .mv = ctx.matvec, .params = .{ .m = 1, .n = n, .k = k, .alpha = s.alpha, .beta = s.beta }, .f16 = b_dtype == .f16, .c = c, .a = a, .b = b };
+        const ctx2: Ctx = .{ .mv = ctx.matvec, .params = .{ .m = 1, .n = n, .k = k, .alpha = scale.alpha, .beta = scale.beta }, .f16 = b_dtype == .f16, .c = c, .a = a, .b = b };
         return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, groups, MATVEC_COLUMN_GROUP * k * eb, ctx2, Ctx.run);
     }
 
@@ -279,12 +287,12 @@ fn matmul2D(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k
                 return x.mv.matvec_q8_0_kmajor(params, x.c[j0 * @sizeOf(f32) ..], x.a, x.b[j0 * x.block_bytes ..]);
             }
         };
-        const ctx2: Ctx = .{ .mv = ctx.matvec, .m = m, .n = n, .k = k, .alpha = s.alpha, .beta = s.beta, .block_bytes = blk.block_bytes, .c = c, .a = a, .b = b };
+        const ctx2: Ctx = .{ .mv = ctx.matvec, .m = m, .n = n, .k = k, .alpha = scale.alpha, .beta = scale.beta, .block_bytes = blk.block_bytes, .c = c, .a = a, .b = b };
         const col_bytes = (k / blk.block_elems) * blk.block_bytes;
         return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, groups, MATVEC_COLUMN_GROUP * col_bytes, ctx2, Ctx.run);
     }
 
-    return runGemm(ctx, planGemm(ctx, s, m, n, k, b_dtype, ctx.thread_count), c, a, b);
+    return runGemm(ctx, planGemm(ctx, scale, m, n, k, b_dtype, ctx.thread_count), c, a, b);
 }
 
 /// Whether a `MatMulNT` goes through the packed GEMM: an f32 `[N, K]` B with more
@@ -318,8 +326,7 @@ pub fn execMatMulNT(ctx: *MatMulExecCtx, s: executable.StepMatMulNT, store: tens
     if (a_view.bytes.len < m * k * @sizeOf(f32) or b_view.bytes.len < n * k * @sizeOf(f32) or c_view.bytes.len < m * n * @sizeOf(f32)) return BackendError.InvalidArgument;
     if (m == 0 or n == 0) return;
 
-    const as_mm: executable.StepMatMul = .{ .c = s.c, .a = s.a, .b = s.b, .alpha = s.alpha, .beta = s.beta };
-    var plan = planGemm(ctx, as_mm, m, n, k, .f32, ctx.thread_count);
+    var plan = planGemm(ctx, .{ .alpha = s.alpha, .beta = s.beta }, m, n, k, .f32, ctx.thread_count);
     plan.b_rows = true;
     return runGemm(ctx, plan, c_view.bytes, a_view.bytes, b_view.bytes);
 }
@@ -344,14 +351,14 @@ fn runGemm(ctx: *MatMulExecCtx, plan: GemmPlan, c: []u8, a: []const u8, b: []con
         }
     };
     const job: Job = .{ .plan = plan, .scratch = ctx.matmul_scratch, .c = c, .a = a, .b = b };
-    // Compute-heavy: a task is worth a thread as soon as there are two of them.
-    return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, plan.tasks, exec_utils.parallel_min_bytes, job, Job.run);
+    // A task's weight is its multiply-adds, so a small GEMM stays on one thread.
+    return exec_utils.parallelRange(BackendError, ctx.pool, ctx.thread_count, plan.tasks, plan.rows * plan.nc * plan.k, job, Job.run);
 }
 
 /// A blocked GEMM's grid: `row_groups x col_blocks` tasks, each a `rows x nc` block
 /// of C that walks K in `kc` blocks.
 const GemmPlan = struct {
-    s: executable.StepMatMul,
+    scale: Scale,
     mk: matmul_registry.F32Kernels,
     qk: matmul_q_registry.QuantKernels,
     b_dtype: DType,
@@ -371,7 +378,7 @@ const GemmPlan = struct {
 /// column block, so the grid balances the two: `col_blocks ~ sqrt(threads * n * cost / m)`,
 /// with `cost` what packing a B element costs next to copying an A element (a q4
 /// block is unpacked, a q8 one reordered, floats only copied).
-fn planGemm(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k: usize, b_dtype: DType, threads_in: usize) GemmPlan {
+fn planGemm(ctx: *MatMulExecCtx, scale: Scale, m: usize, n: usize, k: usize, b_dtype: DType, threads_in: usize) GemmPlan {
     const quant = b_dtype.info().is_quantized;
     const kc: usize = if (quant) ctx.matmul_q.default.tuning.kc else ctx.matmul_f32.tuning.kc;
     const nc_max: usize = if (quant) ctx.matmul_q.default.tuning.nc else ctx.matmul_f32.tuning.nc;
@@ -396,7 +403,7 @@ fn planGemm(ctx: *MatMulExecCtx, s: executable.StepMatMul, m: usize, n: usize, k
     rows = @max(rows, 1);
     const row_groups = std.math.divCeil(usize, m, rows) catch unreachable;
     return .{
-        .s = s,
+        .scale = scale,
         .mk = ctx.matmul_f32,
         .qk = ctx.matmul_q.default,
         .b_dtype = b_dtype,
@@ -424,7 +431,7 @@ fn gemmTask(p: GemmPlan, task: usize, scratch: []align(32) u8, c: []u8, a: []con
     var pc: usize = 0;
     while (pc < p.k) : (pc += p.kc) {
         const kw = @min(p.kc, p.k - pc);
-        const params: MatMulParams = .{ .m = rw, .n = nw, .k = kw, .lda = p.k, .ldc = p.n, .alpha = p.s.alpha, .beta = if (pc == 0) p.s.beta else 1.0 };
+        const params: MatMulParams = .{ .m = rw, .n = nw, .k = kw, .lda = p.k, .ldc = p.n, .alpha = p.scale.alpha, .beta = if (pc == 0) p.scale.beta else 1.0 };
         const a_blk = a[(r0 * p.k + pc) * @sizeOf(f32) ..];
         switch (p.b_dtype) {
             .q8_0, .q4_0 => {

@@ -1,134 +1,32 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
+//! The fused LSTM cell: `gates = x @ W_ih + h @ W_hh + b_ih + b_hh` for the whole
+//! batch as two GEMMs through the f32 matmul (threaded, packed, SME where the CPU
+//! has it), then the gate math per row across the pool.
+//!
+//! The cell computes in f32 whatever its tensors are stored as: f16 x and h are
+//! widened before the GEMMs (f16 weights the matmul reads itself), and the gate
+//! math reads and writes through f32. That keeps the f16 cell in step with the f32
+//! one for the same widened inputs, and with the GPU kernels, which use the same
+//! sigmoid/tanh approximations (gpu/kernels/lstm_act.wgsl).
 const std = @import("std");
 
 const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
 const fast_math = @import("../kernels/fast_math.zig");
-const thread_pool = @import("../../../runtime/thread_pool.zig");
 const tensor_store = @import("../../../runtime/tensor_store.zig");
 const executable = @import("../../../runtime/executable.zig");
+const exec_matmul = @import("matmul.zig");
+const exec_utils = @import("utils.zig");
 
 const BackendError = types.BackendError;
+const DType = types.DType;
 const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
-const MAX_HIDDEN: usize = 1024;
-const MAX_INPUT: usize = 2048;
+/// Rough cost of one hidden unit's gate math (four sigmoid/tanh and the update)
+/// in `parallelRange`'s multiply-add units.
+const GATE_UNIT_COST: usize = 64;
 
-// Every operand is read into (and written from) f32 scratch, so the gate math
-// below runs in f32 whatever the tensors are stored as. That is what makes the
-// f16 cell bit-identical to the f32 one for the same widened inputs, and what
-// keeps it in step with the GPU kernel — only these four helpers know the dtype.
-
-/// Dispatch a dtype-generic helper over the scalar float types the cell accepts.
-/// `else` is unreachable for a validated step; it stays a hard error rather than
-/// a silent f32 read of f16 bytes.
-fn floatDispatch(comptime name: []const u8, dtype: types.DType, args: anytype) ExecuteProgramError!void {
-    return switch (dtype) {
-        .f32 => @call(.auto, @field(@This(), name), .{f32} ++ args),
-        .f16 => @call(.auto, @field(@This(), name), .{f16} ++ args),
-        else => BackendError.InvalidArgument,
-    };
-}
-
-fn loadRowAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
-    return floatDispatch("loadRowT", meta.dtype, .{ store, meta, id, row, out });
-}
-
-fn loadRowT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, row: usize, out: []f32) ExecuteProgramError!void {
-    if (meta.rank != 2) return BackendError.InvalidArgument;
-    if (row >= meta.shape[0]) return BackendError.InvalidArgument;
-    if (out.len != meta.shape[1]) return BackendError.InvalidArgument;
-    const t = try store.acquireConst(id);
-    defer store.releaseConst(t.token);
-    const src = std.mem.bytesAsSlice(T, t.bytes)[row * out.len ..][0..out.len];
-    for (out, src) |*d, v| d.* = @floatCast(v);
-}
-
-fn loadVecAsF32(store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
-    return floatDispatch("loadVecT", meta.dtype, .{ store, meta, id, out });
-}
-
-fn loadVecT(comptime T: type, store: tensor_store.TensorStore, meta: tensor_store.TensorMeta, id: tensor_store.TensorId, out: []f32) ExecuteProgramError!void {
-    if (meta.rank != 1) return BackendError.InvalidArgument;
-    if (out.len != meta.shape[0]) return BackendError.InvalidArgument;
-    const t = try store.acquireConst(id);
-    defer store.releaseConst(t.token);
-    const src = std.mem.bytesAsSlice(T, t.bytes)[0..out.len];
-    for (out, src) |*d, v| d.* = @floatCast(v);
-}
-
-fn storeRowState(
-    store: tensor_store.TensorStore,
-    meta: tensor_store.TensorMeta,
-    id: tensor_store.TensorId,
-    row: usize,
-    h: []const f32,
-    c: []const f32,
-) ExecuteProgramError!void {
-    return floatDispatch("storeRowStateT", meta.dtype, .{ store, meta, id, row, h, c });
-}
-
-/// Row `row` of the `[B, 2*H]` state is `h` followed by `c`.
-fn storeRowStateT(
-    comptime T: type,
-    store: tensor_store.TensorStore,
-    meta: tensor_store.TensorMeta,
-    id: tensor_store.TensorId,
-    row: usize,
-    h: []const f32,
-    c: []const f32,
-) ExecuteProgramError!void {
-    if (meta.rank != 2) return BackendError.InvalidArgument;
-    if (row >= meta.shape[0]) return BackendError.InvalidArgument;
-    if (meta.shape[1] != h.len + c.len) return BackendError.InvalidArgument;
-    const t = try store.acquireMut(id);
-    defer store.releaseMut(t.token);
-    const dst = std.mem.bytesAsSlice(T, t.bytes)[row * meta.shape[1] ..][0..meta.shape[1]];
-    for (dst[0..h.len], h) |*d, v| d.* = @floatCast(v);
-    for (dst[h.len..], c) |*d, v| d.* = @floatCast(v);
-}
-
-/// `out += x @ W` for `W [rows, cols]`.
-fn accumMatVec(
-    store: tensor_store.TensorStore,
-    w_meta: tensor_store.TensorMeta,
-    w_id: tensor_store.TensorId,
-    x: []const f32,
-    out: []f32,
-) ExecuteProgramError!void {
-    return floatDispatch("accumMatVecT", w_meta.dtype, .{ store, w_meta, w_id, x, out });
-}
-
-fn accumMatVecT(
-    comptime T: type,
-    store: tensor_store.TensorStore,
-    w_meta: tensor_store.TensorMeta,
-    w_id: tensor_store.TensorId,
-    x: []const f32,
-    out: []f32,
-) ExecuteProgramError!void {
-    if (w_meta.rank != 2) return BackendError.InvalidArgument;
-    if (x.len != w_meta.shape[0]) return BackendError.InvalidArgument;
-    if (out.len != w_meta.shape[1]) return BackendError.InvalidArgument;
-    const t = try store.acquireConst(w_id);
-    defer store.releaseConst(t.token);
-    const w = std.mem.bytesAsSlice(T, t.bytes);
-    for (x, 0..) |xv, r| {
-        if (xv == 0.0) continue;
-        const w_row = w[r * out.len ..][0..out.len];
-        for (out, w_row) |*o, wv| o.* += xv * @as(f32, @floatCast(wv));
-    }
-}
-
-pub fn execLSTMCellFused(
-    pool: ?*thread_pool.ThreadPool,
-    thread_count: usize,
-    s: executable.StepLSTMCellFused,
-    store: tensor_store.TensorStore,
-) ExecuteProgramError!void {
-    _ = pool;
-    _ = thread_count;
-
+pub fn execLSTMCellFused(mm: *exec_matmul.MatMulExecCtx, s: executable.StepLSTMCellFused, store: tensor_store.TensorStore) ExecuteProgramError!void {
     const out_meta = try store.meta(s.out_state);
     const x_meta = try store.meta(s.x);
     const h_meta = try store.meta(s.h_prev);
@@ -136,98 +34,106 @@ pub fn execLSTMCellFused(
     const wih_meta = try store.meta(s.w_ih);
     const whh_meta = try store.meta(s.w_hh);
 
-    // f32 and f16 storage; the cell itself always computes in f32 (see the
-    // helpers above). `infer` already requires every operand to share this dtype.
-    if (out_meta.dtype != .f32 and out_meta.dtype != .f16) return BackendError.Unsupported;
-    if (x_meta.dtype != out_meta.dtype or h_meta.dtype != out_meta.dtype or c_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
-    if (wih_meta.dtype != out_meta.dtype or whh_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
-
-    if (out_meta.rank != 2 or x_meta.rank != 2 or h_meta.rank != 2 or c_meta.rank != 2) return BackendError.InvalidArgument;
-    if (wih_meta.rank != 2 or whh_meta.rank != 2) return BackendError.InvalidArgument;
+    // `infer` already requires every operand to share this dtype.
+    const dtype = out_meta.dtype;
+    if (dtype != .f32 and dtype != .f16) return BackendError.Unsupported;
+    for ([_]DType{ x_meta.dtype, h_meta.dtype, c_meta.dtype, wih_meta.dtype, whh_meta.dtype }) |d| {
+        if (d != dtype) return BackendError.InvalidArgument;
+    }
+    for ([_]tensor_store.TensorMeta{ out_meta, x_meta, h_meta, c_meta, wih_meta, whh_meta }) |m| {
+        if (m.rank != 2) return BackendError.InvalidArgument;
+    }
 
     const batch: usize = x_meta.shape[0];
     const input_size: usize = x_meta.shape[1];
     const hidden: usize = h_meta.shape[1];
-
-    if (batch == 0 or input_size == 0 or hidden == 0) return BackendError.InvalidArgument;
-    if (input_size > MAX_INPUT or hidden > MAX_HIDDEN) return BackendError.InvalidArgument;
-
     const gate_dim: usize = hidden * 4;
+    if (batch == 0 or input_size == 0 or hidden == 0) return BackendError.InvalidArgument;
     if (wih_meta.shape[0] != input_size or wih_meta.shape[1] != gate_dim) return BackendError.InvalidArgument;
     if (whh_meta.shape[0] != hidden or whh_meta.shape[1] != gate_dim) return BackendError.InvalidArgument;
-
-    if (h_meta.shape[0] != batch or c_meta.shape[0] != batch) return BackendError.InvalidArgument;
-    if (c_meta.shape[1] != hidden) return BackendError.InvalidArgument;
-
+    if (h_meta.shape[0] != batch or c_meta.shape[0] != batch or c_meta.shape[1] != hidden) return BackendError.InvalidArgument;
     if (out_meta.shape[0] != batch or out_meta.shape[1] != hidden * 2) return BackendError.InvalidArgument;
+    if ((s.b_ih == null) != (s.b_hh == null)) return BackendError.InvalidArgument;
 
-    var b_ih_buf: [MAX_HIDDEN * 4]f32 = undefined;
-    var b_hh_buf: [MAX_HIDDEN * 4]f32 = undefined;
-    const has_bias: bool = (s.b_ih != null);
-    if (has_bias != (s.b_hh != null)) return BackendError.InvalidArgument;
-
-    if (has_bias) {
-        const bih_id: tensor_store.TensorId = s.b_ih.?;
-        const bhh_id: tensor_store.TensorId = s.b_hh.?;
-        const bih_meta = try store.meta(bih_id);
-        const bhh_meta = try store.meta(bhh_id);
-        if (bih_meta.dtype != out_meta.dtype or bhh_meta.dtype != out_meta.dtype) return BackendError.InvalidArgument;
-        if (bih_meta.rank != 1 or bhh_meta.rank != 1) return BackendError.InvalidArgument;
-        if (bih_meta.shape[0] != gate_dim or bhh_meta.shape[0] != gate_dim) return BackendError.InvalidArgument;
-
-        try loadVecAsF32(store, bih_meta, bih_id, b_ih_buf[0..gate_dim]);
-        try loadVecAsF32(store, bhh_meta, bhh_id, b_hh_buf[0..gate_dim]);
+    const alloc = mm.allocator;
+    const gates = alloc.alloc(f32, batch * gate_dim) catch return BackendError.ExecutionFailed;
+    defer alloc.free(gates);
+    const bias = alloc.alloc(f32, gate_dim) catch return BackendError.ExecutionFailed;
+    defer alloc.free(bias);
+    @memset(bias, 0.0);
+    if (s.b_ih) |bih| {
+        try accumVec(store, bih, gate_dim, bias);
+        try accumVec(store, s.b_hh.?, gate_dim, bias);
     }
 
-    var x_row_buf: [MAX_INPUT]f32 = undefined;
-    var h_row_buf: [MAX_HIDDEN]f32 = undefined;
-    var c_row_buf: [MAX_HIDDEN]f32 = undefined;
-    var gates_buf: [MAX_HIDDEN * 4]f32 = undefined;
-    var h_out_buf: [MAX_HIDDEN]f32 = undefined;
-    var c_out_buf: [MAX_HIDDEN]f32 = undefined;
+    try gemmInto(mm, store, dtype, s.x, s.w_ih, .{ .beta = 0.0 }, batch, gate_dim, input_size, gates);
+    try gemmInto(mm, store, dtype, s.h_prev, s.w_hh, .{ .beta = 1.0 }, batch, gate_dim, hidden, gates);
 
-    var b: usize = 0;
-    while (b < batch) : (b += 1) {
-        try loadRowAsF32(store, x_meta, s.x, b, x_row_buf[0..input_size]);
-        try loadRowAsF32(store, h_meta, s.h_prev, b, h_row_buf[0..hidden]);
-        try loadRowAsF32(store, c_meta, s.c_prev, b, c_row_buf[0..hidden]);
+    const c_prev = try store.acquireConst(s.c_prev);
+    defer store.releaseConst(c_prev.token);
+    const out = try store.acquireMut(s.out_state);
+    defer store.releaseMut(out.token);
+    const rows: Rows = .{ .gates = gates, .bias = bias, .hidden = hidden, .c_prev = c_prev.bytes, .out = out.bytes, .f16 = dtype == .f16 };
+    return exec_utils.parallelRange(BackendError, mm.pool, mm.thread_count, batch, hidden * GATE_UNIT_COST, rows, Rows.run);
+}
 
-        // gates = bias (optional)
-        var j: usize = 0;
-        while (j < gate_dim) : (j += 1) {
-            gates_buf[j] = if (has_bias) (b_ih_buf[j] + b_hh_buf[j]) else 0.0;
-        }
+/// `gates = a @ w + scale.beta * gates` for a float `[m, k]` A and `[k, n]` W.
+fn gemmInto(mm: *exec_matmul.MatMulExecCtx, store: tensor_store.TensorStore, dtype: DType, a_id: tensor_store.TensorId, w_id: tensor_store.TensorId, scale: exec_matmul.Scale, m: usize, n: usize, k: usize, gates: []f32) ExecuteProgramError!void {
+    const a = try store.acquireConst(a_id);
+    defer store.releaseConst(a.token);
+    const w = try store.acquireConst(w_id);
+    defer store.releaseConst(w.token);
+    const a32 = try exec_matmul.widen(mm.allocator, dtype, @constCast(a.bytes));
+    defer if (a32.ptr != a.bytes.ptr) exec_matmul.unwiden(mm.allocator, a32);
+    try exec_matmul.gemm2D(mm, scale, m, n, k, std.mem.sliceAsBytes(gates), a32, w.bytes, dtype);
+}
 
-        // gates += x @ w_ih
-        try accumMatVec(store, wih_meta, s.w_ih, x_row_buf[0..input_size], gates_buf[0..gate_dim]);
-        // gates += h_prev @ w_hh
-        try accumMatVec(store, whh_meta, s.w_hh, h_row_buf[0..hidden], gates_buf[0..gate_dim]);
-
-        // Compute new state.
-        const h_off0: usize = 0;
-        const h_off1: usize = hidden;
-        const h_off2: usize = hidden * 2;
-        const h_off3: usize = hidden * 3;
-
-        j = 0;
-        while (j < hidden) : (j += 1) {
-            const i_lin: f32 = gates_buf[h_off0 + j];
-            const f_lin: f32 = gates_buf[h_off1 + j];
-            const g_lin: f32 = gates_buf[h_off2 + j];
-            const o_lin: f32 = gates_buf[h_off3 + j];
-
-            const i_gate: f32 = fast_math.sigmoidApproxF32(i_lin);
-            const f_gate: f32 = fast_math.sigmoidApproxF32(f_lin);
-            const g_gate: f32 = fast_math.tanhApproxF32(g_lin);
-            const o_gate: f32 = fast_math.sigmoidApproxF32(o_lin);
-
-            const c_t: f32 = f_gate * c_row_buf[j] + i_gate * g_gate;
-            const h_t: f32 = o_gate * fast_math.tanhApproxF32(c_t);
-
-            c_out_buf[j] = c_t;
-            h_out_buf[j] = h_t;
-        }
-
-        try storeRowState(store, out_meta, s.out_state, b, h_out_buf[0..hidden], c_out_buf[0..hidden]);
+/// `out += v` for a float vector tensor of `n` elements.
+fn accumVec(store: tensor_store.TensorStore, id: tensor_store.TensorId, n: usize, out: []f32) ExecuteProgramError!void {
+    const meta = try store.meta(id);
+    if (meta.rank != 1 or meta.shape[0] != n) return BackendError.InvalidArgument;
+    const t = try store.acquireConst(id);
+    defer store.releaseConst(t.token);
+    switch (meta.dtype) {
+        .f32 => for (out, std.mem.bytesAsSlice(f32, t.bytes)[0..n]) |*o, v| {
+            o.* += v;
+        },
+        .f16 => for (out, std.mem.bytesAsSlice(f16, t.bytes)[0..n]) |*o, v| {
+            o.* += v;
+        },
+        else => return BackendError.InvalidArgument,
     }
 }
+
+/// The gate math for a range of batch rows: row `b` of the `[B, 2H]` state is
+/// `h` followed by `c`.
+const Rows = struct {
+    gates: []const f32,
+    bias: []const f32,
+    hidden: usize,
+    c_prev: []const u8,
+    out: []u8,
+    f16: bool,
+
+    fn run(r: Rows, lo: usize, hi: usize, _: usize) BackendError!void {
+        if (r.f16) r.rowsT(f16, lo, hi) else r.rowsT(f32, lo, hi);
+    }
+
+    fn rowsT(r: Rows, comptime T: type, lo: usize, hi: usize) void {
+        const hd = r.hidden;
+        const c_prev = std.mem.bytesAsSlice(T, r.c_prev);
+        const out = std.mem.bytesAsSlice(T, r.out);
+        for (lo..hi) |b| {
+            const g = r.gates[b * 4 * hd ..][0 .. 4 * hd];
+            for (0..hd) |j| {
+                const i_gate = fast_math.sigmoidApproxF32(g[j] + r.bias[j]);
+                const f_gate = fast_math.sigmoidApproxF32(g[hd + j] + r.bias[hd + j]);
+                const g_gate = fast_math.tanhApproxF32(g[2 * hd + j] + r.bias[2 * hd + j]);
+                const o_gate = fast_math.sigmoidApproxF32(g[3 * hd + j] + r.bias[3 * hd + j]);
+                const c_t = f_gate * @as(f32, @floatCast(c_prev[b * hd + j])) + i_gate * g_gate;
+                out[b * 2 * hd + j] = @floatCast(o_gate * fast_math.tanhApproxF32(c_t));
+                out[b * 2 * hd + hd + j] = @floatCast(c_t);
+            }
+        }
+    }
+};

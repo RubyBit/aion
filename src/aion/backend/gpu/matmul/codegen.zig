@@ -229,7 +229,7 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
         w.lit("                ow_out: u32, h_in: u32, w_in: u32, c_in: u32,");
         w.lit("                kh: u32, kw: u32, x_batch: u32, pad_top: u32,");
         w.lit("                pad_left: u32, stride_h: u32, stride_w: u32, dil_h: u32,");
-        w.lit("                dil_w: u32, has_bias: u32, ohw: u32, _pad: u32 };");
+        w.lit("                dil_w: u32, has_bias: u32, ohw: u32, reflect: u32 };");
         // A is gathered one activation at a time, so it is always scalar-addressed;
         // B is the weight matrix and still takes the 128-bit path when aligned.
         w.lit("@group(0) @binding(0) var<storage, read> a: array<f32>;");
@@ -264,20 +264,39 @@ fn header(w: *Wgsl, cfg: MatmulConfig) void {
 
 /// The two im2col readers — the whole difference between this and the GEMM.
 /// A[m, k] is the activation at `(m -> batch, oh, ow)` offset by `(k -> kh, kw,
-/// c_in)`, or zero where the window falls outside the image. M runs over every
-/// batch, so one dispatch covers the whole output.
+/// c_in)`; where the window leaves the image it is zero, or with `reflect` the
+/// mirrored tap (conv.wgsl's `reflect_idx`). M runs over every batch, so one
+/// dispatch covers the whole output.
 fn im2colFns(w: *Wgsl) void {
     w.blank();
-    w.open("fn im2col_at(m: u32, k: u32) -> f32", .{});
+    w.open("fn reflect_idx(idx: i32, len: i32) -> i32", .{});
+    w.lit("var v = idx;");
+    w.open("loop", .{});
+    w.lit("if (v >= 0 && v < len) { break; }");
+    w.lit("if (v < 0) { v = -v; } else { v = (2 * len - 2) - v; }");
+    w.close();
+    w.lit("return v;");
+    w.close();
+    w.blank();
+    // Where A[m, k]'s tap starts in `a` (k's channel not added), or -1 for a zero.
+    w.open("fn im2col_tap(m: u32, k: u32) -> i32", .{});
     w.lit("let kwc = p.kw * p.c_in;");
     w.lit("let mb = m / p.ohw;");
     w.lit("let mr = m % p.ohw;");
-    w.lit("let ih = i32((mr / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
-    w.lit("let iw = i32((mr % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
+    w.lit("var ih = i32((mr / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
+    w.lit("var iw = i32((mr % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
     w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
-    w.lit("return 0.0;");
+    w.lit("if (p.reflect == 0u) { return -1; }");
+    w.lit("ih = reflect_idx(ih, i32(p.h_in));");
+    w.lit("iw = reflect_idx(iw, i32(p.w_in));");
     w.close();
-    w.lit("return a[mb * p.x_batch + (u32(ih) * p.w_in + u32(iw)) * p.c_in + (k % p.c_in)];");
+    w.lit("return i32(mb * p.x_batch + (u32(ih) * p.w_in + u32(iw)) * p.c_in);");
+    w.close();
+    w.blank();
+    w.open("fn im2col_at(m: u32, k: u32) -> f32", .{});
+    w.lit("let t = im2col_tap(m, k);");
+    w.lit("if (t < 0) { return 0.0; }");
+    w.lit("return a[u32(t) + k % p.c_in];");
     w.close();
     w.blank();
     // Four consecutive k stay within one (kh, kw) tap unless the channel run
@@ -285,15 +304,9 @@ fn im2colFns(w: *Wgsl) void {
     w.open("fn im2col_vec4(m: u32, k: u32) -> vec4<f32>", .{});
     w.lit("let ci = k % p.c_in;");
     w.open("if (ci + 3u < p.c_in)", .{});
-    w.lit("let kwc = p.kw * p.c_in;");
-    w.lit("let mb = m / p.ohw;");
-    w.lit("let mr = m % p.ohw;");
-    w.lit("let ih = i32((mr / p.ow_out) * p.stride_h) + i32((k / kwc) * p.dil_h) - i32(p.pad_top);");
-    w.lit("let iw = i32((mr % p.ow_out) * p.stride_w) + i32(((k % kwc) / p.c_in) * p.dil_w) - i32(p.pad_left);");
-    w.open("if (ih < 0 || ih >= i32(p.h_in) || iw < 0 || iw >= i32(p.w_in))", .{});
-    w.lit("return vec4<f32>(0.0);");
-    w.close();
-    w.lit("let base = mb * p.x_batch + (u32(ih) * p.w_in + u32(iw)) * p.c_in + ci;");
+    w.lit("let t = im2col_tap(m, k);");
+    w.lit("if (t < 0) { return vec4<f32>(0.0); }");
+    w.lit("let base = u32(t) + ci;");
     w.lit("return vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);");
     w.close();
     w.lit("return vec4<f32>(im2col_at(m, k), im2col_at(m, k + 1u), im2col_at(m, k + 2u), im2col_at(m, k + 3u));");

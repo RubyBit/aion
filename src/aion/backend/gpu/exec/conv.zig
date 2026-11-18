@@ -10,12 +10,12 @@
 //!   - pad_mode zero or reflect (reflect needs input extent >= 2).
 //! One dispatch covers every batch.
 //!
-//! A rank-4, single-group, zero-padded conv instead lowers onto the generated
-//! implicit-GEMM kernels (`matmul/codegen.zig`, `kind = .conv`): same register
-//! blocking as the GEMM, with A gathered from the activation, or on a device with
-//! matrix units the same tiles as the GEMM, read from the activation in place
-//! (`recordConvTiles`). The direct kernel stays as the general case — grouped,
-//! dilated-into-reflect, conv1d, depthwise.
+//! A single-group conv instead lowers onto the generated implicit-GEMM kernels
+//! (`matmul/codegen.zig`, `kind = .conv`): same register blocking as the GEMM,
+//! with A gathered from the activation (zero or reflect padding), or on a device
+//! with matrix units the same tiles as the GEMM, read from the activation in place
+//! (`recordConvTiles`, zero padding). The direct kernel stays as the general case:
+//! grouped, depthwise, and anything the GEMM grid cannot cover.
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -67,7 +67,7 @@ const ConvGemmParams = extern struct {
     dil_w: u32,
     has_bias: u32,
     ohw: u32,
-    _pad: u32 = 0,
+    reflect: u32,
 };
 
 /// The implicit-GEMM operands of one conv: x, w, bias (w when absent), out.
@@ -88,9 +88,9 @@ const pad_kernel: KernelDesc = .{ .name = "pad", .wgsl = @embedFile("../kernels/
 const PadParams = extern struct { src_shape: [4]u32, dst_shape: [4]u32, at: [4]u32 };
 
 /// Whether a conv can run on matrix tiles at all: its channels divide into
-/// tiles, and an output row holds one.
+/// tiles, an output row holds one, and padding is zero (the padded copy below).
 fn tilesFit(gp: ConvGemmParams) bool {
-    return gp.c_in % codegen.TILE == 0 and gp.ow_out >= codegen.TILE;
+    return gp.c_in % codegen.TILE == 0 and gp.ow_out >= codegen.TILE and gp.reflect == 0;
 }
 
 /// The matrix-tile conv (see `codegen.convTileFn`). Its tiles are read from the
@@ -233,7 +233,7 @@ fn prodU(xs: []const usize) usize {
     return p;
 }
 
-pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1D) ExecuteProgramError!void {
+pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1D, mm: *matmul_exec.Matmul) ExecuteProgramError!void {
     const hs = ctx.store;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
     if (x_meta.rank != 3) return error.Unsupported;
@@ -252,7 +252,7 @@ pub fn execConv1D(ctx: Ctx, frame: *Frame, s: executable.StepConv1D) ExecuteProg
         .pad_left = 0,
         .pad_mode = s.pad_mode,
     };
-    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, null);
+    return execConv(ctx, frame, s.out, s.x, s.w, s.bias, geo, 3, mm);
 }
 
 pub fn execConv2D(ctx: Ctx, frame: *Frame, s: executable.StepConv2D, mm: *matmul_exec.Matmul) ExecuteProgramError!void {
@@ -286,8 +286,8 @@ fn execConv(
     bias_id: ?executable.TensorId,
     geo_in: Geometry,
     rank: usize,
-    /// The implicit-GEMM kernels and their tuning, for a conv2d; null for a conv1d.
-    mm: ?*matmul_exec.Matmul,
+    /// The implicit-GEMM kernels and their tuning.
+    mm: *matmul_exec.Matmul,
 ) ExecuteProgramError!void {
     const hs = ctx.store;
     const out_meta = hs.meta(out_id) catch return error.ExecutionFailed;
@@ -346,10 +346,9 @@ fn execConv(
     const bufs = [_]c.WGPUBuffer{ ctx.devmem.bufferFor(dx.handle).?, ctx.devmem.bufferFor(dw.handle).?, bias_buf, ctx.devmem.bufferFor(dout.handle).? };
     const sizes = [_]u64{ dx.len, dw.len, bias_len, dout.len };
 
-    // Implicit GEMM needs a plain 2-D convolution: a group splits A by output
-    // column, and reflect padding is not a zero-fill, so neither fits the kernel.
-    // M runs over every batch's pixels, so C is the output buffer exactly.
-    if (mm) |tuner| if (rank == 4 and geo.groups == 1 and geo.pad_mode == .zero) gemm: {
+    // Implicit GEMM needs a single group: a group splits A by output column. M
+    // runs over every batch's pixels, so C is the output buffer exactly.
+    if (geo.groups == 1) gemm: {
         const gp: ConvGemmParams = .{
             .m = std.math.cast(u32, batch * oh_cnt * ow_cnt) orelse break :gemm,
             .n = std.math.cast(u32, c_out) orelse break :gemm,
@@ -371,11 +370,12 @@ fn execConv(
             .dil_w = @intCast(geo.dil_w),
             .has_bias = @intFromBool(dbias != null),
             .ohw = @intCast(oh_cnt * ow_cnt),
+            .reflect = @intFromBool(geo.pad_mode == .reflect),
         };
         const ops: ConvGemmOperands = .{ .bufs = bufs, .sizes = sizes };
-        const gi = (try chooseConvConfig(tuner, ctx, frame, gp, ops)) orelse break :gemm;
-        if (try recordConvGemm(ctx, frame, tuner.generated_conv[gi], gp, ops)) |_| return;
-    };
+        const gi = (try chooseConvConfig(mm, ctx, frame, gp, ops)) orelse break :gemm;
+        if (try recordConvGemm(ctx, frame, mm.generated_conv[gi], gp, ops)) |_| return;
+    }
 
     const use_dw = depthwiseOk(geo, c_in_g, c_out, rank) and
         ctx.gpu.limits.max_shared_bytes >= DW_SHARED_BYTES;

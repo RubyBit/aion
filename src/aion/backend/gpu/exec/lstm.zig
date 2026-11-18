@@ -6,8 +6,9 @@
 //! the cell update are f32 either way, so the dtype only picks an entry point.
 //! Every operand must be one buffer and share the cell's dtype.
 //!
-//! Numerics note: the CPU exec uses sigmoid/tanh fast approximations; the GPU
-//! uses exact builtins — CPU-vs-GPU comparisons need a ~1e-3 tolerance.
+//! An f32 cell of `GEMM_MIN_BATCH` rows or more instead runs its gates as two
+//! GEMMs into pooled scratch, then the update (kernels/lstm_gates.wgsl). Both
+//! paths use the CPU cell's sigmoid/tanh approximations (kernels/lstm_act.wgsl).
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -15,6 +16,7 @@ const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
 const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
+const matmul_exec = @import("matmul.zig");
 const executable = @import("../../../runtime/executable.zig");
 const device_store = @import("../../../runtime/device_store.zig");
 
@@ -29,7 +31,14 @@ fn elemBytes(dtype: types.DType) usize {
     return if (dtype == .f16) 2 else 4;
 }
 
-const lstm_kernel: KernelDesc = .{ .name = "lstm", .wgsl = @embedFile("../kernels/lstm.wgsl") };
+const act_wgsl = @embedFile("../kernels/lstm_act.wgsl");
+const lstm_kernel: KernelDesc = .{ .name = "lstm", .wgsl = @embedFile("../kernels/lstm.wgsl") ++ act_wgsl };
+const gates_kernel: KernelDesc = .{ .name = "lstm_gates", .wgsl = @embedFile("../kernels/lstm_gates.wgsl") ++ act_wgsl };
+
+/// Rows from which an f32 cell runs as GEMMs: each fused thread walks four weight
+/// columns on its own, where a GEMM tile reuses them across rows. A few rows
+/// (decode) stay one dispatch.
+const GEMM_MIN_BATCH: usize = 16;
 
 const WG_1D: u32 = 64;
 
@@ -62,7 +71,7 @@ fn acquirePackedConst(ctx: Ctx, id: executable.TensorId, min_elems: usize, dtype
     return t;
 }
 
-pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) ExecuteProgramError!void {
+pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused, mm: *matmul_exec.Matmul) ExecuteProgramError!void {
     const hs = ctx.store;
     const out_meta = hs.meta(s.out_state) catch return error.ExecutionFailed;
     const x_meta = hs.meta(s.x) catch return error.ExecutionFailed;
@@ -109,6 +118,11 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
     if (out_meta.shape[0] * out_meta.shape[1] < batch * hidden * 2) return error.Unsupported;
 
     const total = std.math.cast(u32, batch * hidden) orelse return error.Unsupported;
+    // Dummy bias bindings when absent (never read: has_bias == 0).
+    const bih_buf = if (dbih) |t| ctx.devmem.bufferFor(t.handle).? else ctx.devmem.bufferFor(dwih.handle).?;
+    const bih_len = if (dbih) |t| t.len else dwih.len;
+    const bhh_buf = if (dbhh) |t| ctx.devmem.bufferFor(t.handle).? else ctx.devmem.bufferFor(dwih.handle).?;
+    const bhh_len = if (dbhh) |t| t.len else dwih.len;
     const params: LstmParams = .{
         .batch = @intCast(batch),
         .input_size = @intCast(input_size),
@@ -116,14 +130,22 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         .has_bias = @intFromBool(has_bias),
         .total = total,
     };
+    const groups = @max(1, @min(context.ceilDiv(total, WG_1D), context.MAX_GROUPS_1D));
+
+    const gate_bytes = @as(u64, batch) * gate_dim * @sizeOf(f32);
+    if (dt == .f32 and batch >= GEMM_MIN_BATCH and context.storageBindingFits(ctx, gate_bytes)) {
+        // gates = x @ w_ih, gates += h_prev @ w_hh, then the update.
+        const gates = try ctx.scratch.ensure(ctx.gpu, gate_bytes);
+        const n: u32 = @intCast(gate_dim);
+        const m: u32 = @intCast(batch);
+        try mm.execBound(ctx, frame, .{ .a = ctx.devmem.bufferFor(dx.handle).?, .a_len = dx.len, .b = ctx.devmem.bufferFor(dwih.handle).?, .b_len = dwih.len, .c = gates, .c_len = gate_bytes, .m = m, .n = n, .k = params.input_size, .c_row = n, .c_off = 0 });
+        try mm.execBound(ctx, frame, .{ .a = ctx.devmem.bufferFor(dh.handle).?, .a_len = dh.len, .b = ctx.devmem.bufferFor(dwhh.handle).?, .b_len = dwhh.len, .c = gates, .c_len = gate_bytes, .m = m, .n = n, .k = params.hidden, .c_row = n, .c_off = 0, .beta = 1.0 });
+        const bufs = [_]c.WGPUBuffer{ gates, ctx.devmem.bufferFor(dc.handle).?, bih_buf, bhh_buf, ctx.devmem.bufferFor(dout.handle).? };
+        const sizes = [_]u64{ gate_bytes, dc.len, bih_len, bhh_len, dout.len };
+        return frame.recordCompute(try ctx.pipes.get(gates_kernel, "lstm_gates"), &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
+    }
+
     const built = try ctx.pipes.get(lstm_kernel, if (dt == .f16) "lstm_cell_f16" else "lstm_cell");
-
-    // Dummy bias bindings when absent (never read: has_bias == 0).
-    const bih_buf = if (dbih) |t| ctx.devmem.bufferFor(t.handle).? else ctx.devmem.bufferFor(dwih.handle).?;
-    const bih_len = if (dbih) |t| t.len else dwih.len;
-    const bhh_buf = if (dbhh) |t| ctx.devmem.bufferFor(t.handle).? else ctx.devmem.bufferFor(dwih.handle).?;
-    const bhh_len = if (dbhh) |t| t.len else dwih.len;
-
     const bufs = [_]c.WGPUBuffer{
         ctx.devmem.bufferFor(dx.handle).?,
         ctx.devmem.bufferFor(dh.handle).?,
@@ -135,6 +157,5 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused) Ex
         ctx.devmem.bufferFor(dout.handle).?,
     };
     const sizes = [_]u64{ dx.len, dh.len, dc.len, dwih.len, dwhh.len, bih_len, bhh_len, dout.len };
-    const groups = @max(1, @min(context.ceilDiv(total, WG_1D), context.MAX_GROUPS_1D));
     try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
 }

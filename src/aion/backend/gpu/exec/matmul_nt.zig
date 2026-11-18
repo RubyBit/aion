@@ -11,7 +11,7 @@
 //!     `kernels/matmul_nt_gemv.wgsl` reads B once per row of A (dequant-in-
 //!     registers for q8_0), one dispatch per row.
 //!   - larger M (prefill): compute-bound. An f32 B runs the autotuned GEMM that
-//!     stages B from its rows (`Matmul.execRowsB`), so nothing is copied. A q8_0
+//!     stages B from its rows (`Matmul.execBound`), so nothing is copied. A q8_0
 //!     B in `lanes32x16` order runs on matrix tiles, dequantized as it is staged
 //!     (`matmul_q8_mx16.zig` on 16x16 f16 tiles, `matmul_q8_mx.zig` on 8x8 f32
 //!     ones), where the device has them. Otherwise it is
@@ -166,7 +166,8 @@ pub const MatmulNt = struct {
                     try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, row * (k / 4), row * c_row + c_off, form);
                 }
             } else if (form == .f32) {
-                try mm.execRowsB(ctx, frame, .{
+                try mm.execBound(ctx, frame, .{
+                    .b_rows = true,
                     .a = ctx.devmem.bufferFor(da.handle).?,
                     .a_len = da.len,
                     .b = ctx.devmem.bufferFor(db.handle).?,
@@ -278,7 +279,7 @@ pub const MatmulNt = struct {
         const count: u32 = switch (form) {
             .q8_pairs => n_count * (k / 64),
             .q8_lanes32x16 => n_count * (k / Q8_BLOCK_ELEMS),
-            .f32 => unreachable, // `Matmul.execRowsB`
+            .f32 => unreachable, // `Matmul.execBound`
         };
         const dq_built = try ctx.pipes.get(dequant_kernel, switch (form) {
             .q8_pairs => "q8_nt_to_f32t",

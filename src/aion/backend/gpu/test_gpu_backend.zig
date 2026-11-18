@@ -1760,6 +1760,23 @@ test "gpu backend: conv1d (reflect pad, dilated, no bias) matches CPU" {
     try expectGpuMatchesCpu(buildConv1DReflect, 1 * 12 * 4, 1e-4);
 }
 
+fn buildConv1DReflectGemm(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    // A batched, strided single-channel filter bank with reflect padding on both
+    // sides (an STFT-style frontend): x [8, 72, 1], w [16, 1, 36], stride 8,
+    // pads 4 / 8 -> out [8, 9, 36]. Big enough for the implicit-GEMM route.
+    const x = try makeInput(&g, mgr, &.{ 8, 72, 1 }, 83);
+    const w = try makeInput(&g, mgr, &.{ 16, 1, 36 }, 84);
+    const b = try makeInput(&g, mgr, &.{36}, 85);
+    const out = try g.addConv1DWithPadMode(x, w, b, 8, 1, 4, 8, .reflect, 1);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: conv1d (batched, strided, reflect both sides) matches CPU" {
+    try expectGpuMatchesCpu(buildConv1DReflectGemm, 8 * 9 * 36, 1e-4);
+}
+
 fn buildConv1DDepthwise(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
@@ -2092,8 +2109,27 @@ fn buildLSTM(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
 }
 
 test "gpu backend: lstm cell (fused, biased) matches CPU" {
-    // CPU uses sigmoid/tanh fast approximations; GPU uses exact builtins.
     try expectGpuMatchesCpu(buildLSTM, 4 * 32, 2e-3);
+}
+
+fn buildLSTMBatched(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    // batch=40, input_size=24, hidden=32 -> state [40, 64]: past the GPU cell's
+    // GEMM threshold, so the gates run as two GEMMs plus `lstm_gates`.
+    const x = try makeInput(&g, mgr, &.{ 40, 24 }, 97);
+    const h = try makeInput(&g, mgr, &.{ 40, 32 }, 98);
+    const cc = try makeInput(&g, mgr, &.{ 40, 32 }, 99);
+    const w_ih = try makeInput(&g, mgr, &.{ 24, 128 }, 100);
+    const w_hh = try makeInput(&g, mgr, &.{ 32, 128 }, 101);
+    const b_ih = try makeInput(&g, mgr, &.{128}, 102);
+    const b_hh = try makeInput(&g, mgr, &.{128}, 103);
+    const out = try g.addLSTMCell(x, h, cc, w_ih, w_hh, b_ih, b_hh);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: lstm cell (batched, GEMM route) matches CPU" {
+    try expectGpuMatchesCpu(buildLSTMBatched, 40 * 64, 1e-4);
 }
 
 fn buildRFFT(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
@@ -3156,9 +3192,8 @@ fn buildLSTMF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return finishProg(alloc, &g, mgr, try g.addCast(out, .f32));
 }
 
-// Wider tolerance than the elementwise kernels: the CPU cell uses fast sigmoid/
-// tanh approximations where this kernel uses the WGSL builtins (see the module
-// comment in exec/lstm.zig), and that gap dominates the f16 rounding.
+// Wider tolerance than the elementwise kernels: f16 rounding of the stored
+// state and of the f16 weights each backend widens in its own order.
 test "gpu backend: lstm cell (f16) matches CPU" {
     try expectGpuMatchesCpu(buildLSTMF16, 4 * 32, 3e-3);
 }

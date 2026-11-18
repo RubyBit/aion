@@ -497,8 +497,8 @@ pub const CpuBackend = struct {
             },
 
             .LSTMCellFused => |s| {
-                const pool_ptr: ?*thread_pool.ThreadPool = if (self.pool) |*p| p else null;
-                try exec_lstm.execLSTMCellFused(pool_ptr, self.thread_count, s, store);
+                var mm_ctx = self.matmulCtx();
+                try exec_lstm.execLSTMCellFused(&mm_ctx, s, store);
             },
 
             .RFFT => |s| {

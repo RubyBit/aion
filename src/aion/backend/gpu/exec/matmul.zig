@@ -169,7 +169,7 @@ pub const Matmul = struct {
     generated: []const Generated,
     /// The implicit-GEMM conv kernels, rendered into the same arena (see `conv.zig`).
     generated_conv: []const Generated,
-    /// The GEMM over a B stored as rows (`execRowsB`).
+    /// The GEMM over a B stored as rows (`execBound` with `b_rows`).
     generated_rows: []const Generated,
 
     /// Pooled f32 scratch holding a dequantized B [k, n] for the q8_0-B GEMM path.
@@ -346,38 +346,13 @@ pub const Matmul = struct {
     /// rows of `k` (a `MatMulNT`'s weight, or one chunk of it): the GEMM staging B
     /// transposed, autotuned per shape like `exec`'s, so no transposed copy of B
     /// is made.
-    pub fn execRowsB(self: *Matmul, ctx: Ctx, frame: *Frame, op: RowsB) ExecuteProgramError!void {
-        const idx = try self.chooseRowsConfig(ctx, frame, op);
-        const gen = self.generated_rows[idx];
-        try recordRowsB(frame, gen, try ctx.pipes.get(gen.desc, gen.entry), op);
-    }
-
-    fn chooseRowsConfig(self: *Matmul, ctx: Ctx, frame: *Frame, op: RowsB) ExecuteProgramError!usize {
-        const g: Gemm = .{ .m = op.m, .n = op.n, .k = op.k, .batch = 1, .a_batch = 0, .b_batch = 0 };
-        const Cand = struct {
-            ctx: Ctx,
-            op: RowsB,
-            g: Gemm,
-            generated: []const Generated,
-
-            pub fn eligible(t: @This(), idx: usize) bool {
-                const cfg = t.generated[idx].cfg;
-                const row_bytes: isize = @intCast(@as(u64, t.op.k) * @sizeOf(f32));
-                return fits(cfg, t.g) and eligibleConfig(cfg, t.ctx.gpu.limits, row_bytes, row_bytes);
-            }
-            pub fn record(t: @This(), idx: usize, f: *Frame) ExecuteProgramError!void {
-                const gen = t.generated[idx];
-                return recordRowsB(f, gen, try t.ctx.pipes.get(gen.desc, gen.entry), t.op);
-            }
-        };
-        const cand: Cand = .{ .ctx = ctx, .op = op, .g = g, .generated = self.generated_rows };
-        // A trial re-runs the product on the real C (see `chooseConfig`), so an
-        // accumulating one takes the first eligible config untimed.
-        if (op.beta != 0.0) {
-            for (0..self.generated_rows.len) |i| if (cand.eligible(i)) return i;
-            return error.Unsupported;
-        }
-        return (try ctx.tune.pick(ctx, frame, .of(.gemm_rows, .{ autotune.sizeClass(g.m), g.n, g.k }), self.generated_rows.len, cand)) orelse error.Unsupported;
+    /// One f32 product on bound buffers (see `Bound`), autotuned per shape like
+    /// `exec`'s: B as `[K, N]`, or as the `n` rows of `k` a `MatMulNT` holds.
+    pub fn execBound(self: *Matmul, ctx: Ctx, frame: *Frame, op: Bound) ExecuteProgramError!void {
+        const generated = if (op.b_rows) self.generated_rows else self.generated;
+        const idx = try chooseBoundConfig(ctx, frame, op, generated);
+        const gen = generated[idx];
+        try recordBound(frame, gen, try ctx.pipes.get(gen.desc, gen.entry), op);
     }
 
     /// The fastest of `configs.generated` for this `(m, n, k)`, timed on the device
@@ -479,10 +454,10 @@ fn recordGemm(ctx: Ctx, frame: *Frame, s: StepMatMul, gen: Generated, built: pip
     try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ gx, gy, gz });
 }
 
-/// One `execRowsB` product: its bound buffers and dims. `n` is B's rows here (a
-/// chunk's, when B is chunked); C's rows are `c_row` apart and this chunk's
-/// columns start `c_off` in.
-pub const RowsB = struct {
+/// One `execBound` product: its bound buffers and dims. C's rows are `c_row`
+/// apart and its columns start `c_off` in. With `b_rows`, B is `n` rows of `k`
+/// (a chunk's, when B is chunked); otherwise `[k, n]`.
+pub const Bound = struct {
     a: c.WGPUBuffer,
     a_len: u64,
     b: c.WGPUBuffer,
@@ -494,12 +469,49 @@ pub const RowsB = struct {
     k: u32,
     c_row: u32,
     c_off: u32,
-    alpha: f32,
-    beta: f32,
+    alpha: f32 = 1.0,
+    beta: f32 = 0.0,
+    b_rows: bool = false,
+
+    fn bRow(op: Bound) u32 {
+        return if (op.b_rows) op.k else op.n;
+    }
 };
 
-fn recordRowsB(frame: *Frame, gen: Generated, built: pipelines.Built, op: RowsB) ExecuteProgramError!void {
-    const params: MatMulParams = .{ .m = op.m, .n = op.n, .k = op.k, .a_row = op.k, .b_row = op.k, .c_row = op.c_row, .alpha = op.alpha, .beta = op.beta, .c_off = op.c_off };
+/// The fastest of `generated` for `op`'s shape, timed on the device the first
+/// time the shape is seen.
+fn chooseBoundConfig(ctx: Ctx, frame: *Frame, op: Bound, generated: []const Generated) ExecuteProgramError!usize {
+    const g: Gemm = .{ .m = op.m, .n = op.n, .k = op.k, .batch = 1, .a_batch = 0, .b_batch = 0 };
+    const Cand = struct {
+        ctx: Ctx,
+        op: Bound,
+        g: Gemm,
+        generated: []const Generated,
+
+        pub fn eligible(t: @This(), idx: usize) bool {
+            const cfg = t.generated[idx].cfg;
+            const a_bytes: isize = @intCast(@as(u64, t.op.k) * @sizeOf(f32));
+            const b_bytes: isize = @intCast(@as(u64, t.op.bRow()) * @sizeOf(f32));
+            return fits(cfg, t.g) and eligibleConfig(cfg, t.ctx.gpu.limits, a_bytes, b_bytes);
+        }
+        pub fn record(t: @This(), idx: usize, f: *Frame) ExecuteProgramError!void {
+            const gen = t.generated[idx];
+            return recordBound(f, gen, try t.ctx.pipes.get(gen.desc, gen.entry), t.op);
+        }
+    };
+    const cand: Cand = .{ .ctx = ctx, .op = op, .g = g, .generated = generated };
+    // A trial re-runs the product on the real C (see `chooseConfig`), so an
+    // accumulating one takes the first eligible config untimed.
+    if (op.beta != 0.0) {
+        for (0..generated.len) |i| if (cand.eligible(i)) return i;
+        return error.Unsupported;
+    }
+    const family: autotune.Family = if (op.b_rows) .gemm_rows else .gemm;
+    return (try ctx.tune.pick(ctx, frame, .of(family, .{ autotune.sizeClass(g.m), g.n, g.k }), generated.len, cand)) orelse error.Unsupported;
+}
+
+fn recordBound(frame: *Frame, gen: Generated, built: pipelines.Built, op: Bound) ExecuteProgramError!void {
+    const params: MatMulParams = .{ .m = op.m, .n = op.n, .k = op.k, .a_row = op.k, .b_row = op.bRow(), .c_row = op.c_row, .alpha = op.alpha, .beta = op.beta, .c_off = op.c_off };
     const gx = context.ceilDiv(op.n, gen.cfg.bn);
     const gy = context.ceilDiv(op.m, gen.cfg.bm);
     if (gx > context.MAX_GROUPS_PER_DIM or gy > context.MAX_GROUPS_PER_DIM) return error.Unsupported;

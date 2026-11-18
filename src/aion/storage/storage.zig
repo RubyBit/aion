@@ -26,7 +26,7 @@ pub const StorageError = error{
 /// Which device a tensor's bytes currently live on. Move semantics: a tensor is
 /// resident on exactly one device at a time. `.gpu` uses `index` to name which GPU
 /// in the Context's device registry (multi-GPU); `.cpu` ignores `index`.
-pub const DeviceRef = packed struct(u16) {
+pub const DeviceRef = bitpack struct(u16) {
     kind: enum(u8) { cpu = 0, gpu = 1 } = .cpu,
     index: u8 = 0,
 

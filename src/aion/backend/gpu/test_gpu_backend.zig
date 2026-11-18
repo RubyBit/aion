@@ -268,6 +268,64 @@ fn checkMatmulSharedRows(entry: []const u8, m: usize, k: usize, n: usize) !void 
     }
 }
 
+/// Run `[m, k] @ [k, n]` on `gb` and check it against a direct sum.
+fn checkMatmulOn(gb: *gpu.GpuBackend, m: usize, k: usize, n: usize) !void {
+    const alloc = std.testing.allocator;
+    var mgr = StorageManager.init(alloc);
+    defer mgr.deinit();
+    const a_shape = [_]usize{ m, k };
+    const b_shape = [_]usize{ k, n };
+    const a_id = try mgr.createTensor(.f32, &a_shape, .{});
+    const b_id = try mgr.createTensor(.f32, &b_shape, .{});
+    const a_data = try alloc.alloc(f32, m * k);
+    defer alloc.free(a_data);
+    const b_data = try alloc.alloc(f32, k * n);
+    defer alloc.free(b_data);
+    const actual = try alloc.alloc(f32, m * n);
+    defer alloc.free(actual);
+    for (a_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 3) % 29)) - 14)) * 0.125;
+    for (b_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 5) % 31)) - 15)) * 0.125;
+    try mgr.writeFromPackedScalar(a_id, std.mem.sliceAsBytes(a_data));
+    try mgr.writeFromPackedScalar(b_id, std.mem.sliceAsBytes(b_data));
+
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    const av = try g.addInput(.f32, &a_shape);
+    try g.bindExternal(av, a_id);
+    const bv = try g.addInput(.f32, &b_shape);
+    try g.bindExternal(bv, b_id);
+    try g.setOutputs(&.{try g.addMatMul(av, bv, 1.0, 0.0)});
+    var prog = try aion.program.compileGraph(alloc, &g, &mgr, .init(.{ .kind = .gpu }, .row_major));
+    defer prog.deinit();
+    try placeProgramOnGpu(&mgr, &prog, gb);
+    try gb.backend().executeProgram(&prog, mgr.tensorStore());
+    try readPlacedOutput(&mgr, prog.outputs[0], std.mem.sliceAsBytes(actual));
+    for (0..m) |row| {
+        for (0..n) |col| {
+            var expected: f32 = 0;
+            for (0..k) |inner| expected += a_data[row * k + inner] * b_data[inner * n + col];
+            try std.testing.expectApproxEqAbs(expected, actual[row * n + col], 1e-4);
+        }
+    }
+}
+
+// A model run at many input lengths is timed once per size class, not once per
+// length: rows 137, 151 and 201 share one choice (each still runs, and matches,
+// at its own size), and 300 is the next class. N = 96 divides no 128-wide tile,
+// so every length here has the same candidates.
+test "gpu backend: matmul lengths in one size class share one tuning" {
+    const alloc = std.testing.allocator;
+    var device = wgpu.Gpu.init(.{ .power = .high }) catch return error.SkipZigTest;
+    defer device.deinit();
+    var gb = gpu.GpuBackend.init(alloc, &device);
+    defer gb.deinit();
+
+    for ([_]usize{ 137, 151, 201 }) |m| try checkMatmulOn(&gb, m, 64, 96);
+    try std.testing.expectEqual(@as(usize, 1), gb.tune.count(.gemm));
+    try checkMatmulOn(&gb, 300, 64, 96);
+    try std.testing.expectEqual(@as(usize, 2), gb.tune.count(.gemm));
+}
+
 // A batch-one f32 matmul (a fully connected layer at batch one) is a matvec: it
 // streams B once instead of staging it through a tiled GEMM. N is a multiple of 4
 // but of no tile, and K of nothing in particular.

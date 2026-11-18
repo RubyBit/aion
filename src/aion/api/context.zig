@@ -433,7 +433,7 @@ pub const Context = struct {
     /// along `quant_axis` (the matmul-B K axis is rank-2; an embedding table
     /// blocked along its feature dim uses the last axis).
     pub fn fromF32Quantized(self: *Self, dtype: DType, shape: []const usize, quant_axis: usize, values: []const f32) api_errors.ApiError!api_tensor.Tensor {
-        if (values.len != shapeCount(shape) orelse return api_errors.ApiError.InvalidArgument) return api_errors.ApiError.InvalidArgument;
+        if (values.len != (shapeCount(shape) orelse return api_errors.ApiError.InvalidArgument)) return api_errors.ApiError.InvalidArgument;
         return self.quantize(dtype, shape, quant_axis, .{ .view = .contiguous(.f32, shape, std.mem.sliceAsBytes(values)) });
     }
 
@@ -615,11 +615,9 @@ pub const Context = struct {
         if (ShapeInfo.dt_opt == null) return api_errors.ApiError.InvalidArgument;
         const dt: DType = ShapeInfo.dt_opt.?;
 
-        var shape_mem: [tensor_store_max_rank]usize = undefined;
-        var i: usize = 0;
-        while (i < ShapeInfo.rank) : (i += 1) {
-            shape_mem[i] = ShapeInfo.dims[i];
-        }
+        // Copied whole: indexing the comptime `dims` with a runtime index would need
+        // a runtime pointer into comptime memory, which Zig 0.18 rejects.
+        const shape_mem: [tensor_store_max_rank]usize = ShapeInfo.dims;
         const shape: []const usize = shape_mem[0..ShapeInfo.rank];
 
         const packed_bytes: []const u8 = switch (@typeInfo(ArrT)) {

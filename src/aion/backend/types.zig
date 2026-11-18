@@ -10,7 +10,7 @@ pub const BackendKind = enum(u9) {
     webgpu,
 };
 
-pub const BackendCaps = packed struct(u64) {
+pub const BackendCaps = bitpack struct(u64) {
     simd: bool = false,
     threads: bool = false,
     fp16: bool = false,

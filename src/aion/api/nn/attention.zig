@@ -471,7 +471,7 @@ pub const RelPosSelfAttention = struct {
             .head_dim = pe[2],
             .scale = cfg.scale,
             .window = cfg.window,
-            .relative_zero_index = cfg.relative_zero_index orelse pe[1] / 2,
+            .relative_zero_index = cfg.relative_zero_index orelse (pe[1] / 2),
             .attn_logits_soft_cap = cfg.attn_logits_soft_cap,
             .id = id,
         };

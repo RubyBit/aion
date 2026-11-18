@@ -26,6 +26,10 @@ pub const Family = enum(u8) { gemm, gemm_rows, gemm_q8, conv, attention };
 pub const Key = struct {
     family: Family,
     dims: [8]u32 = @splat(0),
+    /// The candidates that can run this problem, one bit each. `pick` fills it in,
+    /// so a remembered choice is only reused where it can run: dims in one size
+    /// class can still differ in which tiles divide them.
+    eligible: u64 = 0,
 
     pub fn of(family: Family, dims: anytype) Key {
         var key: Key = .{ .family = family };
@@ -33,6 +37,17 @@ pub const Key = struct {
         return key;
     }
 };
+
+/// The size class a dim that follows the input's length is keyed by: the next
+/// power of two. A prompt of 137 tokens and one of 138 want the same tiling, and
+/// timing every length a model is run at cost more than the tuning bought (Gemma
+/// prefill: 12 GEMMs re-timed per new length, ~0.8 s, against a ~50 ms run). The
+/// kernel still runs at the exact size; only the remembered choice is shared.
+pub fn sizeClass(n: anytype) u32 {
+    const v: u32 = @intCast(n);
+    if (v <= 1) return v;
+    return std.math.ceilPowerOfTwo(u32, v) catch std.math.maxInt(u32);
+}
 
 /// How long a timed burst lasts, whatever the kernel costs: as many runs as fit,
 /// found from a short probe. A burst is one submit, whose own cost is a few
@@ -80,16 +95,19 @@ pub const Tuner = struct {
     /// `record` records one run of candidate `idx` into `frame`. A trial runs on
     /// the op's real operands, so it must be safe to repeat: it may overwrite the
     /// op's output, which the real run rewrites, and nothing else.
-    pub fn pick(self: *Tuner, ctx: Ctx, frame: *Frame, key: Key, candidates: usize, cand: anytype) ExecuteProgramError!?usize {
-        if (self.choices.get(key)) |idx| return idx;
-
+    pub fn pick(self: *Tuner, ctx: Ctx, frame: *Frame, problem: Key, candidates: usize, cand: anytype) ExecuteProgramError!?usize {
+        std.debug.assert(candidates <= @bitSizeOf(u64));
+        var key = problem;
         var only: ?usize = null;
         var eligible: usize = 0;
         for (0..candidates) |idx| {
             if (!cand.eligible(idx)) continue;
             only = only orelse idx;
             eligible += 1;
+            key.eligible |= @as(u64, 1) << @intCast(idx);
         }
+        if (self.choices.get(key)) |idx| return idx;
+
         var best: ?usize = only;
         if (eligible > 1) {
             // Trials run ahead of anything still pending in `frame`, and they

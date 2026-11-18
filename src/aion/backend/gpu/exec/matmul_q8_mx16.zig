@@ -83,7 +83,7 @@ pub fn record(ctx: Ctx, frame: *Frame, bufs: [3]c.WGPUBuffer, sizes: [3]u64, par
         }
     };
     const cand: Cand = .{ .ctx = ctx, .bufs = bufs, .sizes = sizes, .params = params };
-    const key: autotune.Key = .of(.gemm_q8, .{ params.m, params.n, params.k });
+    const key: autotune.Key = .of(.gemm_q8, .{ autotune.sizeClass(params.m), params.n, params.k });
     const idx = (try ctx.tune.pick(ctx, frame, key, configs.len, cand)) orelse return error.Unsupported;
     return recordConfig(ctx, frame, idx, bufs, sizes, params);
 }

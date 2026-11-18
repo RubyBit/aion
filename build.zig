@@ -91,7 +91,9 @@ pub fn build(b: *std.Build) void {
     const armFloorQuery = struct {
         fn make(base: std.Target.Query, comptime extra: []const tier_kinds.Feature, floor: std.Target.aarch64.Feature) std.Target.Query {
             var q = base;
-            q.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic };
+            // The architecture's generic model (LLVM "generic"; Zig 0.18 names it
+            // `armv8a`), asked for by role so a rename cannot break the floor.
+            q.cpu_model = .{ .explicit = std.Target.Cpu.Model.generic(.aarch64) };
             q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_sub = std.Target.Cpu.Feature.Set.empty;
             q.cpu_features_add.addFeature(@intFromEnum(floor));

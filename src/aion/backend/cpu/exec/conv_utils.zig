@@ -150,7 +150,7 @@ pub const ConvCache = struct {
 /// Gathering the weight block costs as much as the pack itself, so a caller that
 /// asks this first pays neither once the cache is warm.
 pub fn findPackedWeights(cache: *ConvCache, key: PackedWeightKey) ?PackedWeightEntry {
-    std.Io.Threaded.mutexLock(&cache.mutex);
+    std.Io.Threaded.mutexLockUncancelable(&cache.mutex);
     defer std.Io.Threaded.mutexUnlock(&cache.mutex);
     return cache.map.get(key);
 }
@@ -161,7 +161,7 @@ pub fn getOrCreatePackedWeights(
     key: PackedWeightKey,
     w_matrix: ?[]align(1) const f32,
 ) ExecuteProgramError!PackedWeightEntry {
-    std.Io.Threaded.mutexLock(&cache.mutex);
+    std.Io.Threaded.mutexLockUncancelable(&cache.mutex);
     defer std.Io.Threaded.mutexUnlock(&cache.mutex);
 
     if (cache.map.get(key)) |entry| return entry;

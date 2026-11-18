@@ -586,7 +586,7 @@ const BlockedCtx = struct {
 
     fn fail(self: *@This(), err: anyerror) void {
         if (self.stop.swap(true, .acq_rel)) return;
-        std.Io.Threaded.mutexLock(&self.err_mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.err_mutex);
         defer std.Io.Threaded.mutexUnlock(&self.err_mutex);
         if (self.err_any == null) self.err_any = err;
     }
@@ -1017,7 +1017,7 @@ const ExecCtx = struct {
 
     fn fail(self: *@This(), err: anyerror) void {
         if (self.stop.swap(true, .acq_rel)) return;
-        std.Io.Threaded.mutexLock(&self.err_mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.err_mutex);
         defer std.Io.Threaded.mutexUnlock(&self.err_mutex);
         if (self.err_any == null) self.err_any = err;
     }

@@ -8,6 +8,7 @@ const std = @import("std");
 const wgpu = @import("../wgpu.zig");
 const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
+const autotune = @import("../autotune.zig");
 const codegen = @import("../matmul/codegen.zig");
 const configs = @import("../matmul/configs.zig");
 const backend_mod = @import("../../backend.zig");
@@ -376,7 +377,7 @@ pub const Matmul = struct {
             for (0..self.generated_rows.len) |i| if (cand.eligible(i)) return i;
             return error.Unsupported;
         }
-        return (try ctx.tune.pick(ctx, frame, .of(.gemm_rows, .{ g.m, g.n, g.k }), self.generated_rows.len, cand)) orelse error.Unsupported;
+        return (try ctx.tune.pick(ctx, frame, .of(.gemm_rows, .{ autotune.sizeClass(g.m), g.n, g.k }), self.generated_rows.len, cand)) orelse error.Unsupported;
     }
 
     /// The fastest of `configs.generated` for this `(m, n, k)`, timed on the device
@@ -409,7 +410,7 @@ pub const Matmul = struct {
             }
         };
         const cand: Cand = .{ .ctx = ctx, .s = s, .g = g, .row_bytes = row_bytes, .generated = self.generated };
-        return (try ctx.tune.pick(ctx, frame, .of(.gemm, .{ g.m, g.n, g.k }), self.generated.len, cand)) orelse error.ExecutionFailed;
+        return (try ctx.tune.pick(ctx, frame, .of(.gemm, .{ autotune.sizeClass(g.m), g.n, g.k }), self.generated.len, cand)) orelse error.ExecutionFailed;
     }
 };
 

@@ -192,7 +192,7 @@ pub const ThreadPool = struct {
     }
 
     pub fn deinit(self: *ThreadPool) void {
-        std.Io.Threaded.mutexLock(&self.submit_mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.submit_mutex);
         defer std.Io.Threaded.mutexUnlock(&self.submit_mutex);
 
         const shared = self.shared orelse {
@@ -316,7 +316,7 @@ pub const ThreadPool = struct {
             return;
         }
 
-        std.Io.Threaded.mutexLock(&self.submit_mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.submit_mutex);
         defer std.Io.Threaded.mutexUnlock(&self.submit_mutex);
 
         const shared = self.shared orelse {

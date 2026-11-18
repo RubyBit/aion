@@ -10,6 +10,7 @@ const matmul_registry = @import("registry/matmul_registry.zig");
 const matmul_q_registry = @import("registry/matmul_q_registry.zig");
 const cpu_target = @import("registry/cpu_target.zig");
 const matmul_nt_registry = @import("registry/matmul_nt_registry.zig");
+const matmul_nt_q = @import("kernels/matmul_nt_q.zig");
 const matvec_registry = @import("registry/matvec_registry.zig");
 const attention_registry = @import("registry/attention_registry.zig");
 const conv2d_registry = @import("registry/conv2d_registry.zig");
@@ -62,7 +63,7 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 /// The single-target build's quantized kernels: those of the ISA it was compiled for.
 const compiled_quantized = dispatch_table.quantizedFor(cpu_target.compiled);
 
-const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch.isAARCH64()) and
+const multiversion_enabled: bool = (builtin.cpu.arch.isX86() or builtin.cpu.arch.isAarch64()) and
     @import("build_options").multiversion;
 
 /// CPU Backend implementation.
@@ -136,10 +137,10 @@ pub const CpuBackend = struct {
         };
     }
 
-    /// The row grouping this backend's NT q8 kernel reads (see
-    /// `types.QuantBlockOrder`): its byte dot's lane count.
+    /// The block order this backend's NT q8 kernel reads fastest, and so the one
+    /// weights are re-laid into for it (see `matmul_nt_q.blockOrderFor`).
     pub fn quantBlockOrder(self: *const Self) types.QuantBlockOrder {
-        return types.QuantBlockOrder.withGroup(self.matmul_nt.tuning.lanes) orelse .row_major;
+        return matmul_nt_q.blockOrderFor(self.matmul_nt.tuning);
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !Self {

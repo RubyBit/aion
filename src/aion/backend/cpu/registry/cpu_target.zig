@@ -43,7 +43,7 @@ pub const DotEnc = matmul_q_i8.DotEnc;
 pub fn canEmit(comptime enc: DotEnc) bool {
     return switch (enc) {
         .portable => true,
-        .sdot => builtin.cpu.arch.isAARCH64(),
+        .sdot => builtin.cpu.arch.isAarch64(),
         .vex, .evex, .avx2 => builtin.cpu.arch.isX86() and builtin.zig_backend != .stage2_x86_64,
     };
 }
@@ -70,7 +70,7 @@ pub fn simdWidthFromF32Lanes(lanes: usize) SimdWidth {
 pub const compiled: Target = blk: {
     const features = builtin.cpu.features;
     const x86 = builtin.cpu.arch.isX86();
-    const arm = builtin.cpu.arch.isAARCH64();
+    const arm = builtin.cpu.arch.isAarch64();
     const lanes: usize = if (x86 and std.Target.x86.featureSetHas(features, .avx512f))
         16
     else if (x86 and std.Target.x86.featureSetHas(features, .avx2))

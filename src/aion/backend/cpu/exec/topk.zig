@@ -90,7 +90,7 @@ fn Rows(comptime T: type) type {
 
         fn fail(t: *@This(), err: anyerror) void {
             if (t.stop.swap(true, .acq_rel)) return;
-            std.Io.Threaded.mutexLock(&t.err_mutex);
+            std.Io.Threaded.mutexLockUncancelable(&t.err_mutex);
             defer std.Io.Threaded.mutexUnlock(&t.err_mutex);
             if (t.err_any == null) t.err_any = err;
         }

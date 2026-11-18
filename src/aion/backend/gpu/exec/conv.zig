@@ -21,6 +21,7 @@ const std = @import("std");
 const wgpu = @import("../wgpu.zig");
 const pipelines = @import("../pipelines.zig");
 const context = @import("../context.zig");
+const autotune = @import("../autotune.zig");
 const backend_mod = @import("../../backend.zig");
 const types = @import("../../types.zig");
 const tensor_store_mod = @import("../../../runtime/tensor_store.zig");
@@ -154,7 +155,7 @@ fn chooseConvConfig(mm: *const matmul_exec.Matmul, ctx: Ctx, frame: *Frame, gp: 
         }
     };
     const cand: Cand = .{ .ctx = ctx, .gp = gp, .ops = ops, .generated = mm.generated_conv };
-    return ctx.tune.pick(ctx, frame, .of(.conv, .{ gp.m, gp.n, gp.k }), mm.generated_conv.len, cand);
+    return ctx.tune.pick(ctx, frame, .of(.conv, .{ autotune.sizeClass(gp.m), gp.n, gp.k }), mm.generated_conv.len, cand);
 }
 
 const conv_kernel: KernelDesc = .{ .name = "conv", .wgsl = @embedFile("../kernels/conv.wgsl") };

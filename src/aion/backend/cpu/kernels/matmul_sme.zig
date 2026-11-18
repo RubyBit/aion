@@ -30,7 +30,7 @@ pub const MR: usize = 2 * SVL;
 pub const NR: usize = 2 * SVL;
 
 /// The kernel loads with SME2's multi-vector `ld1w`, so SME alone is not enough.
-const have_sme = builtin.cpu.arch.isAARCH64() and
+const have_sme = builtin.cpu.arch.isAarch64() and
     std.Target.aarch64.featureSetHasAll(builtin.cpu.features, .{ .sme, .sme2 });
 
 var svl_cache: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);

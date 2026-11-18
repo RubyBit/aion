@@ -21,7 +21,7 @@ const tier_kinds = @import("tier_kinds.zig");
 
 const tiers = if (builtin.cpu.arch.isX86())
     &tier_kinds.x86_tiers
-else if (builtin.cpu.arch.isAARCH64())
+else if (builtin.cpu.arch.isAarch64())
     &tier_kinds.arm_tiers
 else
     @compileError("kernel_dispatch: unsupported arch");

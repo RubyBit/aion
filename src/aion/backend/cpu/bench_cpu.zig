@@ -30,6 +30,8 @@ const BenchSuite = enum {
     matmul,
     quant_matmul,
     decode,
+    /// Gemma 4 E2B's q8_0 MatMulNT shapes at `--m` rows: the prefill GEMMs.
+    prefill,
     kernels,
     token,
 };
@@ -1690,14 +1692,25 @@ fn benchDecodeMatMul(allocator: std.mem.Allocator, rnd: std.Random, iters: usize
 }
 
 fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, k: usize, n: usize, label: []const u8, be: Backend) !void {
+    return benchMatMulNTRows(allocator, rnd, iters, 1, k, n, label, .row_major, be);
+}
+
+/// `[m, k] @ B^T` against a q8_0 B `[n, k]`, through the real program path. One
+/// row is a decode GEMV, reported as weight GiB/s; more rows are a prefill GEMM,
+/// reported as GFLOP/s.
+///
+/// `order` is the block order the compile re-lays B into: `.row_major` keeps it as
+/// stored, and a CPU backend's own order (`CpuBackend.quantBlockOrder`) is what a
+/// model loaded through `api.Context` runs.
+fn benchMatMulNTRows(allocator: std.mem.Allocator, rnd: std.Random, iters: usize, m: usize, k: usize, n: usize, label: []const u8, order: types.QuantBlockOrder, be: Backend) !void {
     var sm = StorageManager.init(allocator);
     defer sm.deinit();
 
-    const a: []f32 = try allocator.alloc(f32, k);
+    const a: []f32 = try allocator.alloc(f32, m * k);
     defer allocator.free(a);
     fillRandomF32(rnd, a);
 
-    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ 1, 1, k }, .{});
+    const a_tid: TensorId = try sm.createTensor(.f32, &[_]usize{ 1, m, k }, .{});
     try sm.writeFromPackedScalar(a_tid, std.mem.sliceAsBytes(a));
 
     const b_bytes: []u8 = try buildQuantB_Q8_0_NT(allocator, rnd, n, k);
@@ -1708,25 +1721,54 @@ fn benchDecodeMatMulNT(allocator: std.mem.Allocator, rnd: std.Random, iters: usi
 
     var g = graph_mod.Graph.init(allocator);
     defer g.deinit();
-    const a_in = try g.addInput(.f32, &[_]usize{ 1, 1, k });
+    const a_in = try g.addInput(.f32, &[_]usize{ 1, m, k });
     const b_in = try g.addInput(.q8_0, &[_]usize{ n, k });
     try g.bindExternal(a_in, @intCast(a_tid));
     try g.bindExternal(b_in, @intCast(b_tid));
     const out = try g.addMatMul(a_in, try g.addViewTranspose2D(b_in), 1.0, 0.0);
     try g.setOutputs(&[_]graph_mod.ValueId{out});
 
-    var prog = try program_mod.compileGraph(allocator, &g, &sm, .cpu());
+    var prog = try program_mod.compileGraph(allocator, &g, &sm, .init(.{}, order));
     defer prog.deinit();
 
     const ns: u64 = try benchProgram(iters, be, &sm, &prog);
 
-    const out_buf: []u8 = try allocator.alloc(u8, n * @sizeOf(f32));
+    const out_buf: []u8 = try allocator.alloc(u8, m * n * @sizeOf(f32));
     defer allocator.free(out_buf);
     try sm.readToPackedScalar(prog.outputs[0], out_buf);
     const ov = asF32Slice(out_buf);
-    const chk: f32 = ov[0] + ov[n / 2] + ov[n - 1];
+    const chk: f32 = ov[0] + ov[m * n / 2] + ov[m * n - 1];
 
-    rep("dec_nt_{s}", .{label}, iters, ns, @floatFromInt((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES), 0, chk);
+    if (m == 1) {
+        rep("dec_nt_{s}", .{label}, iters, ns, @floatFromInt((k / Q8_0_BLOCK_ELEMS) * n * Q8_0_BLOCK_BYTES), 0, chk);
+    } else {
+        rep("pre_nt_{s}_{s}", .{ label, @tagName(order) }, iters, ns, 0, 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(k)), chk);
+    }
+}
+
+/// Gemma 4 E2B's prefill GEMMs: its q8_0 MatMulNT weights at `--m` rows, in the
+/// stored order and in `backend_order`, the one a loaded model's weights are re-laid
+/// into.
+fn runPrefillSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend, backend_order: types.QuantBlockOrder) !void {
+    const Shape = struct { label: []const u8, k: usize, n: usize };
+    const shapes = [_]Shape{
+        .{ .label = "ffn_gate_up", .k = 1536, .n = 12288 },
+        .{ .label = "ffn_down", .k = 6144, .n = 1536 },
+        .{ .label = "q_proj_local", .k = 1536, .n = 2048 },
+        .{ .label = "o_proj_local", .k = 2048, .n = 1536 },
+        .{ .label = "kv_proj_local", .k = 1536, .n = 256 },
+        .{ .label = "logits_tied", .k = 1536, .n = 262144 },
+    };
+    std.debug.print("prefill MatMulNT q8_0, m={d}, iters={d}\n", .{ opts.m, opts.iters });
+    for (shapes) |s| {
+        if (opts.op_filter) |filter| {
+            if (!std.mem.eql(u8, filter, s.label)) continue;
+        }
+        try benchMatMulNTRows(allocator, rnd, opts.iters, opts.m, s.k, s.n, s.label, .row_major, be);
+        if (backend_order != .row_major) {
+            try benchMatMulNTRows(allocator, rnd, opts.iters, opts.m, s.k, s.n, s.label, backend_order, be);
+        }
+    }
 }
 
 fn runDecodeSuite(allocator: std.mem.Allocator, rnd: std.Random, opts: BenchOptions, be: Backend) !void {
@@ -2244,6 +2286,7 @@ fn mainImpl(args: std.process.Args) !void {
         return;
     }
     if (opts.suite == .token) return runTokenSuite(allocator, opts, be);
+    if (opts.suite == .prefill) return runPrefillSuite(allocator, rnd, opts, be, cpu.quantBlockOrder());
 
     switch (opts.dtype_mode) {
         .f32 => try runF32Benches(allocator, rnd, opts, be),

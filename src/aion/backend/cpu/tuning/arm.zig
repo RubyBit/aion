@@ -3,6 +3,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cpuid_root = @import("cpuid.zig");
 
+/// The Linux auxiliary vector entry `index`. With libc linked (the library does
+/// on Linux) `std.os.linux.getauxval` is void since Zig 0.18 and libc's own
+/// `getauxval` holds the vector, the same split `std.posix` makes.
+fn auxval(index: usize) usize {
+    if (comptime builtin.link_libc) return @intCast(std.c.getauxval(@intCast(index)));
+    return std.os.linux.getauxval(index);
+}
+
 pub fn detect() cpuid_root.CpuInfo {
     var info: cpuid_root.CpuInfo = .{
         .arch = .aarch64,
@@ -12,8 +20,8 @@ pub fn detect() cpuid_root.CpuInfo {
     if (builtin.os.tag == .linux) {
         const AT_HWCAP = 16;
         const AT_HWCAP2 = 26;
-        const hwcaps = std.os.linux.getauxval(AT_HWCAP);
-        const hwcaps2 = std.os.linux.getauxval(AT_HWCAP2);
+        const hwcaps = auxval(AT_HWCAP);
+        const hwcaps2 = auxval(AT_HWCAP2);
 
         const HWCAP_ASIMDDP = 1 << 20;
         const HWCAP2_I8MM = 1 << 13;

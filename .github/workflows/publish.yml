@@ -37,7 +37,7 @@ env:
   # setup-zig v2 still declares node20; exercise it on Node 24 too.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   # Keep in sync with .github/workflows/ci.yml and build.zig.zon's dev pin.
-  ZIG_VERSION: 0.17.0-dev.1756+613c03321
+  ZIG_VERSION: 0.18.0-dev.1180+2e9bb03df
 
 jobs:
   build-aion:

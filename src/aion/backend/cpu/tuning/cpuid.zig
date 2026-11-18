@@ -57,7 +57,7 @@ pub const CpuInfo = struct {
 pub fn detect() CpuInfo {
     if (builtin.cpu.arch.isX86()) {
         return x86.detect();
-    } else if (builtin.cpu.arch.isAARCH64()) {
+    } else if (builtin.cpu.arch.isAarch64()) {
         return arm.detect();
     }
     return .{};

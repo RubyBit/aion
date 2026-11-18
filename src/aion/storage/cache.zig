@@ -68,7 +68,7 @@ pub const Cache = struct {
     allocator: std.mem.Allocator,
     cfg: CacheConfig,
 
-    tensor_policies: std.ArrayListUnmanaged(TensorPolicyRecord) = .empty,
+    tensor_policies: std.ArrayList(TensorPolicyRecord) = .empty,
 
     const Self = @This();
 

@@ -45,11 +45,16 @@ const DotEnc = matmul_q_i8.DotEnc;
 /// encoding needs removed.
 const ABlock = struct { q: VQ, scale: f32, correction: VI };
 
+/// The correction is the slot's stored `128 * sum(a)`, all in lane 0: the four
+/// lanes of a block's dot are only ever summed, so the total is what matters, and
+/// loading it replaces re-summing the block's bytes every time it is read (which
+/// Zig 0.18 compiles to ~100 scalar extract/insert instructions per 2x2 tile).
 inline fn loadA(comptime enc: DotEnc, p: [*]const u8) ABlock {
+    const correction: VI = if (comptime matmul_q_i8.encNeedsBias(enc)) .{ slotCorrection(p), 0, 0, 0 } else @splat(0);
     return .{
         .q = simd.load(VQ, p),
-        .scale = @as(*align(1) const f32, @ptrCast(p + Q8_0_BLOCK_ELEMS)).*,
-        .correction = matmul_q_i8.prepBiasNarrow(enc, p),
+        .scale = slotScale(p),
+        .correction = correction,
     };
 }
 
@@ -612,7 +617,7 @@ const testable_encs: []const DotEnc = blk: {
     break :blk list;
 };
 
-// Every grouping against a reference, through the unrolled sweep and the
+// Every block order (row-major and each grouping) against a reference, through the unrolled sweep and the
 // gathering fallback, at row counts below, at and past the
 // kernel's row tile, with every byte dot this machine runs. The portable dot runs
 // anywhere, so the widths other tiers use are checked on this machine too; the
@@ -622,7 +627,7 @@ test "matmul_nt_q: grouped kernels match the reference at every width" {
     const k: usize = 96;
     const blocks = k / Q8_0_BLOCK_ELEMS;
 
-    inline for (testable_encs) |enc| inline for ([_]types.QuantBlockOrder{ .lanes4, .lanes8, .lanes16, .lanes32 }) |order| {
+    inline for (testable_encs) |enc| inline for ([_]types.QuantBlockOrder{ .row_major, .lanes4, .lanes8, .lanes16, .lanes32 }) |order| {
         const W = comptime order.groupRows();
         const n = 2 * W;
         var b_rows: [n * blocks * Q8_0_BLOCK_BYTES]u8 = undefined;

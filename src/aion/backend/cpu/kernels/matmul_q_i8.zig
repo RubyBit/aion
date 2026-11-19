@@ -20,6 +20,7 @@
 // is ISA-neutral.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../../types.zig");
 const simd = @import("simd.zig");
 
@@ -55,6 +56,32 @@ pub const DotEnc = enum { vex, evex, avx2, sdot, portable };
 pub fn encNeedsBias(comptime enc: DotEnc) bool {
     return enc == .vex or enc == .evex;
 }
+
+/// Whether this build can both emit and execute `enc`: the compile target has the
+/// instructions, and the assembler can encode them (the self-hosted x86 backend
+/// cannot encode the byte dots at all). Comptime, so a test of a dot the host lacks
+/// is never compiled; its asm would #UD.
+pub fn runsHere(comptime enc: DotEnc) bool {
+    const f = builtin.cpu.features;
+    const x86 = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_x86_64;
+    return switch (enc) {
+        .portable => true,
+        .avx2 => x86 and std.Target.x86.featureSetHas(f, .avx2),
+        // VEX-encoded `vpdpbusd` #UDs without AVX-VNNI, even where AVX-512-VNNI exists.
+        .vex => x86 and std.Target.x86.featureSetHas(f, .avxvnni),
+        .evex => x86 and std.Target.x86.featureSetHas(f, .avx512vnni) and std.Target.x86.featureSetHas(f, .avx512vl),
+        .sdot => builtin.cpu.arch.isAarch64() and std.Target.aarch64.featureSetHas(f, .dotprod),
+    };
+}
+
+/// Every byte dot that `runsHere`, for kernel tests to sweep.
+pub const runnable_encs: []const DotEnc = blk: {
+    var list: []const DotEnc = &.{};
+    for (std.enums.values(DotEnc)) |enc| {
+        if (runsHere(enc)) list = list ++ &[_]DotEnc{enc};
+    }
+    break :blk list;
+};
 
 /// Computes, per output lane j: `acc[j] += Σ_{kk=0..3} a[j*4+kk] · b[j*4+kk]`.
 ///
@@ -197,10 +224,14 @@ pub inline fn dotI8Narrow(
     return acc + @as(@Vector(4, i32), wide[0..4].*) + @as(@Vector(4, i32), wide[4..8].*);
 }
 
-/// One activation block prepared for `dotI8`: the 32 int8s, then the f32 scale
-/// that reconstructs them. Kernels that quantize A up front — the decode matvec
-/// and the NT GEMM — share this slot layout so they can share the helpers below.
-pub const PREP_BLOCK_BYTES: usize = Q8_0_BLOCK_ELEMS + @sizeOf(f32);
+/// One activation block prepared for `dotI8`: the 32 int8s, their f32 scale, then
+/// an i32 `128 * sum(int8s)`. The last is what an unsigned x signed dot (`vpdpbusd`
+/// with the weight as the unsigned side) adds to the block's total, so kernels take
+/// it back with one load instead of re-summing the block's bytes on every read
+/// (which Zig 0.18 compiles to ~100 scalar extract/insert instructions). Kernels
+/// that quantize A up front — the decode matvec and the NT GEMM — share this slot.
+pub const PREP_BLOCK_BYTES: usize = PREP_CORRECTION_OFFSET + @sizeOf(i32);
+const PREP_CORRECTION_OFFSET: usize = Q8_0_BLOCK_ELEMS + @sizeOf(f32);
 
 /// Quantize `blocks` K blocks of one activation row into consecutive slots.
 pub inline fn prepareARow(out: [*]u8, a_row: [*]align(1) const f32, blocks: usize) void {
@@ -208,26 +239,28 @@ pub inline fn prepareARow(out: [*]u8, a_row: [*]align(1) const f32, blocks: usiz
         const slot = out + kb * PREP_BLOCK_BYTES;
         const scale: *align(1) f32 = @ptrCast(slot + Q8_0_BLOCK_ELEMS);
         scale.* = quantizeABlock(a_row + kb * Q8_0_BLOCK_ELEMS, @ptrCast(slot));
+        const q: @Vector(Q8_0_BLOCK_ELEMS, i8) = simd.load(@Vector(Q8_0_BLOCK_ELEMS, i8), slot);
+        const sum: i32 = @reduce(.Add, @as(@Vector(Q8_0_BLOCK_ELEMS, i32), q));
+        @as(*align(1) i32, @ptrCast(slot + PREP_CORRECTION_OFFSET)).* = 128 * sum;
     }
 }
 
-/// The `128 * sum(a)` an unsigned x signed dot has to give back, per lane group.
-/// Signed dots (SDOT, portable) need no correction, so this folds to zero.
-pub inline fn prepBias(comptime enc: DotEnc, slot: [*]const u8) @Vector(8, i32) {
-    if (comptime !encNeedsBias(enc)) return @splat(0);
-    const aq: [*]const i8 = @ptrCast(slot);
-    var bias: @Vector(8, i32) = @splat(0);
-    inline for (0..8) |g| {
-        inline for (0..4) |kk| bias[g] += @as(i32, aq[g * 4 + kk]);
-    }
-    return bias * @as(@Vector(8, i32), @splat(128));
+/// A prepared slot's scale.
+pub inline fn slotScale(slot: [*]const u8) f32 {
+    return @as(*align(1) const f32, @ptrCast(slot + Q8_0_BLOCK_ELEMS)).*;
 }
 
-/// `prepBias` folded to match `dotI8Narrow`.
-pub inline fn prepBiasNarrow(comptime enc: DotEnc, slot: [*]const u8) @Vector(4, i32) {
+/// A prepared slot's stored `128 * sum(a)`.
+pub inline fn slotCorrection(slot: [*]const u8) i32 {
+    return @as(*align(1) const i32, @ptrCast(slot + PREP_CORRECTION_OFFSET)).*;
+}
+
+/// The correction to subtract from a `dotI8Narrow` against a prepared slot: the
+/// stored `128 * sum(a)` in lane 0, since the four lanes of a block's dot are only
+/// ever summed. Signed dots (SDOT, portable) need none, so this folds to zero.
+pub inline fn slotCorrectionNarrow(comptime enc: DotEnc, slot: [*]const u8) @Vector(4, i32) {
     if (comptime !encNeedsBias(enc)) return @splat(0);
-    const wide: [8]i32 = prepBias(enc, slot);
-    return @as(@Vector(4, i32), wide[0..4].*) + @as(@Vector(4, i32), wide[4..8].*);
+    return .{ slotCorrection(slot), 0, 0, 0 };
 }
 
 pub const QuantSource = enum { q8_0, q4_0 };
@@ -782,17 +815,6 @@ pub fn KernelMM(comptime opts: struct { kc: usize, nc: usize, enc: MmEnc }) type
 // Tests
 // ---------------------------------------------------------------------------
 const testing = std.testing;
-const builtin = @import("builtin");
-
-/// Whether the `.vex` encoding can be compiled *and* executed in this build:
-/// x86_64 with the AVX-VNNI CPUID bit (the VEX-encoded `vpdpbusd` #UDs without
-/// it, even on CPUs that have AVX-512-VNNI), and a backend whose assembler
-/// knows the LLVM-only `{vex}` prefix (the self-hosted x86 backend does not).
-/// Comptime-known so that gated test bodies are fully eliminated — a runtime
-/// skip would still codegen the asm and break non-LLVM builds.
-const vex_testable: bool = builtin.cpu.arch == .x86_64 and
-    std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni) and
-    builtin.zig_backend != .stage2_x86_64;
 
 fn f32ToF16Bits(x: f32) u16 {
     return @bitCast(@as(f16, @floatCast(x)));
@@ -840,7 +862,7 @@ fn dequantQ8_0(allocator: std.mem.Allocator, b: []const u8, k: usize, n: usize) 
 }
 
 test "vnni dotI8: vex (unsigned×signed, +128 bias) matches portable signed after de-bias" {
-    if (comptime !vex_testable) return error.SkipZigTest;
+    if (comptime !runsHere(.vex)) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xABCDEF);
     const rnd = prng.random();
     var iter: usize = 0;
@@ -899,9 +921,7 @@ fn refMatmul(c: []f32, a: []const f32, w: []const f32, m: usize, n: usize, k: us
 }
 
 fn runKernelTest(comptime enc: DotEnc, m: usize, n: usize, k: usize) !void {
-    // `.portable` runs everywhere (it already backs the i8mm reference on
-    // aarch64); only the x86 asm encodings need capability gating.
-    if (comptime enc == .vex and !vex_testable) return error.SkipZigTest;
+    if (comptime !runsHere(enc)) return error.SkipZigTest;
     const allocator = testing.allocator;
     const K = Kernel(.{ .kc = 256, .nc = 256, .enc = enc });
 

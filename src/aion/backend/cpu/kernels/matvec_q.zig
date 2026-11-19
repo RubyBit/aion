@@ -128,8 +128,8 @@ fn dotColumns(
         while (kb < nb) : (kb += 1) {
             const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
             const aqv: @Vector(32, i8) = simd.load(@Vector(32, i8), slot.ptr);
-            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
-            const correction = matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            const a_scale: f32 = matmul_q_i8.slotScale(slot.ptr);
+            const correction = matmul_q_i8.slotCorrectionNarrow(enc, slot.ptr);
             const row = b + (kb * ldb + jt) * Q8_0_BLOCK_BYTES;
             inline for (0..NT) |jj| {
                 const bp = row + jj * Q8_0_BLOCK_BYTES;
@@ -148,11 +148,11 @@ fn dotColumns(
         while (kb < nb) : (kb += 1) {
             const slot = dot_prep[kb * PREP_BLOCK_BYTES ..];
             const aqv: @Vector(32, i8) = simd.load(@Vector(32, i8), slot.ptr);
-            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(slot.ptr + Q8_0_BLOCK_ELEMS)).*;
+            const a_scale: f32 = matmul_q_i8.slotScale(slot.ptr);
             const bp = b + (kb * ldb + jt) * Q8_0_BLOCK_BYTES;
             const bits: u16 = @as(*align(1) const u16, @ptrCast(bp)).*;
             const qv: @Vector(32, i8) = simd.load(@Vector(32, i8), bp + 2);
-            const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - matmul_q_i8.prepBiasNarrow(enc, slot.ptr);
+            const dots = matmul_q_i8.dotI8Narrow(enc, @as(VI, @splat(0)), qv, aqv) - matmul_q_i8.slotCorrectionNarrow(enc, slot.ptr);
             acc += @as(VF, @floatFromInt(dots)) * @as(VF, @splat(a_scale * @as(f32, @as(f16, @bitCast(bits)))));
         }
         store(c, params, first, jt, @reduce(.Add, acc));
@@ -170,11 +170,13 @@ pub fn MatvecKernel(comptime t: MatvecTuning) type {
 }
 
 // Past `DOT_MAX_K` the activation is quantized in chunks; a chunk boundary sits on
-// a block boundary, so it must change nothing about the integer dot.
+// a block boundary, so it must change nothing about the integer dot. Every byte dot
+// this build runs (the x86 ones subtract the slot's stored correction), and an N
+// past the column tile so the leftover-column loop runs too.
 test "matvec_q: int8 results hold past the prepared-activation chunk and above M = 1" {
     const testing = std.testing;
     const m: usize = 2;
-    const n: usize = 4;
+    const n: usize = 5;
     const k: usize = DOT_MAX_K + 64;
     const blocks = k / Q8_0_BLOCK_ELEMS;
 
@@ -188,10 +190,17 @@ test "matvec_q: int8 results hold past the prepared-activation chunk and above M
         for (b[bi * Q8_0_BLOCK_BYTES + 2 ..][0..32], 0..) |*q, t| q.* = @truncate(bi *% 5 +% t *% 3);
     }
 
-    var got: [m * n]f32 = undefined;
-    const K = MatvecKernel(.{ .lanes = 4, .dot_enc = .portable });
-    try K.matvecQ8_0KMajor(.{ .m = m, .n = n, .k = k }, std.mem.sliceAsBytes(&got), std.mem.sliceAsBytes(a), b);
+    inline for (matmul_q_i8.runnable_encs) |enc| {
+        var got: [m * n]f32 = undefined;
+        const K = MatvecKernel(.{ .lanes = 4, .dot_enc = enc });
+        try K.matvecQ8_0KMajor(.{ .m = m, .n = n, .k = k }, std.mem.sliceAsBytes(&got), std.mem.sliceAsBytes(a), b);
+        try expectMatchesReference(m, n, k, a, b, &got);
+    }
+}
 
+fn expectMatchesReference(m: usize, n: usize, k: usize, a: []const f32, b: []const u8, got: []const f32) !void {
+    const testing = std.testing;
+    const blocks = k / Q8_0_BLOCK_ELEMS;
     for (0..m) |r| {
         for (0..n) |c| {
             var want: f64 = 0;

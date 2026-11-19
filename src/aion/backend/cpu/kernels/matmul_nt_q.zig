@@ -16,22 +16,13 @@ const BackendError = types.BackendError;
 const MatMulParams = types.MatMulParams;
 const Q8_0_BLOCK_ELEMS: usize = matmul_q_i8.Q8_0_BLOCK_ELEMS;
 const Q8_0_BLOCK_BYTES: usize = matmul_q_i8.Q8_0_BLOCK_BYTES;
+/// One prepared A block is `matmul_q_i8`'s slot: 32 int8s, their f32 scale, and the
+/// stored `128 * sum` an unsigned x signed dot gives back, so a grouped sweep takes
+/// that sum back with one load per block instead of summing the block again for
+/// every group of B's rows.
 const PREP_BLOCK_BYTES: usize = matmul_q_i8.PREP_BLOCK_BYTES;
-
-/// One prepared A block here: `matmul_q_i8`'s slot (32 int8s, then their f32
-/// scale), then an i32 `128 * sum(int8s)`. The last is what an unsigned x signed
-/// dot over the weight (`vpdpbusd` with B as the unsigned side) adds to every
-/// lane, so a grouped sweep takes it back with one load per block instead of
-/// summing the block again for every group of B's rows.
-const SLOT_BYTES: usize = PREP_BLOCK_BYTES + @sizeOf(i32);
-
-inline fn slotScale(slot: [*]const u8) f32 {
-    return @as(*align(1) const f32, @ptrCast(slot + Q8_0_BLOCK_ELEMS)).*;
-}
-
-inline fn slotCorrection(slot: [*]const u8) i32 {
-    return @as(*align(1) const i32, @ptrCast(slot + PREP_BLOCK_BYTES)).*;
-}
+const slotScale = matmul_q_i8.slotScale;
+const slotCorrection = matmul_q_i8.slotCorrection;
 
 /// A folded block dot is four lanes wide (see `matmul_q_i8.dotI8Narrow`), and the
 /// sums that consume it follow.
@@ -45,16 +36,11 @@ const DotEnc = matmul_q_i8.DotEnc;
 /// encoding needs removed.
 const ABlock = struct { q: VQ, scale: f32, correction: VI };
 
-/// The correction is the slot's stored `128 * sum(a)`, all in lane 0: the four
-/// lanes of a block's dot are only ever summed, so the total is what matters, and
-/// loading it replaces re-summing the block's bytes every time it is read (which
-/// Zig 0.18 compiles to ~100 scalar extract/insert instructions per 2x2 tile).
 inline fn loadA(comptime enc: DotEnc, p: [*]const u8) ABlock {
-    const correction: VI = if (comptime matmul_q_i8.encNeedsBias(enc)) .{ slotCorrection(p), 0, 0, 0 } else @splat(0);
     return .{
         .q = simd.load(VQ, p),
         .scale = slotScale(p),
-        .correction = correction,
+        .correction = matmul_q_i8.slotCorrectionNarrow(enc, p),
     };
 }
 
@@ -99,7 +85,7 @@ inline fn sweepBlock(
     var kb: usize = 0;
     while (kb < blocks) : (kb += 1) {
         var a: [rows]ABlock = undefined;
-        inline for (0..rows) |ii| a[ii] = loadA(enc, a_rows + ii * a_stride + kb * SLOT_BYTES);
+        inline for (0..rows) |ii| a[ii] = loadA(enc, a_rows + ii * a_stride + kb * PREP_BLOCK_BYTES);
         inline for (0..cols) |jj| {
             const bp = b_col + jj * b_stride + kb * Q8_0_BLOCK_BYTES;
             inline for (0..rows) |ii| acc[ii][jj] += blockDot(enc, a[ii], bp);
@@ -211,7 +197,7 @@ inline fn sweepLanes(
         var bias: VI_W = @splat(0);
         var a: [rows][2]@Vector(16, i8) = undefined;
         inline for (0..rows) |r| {
-            const slot = a_rows + r * a_stride + kb * SLOT_BYTES;
+            const slot = a_rows + r * a_stride + kb * PREP_BLOCK_BYTES;
             inline for (0..2) |h| a[r][h] = simd.load(@Vector(16, i8), slot + h * 16);
         }
         inline for (0..Q8_0_BLOCK_ELEMS / 4) |j| {
@@ -222,7 +208,7 @@ inline fn sweepLanes(
         inline for (0..rows) |r| {
             var sum: VI_W = sums[r][0] - bias;
             inline for (1..CH) |c| sum += sums[r][c];
-            const a_scale: f32 = @as(*align(1) const f32, @ptrCast(a_rows + r * a_stride + kb * SLOT_BYTES + Q8_0_BLOCK_ELEMS)).*;
+            const a_scale: f32 = slotScale(a_rows + r * a_stride + kb * PREP_BLOCK_BYTES);
             acc[r] += @as(VF_W, @floatFromInt(sum)) * b_scale * @as(VF_W, @splat(a_scale));
         }
     }
@@ -318,7 +304,7 @@ inline fn sweepLanesX86(
     while (kb < blocks) : (kb += 1) {
         const seg = group + kb * segment_bytes;
         const quants = seg + 2 * W;
-        const slots = a_rows + kb * SLOT_BYTES;
+        const slots = a_rows + kb * PREP_BLOCK_BYTES;
         var sums: [rows][CH][H]V8I = @splat(@splat(@splat(@splat(0))));
         inline for (0..Q8_0_BLOCK_ELEMS / 4) |j| {
             inline for (0..H) |h| {
@@ -509,7 +495,7 @@ fn matmulNtQ8_0Foreign(
             var acc: VF = @splat(0.0);
             for (0..g.blocks) |kb| {
                 order.loadBlock(b_bytes, g.blocks, col, kb, &block);
-                acc += blockDot(enc, loadA(enc, a_bytes.ptr + r * g.a_stride + kb * SLOT_BYTES), &block);
+                acc += blockDot(enc, loadA(enc, a_bytes.ptr + r * g.a_stride + kb * PREP_BLOCK_BYTES), &block);
             }
             storeBlock(1, 1, g.c, params, g.ldc, r, col, .{.{@reduce(.Add, acc)}});
         }
@@ -532,7 +518,7 @@ const Geometry = struct {
         if (m == 0 or n == 0) return null;
 
         const blocks = params.k / Q8_0_BLOCK_ELEMS;
-        const a_stride = blocks * SLOT_BYTES;
+        const a_stride = blocks * PREP_BLOCK_BYTES;
         const c: []align(1) f32 = simd.bytesAsSliceMutUnaligned(f32, c_bytes);
         if (a_bytes.len < m * a_stride) return BackendError.InvalidArgument;
         if (b_bytes.len < n * blocks * Q8_0_BLOCK_BYTES) return BackendError.InvalidArgument;
@@ -544,24 +530,16 @@ const Geometry = struct {
 
 /// Bytes `prepareActivation` needs for `m` rows of `k`.
 pub fn preparedBytes(m: usize, k: usize) usize {
-    return m * (k / Q8_0_BLOCK_ELEMS) * SLOT_BYTES;
+    return m * (k / Q8_0_BLOCK_ELEMS) * PREP_BLOCK_BYTES;
 }
 
 /// Quantize `m` rows of A once, for every N tile of the same matmul to share, into
-/// `SLOT_BYTES` slots.
+/// `PREP_BLOCK_BYTES` slots.
 pub fn prepareActivation(out: []u8, a_bytes: []const u8, m: usize, k: usize) BackendError!void {
     const blocks: usize = k / Q8_0_BLOCK_ELEMS;
     const a: []align(1) const f32 = simd.bytesAsSliceConstUnaligned(f32, a_bytes);
     if (a.len < m * k or out.len < preparedBytes(m, k)) return BackendError.InvalidArgument;
-    for (0..m) |r| {
-        for (0..blocks) |kb| {
-            const slot = out[(r * blocks + kb) * SLOT_BYTES ..].ptr;
-            matmul_q_i8.prepareARow(slot, a.ptr + r * k + kb * Q8_0_BLOCK_ELEMS, 1);
-            const q: @Vector(Q8_0_BLOCK_ELEMS, i8) = simd.load(@Vector(Q8_0_BLOCK_ELEMS, i8), slot);
-            const sum: i32 = @reduce(.Add, @as(@Vector(Q8_0_BLOCK_ELEMS, i32), q));
-            @as(*align(1) i32, @ptrCast(slot + PREP_BLOCK_BYTES)).* = 128 * sum;
-        }
-    }
+    for (0..m) |r| matmul_q_i8.prepareARow(out[r * blocks * PREP_BLOCK_BYTES ..].ptr, a.ptr + r * k, blocks);
 }
 
 /// The block order a tier's kernel reads fastest, which is the order weights are
@@ -600,22 +578,6 @@ pub fn Kernel(comptime t: matmul_nt.Tuning) type {
     };
 }
 
-/// The byte dots this build can both emit and run, decided at comptime so a
-/// dot the host lacks is never compiled into the test (its asm would #UD).
-/// The x86 ones need LLVM: the self-hosted backend cannot encode them.
-const testable_encs: []const DotEnc = blk: {
-    var list: []const DotEnc = &.{.portable};
-    const x86 = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_x86_64;
-    const has = struct {
-        fn f(comptime feature: std.Target.x86.Feature) bool {
-            return std.Target.x86.featureSetHas(builtin.cpu.features, feature);
-        }
-    }.f;
-    if (x86 and has(.avx2)) list = list ++ &[_]DotEnc{.avx2};
-    if (x86 and has(.avxvnni)) list = list ++ &[_]DotEnc{.vex};
-    if (x86 and has(.avx512vnni) and has(.avx512vl)) list = list ++ &[_]DotEnc{.evex};
-    break :blk list;
-};
 
 // Every block order (row-major and each grouping) against a reference, through the unrolled sweep and the
 // gathering fallback, at row counts below, at and past the
@@ -627,7 +589,7 @@ test "matmul_nt_q: grouped kernels match the reference at every width" {
     const k: usize = 96;
     const blocks = k / Q8_0_BLOCK_ELEMS;
 
-    inline for (testable_encs) |enc| inline for ([_]types.QuantBlockOrder{ .row_major, .lanes4, .lanes8, .lanes16, .lanes32 }) |order| {
+    inline for (matmul_q_i8.runnable_encs) |enc| inline for ([_]types.QuantBlockOrder{ .row_major, .lanes4, .lanes8, .lanes16, .lanes32 }) |order| {
         const W = comptime order.groupRows();
         const n = 2 * W;
         var b_rows: [n * blocks * Q8_0_BLOCK_BYTES]u8 = undefined;
@@ -642,9 +604,9 @@ test "matmul_nt_q: grouped kernels match the reference at every width" {
         for ([_]usize{ 1, 2, R, R + 3 }) |m| {
             var a: [(R + 3) * k]f32 = undefined;
             for (a[0 .. m * k], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.03;
-            var prepared: [(R + 3) * blocks * SLOT_BYTES]u8 align(32) = undefined;
+            var prepared: [(R + 3) * blocks * PREP_BLOCK_BYTES]u8 align(32) = undefined;
             try prepareActivation(&prepared, std.mem.sliceAsBytes(a[0 .. m * k]), m, k);
-            const a_bytes: []const u8 = prepared[0 .. m * blocks * SLOT_BYTES];
+            const a_bytes: []const u8 = prepared[0 .. m * blocks * PREP_BLOCK_BYTES];
 
             for ([_]bool{ true, false }) |fast| {
                 var c: [(R + 3) * n]f32 = undefined;

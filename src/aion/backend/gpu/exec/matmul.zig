@@ -241,7 +241,7 @@ pub const Matmul = struct {
         if (b_meta.dtype == .q8_0) return self.execQuantB(ctx, frame, s, g);
         if (b_meta.dtype != .f32) return error.Unsupported;
         // One row of A streams B once: a matvec, not a tiled GEMM that would stage it.
-        if (g.batch == 1 and g.m == 1 and g.n % 4 == 0 and g.k % 4 == 0) return recordGemvF32(ctx, frame, s, g);
+        if (g.batch == 1 and g.m == 1 and g.n % 4 == 0 and g.k % 4 == 0) return recordGemvStep(ctx, frame, s, g);
 
         // Batched products are small in these models: one bounds-checked config
         // rather than a tune per shape.
@@ -349,6 +349,8 @@ pub const Matmul = struct {
     /// One f32 product on bound buffers (see `Bound`), autotuned per shape like
     /// `exec`'s: B as `[K, N]`, or as the `n` rows of `k` a `MatMulNT` holds.
     pub fn execBound(self: *Matmul, ctx: Ctx, frame: *Frame, op: Bound) ExecuteProgramError!void {
+        // One row of A streams B once: a matvec, not a tiled GEMM that would stage it.
+        if (op.m == 1 and !op.b_rows and op.c_off == 0 and op.n % 4 == 0 and op.k % 4 == 0) return recordGemvF32(ctx, frame, op);
         const generated = if (op.b_rows) self.generated_rows else self.generated;
         const idx = try chooseBoundConfig(ctx, frame, op, generated);
         const gen = generated[idx];
@@ -393,8 +395,8 @@ fn castU32(v: usize) ExecuteProgramError!u32 {
     return std.math.cast(u32, v) orelse error.Unsupported;
 }
 
-/// C[n] = alpha * A[k] . B[k, n] + beta * C[n] for an f32 B (see `gemv_f32_kmajor`).
-fn recordGemvF32(ctx: Ctx, frame: *Frame, s: StepMatMul, g: Gemm) ExecuteProgramError!void {
+/// `recordGemvF32` for a MatMul step's tensors.
+fn recordGemvStep(ctx: Ctx, frame: *Frame, s: StepMatMul, g: Gemm) ExecuteProgramError!void {
     const hs = ctx.store;
     const da = hs.acquireConst(s.a) catch return error.ExecutionFailed;
     defer hs.releaseConst(da.token);
@@ -403,18 +405,30 @@ fn recordGemvF32(ctx: Ctx, frame: *Frame, s: StepMatMul, g: Gemm) ExecuteProgram
     const dc = hs.acquireMut(s.c) catch return error.ExecutionFailed;
     defer hs.releaseMut(dc.token);
     inline for (.{ da.len, db.len, dc.len }) |len| if (!context.storageBindingFits(ctx, len)) return error.Unsupported;
-
     const n = try castU32(g.n);
-    const params: GemvParams = .{ .k = try castU32(g.k), .n = n, .alpha = s.alpha, .beta = s.beta };
-    const bufs = [_]c.WGPUBuffer{
-        ctx.devmem.bufferFor(da.handle).?,
-        ctx.devmem.bufferFor(db.handle).?,
-        ctx.devmem.bufferFor(dc.handle).?,
-    };
-    const sizes = [_]u64{ da.len, db.len, dc.len };
+    return recordGemvF32(ctx, frame, .{
+        .a = ctx.devmem.bufferFor(da.handle).?,
+        .a_len = da.len,
+        .b = ctx.devmem.bufferFor(db.handle).?,
+        .b_len = db.len,
+        .c = ctx.devmem.bufferFor(dc.handle).?,
+        .c_len = dc.len,
+        .m = 1,
+        .n = n,
+        .k = try castU32(g.k),
+        .c_row = n,
+        .c_off = 0,
+        .alpha = s.alpha,
+        .beta = s.beta,
+    });
+}
+
+/// C[n] = alpha * A[k] . B[k, n] + beta * C[n] for an f32 B (see `gemv_f32_kmajor`).
+fn recordGemvF32(ctx: Ctx, frame: *Frame, op: Bound) ExecuteProgramError!void {
+    const params: GemvParams = .{ .k = op.k, .n = op.n, .alpha = op.alpha, .beta = op.beta };
     const built = try ctx.pipes.get(gemv_kernel, "gemv_f32_kmajor");
-    const groups = @max(1, context.ceilDiv(n / 4, GEMV_F32_QUADS));
-    try frame.recordCompute(built, &bufs, &sizes, std.mem.asBytes(&params), .{ groups, 1, 1 });
+    const groups = @max(1, context.ceilDiv(op.n / 4, GEMV_F32_QUADS));
+    try frame.recordCompute(built, &.{ op.a, op.b, op.c }, &.{ op.a_len, op.b_len, op.c_len }, std.mem.asBytes(&params), .{ groups, 1, 1 });
 }
 
 /// Record the one dispatch computing `g` with config `gen`: the real run's, and a

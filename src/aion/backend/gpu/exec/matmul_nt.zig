@@ -10,13 +10,13 @@
 //!   - small M (decode, streaming chunks; see `gemvMaxM`): bandwidth-bound matvec —
 //!     `kernels/matmul_nt_gemv.wgsl` reads B once per row of A (dequant-in-
 //!     registers for q8_0), one dispatch per row.
-//!   - larger M (prefill): compute-bound. An f32 B runs the autotuned GEMM that
-//!     stages B from its rows (`Matmul.execBound`), so nothing is copied. A q8_0
-//!     B in `lanes32x16` order runs on matrix tiles, dequantized as it is staged
-//!     (`matmul_q8_mx16.zig` on 16x16 f16 tiles, `matmul_q8_mx.zig` on 8x8 f32
-//!     ones), where the device has them. Otherwise it is
-//!     dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM runs
-//!     on it. Scratch is reused across chunks; the frame's compute-pass ordering
+//!   - larger M (prefill; from two rows on 8x8 f32 tiles): an f32 B runs the
+//!     autotuned GEMM that stages B from its rows (`Matmul.execBound`), so nothing
+//!     is copied. A q8_0 B in `lanes32x16` order runs on matrix tiles, dequantized
+//!     as it is staged (`matmul_q8_mx16.zig` on 16x16 f16 tiles,
+//!     `matmul_q8_mx.zig` on 8x8 f32 ones), where the device has them. Otherwise
+//!     it is dequantized into a pooled f32 [K, n] scratch first, then the f32 GEMM
+//!     runs on it. Scratch is reused across chunks; the frame's compute-pass ordering
 //!     serializes dequant(i+1) after gemm(i).
 //!
 //! q8_0 path requires K % 64 == 0 (whole word-aligned block pairs per row —
@@ -59,9 +59,15 @@ const LANES_WIDE_BELOW_GROUPS: u32 = 64;
 /// row still beats a GEMM whose tiles would be mostly empty rows. Measured on an
 /// RTX 4080 (N=1024, K=4096): a q8_0 GEMV row costs ~9 us against ~670 us for
 /// dequant-to-scratch + GEMM at any M <= 128; an f32 one ~14 us against
-/// ~330 us for the rows-B GEMM at M = 16.
-fn gemvMaxM(form: BForm) u32 {
-    return if (form == .f32) 16 else 32;
+/// ~330 us for the rows-B GEMM at M = 16. On 8x8 f32 tiles a short block reads
+/// a `lanes32x16` weight once for all its rows, and wins from two (M5, N=4096,
+/// K=1024: 0.063 ms against 0.084 for two GEMVs, 0.12 against 0.45 at M = 14).
+fn gemvMaxM(form: BForm, limits: wgpu.Limits) u32 {
+    return switch (form) {
+        .f32 => 16,
+        .q8_lanes32x16 => if (limits.matrix_f32) 1 else 32,
+        .q8_pairs => 32,
+    };
 }
 
 /// The grouping these kernels read fastest (`types.QuantBlockOrder`), which the
@@ -160,7 +166,7 @@ pub const MatmulNt = struct {
             const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32x16 else .q8_pairs;
             // The GEMV reads A as vec4s; an f32 B of any other K takes the GEMM,
             // whose scalar config reads any.
-            if (m_total <= gemvMaxM(form) and k % 4 == 0) {
+            if (m_total <= gemvMaxM(form, ctx.gpu.limits) and k % 4 == 0) {
                 var row: u32 = 0;
                 while (row < m_total) : (row += 1) {
                     try self.recordGemv(ctx, frame, s, da, db, dc, k, n_count, b_wpr, row * (k / 4), row * c_row + c_off, form);

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later
 //
-//! Fused LSTM cell execution for the GPU backend (kernels/lstm.wgsl): one
-//! thread per (batch, hidden) element computes all four gates and writes the
-//! [h_t | c_t] state row. f32 or f16 storage — the gates, the activations and
-//! the cell update are f32 either way, so the dtype only picks an entry point.
-//! Every operand must be one buffer and share the cell's dtype.
-//!
-//! An f32 cell of `GEMM_MIN_BATCH` rows or more instead runs its gates as two
-//! GEMMs into pooled scratch, then the update (kernels/lstm_gates.wgsl). Both
-//! paths use the CPU cell's sigmoid/tanh approximations (kernels/lstm_act.wgsl).
+//! LSTM cell execution for the GPU backend. An f32 cell runs its gates as two
+//! matmuls into pooled scratch (a matvec at one row, `Matmul.execBound`), then the
+//! update (kernels/lstm_gates.wgsl). An f16 cell, or one whose gates outgrow a
+//! binding, runs fused (kernels/lstm.wgsl): one thread per (batch, hidden) element
+//! computes all four gates and writes the [h_t | c_t] state row, in f32 whatever
+//! the storage. Every operand must be one buffer and share the cell's dtype.
+//! Both paths use the CPU cell's sigmoid/tanh approximations (kernels/lstm_act.wgsl).
 
 const std = @import("std");
 const wgpu = @import("../wgpu.zig");
@@ -34,11 +32,6 @@ fn elemBytes(dtype: types.DType) usize {
 const act_wgsl = @embedFile("../kernels/lstm_act.wgsl");
 const lstm_kernel: KernelDesc = .{ .name = "lstm", .wgsl = @embedFile("../kernels/lstm.wgsl") ++ act_wgsl };
 const gates_kernel: KernelDesc = .{ .name = "lstm_gates", .wgsl = @embedFile("../kernels/lstm_gates.wgsl") ++ act_wgsl };
-
-/// Rows from which an f32 cell runs as GEMMs: each fused thread walks four weight
-/// columns on its own, where a GEMM tile reuses them across rows. A few rows
-/// (decode) stay one dispatch.
-const GEMM_MIN_BATCH: usize = 16;
 
 const WG_1D: u32 = 64;
 
@@ -133,7 +126,9 @@ pub fn execLSTMCell(ctx: Ctx, frame: *Frame, s: executable.StepLSTMCellFused, mm
     const groups = @max(1, @min(context.ceilDiv(total, WG_1D), context.MAX_GROUPS_1D));
 
     const gate_bytes = @as(u64, batch) * gate_dim * @sizeOf(f32);
-    if (dt == .f32 and batch >= GEMM_MIN_BATCH and context.storageBindingFits(ctx, gate_bytes)) {
+    // The fused kernel's threads each walk four weight columns alone, so the GPU
+    // runs a few hundred of them: matmuls spread the weights over all of it.
+    if (dt == .f32 and context.storageBindingFits(ctx, gate_bytes)) {
         // gates = x @ w_ih, gates += h_prev @ w_hh, then the update.
         const gates = try ctx.scratch.ensure(ctx.gpu, gate_bytes);
         const n: u32 = @intCast(gate_dim);

@@ -52,6 +52,8 @@ const view_ops = @import("exec/view_ops.zig");
 const autotune = @import("autotune.zig");
 const matmul_exec = @import("exec/matmul.zig");
 const matmul_nt = @import("exec/matmul_nt.zig");
+/// Its config menu, for tests that pin each config (`autotune.Tuner.pinned`).
+pub const matmul_q8_mx = @import("exec/matmul_q8_mx.zig");
 const frame_mod = @import("frame.zig");
 const timestamp_profile = @import("timestamp_profile.zig");
 const TimestampProfiler = timestamp_profile.TimestampProfiler;

@@ -120,7 +120,7 @@ pub const Model = struct {
     /// device-resident across `run` calls. Released in `deinit`.
     session: backend_mod.Session,
     /// Compilation and execution device, weight layout, and optimization policy.
-    /// Discrete GPUs may also keep recurrent-state slots device-exclusive.
+    /// On a GPU, recurrent-state slots also live on the device.
     target: Target,
     /// The model's graph before its free dims are known, and whatever owns its records.
     template: template_mod.Template,
@@ -1795,9 +1795,9 @@ pub const Model = struct {
         return signatures.sameUsize(have, want);
     }
 
-    /// Move a new recurrent-state slot to device-exclusive storage on a discrete GPU
-    /// when it fits one buffer. CPU, unified memory, oversized slots, and migration
-    /// failures retain the correct host/staged path.
+    /// Move a new recurrent-state slot to the GPU when it fits one buffer, so each
+    /// run's carry is a device copy. The CPU, oversized slots, and migration
+    /// failures keep it on the host.
     fn migrateStateSlotToDevice(self: *Self, tid: TensorId, dtype: DType, shape: []const usize) void {
         if (self.target.device.kind == .cpu) return;
         const mem = self.store.deviceMemoryFor(self.target.device) orelse return;

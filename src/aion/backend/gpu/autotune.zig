@@ -20,7 +20,7 @@ const ExecuteProgramError = backend_mod.ExecuteProgramError;
 
 /// The op families that tune. Part of the key: two families' problems can share
 /// dims and still want different candidates.
-pub const Family = enum(u8) { gemm, gemm_rows, gemm_q8, conv, attention };
+pub const Family = enum(u8) { gemm, gemm_rows, gemm_q8, gemm_q8_mx, conv, attention };
 
 /// The problem a choice was timed for: the family and the dims that decide it.
 pub const Key = struct {
@@ -69,6 +69,10 @@ const ROUNDS: usize = 4;
 
 pub const Tuner = struct {
     choices: std.AutoHashMap(Key, usize),
+    /// A candidate `pick` returns untimed wherever it is eligible: tests pin each
+    /// in turn to check every kernel of a menu, not only the one this device
+    /// times fastest.
+    pinned: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator) Tuner {
         return .{ .choices = .init(allocator) };
@@ -97,6 +101,7 @@ pub const Tuner = struct {
     /// op's output, which the real run rewrites, and nothing else.
     pub fn pick(self: *Tuner, ctx: Ctx, frame: *Frame, problem: Key, candidates: usize, cand: anytype) ExecuteProgramError!?usize {
         std.debug.assert(candidates <= @bitSizeOf(u64));
+        if (self.pinned) |idx| if (idx < candidates and cand.eligible(idx)) return idx;
         var key = problem;
         var only: ?usize = null;
         var eligible: usize = 0;

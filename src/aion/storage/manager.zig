@@ -560,8 +560,9 @@ pub const StorageManager = struct {
     /// residency (any host/device combination): the source's packed bytes are read
     /// (D2H when it is on a device) and written into the destination (H2D when it
     /// is). dtype and logical shape must match. Used to seed a device-resident
-    /// recurrent state slot from a caller's host tensor, and to mirror device state
-    /// back to a host tensor for reads.
+    /// recurrent state slot from a caller's host tensor, to carry recurrent state
+    /// from a run's output into its slot, and to mirror device state back to a host
+    /// tensor for reads.
     pub fn copyTensorData(self: *Self, dst_id: TensorId, src_id: TensorId) StorageError!void {
         const src: *const Tensor = try self.getConst(src_id);
         const dst: *Tensor = try self.getMut(dst_id);
@@ -569,10 +570,23 @@ pub const StorageManager = struct {
 
         const len: usize = try src.byteLen();
         if (src.device.kind == .cpu) return writeBytesAtPlacement(dst, 0, src.data[0..len]);
+        if (try copyOnDevice(dst, src, len)) return;
         const buf: []u8 = self.allocator.alloc(u8, len) catch return StorageError.OutOfMemory;
         defer self.allocator.free(buf);
         try self.readBytesAtPlacement(src, 0, buf);
         try writeBytesAtPlacement(dst, 0, buf);
+    }
+
+    /// Copy between two single-buffer tensors on the same device, buffer to buffer.
+    /// The copy is queued behind whatever wrote `src`, so nothing waits on the
+    /// device. False when the layout needs the host path: another device, several
+    /// chunks, or a length that is not whole 4-byte words.
+    fn copyOnDevice(dst: *Tensor, src: *const Tensor, len: usize) StorageError!bool {
+        if (!dst.device.eql(src.device) or len % 4 != 0) return false;
+        if (src.chunk_handles.len != 1 or dst.chunk_handles.len != 1) return false;
+        const d = src.dev orelse return false;
+        d.copyD2D(dst.chunk_handles[0], 0, src.chunk_handles[0], 0, len) catch return StorageError.InvalidArgument;
+        return true;
     }
 
     /// Zero a tensor's contents at its current placement: host bytes are cleared

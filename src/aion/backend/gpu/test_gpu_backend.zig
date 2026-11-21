@@ -24,6 +24,7 @@ const gpu = aion.gpu; // feature-gated GPU backend (root.zig exposes it when -Dg
 /// placement decides where each step runs and which reads cross back to the host.
 /// The CPU reference run replays the same program — a transfer is just a copy there.
 const wgpu = gpu.wgpu; // the wgpu helper, re-exported by the backend
+const matmul_q8_mx = gpu.matmul_q8_mx;
 
 const StorageManager = aion.storage_manager.StorageManager;
 const Graph = aion.graph.Graph;
@@ -415,6 +416,8 @@ const RunOpts = struct {
     /// Steps the GPU backend records between submits, to move where a program
     /// is split.
     submit_chunk: ?usize = null,
+    /// The candidate every tuned choice takes where eligible (`Tuner.pinned`).
+    tune_pin: ?usize = null,
 };
 
 fn runOnBothBackendsWith(
@@ -436,6 +439,7 @@ fn runOnBothBackendsWith(
     var gb = gpu.GpuBackend.init(alloc, &device);
     defer gb.deinit();
     if (opts.submit_chunk) |steps| gb.submit_chunk = steps;
+    gb.tune.pinned = opts.tune_pin;
     if (opts.matrix_tiles) {
         if (!device.limits.matrix_f32) return error.SkipZigTest;
         // Each menu ends with its matrix configs.
@@ -1038,9 +1042,10 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
 }
 
 // 2048 rows are 64 groups (the 8-slice GEMV); 64 rows are 2 (the 32-slice one);
-// M = 24 runs that GEMV once per row; M = 40 dequantizes the grouped B for the GEMM;
-// M = 100 against 96 rows of B takes the matrix-tile GEMM where the device has it,
-// its last block sliding back both ways (neither is a whole number of 64-blocks).
+// M = 24 runs that GEMV once per row and M = 40 dequantizes the grouped B for the
+// GEMM, or both take short blocks where the device has 8x8 f32 tiles; M = 100
+// against 96 rows of B takes the matrix-tile GEMM where the device has it, its
+// last block sliding back both ways (neither is a whole number of 64-blocks).
 fn buildNtLanesGemv(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return buildNtLanes(alloc, mgr, 1, 96, 2048);
 }
@@ -1063,6 +1068,35 @@ fn buildNtLanesTilesF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPr
 }
 test "gpu backend: matmul NT q8_0 on f16 matrix tiles matches CPU" {
     try expectGpuMatchesCpuNmseWith(buildNtLanesTilesF16, 200 * 160, ntQ8MaxNmse(96), .{ .f16_tiles = .require, .inspect = expectMx16Ran });
+}
+
+// Fewer than 64 rows of A take a short block on 8x8 f32 tiles, each pinned in
+// turn: M = 21 leaves a partial block at every height and is shorter than the
+// 32-row one, M = 3 shorter than all; 192 rows of B slide the 128-wide block back.
+fn buildNtLanesShort(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 21, 96, 192);
+}
+fn buildNtLanesShortest(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 3, 96, 192);
+}
+test "gpu backend: matmul NT q8_0 on every short 8x8-tile block matches CPU" {
+    inline for (matmul_q8_mx.configs, 0..) |cfg, idx| {
+        if (cfg.bm >= 64) continue;
+        const opts: RunOpts = .{ .matrix_tiles = true, .tune_pin = idx, .inspect = expectMxRan(cfg) };
+        try expectGpuMatchesCpuNmseWith(buildNtLanesShort, 21 * 192, ntQ8MaxNmse(96), opts);
+        try expectGpuMatchesCpuNmseWith(buildNtLanesShortest, 3 * 192, ntQ8MaxNmse(96), opts);
+    }
+}
+
+/// The product ran on `cfg`'s 8x8-tile kernel.
+fn expectMxRan(comptime cfg: matmul_q8_mx.Config) fn (*const gpu.GpuBackend) anyerror!void {
+    return struct {
+        fn check(gb: *const gpu.GpuBackend) !void {
+            const name = std.fmt.comptimePrint("matmul_q8_mx_{d}x{d}_{d}x{d}", .{ cfg.bm, cfg.bn, cfg.sgm, cfg.sgn });
+            if (gb.pipes.modules.contains(name)) return;
+            return error.TestExpectedMxConfig;
+        }
+    }.check;
 }
 
 /// The product ran on the f16 tiles, not a fallback.
@@ -2108,15 +2142,35 @@ fn buildLSTM(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     return finishProg(alloc, &g, mgr, out);
 }
 
-test "gpu backend: lstm cell (fused, biased) matches CPU" {
+test "gpu backend: lstm cell (biased) matches CPU" {
     try expectGpuMatchesCpu(buildLSTM, 4 * 32, 2e-3);
+}
+
+fn buildLSTMRow(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    var g = Graph.init(alloc);
+    defer g.deinit();
+    // batch=1, input_size=12, hidden=20 -> state [1, 40]: the gates are two
+    // matvecs, the second accumulating onto the first.
+    const x = try makeInput(&g, mgr, &.{ 1, 12 }, 104);
+    const h = try makeInput(&g, mgr, &.{ 1, 20 }, 105);
+    const cc = try makeInput(&g, mgr, &.{ 1, 20 }, 106);
+    const w_ih = try makeInput(&g, mgr, &.{ 12, 80 }, 107);
+    const w_hh = try makeInput(&g, mgr, &.{ 20, 80 }, 108);
+    const b_ih = try makeInput(&g, mgr, &.{80}, 109);
+    const b_hh = try makeInput(&g, mgr, &.{80}, 110);
+    const out = try g.addLSTMCell(x, h, cc, w_ih, w_hh, b_ih, b_hh);
+    return finishProg(alloc, &g, mgr, out);
+}
+
+test "gpu backend: lstm cell (one row, matvec route) matches CPU" {
+    try expectGpuMatchesCpu(buildLSTMRow, 40, 1e-4);
 }
 
 fn buildLSTMBatched(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
-    // batch=40, input_size=24, hidden=32 -> state [40, 64]: past the GPU cell's
-    // GEMM threshold, so the gates run as two GEMMs plus `lstm_gates`.
+    // batch=40, input_size=24, hidden=32 -> state [40, 64]: the gates run as two
+    // tiled GEMMs plus `lstm_gates`.
     const x = try makeInput(&g, mgr, &.{ 40, 24 }, 97);
     const h = try makeInput(&g, mgr, &.{ 40, 32 }, 98);
     const cc = try makeInput(&g, mgr, &.{ 40, 32 }, 99);

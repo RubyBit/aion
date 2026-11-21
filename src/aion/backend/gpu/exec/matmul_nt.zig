@@ -10,7 +10,7 @@
 //!   - small M (decode, streaming chunks; see `gemvMaxM`): bandwidth-bound matvec —
 //!     `kernels/matmul_nt_gemv.wgsl` reads B once per row of A (dequant-in-
 //!     registers for q8_0), one dispatch per row.
-//!   - larger M (prefill; from two rows on 8x8 f32 tiles): an f32 B runs the
+//!   - larger M (prefill; from two rows on matrix tiles): an f32 B runs the
 //!     autotuned GEMM that stages B from its rows (`Matmul.execBound`), so nothing
 //!     is copied. A q8_0 B in `lanes32x16` order runs on matrix tiles, dequantized
 //!     as it is staged (`matmul_q8_mx16.zig` on 16x16 f16 tiles,
@@ -59,13 +59,16 @@ const LANES_WIDE_BELOW_GROUPS: u32 = 64;
 /// row still beats a GEMM whose tiles would be mostly empty rows. Measured on an
 /// RTX 4080 (N=1024, K=4096): a q8_0 GEMV row costs ~9 us against ~670 us for
 /// dequant-to-scratch + GEMM at any M <= 128; an f32 one ~14 us against
-/// ~330 us for the rows-B GEMM at M = 16. On 8x8 f32 tiles a short block reads
-/// a `lanes32x16` weight once for all its rows, and wins from two (M5, N=4096,
-/// K=1024: 0.063 ms against 0.084 for two GEMVs, 0.12 against 0.45 at M = 14).
+/// ~330 us for the rows-B GEMM at M = 16. On matrix tiles a short block reads
+/// a `lanes32x16` weight once for all its rows, and wins from two (M5's 8x8 f32
+/// tiles, N=4096, K=1024: 0.063 ms against 0.084 for two GEMVs, 0.12 against
+/// 0.45 at M = 14; an RTX 4080 Laptop's 16x16 f16 ones, N=1024, K=4096: a tie
+/// with two GEMVs at M = 2, 0.027 against 0.114 ms for 16 at M = 16, and 0.042
+/// against 0.54 for dequant + GEMM at M = 48).
 fn gemvMaxM(form: BForm, limits: wgpu.Limits) u32 {
     return switch (form) {
         .f32 => 16,
-        .q8_lanes32x16 => if (limits.matrix_f32) 1 else 32,
+        .q8_lanes32x16 => if (limits.matrix_f32 or limits.matrix_f16) 1 else 32,
         .q8_pairs => 32,
     };
 }
@@ -164,6 +167,7 @@ pub const MatmulNt = struct {
 
             if (lanes and n_count % LANES_W != 0) return error.Unsupported;
             const form: BForm = if (b_meta.dtype != .q8_0) .f32 else if (lanes) .q8_lanes32x16 else .q8_pairs;
+            const mx16: matmul_q8_mx16.Params = .{ .m = m_total, .n = n_count, .k = k, .c_row = c_row, .c_off = c_off, .alpha = s.alpha, .beta = s.beta };
             // The GEMV reads A as vec4s; an f32 B of any other K takes the GEMM,
             // whose scalar config reads any.
             if (m_total <= gemvMaxM(form, ctx.gpu.limits) and k % 4 == 0) {
@@ -188,20 +192,12 @@ pub const MatmulNt = struct {
                     .alpha = s.alpha,
                     .beta = s.beta,
                 });
-            } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f16 and
-                matmul_q8_mx16.fits(m_total, n_count, k, c_row, c_off, s.alpha, s.beta))
-            {
+            } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f16 and matmul_q8_mx16.fits(ctx.gpu.limits, mx16)) {
                 try matmul_q8_mx16.record(ctx, frame, .{
                     ctx.devmem.bufferFor(da.handle).?,
                     ctx.devmem.bufferFor(db.handle).?,
                     ctx.devmem.bufferFor(dc.handle).?,
-                }, .{ da.len, db.len, dc.len }, .{
-                    .m = m_total,
-                    .n = n_count,
-                    .k = k,
-                    .c_row = c_row,
-                    .c_off = c_off,
-                });
+                }, .{ da.len, db.len, dc.len }, mx16);
             } else if (form == .q8_lanes32x16 and ctx.gpu.limits.matrix_f32 and matmul_q8_mx.fits(m_total, n_count, k)) {
                 try matmul_q8_mx.record(ctx, frame, .{
                     ctx.devmem.bufferFor(da.handle).?,

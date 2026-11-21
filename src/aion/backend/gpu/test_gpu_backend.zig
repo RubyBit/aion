@@ -25,6 +25,7 @@ const gpu = aion.gpu; // feature-gated GPU backend (root.zig exposes it when -Dg
 /// The CPU reference run replays the same program — a transfer is just a copy there.
 const wgpu = gpu.wgpu; // the wgpu helper, re-exported by the backend
 const matmul_q8_mx = gpu.matmul_q8_mx;
+const matmul_q8_mx16 = gpu.matmul_q8_mx16;
 
 const StorageManager = aion.storage_manager.StorageManager;
 const Graph = aion.graph.Graph;
@@ -1015,6 +1016,11 @@ fn ntQ8MaxNmse(k: usize) f64 {
 /// An NT q8 matmul compiled the way a GPU device lays weights out: the target asks
 /// for the GPU's grouped order, so the layout pass re-lays B and the GPU reads it coalesced.
 fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n: usize) !BuiltProg {
+    return buildNtLanesScaled(alloc, mgr, m, k, n, 1.0);
+}
+
+/// `buildNtLanes` with the product scaled by `alpha`.
+fn buildNtLanesScaled(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usize, n: usize, alpha: f32) !BuiltProg {
     var g = Graph.init(alloc);
     defer g.deinit();
     const av = try makeInput(&g, mgr, &.{ m, k }, 20);
@@ -1030,7 +1036,7 @@ fn buildNtLanes(alloc: std.mem.Allocator, mgr: *StorageManager, m: usize, k: usi
     try mgr.writeFromPackedQuant(b_id, packed_b);
     const bv = try g.addInput(.q8_0, &.{ n, k });
     try g.bindExternal(bv, b_id);
-    try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMul(av, try g.addViewTranspose2D(bv), 1.0, 0.0)});
+    try g.setOutputs(&[_]aion.graph.ValueId{try g.addMatMul(av, try g.addViewTranspose2D(bv), alpha, 0.0)});
 
     const order = gpu.GpuBackend.quant_block_order;
     const prog = try aion.program.compileGraph(alloc, &g, mgr, .init(.{ .kind = .gpu }, order));
@@ -1068,6 +1074,53 @@ fn buildNtLanesTilesF16(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltPr
 }
 test "gpu backend: matmul NT q8_0 on f16 matrix tiles matches CPU" {
     try expectGpuMatchesCpuNmseWith(buildNtLanesTilesF16, 200 * 160, ntQ8MaxNmse(96), .{ .f16_tiles = .require, .inspect = expectMx16Ran });
+}
+
+// Every f16-tile block, pinned in turn, over 37 q8 blocks of K: few enough
+// workgroups that K splits, into uneven splits whose last one ends in a part
+// stage. Tall blocks take M = 200 against 160 rows of B (both slide back);
+// short ones M = 21 (a partial block at every height) and M = 3 (shorter than
+// all) against 192.
+const NT_SPLIT_K: usize = 37 * 32;
+fn buildNtLanesSplitTall(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 200, NT_SPLIT_K, 160);
+}
+fn buildNtLanesSplitShort(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 21, NT_SPLIT_K, 192);
+}
+fn buildNtLanesSplitShortest(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanes(alloc, mgr, 3, NT_SPLIT_K, 192);
+}
+test "gpu backend: matmul NT q8_0 on every f16-tile block, K split, matches CPU" {
+    const max_nmse = ntQ8MaxNmse(NT_SPLIT_K);
+    inline for (matmul_q8_mx16.configs, 0..) |cfg, idx| {
+        const opts: RunOpts = .{ .f16_tiles = .require, .tune_pin = idx, .inspect = expectMx16SplitRan(cfg) };
+        if (cfg.staged()) {
+            try expectGpuMatchesCpuNmseWith(buildNtLanesSplitShort, 21 * 192, max_nmse, opts);
+            try expectGpuMatchesCpuNmseWith(buildNtLanesSplitShortest, 3 * 192, max_nmse, opts);
+        } else {
+            try expectGpuMatchesCpuNmseWith(buildNtLanesSplitTall, 200 * 160, max_nmse, opts);
+        }
+    }
+}
+
+// A scaled product cannot store tiles straight to C, so even M = 100 takes a
+// short f16-tile block, whose way out scales.
+fn buildNtLanesScaledTiles(alloc: std.mem.Allocator, mgr: *StorageManager) !BuiltProg {
+    return buildNtLanesScaled(alloc, mgr, 100, 96, 96, 0.5);
+}
+test "gpu backend: scaled matmul NT q8_0 on short f16-tile blocks matches CPU" {
+    try expectGpuMatchesCpuNmseWith(buildNtLanesScaledTiles, 100 * 96, ntQ8MaxNmse(96), .{ .f16_tiles = .require, .inspect = expectMx16Ran });
+}
+
+/// The product ran on `cfg`'s f16-tile kernel, its K split and reduced.
+fn expectMx16SplitRan(comptime cfg: matmul_q8_mx16.Config) fn (*const gpu.GpuBackend) anyerror!void {
+    return struct {
+        fn check(gb: *const gpu.GpuBackend) !void {
+            if (!gb.pipes.modules.contains(matmul_q8_mx16.kernelName(cfg))) return error.TestExpectedMx16Config;
+            if (!gb.pipes.modules.contains("split_k_reduce")) return error.TestExpectedSplitK;
+        }
+    }.check;
 }
 
 // Fewer than 64 rows of A take a short block on 8x8 f32 tiles, each pinned in
